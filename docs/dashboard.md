@@ -64,11 +64,19 @@ statuses may be stale because this UI deliberately does not reconcile processes.
 | Key | Action |
 |---|---|
 | `1`–`4`, Tab | Bridge, Fleet, Logbook, Terminals |
+| Left click a top tab | Switch views |
+| Left click an assignment/terminal | Select it and show details |
+| Mouse wheel | Scroll details, or move selection when over the list |
 | Up/Down, `j`/`k` | Select assignment or terminal |
 | Page Up/Down | Scroll details |
 | `c` | Hide/show additional routine activity on Bridge |
 | Enter, `f` in Terminals | Focus the selected existing agent |
 | `q`, Escape, Ctrl-C | Exit the dashboard; workers continue |
+
+Mouse support works in the demo and live view when the terminal forwards mouse
+events (including inside Herdr). Clicking selects only; Enter or `f` still opens
+an existing live agent through the identity checks. Tab and row targets follow
+the rendered layout and list scroll position. Mouse capture is released on exit.
 
 The compact summary starts on. Grouped pending issues remain visible and routine
 facts stay available in Logbook; viewing never deletes facts or acknowledges an

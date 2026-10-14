@@ -19,6 +19,7 @@ Use `--home /absolute/privateer/home` to observe an existing home. Inside Herdr,
 the dashboard can inspect and focus existing agent terminals using the injected
 socket. It does not launch agents, send prompts, acknowledge alerts or migrate a
 fleet. Navigator chat and automatic agent activation are not connected yet.
+Click the top tabs and list entries, or use `1`–`4`, Tab and the arrow keys.
 See [dashboard setup and boundaries](docs/dashboard.md).
 
 ## General runtime and optional integrations

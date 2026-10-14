@@ -1,5 +1,11 @@
 use anyhow::{Context, Result, bail, ensure};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
+    execute,
+};
 use privateer::dashboard::{
     herdr::{Client, Pane, View},
     model::Snapshot,
@@ -79,6 +85,13 @@ struct Sample<T> {
 struct Focus {
     observed: View,
     pane: Pane,
+}
+
+struct MouseCapture;
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
 }
 
 fn state_worker(home: PathBuf) -> Receiver<Sample<Snapshot>> {
@@ -193,9 +206,14 @@ fn run(opts: Options) -> Result<()> {
     let mut herdr_updated: Option<Instant> = None;
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<()> {
+        let _mouse_capture = MouseCapture;
+        execute!(io::stdout(), EnableMouseCapture)?;
+        let mut redraw = true;
+        let mut last_draw = Instant::now();
         loop {
             if let Some(updates) = &home_updates {
                 while let Ok(update) = updates.try_recv() {
+                    redraw = true;
                     match update.value {
                         Ok(snapshot) => {
                             app.snapshot = snapshot;
@@ -210,6 +228,7 @@ fn run(opts: Options) -> Result<()> {
             }
             if let Some((updates, _)) = &herdr {
                 while let Ok(update) = updates.try_recv() {
+                    redraw = true;
                     if let Some(notice) = update.notice {
                         app.notice = notice;
                     }
@@ -226,30 +245,40 @@ fn run(opts: Options) -> Result<()> {
             app.home_age = Some(home_updated.elapsed().as_secs());
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
             app.selected = app.selected.min(app.selection_len().saturating_sub(1));
-            terminal.draw(|frame| app.draw(frame))?;
+            if redraw || last_draw.elapsed() >= Duration::from_secs(1) {
+                terminal.draw(|frame| app.draw(frame))?;
+                last_draw = Instant::now();
+                redraw = false;
+            }
             if !event::poll(Duration::from_secs(1))? {
                 continue;
             }
-            if let Event::Key(key) = event::read()? {
+            let input = event::read()?;
+            if let Event::Mouse(mouse) = input {
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                ) {
+                    app.handle_mouse(mouse);
+                    redraw = true;
+                }
+            } else if let Event::Key(key) = input {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                redraw = true;
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('1'..='4') => {
                         if let KeyCode::Char(n) = key.code {
-                            app.tab = n as usize - '1' as usize;
-                            app.selected = 0;
-                            app.scroll = 0;
-                            app.selection_invalidated = false;
+                            app.select_tab(n as usize - '1' as usize);
                         }
                     }
                     KeyCode::Tab => {
-                        app.tab = (app.tab + 1) % 4;
-                        app.selected = 0;
-                        app.scroll = 0;
-                        app.selection_invalidated = false;
+                        app.select_tab((app.tab + 1) % 4);
                     }
                     KeyCode::Down | KeyCode::Char('j') => app.move_selection(true),
                     KeyCode::Up | KeyCode::Char('k') => app.move_selection(false),
@@ -284,6 +313,8 @@ fn run(opts: Options) -> Result<()> {
                     }
                     _ => {}
                 }
+            } else if matches!(input, Event::Resize(_, _)) {
+                redraw = true;
             }
         }
         Ok(())
