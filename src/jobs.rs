@@ -318,9 +318,10 @@ fn same_start(recorded: &str, current: &str) -> bool {
     }
     false
 }
-/// Whether our child has exited, without reaping it. The zombie keeps its PID,
-/// and therefore its process-group id, reserved until try_wait reaps it.
-fn leader_exited(pid: u32) -> Result<bool> {
+/// Observe whether our child has exited, without reaping it: Some(success)
+/// once it is a zombie. Until reaped, the zombie keeps its PID, and therefore
+/// its process-group id, reserved, so the group can still be signalled.
+pub(crate) fn exited_unreaped(pid: u32) -> Result<Option<bool>> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::waitid(
@@ -332,10 +333,18 @@ fn leader_exited(pid: u32) -> Result<bool> {
     };
     ensure!(
         rc == 0,
-        "cannot inspect payload leader: {}",
+        "cannot inspect child process: {}",
         std::io::Error::last_os_error()
     );
-    Ok(unsafe { info.si_pid() } != 0)
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+    ))
+}
+fn leader_exited(pid: u32) -> Result<bool> {
+    Ok(exited_unreaped(pid)?.is_some())
 }
 fn same_process(process: &Process) -> Result<bool> {
     Ok(identity(process.pid)?
