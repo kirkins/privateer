@@ -113,7 +113,15 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     for kind in kinds {
         identifier(kind.as_str().context("request kinds are strings")?)?;
     }
-    let record = json!({"name": name, "scope": scope, "location": location, "accepts": accepts});
+    let mut record =
+        json!({"name": name, "scope": scope, "location": location, "accepts": accepts});
+    if let Some(profile) = args.get("first_mate").filter(|v| !v.is_null()) {
+        ensure!(
+            location == "here",
+            "only ships hosted here have a first mate to wake"
+        );
+        record["first_mate"] = crate::activation::profile(store, name, profile)?;
+    }
     store.connection().execute(
         "INSERT INTO ships(name, record) VALUES(?1, ?2) ON CONFLICT(name) DO UPDATE SET record=excluded.record",
         params![name, record.to_string()],
