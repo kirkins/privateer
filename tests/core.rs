@@ -269,11 +269,11 @@ fn delivery_checks_head_and_production_approval_is_exact_and_once_only() {
     prod["deploys_production"] = json!(true);
     prod["environment"] = json!("production");
     assert!(dispatch(&mut s, "delivery.check", prod.clone()).is_err());
-    let grant =
-        json!({"id":"permission","task_id":"main","artifact":"abc123","environment":"production"});
+    let grant = json!({"id":"permission","task_id":"main","artifact":"abc123","environment":"production","approver":"release-manager"});
     dispatch(&mut s, "approval.grant", grant.clone()).unwrap();
-    dispatch(&mut s, "delivery.check", prod.clone()).unwrap();
-    dispatch(&mut s, "approval.consume", grant.clone()).unwrap();
+    let allowed = dispatch(&mut s, "delivery.check", prod.clone()).unwrap();
+    assert_eq!(allowed["approval_id"], "permission");
+    // The allowed delivery used the approval; it cannot be consumed again.
     assert!(dispatch(&mut s, "approval.consume", grant.clone()).is_err());
     assert!(dispatch(&mut s, "approval.grant", grant).is_err());
     assert!(dispatch(&mut s, "delivery.check", prod).is_err());
@@ -286,7 +286,7 @@ fn changed_charter_invalidates_old_approval_without_resetting_omitted_limits() {
     dispatch(
         &mut s,
         "approval.grant",
-        json!({"id":"permission","task_id":"main","artifact":"abc123","environment":"production"}),
+        json!({"id":"permission","task_id":"main","artifact":"abc123","environment":"production","approver":"release-manager"}),
     )
     .unwrap();
     let changed = dispatch(
@@ -395,12 +395,14 @@ fn explicit_production_approval_does_not_require_widening_the_standing_charter()
     let before = s.charter("project").unwrap();
     let check = json!({"task_id":"main","current_head":"release-a","tested_head":"release-a","checks_passed":true,"deploys_production":true,"environment":"production"});
     assert!(dispatch(&mut s, "delivery.check", check.clone()).is_err());
-    dispatch(&mut s,"approval.grant",json!({"id":"one-deployment","task_id":"main","artifact":"release-a","environment":"production"})).unwrap();
-    dispatch(&mut s, "delivery.check", check).unwrap();
+    dispatch(&mut s,"approval.grant",json!({"id":"one-deployment","task_id":"main","artifact":"release-a","environment":"production","approver":"release-manager"})).unwrap();
+    dispatch(&mut s, "delivery.check", check.clone()).unwrap();
     assert_eq!(s.charter("project").unwrap(), before);
     assert!(s.authorize("main", "deploy_production").is_err());
     assert!(dispatch(&mut s,"approval.consume",json!({"id":"one-deployment","task_id":"main","artifact":"release-b","environment":"production"})).is_err());
-    dispatch(&mut s,"approval.consume",json!({"id":"one-deployment","task_id":"main","artifact":"release-a","environment":"production"})).unwrap();
+    // The single deployment it authorised has used it.
+    assert!(dispatch(&mut s, "delivery.check", check).is_err());
+    assert!(dispatch(&mut s,"approval.consume",json!({"id":"one-deployment","task_id":"main","artifact":"release-a","environment":"production"})).is_err());
 }
 
 #[test]
@@ -466,7 +468,7 @@ fn custody_and_approval_do_not_depend_on_an_inspect_action() {
     .unwrap();
     let accepted = dispatch(&mut s, "task.accept", json!({"id":"main","actor":"apps"})).unwrap();
     assert_eq!(accepted["owner"], "apps");
-    let approval = json!({"task_id":"main","artifact":"abc123","environment":"production"});
+    let approval = json!({"task_id":"main","artifact":"abc123","environment":"production","approver":"release-manager"});
     let granted = dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
     let mut consume = approval;
     consume["id"] = granted["id"].clone();
@@ -494,4 +496,103 @@ fn custody_and_approval_do_not_depend_on_an_inspect_action() {
     let error = dispatch(&mut s, "task.accept", json!({"id":"main","actor":"infra"})).unwrap_err();
     assert!(error.to_string().contains("terminal"), "{error}");
     assert_eq!(s.task("main").unwrap()["owner"], "apps");
+}
+
+#[test]
+fn agents_cannot_run_operator_commands_or_act_as_someone_else() {
+    use privateer::store::Caller;
+    let (_temp, mut s) = fixture();
+    s.set_caller(Caller::Agent {
+        actor: "navigator".into(),
+    });
+    for command in privateer::OPERATOR_COMMANDS {
+        let error = dispatch(&mut s, command, json!({"id":"project"})).unwrap_err();
+        assert!(
+            error.to_string().contains("operator command"),
+            "{command}: {error}"
+        );
+    }
+    let error = dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"main","actor":"apps","status":"running"}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot act as"), "{error}");
+    let error = dispatch(
+        &mut s,
+        "message.send",
+        json!({"id":"m1","task_id":"main","from":"apps","to":"infra","body":"hi"}),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot act as"), "{error}");
+    // Ordinary department work under the charter still works.
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"main","actor":"navigator","status":"running"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "message.send",
+        json!({"id":"m2","task_id":"main","from":"navigator","to":"infra","body":"hi"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "task.create",
+        json!({"id":"child","parent":"main","owner":"infra","title":"Delegated"}),
+    )
+    .unwrap();
+    // Nothing the agent tried changed the charter.
+    assert_eq!(s.charter("project").unwrap()["revision"], 1);
+}
+
+#[test]
+fn caller_role_can_be_narrowed_but_never_widened() {
+    use privateer::store::Caller;
+    let agent = Caller::Agent {
+        actor: "apps".into(),
+    };
+    assert_eq!(
+        Caller::resolve(None, None, None, None).unwrap(),
+        Caller::Operator
+    );
+    assert_eq!(
+        Caller::resolve(Some("agent"), Some("apps"), Some("operator"), None).unwrap(),
+        agent
+    );
+    assert_eq!(
+        Caller::resolve(None, None, Some("agent"), Some("apps")).unwrap(),
+        agent
+    );
+    assert!(Caller::resolve(Some("agent"), None, None, None).is_err());
+    assert!(Caller::resolve(Some("agent"), Some("apps"), None, Some("infra")).is_err());
+    assert!(Caller::resolve(Some("root"), None, None, None).is_err());
+    assert!(Caller::resolve(Some("agent"), Some("bad name"), None, None).is_err());
+}
+
+#[test]
+fn approvals_name_an_approver_other_than_the_task_owner() {
+    let (temp, mut s) = fixture();
+    let grant = |approver: Option<&str>| {
+        let mut args = json!({"task_id":"main","artifact":"abc123","environment":"production"});
+        if let Some(approver) = approver {
+            args["approver"] = json!(approver);
+        }
+        args
+    };
+    assert!(dispatch(&mut s, "approval.grant", grant(None)).is_err());
+    let error = dispatch(&mut s, "approval.grant", grant(Some("navigator"))).unwrap_err();
+    assert!(error.to_string().contains("task owner"), "{error}");
+    let granted = dispatch(&mut s, "approval.grant", grant(Some("release-manager"))).unwrap();
+    assert_eq!(granted["approver"], "release-manager");
+    // A home created before approvers were recorded gains the column on open.
+    s.connection()
+        .execute_batch("ALTER TABLE approvals DROP COLUMN approver;")
+        .unwrap();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    dispatch(&mut s, "approval.grant", grant(Some("release-manager"))).unwrap();
 }

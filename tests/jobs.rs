@@ -808,3 +808,57 @@ fn vanished_supervisor_with_ended_payload_settles_as_failed() {
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
+
+#[test]
+fn agent_jobs_carry_the_role_into_their_payload() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let agent = [("PRIVATEER_ROLE", "agent"), ("PRIVATEER_ACTOR", "peer")];
+    // The payload is an agent: an operator command fails inside it.
+    let script = format!(
+        "'{BIN}' --home '{}' charter.put --json '{{\"id\":\"mission\",\"active\":true}}' 2>/dev/null; echo \"$? $PRIVATEER_ROLE $PRIVATEER_ACTOR\" > role.txt",
+        home.display()
+    );
+    let started = ok_env(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"agent-work","command":["/bin/sh","-c",script],"heavy":false}),
+        &agent,
+    );
+    assert_eq!(started["agent_actor"], "peer");
+    wait(&home, "agent-work", &["succeeded"]);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("role.txt")).unwrap(),
+        "1 agent peer\n"
+    );
+    // Operator jobs never inherit a stray role marker.
+    let started = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"operator-work","heavy":false,
+            "command":["/bin/sh","-c","echo \"${PRIVATEER_ROLE:-operator}\" > role.txt"]}),
+    );
+    assert_eq!(started["agent_actor"], Value::Null);
+    wait(&home, "operator-work", &["succeeded"]);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("role.txt")).unwrap(),
+        "operator\n"
+    );
+    // Agents start work only on tasks they own, and only as themselves.
+    let output = Command::new(BIN)
+        .args(["--home", home.to_str().unwrap(), "job.start", "--json"])
+        .arg(json!({"task_id":"task","id":"foreign","command":["true"],"heavy":false}).to_string())
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "someone-else")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tasks it owns"));
+    let output = Command::new(BIN)
+        .args(["--home", home.to_str().unwrap(), "job.start", "--json"])
+        .arg(json!({"task_id":"task","id":"disguised","command":["true"],"heavy":false,"agent_actor":"other"}).to_string())
+        .envs(agent)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}

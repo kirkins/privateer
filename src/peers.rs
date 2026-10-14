@@ -14,7 +14,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::store::Store;
+use crate::store::{Caller, Store};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Peer {
@@ -144,7 +144,7 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn call(peer: &Peer, id: &str, command: &str, args: Value) -> Result<Value> {
+fn call(peer: &Peer, id: &str, command: &str, args: Value, caller: &Caller) -> Result<Value> {
     token(command, 128, "RPC command")?;
     ensure!(args.is_object(), "RPC args must be an object");
     ensure!(
@@ -153,21 +153,25 @@ fn call(peer: &Peer, id: &str, command: &str, args: Value) -> Result<Value> {
     );
     let request = serde_json::to_vec(&json!({"id":id,"command":command,"args":args}))?;
     ensure!(request.len() <= 1_048_576, "peer request exceeds 1 MiB");
+    // An agent stays an agent at the remote home: the role travels as CLI
+    // flags, which the remote side can only use to narrow its caller.
+    let mut remote_argv = vec![peer.executable.as_str(), "--home", peer.home.as_str()];
+    if let Caller::Agent { actor } = caller {
+        remote_argv.extend(["--role", "agent", "--actor", actor.as_str()]);
+    }
+    remote_argv.push("rpc");
     let mut child_command = if peer.transport == "local" {
         let mut cmd = Command::new(&peer.executable);
-        cmd.args(["--home", &peer.home, "rpc"]);
+        cmd.args(&remote_argv[1..]);
         cmd
     } else {
         let ssh = std::env::var_os("PRIVATEER_SSH_EXECUTABLE").unwrap_or_else(|| "ssh".into());
         let mut cmd = Command::new(ssh);
-        let remote = [
-            peer.executable.as_str(),
-            "--home",
-            peer.home.as_str(),
-            "rpc",
-        ]
-        .map(posix_quote)
-        .join(" ");
+        let remote = remote_argv
+            .iter()
+            .map(|token| posix_quote(token))
+            .collect::<Vec<_>>()
+            .join(" ");
         cmd.args([
             "-T",
             "-o",
@@ -347,6 +351,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 &id,
                 command,
                 args.get("args").cloned().unwrap_or_else(|| json!({})),
+                store.caller(),
             )?;
             store.audit(
                 "peer.called",

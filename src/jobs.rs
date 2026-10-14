@@ -2,7 +2,7 @@
 //!
 //! This is process supervision, not a privileged sandbox. Unknown/orphaned
 //! payloads keep their reservation until their recorded process group is gone.
-use crate::store::Store;
+use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,9 @@ struct Job {
     plugin_binding: Option<Value>,
     #[serde(default)]
     cleanup_descendants: bool,
+    /// When set, the payload runs as this agent (PRIVATEER_ROLE=agent).
+    #[serde(default)]
+    agent_actor: Option<String>,
     /// Outcome the job settles to once descendants left by an exited leader
     /// are gone. Absent when the supervisor vanished before recording one.
     #[serde(default)]
@@ -543,6 +546,29 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         })
         .transpose()?
         .unwrap_or(false);
+    let requested_actor = args
+        .get("agent_actor")
+        .filter(|v| !v.is_null())
+        .map(|v| v.as_str().context("agent_actor must be a string"))
+        .transpose()?;
+    if let Some(actor) = requested_actor {
+        crate::store::identifier(actor)?;
+    }
+    // Work started by an agent stays agent work, for the agent's own tasks.
+    let agent_actor = match store.caller() {
+        Caller::Agent { actor } => {
+            ensure!(
+                store.task(task_id)?["owner"] == actor.as_str(),
+                "agent {actor} can only start work on tasks it owns"
+            );
+            ensure!(
+                requested_actor.is_none_or(|a| a == actor),
+                "agent {actor} cannot launch work as another actor"
+            );
+            Some(actor.clone())
+        }
+        Caller::Operator => requested_actor.map(str::to_owned),
+    };
     if let Ok(existing) = load(store, &id) {
         ensure!(
             existing.task_id == task_id
@@ -551,7 +577,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
                 && existing.heavy == heavy
                 && existing.action == action
                 && existing.plugin_binding == plugin_binding
-                && existing.cleanup_descendants == cleanup_descendants,
+                && existing.cleanup_descendants == cleanup_descendants
+                && existing.agent_actor == agent_actor,
             "job id already belongs to different work"
         );
         return Ok(public_job(&existing));
@@ -611,6 +638,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         group_anchors: vec![],
         plugin_binding,
         cleanup_descendants,
+        agent_actor,
         leader_result: None,
     };
     let reservation = Reservation {
@@ -639,7 +667,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
                     && existing.heavy == heavy
                     && existing.action == action
                     && existing.plugin_binding == job.plugin_binding
-                    && existing.cleanup_descendants == job.cleanup_descendants,
+                    && existing.cleanup_descendants == job.cleanup_descendants
+                    && existing.agent_actor == job.agent_actor,
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));
@@ -889,6 +918,16 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     let mut cmd = Command::new(&job.command[0]);
+    match &job.agent_actor {
+        Some(actor) => {
+            cmd.env("PRIVATEER_ROLE", "agent")
+                .env("PRIVATEER_ACTOR", actor);
+        }
+        None => {
+            cmd.env_remove("PRIVATEER_ROLE")
+                .env_remove("PRIVATEER_ACTOR");
+        }
+    }
     cmd.args(&job.command[1..])
         .current_dir(&job.cwd)
         .stdin(Stdio::null())
@@ -1342,7 +1381,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
             );
             store.authorize(&old.task_id, "recovery")?;
-            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants});
+            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor});
             if let Some(id) = args.get("new_id") {
                 next["id"] = id.clone();
             }

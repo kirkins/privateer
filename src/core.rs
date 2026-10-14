@@ -317,8 +317,17 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     // It must not require widening every task's standing charter first.
     let charter = store.active_charter(task)?;
     let charter_hash = hash(&charter);
+    let mut approver = None;
     let tx = store.write_transaction()?;
     let id = if command == "approval.grant" {
+        // The approver is recorded and must be someone other than the task's
+        // owner, who would otherwise approve its own production change.
+        let named = required(&args, "approver")?;
+        identifier(named)?;
+        if store.task(task)?["owner"] == named {
+            bail!("the task owner cannot approve its own production change");
+        }
+        approver = Some(named);
         let id = args
             .get("id")
             .and_then(Value::as_str)
@@ -326,15 +335,21 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         identifier(&id)?;
         // Replaying a grant can never reset an already consumed approval.
-        let existing = tx.query_row("SELECT task_id,artifact,environment,charter_hash,consumed FROM approvals WHERE id=?1",[&id],|r| {
-            Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?))
+        let existing = tx.query_row("SELECT task_id,artifact,environment,charter_hash,consumed,approver FROM approvals WHERE id=?1",[&id],|r| {
+            Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?))
         }).optional()?;
-        if let Some((t, a, e, h, c)) = existing {
-            if t != task || a != artifact || e != environment || h != charter_hash || c != 0 {
+        if let Some((t, a, e, h, c, by)) = existing {
+            if t != task
+                || a != artifact
+                || e != environment
+                || h != charter_hash
+                || c != 0
+                || by.as_deref() != approver
+            {
                 bail!("approval id cannot be reused");
             }
         } else {
-            tx.execute("INSERT INTO approvals(id,task_id,artifact,environment,charter_hash) VALUES(?1,?2,?3,?4,?5)",params![id,task,artifact,environment,charter_hash])?;
+            tx.execute("INSERT INTO approvals(id,task_id,artifact,environment,charter_hash,approver) VALUES(?1,?2,?3,?4,?5,?6)",params![id,task,artifact,environment,charter_hash,approver])?;
         }
         id
     } else {
@@ -347,12 +362,14 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     };
     store.audit(
         command,
-        &json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment}),
+        &json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"approver":approver}),
     )?;
     tx.commit()?;
-    Ok(
-        json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"consumed":command=="approval.consume"}),
-    )
+    let mut result = json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"consumed":command=="approval.consume"});
+    if let Some(approver) = approver {
+        result["approver"] = json!(approver);
+    }
+    Ok(result)
 }
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -492,16 +509,28 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             {
                 bail!("passing checks must apply to the current head");
             }
+            let mut result = json!({"allowed":true,"task_id":task,"head":head,"evidence":"caller-supplied; forge adapter must verify live checks"});
             if args.get("deploys_production") == Some(&json!(true)) {
                 let env = required(&args, "environment")?;
-                let matching: bool=store.connection().query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3 AND charter_hash=?4 AND consumed=0)",params![task,head,env,hash(&charter)],|r|r.get(0))?;
-                if !matching {
+                // The approval authorises one deployment: allowing it uses the
+                // approval up in the same transaction.
+                let tx = store.write_transaction()?;
+                let approval: Option<String> = tx.query_row("SELECT id FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3 AND charter_hash=?4 AND consumed=0 ORDER BY id LIMIT 1",params![task,head,env,hash(&charter)],|r|r.get(0)).optional()?;
+                let Some(approval) = approval else {
                     bail!("production requires approval of this exact artifact and environment");
-                }
+                };
+                tx.execute(
+                    "UPDATE approvals SET consumed=1 WHERE id=?1 AND consumed=0",
+                    [&approval],
+                )?;
+                store.audit(
+                    "approval.consumed_by_delivery",
+                    &json!({"id":approval,"task_id":task,"artifact":head,"environment":env}),
+                )?;
+                tx.commit()?;
+                result["approval_id"] = json!(approval);
             }
-            Ok(
-                json!({"allowed":true,"task_id":task,"head":head,"evidence":"caller-supplied; forge adapter must verify live checks"}),
-            )
+            Ok(result)
         }
         "audit.list" => {
             let mut s = store.connection().prepare(

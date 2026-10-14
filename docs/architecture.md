@@ -26,6 +26,10 @@ This milestone does not implement distributed consensus or cryptographic cross-h
 
 ## Delivery and deployment
 
-Passing-head checks bind delivery evidence to the current artifact. Production approval binds a separate decision to an exact artifact and environment; that approval supplies authority for the single deployment without requiring broader standing deployment rights. These are workflow guards running under one OS identity. Hard isolation from production credentials requires a separately enforced broker or account boundary.
+Passing-head checks bind delivery evidence to the current artifact. Production approval binds a separate decision to an exact artifact and environment and records an approver other than the task owner. That approval supplies authority for the single deployment without requiring broader standing deployment rights: the production `delivery.check` that allows it consumes it. These are workflow guards running under one OS identity.
+
+## Operators and agents
+
+Harnesses launched by `agent.start`, and any job an agent starts, run with `PRIVATEER_ROLE=agent` and `PRIVATEER_ACTOR` set to the task owner. Under that role, operator commands (`init`, `charter.put`, `charter.revoke`, `approval.grant`, `approval.consume`, `peer.put`, `resource.recover`) are refused, `actor`/`from` arguments must name the agent itself, and jobs can be started only for the agent's own tasks. `peer.call` passes the role to the remote home as `--role agent --actor NAME`, flags that can only narrow a caller, never widen it. This stops a confused or overeager agent from widening its charter or approving its own deployment. It is not a security boundary: an agent that deliberately clears its environment or edits the state database is outside it. Enforced separation needs a separate OS account or broker. Hard isolation from production credentials requires a separately enforced broker or account boundary.
 
 The first milestone has no live forge merge/deployment adapter and no automatic fleet migration. A passing runtime pilot establishes behavior of the machinery; native model-driven execution is a separate qualification step.

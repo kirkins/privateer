@@ -6,11 +6,35 @@ pub mod store;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
-use store::Store;
+use store::{Caller, Store};
+
+/// Commands that change authority, configuration or capacity. Agents
+/// launched by Privateer cannot run them; see `store::Caller`.
+pub const OPERATOR_COMMANDS: &[&str] = &[
+    "init",
+    "charter.put",
+    "charter.revoke",
+    "approval.grant",
+    "approval.consume",
+    "peer.put",
+    "resource.recover",
+];
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     if !args.is_object() {
         bail!("command arguments must be a JSON object");
+    }
+    if let Caller::Agent { actor } = store.caller() {
+        if OPERATOR_COMMANDS.contains(&command) {
+            bail!("{command} is an operator command; agents cannot run it");
+        }
+        for key in ["actor", "from"] {
+            if let Some(claimed) = args.get(key) {
+                if claimed.as_str() != Some(actor) {
+                    bail!("agent {actor} cannot act as {claimed}");
+                }
+            }
+        }
     }
     match command.split('.').next().unwrap_or("") {
         "job" | "resource" => jobs::dispatch(store, command, args),
@@ -23,12 +47,15 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .ok_or_else(|| anyhow::anyhow!("task_id is required"))?
                 .to_owned();
             let charter = store.authorize(&task, "spawn")?;
+            let owner = store.task(&task)?["owner"].clone();
             let plan = plugins::dispatch(store, "plugin.command", args.clone())?;
+            // The launched harness acts as the task owner, under the agent role.
             let mut job = serde_json::json!({
                 "task_id": task,
                 "command": plan["argv"],
                 "cwd": plan["cwd"],
                 "cleanup_descendants": true,
+                "agent_actor": owner,
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(true))
             });
             if let Some(id) = args.get("id") {
