@@ -10,16 +10,17 @@ const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 const ADAPTER: &str = r#"import json, sys
 r = json.loads(sys.stdin.readline())
 c, o = r["context"], r["options"]
-argv = [sys.executable, o["mate"], json.dumps(c["control"]["cli_argv"]), c["owner"], c["brief"], o["mode"], o["log"]]
+argv = [sys.executable, o["mate"], json.dumps(c["control"]["cli_argv"]), c["owner"], c["brief"], o["mode"], o["log"], o.get("resume", "")]
 print(json.dumps({"id": r["id"], "version": 1, "ok": True, "result": {"argv": argv, "cwd": c["repo"], "env_names": []}}))
 "#;
 
 // A scripted first mate: reads its mailbox through the real CLI, answers open
-// requests, acknowledges through the sequence its wake names, and reports
-// usage the way Codex does. No model is involved.
-const MATE: &str = r#"import json, pathlib, re, subprocess, sys, time
+// requests, acknowledges through the sequence its wake names, and reports its
+// session and usage the way Codex does. No model is involved.
+const MATE: &str = r#"import json, pathlib, re, subprocess, sys, time, uuid
 cli, ship, prompt = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
-mode_file, log = pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[5])
+mode_file, log, resume = pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[5]), sys.argv[6]
+print(json.dumps({"type": "thread.started", "thread_id": resume or str(uuid.uuid4())}), flush=True)
 with log.open("a") as f:
     f.write(json.dumps(prompt) + "\n")
 mode = mode_file.read_text().strip() if mode_file.exists() else "normal"
@@ -64,7 +65,7 @@ impl Fleet {
         fs::write(root.join("mate.py"), MATE).unwrap();
         fs::write(
             root.join("manifest.json"),
-            json!({"schema_version":1,"id":"scripted-mate","executable":["python3", root.join("adapter.py")],"timeout_ms":5000,"max_output_bytes":1_048_576}).to_string(),
+            json!({"schema_version":1,"id":"codex","executable":["python3", root.join("adapter.py")],"timeout_ms":5000,"max_output_bytes":1_048_576}).to_string(),
         )
         .unwrap();
         dispatch(
@@ -406,5 +407,83 @@ fn wakes_group_mail_by_focus_carry_handoff_notes_and_run_under_the_focus_task() 
     let woke = Fleet::infra(&fleet.tick());
     assert_eq!(woke["focus"], "thread:just-a-question");
     assert_eq!(woke["task_id"], "infra-duty");
+    fleet.settle();
+}
+
+#[test]
+fn a_warm_single_focus_session_is_resumed_with_only_the_new_mail() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.send(
+        json!({"id":"q1","from":"apps","to":"infra","kind":"request","task_id":"infra-repair","body":"Start the repair?"}),
+    );
+    fleet.tick();
+    let first = fleet.settle();
+    assert_eq!(first["mode"], "fresh");
+    let session = first["session_id"].as_str().unwrap().to_owned();
+    fleet.send(
+        json!({"id":"q2","from":"apps","to":"infra","kind":"request","task_id":"infra-repair","body":"And the cache?"}),
+    );
+    let woke = Fleet::infra(&fleet.tick());
+    assert_eq!(woke["mode"], "resume", "{woke}");
+    let second = fleet.settle();
+    assert_eq!(second["session_id"], session.as_str());
+    // A resumed wake sends only the wake text: no brief, bearings or notes.
+    let prompt = fleet.prompts().pop().unwrap();
+    assert!(prompt.starts_with("Wake wake-"), "{prompt}");
+    assert!(!prompt.contains("Bearings for"));
+    assert!(!prompt.contains("Your handoff note"));
+    assert!(prompt.contains("id q2"));
+}
+
+#[test]
+fn cold_mixed_rotated_or_failed_sessions_start_fresh() {
+    // Outside the cache window.
+    let mut fleet = Fleet::new(
+        json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":0,"cache_window_secs":0}),
+    );
+    for id in ["a1", "a2"] {
+        fleet.send(json!({"id":id,"from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":id}));
+        fleet.tick();
+        assert_eq!(fleet.settle()["mode"], "fresh");
+    }
+    // Past the rotation limit.
+    let mut fleet = Fleet::new(
+        json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":0,"session_max_wakes":1}),
+    );
+    for id in ["b1", "b2"] {
+        fleet.send(json!({"id":id,"from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":id}));
+        fleet.tick();
+        assert_eq!(fleet.settle()["mode"], "fresh");
+    }
+    // Mail spanning two foci never resumes one focus's conversation.
+    let mut fleet = Fleet::new(now_settings());
+    fleet.send(
+        json!({"from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":"c1"}),
+    );
+    fleet.tick();
+    fleet.settle();
+    fleet.send(
+        json!({"from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":"c2"}),
+    );
+    fleet.send(json!({"id":"other","from":"apps","to":"infra","kind":"notice","body":"elsewhere"}));
+    fleet.tick();
+    assert_eq!(fleet.settle()["mode"], "fresh");
+    // A failed resumed wake drops the session; the retry starts fresh.
+    let mut fleet =
+        Fleet::new(json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600}));
+    fleet.send(
+        json!({"from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":"d1"}),
+    );
+    fleet.tick();
+    fleet.settle();
+    fleet.mode("fail");
+    fleet.send(
+        json!({"from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":"d2"}),
+    );
+    assert_eq!(Fleet::infra(&fleet.tick())["mode"], "resume");
+    assert_eq!(fleet.settle()["status"], "failed");
+    fleet.mode("normal");
+    fleet.configure(now_settings());
+    assert_eq!(Fleet::infra(&fleet.tick())["mode"], "fresh");
     fleet.settle();
 }

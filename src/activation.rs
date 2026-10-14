@@ -19,6 +19,10 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
     ("max_delay_secs", 60, 0, 86_400),
     ("max_wakes_per_hour", 12, 1, 3600),
     ("retry_backoff_secs", 60, 0, 86_400),
+    // Resume a focus's session only while the provider's prompt cache is
+    // likely warm (0 disables resuming), and rotate after this many wakes.
+    ("cache_window_secs", 300, 0, 86_400),
+    ("session_max_wakes", 6, 1, 1_000),
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;
@@ -30,17 +34,64 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, finished_ms INTEGER, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);",
     )?;
-    let present: bool = store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name='focuses')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !present {
-        store
-            .connection()
-            .execute_batch("ALTER TABLE wakes ADD COLUMN focuses TEXT;")?;
+    for column in ["focuses", "harness", "session_id"] {
+        let present: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            store
+                .connection()
+                .execute_batch(&format!("ALTER TABLE wakes ADD COLUMN {column} TEXT;"))?;
+        }
     }
+    // One native session per ship and focus, so topics never share a
+    // conversation.
+    store.connection().execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions(ship TEXT NOT NULL, focus TEXT NOT NULL, harness TEXT NOT NULL,
+           session_id TEXT NOT NULL, wakes INTEGER NOT NULL, started_ms INTEGER NOT NULL,
+           last_turn_ms INTEGER NOT NULL, PRIMARY KEY(ship, focus));",
+    )?;
     Ok(())
+}
+
+/// The native session a harness reported starting, from its JSON event
+/// stream. Mirrors `session_started` in plugins/native_events.py; a harness
+/// not listed there stays unresumable.
+fn session_started(harness: &str, event: &Value) -> Option<String> {
+    let kind = event["type"].as_str()?;
+    let value = match harness {
+        "codex" if kind == "thread.started" => &event["thread_id"],
+        "pi" | "pi-signed" | "gateway-pi" | "omp" if kind == "session" => &event["id"],
+        "claude" | "cursor" if kind == "system" && event["subtype"] == "init" => {
+            &event["session_id"]
+        }
+        "gemini" | "agy" if kind == "init" => &event["session_id"],
+        "opencode" if kind == "step_start" => &event["sessionID"],
+        _ => return None,
+    };
+    let id = value.as_str()?;
+    (!id.is_empty() && id.len() <= 512 && !id.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .then(|| id.to_owned())
+}
+
+fn read_session(harness: &str, log: &str) -> Option<String> {
+    log.lines()
+        .take(10_000)
+        .filter(|line| line.len() <= 65_536)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|event| session_started(harness, &event))
+}
+
+/// The manifest's declared harness id, which selects session decoding.
+fn harness_id(profile: &Value) -> String {
+    profile["manifest"]
+        .as_str()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|manifest| manifest["id"].as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// Validate a ship's first-mate profile: the harness plugin to launch, the
@@ -181,10 +232,20 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
 /// bearings from records, then the new mail grouped by focus, each focus
 /// with its handoff note, so a fresh first mate sees the judgement it left
 /// for exactly the topics in play.
-fn wake_text(store: &Store, wake: &str, ship: &str, mail: &[Mail], through: i64) -> Result<String> {
-    let bearings = crate::context::bearings(store, ship)?;
+fn wake_text(
+    store: &Store,
+    wake: &str,
+    ship: &str,
+    mail: &[Mail],
+    through: i64,
+    resumed: bool,
+) -> Result<String> {
     let mut text = format!("Wake {wake} for ship {ship}.\n");
-    text.push_str(bearings["text"].as_str().unwrap_or(""));
+    // A resumed session already has its bearings and notes in context.
+    if !resumed {
+        let bearings = crate::context::bearings(store, ship)?;
+        text.push_str(bearings["text"].as_str().unwrap_or(""));
+    }
     text.push_str(&format!("New mail through seq {through}, by focus:\n"));
     let mut foci: Vec<&str> = vec![];
     for item in mail {
@@ -195,7 +256,12 @@ fn wake_text(store: &Store, wake: &str, ship: &str, mail: &[Mail], through: i64)
     let mut shown = 0;
     for focus in &foci {
         let mut section = format!("## {focus}\n");
-        if let Some(note) = crate::context::current_note(store, ship, focus)? {
+        let note = if resumed {
+            None
+        } else {
+            crate::context::current_note(store, ship, focus)?
+        };
+        if let Some(note) = note {
             section.push_str(&format!(
                 "Your handoff note (v{}):\n{}\n",
                 note["version"],
@@ -290,12 +356,14 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
             .join(&job_id)
             .join(job["incarnation"].as_str().unwrap_or(""))
             .join("stdout.log");
-        let reported = std::fs::read_to_string(log).ok().and_then(|l| usage(&l));
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let reported = usage(&text);
         let outcome = if status == "succeeded" {
             "succeeded"
         } else {
             "failed"
         };
+        bind_session(store, &wake, outcome, &text)?;
         store.connection().execute(
             "UPDATE wakes SET status=?2, finished_ms=?3, error=?4, usage=?5 WHERE id=?1",
             params![
@@ -309,6 +377,91 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
         settled.push(json!({"wake": wake, "status": outcome, "usage": reported}));
     }
     Ok(settled)
+}
+
+/// After a wake, keep the focus's native session for warm resumes: a
+/// single-focus wake binds the session its harness reported (a fresh one
+/// replaces the old, a resumed one counts another wake); a failed wake drops
+/// the focus's session so the next wake starts fresh.
+fn bind_session(store: &Store, wake: &str, outcome: &str, log: &str) -> Result<()> {
+    let (ship, focuses, harness, requested): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = store.connection().query_row(
+        "SELECT ship, focuses, harness, session_id FROM wakes WHERE id=?1",
+        [wake],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let focuses: Vec<String> = focuses
+        .and_then(|f| serde_json::from_str(&f).ok())
+        .unwrap_or_default();
+    let [focus] = focuses.as_slice() else {
+        return Ok(());
+    };
+    if outcome != "succeeded" {
+        store.connection().execute(
+            "DELETE FROM sessions WHERE ship=?1 AND focus=?2",
+            params![ship, focus],
+        )?;
+        return Ok(());
+    }
+    let harness = harness.unwrap_or_default();
+    let Some(session) = read_session(&harness, log) else {
+        return Ok(());
+    };
+    let now = Store::now_ms();
+    if requested.as_deref() == Some(session.as_str()) {
+        store.connection().execute(
+            "UPDATE sessions SET wakes=wakes+1, last_turn_ms=?3 WHERE ship=?1 AND focus=?2",
+            params![ship, focus, now],
+        )?;
+    } else {
+        store.connection().execute(
+            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms)
+             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5)
+             ON CONFLICT(ship, focus) DO UPDATE SET harness=excluded.harness,
+               session_id=excluded.session_id, wakes=1, started_ms=excluded.started_ms,
+               last_turn_ms=excluded.last_turn_ms",
+            params![ship, focus, harness, session, now],
+        )?;
+    }
+    store.connection().execute(
+        "UPDATE wakes SET session_id=?2 WHERE id=?1",
+        params![wake, session],
+    )?;
+    Ok(())
+}
+
+/// A focus session worth resuming: same harness, last turn inside the cache
+/// window, and below the rotation limit.
+fn warm_session(
+    store: &Store,
+    ship: &str,
+    focus: &str,
+    harness: &str,
+    profile: &Value,
+) -> Result<Option<String>> {
+    let window = setting(profile, "cache_window_secs") * 1000;
+    if window == 0 {
+        return Ok(None);
+    }
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT session_id FROM sessions WHERE ship=?1 AND focus=?2 AND harness=?3
+             AND last_turn_ms >= ?4 AND wakes < ?5",
+            params![
+                ship,
+                focus,
+                harness,
+                Store::now_ms() - window,
+                setting(profile, "session_max_wakes")
+            ],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// Decide whether a ship's first mate is due, and wake it if so.
@@ -397,11 +550,25 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
             foci.push(item.focus.clone());
         }
     }
-    let text = wake_text(store, &wake, &name, &mail, through)?;
+    // Resume only a single focus's warm session: mixing topics in one
+    // conversation is what makes long sessions costly and confused.
+    let harness = harness_id(&profile);
+    let resume = match foci.as_slice() {
+        [focus] => warm_session(store, &name, focus, &harness, &profile)?,
+        _ => None,
+    };
+    let text = wake_text(store, &wake, &name, &mail, through, resume.is_some())?;
     let mut start = json!({
         "id": wake, "task_id": task, "manifest": profile["manifest"],
         "options": profile["options"], "wake": text,
     });
+    if let Some(session) = &resume {
+        // The resumed session already holds the brief and earlier turns:
+        // send only the new wake text.
+        start["options"]["resume"] = json!(session);
+        start["wake_only"] = json!(true);
+    }
+    let mode = if resume.is_some() { "resume" } else { "fresh" };
     if let Some(config) = profile.get("config") {
         start["config"] = config.clone();
     }
@@ -411,8 +578,8 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         Err(error) => ("failed", Some(format!("{error:#}"))),
     };
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, focuses)
-         VALUES(?1, ?2, ?3, ?4, ?5, 'fresh', ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, focuses, harness, session_id)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?11, ?6, ?7, ?8, ?9, ?10, ?12, ?13)",
         params![
             wake,
             name,
@@ -423,7 +590,10 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
             now,
             error.is_some().then_some(now),
             error,
-            json!(foci).to_string()
+            json!(foci).to_string(),
+            mode,
+            harness,
+            resume
         ],
     )?;
     store.audit(
@@ -432,7 +602,7 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     )?;
     Ok(
         json!({"ship": name, "wake": wake, "status": status, "through_seq": through,
-        "focus": primary, "task_id": task, "focuses": foci, "error": error}),
+        "focus": primary, "task_id": task, "focuses": foci, "mode": mode, "error": error}),
     )
 }
 
@@ -501,7 +671,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .unwrap_or(50)
                 .clamp(1, 1000);
             let mut statement = store.connection().prepare(
-                "SELECT id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, usage, focuses
+                "SELECT id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, usage, focuses, session_id
                  FROM wakes WHERE (?1 IS NULL OR ship=?1) ORDER BY created_ms DESC LIMIT ?2",
             )?;
             let wakes = statement
@@ -516,6 +686,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         "usage": usage.and_then(|u| serde_json::from_str::<Value>(&u).ok()),
                         "focuses": r.get::<_, Option<String>>(11)?
                             .and_then(|f| serde_json::from_str::<Value>(&f).ok()),
+                        "session_id": r.get::<_, Option<String>>(12)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
