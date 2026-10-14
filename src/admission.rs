@@ -272,7 +272,8 @@ pub fn admit(
         .filter(|h| h.created_ms >= ramp_start)
         .filter_map(|h| h.demand)
         .collect();
-    let recent_cpus: f64 = recent.iter().map(|d| d.cpus).sum();
+    // + 0.0 turns the empty sum's -0.0 into 0.0 for messages.
+    let recent_cpus: f64 = recent.iter().map(|d| d.cpus).sum::<f64>() + 0.0;
     let recent_memory: u64 = recent.iter().map(|d| d.memory_bytes).sum();
     // CPU: there must be headroom now, counting jobs that just started. The
     // job's own estimate then counts against the next request during its
@@ -339,7 +340,9 @@ fn memory() -> Result<(u64, u64)> {
 #[cfg(target_os = "macos")]
 fn memory() -> Result<(u64, u64)> {
     use std::process::Command;
-    let total = Command::new("sysctl")
+    // Absolute paths: services and tests may run with a minimal PATH, and
+    // sysctl lives in /usr/sbin.
+    let total = Command::new("/usr/sbin/sysctl")
         .args(["-n", "hw.memsize"])
         .output()
         .context("read hw.memsize")?;
@@ -347,7 +350,7 @@ fn memory() -> Result<(u64, u64)> {
         .trim()
         .parse()
         .context("invalid hw.memsize")?;
-    let output = Command::new("vm_stat")
+    let output = Command::new("/usr/bin/vm_stat")
         .env("LC_ALL", "C")
         .output()
         .context("run vm_stat")?;

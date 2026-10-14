@@ -1119,17 +1119,23 @@ fn recent_estimates_space_out_heavy_jobs_until_their_ramp_passes() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
     let other = fixture.home("other", 0);
-    let cpus = ok(&home, "resource.status", json!({}))["host"]["cpus"]
-        .as_f64()
-        .unwrap();
+    let host = ok(&home, "resource.status", json!({}))["host"].clone();
+    let cpus = host["cpus"].as_f64().unwrap();
+    // Size the limit and the estimate from this machine's own readings: CI
+    // hosts can run far above one runnable task per CPU. The big estimate is
+    // twice the margin, so it refuses a follow-up whatever the load does
+    // within that margin.
+    let big = (cpus * 50.0).min(1024.0);
+    let margin = big / cpus / 2.0;
+    let limit = host["load"].as_f64().unwrap() / cpus + margin;
     // No slot cap: only live load plus recent estimates decide.
     ok(
         &home,
         "resource.configure",
-        json!({"max_heavy_jobs":null,"max_load_per_cpu":4.0,"min_available_memory_bytes":0,
+        json!({"max_heavy_jobs":null,"max_load_per_cpu":limit,"min_available_memory_bytes":0,
             "heavy_estimate":{"memory_bytes":0},"ramp_secs":2}),
     );
-    let big = json!({"estimate":{"cpus":(cpus * 5.0).min(1024.0)}});
+    let big = json!({"estimate":{"cpus":big}});
     let first = heavy_job(&home, "big-build", big);
     assert!(
         first.status.success(),
