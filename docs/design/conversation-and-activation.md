@@ -133,9 +133,11 @@ Each harness plugin declares which wake modes it supports:
 
 | Mode | What happens | Best for |
 |---|---|---|
-| **Resume** | Continue the ship's persistent native session (Codex, Claude and Pi can resume). Prompt caching makes this cheaper, and the first mate keeps its conversation. | The default |
+| **Resume** | Continue the focus's native session (Codex, Claude and Pi can resume). Cheap only while the provider's prompt cache is warm. | Back-and-forth within minutes |
 | **Inject** | Deliver into a live interactive session, such as a Herdr or tmux pane. | When the captain is watching |
-| **Fresh** | Start a headless run with the brief plus the new mail. Simple, but rebuilds context every time. | The fallback |
+| **Fresh** | Start a new headless session primed with the brief, the ship summary, the focus's handoff note and the new mail. | Most wakes, which arrive long after the last turn |
+
+The runtime chooses between resume and fresh on every wake; see [Context and cost](#context-and-cost). A harness that cannot resume always starts fresh.
 
 Terminal integrations such as Herdr are **activation and observation backends**: they provide the inject mode, live status and attach/reconnect. They are not a separate orchestration system.
 
@@ -149,7 +151,35 @@ Terminal integrations such as Herdr are **activation and observation backends**:
 - **Capacity:** wakes go through admission and the capacity queue.
 - **Acknowledgement:** a wake hands the agent everything up to a given sequence number, and the agent acknowledges exactly what it saw; anything newer triggers the next wake.
 
-Activation is where a fleet's inference cost lives: every wake is a model turn. Grouping, resuming rather than starting fresh, and deciding what is wake-worthy largely determine what the fleet costs to run.
+Activation is where a fleet's inference cost lives: every wake is a model turn. How much context each wake carries, and whether it needs to happen at all, largely determine what the fleet costs to run.
+
+### Context and cost
+
+Neither extreme works. Always resuming one long session is cheap only while the provider's prompt cache is warm, which lasts minutes (Anthropic's default is five minutes, with an optional hour; others are similar), while most wakes arrive hours apart and would re-read the whole transcript at full price. Long sessions also perform worse once their history is about work the first mate has moved on from. Compaction pays for an extra call over the whole context and loses detail. Always starting fresh is cheap and predictable, but only if the first mate can find what it needs.
+
+**Context follows the focus, not the ship.** A focus is a task, a request thread, or the captain's conversation with the ship. Each focus has its own session and its own handoff note. Mail about task A resumes or starts task A's session; switching to task B never carries A's history.
+
+**Records come in layers:** load little, look up the rest.
+
+1. *Always loaded, small and bounded:* the byte-stable brief, a one-line-per-item ship summary (open tasks, requests owed and owing, unacknowledged mail, recent crew outcomes) assembled from records with no model call, the focus's handoff note, and the new mail.
+2. *Looked up on demand, never preloaded:* a focus's full history (events, mail threads, job outcomes and logs, older notes), through commands that return curated digests rather than raw dumps.
+3. *Long-lived ship knowledge:* a small curated log of what should outlive any task (the captain's preferences, project conventions, standing decisions), consulted when relevant.
+
+**Notes hold judgement; the runtime holds facts.** Facts (what happened, when, outcomes) are recorded by the runtime automatically and cost nothing. At the end of each wake the first mate writes the focus's handoff note: what it is doing and why, what it is waiting on, and what comes next, in a short structured form with a size cap (about 2 KB). Each note replaces the previous one for that focus, with a few prior versions retained, so notes stay current instead of accumulating.
+
+**The runtime decides per wake, without a model:**
+
+- resume the focus's session if its last turn ended within the cache window and the session is still below a size cap;
+- otherwise start fresh with the always-loaded layer;
+- when a session passes the size cap, the next wake starts fresh from the handoff note (rotation instead of compaction).
+
+**Fewer and lighter wakes:**
+
+- The brief is byte-stable, with changing parts (summary, note, mail) at the end, so even fresh sessions hit the cache on their prefix.
+- A short batching window turns a burst of mail into one wake.
+- Routine mail (notices marked as information only) waits for the next real wake instead of causing one.
+
+**Tunable and measured.** The cache window, session cap, batching window and what counts as routine are per-ship settings that the captain or an agent can tune for a provider and budget. Every wake records the token usage its harness reports (cached and uncached input, output), so whether resuming pays off for a ship is answered by data.
 
 ## Channels and standing grants
 
@@ -190,7 +220,7 @@ A flotilla is a group of ships commanded by one ship: the commanding ship can as
 ## Build order
 
 1. **Mailbox v1:** typed messages, correlated requests with reply routing and overdue flags, and the ship directory.
-2. **Resident service and first-mate activation:** `privateer serve`, wake requests, grouping and guards, and resume/fresh wake modes through harness plugins.
+2. **Resident service and first-mate activation:** `privateer serve`, wake requests, grouping and guards, focus-scoped sessions with handoff notes and the ship summary, the resume-or-fresh policy through harness plugins, and per-wake usage recording.
 3. **Crew outcomes wake the first mate:** runtime-recorded crew outcomes become wakes.
 4. **Channels and standing grants:** channel and grant records, request evaluation, auto-minted approvals, notices and veto windows.
 5. **The captain as a participant:** front door, delivery policy, status/ask/message handling and a liaison charter, followed by plugins (mobile, voice, chat) and an inject wake mode for terminal backends such as Herdr.
@@ -199,7 +229,7 @@ Each step ships with tests at real process boundaries and an isolated pilot, as 
 
 ## Open questions
 
-- Which harnesses support resumable sessions, and how session identity is stored and recovered.
+- Which harnesses support resumable sessions, how session identity is captured from their output, stored and recovered, and how each reports token usage.
 - Concrete loop-detection limits and how runaways are escalated.
 - Where request-kind schemas are defined: core, plugins or ship configuration.
 - Stronger cross-ship identity for grants on a single machine.
