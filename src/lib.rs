@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod admission;
+pub mod context;
 pub mod core;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
@@ -36,7 +37,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             bail!("{command} is an operator command; agents cannot run it");
         }
         // Agents speak, and read mail, only as themselves.
-        for key in ["actor", "from", "address"] {
+        for key in ["actor", "from", "address", "ship"] {
             if let Some(claimed) = args.get(key) {
                 if claimed.as_str() != Some(actor) {
                     bail!("agent {actor} cannot act as {claimed}");
@@ -48,6 +49,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
+        "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
+        "note" | "focus" => context::dispatch(store, command, args),
         "ship" | "mail" => mail::dispatch(store, command, args),
         "wake" => activation::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
