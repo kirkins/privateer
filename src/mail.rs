@@ -29,7 +29,37 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS mail_correlation ON mail(correlation);
          CREATE TABLE IF NOT EXISTS mail_cursor(address TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);",
     )?;
+    // Delivery state for mail crossing homes: NULL for mail that stays in
+    // this home, 'pending' or 'delivered' for outgoing copies, 'received' for
+    // mail delivered here by a peer.
+    let tx = store.write_transaction()?;
+    for (column, declaration) in [
+        ("delivery", "TEXT"),
+        ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("delivery_error", "TEXT"),
+        ("delivered_ms", "INTEGER"),
+    ] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!(
+                "ALTER TABLE mail ADD COLUMN {column} {declaration};"
+            ))?;
+        }
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS mail_pending ON mail(delivery, seq) WHERE delivery='pending';",
+    )?;
+    tx.commit()?;
     Ok(())
+}
+
+/// Where a ship's mailbox lives: None for this home, Some(peer) for another.
+fn remote_peer(ship: &Value) -> Option<&str> {
+    ship["location"]["peer"].as_str()
 }
 
 fn ship(store: &Store, name: &str) -> Result<Option<Value>> {
@@ -65,10 +95,17 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
         "scope is limited to {MAX_SCOPE_CHARS} characters"
     );
     let location = args.get("location").cloned().unwrap_or(json!("here"));
-    ensure!(
-        location == "here",
-        "location must be \"here\" (ships behind peers arrive with remote delivery)"
-    );
+    if location != "here" {
+        let peer = location
+            .get("peer")
+            .and_then(Value::as_str)
+            .filter(|_| location.as_object().is_some_and(|o| o.len() == 1))
+            .context("location must be \"here\" or {\"peer\": \"<configured peer>\"}")?;
+        ensure!(
+            crate::peers::configured(store, peer)?,
+            "peer {peer} is not configured; add it with peer.put"
+        );
+    }
     let accepts = args.get("accepts").cloned().unwrap_or(json!([]));
     let kinds = accepts
         .as_array()
@@ -162,7 +199,14 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         "unknown ship {to}; add it with ship.put"
     );
     ensure!(from != to, "a mailbox cannot write to itself");
-    local_address(store, to)?;
+    let peer = recipient.as_ref().and_then(remote_peer).map(str::to_owned);
+    if peer.is_some() {
+        // The captain's mailbox is per home until the captain's front door.
+        ensure!(
+            from != CAPTAIN,
+            "the captain's mail stays in this home for now"
+        );
+    }
     let id = optional_str(args, "id")?
         .map(str::to_owned)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -253,8 +297,8 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     }
     let now = Store::now_ms();
     tx.execute(
-        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
             id,
             from,
@@ -268,7 +312,8 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             urgency,
             deadline_ms,
             now,
-            opens.then_some("open")
+            opens.then_some("open"),
+            peer.as_ref().map(|_| "pending")
         ],
     )?;
     if kind == "reply" {
@@ -278,10 +323,192 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         )?;
     }
     tx.commit()?;
+    // Recorded first, delivered second: a failed attempt leaves the message
+    // pending for mail.flush rather than losing it.
+    if let Some(peer) = peer {
+        deliver_one(store, &id, &peer)?;
+    }
     Ok(annotate(
         by_id(store, &id)?.context("message vanished")?,
         Store::now_ms(),
     ))
+}
+
+/// The envelope another home receives. Task ids are local to a home and do
+/// not travel.
+fn envelope(message: &Value) -> Value {
+    let mut envelope = json!({});
+    for key in [
+        "id",
+        "from",
+        "to",
+        "kind",
+        "correlation",
+        "request_kind",
+        "body",
+        "payload",
+        "urgency",
+        "deadline_ms",
+        "created_ms",
+    ] {
+        envelope[key] = message[key].clone();
+    }
+    envelope
+}
+
+/// Try once to deliver a pending outgoing message; record the outcome.
+fn deliver_one(store: &Store, id: &str, peer: &str) -> Result<bool> {
+    let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
+    let outcome = crate::peers::call_peer(
+        store,
+        peer,
+        &format!("deliver-{id}"),
+        "mail.deliver",
+        envelope(&message),
+    )
+    .and_then(|response| match response["ok"].as_bool() {
+        Some(true) => Ok(()),
+        _ => bail!(
+            "{}",
+            response["error"]
+                .as_str()
+                .unwrap_or("peer refused delivery")
+        ),
+    });
+    let delivered = outcome.is_ok();
+    store.connection().execute(
+        "UPDATE mail SET delivery=CASE WHEN ?2 THEN 'delivered' ELSE delivery END,
+           delivered_ms=CASE WHEN ?2 THEN ?3 ELSE delivered_ms END,
+           delivery_attempts=delivery_attempts+1, delivery_error=?4
+         WHERE id=?1 AND delivery='pending'",
+        params![
+            id,
+            delivered,
+            Store::now_ms(),
+            outcome.err().map(|e| format!("{e:#}"))
+        ],
+    )?;
+    Ok(delivered)
+}
+
+/// Retry delivery of pending outgoing mail, oldest first.
+fn flush(store: &Store, args: &Value) -> Result<Value> {
+    // An agent delivers only its own ship's mail; the receiving home would
+    // refuse anything else from it.
+    let sender = match store.caller() {
+        Caller::Agent { actor } => Some(actor.clone()),
+        Caller::Operator => None,
+    };
+    let mut statement = store.connection().prepare(
+        "SELECT id, recipient FROM mail WHERE delivery='pending' AND (?1 IS NULL OR sender=?1)
+         ORDER BY seq LIMIT ?2",
+    )?;
+    let pending: Vec<(String, String)> = statement
+        .query_map(params![sender, limit(args, 50)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let (mut delivered, mut still_pending) = (0, 0);
+    for (id, recipient) in pending {
+        let peer = ship(store, &recipient)?
+            .as_ref()
+            .and_then(remote_peer)
+            .map(str::to_owned);
+        let sent = match peer {
+            Some(peer) => deliver_one(store, &id, &peer)?,
+            None => false,
+        };
+        if sent {
+            delivered += 1;
+        } else {
+            still_pending += 1;
+        }
+    }
+    Ok(json!({"delivered": delivered, "pending": still_pending}))
+}
+
+/// Accept mail a peer delivers for a ship hosted here. The sender must be a
+/// ship this home knows to live behind a peer; replies close this home's copy
+/// of the request they answer.
+fn deliver(store: &Store, args: &Value) -> Result<Value> {
+    ensure!(
+        args.to_string().len() <= MAX_MESSAGE_BYTES,
+        "message exceeds 64 KiB"
+    );
+    let id = required(args, "id")?;
+    identifier(id)?;
+    let from = required(args, "from")?;
+    let to = required(args, "to")?;
+    let kind = required(args, "kind")?;
+    ensure!(KINDS.contains(&kind), "unknown message kind {kind}");
+    ensure!(
+        kind != "decision" && from != CAPTAIN && to != CAPTAIN,
+        "the captain's mail stays in its own home for now"
+    );
+    let sender = ship(store, from)?.with_context(|| format!("unknown ship {from}"))?;
+    ensure!(
+        remote_peer(&sender).is_some(),
+        "{from} is hosted here; local mail is sent with mail.send"
+    );
+    local_address(store, to)?;
+    let correlation = optional_str(args, "correlation")?;
+    let request_kind = optional_str(args, "request_kind")?;
+    let body = args.get("body").and_then(Value::as_str).unwrap_or("");
+    let payload = args.get("payload").cloned().unwrap_or(json!({}));
+    ensure!(payload.is_object(), "payload must be an object");
+    let urgency = optional_str(args, "urgency")?.unwrap_or("normal");
+    ensure!(URGENCIES.contains(&urgency), "invalid urgency");
+    let deadline_ms = args.get("deadline_ms").and_then(Value::as_i64);
+    let tx = store.write_transaction()?;
+    if let Some(existing) = by_id(store, id)? {
+        // Redelivery after a lost acknowledgement is a no-op.
+        ensure!(
+            existing["from"] == from && existing["to"] == to && existing["kind"] == kind,
+            "message id already holds a different message"
+        );
+        tx.commit()?;
+        return Ok(json!({"id": id, "duplicate": true}));
+    }
+    if kind == "reply" {
+        let correlation = correlation.context("a reply names the request it answers")?;
+        let request =
+            by_id(store, correlation)?.with_context(|| format!("unknown request {correlation}"))?;
+        ensure!(
+            request["from"] == to && request["to"] == from,
+            "only the recipient of {correlation} can answer it"
+        );
+        ensure!(
+            request["state"] == "open",
+            "{correlation} was already answered"
+        );
+    }
+    let now = Store::now_ms();
+    tx.execute(
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11)",
+        params![
+            id,
+            from,
+            to,
+            kind,
+            correlation,
+            request_kind,
+            body,
+            payload.to_string(),
+            urgency,
+            deadline_ms,
+            now,
+            (kind == "request").then_some("open")
+        ],
+    )?;
+    if kind == "reply" {
+        tx.execute(
+            "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3 WHERE id=?1",
+            params![correlation, id, now],
+        )?;
+    }
+    tx.commit()?;
+    Ok(json!({"id": id, "duplicate": false}))
 }
 
 fn cursor(store: &Store, address: &str) -> Result<i64> {
@@ -395,7 +622,7 @@ fn requests(store: &Store, args: &Value) -> Result<Value> {
 pub fn summary(store: &Store) -> Result<Value> {
     let unread: i64 = store.connection().query_row(
         "SELECT COUNT(*) FROM mail m LEFT JOIN mail_cursor c ON c.address=m.recipient
-         WHERE m.seq > COALESCE(c.through_seq, 0)",
+         WHERE COALESCE(m.delivery, 'received')='received' AND m.seq > COALESCE(c.through_seq, 0)",
         [],
         |r| r.get(0),
     )?;
@@ -405,14 +632,23 @@ pub fn summary(store: &Store) -> Result<Value> {
             .query_row("SELECT COUNT(*) FROM mail WHERE state='open'", [], |r| {
                 r.get(0)
             })?;
-    Ok(json!({"unacknowledged_mail": unread, "open_requests": open}))
+    let undelivered: i64 = store.connection().query_row(
+        "SELECT COUNT(*) FROM mail WHERE delivery='pending'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(
+        json!({"unacknowledged_mail": unread, "open_requests": open, "undelivered_mail": undelivered}),
+    )
 }
 
 /// Retention for `history.prune`: acknowledged mail older than the cutoff,
 /// never unread mail or a request still owed its reply.
 pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
-    let stale = "created_ms < ?1 AND COALESCE(state, '') <> 'open'
-        AND seq <= COALESCE((SELECT through_seq FROM mail_cursor WHERE address=mail.recipient), 0)";
+    // Mail held here counts once acknowledged; an outgoing copy once delivered.
+    let stale = "created_ms < ?1 AND COALESCE(state, '') <> 'open' AND (delivery='delivered'
+        OR (COALESCE(delivery, 'received')='received'
+            AND seq <= COALESCE((SELECT through_seq FROM mail_cursor WHERE address=mail.recipient), 0)))";
     let count: i64 = store.connection().query_row(
         &format!("SELECT COUNT(*) FROM mail WHERE {stale}"),
         [cutoff_ms],
@@ -448,6 +684,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "mail.ack" => ack(store, &args),
         "mail.show" => show(store, &args),
         "mail.requests" => requests(store, &args),
+        "mail.deliver" => deliver(store, &args),
+        "mail.flush" => flush(store, &args),
         _ => bail!("unknown mailbox command {command}"),
     }
 }

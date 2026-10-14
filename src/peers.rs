@@ -298,6 +298,45 @@ fn call(peer: &Peer, id: &str, command: &str, args: Value, caller: &Caller) -> R
     Ok(response)
 }
 
+/// Send one correlated RPC to a configured peer as the current caller and
+/// return its envelope (a remote error is an `ok:false` envelope, not Err).
+pub(crate) fn call_peer(
+    store: &Store,
+    name: &str,
+    id: &str,
+    command: &str,
+    args: Value,
+) -> Result<Value> {
+    init(store)?;
+    token(name, 64, "peer name")?;
+    let config: String = store
+        .connection()
+        .query_row(
+            "SELECT config_json FROM peer_endpoints WHERE name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .context("peer not configured")?;
+    let peer: Peer = serde_json::from_str(&config)?;
+    validate(&peer)?;
+    let response = call(&peer, id, command, args, store.caller())?;
+    store.audit(
+        "peer.called",
+        &json!({"name":name,"command":command,"correlation_id":id,"ok":response["ok"]}),
+    )?;
+    Ok(response)
+}
+
+/// Whether a peer with this name is configured.
+pub(crate) fn configured(store: &Store, name: &str) -> Result<bool> {
+    init(store)?;
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM peer_endpoints WHERE name=?1)",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     init(store)?;
     match command {
@@ -326,17 +365,6 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .get("name")
                 .and_then(Value::as_str)
                 .context("peer.call requires name")?;
-            token(name, 64, "peer name")?;
-            let config: String = store
-                .connection()
-                .query_row(
-                    "SELECT config_json FROM peer_endpoints WHERE name=?1",
-                    [name],
-                    |row| row.get(0),
-                )
-                .context("peer not configured")?;
-            let peer: Peer = serde_json::from_str(&config)?;
-            validate(&peer)?;
             let command = args
                 .get("command")
                 .and_then(Value::as_str)
@@ -346,18 +374,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let response = call(
-                &peer,
+            call_peer(
+                store,
+                name,
                 &id,
                 command,
                 args.get("args").cloned().unwrap_or_else(|| json!({})),
-                store.caller(),
-            )?;
-            store.audit(
-                "peer.called",
-                &json!({"name":name,"command":command,"correlation_id":id,"ok":response["ok"]}),
-            )?;
-            Ok(response)
+            )
         }
         _ => bail!("unknown peer command: {command}"),
     }

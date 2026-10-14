@@ -361,3 +361,191 @@ fn status_counts_mail_and_prune_keeps_unread_mail_and_open_requests() {
     dispatch(&mut s, "mail.show", json!({"id":"unread"})).unwrap();
     dispatch(&mut s, "mail.show", json!({"id":"owed"})).unwrap();
 }
+
+/// Two homes on this machine, each hosting one ship and knowing the other's
+/// ship behind a local-transport peer that runs the real binary.
+struct Pair {
+    _temp: tempfile::TempDir,
+    a: Store,
+    b: Store,
+    b_home: std::path::PathBuf,
+}
+fn pair() -> Pair {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (a_home, b_home) = (root.join("a"), root.join("b"));
+    let mut a = Store::open(&a_home).unwrap();
+    let mut b = Store::open(&b_home).unwrap();
+    let binary = env!("CARGO_BIN_EXE_privateer");
+    for (store, peer, home) in [(&mut a, "home-b", &b_home), (&mut b, "home-a", &a_home)] {
+        dispatch(
+            store,
+            "peer.put",
+            json!({"name":peer,"transport":"local","executable":binary,"home":home}),
+        )
+        .unwrap();
+    }
+    dispatch(&mut a, "ship.put", json!({"name":"apps","scope":"apps"})).unwrap();
+    dispatch(
+        &mut a,
+        "ship.put",
+        json!({"name":"infra","scope":"deploys","location":{"peer":"home-b"}}),
+    )
+    .unwrap();
+    dispatch(
+        &mut b,
+        "ship.put",
+        json!({"name":"infra","scope":"deploys"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut b,
+        "ship.put",
+        json!({"name":"apps","scope":"apps","location":{"peer":"home-a"}}),
+    )
+    .unwrap();
+    Pair {
+        _temp: temp,
+        a,
+        b,
+        b_home,
+    }
+}
+
+#[test]
+fn requests_and_replies_cross_homes_and_close_both_copies() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    let sent = send(
+        &mut a,
+        json!({"id":"staging-health","from":"apps","to":"infra","kind":"request","body":"Is staging healthy?"}),
+    )
+    .unwrap();
+    assert_eq!(sent["state"], "open");
+    let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+    assert_eq!(inbox["messages"][0]["id"], "staging-health");
+    assert_eq!(inbox["messages"][0]["from"], "apps");
+    send(
+        &mut b,
+        json!({"id":"all-green","from":"infra","to":"apps","kind":"reply","correlation":"staging-health","body":"All green."}),
+    )
+    .unwrap();
+    // Both homes' copies of the request close, and the reply reaches apps.
+    for store in [&mut a, &mut b] {
+        let request = dispatch(store, "mail.show", json!({"id":"staging-health"})).unwrap();
+        assert_eq!(request["state"], "answered");
+        assert_eq!(request["answered_by"], "all-green");
+    }
+    let replies = dispatch(&mut a, "mail.inbox", json!({"address":"apps"})).unwrap();
+    assert_eq!(replies["messages"][0]["body"], "All green.");
+    assert_eq!(
+        dispatch(&mut a, "status", json!({})).unwrap()["undelivered_mail"],
+        0
+    );
+    // A home cannot read a mailbox it does not hold.
+    assert!(dispatch(&mut a, "mail.inbox", json!({"address":"infra"})).is_err());
+}
+
+#[test]
+fn undeliverable_mail_stays_pending_until_flushed() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        b_home,
+    } = pair();
+    // Point the peer at a missing executable: the transport fails.
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local","executable":"/nonexistent/privateer","home":b_home}),
+    )
+    .unwrap();
+    let sent = send(
+        &mut a,
+        json!({"id":"queued","from":"apps","to":"infra","kind":"notice","body":"Deploy window moved"}),
+    )
+    .unwrap();
+    let stored = dispatch(&mut a, "mail.show", json!({"id":"queued"})).unwrap();
+    assert_eq!(sent["id"], "queued");
+    assert_eq!(
+        dispatch(&mut a, "status", json!({})).unwrap()["undelivered_mail"],
+        1
+    );
+    assert!(stored.get("seq").is_some());
+    assert_eq!(
+        dispatch(&mut a, "mail.flush", json!({})).unwrap()["pending"],
+        1
+    );
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local","executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut a, "mail.flush", json!({})).unwrap()["delivered"],
+        1
+    );
+    assert_eq!(
+        dispatch(&mut a, "status", json!({})).unwrap()["undelivered_mail"],
+        0
+    );
+    let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+    assert_eq!(inbox["messages"][0]["id"], "queued");
+    // Redelivering the same message is a no-op at the receiving home.
+    let again = dispatch(
+        &mut b,
+        "mail.deliver",
+        json!({"id":"queued","from":"apps","to":"infra","kind":"notice","body":"Deploy window moved"}),
+    )
+    .unwrap();
+    assert_eq!(again["duplicate"], true);
+}
+
+#[test]
+fn agents_mail_other_homes_as_themselves() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    a.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    send(
+        &mut a,
+        json!({"id":"from-agent","from":"apps","to":"infra","kind":"notice","body":"hello from an agent"}),
+    )
+    .unwrap();
+    let delivered = dispatch(&mut b, "mail.show", json!({"id":"from-agent"})).unwrap();
+    assert_eq!(delivered["from"], "apps");
+}
+
+#[test]
+fn delivery_accepts_only_known_remote_senders_for_local_ships() {
+    let Pair { _temp, mut b, .. } = pair();
+    dispatch(&mut b, "ship.put", json!({"name":"local-only","scope":"x"})).unwrap();
+    for bad in [
+        // Unknown sender.
+        json!({"id":"m1","from":"stranger","to":"infra","kind":"notice","body":"x"}),
+        // A sender this home hosts cannot arrive from a peer.
+        json!({"id":"m2","from":"local-only","to":"infra","kind":"notice","body":"x"}),
+        // Recipient not hosted here.
+        json!({"id":"m3","from":"apps","to":"apps","kind":"notice","body":"x"}),
+        // The captain's mail stays in its own home for now.
+        json!({"id":"m4","from":"apps","to":"captain","kind":"decision","body":"x"}),
+        // A reply to a request this home never sent.
+        json!({"id":"m5","from":"apps","to":"infra","kind":"reply","correlation":"nothing","body":"x"}),
+    ] {
+        assert!(
+            dispatch(&mut b, "mail.deliver", bad.clone()).is_err(),
+            "{bad}"
+        );
+    }
+}
