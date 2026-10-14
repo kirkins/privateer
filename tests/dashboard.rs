@@ -194,21 +194,23 @@ fn mouse_navigation_selects_visible_tabs_rows_and_details_without_opening_agents
         compact: true,
         ..App::default()
     };
+    app.select_ship(Some("apps".into()));
     for (tab, label) in [
-        (1, "2 Fleet"),
-        (2, "3 Logbook"),
-        (3, "4 Terminals"),
+        (1, "2 Assignments"),
+        (2, "3 Terminals"),
+        (3, "4 Logbook"),
         (0, "1 Bridge"),
     ] {
         let screen = render(&mut app, 120, 34);
         click_text(&mut app, &screen, label);
         assert_eq!(app.tab, tab);
     }
+    app.select_tab(1);
     let screen = render(&mut app, 120, 34);
     click_text(&mut app, &screen, "Investigate the failing build");
     let screen = render(&mut app, 120, 34);
     assert!(screen.contains("Task: app-build"));
-    app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 80, 15));
+    app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 80, 25));
     assert!(app.scroll > 0);
     let before = app.tab;
     app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 110, 3));
@@ -238,9 +240,12 @@ fn mouse_selection_tracks_the_scrolled_list_instead_of_its_first_record() {
         selected: 29,
         ..App::default()
     };
+    app.ship = Some("navigator".into());
+    app.tab = 1;
+    app.focus_content = true;
     let screen = render(&mut app, 80, 20);
-    click_text(&mut app, &screen, "Assignment 27");
-    assert_eq!(app.snapshot.tasks[app.selected].id, "task-27");
+    click_text(&mut app, &screen, "Assignment 28");
+    assert_eq!(app.selected_task().unwrap().id, "task-28");
 }
 
 #[test]
@@ -440,7 +445,27 @@ fn refresh_preserves_selected_identity_and_requires_reselection_after_replacemen
     other.pane_id = "w2:p1".into();
     other.terminal_id = "other".into();
     let mut app = App {
-        tab: 3,
+        tab: 2,
+        ship: Some("worker".into()),
+        focus_content: true,
+        snapshot: Snapshot {
+            ships: vec![privateer::dashboard::model::Ship {
+                id: "worker".into(),
+                name: "Worker".into(),
+                terminals: vec![
+                    privateer::dashboard::model::TerminalBinding {
+                        pane_id: pane.pane_id.clone(),
+                        terminal_id: pane.terminal_id.clone(),
+                    },
+                    privateer::dashboard::model::TerminalBinding {
+                        pane_id: other.pane_id.clone(),
+                        terminal_id: other.terminal_id.clone(),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Snapshot::default()
+        },
         herdr: Some(View {
             panes: vec![pane.clone()],
             socket_identity: (1, 2),
@@ -453,7 +478,7 @@ fn refresh_preserves_selected_identity_and_requires_reselection_after_replacemen
         socket_identity: (1, 2),
         ..View::default()
     });
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.selected, 0);
     assert!(!app.selection_invalidated);
     let mut replaced = pane;
     replaced.terminal_id = "replacement".into();
@@ -507,14 +532,126 @@ fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
     let mut app = App {
         snapshot: Snapshot::demo(),
         demo: true,
+        herdr: Some(privateer::dashboard::herdr::View::demo()),
         compact: true,
         home_age: Some(0),
+        herdr_age: Some(0),
         ..App::default()
     };
+    let home = render(&mut app, 120, 34);
+    assert!(home.contains("Fleet overview"));
+    assert!(home.contains("Research"));
+    app.select_ship(Some("navigator".into()));
     let view = render(&mut app, 120, 34);
     assert!(view.contains("DEMO / sample data"));
-    assert!(view.contains("Navigator chat and agent launch are not connected"));
+    assert!(view.contains("Conversation and agent launch are not connected"));
     if let Some(path) = std::env::var_os("PRIVATEER_DASHBOARD_PREVIEW") {
-        fs::write(path, view).unwrap();
+        fs::write(&path, &home).unwrap();
+        app.select_ship(Some("apps".into()));
+        app.select_tab(1);
+        let assignments = render(&mut app, 120, 34);
+        fs::write(
+            std::path::PathBuf::from(path).with_file_name("dashboard-preview-assignments.txt"),
+            assignments,
+        )
+        .unwrap();
     }
+}
+
+#[test]
+fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
+    use privateer::dashboard::herdr::View;
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        herdr: Some(View::demo()),
+        ..App::default()
+    };
+    assert!(app.ship.is_none());
+    app.select_ship(Some("apps".into()));
+    let bridge = render(&mut app, 140, 40);
+    assert!(!bridge.contains("Repeated connection facts"));
+    assert!(
+        !bridge.contains("Investigate the failing build"),
+        "assignments belong in their own view"
+    );
+    app.select_tab(1);
+    assert!(render(&mut app, 140, 40).contains("Investigate the failing build"));
+    assert_eq!(app.assignment_indices().len(), 1);
+    app.select_tab(2);
+    assert_eq!(app.scoped_panes().len(), 1);
+    assert_eq!(app.selected_pane().unwrap().agent.as_deref(), Some("codex"));
+    app.select_ship(Some("research".into()));
+    assert!(app.assignment_indices().is_empty());
+    assert!(app.scoped_panes().is_empty());
+    app.select_tab(3);
+    assert!(!render(&mut app, 140, 40).contains("Sample logbook outcome"));
+    app.select_ship(None);
+    let home = render(&mut app, 140, 40);
+    assert!(home.contains("4 ships"));
+    assert!(home.contains("Research"));
+}
+
+#[test]
+fn accepted_handoff_moves_the_same_assignment_and_preserves_custody_history() {
+    let (_root, mut store) = fixture();
+    dispatch(
+        &mut store,
+        "task.handoff",
+        json!({"id":"main","actor":"navigator","target":"infrastructure"}),
+    )
+    .unwrap();
+    let before = Snapshot::read(store.home()).unwrap();
+    let mut incoming = App {
+        snapshot: before.clone(),
+        ..App::default()
+    };
+    incoming.select_ship(Some("infrastructure".into()));
+    incoming.select_tab(1);
+    assert_eq!(incoming.selected_task().unwrap().owner, "navigator");
+    assert!(render(&mut incoming, 140, 40).contains("Incoming"));
+    dispatch(
+        &mut store,
+        "task.accept",
+        json!({"id":"main","actor":"infrastructure"}),
+    )
+    .unwrap();
+    let after = Snapshot::read(store.home()).unwrap();
+    assert_eq!(after.tasks.len(), before.tasks.len());
+    assert_eq!(after.tasks[0].id, "main");
+    assert_eq!(after.tasks[0].owner, "infrastructure");
+    incoming.update_snapshot(after.clone());
+    assert!(incoming.selected_task().unwrap().handoff_to.is_none());
+    let mut outgoing = App {
+        snapshot: after,
+        ..App::default()
+    };
+    outgoing.select_ship(Some("navigator".into()));
+    outgoing.select_tab(1);
+    assert!(outgoing.assignment_indices().is_empty());
+    outgoing.select_tab(3);
+    assert!(render(&mut outgoing, 140, 40).contains("offered a handoff"));
+}
+
+#[test]
+fn ship_registry_keeps_idle_peers_and_rejects_ambiguous_terminal_ownership() {
+    let (_root, store) = fixture();
+    let path = store.home().join("dashboard.json");
+    fs::write(
+        &path,
+        json!({"ships":[{"id":"idle","name":"Idle ship"}]}).to_string(),
+    )
+    .unwrap();
+    let view = Snapshot::read(store.home()).unwrap();
+    assert!(view.ships.iter().any(|s| s.id == "idle"));
+    assert!(view.ships.iter().any(|s| s.id == "navigator"));
+    let binding = json!({"pane_id":"w1:p1","terminal_id":"terminal-1"});
+    fs::write(&path,json!({"ships":[{"id":"one","name":"One","terminals":[binding]},{"id":"two","name":"Two","terminals":[binding]}]}).to_string()).unwrap();
+    assert!(
+        Snapshot::read(store.home())
+            .unwrap_err()
+            .to_string()
+            .contains("only one ship")
+    );
+    fs::write(&path, "x".repeat(65537)).unwrap();
+    assert!(Snapshot::read(store.home()).is_err());
 }

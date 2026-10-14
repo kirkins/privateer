@@ -8,8 +8,8 @@ See [milestone status and validation](docs/milestone-1.md) for what is implement
 
 ## Terminal dashboard
 
-The optional Rust dashboard provides a nautical Bridge, Fleet, Logbook and Herdr
-terminal view. The home screen keeps its space for assignments and activity:
+The optional Rust dashboard opens on a Fleet overview with ships in a persistent
+sidebar. Each ship has its own Bridge, Assignments, Terminals and Logbook views:
 
 ```sh
 cargo run --features dashboard --bin privateer-dashboard -- --demo
@@ -19,7 +19,8 @@ Use `--home /absolute/privateer/home` to observe an existing home. Inside Herdr,
 the dashboard can inspect and focus existing agent terminals using the injected
 socket. It does not launch agents, send prompts, acknowledge alerts or migrate a
 fleet. Navigator chat and automatic agent activation are not connected yet.
-Click the top tabs and list entries, or use `1`–`4`, Tab and the arrow keys.
+Click a ship, then its workspace tabs; `0` returns to Fleet overview. Keyboard
+navigation and mouse-wheel scrolling remain available.
 See [dashboard setup and boundaries](docs/dashboard.md).
 
 ## General runtime and optional integrations
