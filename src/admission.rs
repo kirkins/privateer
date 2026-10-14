@@ -13,6 +13,27 @@ use serde_json::{Map, Value, json};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+/// A request that does not fit right now. Unlike other errors it can wait in
+/// the capacity queue and succeed later.
+#[derive(Debug)]
+pub struct Refused(pub String);
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Refused {}
+
+macro_rules! refuse_unless {
+    ($condition:expr, $($message:tt)+) => {
+        let fits: bool = $condition;
+        if !fits {
+            return Err(Refused(format!($($message)+)).into());
+        }
+    };
+}
+pub(crate) use refuse_unless;
+
 /// Resources a job is expected to use. Fields left out of a request fall back
 /// to the heavy-job default for heavy jobs and to zero for others.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -253,14 +274,14 @@ pub fn admit(
     if request.heavy {
         let heavy = held.iter().filter(|h| h.heavy).count() as u64;
         if let Some(cap) = settings.max_heavy_jobs {
-            ensure!(heavy < cap, "heavy-job capacity exhausted ({heavy}/{cap})");
+            refuse_unless!(heavy < cap, "heavy-job capacity exhausted ({heavy}/{cap})");
         }
         if let Some(cap) = request.charter_cap {
             let share = held
                 .iter()
                 .filter(|h| h.heavy && h.home == request.home && h.charter == Some(request.charter))
                 .count() as u64;
-            ensure!(
+            refuse_unless!(
                 share < cap,
                 "charter heavy-job share exhausted ({share}/{cap})"
             );
@@ -279,7 +300,7 @@ pub fn admit(
     // job's own estimate then counts against the next request during its
     // ramp, so one job is never refused for its own size alone.
     let per_cpu = (host.load + recent_cpus) / host.cpus;
-    ensure!(
+    refuse_unless!(
         per_cpu < settings.max_load_per_cpu,
         "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
         settings.max_load_per_cpu,
@@ -290,7 +311,7 @@ pub fn admit(
     // must fit above the floor too.
     let left =
         host.memory_available_bytes as i128 - recent_memory as i128 - demand.memory_bytes as i128;
-    ensure!(
+    refuse_unless!(
         left >= settings.min_available_memory_bytes as i128,
         "admission refused: {} MiB available, {} MiB recently admitted, {} MiB estimated for this job, {} MiB must stay free; retry later or tune resource.configure",
         mib(host.memory_available_bytes),

@@ -409,3 +409,29 @@ fn failed_plugin_descendants_are_stopped() {
     }
     assert!(!alive(pid), "descendant {pid} survived its failed plugin");
 }
+
+#[test]
+fn agent_harness_jobs_are_light_and_run_as_the_task_owner() {
+    let mut f = Fixture::new();
+    // Keep this job's reservation in a private ledger, not the host's.
+    fs::write(
+        f.store.home().join("config.json"),
+        json!({"resource_home": f.base().join("ledger")}).to_string(),
+    )
+    .unwrap();
+    let repo = f.repo.display().to_string();
+    let path = manifest(
+        &f,
+        &response_script(&format!(
+            "{{'argv':['true'],'cwd':{repo:?},'env_names':[]}}"
+        )),
+        2000,
+        65536,
+    );
+    let mut args = f.args(&path);
+    args["id"] = json!("harness");
+    let job = privateer::dispatch(&mut f.store, "agent.start", args).unwrap();
+    assert_eq!(job["heavy"], false);
+    assert_eq!(job["agent_actor"], "department");
+    assert_eq!(job["cleanup_descendants"], true);
+}
