@@ -60,10 +60,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "cwd": plan["cwd"],
                 "cleanup_descendants": true,
                 "agent_actor": owner,
-                "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(true))
+                // The harness mostly waits on its model; builds it runs go
+                // through job.start with heavy and wait_for_capacity.
+                "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))
             });
-            if let Some(id) = args.get("id") {
-                job["id"] = id.clone();
+            for key in ["id", "estimate", "wait_for_capacity", "max_wait_secs"] {
+                if let Some(value) = args.get(key) {
+                    job[key] = value.clone();
+                }
             }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();

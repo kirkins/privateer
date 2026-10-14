@@ -2,7 +2,7 @@
 //!
 //! This is process supervision, not a privileged sandbox. Unknown/orphaned
 //! payloads keep their reservation until their recorded process group is gone.
-use crate::admission::{self, Demand, Estimate};
+use crate::admission::{self, Demand, Estimate, Refused, refuse_unless};
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 const LOG_LIMIT: usize = 1024 * 1024;
 const START_GRACE_MS: i64 = 30_000;
+const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
+const QUEUE_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Process {
@@ -64,6 +66,12 @@ struct Job {
     /// Requested resource estimate, if any; see admission.
     #[serde(default)]
     estimate: Option<Estimate>,
+    /// Wait in the host capacity queue instead of being refused, for at
+    /// most `max_wait_secs`.
+    #[serde(default)]
+    wait_for_capacity: bool,
+    #[serde(default)]
+    max_wait_secs: Option<u64>,
     /// Outcome the job settles to once descendants left by an exited leader
     /// are gone. Absent when the supervisor vanished before recording one.
     #[serde(default)]
@@ -92,6 +100,16 @@ struct Reservation {
     demand: Option<Demand>,
 }
 
+/// A job waiting for capacity, first come first served across homes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Queued {
+    key: String,
+    home: PathBuf,
+    job_id: String,
+    incarnation: String,
+    created_ms: i64,
+    supervisor: Option<Process>,
+}
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, record TEXT NOT NULL);",
@@ -184,6 +202,9 @@ fn ledger(path: &Path) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);",
     )?;
     admission::init(&conn)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS queue (key TEXT PRIMARY KEY, record TEXT NOT NULL);",
+    )?;
     Ok(conn)
 }
 fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
@@ -194,17 +215,65 @@ fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
 fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
     format!("{}:{id}:{incarnation}", home.display())
 }
+/// Queue entries in arrival order, dropping those whose supervisor is gone (or
+/// never appeared within the start grace) so they cannot block the line.
+fn live_queue(conn: &Connection) -> Result<Vec<Queued>> {
+    let mut statement = conn.prepare("SELECT record FROM queue")?;
+    let mut entries: Vec<Queued> = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .map(|raw| Ok(serde_json::from_str(&raw?)?))
+        .collect::<Result<_>>()?;
+    entries.sort_by(|a, b| (a.created_ms, &a.key).cmp(&(b.created_ms, &b.key)));
+    let mut live = vec![];
+    for entry in entries {
+        let alive = match &entry.supervisor {
+            Some(p) => same_process(p)?,
+            None => Store::now_ms() - entry.created_ms <= START_GRACE_MS,
+        };
+        if alive {
+            live.push(entry);
+        } else {
+            conn.execute("DELETE FROM queue WHERE key=?1", [&entry.key])?;
+        }
+    }
+    Ok(live)
+}
+fn dequeue(store: &Store, job: &Job) -> Result<()> {
+    ledger(&job.ledger)?.execute(
+        "DELETE FROM queue WHERE key=?1",
+        [reservation_key(store.home(), &job.id, &job.incarnation)],
+    )?;
+    Ok(())
+}
 /// Admit and record a reservation under the ledger's write lock, so homes
 /// sharing the host decide one at a time against the same readings.
+///
+/// A request from the queue must be at its head; a direct request may not
+/// jump a non-empty queue. Either way an unfitting request is `Refused`.
 fn reserve(
     conn: &Connection,
     reservation: &mut Reservation,
     estimate: Option<&Estimate>,
     charter_cap: Option<u64>,
+    from_queue: bool,
 ) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
         if reservation.heavy || estimate.is_some() {
+            let queue = live_queue(conn)?;
+            let ahead = queue
+                .iter()
+                .take_while(|q| q.key != reservation.key)
+                .count();
+            if from_queue {
+                refuse_unless!(ahead == 0, "waiting behind {ahead} earlier jobs");
+            } else {
+                refuse_unless!(
+                    queue.is_empty(),
+                    "{} jobs are waiting for capacity; pass wait_for_capacity:true to join the queue",
+                    queue.len()
+                );
+            }
             // Never garbage-collect reservations merely because a wrapper disappeared.
             let held = reservations(conn)?;
             let settings = admission::settings(conn)?;
@@ -233,6 +302,11 @@ fn reserve(
                     demand: reservation.demand,
                 },
             )?;
+            if from_queue {
+                conn.execute("DELETE FROM queue WHERE key=?1", [&reservation.key])?;
+                // Its ramp starts now, not when it joined the queue.
+                reservation.created_ms = Store::now_ms();
+            }
         }
         conn.execute(
             "INSERT INTO reservations(key,record) VALUES(?1,?2)",
@@ -583,6 +657,24 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         .filter(|v| !v.is_null())
         .map(admission::estimate)
         .transpose()?;
+    let wait_for_capacity = args
+        .get("wait_for_capacity")
+        .map(|v| v.as_bool().context("wait_for_capacity must be boolean"))
+        .transpose()?
+        .unwrap_or(false);
+    let max_wait_secs = match args.get("max_wait_secs").filter(|v| !v.is_null()) {
+        Some(v) => Some(
+            v.as_u64()
+                .filter(|s| (1..=86_400).contains(s))
+                .context("max_wait_secs must be 1..86400")?,
+        ),
+        None if wait_for_capacity => Some(DEFAULT_MAX_WAIT_SECS),
+        None => None,
+    };
+    ensure!(
+        wait_for_capacity || max_wait_secs.is_none(),
+        "max_wait_secs requires wait_for_capacity"
+    );
     let cleanup_descendants = args
         .get("cleanup_descendants")
         .map(|value| {
@@ -625,7 +717,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
                 && existing.plugin_binding == plugin_binding
                 && existing.cleanup_descendants == cleanup_descendants
                 && existing.agent_actor == agent_actor
-                && existing.estimate == estimate,
+                && existing.estimate == estimate
+                && existing.wait_for_capacity == wait_for_capacity,
             "job id already belongs to different work"
         );
         return Ok(public_job(&existing));
@@ -678,6 +771,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         cleanup_descendants,
         agent_actor,
         estimate: estimate.clone(),
+        wait_for_capacity,
+        max_wait_secs,
         leader_result: None,
     };
     let mut reservation = Reservation {
@@ -710,22 +805,46 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
                     && existing.plugin_binding == job.plugin_binding
                     && existing.cleanup_descendants == job.cleanup_descendants
                     && existing.agent_actor == job.agent_actor
-                    && existing.estimate == job.estimate,
+                    && existing.estimate == job.estimate
+                    && existing.wait_for_capacity == job.wait_for_capacity,
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));
         }
-        reserve(
-            &ledger(&ledger_path)?,
+        let ledger = ledger(&ledger_path)?;
+        match reserve(
+            &ledger,
             &mut reservation,
             estimate.as_ref(),
             charter_cap,
-        )?;
+            false,
+        ) {
+            Ok(()) => {}
+            // No capacity now: join the queue; the supervisor waits there.
+            Err(error) if wait_for_capacity && error.downcast_ref::<Refused>().is_some() => {
+                let entry = Queued {
+                    key: reservation.key.clone(),
+                    home: reservation.home.clone(),
+                    job_id: id.clone(),
+                    incarnation: job.incarnation.clone(),
+                    created_ms: job.created_ms,
+                    supervisor: None,
+                };
+                ledger.execute(
+                    "INSERT INTO queue(key,record) VALUES(?1,?2)",
+                    params![entry.key, serde_json::to_string(&entry)?],
+                )?;
+                job.status = "queued".into();
+                job.reason = Some(format!("waiting for capacity: {error}"));
+            }
+            Err(error) => return Err(error),
+        }
         if let Err(error) = conn.execute(
             "INSERT INTO jobs(id,record) VALUES(?1,?2)",
             params![id, serde_json::to_string(&job)?],
         ) {
             release(store, &job)?;
+            dequeue(store, &job)?;
             return Err(error.into());
         }
         Ok(None)
@@ -734,6 +853,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         if let Err(error) = conn.execute_batch("COMMIT") {
             let _ = conn.execute_batch("ROLLBACK");
             release(store, &job)?;
+            dequeue(store, &job)?;
             return Err(error.into());
         }
     } else {
@@ -791,6 +911,116 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         &json!({"job_id": id, "task_id": task_id, "incarnation": job.incarnation}),
     )?;
     Ok(public_job(&job))
+}
+
+/// Wait at the capacity queue until admitted (Some, now launching) or until
+/// cancellation, lost authority or max_wait_secs ends the job (None). No
+/// payload exists while a job is queued.
+fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
+    let key = reservation_key(store.home(), &job.id, &job.incarnation);
+    // Other homes judge the entry's liveness by this supervisor.
+    {
+        let conn = ledger(&job.ledger)?;
+        let raw: Option<String> = conn
+            .query_row("SELECT record FROM queue WHERE key=?1", [&key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(raw) = raw {
+            let mut entry: Queued = serde_json::from_str(&raw)?;
+            entry.supervisor = job.supervisor.clone();
+            conn.execute(
+                "UPDATE queue SET record=?2 WHERE key=?1",
+                params![key, serde_json::to_string(&entry)?],
+            )?;
+        }
+    }
+    let max_wait = job.max_wait_secs.unwrap_or(DEFAULT_MAX_WAIT_SECS);
+    let deadline = job.created_ms + (max_wait as i64) * 1000;
+    let end = |job: &Job, status: &str, reason: String| -> Result<Option<Job>> {
+        let status = status.to_owned();
+        let ended = alter(store, &job.id, |j| {
+            j.status = status;
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some(reason);
+        })?;
+        dequeue(store, &ended)?;
+        store.audit(
+            "job.finished",
+            &json!({"job_id": ended.id, "status": ended.status, "exit_code": null}),
+        )?;
+        Ok(None)
+    };
+    loop {
+        job = load(store, &job.id)?;
+        if job.cancel_requested {
+            return end(
+                &job,
+                "cancelled",
+                "cancelled while waiting for capacity".into(),
+            );
+        }
+        let charter = match store
+            .authorize(&job.task_id, &job.action)
+            .and_then(|c| check_plugin_binding(&job, &c).map(|()| c))
+        {
+            Ok(charter) => charter,
+            Err(error) => {
+                return end(
+                    &job,
+                    "failed",
+                    format!("authority ended while waiting: {error}"),
+                );
+            }
+        };
+        if Store::now_ms() >= deadline {
+            let last = job.reason.clone().unwrap_or_default();
+            return end(
+                &job,
+                "failed",
+                format!("no capacity within {max_wait} s ({last})"),
+            );
+        }
+        let mut reservation = Reservation {
+            key: key.clone(),
+            home: store.home().to_owned(),
+            job_id: job.id.clone(),
+            incarnation: job.incarnation.clone(),
+            heavy: job.heavy,
+            state: "starting".to_owned(),
+            created_ms: Store::now_ms(),
+            supervisor: job.supervisor.clone(),
+            payload: None,
+            charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
+            demand: None,
+        };
+        let cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
+        match reserve(
+            &ledger(&job.ledger)?,
+            &mut reservation,
+            job.estimate.as_ref(),
+            cap,
+            true,
+        ) {
+            Ok(()) => {
+                let admitted = alter(store, &job.id, |j| {
+                    j.status = "launching".into();
+                    j.reason = None;
+                })?;
+                return Ok(Some(admitted));
+            }
+            Err(error) if error.downcast_ref::<Refused>().is_some() => {
+                let reason = format!("waiting for capacity: {error}");
+                if job.reason.as_deref() != Some(reason.as_str()) {
+                    job = alter(store, &job.id, |j| j.reason = Some(reason))?;
+                }
+            }
+            Err(error) => {
+                return end(&job, "failed", format!("capacity queue error: {error:#}"));
+            }
+        }
+        thread::sleep(QUEUE_POLL);
+    }
 }
 
 fn capture(
@@ -874,7 +1104,9 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
                 .as_ref()
                 .is_some_and(|p| p.pid == std::process::id())
             {
-                let stopped = job.payload.as_ref().and_then(|p| group_alive(p).ok()) == Some(false);
+                // A queued job has no payload; an unspawned one holds nothing.
+                let stopped = job.status == "queued"
+                    || job.payload.as_ref().and_then(|p| group_alive(p).ok()) == Some(false);
                 if let Ok(updated) = alter(store, id, |j| {
                     if !terminal(&j.status) {
                         j.status = if stopped {
@@ -890,6 +1122,7 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
                 }) {
                     if stopped {
                         let _ = release(store, &updated);
+                        let _ = dequeue(store, &updated);
                     } else {
                         let _ = update_reservation(store, &updated);
                     }
@@ -910,12 +1143,20 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let claimed = (|| -> Result<Job> {
         let mut job = load(store, id)?;
+        // start() records this supervisor's identity after spawning it; any
+        // other supervisor claiming a queued job is a duplicate.
+        let ours = job
+            .supervisor
+            .as_ref()
+            .is_none_or(|p| p.pid == me.pid && same_start(&p.started, &me.started));
         ensure!(
-            job.status == "starting",
+            job.status == "starting" || (job.status == "queued" && ours),
             "job already supervised or terminal"
         );
         job.supervisor = Some(me);
-        job.status = "launching".into();
+        if job.status == "starting" {
+            job.status = "launching".into();
+        }
         conn.execute(
             "UPDATE jobs SET record=?2 WHERE id=?1",
             params![id, serde_json::to_string(&job)?],
@@ -928,6 +1169,12 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         let _ = conn.execute_batch("ROLLBACK");
     }
     let mut job = claimed?;
+    if job.status == "queued" {
+        match wait_in_queue(store, job)? {
+            Some(admitted) => job = admitted,
+            None => return Ok(()),
+        }
+    }
     update_reservation(store, &job)?;
     if job.cancel_requested {
         job = alter(store, id, |j| {
@@ -1187,6 +1434,23 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         Some(p) => same_process(p)?,
         None => false,
     };
+    if job.status == "queued" {
+        // Nothing runs while queued, so a vanished supervisor ends the job.
+        if !supervisor_alive
+            && (job.supervisor.is_some() || Store::now_ms() - job.created_ms > START_GRACE_MS)
+        {
+            let observed = job.supervisor.clone();
+            job = alter(store, &job.id, |j| {
+                if j.status == "queued" && j.supervisor == observed {
+                    j.status = "failed".into();
+                    j.finished_ms = Some(Store::now_ms());
+                    j.reason = Some("supervisor disappeared while waiting for capacity".into());
+                }
+            })?;
+            dequeue(store, &job)?;
+        }
+        return Ok(job);
+    }
     let payload_alive = match &job.payload {
         Some(p) => group_alive(p)?,
         None => false,
@@ -1282,7 +1546,19 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
         Some(p) => same_process(p)?,
         None => false,
     };
-    if !supervisor_alive {
+    // A live queued supervisor leaves the queue itself within a poll. Without
+    // one, a queued job has no payload and simply ends.
+    if job.status == "queued" && !supervisor_alive {
+        job = alter(store, id, |j| {
+            if j.status == "queued" {
+                j.status = "cancelled".into();
+                j.finished_ms = Some(Store::now_ms());
+                j.reason = Some("cancelled while waiting for capacity".into());
+            }
+        })?;
+        dequeue(store, &job)?;
+    }
+    if !supervisor_alive && !terminal(&job.status) {
         if let Some(p) = job.payload.clone() {
             if group_alive(&p)? {
                 let anchors = if same_process(&p)? {
@@ -1509,7 +1785,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
             );
             store.authorize(&old.task_id, "recovery")?;
-            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate});
+            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate, "wait_for_capacity": old.wait_for_capacity, "max_wait_secs": old.max_wait_secs});
             if let Some(id) = args.get("new_id") {
                 next["id"] = id.clone();
             }
@@ -1560,6 +1836,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             status["ledger"] = json!(path);
             status["heavy_reserved"] = json!(values.iter().filter(|v| v["heavy"] == true).count());
             status["reservations"] = json!(values);
+            status["queue"] = json!(live_queue(&conn)?);
             Ok(status)
         }
         _ => bail!("unknown jobs command {command}"),

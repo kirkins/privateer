@@ -1209,3 +1209,118 @@ fn start_light(home: &Path, id: &str, command: &[&str]) {
     );
     wait(home, id, &["succeeded"]);
 }
+
+#[test]
+fn waiting_jobs_start_in_arrival_order_and_others_cannot_jump_the_queue() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    // The fixture allows one heavy job on the host.
+    start(&home, "running", &["sleep", "1"]);
+    let marker = fixture.repo.join("order.txt");
+    let append = |name: &str| {
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("printf {name} >> '{}'", marker.display()),
+        ]
+    };
+    let first = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"first","command":append("A"),"wait_for_capacity":true}),
+    );
+    assert_eq!(first["status"], "queued", "{first}");
+    assert!(
+        first["reason"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for capacity")
+    );
+    let second = ok(
+        &other,
+        "job.start",
+        json!({"task_id":"task","id":"second","command":append("B"),"wait_for_capacity":true}),
+    );
+    assert_eq!(second["status"], "queued");
+    assert_eq!(
+        ok(&home, "resource.status", json!({}))["queue"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // A direct request that admission applies to may not jump the line. This
+    // light job's estimate fits the load limits and no slot cap applies to it,
+    // so only the waiting line refuses it.
+    let jumped = run(
+        &other,
+        "job.start",
+        json!({"task_id":"task","id":"jumper","command":["true"],"heavy":false,"estimate":{"cpus":0.1}}),
+    );
+    assert!(!jumped.status.success());
+    let error = String::from_utf8_lossy(&jumped.stderr);
+    assert!(error.contains("2 jobs are waiting for capacity"), "{error}");
+    wait(&home, "running", &["succeeded"]);
+    wait(&home, "first", &["succeeded"]);
+    wait(&other, "second", &["succeeded"]);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "AB");
+    let status = ok(&home, "resource.status", json!({}));
+    assert_eq!(status["queue"], json!([]));
+    assert_eq!(status["heavy_reserved"], 0);
+}
+
+#[test]
+fn waiting_jobs_end_on_cancel_timeout_or_a_vanished_supervisor() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "holder", &["sleep", "30"]);
+    let queue = |id: &str, extra: Value| {
+        let mut args =
+            json!({"task_id":"task","id":id,"command":["true"],"wait_for_capacity":true});
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        ok(&home, "job.start", args)
+    };
+    queue("impatient", json!({"max_wait_secs":1}));
+    let timed_out = wait(&home, "impatient", &["failed"]);
+    assert!(
+        timed_out["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no capacity within 1 s"),
+        "{timed_out}"
+    );
+    queue("withdrawn", json!({}));
+    ok(&home, "job.cancel", json!({"id":"withdrawn"}));
+    let cancelled = wait(&home, "withdrawn", &["cancelled"]);
+    assert_eq!(cancelled["reason"], "cancelled while waiting for capacity");
+    queue("abandoned", json!({}));
+    let until = Instant::now() + Duration::from_secs(5);
+    let supervisor = loop {
+        let job = ok(&home, "job.status", json!({"id":"abandoned"}));
+        if let Some(pid) = job["supervisor"]["pid"].as_i64() {
+            break pid as i32;
+        }
+        assert!(Instant::now() < until, "supervisor never recorded");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    let failed = wait(&home, "abandoned", &["failed"]);
+    assert_eq!(
+        failed["reason"],
+        "supervisor disappeared while waiting for capacity"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["queue"], json!([]));
+    assert!(
+        !run(
+            &home,
+            "job.start",
+            json!({"task_id":"task","id":"bad","command":["true"],"max_wait_secs":5})
+        )
+        .status
+        .success()
+    );
+    ok(&home, "job.cancel", json!({"id":"holder"}));
+}
