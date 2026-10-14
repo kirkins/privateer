@@ -2,6 +2,7 @@
 //!
 //! This is process supervision, not a privileged sandbox. Unknown/orphaned
 //! payloads keep their reservation until their recorded process group is gone.
+use crate::admission::{self, Demand, Estimate};
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -60,6 +61,9 @@ struct Job {
     /// When set, the payload runs as this agent (PRIVATEER_ROLE=agent).
     #[serde(default)]
     agent_actor: Option<String>,
+    /// Requested resource estimate, if any; see admission.
+    #[serde(default)]
+    estimate: Option<Estimate>,
     /// Outcome the job settles to once descendants left by an exited leader
     /// are gone. Absent when the supervisor vanished before recording one.
     #[serde(default)]
@@ -81,6 +85,11 @@ struct Reservation {
     created_ms: i64,
     supervisor: Option<Process>,
     payload: Option<Process>,
+    #[serde(default)]
+    charter: Option<String>,
+    /// Resolved estimate counted by admission while recently admitted.
+    #[serde(default)]
+    demand: Option<Demand>,
 }
 
 pub fn init(store: &Store) -> Result<()> {
@@ -174,6 +183,7 @@ fn ledger(path: &Path) -> Result<Connection> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);",
     )?;
+    admission::init(&conn)?;
     Ok(conn)
 }
 fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
@@ -184,15 +194,46 @@ fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
 fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
     format!("{}:{id}:{incarnation}", home.display())
 }
-fn reserve(conn: &Connection, reservation: &Reservation, max_heavy: u64) -> Result<()> {
+/// Admit and record a reservation under the ledger's write lock, so homes
+/// sharing the host decide one at a time against the same readings.
+fn reserve(
+    conn: &Connection,
+    reservation: &mut Reservation,
+    estimate: Option<&Estimate>,
+    charter_cap: Option<u64>,
+) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
-        // Never garbage-collect reservations merely because a wrapper disappeared.
-        let count = reservations(conn)?.iter().filter(|r| r.heavy).count() as u64;
-        ensure!(
-            !reservation.heavy || count < max_heavy,
-            "heavy-job capacity exhausted ({count}/{max_heavy})"
-        );
+        if reservation.heavy || estimate.is_some() {
+            // Never garbage-collect reservations merely because a wrapper disappeared.
+            let held = reservations(conn)?;
+            let settings = admission::settings(conn)?;
+            let host = admission::measure()?;
+            reservation.demand = admission::demand(&settings, &host, reservation.heavy, estimate);
+            let view: Vec<admission::Held> = held
+                .iter()
+                .map(|r| admission::Held {
+                    heavy: r.heavy,
+                    home: &r.home,
+                    charter: r.charter.as_deref(),
+                    created_ms: r.created_ms,
+                    demand: r.demand,
+                })
+                .collect();
+            admission::admit(
+                &settings,
+                &host,
+                Store::now_ms(),
+                &view,
+                &admission::Request {
+                    heavy: reservation.heavy,
+                    home: &reservation.home,
+                    charter: reservation.charter.as_deref().unwrap_or(""),
+                    charter_cap,
+                    demand: reservation.demand,
+                },
+            )?;
+        }
         conn.execute(
             "INSERT INTO reservations(key,record) VALUES(?1,?2)",
             params![reservation.key, serde_json::to_string(reservation)?],
@@ -537,6 +578,11 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         "cwd must stay inside charter repository"
     );
     let heavy = args.get("heavy").and_then(Value::as_bool).unwrap_or(true);
+    let estimate = args
+        .get("estimate")
+        .filter(|v| !v.is_null())
+        .map(admission::estimate)
+        .transpose()?;
     let cleanup_descendants = args
         .get("cleanup_descendants")
         .map(|value| {
@@ -578,7 +624,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
                 && existing.action == action
                 && existing.plugin_binding == plugin_binding
                 && existing.cleanup_descendants == cleanup_descendants
-                && existing.agent_actor == agent_actor,
+                && existing.agent_actor == agent_actor
+                && existing.estimate == estimate,
             "job id already belongs to different work"
         );
         return Ok(public_job(&existing));
@@ -604,17 +651,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         available >= min_free,
         "disk admission refused: {available} available, {min_free} required"
     );
-    let cfg = config(store)?;
-    let max_heavy = charter
-        .get("max_heavy_jobs")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .min(
-            cfg.get("max_heavy_jobs")
-                .and_then(Value::as_u64)
-                .unwrap_or(1),
-        );
-    ensure!(!heavy || max_heavy > 0, "heavy jobs disabled");
+    // An optional per-charter share of the host's heavy work.
+    let charter_cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
     let ledger_path = ledger_path(store)?;
     let mut job = Job {
         id: id.clone(),
@@ -639,9 +677,10 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         plugin_binding,
         cleanup_descendants,
         agent_actor,
+        estimate: estimate.clone(),
         leader_result: None,
     };
-    let reservation = Reservation {
+    let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
         home: store.home().to_owned(),
         job_id: id.clone(),
@@ -651,6 +690,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         created_ms: job.created_ms,
         supervisor: None,
         payload: None,
+        charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
+        demand: None,
     };
     let conn = store.connection();
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -668,12 +709,18 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
                     && existing.action == action
                     && existing.plugin_binding == job.plugin_binding
                     && existing.cleanup_descendants == job.cleanup_descendants
-                    && existing.agent_actor == job.agent_actor,
+                    && existing.agent_actor == job.agent_actor
+                    && existing.estimate == job.estimate,
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));
         }
-        reserve(&ledger(&ledger_path)?, &reservation, max_heavy)?;
+        reserve(
+            &ledger(&ledger_path)?,
+            &mut reservation,
+            estimate.as_ref(),
+            charter_cap,
+        )?;
         if let Err(error) = conn.execute(
             "INSERT INTO jobs(id,record) VALUES(?1,?2)",
             params![id, serde_json::to_string(&job)?],
@@ -1462,7 +1509,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
             );
             store.authorize(&old.task_id, "recovery")?;
-            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor});
+            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate});
             if let Some(id) = args.get("new_id") {
                 next["id"] = id.clone();
             }
@@ -1472,9 +1519,24 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             start(store, next, Some(old_id.to_owned()))
         }
         "resource.recover" => recover(store, &args),
+        // Host-wide and open to agents, which tune it to their person's wishes.
+        "resource.configure" => {
+            let settings = admission::configure(&ledger(&ledger_path(store)?)?, &args)?;
+            let caller = match store.caller() {
+                Caller::Operator => json!("operator"),
+                Caller::Agent { actor } => json!({"agent": actor}),
+            };
+            store.audit(
+                "resource.configured",
+                &json!({"changes": args, "by": caller}),
+            )?;
+            Ok(admission::report(&settings, &admission::measure()?))
+        }
         "resource.status" => {
             let path = ledger_path(store)?;
-            let records = reservations(&ledger(&path)?)?;
+            let conn = ledger(&path)?;
+            let records = reservations(&conn)?;
+            let settings = admission::settings(&conn)?;
             let mut values = vec![];
             for r in records {
                 let supervisor_alive = match &r.supervisor {
@@ -1494,9 +1556,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 );
                 values.push(value);
             }
-            Ok(
-                json!({"ledger": path, "heavy_reserved": values.iter().filter(|v| v["heavy"] == true).count(), "reservations": values}),
-            )
+            let mut status = admission::report(&settings, &admission::measure()?);
+            status["ledger"] = json!(path);
+            status["heavy_reserved"] = json!(values.iter().filter(|v| v["heavy"] == true).count());
+            status["reservations"] = json!(values);
+            Ok(status)
         }
         _ => bail!("unknown jobs command {command}"),
     }

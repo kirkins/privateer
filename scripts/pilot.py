@@ -76,6 +76,11 @@ def main():
                 "repo": str(repo), "max_heavy_jobs": 1, "min_free_bytes": 1024,
                 "job_timeout_secs": 20,
             })
+        # One shared heavy slot for the whole host makes the cross-home refusal
+        # deterministic; live load and memory limits are left generous here.
+        invoke(homes["navigator"], "resource.configure", {
+            "max_heavy_jobs": 1, "max_load_per_cpu": 64, "min_available_memory_bytes": 0,
+        })
         for source, targets in (
             ("navigator", ("applications", "infrastructure")),
             ("applications", ("infrastructure",)),

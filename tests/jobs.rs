@@ -31,10 +31,18 @@ impl Fixture {
     }
     fn home(&self, name: &str, min_free: u64) -> PathBuf {
         let home = self.root.join(name);
-        let store = Store::open(&home).unwrap();
+        let mut store = Store::open(&home).unwrap();
         fs::write(
             home.join("config.json"),
-            serde_json::to_vec(&json!({"resource_home":self.ledger,"max_heavy_jobs":1})).unwrap(),
+            serde_json::to_vec(&json!({"resource_home":self.ledger})).unwrap(),
+        )
+        .unwrap();
+        // These cases exercise supervision with one deterministic heavy slot;
+        // live load and memory admission is tested separately.
+        privateer::dispatch(
+            &mut store,
+            "resource.configure",
+            json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0}),
         )
         .unwrap();
         let charter = json!({"id":"mission","objective":"isolated supervisor fixture","repo":self.repo,
@@ -1040,4 +1048,158 @@ fn job_list_pages_and_still_repairs_a_leftover_reservation() {
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
     ok(&home, "job.list", json!({}));
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+fn heavy_job(home: &Path, id: &str, extra: Value) -> std::process::Output {
+    let mut args = json!({"task_id":"task","id":id,"command":["sleep","30"],"heavy":true});
+    for (key, value) in extra.as_object().unwrap() {
+        args[key] = value.clone();
+    }
+    run(home, "job.start", args)
+}
+
+#[test]
+fn resource_settings_are_host_wide_open_to_agents_and_validated() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    let agent = [("PRIVATEER_ROLE", "agent"), ("PRIVATEER_ACTOR", "peer")];
+    let configured = ok_env(
+        &home,
+        "resource.configure",
+        json!({"max_load_per_cpu":0.7,"min_available_memory_bytes":4_294_967_296_u64}),
+        &agent,
+    );
+    assert_eq!(configured["settings"]["max_load_per_cpu"], 0.7);
+    // Another home on the host sees the same policy, with live readings.
+    let status = ok(&other, "resource.status", json!({}));
+    assert_eq!(status["settings"]["max_load_per_cpu"], 0.7);
+    assert_eq!(
+        status["settings"]["min_available_memory_bytes"],
+        4_294_967_296_u64
+    );
+    let host = &status["host"];
+    assert!(host["cpus"].as_f64().unwrap() >= 1.0);
+    assert!(host["load"].as_f64().unwrap() >= 0.0);
+    let available = host["memory_available_bytes"].as_u64().unwrap();
+    assert!(available > 0 && available <= host["memory_total_bytes"].as_u64().unwrap());
+    // null restores a default.
+    let reset = ok(
+        &other,
+        "resource.configure",
+        json!({"max_load_per_cpu":null}),
+    );
+    assert_eq!(reset["settings"]["max_load_per_cpu"], 1.0);
+    for bad in [
+        json!({"max_load_per_cpu":0}),
+        json!({"max_heavy_jobs":0}),
+        json!({"heavy_estimate":{"gpus":1}}),
+        json!({"unknown":1}),
+    ] {
+        assert!(
+            !run(&home, "resource.configure", bad.clone())
+                .status
+                .success(),
+            "{bad}"
+        );
+    }
+    let audit = ok(&home, "audit.list", json!({"limit":100}));
+    // The fixture configured the host as operator first; the agent's change
+    // is recorded with its identity.
+    let by_agent = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "resource.configured" && e["payload"]["by"]["agent"] == "peer");
+    assert!(by_agent, "{audit}");
+}
+
+#[test]
+fn recent_estimates_space_out_heavy_jobs_until_their_ramp_passes() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    let cpus = ok(&home, "resource.status", json!({}))["host"]["cpus"]
+        .as_f64()
+        .unwrap();
+    // No slot cap: only live load plus recent estimates decide.
+    ok(
+        &home,
+        "resource.configure",
+        json!({"max_heavy_jobs":null,"max_load_per_cpu":4.0,"min_available_memory_bytes":0,
+            "heavy_estimate":{"memory_bytes":0},"ramp_secs":2}),
+    );
+    let big = json!({"estimate":{"cpus":(cpus * 5.0).min(1024.0)}});
+    let first = heavy_job(&home, "big-build", big);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    // Its load is not visible yet, but its estimate is counted, across homes.
+    let refused = heavy_job(&other, "second-build", json!({}));
+    assert!(!refused.status.success());
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("CPU demand"), "{error}");
+    // After the ramp the live reading is trusted; a sleeping job adds no load.
+    thread::sleep(Duration::from_millis(2500));
+    let admitted = heavy_job(&other, "second-build", json!({}));
+    assert!(
+        admitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    ok(&home, "job.cancel", json!({"id":"big-build"}));
+    ok(&other, "job.cancel", json!({"id":"second-build"}));
+}
+
+#[test]
+fn memory_floor_and_charter_share_refuse_heavy_work_only() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    let total = ok(&home, "resource.status", json!({}))["host"]["memory_total_bytes"]
+        .as_u64()
+        .unwrap();
+    ok(
+        &home,
+        "resource.configure",
+        json!({"max_heavy_jobs":null,"min_available_memory_bytes":total * 2}),
+    );
+    let refused = heavy_job(&home, "needs-memory", json!({}));
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("must stay free"), "{error}");
+    // Light jobs are not subject to admission unless they opt in.
+    start_light(&home, "light", &["true"]);
+    let estimated = run(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"estimated","command":["true"],"heavy":false,"estimate":{"memory_bytes":1}}),
+    );
+    assert!(!estimated.status.success());
+    // Each fixture charter allows itself one heavy job at a time.
+    ok(
+        &home,
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"max_load_per_cpu":1024,"ramp_secs":0}),
+    );
+    assert!(heavy_job(&home, "share-1", json!({})).status.success());
+    let second = heavy_job(&home, "share-2", json!({}));
+    let error = String::from_utf8_lossy(&second.stderr);
+    assert!(error.contains("charter heavy-job share"), "{error}");
+    assert!(heavy_job(&other, "elsewhere", json!({})).status.success());
+    // The estimate is part of a job's identity.
+    let changed = heavy_job(&home, "share-1", json!({"estimate":{"cpus":1}}));
+    assert!(!changed.status.success());
+    ok(&home, "job.cancel", json!({"id":"share-1"}));
+    ok(&other, "job.cancel", json!({"id":"elsewhere"}));
+}
+
+fn start_light(home: &Path, id: &str, command: &[&str]) {
+    ok(
+        home,
+        "job.start",
+        json!({"task_id":"task","id":id,"command":command,"heavy":false}),
+    );
+    wait(home, id, &["succeeded"]);
 }

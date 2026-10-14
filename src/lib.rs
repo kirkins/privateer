@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod core;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
