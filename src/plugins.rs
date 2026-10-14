@@ -209,7 +209,12 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
     if let Some(wake) = args.get("wake").filter(|v| !v.is_null()) {
         let wake = wake.as_str().context("wake must be text")?;
         ensure!(wake.len() <= 32_768, "wake text exceeds 32 KiB");
-        text.push_str("\n\n");
+        // A resumed native session already holds the brief.
+        if args.get("wake_only") == Some(&json!(true)) {
+            text.clear();
+        } else {
+            text.push_str("\n\n");
+        }
         text.push_str(wake);
     }
     context["brief"] = json!(text);
