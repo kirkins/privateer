@@ -57,6 +57,14 @@ impl Store {
     pub fn connection(&self) -> &Connection {
         &self.connection
     }
+    /// Read-modify-write transaction. IMMEDIATE takes the write lock up front so
+    /// concurrent writers wait on busy_timeout instead of failing on upgrade.
+    pub fn write_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    }
     pub fn home(&self) -> &Path {
         &self.home
     }
