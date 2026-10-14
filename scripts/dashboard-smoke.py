@@ -62,10 +62,22 @@ def main():
             os.write(terminal, f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
             drain(0.3)
             return output[start:]
-        assert b"Bridge" in click(5,8), "ship click did not open its workspace"
-        assert b"awaiting" in click(55,4), "Assignments click did not show handoff details"
-        assert b"codex" in click(71,4), "Terminals click did not show this ship's agent"
-        assert b"Custody" in click(85,4), "Logbook click did not show ship history"
+        assert b"Bridge" in click(5,10), "ship click did not open its workspace"
+        assert b"awaiting" in click(55,5), "Assignments click did not show handoff details"
+        assert b"codex" in click(71,5), "Terminals click did not show this ship's agent"
+        assert b"Custody" in click(85,5), "Logbook click did not show ship history"
+        os.write(terminal, b"i")
+        drain(0.2)
+        os.write(terminal, b"l")
+        drain(0.2)
+        os.write(terminal, b"m")
+        drain(0.2)
+        # Ratatui emits cursor moves between unchanged spaces, so phrases need
+        # not appear contiguously in a terminal's incremental byte stream.
+        assert all(word in output for word in [b"Tab:", b"preview", b"cancel"]), "demo composer did not open"
+        os.write(terminal, b"status please\t\r")
+        drain(0.3)
+        assert b"Recorded" in output, "status preview did not render"
         click(5,4)
         for key in [b"2", b"3", b"f", b"4", b"1", b"c", b"0"]:
             os.write(terminal, key)
@@ -89,7 +101,7 @@ def main():
             assert (before[3] & flag) == (after[3] & flag), "terminal mode was not restored"
         assert b"\x1b[?1049l" in output, "alternate screen was not restored"
         assert b"\x1b[?1006l" in output, "mouse capture was not restored"
-        print("Dashboard PTY smoke passed: mouse/keyboard navigation, resize, detail toggle, quit and terminal/mouse restoration.")
+        print("Dashboard PTY smoke passed: ship/inbox/liaison navigation, demo composer, resize, quit and terminal/mouse restoration.")
     finally:
         if not reaped:
             os.kill(pid, signal.SIGKILL)

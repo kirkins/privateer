@@ -26,6 +26,15 @@ floor; this does not require adopting a newer compiler for the runtime.
 Demo mode uses clearly labeled sample data, never opens an inherited Herdr
 socket and does not create a runtime home, jobs, events or model calls.
 
+Fleet home now previews a separate captain's inbox. Press `i` to inspect its
+sample decisions, replies and grouped notices, or `l` to open the liaison's
+Bridge. The liaison is an optional contact role among peer ships. In the demo,
+`m` opens a local Status/Ask/Message composer: Tab changes mode, Enter previews
+the interaction, and Escape cancels. Preview exchanges stay in memory and are
+discarded on exit. They do not call a model or deliver a live message. In live
+mode, the captain's inbox and messaging remain unavailable until the runtime's
+front door is connected; task alerts are not treated as captain mail.
+
 ## Existing state and Herdr
 
 In a Herdr pane, run:
@@ -71,6 +80,10 @@ owner/handoff identities observed in the bounded local snapshot. A registry
 entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
+
+One optional `liaison: true` ship supplies the contact badge and shortcut. This
+is presentation configuration, not a grant of authority or an implementation of
+the captain's runtime delivery policy.
 
 See [the example registry](../examples/dashboard.json). Its `id` must match the
 runtime's exact task-owner identity. Names, descriptions and terminal bindings

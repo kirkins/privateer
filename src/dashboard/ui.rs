@@ -1,4 +1,5 @@
 use super::{
+    captain::{Composer, Exchange, Mail},
     herdr,
     model::{Snapshot, Task, clean},
 };
@@ -15,6 +16,7 @@ const TABS: [&str; 4] = ["1 Bridge", "2 Assignments", "3 Terminals", "4 Logbook"
 
 #[derive(Default)]
 pub struct MouseMap {
+    actions: Vec<(Rect, char)>,
     tabs: Vec<(Rect, usize)>,
     ships: Rect,
     ship_offset: usize,
@@ -25,6 +27,10 @@ pub struct MouseMap {
 
 #[derive(Default)]
 pub struct App {
+    pub inbox_open: bool,
+    pub mail: Vec<Mail>,
+    pub composer: Option<Composer>,
+    pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
     pub herdr: Option<herdr::View>,
     pub home_error: Option<String>,
@@ -52,7 +58,7 @@ impl App {
         {
             return;
         }
-        if self.ship != id {
+        if self.ship != id || self.inbox_open {
             if self.ship.is_none() || id.is_none() {
                 self.tab = 0;
             }
@@ -61,6 +67,7 @@ impl App {
             self.scroll = 0;
             self.selection_invalidated = false;
         }
+        self.inbox_open = false;
         self.focus_content = false;
     }
     pub fn select_tab(&mut self, tab: usize) {
@@ -80,7 +87,7 @@ impl App {
         self.ship
             .as_ref()
             .and_then(|id| self.snapshot.ships.iter().position(|s| &s.id == id))
-            .map_or(0, |i| i + 1)
+            .map_or(usize::from(self.inbox_open), |i| i + 2)
     }
     pub fn assignment_indices(&self) -> Vec<usize> {
         let Some(ship) = self.ship.as_deref() else {
@@ -130,6 +137,9 @@ impl App {
             .copied()
     }
     pub fn selection_len(&self) -> usize {
+        if self.inbox_open {
+            return if self.demo { self.mail.len() } else { 0 };
+        }
         match self.tab {
             1 => self.assignment_indices().len(),
             2 => self.scoped_panes().len(),
@@ -139,16 +149,14 @@ impl App {
     pub fn move_selection(&mut self, down: bool) {
         if !self.focus_content {
             let current = self.ship_index();
-            let max = self.snapshot.ships.len();
+            let max = self.snapshot.ships.len() + 1;
             let next = if down {
                 (current + 1).min(max)
             } else {
                 current.saturating_sub(1)
             };
-            self.select_ship(
-                next.checked_sub(1)
-                    .map(|i| self.snapshot.ships[i].id.clone()),
-            );
+            self.select_navigation(next);
+            self.focus_content = false;
         } else if self.selection_len() > 0 {
             self.selected = if down {
                 (self.selected + 1).min(self.selection_len() - 1)
@@ -163,6 +171,17 @@ impl App {
             } else {
                 self.scroll.saturating_sub(1)
             };
+        }
+    }
+    fn select_navigation(&mut self, index: usize) {
+        match index {
+            0 => self.select_ship(None),
+            1 => self.open_inbox(),
+            _ => {
+                if let Some(ship) = self.snapshot.ships.get(index - 2) {
+                    self.select_ship(Some(ship.id.clone()));
+                }
+            }
         }
     }
     pub fn update_snapshot(&mut self, mut snapshot: Snapshot) {
@@ -208,18 +227,26 @@ impl App {
         }
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.composer.is_some() {
+            return;
+        }
         let point = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.mouse.ships.contains(point) {
+                if let Some((_, action)) =
+                    self.mouse.actions.iter().find(|(r, _)| r.contains(point))
+                {
+                    match action {
+                        'i' => self.open_inbox(),
+                        'l' => self.open_liaison(),
+                        'm' => self.compose(),
+                        _ => {}
+                    }
+                } else if self.mouse.ships.contains(point) {
                     let index =
                         self.mouse.ship_offset + usize::from((event.row - self.mouse.ships.y) / 2);
-                    if index <= self.snapshot.ships.len() {
-                        self.select_ship(
-                            index
-                                .checked_sub(1)
-                                .map(|i| self.snapshot.ships[i].id.clone()),
-                        );
+                    if index <= self.snapshot.ships.len() + 1 {
+                        self.select_navigation(index);
                     }
                 } else if let Some((_, tab)) =
                     self.mouse.tabs.iter().find(|(r, _)| r.contains(point))
@@ -287,6 +314,9 @@ impl App {
         lines
     }
     fn details(&self) -> Vec<Line<'static>> {
+        if self.inbox_open {
+            return self.inbox_lines();
+        }
         let Some(ship) = self
             .snapshot
             .ships
@@ -300,9 +330,31 @@ impl App {
                     self.snapshot.tasks.len(),
                     self.snapshot.pending.len()
                 )),
-                Line::from("Select a ship on the left to enter its workspace."),
+                Line::from("Select a ship to enter its workspace. i: Inbox · l: Talk to liaison"),
                 Line::from(""),
             ];
+            lines.push(Line::styled(
+                "Captain's inbox",
+                Style::default().fg(Color::Cyan),
+            ));
+            if self.demo {
+                for mail in self.mail.iter().take(3) {
+                    lines.push(Line::from(format!(
+                        "{} · {} · {}",
+                        clean(&mail.kind, 40),
+                        clean(&mail.from, 80),
+                        clean(&mail.subject, 160)
+                    )));
+                }
+                lines.push(Line::from(
+                    "Sample messages · i to inspect; no live mailbox connected",
+                ));
+            } else {
+                lines.push(Line::from(
+                    "Mailbox not connected. Ship alerts below are operational state.",
+                ));
+            }
+            lines.push(Line::from(""));
             for ship in &self.snapshot.ships {
                 let owned = self
                     .snapshot
@@ -323,13 +375,16 @@ impl App {
                     .filter(|n| n.owner == ship.id)
                     .count();
                 lines.push(Line::styled(
-                    clean(&ship.name, 160),
+                    format!(
+                        "{}{}",
+                        clean(&ship.name, 160),
+                        if ship.liaison { " · Liaison" } else { "" }
+                    ),
                     Style::default().fg(Color::Yellow),
                 ));
                 lines.push(Line::from(format!(
                     "{owned} owned · {incoming} incoming handoffs · {pending} pending issues"
                 )));
-                lines.push(Line::from(""));
             }
             lines.extend(self.pending_lines());
             return lines;
@@ -342,6 +397,11 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 ));
                 lines.push(Line::from(clean(&ship.description, 512)));
+                lines.push(Line::from(if ship.liaison {
+                    "Liaison · your default contact; a peer ship, not a commander."
+                } else {
+                    "Independent peer · first mate and crew work within this ship."
+                }));
                 let owned = self
                     .snapshot
                     .tasks
@@ -366,6 +426,22 @@ impl App {
                 lines.push(Line::from(
                     "Conversation and agent launch are not connected in this preview.",
                 ));
+                lines.push(Line::styled(
+                    if self.demo {
+                        "m: Try Status / Ask / Message · local demo only"
+                    } else {
+                        "Messaging unavailable until the captain's front door is connected."
+                    },
+                    Style::default().fg(Color::Cyan),
+                ));
+                for exchange in self.exchanges.iter().filter(|e| e.ship == ship.id) {
+                    lines.push(Line::from(format!(
+                        "Captain [{}]: {}",
+                        exchange.mode.label(),
+                        clean(&exchange.body, 1024)
+                    )));
+                    lines.push(Line::from(clean(&exchange.response, 1024)));
+                }
                 lines.push(Line::from(""));
                 lines.extend(self.pending_lines());
                 if !self.compact {
@@ -493,9 +569,15 @@ impl App {
             .ship
             .as_ref()
             .and_then(|id| self.snapshot.ships.iter().find(|s| &s.id == id))
-            .map_or("Fleet overview".into(), |s| {
-                format!("{} / {}", clean(&s.name, 160), TABS[self.tab])
-            });
+            .map_or(
+                if self.inbox_open {
+                    "Captain / Inbox"
+                } else {
+                    "Fleet overview"
+                }
+                .into(),
+                |s| format!("{} / {}", clean(&s.name, 160), TABS[self.tab]),
+            );
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
@@ -517,10 +599,17 @@ impl App {
         );
         let cols = Layout::horizontal([Constraint::Percentage(27), Constraint::Percentage(73)])
             .split(rows[1]);
-        let mut items = vec![ListItem::new(vec![
-            Line::from("Fleet overview"),
-            Line::from("All ships"),
-        ])];
+        let mut items = vec![
+            ListItem::new(vec![Line::from("Fleet overview"), Line::from("All ships")]),
+            ListItem::new(vec![
+                Line::from("Captain's inbox"),
+                Line::from(if self.demo {
+                    "Sample decisions / replies"
+                } else {
+                    "Not connected"
+                }),
+            ]),
+        ];
         for s in &self.snapshot.ships {
             let count = self
                 .snapshot
@@ -531,15 +620,16 @@ impl App {
             items.push(ListItem::new(vec![
                 Line::from(clean(&s.name, 160)),
                 Line::from(format!(
-                    "{count} assignment{}",
+                    "{} · {count} assignment{}",
+                    if s.liaison { "Liaison" } else { "Peer ship" },
                     if count == 1 { "" } else { "s" }
                 )),
             ]));
         }
         let block = Block::bordered().title(if self.focus_content {
-            "Ships · ← to navigate"
+            "Navigation · ←"
         } else {
-            "Ships"
+            "Navigation"
         });
         self.mouse.ships = block.inner(cols[0]);
         self.mouse.ships.height -= self.mouse.ships.height % 2;
@@ -554,6 +644,27 @@ impl App {
         );
         self.mouse.ship_offset = state.offset();
         let mut body = cols[1];
+        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
+        let mut actions = vec![("[i Inbox]", 'i'), ("[l Talk to liaison]", 'l')];
+        if self.ship.is_some() {
+            actions.push(("[m Message ship]", 'm'));
+        }
+        let mut x = sections[0].x;
+        let mut spans = Vec::new();
+        for (label, action) in actions {
+            let width = (label.len() as u16).min(sections[0].right().saturating_sub(x));
+            if width == 0 {
+                break;
+            }
+            self.mouse
+                .actions
+                .push((Rect::new(x, sections[0].y, width, 1), action));
+            spans.push(Span::styled(label, Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" "));
+            x = x.saturating_add(width + 1);
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), sections[0]);
+        body = sections[1];
         if self.ship.is_some() {
             let sections =
                 Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(body);
@@ -582,7 +693,9 @@ impl App {
             );
             body = sections[1];
         }
-        let mut title = if self.ship.is_none() {
+        let title = if self.inbox_open {
+            "Captain's inbox · message details"
+        } else if self.ship.is_none() {
             "Fleet overview"
         } else {
             match self.tab {
@@ -592,13 +705,35 @@ impl App {
                 _ => "Ship logbook",
             }
         };
-        if self.ship.is_some() && matches!(self.tab, 1 | 2) {
+        if self.inbox_open || (self.ship.is_some() && matches!(self.tab, 1 | 2)) {
             let parts = Layout::vertical([
                 Constraint::Length((body.height / 2).max(4)),
                 Constraint::Min(1),
             ])
             .split(body);
-            let entries = if self.tab == 1 {
+            let entries = if self.inbox_open {
+                if self.demo {
+                    self.mail
+                        .iter()
+                        .map(|m| {
+                            ListItem::new(vec![
+                                Line::from(format!(
+                                    "{} · {}",
+                                    clean(&m.kind, 40),
+                                    clean(&m.subject, 160)
+                                )),
+                                Line::from(format!(
+                                    "{} · {}",
+                                    clean(&m.from, 80),
+                                    clean(&m.status, 80)
+                                )),
+                            ])
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            } else if self.tab == 1 {
                 self.assignment_indices()
                     .iter()
                     .map(|&i| {
@@ -629,7 +764,9 @@ impl App {
                     })
                     .collect::<Vec<_>>()
             };
-            let block = Block::bordered().title(if self.tab == 1 {
+            let block = Block::bordered().title(if self.inbox_open {
+                "For the captain · decisions / replies / notices"
+            } else if self.tab == 1 {
                 "This ship's assignments / incoming handoffs"
             } else {
                 "This ship's terminals"
@@ -655,9 +792,6 @@ impl App {
                 "Bounded snapshot; older records remain in the runtime.",
                 Style::default().fg(Color::Yellow),
             ));
-        }
-        if self.ship.is_none() {
-            title = "Fleet overview";
         }
         let block = Block::bordered().title(title);
         self.mouse.details = block.inner(body);
@@ -685,7 +819,8 @@ impl App {
                 clean(&self.notice, 160)
             )
         });
-        frame.render_widget(Paragraph::new(vec![Line::from(" Click ships/tabs · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.home_error.is_some()||self.herdr_error.is_some(){Color::Red}else{Color::Gray}))]),rows[2]);
+        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.home_error.is_some()||self.herdr_error.is_some(){Color::Red}else{Color::Gray}))]),rows[2]);
+        self.draw_composer(frame);
     }
 }
 fn age(value: Option<u64>) -> String {

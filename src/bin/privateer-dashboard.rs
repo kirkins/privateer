@@ -7,6 +7,7 @@ use crossterm::{
     execute,
 };
 use privateer::dashboard::{
+    captain::sample_mail,
     herdr::{Client, Pane, View},
     model::Snapshot,
     ui::App,
@@ -49,7 +50,7 @@ fn options() -> Result<Option<Options>> {
             "--no-herdr" => out.no_herdr = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard --home /absolute/home [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only home view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, acknowledgments, inference, or fleet updates."
+                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard --home /absolute/home [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: liaison; m: demo Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only home view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, acknowledgments, inference, or fleet updates."
                 );
                 return Ok(None);
             }
@@ -200,6 +201,7 @@ fn run(opts: Options) -> Result<()> {
         compact: true,
         ascii: opts.ascii,
         demo: opts.demo,
+        mail: if opts.demo { sample_mail() } else { Vec::new() },
         home_age: Some(0),
         ..App::default()
     };
@@ -273,14 +275,31 @@ fn run(opts: Options) -> Result<()> {
                     continue;
                 }
                 redraw = true;
+                if app.composer.is_some() {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        app.edit_composer(key.code);
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Esc if app.ship.is_some() => app.select_ship(None),
+                    KeyCode::Esc if app.ship.is_some() || app.inbox_open => app.select_ship(None),
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('0') | KeyCode::Home => app.select_ship(None),
+                    KeyCode::Char('i') => app.open_inbox(),
+                    KeyCode::Char('l') => app.open_liaison(),
+                    KeyCode::Char('m') => app.compose(),
                     KeyCode::Left => app.focus_content = false,
-                    KeyCode::Right => app.focus_content = app.ship.is_some(),
+                    KeyCode::Right => app.focus_content = app.ship.is_some() || app.inbox_open,
                     KeyCode::Char('1'..='4') => {
                         if let KeyCode::Char(n) = key.code {
                             app.select_tab(n as usize - '1' as usize);
@@ -294,7 +313,9 @@ fn run(opts: Options) -> Result<()> {
                     KeyCode::PageDown => app.scroll = app.scroll.saturating_add(8),
                     KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(8),
                     KeyCode::Char('c') => app.compact = !app.compact,
-                    KeyCode::Enter if !app.focus_content => app.focus_content = app.ship.is_some(),
+                    KeyCode::Enter if !app.focus_content => {
+                        app.focus_content = app.ship.is_some() || app.inbox_open
+                    }
                     KeyCode::Enter | KeyCode::Char('f')
                         if app.ship.is_some() && matches!(app.tab, 0 | 2) =>
                     {
