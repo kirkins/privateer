@@ -3,6 +3,7 @@
     {
       "id": "navigator",
       "name": "Navigator",
+      "liaison": true,
       "description": "A familiar point of contact; an equal peer",
       "terminals": []
     },

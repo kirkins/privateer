@@ -29,6 +29,8 @@ pub struct Ship {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub liaison: bool,
+    #[serde(default)]
     pub terminals: Vec<TerminalBinding>,
 }
 
@@ -38,6 +40,7 @@ impl Ship {
             id: id.into(),
             name: name.into(),
             description: description.into(),
+            liaison: id == "navigator",
             terminals: agent
                 .map(|_| TerminalBinding {
                     pane_id: format!("demo:{id}"),
@@ -85,6 +88,10 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
     );
     let mut ids = BTreeSet::new();
     let mut terminals = BTreeSet::new();
+    ensure!(
+        registry.ships.iter().filter(|s| s.liaison).count() <= 1,
+        "only one ship may be the liaison"
+    );
     for ship in &registry.ships {
         crate::store::identifier(&ship.id)?;
         ensure!(ids.insert(ship.id.clone()), "duplicate ship identity");

@@ -531,6 +531,7 @@ fn oversized_and_slow_drip_socket_responses_are_bounded() {
 fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
     let mut app = App {
         snapshot: Snapshot::demo(),
+        mail: privateer::dashboard::captain::sample_mail(),
         demo: true,
         herdr: Some(privateer::dashboard::herdr::View::demo()),
         compact: true,
@@ -551,11 +552,149 @@ fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
         app.select_tab(1);
         let assignments = render(&mut app, 120, 34);
         fs::write(
-            std::path::PathBuf::from(path).with_file_name("dashboard-preview-assignments.txt"),
+            std::path::PathBuf::from(&path).with_file_name("dashboard-preview-assignments.txt"),
             assignments,
         )
         .unwrap();
+        app.open_inbox();
+        fs::write(
+            std::path::PathBuf::from(&path).with_file_name("dashboard-preview-inbox.txt"),
+            render(&mut app, 120, 34),
+        )
+        .unwrap();
+        app.open_liaison();
+        app.compose();
+        fs::write(
+            std::path::PathBuf::from(&path).with_file_name("dashboard-preview-compose.txt"),
+            render(&mut app, 120, 34),
+        )
+        .unwrap();
     }
+}
+
+#[test]
+fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh() {
+    use privateer::dashboard::{captain::sample_mail, herdr::View};
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        mail: sample_mail(),
+        demo: true,
+        ..App::default()
+    };
+    let before = serde_json::to_value(&app.snapshot).unwrap();
+    let screen = render(&mut app, 120, 34);
+    click_text(&mut app, &screen, "[i Inbox]");
+    assert!(app.inbox_open && app.ship.is_none());
+    let screen = render(&mut app, 120, 34);
+    click_text(&mut app, &screen, "Reply · Build investigation");
+    assert_eq!(app.selected, 1);
+    app.update_herdr(View::demo());
+    assert_eq!(
+        app.selected, 1,
+        "a terminal refresh cannot reset a mail selection"
+    );
+    assert!(render(&mut app, 120, 34).contains("still owned by Apps"));
+    assert!(app.selected_pane().is_none());
+    assert!(app.assignment_indices().is_empty());
+    let screen = render(&mut app, 120, 34);
+    click_text(&mut app, &screen, "[l Talk to liaison]");
+    assert_eq!(app.ship.as_deref(), Some("navigator"));
+    assert!(!app.inbox_open);
+    assert!(render(&mut app, 120, 34).contains("Liaison · your default contact"));
+    assert_eq!(serde_json::to_value(&app.snapshot).unwrap(), before);
+    app.select_ship(None);
+    app.move_selection(true);
+    assert!(app.inbox_open);
+    app.move_selection(true);
+    assert_eq!(app.ship.as_deref(), Some("navigator"));
+}
+
+#[test]
+fn demo_composer_bounds_input_and_history_without_changing_runtime_state() {
+    use crossterm::event::KeyCode;
+    use privateer::dashboard::captain::InputMode;
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        demo: true,
+        ..App::default()
+    };
+    let before = serde_json::to_value(&app.snapshot).unwrap();
+    app.open_liaison();
+    app.compose();
+    for c in "quit?".chars() {
+        app.edit_composer(KeyCode::Char(c));
+    }
+    app.edit_composer(KeyCode::Esc);
+    assert!(app.exchanges.is_empty());
+    app.compose();
+    for _ in 0..1100 {
+        app.edit_composer(KeyCode::Char('界'));
+    }
+    app.edit_composer(KeyCode::Char('\u{202e}'));
+    assert_eq!(app.composer.as_ref().unwrap().body.chars().count(), 1024);
+    let small = render(&mut app, 50, 14);
+    assert!(
+        small.contains("Esc: cancel"),
+        "long input must not hide modal controls"
+    );
+    app.edit_composer(KeyCode::Tab);
+    assert_eq!(app.composer.as_ref().unwrap().mode, InputMode::Status);
+    app.edit_composer(KeyCode::Enter);
+    app.edit_composer(KeyCode::Enter);
+    assert_eq!(app.exchanges.len(), 1, "submission consumes the draft once");
+    assert!(app.exchanges[0].response.contains("No model call or wake"));
+    for _ in 0..25 {
+        app.compose();
+        app.edit_composer(KeyCode::Char('a'));
+        app.edit_composer(KeyCode::Enter);
+    }
+    assert_eq!(app.exchanges.len(), 20);
+    assert_eq!(serde_json::to_value(&app.snapshot).unwrap(), before);
+}
+
+#[test]
+fn live_captain_view_does_not_infer_mail_or_allow_demo_sends() {
+    let (_root, store) = fixture();
+    let mut app = App {
+        snapshot: Snapshot::read(store.home()).unwrap(),
+        ..App::default()
+    };
+    app.open_inbox();
+    assert_eq!(app.selection_len(), 0);
+    assert!(render(&mut app, 120, 34).contains("not connected to a runtime mailbox"));
+    app.select_ship(Some("navigator".into()));
+    app.compose();
+    assert!(app.composer.is_none());
+    assert!(app.notice.contains("No message sent"));
+    assert!(app.exchanges.is_empty());
+    app.open_liaison();
+    assert!(app.notice.contains("No liaison configured"));
+}
+
+#[test]
+fn registry_allows_one_optional_liaison_without_changing_task_ownership() {
+    let (_root, store) = fixture();
+    let path = store.home().join("dashboard.json");
+    fs::write(
+        &path,
+        json!({"ships":[{"id":"contact","name":"Contact","liaison":true}]}).to_string(),
+    )
+    .unwrap();
+    let snapshot = Snapshot::read(store.home()).unwrap();
+    assert!(
+        snapshot
+            .ships
+            .iter()
+            .any(|s| s.id == "contact" && s.liaison)
+    );
+    assert!(snapshot.tasks.iter().all(|t| t.owner == "navigator"));
+    fs::write(&path, json!({"ships":[{"id":"one","name":"One","liaison":true},{"id":"two","name":"Two","liaison":true}]}).to_string()).unwrap();
+    assert!(
+        Snapshot::read(store.home())
+            .unwrap_err()
+            .to_string()
+            .contains("only one ship may be the liaison")
+    );
 }
 
 #[test]
