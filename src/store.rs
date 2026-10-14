@@ -9,6 +9,50 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct Store {
     home: PathBuf,
     connection: Connection,
+    caller: Caller,
+}
+
+/// Who is issuing commands. Agents launched by Privateer run with a role
+/// marker that refuses operator commands and binds actor names to their own
+/// identity. This guards against confused agents; it is a workflow control
+/// under one OS account, not a security boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Caller {
+    Operator,
+    Agent { actor: String },
+}
+
+impl Caller {
+    /// Combine the role marker from the environment (`PRIVATEER_ROLE`,
+    /// `PRIVATEER_ACTOR`) with optional CLI flags. Either source can narrow the
+    /// caller to an agent; neither can widen an agent back to an operator.
+    pub fn resolve(
+        env_role: Option<&str>,
+        env_actor: Option<&str>,
+        flag_role: Option<&str>,
+        flag_actor: Option<&str>,
+    ) -> Result<Self> {
+        let mut agent = false;
+        for role in [env_role, flag_role].into_iter().flatten() {
+            match role {
+                "agent" => agent = true,
+                "operator" => {}
+                _ => bail!("role must be operator or agent"),
+            }
+        }
+        let actor = match (env_actor, flag_actor) {
+            (Some(a), Some(b)) if a != b => bail!("conflicting actor identities"),
+            (a, b) => a.or(b),
+        };
+        if !agent {
+            return Ok(Self::Operator);
+        }
+        let actor = actor.context("agent role requires an actor identity")?;
+        identifier(actor)?;
+        Ok(Self::Agent {
+            actor: actor.to_owned(),
+        })
+    }
 }
 
 impl Store {
@@ -40,6 +84,21 @@ impl Store {
               kind TEXT NOT NULL,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),
               artifact TEXT NOT NULL,environment TEXT NOT NULL,charter_hash TEXT NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);")?;
+        // Homes created by 0.1.0 lack the approver column. Check and add it
+        // under the write lock so concurrent opens cannot both add it.
+        let migrate = rusqlite::Transaction::new_unchecked(
+            &connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let has_approver: bool = migrate.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='approver')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_approver {
+            migrate.execute_batch("ALTER TABLE approvals ADD COLUMN approver TEXT;")?;
+        }
+        migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;
         let schema: String =
             connection.query_row("SELECT value FROM metadata WHERE key='schema'", [], |r| {
@@ -48,7 +107,11 @@ impl Store {
         if schema != "1" {
             bail!("unsupported state schema {schema}");
         }
-        let store = Self { home, connection };
+        let store = Self {
+            home,
+            connection,
+            caller: Caller::Operator,
+        };
         crate::jobs::init(&store)?;
         crate::peers::init(&store)?;
         Ok(store)
@@ -56,6 +119,12 @@ impl Store {
 
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+    pub fn caller(&self) -> &Caller {
+        &self.caller
+    }
+    pub fn set_caller(&mut self, caller: Caller) {
+        self.caller = caller;
     }
     /// Read-modify-write transaction. IMMEDIATE takes the write lock up front so
     /// concurrent writers wait on busy_timeout instead of failing on upgrade.

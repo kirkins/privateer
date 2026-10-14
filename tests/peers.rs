@@ -276,3 +276,48 @@ fn deadline_covers_blocked_request_writes_and_inherited_output_pipes() {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn agent_role_travels_to_the_remote_home() {
+    let fixture = TempDir::new().unwrap();
+    let home = fixture.path().join("navigator");
+    let remote = fixture.path().join("department");
+    let ssh = script(
+        fixture.path(),
+        "fake-ssh",
+        "for argument do remote=$argument; done\nexec /bin/sh -c \"$remote\"",
+    );
+    for host in [None, Some("department")] {
+        put(&home, &remote, host, 10_000, 1_048_576, Path::new(binary()));
+        let call = |command: &str, args: Value| -> Value {
+            let output = Command::new(binary())
+                .args(["--home", home.to_str().unwrap(), "peer.call", "--json"])
+                .arg(json!({"name":"infrastructure","command":command,"args":args}).to_string())
+                .env("PRIVATEER_SSH_EXECUTABLE", &ssh)
+                .env("PRIVATEER_ROLE", "agent")
+                .env("PRIVATEER_ACTOR", "apps")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).unwrap()
+        };
+        assert_eq!(call("status", json!({}))["ok"], true, "{host:?}");
+        let refused = call("charter.put", json!({"id":"remote","active":true}));
+        assert_eq!(refused["ok"], false, "{host:?}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("operator command"),
+            "{refused}"
+        );
+        let spoofed = call("message.inbox", json!({"actor":"infra"}));
+        assert_eq!(spoofed["ok"], false, "{host:?}");
+        assert_eq!(call("message.inbox", json!({"actor":"apps"}))["ok"], true);
+    }
+}
