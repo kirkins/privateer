@@ -57,6 +57,15 @@ struct Job {
     plugin_binding: Option<Value>,
     #[serde(default)]
     cleanup_descendants: bool,
+    /// Outcome the job settles to once descendants left by an exited leader
+    /// are gone. Absent when the supervisor vanished before recording one.
+    #[serde(default)]
+    leader_result: Option<LeaderResult>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LeaderResult {
+    status: String,
+    reason: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Reservation {
@@ -362,10 +371,13 @@ fn group_alive(process: &Process) -> Result<bool> {
     // A live original leader anchors identity. If it vanished, an orphaned
     // group still occupies this PGID; conservatively preserve that capacity.
     if let Some(current) = identity(process.pid)? {
-        ensure!(
-            same_start(&process.started, &current.started),
-            "payload PID was reused; explicit recovery required"
-        );
+        // POSIX forbids reusing a PID that names a live process group until
+        // that group's lifetime ends. A different process holding the leader
+        // PID therefore proves the recorded group is gone; any group now using
+        // that id belongs to the new process.
+        if !same_start(&process.started, &current.started) {
+            return Ok(false);
+        }
     }
     Ok(!group_members(process.pid)?.is_empty())
 }
@@ -580,6 +592,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         group_anchors: vec![],
         plugin_binding,
         cleanup_descendants,
+        leader_result: None,
     };
     let reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -1007,6 +1020,12 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         };
         j.exit_code = status.code();
         j.finished_ms = Some(Store::now_ms());
+        if group_remains {
+            j.leader_result = Some(LeaderResult {
+                status: outcome.into(),
+                reason: reason.clone(),
+            });
+        }
         j.reason = if group_remains {
             Some(reason.unwrap_or_else(|| {
                 "payload group still has descendants; reservation preserved".into()
@@ -1047,6 +1066,49 @@ fn reconcile(store: &Store, mut job: Job) -> Result<Job> {
         Some(p) => group_alive(p)?,
         None => false,
     };
+    if !supervisor_alive && job.payload.is_some() && !payload_alive {
+        // No supervisor and no recorded group member remains: nothing can hold
+        // this capacity. Settle to the leader's result when it was recorded.
+        let observed_incarnation = job.incarnation.clone();
+        let observed_payload = job.payload.clone();
+        let mut settled = false;
+        job = alter(store, &job.id, |j| {
+            if terminal(&j.status)
+                || j.incarnation != observed_incarnation
+                || j.payload != observed_payload
+            {
+                return;
+            }
+            settled = true;
+            match j.leader_result.take() {
+                Some(result) => {
+                    j.status = result.status;
+                    j.reason = result.reason;
+                }
+                None if j.cancel_requested => {
+                    j.status = "cancelled".into();
+                    j.reason = Some("cancellation requested".into());
+                }
+                None => {
+                    j.status = "failed".into();
+                    j.reason = Some(
+                        "supervisor disappeared; payload ended without a recorded result".into(),
+                    );
+                }
+            }
+            j.finished_ms = j.finished_ms.or(Some(Store::now_ms()));
+        })?;
+        if terminal(&job.status) {
+            release(store, &job)?;
+        }
+        if settled {
+            store.audit(
+                "job.settled",
+                &json!({"job_id": job.id, "status": job.status, "exit_code": job.exit_code}),
+            )?;
+        }
+        return Ok(job);
+    }
     if !supervisor_alive
         && (job.payload.is_some() || Store::now_ms() - job.created_ms > START_GRACE_MS)
     {
@@ -1125,18 +1187,100 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
             job = alter(store, id, |j| {
                 j.status = "cancelled".into();
                 j.finished_ms = Some(Store::now_ms());
+                j.reason = Some("cancellation requested".into());
+                j.leader_result = None;
             })?;
             release(store, &job)?;
         } else {
             // A missing identity in the detach/spawn window is not proof that
             // no process exists. Keep the reservation for manual inspection.
             bail!(
-                "supervisor/payload identity unavailable; cancellation recorded, reservation preserved"
+                "supervisor/payload identity unavailable; cancellation recorded, reservation preserved; after checking for the payload, release it with resource.recover and force:true"
             );
         }
     }
     store.audit("job.cancel_requested", &json!({"job_id": id}))?;
     Ok(public_job(&job))
+}
+/// Explicit operator recovery for a shared-ledger reservation that no job can
+/// settle: its job record is missing (a crash between ledger and home
+/// commits), belongs to another home, or never recorded a payload identity.
+/// Live supervisors and live payload groups are never released, even with
+/// force; those are stopped through job.cancel.
+fn recover(store: &Store, args: &Value) -> Result<Value> {
+    let key = args
+        .get("key")
+        .and_then(Value::as_str)
+        .context("key required (see resource.status)")?;
+    let force = args
+        .get("force")
+        .map(|v| v.as_bool().context("force must be boolean"))
+        .transpose()?
+        .unwrap_or(false);
+    let conn = ledger(&ledger_path(store)?)?;
+    let raw: String = conn
+        .query_row("SELECT record FROM reservations WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .context("unknown reservation")?;
+    let reservation: Reservation = serde_json::from_str(&raw)?;
+    // Prefer this home's job record; the ledger copy may lag behind it.
+    let job = if reservation.home == store.home() {
+        load(store, &reservation.job_id)
+            .ok()
+            .filter(|j| j.incarnation == reservation.incarnation)
+    } else {
+        None
+    };
+    let supervisor = job
+        .as_ref()
+        .and_then(|j| j.supervisor.clone())
+        .or(reservation.supervisor.clone());
+    let payload = job
+        .as_ref()
+        .and_then(|j| j.payload.clone())
+        .or(reservation.payload.clone());
+    if let Some(p) = &supervisor {
+        ensure!(
+            !same_process(p)?,
+            "supervisor is still running; use job.cancel"
+        );
+    }
+    match &payload {
+        Some(p) => ensure!(
+            !group_alive(p)?,
+            "payload group is still running; use job.cancel"
+        ),
+        None => {
+            ensure!(
+                Store::now_ms() - reservation.created_ms > START_GRACE_MS,
+                "reservation is still within its start grace period"
+            );
+            ensure!(
+                force,
+                "no payload identity was recorded, so no process can be proven absent; check for job {} manually, then pass force:true",
+                reservation.job_id
+            );
+        }
+    }
+    if let Some(job) = job.filter(|j| !terminal(&j.status)) {
+        alter(store, &job.id, |j| {
+            if j.incarnation == reservation.incarnation && !terminal(&j.status) {
+                j.status = "failed".into();
+                j.finished_ms = Some(Store::now_ms());
+                j.reason = Some("reservation released by resource.recover".into());
+                j.leader_result = None;
+            }
+        })?;
+    }
+    conn.execute("DELETE FROM reservations WHERE key=?1", [key])?;
+    store.audit(
+        "resource.recovered",
+        &json!({"key": key, "home": reservation.home, "job_id": reservation.job_id,
+            "incarnation": reservation.incarnation, "forced": payload.is_none()}),
+    )?;
+    Ok(json!({"released": key, "job_id": reservation.job_id, "forced": payload.is_none()}))
 }
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -1189,6 +1333,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             start(store, next, Some(old_id.to_owned()))
         }
+        "resource.recover" => recover(store, &args),
         "resource.status" => {
             let path = ledger_path(store)?;
             let records = reservations(&ledger(&path)?)?;
