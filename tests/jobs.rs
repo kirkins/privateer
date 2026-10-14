@@ -505,7 +505,7 @@ fn unexpected_supervisor_error_is_private_durable_and_keeps_payload_capacity() {
         .join(orphan["incarnation"].as_str().unwrap())
         .join("supervisor.log");
     let diagnostic = fs::read_to_string(&logfile).unwrap();
-    assert!(diagnostic.contains("process inspection failed"));
+    assert!(diagnostic.contains("inspection failed"), "{diagnostic}");
     assert!(fs::metadata(&logfile).unwrap().len() <= 1024 * 1024);
     assert_eq!(
         fs::metadata(&logfile).unwrap().permissions().mode() & 0o777,
@@ -540,5 +540,107 @@ fn opted_in_completion_cleanup_stops_owned_helpers_and_preserves_success() {
         .parse()
         .unwrap();
     assert!(!active_pid(descendant));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+fn ok_env(home: &Path, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
+    let output = Command::new(BIN)
+        .arg("--home")
+        .arg(home)
+        .arg(command)
+        .arg("--json")
+        .arg(args.to_string())
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{command}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn process_identity_does_not_depend_on_caller_timezone_or_locale() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    ok_env(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"zoned","command":["sleep","30"],"heavy":true}),
+        &[("TZ", "UTC0"), ("LC_ALL", "C")],
+    );
+    wait(&home, "zoned", &["running"]);
+    // Status, listing and capacity inspection from another environment must
+    // still recognise the supervisor and payload recorded under the first.
+    let elsewhere = [("TZ", "JST-9"), ("LC_ALL", "C.UTF-8")];
+    let job = ok_env(&home, "job.status", json!({"id":"zoned"}), &elsewhere);
+    assert_eq!(job["status"], "running", "{job}");
+    assert_eq!(job["reason"], Value::Null);
+    let listed = ok_env(&home, "job.list", json!({}), &elsewhere);
+    assert_eq!(listed[0]["status"], "running");
+    let resources = ok_env(&home, "resource.status", json!({}), &elsewhere);
+    assert_eq!(resources["reservations"][0]["supervisor_alive"], true);
+    assert_eq!(resources["reservations"][0]["payload_group_alive"], true);
+    ok_env(&home, "job.cancel", json!({"id":"zoned"}), &elsewhere);
+    let cancelled = wait(&home, "zoned", &["cancelled"]);
+    assert!(!active_pid(
+        cancelled["payload"]["pid"].as_i64().unwrap() as i32
+    ));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn records_from_the_previous_identity_format_remain_recoverable() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "legacy", &["sleep", "30"]);
+    let running = wait(&home, "legacy", &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+    // Rewrite every recorded identity as 0.1.0 stored it: local lstart + ticks.
+    let store = Store::open(&home).unwrap();
+    let raw: String = store
+        .connection()
+        .query_row("SELECT record FROM jobs WHERE id='legacy'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut record: Value = serde_json::from_str(&raw).unwrap();
+    let legacy = |p: &mut Value| {
+        let ticks = p["started"].as_str().unwrap().rsplit(':').next().unwrap();
+        p["started"] = json!(format!("Thu Oct 15 05:21:59 2026|ticks:{ticks}"));
+    };
+    legacy(&mut record["supervisor"]);
+    legacy(&mut record["payload"]);
+    for anchor in record["group_anchors"].as_array_mut().unwrap() {
+        legacy(anchor);
+    }
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=?1 WHERE id='legacy'",
+            params![record.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"legacy"}))["status"],
+        "running"
+    );
+    // Without its supervisor, cancellation must still prove and stop the payload.
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    let orphaned = wait(&home, "legacy", &["orphaned"]);
+    assert_eq!(
+        orphaned["reason"],
+        "supervisor disappeared; payload capacity preserved"
+    );
+    ok(&home, "job.cancel", json!({"id":"legacy"}));
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"legacy"}))["status"],
+        "cancelled"
+    );
+    assert!(!active_pid(payload));
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }

@@ -29,6 +29,6 @@ A real native Codex canary launched through the plugin and supervisor, repaired 
 - Qualification of each chosen harness/provider profile and its hooks with representative workloads.
 - Reviewed migration preserving current work, notes, profiles, credentials, and rollback paths.
 
-Charters are workflow controls under the current OS account. Plugins and harnesses are trusted executable code. Hard production credential isolation and containment of intentionally escaped processes require an enforced broker/platform boundary. macOS process identity currently uses second-resolution `ps lstart`; Linux also uses kernel start ticks.
+Charters are workflow controls under the current OS account. Plugins and harnesses are trusted executable code. Hard production credential isolation and containment of intentionally escaped processes require an enforced broker/platform boundary. Linux process identity uses kernel start ticks and the boot id, independent of the caller's timezone and locale. macOS uses second-resolution `ps lstart`, rendered in UTC and the C locale.
 
 No live fleet replacement occurred during this milestone. Source publication is separate from production deployment.

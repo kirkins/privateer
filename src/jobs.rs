@@ -235,9 +235,50 @@ fn release(store: &Store, job: &Job) -> Result<()> {
     )?;
     Ok(())
 }
+/// Start identity must not depend on the caller's environment: status, cancel
+/// and recovery may run from a shell, SSH session or service with another
+/// TZ/locale than the supervisor that recorded it.
+#[cfg(target_os = "linux")]
 fn identity(pid: u32) -> Result<Option<Process>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect process identity"),
+    };
+    // The executable comm may contain spaces/parentheses. Fields after its
+    // final ')' start at field 3 (state); kernel start ticks are field 22.
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .context("invalid kernel process identity")?
+        .1
+        .split_whitespace()
+        .collect();
+    let state = fields.first().context("kernel process state missing")?;
+    let ticks = fields.get(19).context("kernel process start missing")?;
+    // Start ticks count from boot; the boot id keeps them unique across reboots.
+    // It is constant until reboot; supervisors poll identity, so read it once.
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let boot = match BOOT.get() {
+        Some(boot) => boot,
+        None => {
+            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .context("inspect boot identity")?;
+            BOOT.get_or_init(|| boot.trim().to_owned())
+        }
+    };
+    Ok(Some(Process {
+        pid,
+        started: format!("linux:{boot}:{ticks}"),
+        zombie: matches!(*state, "Z" | "X"),
+    }))
+}
+#[cfg(not(target_os = "linux"))]
+fn identity(pid: u32) -> Result<Option<Process>> {
+    // lstart is rendered in local time and locale; pin both.
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "stat="])
+        .env("TZ", "UTC0")
+        .env("LC_ALL", "C")
         .output()
         .context("inspect process identity")?;
     let raw = String::from_utf8(output.stdout)?;
@@ -256,33 +297,49 @@ fn identity(pid: u32) -> Result<Option<Process>> {
     if started.is_empty() {
         return Ok(None);
     }
-    #[cfg(target_os = "linux")]
-    let started = {
-        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        // The executable comm may contain spaces/parentheses. Fields after its
-        // final ')' start at field 3; kernel start ticks are field 22.
-        let rest = stat
-            .rsplit_once(')')
-            .context("invalid kernel process identity")?
-            .1;
-        let ticks = rest
-            .split_whitespace()
-            .nth(19)
-            .context("kernel process start missing")?;
-        format!("{started}|ticks:{ticks}")
-    };
     Ok(Some(Process {
         pid,
         started,
         zombie,
     }))
 }
+/// Compare a recorded start identity with a freshly observed one.
+fn same_start(recorded: &str, current: &str) -> bool {
+    if recorded == current {
+        return true;
+    }
+    // Records from 0.1.0 used "<local lstart>|ticks:N"; their kernel ticks
+    // still identify the process, the environment-dependent prefix does not.
+    #[cfg(target_os = "linux")]
+    if let (Some((_, old)), Some((_, new))) =
+        (recorded.rsplit_once("|ticks:"), current.rsplit_once(':'))
+    {
+        return old == new;
+    }
+    false
+}
+/// Whether our child has exited, without reaping it. The zombie keeps its PID,
+/// and therefore its process-group id, reserved until try_wait reaps it.
+fn leader_exited(pid: u32) -> Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    ensure!(
+        rc == 0,
+        "cannot inspect payload leader: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(unsafe { info.si_pid() } != 0)
+}
 fn same_process(process: &Process) -> Result<bool> {
-    Ok(identity(process.pid)?.is_some_and(|p| !p.zombie && p.started == process.started))
+    Ok(identity(process.pid)?
+        .is_some_and(|p| !p.zombie && same_start(&process.started, &p.started)))
 }
 fn group_members(group: u32) -> Result<Vec<u32>> {
     let output = Command::new("ps")
@@ -306,7 +363,7 @@ fn group_alive(process: &Process) -> Result<bool> {
     // group still occupies this PGID; conservatively preserve that capacity.
     if let Some(current) = identity(process.pid)? {
         ensure!(
-            current.started == process.started,
+            same_start(&process.started, &current.started),
             "payload PID was reused; explicit recovery required"
         );
     }
@@ -316,7 +373,7 @@ fn capture_anchors(process: &Process) -> Result<Vec<Process>> {
     let leader = identity(process.pid)?
         .context("payload leader missing; cannot discover group ownership")?;
     ensure!(
-        leader.started == process.started
+        same_start(&process.started, &leader.started)
             && (leader.zombie
                 || unsafe { libc::getpgid(process.pid as i32) } == process.pid as i32),
         "payload leader changed; cannot discover group ownership"
@@ -854,9 +911,13 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             // Snapshot before reaping: an unreaped original leader (including
             // a zombie) proves group ownership. This records ordinary orphan
             // descendants too, without trusting a bare PGID after leader exit.
+            // Exit is observed without reaping, so the leader cannot be reaped
+            // between this snapshot and the try_wait below.
+            let exited = leader_exited(payload.pid)?;
             if let Some(observed) = identity(payload.pid)? {
-                if observed.started == payload.started
-                    && (observed.zombie
+                if same_start(&payload.started, &observed.started)
+                    && (exited
+                        || observed.zombie
                         || last_anchor_snapshot.elapsed() >= Duration::from_millis(500))
                 {
                     let anchors = capture_anchors(&payload)?;
@@ -864,7 +925,9 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                     last_anchor_snapshot = Instant::now();
                 }
             }
-            leader_status = child.try_wait()?;
+            if exited {
+                leader_status = child.try_wait()?;
+            }
         }
         job = load(store, id)?;
         if let Some(status) = leader_status {
