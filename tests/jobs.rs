@@ -996,3 +996,48 @@ fn history_prune_keeps_pending_facts_and_reserved_capacity() {
         );
     }
 }
+
+#[test]
+fn job_list_pages_and_still_repairs_a_leftover_reservation() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    for id in ["a", "b", "c"] {
+        start(&home, id, &["true"]);
+        wait(&home, id, &["succeeded"]);
+    }
+    let ids = |page: &Value| -> Vec<String> {
+        page.as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let first = ok(&home, "job.list", json!({"limit":2}));
+    assert_eq!(ids(&first), ["a", "b"]);
+    let rest = ok(&home, "job.list", json!({"limit":2,"after_id":"b"}));
+    assert_eq!(ids(&rest), ["c"]);
+    assert!(
+        !run(&home, "job.list", json!({"limit":"all"}))
+            .status
+            .success()
+    );
+    // A finished job whose release was interrupted still holds capacity;
+    // listing repairs it once its process group is provably gone.
+    let job = ok(&home, "job.status", json!({"id":"b"}));
+    let key = format!(
+        "{}:b:{}",
+        home.display(),
+        job["incarnation"].as_str().unwrap()
+    );
+    rusqlite::Connection::open(fixture.ledger.join("resources.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO reservations(key,record) VALUES(?1,?2)",
+            params![key, json!({"key":key,"home":home,"job_id":"b","incarnation":job["incarnation"],
+                "heavy":true,"state":"succeeded","created_ms":0,"supervisor":job["supervisor"],"payload":job["payload"]}).to_string()],
+        )
+        .unwrap();
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    ok(&home, "job.list", json!({}));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}

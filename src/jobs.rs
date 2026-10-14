@@ -1103,10 +1103,31 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn reconcile(store: &Store, mut job: Job) -> Result<Job> {
+/// Reservation keys per ledger, read once per command. A finished job never
+/// gains a reservation, so a key absent here stays absent.
+#[derive(Default)]
+struct Reserved(std::collections::HashMap<PathBuf, std::collections::HashSet<String>>);
+impl Reserved {
+    fn holds(&mut self, store: &Store, job: &Job) -> Result<bool> {
+        if !self.0.contains_key(&job.ledger) {
+            let conn = ledger(&job.ledger)?;
+            let keys = conn
+                .prepare("SELECT key FROM reservations")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            self.0.insert(job.ledger.clone(), keys);
+        }
+        Ok(self.0[&job.ledger].contains(&reservation_key(store.home(), &job.id, &job.incarnation)))
+    }
+}
+fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job> {
     if terminal(&job.status) {
         // Repair only the narrow crash window after durable completion and
         // before release, with actual process-group proof rather than age.
+        // Released jobs, nearly all of them, need no process inspection.
+        if !reserved.holds(store, &job)? {
+            return Ok(job);
+        }
         if match &job.payload {
             Some(p) => !group_alive(p)?,
             None => true,
@@ -1391,19 +1412,36 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .get("id")
                 .and_then(Value::as_str)
                 .context("id required")?;
-            Ok(public_job(&reconcile(store, load(store, id)?)?))
+            Ok(public_job(&reconcile(
+                store,
+                load(store, id)?,
+                &mut Reserved::default(),
+            )?))
         }
         "job.list" => {
+            // Pages in id order: pass the last id seen as after_id.
+            let limit = args
+                .get("limit")
+                .map(|v| v.as_u64().context("limit must be a positive integer"))
+                .transpose()?
+                .unwrap_or(200)
+                .clamp(1, 1000);
+            let after = args
+                .get("after_id")
+                .map(|v| v.as_str().context("after_id must be a job id"))
+                .transpose()?
+                .unwrap_or("");
             let mut stmt = store
                 .connection()
-                .prepare("SELECT record FROM jobs ORDER BY id")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                .prepare("SELECT record FROM jobs WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            let rows = stmt.query_map(params![after, limit], |r| r.get::<_, String>(0))?;
             let all: Vec<Job> = rows
                 .map(|r| Ok(serde_json::from_str(&r?)?))
                 .collect::<Result<_>>()?;
+            let mut reserved = Reserved::default();
             Ok(json!(
                 all.into_iter()
-                    .map(|j| reconcile(store, j).map(|j| public_job(&j)))
+                    .map(|j| reconcile(store, j, &mut reserved).map(|j| public_job(&j)))
                     .collect::<Result<Vec<_>>>()?
             ))
         }
@@ -1418,7 +1456,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .get("id")
                 .and_then(Value::as_str)
                 .context("id required")?;
-            let old = reconcile(store, load(store, old_id)?)?;
+            let old = reconcile(store, load(store, old_id)?, &mut Reserved::default())?;
             ensure!(
                 matches!(old.status.as_str(), "failed" | "cancelled" | "timed_out"),
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
