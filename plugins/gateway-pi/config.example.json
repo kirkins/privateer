@@ -1,0 +1,1 @@
+{"schema_version":1,"pi_config":"/absolute/private/pi-agent/models.json","endpoint":"https://gateway.example.invalid/v1","provider":"private-gateway","model":"configured-model"}

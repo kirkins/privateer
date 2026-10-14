@@ -1,0 +1,19 @@
+# Optional trusted adapters
+
+Privateer core knows tasks, charters, jobs and events. Harnesses and personal provider routes live here, outside the core. Installing an adapter does not enable it: select its manifest explicitly when planning or starting an agent. A charter's optional `provider_plugin` pins `{"manifest":"/absolute/manifest.json","config":"/optional/private/config.json"}`. Omitted call arguments use those paths; different supplied paths are refused. Manifest and private config contents remain trusted operator-controlled files; this is not a cryptographic or network boundary.
+
+The version 1 manifest names an executable argv, bounded timeout and combined stdout/stderr limit. A single request and response use JSON lines. The request contains only the task id, title, repository, owner, effective actions, local control CLI address and lean brief, plus optional adapter options and a private config **path**. Briefs include concrete version 1 task, inbox, message, peer, delegation and handoff command shapes, with current task/owner/home bound. Responses must echo request id and version. `validate` returns `{"valid":true}`. `command` returns `{"argv":[...],"cwd":"...","env_names":[]}`. Environment values and credentials are never protocol fields. Names describe inherited native environment dependencies; Privateer does not copy credentials.
+
+Native Codex and Pi adapters plan argv without shell interpolation. They use the user's installed harness and its existing authentication. Validation checks the command plan, not account login or model availability. No model is hardcoded. A plugin is trusted executable code, not a sandbox, and a native harness retains the privileges of its user.
+
+Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `danger-full-access`) and boolean `ephemeral`. They are omitted by default, preserving native user configuration. Choosing `workspace-write` adds only the local Privateer operational home with `--add-dir`, so the agent can write its durable task and message records as well as work in the repository. `ephemeral:true` suppresses native Codex session persistence while Privateer retains its job records. This does not change global harness preferences.
+
+## Gateway Pi adapter
+
+`gateway-pi` is an optional integration for people routing Pi through a private gateway. Copy `config.example.json` outside the source checkout, edit its endpoint/provider/model/Pi configuration path, and set mode `0600`. Both adapter config and Pi models file must be private and user-owned. Keep API keys in Pi's private native configuration, never in the gateway adapter config or command options.
+
+The adapter verifies that the chosen Pi file is the active `PI_CODING_AGENT_DIR/models.json` (or `~/.pi/agent/models.json`), its provider uses the exact configured endpoint, and the model exists under that provider. Its launcher repeats these checks immediately before invoking Pi with explicit provider and model. It has no fallback. Endpoint URLs cannot contain credentials, query strings or fragments. Configuration and exceptions are not returned in diagnostic output.
+
+This protects against accidental route selection and configuration changes between planning and invocation. It is **not network enforcement**: trusted Pi extensions, configuration mutation after validation, proxies and custom executables remain outside this guard. A hard egress guarantee requires an external network/credential boundary. Gateway availability and live inference are not established by a command plan.
+
+The examples contain generic placeholder names, no user's endpoint, account, model or keys. Protocol tests use temporary private files and fake native executables.

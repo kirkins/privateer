@@ -1,0 +1,28 @@
+[package]
+name = "privateer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A small runtime for autonomous peer agents working under a charter"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[profile.release]
+strip = true

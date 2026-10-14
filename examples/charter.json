@@ -1,0 +1,10 @@
+{
+  "id": "example-project",
+  "objective": "Implement, test, open PRs, and merge passing work for this project",
+  "repo": "/absolute/path/to/project",
+  "actions": ["inspect", "implement", "test", "publish_pr", "merge_green", "recovery", "cleanup", "spawn", "message"],
+  "job_timeout_secs": 900,
+  "min_free_bytes": 2147483648,
+  "max_heavy_jobs": 1,
+  "max_delegation_depth": 4
+}
