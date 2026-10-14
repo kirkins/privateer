@@ -372,3 +372,40 @@ fn gateway_refuses_wrong_model_endpoint_and_inactive_configuration() {
     let database = fs::read(f.store.home().join("privateer.sqlite")).unwrap();
     assert!(!String::from_utf8_lossy(&database).contains("not-a-real-token"));
 }
+
+#[test]
+fn failed_plugin_descendants_are_stopped() {
+    let mut f = Fixture::new();
+    let pidfile = f.base().join("descendant.pid");
+    // The descendant releases the response pipes, so only the group signal
+    // issued for the failed plugin can stop it.
+    let body = format!(
+        "import os,sys,time\nif os.fork()==0:\n    os.close(1); os.close(2)\n    open({pidfile:?},'w').write(str(os.getpid()))\n    time.sleep(30)\nelse:\n    while not os.path.exists({pidfile:?}): time.sleep(0.01)\n    time.sleep(0.05)\n    sys.exit(1)\n",
+        pidfile = pidfile.display().to_string()
+    );
+    let path = manifest(&f, &body, 5000, 65536);
+    let args = f.args(&path);
+    let error = plugins::dispatch(&mut f.store, "plugin.validate", args).unwrap_err();
+    assert!(
+        error.to_string().contains("plugin executable failed"),
+        "{error}"
+    );
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    let alive = |pid: i32| {
+        let out = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        !stat.is_empty() && !stat.starts_with('Z')
+    };
+    while alive(pid) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!alive(pid), "descendant {pid} survived its failed plugin");
+}

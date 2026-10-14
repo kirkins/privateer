@@ -353,11 +353,10 @@ fn invoke(manifest: &Manifest, directory: &Path, mut request: Vec<u8>) -> Result
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if ended == 2 {
-                if let Some(status) = child.try_wait()? {
-                    ensure!(
-                        status.success(),
-                        "plugin executable failed (diagnostics withheld)"
-                    );
+                // Observe exit without reaping, so a failure below can still
+                // signal the plugin's group while its PID is reserved.
+                if let Some(success) = crate::jobs::exited_unreaped(pid)? {
+                    ensure!(success, "plugin executable failed (diagnostics withheld)");
                     let text =
                         std::str::from_utf8(&stdout).context("plugin returned invalid UTF-8")?;
                     let lines: Vec<&str> = text.lines().filter(|s| !s.trim().is_empty()).collect();
@@ -368,12 +367,14 @@ fn invoke(manifest: &Manifest, directory: &Path, mut request: Vec<u8>) -> Result
         }
     })();
     if result.is_err() {
-        // Child owns a separate group. Trusted adapters cannot leave ordinary descendants after a deadline.
+        // Child owns a separate group. Trusted adapters cannot leave ordinary
+        // descendants after a failure or deadline. The plugin is not reaped
+        // yet, so its PID still names that group and cannot have been reused.
         unsafe {
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
         let _ = child.kill();
-        let _ = child.wait();
     }
+    let _ = child.wait();
     result
 }
