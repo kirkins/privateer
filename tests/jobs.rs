@@ -862,3 +862,137 @@ fn agent_jobs_carry_the_role_into_their_payload() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+#[test]
+fn history_prune_keeps_pending_facts_and_reserved_capacity() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let emit = |id: &str, issue: &str| {
+        ok(
+            &home,
+            "event.emit",
+            json!({"id":id,"task_id":"task","issue_key":issue,"kind":"alert"}),
+        )["seq"]
+            .as_i64()
+            .unwrap()
+    };
+    emit("acked-1", "build");
+    let last = emit("acked-2", "build");
+    ok(
+        &home,
+        "event.ack",
+        json!({"task_id":"task","issue_key":"build","through_seq":last}),
+    );
+    emit("pending-1", "deploy");
+    // The fact message.send records (this fixture's charter has no "message").
+    ok(
+        &home,
+        "event.emit",
+        json!({"id":"unread","task_id":"task","issue_key":"message:infra:unread","kind":"message",
+            "payload":{"from":"peer","to":"infra","body":"look"}}),
+    );
+    start(&home, "finished", &["true"]);
+    wait(&home, "finished", &["succeeded"]);
+    // A finished job whose reservation survived the completion/release crash
+    // window still holds capacity and must not be forgotten.
+    start(&home, "held", &["true"]);
+    let held = wait(&home, "held", &["succeeded"]);
+    let key = format!(
+        "{}:held:{}",
+        home.display(),
+        held["incarnation"].as_str().unwrap()
+    );
+    rusqlite::Connection::open(fixture.ledger.join("resources.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO reservations(key,record) VALUES(?1,?2)",
+            params![
+                key,
+                json!({"key":key,"home":home,"job_id":"held","incarnation":held["incarnation"],
+                "heavy":false,"state":"succeeded","created_ms":0,"supervisor":null,"payload":null})
+                .to_string()
+            ],
+        )
+        .unwrap();
+    assert!(home.join("jobs/finished").exists());
+    let now = ok(&home, "status", json!({}));
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 1000;
+
+    let preview = ok(
+        &home,
+        "history.prune",
+        json!({"before_ms":cutoff,"dry_run":true}),
+    );
+    assert_eq!(preview["events"], 2, "{preview}");
+    assert_eq!(preview["jobs"], 1);
+    assert_eq!(preview["jobs_still_reserved"], 1);
+    assert!(preview["audit"].as_i64().unwrap() > 0);
+    assert_eq!(ok(&home, "status", json!({})), now);
+    assert!(home.join("jobs/finished").exists());
+
+    let pruned = ok(&home, "history.prune", json!({"before_ms":cutoff}));
+    assert_eq!(pruned["events"], 2);
+    assert_eq!(pruned["jobs"], 1);
+    assert_eq!(pruned["log_directories_failed"], 0);
+    let history = ok(&home, "event.history", json!({"limit":100}));
+    let ids: Vec<_> = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids, ["pending-1", "unread"]);
+    let status = ok(&home, "status", json!({}));
+    assert_eq!(status["pending_notifications"], 2);
+    let inbox = ok(&home, "message.inbox", json!({"actor":"infra"}));
+    assert_eq!(inbox["messages"][0]["id"], "unread");
+    assert!(
+        !run(&home, "job.status", json!({"id":"finished"}))
+            .status
+            .success()
+    );
+    assert!(!home.join("jobs/finished").exists());
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"held"}))["status"],
+        "succeeded"
+    );
+    let audit = ok(&home, "audit.list", json!({"limit":1000}))["events"].clone();
+    assert_eq!(audit.as_array().unwrap().len(), 1);
+    assert_eq!(audit[0]["kind"], "history.prune");
+
+    // Facts written before events recorded a time count as older than any cutoff.
+    let seq = emit("legacy", "legacy");
+    ok(
+        &home,
+        "event.ack",
+        json!({"task_id":"task","issue_key":"legacy","through_seq":seq}),
+    );
+    Store::open(&home)
+        .unwrap()
+        .connection()
+        .execute("UPDATE events SET time_ms=NULL WHERE id='legacy'", [])
+        .unwrap();
+    assert_eq!(
+        ok(&home, "history.prune", json!({"before_ms":1}))["events"],
+        1
+    );
+    assert_eq!(
+        ok(&home, "history.prune", json!({"older_than_days":30}))["events"],
+        0
+    );
+    for bad in [
+        json!({}),
+        json!({"before_ms":1,"older_than_days":1}),
+        json!({"older_than_days":0}),
+        json!({"before_ms":1,"dry_run":"yes"}),
+    ] {
+        assert!(
+            !run(&home, "history.prune", bad.clone()).status.success(),
+            "{bad}"
+        );
+    }
+}

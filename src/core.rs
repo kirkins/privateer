@@ -270,8 +270,15 @@ fn event_emit(store: &Store, args: Value) -> Result<Value> {
         return Ok(json!({"seq":seq,"duplicate":true}));
     }
     tx.execute(
-        "INSERT INTO events(id,task_id,issue_key,kind,payload) VALUES(?1,?2,?3,?4,?5)",
-        params![id, task_id, issue, kind, payload.to_string()],
+        "INSERT INTO events(id,task_id,issue_key,kind,payload,time_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            id,
+            task_id,
+            issue,
+            kind,
+            payload.to_string(),
+            Store::now_ms()
+        ],
     )?;
     let seq = tx.last_insert_rowid();
     tx.execute("INSERT INTO pending(task_id,issue_key,seq) VALUES(?1,?2,?3) ON CONFLICT(task_id,issue_key) DO UPDATE SET seq=excluded.seq",params![task_id,issue,seq])?;
@@ -369,6 +376,73 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     if let Some(approver) = approver {
         result["approver"] = json!(approver);
     }
+    Ok(result)
+}
+
+/// Operator-run retention. Removes event facts that no longer back a pending
+/// notification, audit rows and finished, released jobs with their logs, all
+/// older than the cutoff. Pending notifications and live jobs are kept.
+/// Pruned event and job ids can be reused afterwards.
+fn history_prune(store: &Store, args: &Value) -> Result<Value> {
+    let cutoff = match (args.get("before_ms"), args.get("older_than_days")) {
+        (Some(v), None) => v
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("before_ms must be an integer"))?,
+        (None, Some(v)) => {
+            let days = v
+                .as_f64()
+                .filter(|d| d.is_finite() && *d > 0.0)
+                .ok_or_else(|| anyhow::anyhow!("older_than_days must be a positive number"))?;
+            Store::now_ms().saturating_sub((days * 86_400_000.0) as i64)
+        }
+        _ => bail!("pass exactly one of before_ms or older_than_days"),
+    };
+    let dry_run = match args.get("dry_run") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("dry_run must be a boolean"))?,
+    };
+    let tx = store.write_transaction()?;
+    let stale_events = "(time_ms IS NULL OR time_ms < ?1) AND seq NOT IN (SELECT seq FROM pending)";
+    let events: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM events WHERE {stale_events}"),
+        [cutoff],
+        |r| r.get(0),
+    )?;
+    let audit: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM audit WHERE time_ms < ?1",
+        [cutoff],
+        |r| r.get(0),
+    )?;
+    if !dry_run {
+        tx.execute(
+            &format!("DELETE FROM events WHERE {stale_events}"),
+            [cutoff],
+        )?;
+        tx.execute("DELETE FROM audit WHERE time_ms < ?1", [cutoff])?;
+    }
+    let (jobs, jobs_still_reserved, directories) = crate::jobs::prune(store, cutoff, dry_run)?;
+    let mut result = json!({"before_ms":cutoff,"dry_run":dry_run,"events":events,"audit":audit,
+        "jobs":jobs,"jobs_still_reserved":jobs_still_reserved});
+    if dry_run {
+        return Ok(result);
+    }
+    store.audit("history.prune", &result)?;
+    tx.commit()?;
+    // Job logs go only after their records are durably gone.
+    let mut failed = 0;
+    for directory in directories {
+        let removed =
+            reject_symlinks(&directory).and_then(|()| match fs::remove_dir_all(&directory) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            });
+        if removed.is_err() {
+            failed += 1;
+        }
+    }
+    result["log_directories_failed"] = json!(failed);
     Ok(result)
 }
 
@@ -532,6 +606,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             Ok(result)
         }
+        "history.prune" => history_prune(store, &args),
         "audit.list" => {
             let mut s = store.connection().prepare(
                 "SELECT seq,time_ms,kind,payload FROM audit WHERE seq>?1 ORDER BY seq LIMIT ?2",

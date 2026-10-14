@@ -10,6 +10,8 @@ Multiple homes on one host share a configured resource ledger. This prevents ind
 
 Events are facts. Pending notifications are a projection: repeated facts concerning the same task and issue update one pending item. An acknowledgment names the sequence actually observed, so a later fact cannot be silently discarded. Messages name a recipient and a task rather than broadcasting to the whole fleet.
 
+History is kept until an operator prunes it. `history.prune` (`older_than_days` or `before_ms`, optionally `dry_run`) removes event facts older than the cutoff that no longer back a pending notification, audit rows older than the cutoff, and finished jobs whose reservations are released, together with their log directories. Pending notifications, including unread messages, and live or still-reserved jobs are kept. Pruned event and job ids may be reused afterwards. Nothing is deleted automatically; run it by hand or from cron.
+
 ## Plugins and local configuration
 
 Optional executable plugins use JSON lines over stdio. They receive a minimal task context and return a validated command specification; they cannot widen the charter. Harness choice, model choice, provider routing, and private gateway policy live outside the core.
