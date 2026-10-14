@@ -98,14 +98,20 @@ impl Store {
         }).optional()?.ok_or_else(|| anyhow::anyhow!("unknown task {id}"))
     }
     pub fn authorize(&self, task_id: &str, action: &str) -> Result<Value> {
-        self.authorize_inner(task_id, action, false)
+        self.authorize_inner(task_id, Some(action), false)
+    }
+    /// The effective charter of an open task, without requiring any charter
+    /// action. For decisions that grant no new work by themselves, such as
+    /// accepting custody or recording an explicit approval.
+    pub fn active_charter(&self, task_id: &str) -> Result<Value> {
+        self.authorize_inner(task_id, None, false)
     }
     /// Completion prevents admission of new work. A job already running may
     /// finish recording its result; cancellation and revocation still stop it.
     pub fn authorize_running(&self, task_id: &str, action: &str) -> Result<Value> {
-        self.authorize_inner(task_id, action, true)
+        self.authorize_inner(task_id, Some(action), true)
     }
-    fn authorize_inner(&self, task_id: &str, action: &str, running: bool) -> Result<Value> {
+    fn authorize_inner(&self, task_id: &str, action: Option<&str>, running: bool) -> Result<Value> {
         let task = self.task(task_id)?;
         if task["status"] == "cancelled" || (!running && task["status"] == "done") {
             bail!("task is terminal");
@@ -121,11 +127,13 @@ impl Store {
         if charter["active"] != true {
             bail!("charter was revoked");
         }
-        if !charter["actions"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(action)))
-        {
-            bail!("action {action} is outside this charter");
+        if let Some(action) = action {
+            if !charter["actions"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(action)))
+            {
+                bail!("action {action} is outside this charter");
+            }
         }
         Ok(charter)
     }
