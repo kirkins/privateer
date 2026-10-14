@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Optional private gateway adapter. No keys are returned by the protocol."""
 import os
+import json
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from protocol import serve, context, private_json
+from native import build
+from native_launch import launch as native_launch
 
 
 def route(config_path):
@@ -43,21 +46,34 @@ def route(config_path):
 def handle(request):
     repo, prompt = context(request)
     config_path = request["config_path"]
-    route(config_path)
+    provider, model = route(config_path)
+    options = pinned_options(request.get("options", {}), provider, model)
+    build("pi", {**request, "options": options})
     # Recheck at invocation, so changing the route after planning does not cause silent fallback.
     return {"valid": True} if request["method"] == "validate" else {
-        "argv": [sys.executable, str(Path(__file__).resolve()), "--launch", config_path, repo, prompt],
+        "argv": [sys.executable, str(Path(__file__).resolve()), "--launch", config_path, repo, json.dumps(options), prompt],
         "cwd": repo, "env_names": ["PI_CODING_AGENT_DIR"]}
+
+
+def pinned_options(options, provider, model):
+    if not isinstance(options, dict):
+        raise ValueError("invalid gateway options")
+    for key, value in (("provider", provider), ("model", model)):
+        if key in options and options[key] != value:
+            raise ValueError("gateway selection differs from the pinned route")
+    return {**options, "provider": provider, "model": model}
 
 
 def launch():
     try:
-        if len(sys.argv) != 5:
+        if len(sys.argv) != 6:
             raise ValueError("invalid launcher arguments")
         provider, model = route(sys.argv[2])
         repo = Path(sys.argv[3]).resolve(strict=True)
+        options = pinned_options(json.loads(sys.argv[4]), provider, model)
+        _, argv = build("pi", {"context": {"repo": str(repo), "title": sys.argv[5]}, "options": options})
         os.chdir(repo)
-        os.execvp("pi", ["pi", "--print", "--provider", provider, "--model", model, sys.argv[4]])
+        native_launch("pi", argv)
     except Exception:
         print("Gateway route validation failed; refusing Pi launch.", file=sys.stderr)
         raise SystemExit(2)
