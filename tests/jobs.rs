@@ -441,6 +441,7 @@ fn ordinary_leader_exit_preserves_and_can_cancel_recorded_descendants() {
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
     let stopped = ok(&home, "job.cancel", json!({"id":"ordinary-orphan"}));
     assert_eq!(stopped["status"], "cancelled");
+    assert_eq!(stopped["reason"], "cancellation requested");
     assert!(!active_pid(descendant));
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
@@ -642,5 +643,168 @@ fn records_from_the_previous_identity_format_remain_recoverable() {
         "cancelled"
     );
     assert!(!active_pid(payload));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+fn leak_reservation(fixture: &Fixture, home: &Path, job: &str, age_ms: i64) -> String {
+    // A reservation committed to the shared ledger whose home commit never
+    // happened: no job record, supervisor or payload identity exists.
+    ok(home, "resource.status", json!({})); // creates the shared ledger
+    let key = format!("{}:{job}:lost-incarnation", home.display());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let record = json!({"key":key,"home":home,"job_id":job,"incarnation":"lost-incarnation",
+        "heavy":true,"state":"starting","created_ms":now - age_ms,"supervisor":null,"payload":null});
+    rusqlite::Connection::open(fixture.ledger.join("resources.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO reservations(key,record) VALUES(?1,?2)",
+            params![key, record.to_string()],
+        )
+        .unwrap();
+    key
+}
+fn fails(home: &Path, command: &str, args: Value) -> String {
+    let output = run(home, command, args);
+    assert!(!output.status.success(), "{command} unexpectedly succeeded");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn orphan_settles_to_its_leader_result_once_descendants_exit() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "lingering", &["/bin/sh", "-c", "sleep 1 & exit 0"]);
+    let orphan = wait(&home, "lingering", &["orphaned", "succeeded"]);
+    assert_eq!(
+        orphan["status"], "orphaned",
+        "descendant should outlive leader"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    let settled = wait(&home, "lingering", &["succeeded"]);
+    assert_eq!(settled["exit_code"], 0);
+    assert_eq!(settled["reason"], Value::Null);
+    assert_eq!(settled["leader_result"], Value::Null);
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+    // A failing leader settles to failure with its exit code.
+    start(
+        &home,
+        "lingering-failure",
+        &["/bin/sh", "-c", "sleep 1 & exit 3"],
+    );
+    let failed = wait(&home, "lingering-failure", &["failed"]);
+    assert_eq!(failed["exit_code"], 3);
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+    let audit = ok(&home, "audit.list", json!({"limit":1000}));
+    let settled_events = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "job.settled")
+        .count();
+    assert_eq!(settled_events, 2);
+}
+
+#[test]
+fn recovery_releases_a_leaked_reservation_only_when_forced_after_grace() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    let leaked = leak_reservation(&fixture, &home, "lost", 60_000);
+    let error = fails(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"blocked","command":["true"]}),
+    );
+    assert!(error.contains("capacity exhausted"), "{error}");
+    let error = fails(&home, "resource.recover", json!({"key":leaked}));
+    assert!(error.contains("force:true"), "{error}");
+    // Any home sharing the ledger can perform the explicit recovery.
+    let released = ok(
+        &other,
+        "resource.recover",
+        json!({"key":leaked,"force":true}),
+    );
+    assert_eq!(released["forced"], true);
+    assert_eq!(released["job_id"], "lost");
+    let recovered = ok(&other, "audit.list", json!({"limit":1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "resource.recovered" && e["payload"]["key"] == leaked);
+    assert!(recovered);
+    start(&home, "admitted", &["true"]);
+    wait(&home, "admitted", &["succeeded"]);
+    // A reservation inside its start window may still be launching.
+    let fresh = leak_reservation(&fixture, &home, "fresh-leak", 0);
+    let error = fails(&home, "resource.recover", json!({"key":fresh,"force":true}));
+    assert!(error.contains("start grace period"), "{error}");
+}
+
+#[test]
+fn recovery_never_releases_live_supervisors_or_payload_groups() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let running = start(&home, "live", &["sleep", "30"]);
+    let running = wait(&home, running["id"].as_str().unwrap(), &["running"]);
+    let key = ok(&home, "resource.status", json!({}))["reservations"][0]["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let error = fails(&home, "resource.recover", json!({"key":key,"force":true}));
+    assert!(error.contains("supervisor is still running"), "{error}");
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    wait(&home, "live", &["orphaned"]);
+    let error = fails(&home, "resource.recover", json!({"key":key,"force":true}));
+    assert!(error.contains("payload group is still running"), "{error}");
+    ok(&home, "job.cancel", json!({"id":"live"}));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
+fn recovery_settles_this_homes_job_when_its_processes_are_provably_gone() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let running = start(&home, "vanished", &["sleep", "30"]);
+    let running = wait(&home, running["id"].as_str().unwrap(), &["running"]);
+    let key = ok(&home, "resource.status", json!({}))["reservations"][0]["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Supervisor and payload both die without recording an outcome.
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    assert_eq!(unsafe { libc::kill(-payload, libc::SIGKILL) }, 0);
+    let until = Instant::now() + Duration::from_secs(5);
+    while active_pid(payload) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let released = ok(&home, "resource.recover", json!({"key":key}));
+    assert_eq!(released["forced"], false);
+    let job = ok(&home, "job.status", json!({"id":"vanished"}));
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["reason"], "reservation released by resource.recover");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
+fn vanished_supervisor_with_ended_payload_settles_as_failed() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let running = start(&home, "abandoned", &["sleep", "30"]);
+    let running = wait(&home, running["id"].as_str().unwrap(), &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    assert_eq!(unsafe { libc::kill(-payload, libc::SIGKILL) }, 0);
+    let job = wait(&home, "abandoned", &["failed"]);
+    assert_eq!(
+        job["reason"],
+        "supervisor disappeared; payload ended without a recorded result"
+    );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }

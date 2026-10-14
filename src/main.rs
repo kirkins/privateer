@@ -26,7 +26,7 @@ fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path rpc\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, message.send/inbox, job.start/status/list/cancel/retry,\nresource.status, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\nLocal homes contain private state; credentials stay with your chosen harness."
+                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path rpc\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, message.send/inbox, job.start/status/list/cancel/retry,\nresource.status/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\nLocal homes contain private state; credentials stay with your chosen harness."
                 );
                 return Ok(());
             }

@@ -22,4 +22,4 @@ Before any fleet replacement, qualify the selected native harnesses and hooks, r
 python3 scripts/native-canary.py --binary target/debug/privateer --manifest plugins/codex/manifest.json
 ```
 
-Native-agent jobs clean up their recorded ordinary descendants on completion. Raw jobs preserve surviving descendants for explicit recovery. Neither mode provides hard containment for children that deliberately escape their process group.
+Native-agent jobs clean up their recorded ordinary descendants on completion. Raw jobs keep surviving descendants and their capacity until those exit, then settle to the leader's result; `job.cancel` stops them sooner. Neither mode provides hard containment for children that deliberately escape their process group.
