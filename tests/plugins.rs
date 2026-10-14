@@ -71,8 +71,8 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
     let mut f = Fixture::new();
     let args = f.args(&example("codex"));
     let command = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
-    assert_eq!(command["argv"][0], "codex");
-    assert_eq!(command["argv"][1], "exec");
+    assert_eq!(command["argv"][3], "codex");
+    assert_eq!(command["argv"][4], "exec");
     assert_eq!(command["cwd"], json!(f.repo));
     assert_eq!(command["env_names"], json!([]));
     let mut args = f.args(&example("codex"));
@@ -99,8 +99,8 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
     let mut args = f.args(&example("pi"));
     args["options"] = json!({"provider":"fixture","model":"fixture-model"});
     let command = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
-    assert_eq!(command["argv"][0], "pi");
-    assert_eq!(command["argv"][3], "fixture");
+    assert_eq!(command["argv"][3], "pi");
+    assert_eq!(command["argv"][6], "fixture");
     let brief = plugins::dispatch(&mut f.store, "agent.brief", json!({"task_id":"task"})).unwrap();
     assert!(brief["brief"].as_str().unwrap().len() < 2048);
     assert!(brief["context"].get("config_path").is_none());
@@ -116,6 +116,194 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
         json!(f.store.home())
     );
     assert!(brief["brief"].as_str().unwrap().contains("peer.call"));
+}
+
+#[test]
+fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_changes() {
+    let mut f = Fixture::new();
+    let id = "46a81234-1234-4567-8123-123456789abc";
+    for name in [
+        "codex",
+        "pi",
+        "pi-signed",
+        "omp",
+        "claude",
+        "opencode",
+        "gemini",
+        "cursor",
+        "grok",
+        "agy",
+        "muse",
+        "devin",
+        "kimi",
+    ] {
+        let mut args = f.args(&example(name));
+        let planned = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+        assert_eq!(planned["cwd"], json!(f.repo));
+        assert_eq!(planned["argv"][2], name);
+        assert_eq!(planned["env_names"], json!([]));
+        let resume = if name == "opencode" {
+            "ses_0123456789abc"
+        } else {
+            id
+        };
+        args["options"] = json!({"resume":resume});
+        let resumed = plugins::dispatch(&mut f.store, "plugin.command", args.clone());
+        if name == "muse" {
+            assert!(
+                resumed.is_err(),
+                "unqualified headless resume must not become a fresh run"
+            );
+        } else {
+            let resumed = resumed.unwrap();
+            assert!(
+                resumed["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == resume)
+            );
+            assert!(
+                !resumed["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == "--last" || s == "--continue")
+            );
+        }
+        args["options"] = json!({"mode":"interactive"});
+        let plan = plugins::dispatch(&mut f.store, "plugin.command", args);
+        if name == "kimi" {
+            assert!(
+                plan.is_err(),
+                "Kimi requires readiness-gated interactive delivery; a bare launch must not lose the brief"
+            );
+            continue;
+        }
+        let plan = plan.unwrap();
+        assert!(
+            !plan["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == "--print" || s == "--single" || s == "exec")
+        );
+    }
+    for invalid in [
+        json!({"resume":"latest"}),
+        json!({"resume":"46a81234"}),
+        json!({"resume":id,"ephemeral":true}),
+        json!({"mode":"injet"}),
+        json!({"model":"--steal-config"}),
+        json!({"session":id}),
+        json!({"endpoint":"https://unexpected.example.invalid"}),
+    ] {
+        let mut args = f.args(&example("codex"));
+        args["options"] = invalid;
+        assert!(plugins::dispatch(&mut f.store, "plugin.command", args).is_err());
+    }
+    let mut args = f.args(&example("gemini"));
+    args["options"] = json!({"effort":"high"});
+    assert!(
+        plugins::dispatch(&mut f.store, "plugin.command", args).is_err(),
+        "unsupported options are not silently omitted"
+    );
+}
+
+#[test]
+fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_identity() {
+    let mut f = Fixture::new();
+    let fakebin = f.base().join("bin");
+    fs::create_dir(&fakebin).unwrap();
+    let fake = fakebin.join("claude");
+    fs::write(&fake, "#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('ANTHROPIC_BASE_URL'),'pi_config':os.getenv('PI_CODING_AGENT_DIR'),'token':os.getenv('SYNTHETIC_TEST_TOKEN'),'foreign':[k for k in ['CLAUDECODE','GEMINI_CLI','PI_CODING_AGENT','CURSOR_AGENT'] if k in os.environ]}))\n").unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut args = f.args(&example("claude"));
+    args["options"] = json!({"model":"fixture-model","permission_mode":"plan"});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+    let argv = plan["argv"].as_array().unwrap();
+    let output = Command::new(argv[0].as_str().unwrap())
+        .args(argv[1..].iter().map(|v| v.as_str().unwrap()))
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "department")
+        .env("ANTHROPIC_BASE_URL", "https://fixture.example.invalid")
+        .env("PI_CODING_AGENT_DIR", f.base().join("native-private"))
+        .env("SYNTHETIC_TEST_TOKEN", "not-a-real-token")
+        .env("CLAUDECODE", "1")
+        .env("GEMINI_CLI", "1")
+        .env("PI_CODING_AGENT", "true")
+        .env("CURSOR_AGENT", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual["foreign"], json!([]));
+    assert_eq!(actual["role"], "agent");
+    assert_eq!(actual["actor"], "department");
+    assert_eq!(actual["route"], "https://fixture.example.invalid");
+    assert_eq!(actual["pi_config"], json!(f.base().join("native-private")));
+    assert_eq!(actual["token"], "not-a-real-token");
+    assert!(
+        actual["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "fixture-model")
+    );
+    // Empty PATH cannot fall back to another installed harness or provider.
+    let failed = Command::new(argv[0].as_str().unwrap())
+        .args(argv[1..].iter().map(|v| v.as_str().unwrap()))
+        .env_clear()
+        .env("PATH", f.base().join("missing-bin"))
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(!String::from_utf8_lossy(&failed.stderr).contains("fixture-model"));
+}
+
+#[test]
+fn native_session_evidence_ignores_tool_text_and_bounds_malformed_logs() {
+    let f = Fixture::new();
+    let script = r#"
+import json,sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from native_events import read_session, session_started
+root=Path(sys.argv[2])
+log=root/'native.log'
+identity='46a81234-1234-4567-8123-123456789abc'
+for event in [
+    {'type':'item.completed','item':{'thread_id':identity}},
+    {'type':'assistant','session_id':identity},
+    {'type':'error','thread_id':identity},
+    {'type':'system','subtype':'tool','session_id':identity},
+    [], None,
+]:
+    assert session_started('codex',event) is None
+    assert session_started('claude',event) is None
+log.write_text('not json\n'+json.dumps({'type':'thread.started','thread_id':identity})+'\n')
+assert read_session('codex',log)==identity
+assert read_session('claude',log) is None
+log.write_text('x'*65537+'\n'+json.dumps({'type':'thread.started','thread_id':identity})+'\n')
+assert read_session('codex',log) is None
+assert session_started('codex',{'type':'thread.started','thread_id':'bad\nidentity'}) is None
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"))
+        .arg(f.base())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -295,6 +483,27 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(!String::from_utf8_lossy(&output.stdout).contains("not-a-real-token"));
+    let resume = "46a81234-1234-4567-8123-123456789abc";
+    let gateway_options = |options: Value| {
+        Command::new(env!("CARGO_BIN_EXE_privateer"))
+        .args(["--home", f.store.home().to_str().unwrap(), "plugin.command", "--json",
+            &json!({"task_id":"task","manifest":example("gateway-pi"),"config":config,"options":options}).to_string()])
+        .env("PI_CODING_AGENT_DIR", &agent).output().unwrap()
+    };
+    let resumed = gateway_options(json!({"resume":resume,"effort":"high"}));
+    assert!(resumed.status.success());
+    let resumed_plan: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    let resumed_options: Value =
+        serde_json::from_str(resumed_plan["argv"][5].as_str().unwrap()).unwrap();
+    assert_eq!(resumed_options["resume"], resume);
+    assert_eq!(resumed_options["provider"], "fixture-route");
+    for options in [
+        json!({"provider":"different"}),
+        json!({"model":"different"}),
+        json!({"endpoint":"https://direct.example.invalid"}),
+    ] {
+        assert!(!gateway_options(options).status.success());
+    }
     let fakebin = f.base().join("bin");
     fs::create_dir(&fakebin).unwrap();
     let fake = fakebin.join("pi");
@@ -337,6 +546,68 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
     let refused = process.env("PI_CODING_AGENT_DIR", &agent).output().unwrap();
     assert!(!refused.status.success());
     assert!(!String::from_utf8_lossy(&refused.stderr).contains("direct.example"));
+}
+
+#[test]
+fn cancellation_reaches_the_execed_harness_and_its_descendants() {
+    let mut f = Fixture::new();
+    fs::write(
+        f.store.home().join("config.json"),
+        json!({"resource_home": f.base().join("ledger")}).to_string(),
+    )
+    .unwrap();
+    let fakebin = f.base().join("bin");
+    fs::create_dir(&fakebin).unwrap();
+    let ready = f.repo.join("ready.json");
+    let fake = fakebin.join("codex");
+    fs::write(&fake, format!("#!/usr/bin/env python3\nimport json,os,time\nchild=os.fork()\nif child==0:\n    time.sleep(30)\nelse:\n    open({:?},'w').write(json.dumps([os.getpid(),child]))\n    time.sleep(30)\n", ready.display().to_string())).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Command::new(env!("CARGO_BIN_EXE_privateer"))
+        .args([
+            "--home",
+            f.store.home().to_str().unwrap(),
+            "agent.start",
+            "--json",
+            &json!({"id":"native-cancel","task_id":"task","manifest":example("codex")}).to_string(),
+        ])
+        .env(
+            "PATH",
+            format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let until = Instant::now() + Duration::from_secs(3);
+    while !ready.exists() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pids = fs::read_to_string(&ready)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<i32>>(&s).ok());
+    privateer::dispatch(&mut f.store, "job.cancel", json!({"id":"native-cancel"})).unwrap();
+    let pids = pids.expect("fake native harness did not start");
+    let until = Instant::now() + Duration::from_secs(3);
+    for pid in pids {
+        loop {
+            let out = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if state.is_empty() || state.starts_with('Z') {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "native payload {pid} survived cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 #[test]

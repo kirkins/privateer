@@ -1,0 +1,1 @@
+{"schema_version":1,"id":"devin","executable":["python3","../native.py","devin"],"timeout_ms":2000,"max_output_bytes":65536}

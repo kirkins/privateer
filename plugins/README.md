@@ -4,7 +4,91 @@ Privateer core knows tasks, charters, jobs and events. Harnesses and personal pr
 
 The version 1 manifest names an executable argv, bounded timeout and combined stdout/stderr limit. A single request and response use JSON lines. The request contains only the task id, title, repository, owner, effective actions, local control CLI address and lean brief, plus optional adapter options and a private config **path**. Briefs include concrete version 1 task, inbox, message, peer, delegation and handoff command shapes, with current task/owner/home bound. The launched harness runs with `PRIVATEER_ROLE=agent` and `PRIVATEER_ACTOR` set to the task owner, so operator commands are refused to it (see [architecture](../docs/architecture.md#operators-and-agents)). Responses must echo request id and version. `validate` returns `{"valid":true}`. `command` returns `{"argv":[...],"cwd":"...","env_names":[]}`. Environment values and credentials are never protocol fields. Names describe inherited native environment dependencies; Privateer does not copy credentials.
 
-Native Codex and Pi adapters plan argv without shell interpolation. They use the user's installed harness and its existing authentication. Validation checks the command plan, not account login or model availability. No model is hardcoded. A plugin is trusted executable code, not a sandbox, and a native harness retains the privileges of its user.
+Native adapters plan argv without shell interpolation. They use the user's installed harness and its existing authentication. Validation checks the command plan, not account login or model availability. No model is hardcoded. A plugin is trusted executable code, not a sandbox, and a native harness retains the privileges of its user.
+
+## Native harnesses
+
+Select `plugins/<id>/manifest.json` through the existing plugin interface. Core
+task, mailbox, job and activation APIs do not change. The adapter defaults to a
+headless run, with native structured output where available. `mode: interactive`
+plans a terminal command; it is for a terminal backend, not the current
+stdin-detached `agent.start` job path.
+
+| ID | Native CLI | Explicit resume selector | Interactive command |
+|---|---|---|---|
+| `codex` | `codex` | Full session UUID | Yes |
+| `claude` | `claude` | Full session UUID | Yes |
+| `pi` | `pi` | Full session UUID or existing absolute session file | Yes |
+| `pi-signed` | `pi-signed` | Same as Pi; requires the selected wrapper | Yes |
+| `omp` | `omp` | Full session UUID or existing absolute session file | Yes |
+| `opencode` | `opencode` | Native `ses_…` ID | Yes |
+| `gemini` | `gemini` | Full session UUID | Yes |
+| `cursor` | `cursor-agent` | Full chat UUID | Yes |
+| `grok` | `grok` | Full session UUID | Yes |
+| `agy` | `agy` | Native conversation ID | Yes |
+| `muse` | `muse` | Headless resume not qualified | Yes, fresh |
+| `devin` | `devin` | Native session ID | Yes |
+| `kimi` | `kimi` (current Kimi Code 2.x) | Native session ID | Readiness-gated initial delivery still needed |
+
+Common options are `model`, `effort`, `resume` and `mode` (`headless` or
+`interactive`). Unsupported options are refused rather than silently dropped.
+`effort` uses native flags; OpenCode variants and Codex/Grok effort values are
+passed to the native CLI for model-specific validation. Gemini, Cursor, Devin
+and Kimi have no independent qualified effort flag here. Pi-family adapters
+also accept `provider` with an explicit `model`, plus boolean `ephemeral`.
+`resume` never selects the latest session or opens a picker. It supplies the
+explicit selector to the native CLI; this alone does not prove that a session
+exists, belongs to a particular ship, or has been resumed successfully.
+The runtime chooses whether to resume or start fresh and binds sessions to a
+focus; an adapter does not choose that policy or share sessions across tasks.
+
+Claude/Grok accept native `permission_mode`; Gemini maps it to `approval-mode`.
+No permission override is supplied by default. Claude's optional `bare: true`
+selects its native minimal launch mode for an isolated pilot. Cursor accepts
+native `sandbox` (`enabled`/`disabled`) and boolean `trust`. Gemini's boolean
+`trust` selects per-run `--skip-trust`, without modifying the trust store. Devin
+accepts native `permission_mode`, boolean `sandbox` and boolean `trust`; its
+`autonomous` permission mode requires its sandbox. Devin headless output is
+native text, not invented JSON events. Kimi's native `--prompt` selects its
+unattended mode; no conflicting `--auto` flag is appended.
+
+The launcher replaces itself with the selected CLI in the same process group.
+It clears inherited foreign harness identity markers while preserving
+`PRIVATEER_ROLE`, `PRIVATEER_ACTOR`, authentication and provider configuration.
+A missing CLI fails without substituting another harness or model.
+
+Inspect supported command options and check installed parsers without inference:
+
+```sh
+python3 plugins/native.py --describe
+python3 scripts/harness-probe.py
+```
+
+The probe invokes help only; it does not establish authentication, live model
+availability, workspace readiness, session continuity or working supervision.
+Live repair/message qualification is opt-in and uses an isolated home/repository:
+
+```sh
+python3 scripts/native-canary.py --binary target/debug/privateer \
+  --manifest plugins/codex/manifest.json --check-resume
+```
+
+Other adapters can use the same canary with their manifest and native
+`--options-json`. It independently checks the repaired tests and task-linked
+message. With `--check-resume`, it also requires native startup session evidence,
+the same session ID on the second run, and recall of prior conversation context.
+The isolated two-job test qualifies native continuity, not runtime focus routing.
+Session-start decoding is currently implemented for Codex, Claude, Pi-family,
+OpenCode, Gemini, Cursor and AGY; an unknown format stays unqualified.
+
+This is progress toward the harness set in
+[First Mate's configuration reference](https://github.com/kunchenguid/firstmate/blob/08f0a069af2f88911858b44175d225b77362cffe/docs/configuration.md#harness-support),
+not full lifecycle parity. Rovo still needs its own verified readiness/delivery
+adapter: First Mate's current `rovo` integration cannot be replaced with a guessed
+positional prompt or silently switched to the older `acli rovodev` CLI.
+Interactive attachment/injection and resident-service wake integration remain
+separate qualification work; command plans do not claim a harness can already
+coordinate a ship. Provider routes remain private configuration.
 
 Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `danger-full-access`) and boolean `ephemeral`. They are omitted by default, preserving native user configuration. Choosing `workspace-write` adds only the local Privateer operational home with `--add-dir`, so the agent can write its durable task and message records as well as work in the repository. `ephemeral:true` suppresses native Codex session persistence while Privateer retains its job records. This does not change global harness preferences.
 
@@ -13,6 +97,10 @@ Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `
 `gateway-pi` is an optional integration for people routing Pi through a private gateway. Copy `config.example.json` outside the source checkout, edit its endpoint/provider/model/Pi configuration path, and set mode `0600`. Both adapter config and Pi models file must be private and user-owned. Keep API keys in Pi's private native configuration, never in the gateway adapter config or command options.
 
 The adapter verifies that the chosen Pi file is the active `PI_CODING_AGENT_DIR/models.json` (or `~/.pi/agent/models.json`), its provider uses the exact configured endpoint, and the model exists under that provider. Its launcher repeats these checks immediately before invoking Pi with explicit provider and model. It has no fallback. Endpoint URLs cannot contain credentials, query strings or fragments. Configuration and exceptions are not returned in diagnostic output.
+
+Gateway Pi accepts the same Pi session/mode/effort options, while binding provider
+and model to its private route. Conflicting requested selectors are refused;
+resuming a session still repeats route validation immediately before launch.
 
 This protects against accidental route selection and configuration changes between planning and invocation. It is **not network enforcement**: trusted Pi extensions, configuration mutation after validation, proxies and custom executables remain outside this guard. A hard egress guarantee requires an external network/credential boundary. Gateway availability and live inference are not established by a command plan.
 

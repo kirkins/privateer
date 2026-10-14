@@ -1,0 +1,1 @@
+{"schema_version":1,"id":"muse","executable":["python3","../native.py","muse"],"timeout_ms":2000,"max_output_bytes":65536}
