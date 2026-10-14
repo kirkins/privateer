@@ -84,20 +84,33 @@ impl Store {
               kind TEXT NOT NULL,payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),
               artifact TEXT NOT NULL,environment TEXT NOT NULL,charter_hash TEXT NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);")?;
-        // Homes created by 0.1.0 lack the approver column. Check and add it
-        // under the write lock so concurrent opens cannot both add it.
+        // Columns added after 0.1.0. Check and add them under the write lock
+        // so concurrent opens cannot both add one.
         let migrate = rusqlite::Transaction::new_unchecked(
             &connection,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let has_approver: bool = migrate.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='approver')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !has_approver {
-            migrate.execute_batch("ALTER TABLE approvals ADD COLUMN approver TEXT;")?;
+        for (table, column, declaration) in [
+            ("approvals", "approver", "TEXT"),
+            // Events written before this column existed have no time and are
+            // treated as older than any retention cutoff.
+            ("events", "time_ms", "INTEGER"),
+        ] {
+            let present: bool = migrate.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                [table, column],
+                |r| r.get(0),
+            )?;
+            if !present {
+                migrate.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
+                ))?;
+            }
         }
+        // Inbox reads look messages up by recipient instead of scanning events.
+        migrate.execute_batch(
+            "CREATE INDEX IF NOT EXISTS event_recipient ON events(json_extract(payload,'$.to'),seq) WHERE kind='message';",
+        )?;
         migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;
         let schema: String =

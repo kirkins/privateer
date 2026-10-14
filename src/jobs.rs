@@ -1259,6 +1259,49 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
     store.audit("job.cancel_requested", &json!({"job_id": id}))?;
     Ok(public_job(&job))
 }
+/// Finished jobs that ended before `cutoff_ms` and no longer hold a ledger
+/// reservation; capacity is never forgotten by pruning. Deletes their records
+/// unless `dry_run` and returns (pruned, still_reserved, log directories),
+/// leaving the directories for the caller to remove after committing.
+pub(crate) fn prune(
+    store: &Store,
+    cutoff_ms: i64,
+    dry_run: bool,
+) -> Result<(u64, u64, Vec<PathBuf>)> {
+    let mut statement = store.connection().prepare("SELECT record FROM jobs")?;
+    let jobs: Vec<Job> = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .map(|raw| Ok(serde_json::from_str(&raw?)?))
+        .collect::<Result<_>>()?;
+    let mut ledgers = std::collections::HashMap::new();
+    let (mut pruned, mut reserved, mut directories) = (0, 0, vec![]);
+    for job in jobs {
+        if !terminal(&job.status) || job.finished_ms.is_none_or(|t| t >= cutoff_ms) {
+            continue;
+        }
+        if !ledgers.contains_key(&job.ledger) {
+            ledgers.insert(job.ledger.clone(), ledger(&job.ledger)?);
+        }
+        let held: bool = ledgers[&job.ledger].query_row(
+            "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
+            [reservation_key(store.home(), &job.id, &job.incarnation)],
+            |r| r.get(0),
+        )?;
+        if held {
+            reserved += 1;
+            continue;
+        }
+        if !dry_run {
+            store
+                .connection()
+                .execute("DELETE FROM jobs WHERE id=?1", [&job.id])?;
+        }
+        pruned += 1;
+        directories.push(store.home().join("jobs").join(&job.id));
+    }
+    Ok((pruned, reserved, directories))
+}
+
 /// Explicit operator recovery for a shared-ledger reservation that no job can
 /// settle: its job record is missing (a crash between ledger and home
 /// commits), belongs to another home, or never recorded a payload identity.

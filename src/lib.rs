@@ -18,6 +18,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "approval.consume",
     "peer.put",
     "resource.recover",
+    "history.prune",
 ];
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
