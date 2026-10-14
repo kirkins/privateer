@@ -1,0 +1,9 @@
+{
+  "name": "department",
+  "transport": "ssh",
+  "host": "department-host",
+  "executable": "/absolute/path/to/privateer",
+  "home": "/absolute/path/to/privateer-home",
+  "timeout_ms": 10000,
+  "max_response_bytes": 1048576
+}
