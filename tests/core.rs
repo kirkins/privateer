@@ -447,3 +447,51 @@ fn concurrent_writers_wait_instead_of_failing() {
         threads * per_thread
     );
 }
+
+#[test]
+fn custody_and_approval_do_not_depend_on_an_inspect_action() {
+    let (_temp, mut s) = fixture();
+    // A narrow charter without "inspect".
+    dispatch(
+        &mut s,
+        "charter.put",
+        json!({"id":"project","actions":["implement","test","message"]}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "task.handoff",
+        json!({"id":"main","actor":"navigator","target":"apps"}),
+    )
+    .unwrap();
+    let accepted = dispatch(&mut s, "task.accept", json!({"id":"main","actor":"apps"})).unwrap();
+    assert_eq!(accepted["owner"], "apps");
+    let approval = json!({"task_id":"main","artifact":"abc123","environment":"production"});
+    let granted = dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
+    let mut consume = approval;
+    consume["id"] = granted["id"].clone();
+    assert_eq!(
+        dispatch(&mut s, "approval.consume", consume).unwrap()["consumed"],
+        true
+    );
+    // Accepting still needs an open task under an active charter.
+    dispatch(
+        &mut s,
+        "task.handoff",
+        json!({"id":"main","actor":"apps","target":"infra"}),
+    )
+    .unwrap();
+    dispatch(&mut s, "charter.revoke", json!({"id":"project"})).unwrap();
+    let error = dispatch(&mut s, "task.accept", json!({"id":"main","actor":"infra"})).unwrap_err();
+    assert!(error.to_string().contains("revoked"), "{error}");
+    dispatch(&mut s, "charter.put", json!({"id":"project","active":true})).unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"main","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    let error = dispatch(&mut s, "task.accept", json!({"id":"main","actor":"infra"})).unwrap_err();
+    assert!(error.to_string().contains("terminal"), "{error}");
+    assert_eq!(s.task("main").unwrap()["owner"], "apps");
+}

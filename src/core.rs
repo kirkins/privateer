@@ -192,7 +192,9 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
         if task["handoff_to"].as_str() != Some(actor) {
             bail!("no handoff offered to this actor");
         }
-        store.authorize(id, "inspect")?;
+        // Custody grants no new work; the new owner's actions stay bounded by
+        // the charter.
+        store.active_charter(id)?;
         tx.execute(
             "UPDATE tasks SET owner=?2,handoff_to=NULL WHERE id=?1",
             params![id, actor],
@@ -313,7 +315,7 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     let environment = required(&args, "environment")?;
     // The explicit approval supplies authority for this one artifact/environment.
     // It must not require widening every task's standing charter first.
-    let charter = store.authorize(task, "inspect")?;
+    let charter = store.active_charter(task)?;
     let charter_hash = hash(&charter);
     let tx = store.write_transaction()?;
     let id = if command == "approval.grant" {
