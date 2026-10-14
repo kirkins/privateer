@@ -3,7 +3,6 @@
 import argparse
 import json
 import pathlib
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,7 +19,7 @@ def main():
     repo.mkdir()
     homes = {name: root / name for name in ("navigator", "applications", "infrastructure")}
     ledger = root / "host-resources"
-    python = str(pathlib.Path(shutil.which("python3")).resolve())
+    python = sys.executable
     evidence = {"directory": str(root), "binary": str(binary), "native_inference": False}
 
     def invoke(home, command, arguments=None, expect=True):
