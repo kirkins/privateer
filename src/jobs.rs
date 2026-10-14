@@ -381,17 +381,27 @@ fn group_alive(process: &Process) -> Result<bool> {
     }
     Ok(!group_members(process.pid)?.is_empty())
 }
-fn capture_anchors(process: &Process) -> Result<Vec<Process>> {
-    let leader = identity(process.pid)?
-        .context("payload leader missing; cannot discover group ownership")?;
-    ensure!(
-        same_start(&process.started, &leader.started)
-            && (leader.zombie
-                || unsafe { libc::getpgid(process.pid as i32) } == process.pid as i32),
-        "payload leader changed; cannot discover group ownership"
-    );
-    // macOS getpgid reports ESRCH for zombies. An unreaped original PID
-    // with matching start identity still prevents PGID reuse here.
+const UNPROVEN_LEADER: &str = "payload leader missing or changed; cannot discover group ownership";
+/// Snapshot live payload group members. Returns None when the leader cannot
+/// currently be proven to own the group (for example caught mid-exit);
+/// inspection failures remain errors.
+///
+/// `reserved` means the caller holds the leader as an exited but unreaped
+/// child (observed with waitid), which by itself keeps the PID and process
+/// group id from being reused, so the leader's identity is not re-inspected.
+fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Process>>> {
+    if !reserved {
+        // macOS getpgid reports ESRCH for zombies. An unreaped original PID
+        // with matching start identity still prevents PGID reuse here.
+        let owned = identity(process.pid)?.is_some_and(|leader| {
+            same_start(&process.started, &leader.started)
+                && (leader.zombie
+                    || unsafe { libc::getpgid(process.pid as i32) } == process.pid as i32)
+        });
+        if !owned {
+            return Ok(None);
+        }
+    }
     let mut anchors = vec![process.clone()];
     for pid in group_members(process.pid)?.into_iter().take(256) {
         if let Some(p) = identity(pid)? {
@@ -400,7 +410,7 @@ fn capture_anchors(process: &Process) -> Result<Vec<Process>> {
             }
         }
     }
-    Ok(anchors)
+    Ok(Some(anchors))
 }
 fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<()> {
     // A still-live recorded member anchors this exact group even if its
@@ -927,13 +937,11 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             // Exit is observed without reaping, so the leader cannot be reaped
             // between this snapshot and the try_wait below.
             let exited = leader_exited(payload.pid)?;
-            if let Some(observed) = identity(payload.pid)? {
-                if same_start(&payload.started, &observed.started)
-                    && (exited
-                        || observed.zombie
-                        || last_anchor_snapshot.elapsed() >= Duration::from_millis(500))
-                {
-                    let anchors = capture_anchors(&payload)?;
+            if exited || last_anchor_snapshot.elapsed() >= Duration::from_millis(500) {
+                // A leader caught mid-exit may not be provable yet (macOS
+                // reports ESRCH for its process group); periodic snapshots are
+                // retried, and the exit-time one is proven by waitid.
+                if let Some(anchors) = capture_anchors(&payload, exited)? {
                     let _ = alter(store, id, |j| j.group_anchors = anchors)?;
                     last_anchor_snapshot = Instant::now();
                 }
@@ -983,7 +991,8 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             } else {
                 "job deadline reached".into()
             });
-            let anchors = capture_anchors(&payload)?;
+            let anchors =
+                capture_anchors(&payload, leader_exited(payload.pid)?)?.context(UNPROVEN_LEADER)?;
             job = alter(store, id, |j| j.group_anchors = anchors)?;
             signal_group(&payload, libc::SIGTERM, &job.group_anchors)?;
             terminated_at = Some(Instant::now());
@@ -1161,7 +1170,7 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
         if let Some(p) = job.payload.clone() {
             if group_alive(&p)? {
                 let anchors = if same_process(&p)? {
-                    capture_anchors(&p)?
+                    capture_anchors(&p, false)?.context(UNPROVEN_LEADER)?
                 } else {
                     job.group_anchors.clone()
                 };
