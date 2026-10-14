@@ -12,15 +12,19 @@ IDENTITY_MARKERS = (
 )
 
 
-def launch(harness, argv):
-    if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
-        raise ValueError("invalid native launch")
+def native_environment():
     env = os.environ.copy()
     for name in IDENTITY_MARKERS:
         env.pop(name, None)
+    return env
+
+
+def launch(harness, argv):
+    if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
+        raise ValueError("invalid native launch")
     # Keep PRIVATEER_ROLE/ACTOR and all native auth/provider configuration.
     # exec preserves the job's process identity, group and cancellation path.
-    os.execvpe(argv[0], argv, env)
+    os.execvpe(argv[0], argv, native_environment())
 
 
 def main():

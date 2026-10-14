@@ -9,6 +9,8 @@ def session_started(harness, event):
     value = None
     if harness == "codex" and kind == "thread.started":
         value = event.get("thread_id")
+    elif harness in ("rovo", "kimi", "devin") and kind == "session.started" and event.get("harness") == harness:
+        value = event.get("session_id")
     elif harness in ("pi", "pi-signed", "gateway-pi", "omp") and kind == "session":
         value = event.get("id")
     elif harness in ("claude", "cursor") and kind == "system" and event.get("subtype") == "init":

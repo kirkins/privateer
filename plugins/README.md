@@ -29,6 +29,7 @@ stdin-detached `agent.start` job path.
 | `muse` | `muse` | Headless resume not qualified | Yes, fresh |
 | `devin` | `devin` | Native session ID | Yes |
 | `kimi` | `kimi` (current Kimi Code 2.x) | Native session ID | Readiness-gated initial delivery still needed |
+| `rovo` | `rovo acp` | Native ACP session ID, requires advertised load support | No |
 
 Common options are `model`, `effort`, `resume` and `mode` (`headless` or
 `interactive`). Unsupported options are refused rather than silently dropped.
@@ -52,10 +53,28 @@ accepts native `permission_mode`, boolean `sandbox` and boolean `trust`; its
 native text, not invented JSON events. Kimi's native `--prompt` selects its
 unattended mode; no conflicting `--auto` flag is appended.
 
-The launcher replaces itself with the selected CLI in the same process group.
+The native launcher replaces itself with the selected CLI in the same process group.
 It clears inherited foreign harness identity markers while preserving
 `PRIVATEER_ROLE`, `PRIVATEER_ACTOR`, authentication and provider configuration.
 A missing CLI fails without substituting another harness or model.
+
+Rovo uses its native ACP interface rather than a guessed positional prompt or
+the older `acli rovodev` CLI. Kimi and Devin optionally accept `transport: acp`;
+their default remains the native print interface. ACP runs one correlated turn
+in the owning job's process group, with bounded messages, queues and deadlines.
+Only the exact requested session can be loaded, and only when the server
+advertises that capability. `end_turn` is required before reporting completion.
+Filesystem and terminal client methods are not advertised or executed. Native
+tools still run with the native harness's own privileges.
+
+ACP permission requests default to cancellation. An explicit
+`acp_permissions: allow_once` may select an offered one-time grant; it never
+selects a persistent grant. Native permission/sandbox options are refused in ACP
+mode rather than reinterpreted. Explicit model selection requires advertised
+session configuration (or the older advertised models API), and configuration
+changes must be confirmed. Unsupported choices fail before the prompt.
+Usage remains absent when the server does not report it; no token counts are
+estimated. The core remains responsible for cancellation and descendant cleanup.
 
 Inspect supported command options and check installed parsers without inference:
 
@@ -79,16 +98,19 @@ message. With `--check-resume`, it also requires native startup session evidence
 the same session ID on the second run, and recall of prior conversation context.
 The isolated two-job test qualifies native continuity, not runtime focus routing.
 Session-start decoding is currently implemented for Codex, Claude, Pi-family,
-OpenCode, Gemini, Cursor and AGY; an unknown format stays unqualified.
+OpenCode, Gemini, Cursor, AGY and the Rovo/Kimi/Devin ACP transport; an unknown
+format stays unqualified.
 
 This is progress toward the harness set in
 [First Mate's configuration reference](https://github.com/kunchenguid/firstmate/blob/08f0a069af2f88911858b44175d225b77362cffe/docs/configuration.md#harness-support),
-not full lifecycle parity. Rovo still needs its own verified readiness/delivery
-adapter: First Mate's current `rovo` integration cannot be replaced with a guessed
-positional prompt or silently switched to the older `acli rovodev` CLI.
-Interactive attachment/injection and resident-service wake integration remain
-separate qualification work; command plans do not claim a harness can already
-coordinate a ship. Provider routes remain private configuration.
+not full lifecycle parity. The ACP adapter has real pipe/process fixtures for
+session identity, permissions, deadlines, cancellation and the existing
+activation/mail contract. Native Kimi and Devin initialization has been checked;
+live authenticated ACP turns, including Rovo, still require qualification.
+Interactive attachment/injection and per-harness supervision remain separate
+qualification work; command plans and scripted protocol fixtures do not claim
+a harness can already coordinate a ship autonomously. Provider routes remain
+private configuration.
 
 Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `danger-full-access`) and boolean `ephemeral`. They are omitted by default, preserving native user configuration. Choosing `workspace-write` adds only the local Privateer operational home with `--add-dir`, so the agent can write its durable task and message records as well as work in the repository. `ephemeral:true` suppresses native Codex session persistence while Privateer retains its job records. This does not change global harness preferences.
 

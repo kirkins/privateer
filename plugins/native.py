@@ -22,6 +22,7 @@ PROFILES = {
     "muse": {"binary": "muse", "resume": None, "effort": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]},
     "devin": {"binary": "devin", "resume": "id", "effort": []},
     "kimi": {"binary": "kimi", "resume": "id", "effort": []},
+    "rovo": {"binary": "rovo", "resume": "id", "effort": []},
 }
 
 
@@ -66,6 +67,8 @@ def build(harness, request):
     repo, prompt = context(request)
     options = request.get("options", {})
     allowed = {"model", "effort", "resume", "mode"}
+    if harness in ("rovo", "kimi", "devin"):
+        allowed |= {"transport", "acp_permissions"}
     if harness == "codex":
         allowed |= {"sandbox", "ephemeral"}
     if harness in ("pi", "pi-signed", "omp"):
@@ -88,6 +91,17 @@ def build(harness, request):
     resume = session(option(options, "resume"), profile)
     headless = mode == "headless"
     argv = [profile["binary"]]
+    if harness in ("rovo", "kimi", "devin"):
+        transport = selector(options, "transport", ["native", "acp"]) or ("acp" if harness == "rovo" else "native")
+        if transport == "acp":
+            if not headless or set(options) - {"mode", "model", "resume", "transport", "acp_permissions"}:
+                raise ValueError("unsupported ACP options")
+            permissions = selector(options, "acp_permissions", ["deny", "allow_once"]) or "deny"
+            payload = {"binary": profile["binary"], "cwd": repo, "prompt": prompt, "model": model,
+                       "resume": resume, "permissions": "auto" if permissions == "allow_once" else "ask"}
+            return repo, [sys.executable, str(Path(__file__).with_name("acp.py")), "--request", json.dumps(payload)]
+        if harness == "rovo" or "acp_permissions" in options:
+            raise ValueError("ACP transport required")
 
     if harness == "codex":
         # Exec options belong before the resume subcommand. Passing -C or
@@ -253,16 +267,17 @@ def build(harness, request):
 def handle(harness, request):
     repo, argv = build(harness, request)
     return {"valid": True} if request["method"] == "validate" else {
-        "argv": [sys.executable, str(Path(__file__).with_name("native_launch.py")), harness, *argv],
+        "argv": argv if argv[:2] == [sys.executable, str(Path(__file__).with_name("acp.py"))] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), harness, *argv],
         "cwd": repo, "env_names": []}
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--describe"]:
         print(json.dumps({name: {"binary": p["binary"], "headless": True,
-                                "interactive_command": name != "kimi", "resume_selector": p["resume"],
+                                "interactive_command": name not in ("kimi", "rovo"), "resume_selector": p["resume"],
                                 "effort": p["effort"], "live_injection": False,
                                 "structured_headless_output": name != "devin",
+                                "acp_transport": name in ("rovo", "kimi", "devin"),
                                 "qualification": "command-plan; native pilots required"}
                           for name, p in PROFILES.items()}, indent=2))
     elif len(sys.argv) == 2 and sys.argv[1] in PROFILES:

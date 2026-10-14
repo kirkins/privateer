@@ -136,11 +136,16 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
         "muse",
         "devin",
         "kimi",
+        "rovo",
     ] {
         let mut args = f.args(&example(name));
         let planned = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
         assert_eq!(planned["cwd"], json!(f.repo));
-        assert_eq!(planned["argv"][2], name);
+        if name == "rovo" {
+            assert!(planned["argv"][1].as_str().unwrap().ends_with("acp.py"));
+        } else {
+            assert_eq!(planned["argv"][2], name);
+        }
         assert_eq!(planned["env_names"], json!([]));
         let resume = if name == "opencode" {
             "ses_0123456789abc"
@@ -156,13 +161,19 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
             );
         } else {
             let resumed = resumed.unwrap();
-            assert!(
-                resumed["argv"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|s| s == resume)
-            );
+            if name == "rovo" {
+                let payload: Value =
+                    serde_json::from_str(resumed["argv"][3].as_str().unwrap()).unwrap();
+                assert_eq!(payload["resume"], resume);
+            } else {
+                assert!(
+                    resumed["argv"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s == resume)
+                );
+            }
             assert!(
                 !resumed["argv"]
                     .as_array()
@@ -173,7 +184,7 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
         }
         args["options"] = json!({"mode":"interactive"});
         let plan = plugins::dispatch(&mut f.store, "plugin.command", args);
-        if name == "kimi" {
+        if matches!(name, "kimi" | "rovo") {
             assert!(
                 plan.is_err(),
                 "Kimi requires readiness-gated interactive delivery; a bare launch must not lose the brief"
@@ -208,6 +219,25 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
         plugins::dispatch(&mut f.store, "plugin.command", args).is_err(),
         "unsupported options are not silently omitted"
     );
+    for name in ["rovo", "kimi", "devin"] {
+        let mut args = f.args(&example(name));
+        args["options"] =
+            json!({"transport":"acp","resume":"saved-session","acp_permissions":"allow_once"});
+        let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+        assert!(plan["argv"][1].as_str().unwrap().ends_with("acp.py"));
+        let payload: Value = serde_json::from_str(plan["argv"][3].as_str().unwrap()).unwrap();
+        assert_eq!(payload["binary"], name);
+        assert_eq!(payload["resume"], "saved-session");
+        assert_eq!(payload["permissions"], "auto");
+        for invalid in [
+            json!({"transport":"acp","mode":"interactive"}),
+            json!({"transport":"acp","permission_mode":"autonomous"}),
+            json!({"transport":"native","acp_permissions":"allow_once"}),
+        ] {
+            args["options"] = invalid;
+            assert!(plugins::dispatch(&mut f.store, "plugin.command", args.clone()).is_err());
+        }
+    }
 }
 
 #[test]
@@ -292,6 +322,9 @@ assert read_session('claude',log) is None
 log.write_text('x'*65537+'\n'+json.dumps({'type':'thread.started','thread_id':identity})+'\n')
 assert read_session('codex',log) is None
 assert session_started('codex',{'type':'thread.started','thread_id':'bad\nidentity'}) is None
+for harness in ('rovo','kimi','devin'):
+    assert session_started(harness,{'type':'session.started','harness':harness,'session_id':identity})==identity
+    assert session_started(harness,{'type':'session.started','harness':'unrelated','session_id':identity}) is None
 "#;
     let output = Command::new("python3")
         .args(["-c", script])
@@ -304,6 +337,98 @@ assert session_started('codex',{'type':'thread.started','thread_id':'bad\nidenti
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn native_acp_bridge_qualifies_real_pipe_and_process_boundaries() {
+    let output = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/acp_bridge.py"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn an_acp_first_mate_uses_the_existing_activation_mail_and_agent_role_contract() {
+    let mut f = Fixture::new();
+    fs::write(
+        f.store.home().join("config.json"),
+        json!({"resource_home":f.base().join("ledger")}).to_string(),
+    )
+    .unwrap();
+    let fakebin = f.base().join("bin");
+    fs::create_dir(&fakebin).unwrap();
+    let server = fakebin.join("rovo");
+    fs::write(&server,r#"#!/usr/bin/env python3
+import json,os,subprocess,sys
+def call(command,args):
+    output=subprocess.run([os.environ['ACP_TEST_CLI'],'--home',os.environ['ACP_TEST_HOME'],command,'--json',json.dumps(args)],capture_output=True,text=True)
+    assert output.returncode==0,command
+    return json.loads(output.stdout)
+for line in sys.stdin:
+    request=json.loads(line)
+    method=request['method']
+    if method=='initialize':result={'protocolVersion':1,'agentCapabilities':{'loadSession':True}}
+    elif method=='session/new':result={'sessionId':'actual-protocol-fixture-session'}
+    elif method=='session/prompt':
+        assert os.environ['PRIVATEER_ROLE']=='agent' and os.environ['PRIVATEER_ACTOR']=='department'
+        assert 'New mail through seq' in request['params']['prompt'][0]['text']
+        inbox=call('mail.inbox',{'address':'department'})
+        for mail in inbox['messages']:
+            if mail['kind']=='request':
+                call('mail.send',{'id':'reply-'+mail['id'],'from':'department','to':mail['from'],'kind':'reply','correlation':mail['id'],'body':'handled through ACP protocol fixture'})
+        call('mail.ack',{'address':'department','through_seq':max(m['seq'] for m in inbox['messages'])})
+        result={'stopReason':'end_turn'}
+    else:raise RuntimeError('unexpected method')
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
+    fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
+    privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"ACP protocol fixture","first_mate":{"manifest":example("rovo"),"duty_task":"task","batch_secs":0,"max_delay_secs":0}})).unwrap();
+    privateer::dispatch(&mut f.store,"mail.send",json!({"id":"acp-work","from":"captain","to":"department","kind":"request","body":"Handle the isolated protocol test"})).unwrap();
+    let tick = Command::new(env!("CARGO_BIN_EXE_privateer"))
+        .args([
+            "--home",
+            f.store.home().to_str().unwrap(),
+            "serve",
+            "--json",
+            "{\"once\":true}",
+        ])
+        .env(
+            "PATH",
+            format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("ACP_TEST_CLI", env!("CARGO_BIN_EXE_privateer"))
+        .env("ACP_TEST_HOME", f.store.home())
+        .output()
+        .unwrap();
+    assert!(
+        tick.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tick.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let wake = loop {
+        privateer::activation::tick(&mut f.store).unwrap();
+        let wakes =
+            privateer::dispatch(&mut f.store, "wake.list", json!({"ship":"department"})).unwrap();
+        let wake = &wakes["wakes"][0];
+        if wake["status"] != "running" {
+            break wake.clone();
+        }
+        assert!(Instant::now() < deadline, "ACP fixture wake did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(wake["status"], "succeeded", "{wake}");
+    assert!(
+        wake["usage"].is_null(),
+        "unreported native usage must not become invented token counts"
+    );
+    let request = privateer::dispatch(&mut f.store, "mail.show", json!({"id":"acp-work"})).unwrap();
+    assert_eq!(request["state"], "answered");
 }
 
 #[test]
@@ -550,62 +675,65 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
 
 #[test]
 fn cancellation_reaches_the_execed_harness_and_its_descendants() {
-    let mut f = Fixture::new();
-    fs::write(
-        f.store.home().join("config.json"),
-        json!({"resource_home": f.base().join("ledger")}).to_string(),
-    )
-    .unwrap();
-    let fakebin = f.base().join("bin");
-    fs::create_dir(&fakebin).unwrap();
-    let ready = f.repo.join("ready.json");
-    let fake = fakebin.join("codex");
-    fs::write(&fake, format!("#!/usr/bin/env python3\nimport json,os,time\nchild=os.fork()\nif child==0:\n    time.sleep(30)\nelse:\n    open({:?},'w').write(json.dumps([os.getpid(),child]))\n    time.sleep(30)\n", ready.display().to_string())).unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-    let start = Command::new(env!("CARGO_BIN_EXE_privateer"))
-        .args([
-            "--home",
-            f.store.home().to_str().unwrap(),
-            "agent.start",
-            "--json",
-            &json!({"id":"native-cancel","task_id":"task","manifest":example("codex")}).to_string(),
-        ])
-        .env(
-            "PATH",
-            format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+    for harness in ["codex", "rovo"] {
+        let mut f = Fixture::new();
+        fs::write(
+            f.store.home().join("config.json"),
+            json!({"resource_home": f.base().join("ledger")}).to_string(),
         )
-        .output()
         .unwrap();
-    assert!(
-        start.status.success(),
-        "{}",
-        String::from_utf8_lossy(&start.stderr)
-    );
-    let until = Instant::now() + Duration::from_secs(3);
-    while !ready.exists() && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let pids = fs::read_to_string(&ready)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<i32>>(&s).ok());
-    privateer::dispatch(&mut f.store, "job.cancel", json!({"id":"native-cancel"})).unwrap();
-    let pids = pids.expect("fake native harness did not start");
-    let until = Instant::now() + Duration::from_secs(3);
-    for pid in pids {
-        loop {
-            let out = Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "stat="])
-                .output()
-                .unwrap();
-            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if state.is_empty() || state.starts_with('Z') {
-                break;
-            }
-            assert!(
-                Instant::now() < until,
-                "native payload {pid} survived cancellation"
-            );
+        let fakebin = f.base().join("bin");
+        fs::create_dir(&fakebin).unwrap();
+        let ready = f.repo.join("ready.json");
+        let fake = fakebin.join(harness);
+        fs::write(&fake, format!("#!/usr/bin/env python3\nimport json,os,time\nchild=os.fork()\nif child==0:\n    time.sleep(30)\nelse:\n    open({:?},'w').write(json.dumps([os.getpid(),child]))\n    time.sleep(30)\n", ready.display().to_string())).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let start = Command::new(env!("CARGO_BIN_EXE_privateer"))
+            .args([
+                "--home",
+                f.store.home().to_str().unwrap(),
+                "agent.start",
+                "--json",
+                &json!({"id":"native-cancel","task_id":"task","manifest":example(harness)})
+                    .to_string(),
+            ])
+            .env(
+                "PATH",
+                format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            start.status.success(),
+            "{}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let until = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        let pids = fs::read_to_string(&ready)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<i32>>(&s).ok());
+        privateer::dispatch(&mut f.store, "job.cancel", json!({"id":"native-cancel"})).unwrap();
+        let pids = pids.expect("fake native harness did not start");
+        let until = Instant::now() + Duration::from_secs(3);
+        for pid in pids {
+            loop {
+                let out = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "stat="])
+                    .output()
+                    .unwrap();
+                let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if state.is_empty() || state.starts_with('Z') {
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "native payload {pid} survived cancellation"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }
