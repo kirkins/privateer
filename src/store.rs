@@ -128,6 +128,7 @@ impl Store {
         crate::jobs::init(&store)?;
         crate::peers::init(&store)?;
         crate::mail::init(&store)?;
+        crate::activation::init(&store)?;
         Ok(store)
     }
 

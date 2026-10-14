@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod admission;
 pub mod core;
 #[cfg(feature = "dashboard")]
@@ -48,6 +49,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
         "ship" | "mail" => mail::dispatch(store, command, args),
+        "wake" => activation::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let task = args
                 .get("task_id")

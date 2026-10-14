@@ -203,7 +203,16 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
         .collect();
     let executable = std::env::current_exe().context("cannot locate Privateer executable")?;
     let mut context = json!({"task_id": id, "title": title, "repo": charter["repo"], "owner": task["owner"], "actions": charter["actions"], "control":{"version":1,"cli_argv":[executable,"--home",store.home()]}});
-    context["brief"] = json!(brief(&context));
+    // Wake-specific text goes after the stable brief, so the brief's bytes
+    // stay identical across wakes and its prefix keeps hitting the cache.
+    let mut text = brief(&context);
+    if let Some(wake) = args.get("wake").filter(|v| !v.is_null()) {
+        let wake = wake.as_str().context("wake must be text")?;
+        ensure!(wake.len() <= 32_768, "wake text exceeds 32 KiB");
+        text.push_str("\n\n");
+        text.push_str(wake);
+    }
+    context["brief"] = json!(text);
     Ok((context, charter))
 }
 fn brief(context: &Value) -> String {
