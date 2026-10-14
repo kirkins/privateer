@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -22,6 +23,25 @@ fn run(home: &Path, command: &str, args: Value, ssh: Option<&Path>) -> Output {
         process.env("PRIVATEER_SSH_EXECUTABLE", ssh);
     }
     process.output().unwrap()
+}
+
+fn run_rpc(home: &Path, command: &str, args: Value, ssh: &Path) -> Output {
+    let mut child = Command::new(binary())
+        .args(["--home", home.to_str().unwrap(), "rpc"])
+        .env("PRIVATEER_SSH_EXECUTABLE", ssh)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // JSON belongs on the protocol stream. A 200 KiB argument exceeds Linux's
+    // per-argument limit on hosts with 4 KiB pages before Privateer can run.
+    let request = json!({"id":"deadline-test","command":command,"args":args});
+    let mut stdin = child.stdin.take().unwrap();
+    serde_json::to_writer(&mut stdin, &request).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    drop(stdin);
+    child.wait_with_output().unwrap()
 }
 
 fn ok(home: &Path, command: &str, args: Value, ssh: Option<&Path>) -> Value {
@@ -242,14 +262,17 @@ fn deadline_covers_blocked_request_writes_and_inherited_output_pipes() {
     for (name, body) in [("blocked", "sleep 5"), ("inherited", "sleep 5 &\nexit 0")] {
         let ssh = script(fixture.path(), name, body);
         let started = Instant::now();
-        let result = run(
+        let result = run_rpc(
             &home,
             "peer.call",
             json!({"name":"infrastructure","command":"status","args":{"padding":"x".repeat(200_000)}}),
-            Some(&ssh),
+            &ssh,
         );
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("timed out"));
+        assert!(result.status.success());
+        let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(response["id"], "deadline-test");
+        assert_eq!(response["ok"], false);
+        assert!(response["error"].as_str().unwrap().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
