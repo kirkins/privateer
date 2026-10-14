@@ -6,6 +6,14 @@ home**, organized as equal peer ships. Fleet overview is the home destination;
 the sidebar always shows ships. Each ship has Bridge, Assignments, Terminals
 and Logbook views. It does not aggregate other homes or remote peers.
 
+The [terminal dashboard and Herdr design](design/terminal-dashboard-and-herdr.md)
+sets the next direction alongside the
+[conversation and activation design](design/conversation-and-activation.md):
+real ships are independent homes, the captain has an inbox, and Herdr supplies
+activation and observation capabilities. Today's owner groups are a presentation
+prototype for that navigation, not independent ship homes. This guide describes
+implemented behavior; those design documents do not imply the features exist yet.
+
 This is an observation and navigation tool. It is not yet a conversational
 navigator, scheduler or interactive agent launcher. Installing it does not
 replace an existing fleet. The current headless harness/job interfaces continue
@@ -174,10 +182,13 @@ renderer or its transcript patches. See [attribution](../THIRD_PARTY_NOTICES.md)
 Its Herdr regression scenarios also informed stale-identity checks and focus
 behavior; its shell backend and policy framework are not imported.
 
-Future work includes persistent navigator conversation, explicit task-to-native
-session bindings, direct worker messaging with delivery evidence, push events,
-and interactive launch/recovery/resource admission. These need meaningful
-qualification; the dashboard does not claim them through its labels or demo.
+Future work follows the linked design: directory-backed ship workspaces, the
+captain's inbox and front door, explicit first-mate/crew session bindings, and
+qualified terminal activation and reconnect capabilities. Ship-to-ship messages
+normally pass between first mates; crew outcomes are recorded by the runtime.
+These need meaningful qualification; the dashboard does not claim them through
+its labels or demo. The resident service will own activation independently of
+the dashboard, with mailbox delivery evidence rather than raw terminal typing.
 
 The broader comparison remains an informational reference in
 [issue #12](https://github.com/kirkins/privateer/issues/12), not a parity checklist.
