@@ -34,6 +34,8 @@ for m in call("mail.inbox", {"address": ship})["messages"]:
     if m["kind"] == "request" and m["state"] == "open":
         call("mail.send", {"from": ship, "to": m["from"], "kind": "reply", "correlation": m["id"], "body": "handled by " + ship})
 through = int(re.search(r"through seq (\d+)", prompt).group(1))
+for focus in re.findall(r"^## (\S+)$", prompt, re.M):
+    call("note.put", {"ship": ship, "focus": focus, "body": "Seen through seq %d" % through})
 call("mail.ack", {"address": ship, "through_seq": through})
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1200, "cached_input_tokens": 1000, "output_tokens": 80}}))
 "#;
@@ -71,7 +73,11 @@ impl Fleet {
             json!({"id":"fleet","objective":"Answer mail","repo":repo,"min_free_bytes":0,"job_timeout_secs":60}),
         )
         .unwrap();
-        for (task, owner) in [("apps-duty", "apps"), ("infra-duty", "infra")] {
+        for (task, owner) in [
+            ("apps-duty", "apps"),
+            ("infra-duty", "infra"),
+            ("infra-repair", "infra"),
+        ] {
             dispatch(
                 &mut store,
                 "task.create",
@@ -348,4 +354,57 @@ fn first_mate_profiles_are_validated() {
     }
     let ship = dispatch(&mut fleet.store, "ship.show", json!({"name":"infra"})).unwrap();
     assert_eq!(ship["first_mate"]["max_wakes_per_hour"], 12);
+}
+
+#[test]
+fn wakes_group_mail_by_focus_carry_handoff_notes_and_run_under_the_focus_task() {
+    let mut fleet = Fleet::new(now_settings());
+    let first = fleet.send(
+        json!({"id":"repair-status","from":"apps","to":"infra","kind":"request","task_id":"infra-repair","body":"How is the repair going?"}),
+    );
+    let woke = Fleet::infra(&fleet.tick());
+    assert_eq!(woke["focus"], "task:infra-repair", "{woke}");
+    assert_eq!(woke["task_id"], "infra-repair");
+    fleet.settle();
+    // The first mate left a note for the focus it worked on.
+    let note = dispatch(
+        &mut fleet.store,
+        "note.get",
+        json!({"ship":"infra","focus":"task:infra-repair"}),
+    )
+    .unwrap();
+    assert_eq!(note["notes"][0]["author"], "infra");
+    assert_eq!(
+        note["notes"][0]["body"],
+        format!("Seen through seq {}", first["seq"])
+    );
+    // Later mail on the same task brings that note back; an unrelated
+    // question is its own thread, run under the duty task.
+    fleet.send(
+        json!({"id":"repair-more","from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":"Also check the cache"}),
+    );
+    fleet.send(
+        json!({"id":"unrelated","from":"apps","to":"infra","kind":"request","body":"Any disk alerts?"}),
+    );
+    let woke = Fleet::infra(&fleet.tick());
+    assert_eq!(woke["task_id"], "infra-repair");
+    assert_eq!(
+        woke["focuses"],
+        json!(["task:infra-repair", "thread:unrelated"])
+    );
+    fleet.settle();
+    let prompt = fleet.prompts().pop().unwrap();
+    assert!(prompt.contains("## task:infra-repair"), "{prompt}");
+    assert!(prompt.contains("Your handoff note (v1)"));
+    assert!(prompt.contains(&format!("Seen through seq {}", first["seq"])));
+    assert!(prompt.contains("## thread:unrelated"));
+    assert!(prompt.contains("Bearings for infra"));
+    // Mail with no owned task runs under the duty task.
+    fleet.send(
+        json!({"id":"just-a-question","from":"apps","to":"infra","kind":"request","body":"Which region?"}),
+    );
+    let woke = Fleet::infra(&fleet.tick());
+    assert_eq!(woke["focus"], "thread:just-a-question");
+    assert_eq!(woke["task_id"], "infra-duty");
+    fleet.settle();
 }

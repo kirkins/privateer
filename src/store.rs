@@ -129,6 +129,7 @@ impl Store {
         crate::peers::init(&store)?;
         crate::mail::init(&store)?;
         crate::activation::init(&store)?;
+        crate::context::init(&store)?;
         Ok(store)
     }
 

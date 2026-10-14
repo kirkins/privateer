@@ -30,6 +30,16 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, finished_ms INTEGER, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);",
     )?;
+    let present: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name='focuses')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        store
+            .connection()
+            .execute_batch("ALTER TABLE wakes ADD COLUMN focuses TEXT;")?;
+    }
     Ok(())
 }
 
@@ -109,13 +119,15 @@ struct Mail {
     seq: i64,
     created_ms: i64,
     routine: bool,
+    focus: String,
     summary: String,
 }
 
-/// Mail for a ship newer than both its acknowledgement and its last wake.
+/// Mail for a ship newer than both its acknowledgement and its last wake,
+/// each labelled with the focus it belongs to.
 fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
     let mut statement = store.connection().prepare(
-        "SELECT seq, id, sender, kind, correlation, request_kind, urgency, body, payload, created_ms
+        "SELECT seq, id, sender, kind, correlation, request_kind, urgency, body, payload, created_ms, task_id
          FROM mail WHERE recipient=?1 AND COALESCE(delivery, 'received')='received' AND seq > ?2
          ORDER BY seq LIMIT 200",
     )?;
@@ -125,57 +137,85 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
         let body: String = r.get(7)?;
         let body: String = body.chars().take(MAX_BODY_CHARS).collect();
         let payload: String = r.get(8)?;
+        let id: String = r.get(1)?;
+        let from: String = r.get(2)?;
+        let correlation: Option<String> = r.get(4)?;
         let mut summary = format!(
-            "- seq {} id {} from {} kind {}",
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            kind
+            "- seq {} id {id} from {from} kind {kind}",
+            r.get::<_, i64>(0)?
         );
         if let Some(request_kind) = r.get::<_, Option<String>>(5)? {
             summary.push_str(&format!(" request_kind {request_kind}"));
         }
-        if let Some(correlation) = r.get::<_, Option<String>>(4)? {
+        if let Some(correlation) = &correlation {
             summary.push_str(&format!(" correlation {correlation}"));
         }
         summary.push_str(&format!(" urgency {urgency}\n  {body}"));
         if payload != "{}" && payload.len() <= 1024 {
             summary.push_str(&format!("\n  payload {payload}"));
         }
-        Ok(Mail {
-            seq: r.get(0)?,
-            created_ms: r.get(9)?,
-            // Information-only notices wait for the next real wake.
-            routine: kind == "notice" && urgency == "low",
-            summary,
-        })
+        let message = json!({"id": id, "from": from, "correlation": correlation,
+            "task_id": r.get::<_, Option<String>>(10)?});
+        Ok((
+            Mail {
+                seq: r.get(0)?,
+                created_ms: r.get(9)?,
+                // Information-only notices wait for the next real wake.
+                routine: kind == "notice" && urgency == "low",
+                focus: String::new(),
+                summary,
+            },
+            message,
+        ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut mail = vec![];
+    for row in rows {
+        let (mut item, message) = row?;
+        item.focus = crate::context::focus_of(store, ship, &message)?;
+        mail.push(item);
+    }
+    Ok(mail)
 }
 
-/// The changing part of a wake prompt, appended after the stable brief.
+/// The changing part of a wake prompt, appended after the stable brief:
+/// bearings from records, then the new mail grouped by focus, each focus
+/// with its handoff note, so a fresh first mate sees the judgement it left
+/// for exactly the topics in play.
 fn wake_text(store: &Store, wake: &str, ship: &str, mail: &[Mail], through: i64) -> Result<String> {
-    let owed: i64 = store.connection().query_row(
-        "SELECT COUNT(*) FROM mail WHERE recipient=?1 AND state='open'",
-        [ship],
-        |r| r.get(0),
-    )?;
-    let owing: i64 = store.connection().query_row(
-        "SELECT COUNT(*) FROM mail WHERE sender=?1 AND state='open'",
-        [ship],
-        |r| r.get(0),
-    )?;
-    let mut text = format!(
-        "Wake {wake} for ship {ship}. Requests you owe a reply: {owed}; requests awaiting replies to you: {owing}.\nNew mail through seq {through}:\n"
-    );
-    let mut shown = 0;
+    let bearings = crate::context::bearings(store, ship)?;
+    let mut text = format!("Wake {wake} for ship {ship}.\n");
+    text.push_str(bearings["text"].as_str().unwrap_or(""));
+    text.push_str(&format!("New mail through seq {through}, by focus:\n"));
+    let mut foci: Vec<&str> = vec![];
     for item in mail {
-        if text.len() + item.summary.len() > MAX_WAKE_BYTES {
+        if !foci.contains(&item.focus.as_str()) {
+            foci.push(&item.focus);
+        }
+    }
+    let mut shown = 0;
+    for focus in &foci {
+        let mut section = format!("## {focus}\n");
+        if let Some(note) = crate::context::current_note(store, ship, focus)? {
+            section.push_str(&format!(
+                "Your handoff note (v{}):\n{}\n",
+                note["version"],
+                note["body"].as_str().unwrap_or("")
+            ));
+        }
+        let mut items = 0;
+        for item in mail.iter().filter(|m| m.focus == *focus) {
+            if text.len() + section.len() + item.summary.len() > MAX_WAKE_BYTES {
+                break;
+            }
+            section.push_str(&item.summary);
+            section.push('\n');
+            items += 1;
+        }
+        if items == 0 {
             break;
         }
-        text.push_str(&item.summary);
-        text.push('\n');
-        shown += 1;
+        shown += items;
+        text.push_str(&section);
     }
     if shown < mail.len() {
         text.push_str(&format!(
@@ -184,7 +224,7 @@ fn wake_text(store: &Store, wake: &str, ship: &str, mail: &[Mail], through: i64)
         ));
     }
     text.push_str(&format!(
-        "Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. When done, acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."
+        "Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. For more history on a focus use focus.digest {{\"ship\":\"{ship}\",\"focus\":...}}. Before you finish, for each focus you worked on, replace its handoff note with note.put {{\"ship\":\"{ship}\",\"focus\":...,\"body\":...}}: what you are doing and why, what you are waiting on, and what comes next, in under 2 KB; facts are already recorded. Then acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."
     ));
     Ok(text)
 }
@@ -337,10 +377,29 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
 
     let through = mail.iter().map(|m| m.seq).max().unwrap_or(0);
     let wake = format!("wake-{}", uuid::Uuid::new_v4());
-    let focus = profile["duty_task"].as_str().unwrap_or("").to_owned();
+    // The primary focus is the oldest wake-worthy mail's. A wake about a task
+    // the ship owns runs under that task when its charter allows a first
+    // mate; anything else runs under the duty task.
+    let primary = triggers
+        .iter()
+        .min_by_key(|m| m.seq)
+        .map(|m| m.focus.clone())
+        .unwrap_or_default();
+    let duty = profile["duty_task"].as_str().unwrap_or("").to_owned();
+    let task = primary
+        .strip_prefix("task:")
+        .filter(|t| store.authorize(t, "spawn").is_ok() && store.authorize(t, "implement").is_ok())
+        .map(str::to_owned)
+        .unwrap_or(duty);
+    let mut foci: Vec<String> = vec![];
+    for item in &mail {
+        if !foci.contains(&item.focus) {
+            foci.push(item.focus.clone());
+        }
+    }
     let text = wake_text(store, &wake, &name, &mail, through)?;
     let mut start = json!({
-        "id": wake, "task_id": focus, "manifest": profile["manifest"],
+        "id": wake, "task_id": task, "manifest": profile["manifest"],
         "options": profile["options"], "wake": text,
     });
     if let Some(config) = profile.get("config") {
@@ -352,18 +411,19 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         Err(error) => ("failed", Some(format!("{error:#}"))),
     };
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error)
-         VALUES(?1, ?2, ?3, ?4, ?5, 'fresh', ?6, ?7, ?8, ?9)",
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, focuses)
+         VALUES(?1, ?2, ?3, ?4, ?5, 'fresh', ?6, ?7, ?8, ?9, ?10)",
         params![
             wake,
             name,
-            focus,
+            primary,
             through,
             started.is_ok().then_some(&wake),
             status,
             now,
             error.is_some().then_some(now),
-            error
+            error,
+            json!(foci).to_string()
         ],
     )?;
     store.audit(
@@ -371,7 +431,8 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         &json!({"wake": wake, "ship": name, "through_seq": through, "status": status}),
     )?;
     Ok(
-        json!({"ship": name, "wake": wake, "status": status, "through_seq": through, "error": error}),
+        json!({"ship": name, "wake": wake, "status": status, "through_seq": through,
+        "focus": primary, "task_id": task, "focuses": foci, "error": error}),
     )
 }
 
@@ -440,7 +501,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .unwrap_or(50)
                 .clamp(1, 1000);
             let mut statement = store.connection().prepare(
-                "SELECT id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, usage
+                "SELECT id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, usage, focuses
                  FROM wakes WHERE (?1 IS NULL OR ship=?1) ORDER BY created_ms DESC LIMIT ?2",
             )?;
             let wakes = statement
@@ -453,6 +514,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         "status": r.get::<_, String>(6)?, "created_ms": r.get::<_, i64>(7)?,
                         "finished_ms": r.get::<_, Option<i64>>(8)?, "error": r.get::<_, Option<String>>(9)?,
                         "usage": usage.and_then(|u| serde_json::from_str::<Value>(&u).ok()),
+                        "focuses": r.get::<_, Option<String>>(11)?
+                            .and_then(|f| serde_json::from_str::<Value>(&f).ok()),
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
