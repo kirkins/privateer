@@ -387,3 +387,18 @@ fn corrupt_charter_is_not_silently_replaced_with_default_authority() {
         .is_err()
     );
 }
+
+#[test]
+fn explicit_production_approval_does_not_require_widening_the_standing_charter() {
+    let (_temp, mut s) = fixture();
+    assert!(s.authorize("main", "deploy_production").is_err());
+    let before = s.charter("project").unwrap();
+    let check = json!({"task_id":"main","current_head":"release-a","tested_head":"release-a","checks_passed":true,"deploys_production":true,"environment":"production"});
+    assert!(dispatch(&mut s, "delivery.check", check.clone()).is_err());
+    dispatch(&mut s,"approval.grant",json!({"id":"one-deployment","task_id":"main","artifact":"release-a","environment":"production"})).unwrap();
+    dispatch(&mut s, "delivery.check", check).unwrap();
+    assert_eq!(s.charter("project").unwrap(), before);
+    assert!(s.authorize("main", "deploy_production").is_err());
+    assert!(dispatch(&mut s,"approval.consume",json!({"id":"one-deployment","task_id":"main","artifact":"release-b","environment":"production"})).is_err());
+    dispatch(&mut s,"approval.consume",json!({"id":"one-deployment","task_id":"main","artifact":"release-a","environment":"production"})).unwrap();
+}

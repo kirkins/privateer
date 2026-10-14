@@ -26,6 +26,6 @@ This milestone does not implement distributed consensus or cryptographic cross-h
 
 ## Delivery and deployment
 
-Passing-head checks bind delivery evidence to the current artifact. Production approval binds a separate decision to an exact artifact and environment. These are workflow guards running under one OS identity. Hard isolation from production credentials requires a separately enforced broker or account boundary.
+Passing-head checks bind delivery evidence to the current artifact. Production approval binds a separate decision to an exact artifact and environment; that approval supplies authority for the single deployment without requiring broader standing deployment rights. These are workflow guards running under one OS identity. Hard isolation from production credentials requires a separately enforced broker or account boundary.
 
 The first milestone has no live forge merge/deployment adapter and no automatic fleet migration. A passing runtime pilot establishes behavior of the machinery; native model-driven execution is a separate qualification step.

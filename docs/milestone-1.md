@@ -13,7 +13,7 @@ Status: working first milestone, ready for review before a fleet trial. Built fr
 
 ## Evidence
 
-On 14 October 2026, all **41 integration tests passed on macOS and Linux**: 13 core, 13 real subprocess/job, 7 peer transport, 8 plugin cases. Formatting and Clippy with warnings denied passed on macOS. CI repeats formatting, Clippy, the test suite, and the scripted runtime pilot on Linux and macOS.
+The suite contains **42 integration tests**: 14 core, 13 real subprocess/job, 7 peer transport, 8 plugin cases. On 14 October 2026, the first 41 passed on macOS and Linux; the additional default-charter production approval regression passed locally. Formatting and Clippy with warnings denied passed on macOS. CI repeats formatting, Clippy, the complete test suite, and the scripted runtime pilot on Linux and macOS.
 
 The three-role runtime pilot completed a real regression repair, meaningful tests, and a local Git commit after the navigator RPC session was killed. Direct department messages worked, repeated alerts retained 50 facts with one pending item, and another home was denied the occupied heavy-work slot.
 

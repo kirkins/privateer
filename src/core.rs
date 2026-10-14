@@ -314,7 +314,9 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     let task = required(&args, "task_id")?;
     let artifact = required(&args, "artifact")?;
     let environment = required(&args, "environment")?;
-    let charter = store.authorize(task, "deploy_production")?;
+    // The explicit approval supplies authority for this one artifact/environment.
+    // It must not require widening every task's standing charter first.
+    let charter = store.authorize(task, "inspect")?;
     let charter_hash = hash(&charter);
     let tx = store.connection().unchecked_transaction()?;
     let id = if command == "approval.grant" {
