@@ -58,6 +58,12 @@ def main():
                 if profile["resume"]:
                     cases.append(("headless", "ses_0123456789abc" if name == "opencode" else "46a81234-1234-4567-8123-123456789abc"))
                 for mode, resume in cases:
+                    if name == "rovo":
+                        if resume or mode != "headless":
+                            continue
+                        passed, reason = check([profile["binary"], "acp", "--help"])
+                        result["cases"].append({"mode": "acp-entry", "resume": False, "passed": passed, "reason": reason})
+                        continue
                     options = {"mode": mode}
                     if resume:
                         options["resume"] = resume
