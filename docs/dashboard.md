@@ -2,8 +2,9 @@
 
 The first dashboard slice is a Rust TUI that runs inside Herdr or an ordinary
 terminal. It supplies a nautical overview of **one existing local Privateer
-home**, grouped pending issues, a recent logbook, stored job outcomes and an
-optional Herdr terminal view. It does not aggregate other homes or remote peers.
+home**, organized as equal peer ships. Fleet overview is the home destination;
+the sidebar always shows ships. Each ship has Bridge, Assignments, Terminals
+and Logbook views. It does not aggregate other homes or remote peers.
 
 This is an observation and navigation tool. It is not yet a conversational
 navigator, scheduler or interactive agent launcher. Installing it does not
@@ -45,7 +46,7 @@ older/malformed responses produce a visible connection error. This minimum is
 based on the installed 0.8.2 protocol schema inspected during development, not
 a claim that all future protocol revisions are qualified.
 
-Select **Terminals**, choose a recognized agent and press Enter or `f` to focus
+Select a ship and its **Terminals** view, choose a bound agent and press Enter or `f` to focus
 its native Herdr terminal. Return through Herdr's own tab/workspace navigation.
 The dashboard does not embed a second terminal emulator. The operation checks
 the selected socket incarnation and re-reads the pane's terminal, workspace,
@@ -59,24 +60,68 @@ There is no inferred binding based on similar labels or matching owners. A
 Herdr `done` state does not mark a task done or prove a passing PR. Stored job
 statuses may be stale because this UI deliberately does not reconcile processes.
 
+## Ships, ownership and terminal bindings
+
+Ships are equal peer identities, not ranks. `Navigator` is a familiar point of
+contact in the demo and has no special authority. The demo also includes Apps,
+Infrastructure and an idle Research ship.
+
+Live ships come from the optional private `<home>/dashboard.json` registry plus
+owner/handoff identities observed in the bounded local snapshot. A registry
+entry keeps an idle ship visible between sessions; an unregistered identity may
+fall out of a later bounded snapshot. This is a dashboard registry, not a new
+runtime authority table or remote-host discovery mechanism.
+
+See [the example registry](../examples/dashboard.json). Its `id` must match the
+runtime's exact task-owner identity. Names, descriptions and terminal bindings
+are presentation configuration. The dashboard reads the file without creating
+or modifying it. It accepts at most 64 KiB, 200 configured ships and 32 terminal
+bindings per ship. Duplicate identities and a pane bound to multiple ships are
+rejected. Missing configuration falls back to observed owners.
+
+A terminal belongs to a ship only through an exact `pane_id` + `terminal_id`
+binding in this registry. The first binding is its primary terminal. Similar
+labels, process kinds and task titles never establish ownership. Stale bindings
+show no connected terminal until the configuration is updated. The existing
+focus action still revalidates the actual server and observed agent/session.
+Unbound Herdr panes are not presented as another ship's crew.
+
+Assignments appear only in their owning ship's Assignments view. An offered
+handoff also appears under the recipient as **Incoming**, with the current owner
+shown explicitly. Ownership changes only after the runtime records acceptance;
+this dashboard does not initiate or accept transfers. The same task ID, jobs and
+pending facts follow the current owner. Logbook includes current assignments'
+events and custody audit rows involving the ship, preserving an outgoing ship's
+handoff reference. Audit rows identify actor/action and current owner; the UI
+does not invent historical target information the runtime did not record.
+
+Fleet overview summarizes all observed ships and pending issues. Ship-level
+alerts, jobs, assignment history and terminal lists are filtered to that ship.
+The preview remains one local database plus one explicitly chosen Herdr socket;
+listing a ship does not establish remote access or task-to-native-session
+continuity. Demo terminals are labeled sample data and never connect to a socket.
+
 ## Controls and presentation
 
-| Key | Action |
+| Key / action | Result |
 |---|---|
-| `1`–`4`, Tab | Bridge, Fleet, Logbook, Terminals |
-| Left click a top tab | Switch views |
-| Left click an assignment/terminal | Select it and show details |
-| Mouse wheel | Scroll details, or move selection when over the list |
-| Up/Down, `j`/`k` | Select assignment or terminal |
-| Page Up/Down | Scroll details |
-| `c` | Hide/show additional routine activity on Bridge |
-| Enter, `f` in Terminals | Focus the selected existing agent |
-| `q`, Escape, Ctrl-C | Exit the dashboard; workers continue |
+| Click a ship | Open its workspace |
+| Click Fleet overview; `0` or Home | Return to the fleet home |
+| `1`–`4`, Tab after selecting a ship | Bridge, Assignments, Terminals, Logbook |
+| Click an assignment/terminal | Select its details |
+| Up/Down, `j`/`k` | Select a ship, or an entry in the focused content list |
+| Left / Right | Focus ship navigation / workspace content |
+| Enter on ship navigation | Focus workspace content |
+| Enter/`f` on a ship's terminal; `f` on Bridge | Open the selected/primary live terminal |
+| Wheel / Page Up/Down | Navigate the pointed list / scroll details |
+| `c` | Hide/show additional stored jobs on Bridge |
+| Escape | Return home from a ship; exit when already home |
+| `q`, Ctrl-C | Exit; workers continue |
 
-Mouse support works in the demo and live view when the terminal forwards mouse
-events (including inside Herdr). Clicking selects only; Enter or `f` still opens
-an existing live agent through the identity checks. Tab and row targets follow
-the rendered layout and list scroll position. Mouse capture is released on exit.
+Mouse support works when the terminal forwards mouse events, including inside
+Herdr. Clicking changes selection only; live terminal focus still requires an
+explicit Enter/`f` action. Hit targets follow rendered layout and list offset;
+resizing clears stale targets. Mouse capture is released on exit.
 
 The compact summary starts on. Grouped pending issues remain visible and routine
 facts stay available in Logbook; viewing never deletes facts or acknowledges an
@@ -85,7 +130,7 @@ retained with its age. The details toggle is session-local.
 
 The home screen has no boat or animation/status band: those three rows are
 available to assignments and details. `--ascii` uses a plain ASCII attention
-marker. Terminals narrower than 40 columns or 11 rows get a resize notice rather
+marker. Terminals narrower than 50 columns or 14 rows get a resize notice rather
 than a broken layout.
 
 The tested Rust boat module is retained for a future Calm experience, where the
@@ -150,6 +195,7 @@ python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
 Dashboard tests use isolated databases, temporary Unix sockets and Ratatui's
 in-memory terminal backend. They cover non-mutating observation, bounded views,
 terminal replacement, socket replacement, malformed replies, timeouts, demo
-isolation, resize and reduced motion. They do not connect to a live fleet or
+isolation, ship scoping, custody transfers, idle ship registration, mouse input,
+resize and the reserved boat module. They do not connect to a live fleet or
 prove model-driven execution. Use a real isolated Herdr session to qualify
 interactive navigation on the installed server version before fleet adoption.

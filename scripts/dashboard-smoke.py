@@ -62,14 +62,12 @@ def main():
             os.write(terminal, f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
             drain(0.3)
             return output[start:]
-        assert b"jobs" in click(17,4), "Fleet tab mouse click did not switch views"
-        assert b"Latest" in click(27,4), "Logbook tab mouse click did not switch views"
+        assert b"Bridge" in click(5,8), "ship click did not open its workspace"
+        assert b"awaiting" in click(55,4), "Assignments click did not show handoff details"
+        assert b"codex" in click(71,4), "Terminals click did not show this ship's agent"
+        assert b"Custody" in click(85,4), "Logbook click did not show ship history"
         click(5,4)
-        selected = click(8,9)
-        # Ratatui emits only changed cells, so the task ID may be split across
-        # cursor movements. Verify the selection marker on the clicked row.
-        assert b"\x1b[9;2H" in selected and b">" in selected, "assignment mouse click did not move the selection"
-        for key in [b"2", b"3", b"4", b"f", b"1", b"c"]:
+        for key in [b"2", b"3", b"f", b"4", b"1", b"c", b"0"]:
             os.write(terminal, key)
             drain(0.15)
         resize(20, 8)

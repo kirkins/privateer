@@ -49,7 +49,7 @@ fn options() -> Result<Option<Options>> {
             "--no-herdr" => out.no_herdr = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard --home /absolute/home [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only home view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, acknowledgments, inference, or fleet updates."
+                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard --home /absolute/home [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only home view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, acknowledgments, inference, or fleet updates."
                 );
                 return Ok(None);
             }
@@ -196,6 +196,7 @@ fn run(opts: Options) -> Result<()> {
     let herdr = opts.socket.map(herdr_worker);
     let mut app = App {
         snapshot,
+        herdr: opts.demo.then(View::demo),
         compact: true,
         ascii: opts.ascii,
         demo: opts.demo,
@@ -216,7 +217,7 @@ fn run(opts: Options) -> Result<()> {
                     redraw = true;
                     match update.value {
                         Ok(snapshot) => {
-                            app.snapshot = snapshot;
+                            app.update_snapshot(snapshot);
                             app.home_error = None;
                             home_updated = update.at;
                         }
@@ -244,6 +245,9 @@ fn run(opts: Options) -> Result<()> {
             }
             app.home_age = Some(home_updated.elapsed().as_secs());
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
+            if opts.demo {
+                app.herdr_age = Some(0);
+            }
             app.selected = app.selected.min(app.selection_len().saturating_sub(1));
             if redraw || last_draw.elapsed() >= Duration::from_secs(1) {
                 terminal.draw(|frame| app.draw(frame))?;
@@ -270,8 +274,13 @@ fn run(opts: Options) -> Result<()> {
                 }
                 redraw = true;
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') => break,
+                    KeyCode::Esc if app.ship.is_some() => app.select_ship(None),
+                    KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('0') | KeyCode::Home => app.select_ship(None),
+                    KeyCode::Left => app.focus_content = false,
+                    KeyCode::Right => app.focus_content = app.ship.is_some(),
                     KeyCode::Char('1'..='4') => {
                         if let KeyCode::Char(n) = key.code {
                             app.select_tab(n as usize - '1' as usize);
@@ -285,13 +294,24 @@ fn run(opts: Options) -> Result<()> {
                     KeyCode::PageDown => app.scroll = app.scroll.saturating_add(8),
                     KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(8),
                     KeyCode::Char('c') => app.compact = !app.compact,
-                    KeyCode::Enter | KeyCode::Char('f') if app.tab == 3 => {
+                    KeyCode::Enter if !app.focus_content => app.focus_content = app.ship.is_some(),
+                    KeyCode::Enter | KeyCode::Char('f')
+                        if app.ship.is_some() && matches!(app.tab, 0 | 2) =>
+                    {
+                        if app.selected_pane().is_none() {
+                            app.notice = "No terminal is connected to this ship.".into();
+                            continue;
+                        }
+                        if app.demo {
+                            app.notice = "Demo terminal only; no live agent is running.".into();
+                            continue;
+                        }
                         if let (Some(view), Some((_, sender))) = (&app.herdr, &herdr) {
                             if !app.selection_invalidated
                                 && app.herdr_error.is_none()
                                 && app.herdr_age.is_some_and(|age| age < 10)
                             {
-                                if let Some(pane) = view.panes.get(app.selected) {
+                                if let Some(pane) = app.selected_pane() {
                                     app.notice = if sender
                                         .try_send(Focus {
                                             observed: view.clone(),
