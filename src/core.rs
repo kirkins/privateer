@@ -45,10 +45,7 @@ fn hash(value: &Value) -> String {
 fn charter_put(store: &Store, args: Value) -> Result<Value> {
     let id = required(&args, "id")?;
     identifier(id)?;
-    let tx = rusqlite::Transaction::new_unchecked(
-        store.connection(),
-        rusqlite::TransactionBehavior::Immediate,
-    )?;
+    let tx = store.write_transaction()?;
     let previous: Option<String> = tx
         .query_row("SELECT data FROM charters WHERE id=?1", [id], |r| r.get(0))
         .optional()?;
@@ -142,7 +139,7 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
     identifier(id)?;
     identifier(owner)?;
     let parent = args.get("parent").and_then(Value::as_str);
-    let tx = store.connection().unchecked_transaction()?;
+    let tx = store.write_transaction()?;
     let (charter_id, depth) = if let Some(parent) = parent {
         let task = store.task(parent)?;
         store.authorize(parent, "spawn")?;
@@ -189,7 +186,7 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
 fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
     let id = required(&args, "id")?;
     let actor = required(&args, "actor")?;
-    let tx = store.connection().unchecked_transaction()?;
+    let tx = store.write_transaction()?;
     let task = store.task(id)?;
     if command == "task.accept" {
         if task["handoff_to"].as_str() != Some(actor) {
@@ -246,7 +243,7 @@ fn event_emit(store: &Store, args: Value) -> Result<Value> {
     }
     store.task(task_id)?;
     let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
-    let tx = store.connection().unchecked_transaction()?;
+    let tx = store.write_transaction()?;
     let old = tx
         .query_row(
             "SELECT seq,task_id,issue_key,kind,payload FROM events WHERE id=?1",
@@ -318,7 +315,7 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     // It must not require widening every task's standing charter first.
     let charter = store.authorize(task, "inspect")?;
     let charter_hash = hash(&charter);
-    let tx = store.connection().unchecked_transaction()?;
+    let tx = store.write_transaction()?;
     let id = if command == "approval.grant" {
         let id = args
             .get("id")
@@ -389,7 +386,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "charter.show" => store.charter(required(&args, "id")?),
         "charter.revoke" => {
             let id = required(&args, "id")?;
-            let tx = store.connection().unchecked_transaction()?;
+            let tx = store.write_transaction()?;
             let mut c = store.charter(id)?;
             c["active"] = json!(false);
             c["revision"] = json!(c.get("revision").and_then(Value::as_u64).unwrap_or(0) + 1);
@@ -429,7 +426,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .and_then(Value::as_i64)
                 .filter(|v| *v > 0)
                 .ok_or_else(|| anyhow::anyhow!("positive through_seq is required"))?;
-            let tx = store.connection().unchecked_transaction()?;
+            let tx = store.write_transaction()?;
             let observed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM events WHERE seq=?1 AND task_id=?2 AND issue_key=?3)",
                 params![seq, task, issue],

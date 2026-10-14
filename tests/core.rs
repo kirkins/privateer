@@ -402,3 +402,48 @@ fn explicit_production_approval_does_not_require_widening_the_standing_charter()
     assert!(dispatch(&mut s,"approval.consume",json!({"id":"one-deployment","task_id":"main","artifact":"release-b","environment":"production"})).is_err());
     dispatch(&mut s,"approval.consume",json!({"id":"one-deployment","task_id":"main","artifact":"release-a","environment":"production"})).unwrap();
 }
+
+#[test]
+fn concurrent_writers_wait_instead_of_failing() {
+    let (_temp, s) = fixture();
+    let home = s.home().to_path_buf();
+    drop(s);
+    let threads = 16;
+    let per_thread = 5;
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let home = home.clone();
+            std::thread::spawn(move || {
+                // Each writer uses its own connection, as separate processes would.
+                let mut store = Store::open(&home).unwrap();
+                (0..per_thread)
+                    .map(|n| {
+                        dispatch(
+                            &mut store,
+                            "event.emit",
+                            json!({"id":format!("t{t}-e{n}"),"task_id":"main","issue_key":"gateway","kind":"wake","payload":{"thread":t,"n":n}}),
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    assert_eq!(results.len(), threads * per_thread);
+    let failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    assert!(failures.is_empty(), "concurrent emits failed: {failures:?}");
+
+    let mut s = Store::open(&home).unwrap();
+    let status = dispatch(&mut s, "status", json!({})).unwrap();
+    assert_eq!(status["event_facts"], (threads * per_thread) as u64);
+    assert_eq!(status["pending_notifications"], 1);
+    let all = dispatch(&mut s, "event.history", json!({"limit":1000})).unwrap();
+    assert_eq!(
+        all["events"].as_array().unwrap().len(),
+        threads * per_thread
+    );
+}
