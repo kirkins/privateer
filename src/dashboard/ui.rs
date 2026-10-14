@@ -2,13 +2,25 @@ use super::{
     herdr,
     model::{Snapshot, clean},
 };
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
+
+const TAB_LABELS: [&str; 4] = ["1 Bridge", "2 Fleet", "3 Logbook", "4 Terminals"];
+
+/// Hit targets from the last rendered frame, including the list's actual offset.
+#[derive(Default)]
+pub struct MouseMap {
+    tabs: Vec<(Rect, usize)>,
+    list: Rect,
+    details: Rect,
+    list_offset: usize,
+}
 
 #[derive(Default)]
 pub struct App {
@@ -26,9 +38,58 @@ pub struct App {
     pub demo: bool,
     pub notice: String,
     pub selection_invalidated: bool,
+    pub mouse: MouseMap,
 }
 
 impl App {
+    pub fn select_tab(&mut self, tab: usize) {
+        if tab < TAB_LABELS.len() && tab != self.tab {
+            self.tab = tab;
+            self.selected = 0;
+            self.scroll = 0;
+            self.selection_invalidated = false;
+        }
+    }
+
+    /// Mouse interaction only changes the view. Opening terminals remains an
+    /// explicit keyboard action through the existing identity checks.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        let point = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, tab)) = self
+                    .mouse
+                    .tabs
+                    .iter()
+                    .find(|(area, _)| area.contains(point))
+                {
+                    self.select_tab(*tab);
+                } else if self.mouse.list.contains(point) {
+                    let index =
+                        self.mouse.list_offset + usize::from((event.row - self.mouse.list.y) / 2);
+                    if index < self.selection_len() {
+                        self.selected = index;
+                        self.scroll = 0;
+                        self.selection_invalidated = false;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = event.kind == MouseEventKind::ScrollDown;
+                if self.mouse.details.contains(point) {
+                    self.scroll = if down {
+                        self.scroll.saturating_add(3)
+                    } else {
+                        self.scroll.saturating_sub(3)
+                    };
+                } else if self.mouse.list.contains(point) {
+                    self.move_selection(down);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn selection_len(&self) -> usize {
         if self.tab == 3 {
             self.herdr.as_ref().map_or(0, |h| h.panes.len())
@@ -79,6 +140,7 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        self.mouse = MouseMap::default();
         let area = frame.area();
         if area.width < 40 || area.height < 11 {
             frame.render_widget(
@@ -116,15 +178,35 @@ impl App {
             ]),
             rows[0],
         );
+        let tabs_block = Block::bordered();
+        let tab_area = tabs_block.inner(rows[1]);
+        let mut x = tab_area.x;
+        for (tab, label) in TAB_LABELS.iter().enumerate() {
+            let width =
+                (Line::from(*label).width() as u16 + 2).min(tab_area.right().saturating_sub(x));
+            if width == 0 {
+                break;
+            }
+            self.mouse
+                .tabs
+                .push((Rect::new(x, tab_area.y, width, tab_area.height), tab));
+            x = x.saturating_add(width + 1); // one-cell divider
+        }
         frame.render_widget(
-            Tabs::new(["1 Bridge", "2 Fleet", "3 Logbook", "4 Terminals"])
+            Tabs::new(TAB_LABELS)
+                .padding(" ", " ")
+                .divider("│")
                 .select(self.tab)
                 .highlight_style(Style::default().fg(Color::Yellow))
-                .block(Block::bordered()),
+                .block(tabs_block),
             rows[1],
         );
         let cols = Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)])
             .split(rows[2]);
+        self.mouse.list = Block::bordered().inner(cols[0]);
+        // Two-row list items never occupy a leftover single row.
+        self.mouse.list.height -= self.mouse.list.height % 2;
+        self.mouse.details = Block::bordered().inner(cols[1]);
         let mut items = Vec::new();
         if self.tab == 3 {
             if let Some(h) = &self.herdr {
@@ -170,6 +252,7 @@ impl App {
             cols[0],
             &mut state,
         );
+        self.mouse.list_offset = state.offset();
 
         let mut details = Vec::<Line>::new();
         if let Some(error) = &self.home_error {
@@ -329,7 +412,9 @@ impl App {
         };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(" 1–4 views · ↑↓ select · PgUp/PgDn scroll · c details · q quit"),
+                Line::from(
+                    " Click/1–4 views · ↑↓ select · wheel/PgUp/PgDn scroll · c details · q quit",
+                ),
                 Line::from(clean(feedback, 256)),
             ]),
             rows[3],

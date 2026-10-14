@@ -159,6 +159,90 @@ fn render(app: &mut App, width: u16, height: u16) -> String {
         .join("\n")
 }
 
+fn mouse_at(
+    kind: crossterm::event::MouseEventKind,
+    x: u16,
+    y: u16,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    }
+}
+
+fn click_text(app: &mut App, screen: &str, label: &str) {
+    let (row, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(label))
+        .unwrap();
+    let column = line[..line.find(label).unwrap()].chars().count();
+    app.handle_mouse(mouse_at(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column as u16,
+        row as u16,
+    ));
+}
+
+#[test]
+fn mouse_navigation_selects_visible_tabs_rows_and_details_without_opening_agents() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        compact: true,
+        ..App::default()
+    };
+    for (tab, label) in [
+        (1, "2 Fleet"),
+        (2, "3 Logbook"),
+        (3, "4 Terminals"),
+        (0, "1 Bridge"),
+    ] {
+        let screen = render(&mut app, 120, 34);
+        click_text(&mut app, &screen, label);
+        assert_eq!(app.tab, tab);
+    }
+    let screen = render(&mut app, 120, 34);
+    click_text(&mut app, &screen, "Investigate the failing build");
+    let screen = render(&mut app, 120, 34);
+    assert!(screen.contains("Task: app-build"));
+    app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 80, 15));
+    assert!(app.scroll > 0);
+    let before = app.tab;
+    app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 110, 3));
+    assert_eq!(app.tab, before);
+    render(&mut app, 20, 8);
+    app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 15, 3));
+    assert_eq!(
+        app.tab, before,
+        "a resize notice must clear the old hit map"
+    );
+}
+
+#[test]
+fn mouse_selection_tracks_the_scrolled_list_instead_of_its_first_record() {
+    let mut snapshot = Snapshot::demo();
+    let template = snapshot.tasks[0].clone();
+    snapshot.tasks = (0..30)
+        .map(|n| {
+            let mut task = template.clone();
+            task.id = format!("task-{n}");
+            task.title = format!("Assignment {n}");
+            task
+        })
+        .collect();
+    let mut app = App {
+        snapshot,
+        selected: 29,
+        ..App::default()
+    };
+    let screen = render(&mut app, 80, 20);
+    click_text(&mut app, &screen, "Assignment 27");
+    assert_eq!(app.snapshot.tasks[app.selected].id, "task-27");
+}
+
 #[test]
 fn compact_view_keeps_failures_visible_and_untrusted_controls_are_not_rendered() {
     let mut app = App {

@@ -56,6 +56,19 @@ def main():
         os.close(gate_write)
         drain(1.4)
         assert all(word in output for word in [b"PRIVATEER", b"DEMO", b"sample", b"data"]), "missing initial dashboard view"
+        assert b"\x1b[?1006h" in output, "mouse capture was not enabled"
+        def click(column, row):
+            start = len(output)
+            os.write(terminal, f"\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m".encode())
+            drain(0.3)
+            return output[start:]
+        assert b"jobs" in click(17,4), "Fleet tab mouse click did not switch views"
+        assert b"Latest" in click(27,4), "Logbook tab mouse click did not switch views"
+        click(5,4)
+        selected = click(8,9)
+        # Ratatui emits only changed cells, so the task ID may be split across
+        # cursor movements. Verify the selection marker on the clicked row.
+        assert b"\x1b[9;2H" in selected and b">" in selected, "assignment mouse click did not move the selection"
         for key in [b"2", b"3", b"4", b"f", b"1", b"c"]:
             os.write(terminal, key)
             drain(0.15)
@@ -77,7 +90,8 @@ def main():
         for flag in [termios.ECHO, termios.ICANON, termios.ISIG]:
             assert (before[3] & flag) == (after[3] & flag), "terminal mode was not restored"
         assert b"\x1b[?1049l" in output, "alternate screen was not restored"
-        print("Dashboard PTY smoke passed: render, navigation, resize, detail toggle, quit and terminal restoration.")
+        assert b"\x1b[?1006l" in output, "mouse capture was not restored"
+        print("Dashboard PTY smoke passed: mouse/keyboard navigation, resize, detail toggle, quit and terminal/mouse restoration.")
     finally:
         if not reaped:
             os.kill(pid, signal.SIGKILL)
