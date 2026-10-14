@@ -18,6 +18,12 @@ Events are facts. Pending notifications are a projection: repeated facts concern
 
 History is kept until an operator prunes it. `history.prune` (`older_than_days` or `before_ms`, optionally `dry_run`) removes event facts older than the cutoff that no longer back a pending notification, audit rows older than the cutoff, and finished jobs whose reservations are released, together with their log directories. Pending notifications, including unread messages, and live or still-reserved jobs are kept. Pruned event and job ids may be reused afterwards. Nothing is deleted automatically; run it by hand or from cron.
 
+## Ships and mailboxes
+
+A ship is an identity with its own mailbox, first mate and crew; a home hosts one or more ships, and the directory (`ship.put`, `ship.list`, `ship.show`) records each ship's plain-language scope, location and the request kinds it accepts. `captain` is the reserved address of the person. Adding ships is an operator command.
+
+`mail.send` writes typed, durable messages: a `request` or a `decision` (addressed to the captain) stays open until its single `reply` from the recipient, and the runtime tracks it rather than any agent's memory; a `notice` states a fact. Message ids are idempotency keys, a request can carry a reply deadline after which it reads as overdue, and typed request kinds are checked against what the recipient accepts. `mail.inbox` returns unacknowledged mail, `mail.ack` acknowledges through a sequence actually present in that mailbox and never moves back, and `mail.requests` lists incoming or outgoing requests by state. Agents send and read mail only as their own ship; only the operator speaks as, or reads mail for, the captain. `history.prune` removes acknowledged mail past its cutoff but never unread mail or a request still owed its reply. This home's mailboxes are local in this version; delivery to ships in other homes follows. The older `message.send`/`message.inbox` commands remain for now. See the [conversation and activation design](design/conversation-and-activation.md) for where mailboxes lead.
+
 ## Plugins and local configuration
 
 Optional executable plugins use JSON lines over stdio. They receive a minimal task context and return a validated command specification; they cannot widen the charter. Harness choice, model choice, provider routing, and private gateway policy live outside the core.

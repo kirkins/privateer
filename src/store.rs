@@ -127,6 +127,7 @@ impl Store {
         };
         crate::jobs::init(&store)?;
         crate::peers::init(&store)?;
+        crate::mail::init(&store)?;
         Ok(store)
     }
 

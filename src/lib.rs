@@ -3,6 +3,7 @@ pub mod core;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod jobs;
+pub mod mail;
 pub mod peers;
 pub mod plugins;
 pub mod store;
@@ -22,6 +23,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "peer.put",
     "resource.recover",
     "history.prune",
+    "ship.put",
 ];
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -32,7 +34,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         if OPERATOR_COMMANDS.contains(&command) {
             bail!("{command} is an operator command; agents cannot run it");
         }
-        for key in ["actor", "from"] {
+        // Agents speak, and read mail, only as themselves.
+        for key in ["actor", "from", "address"] {
             if let Some(claimed) = args.get(key) {
                 if claimed.as_str() != Some(actor) {
                     bail!("agent {actor} cannot act as {claimed}");
@@ -44,6 +47,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
+        "ship" | "mail" => mail::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let task = args
                 .get("task_id")

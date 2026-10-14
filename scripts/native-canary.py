@@ -46,10 +46,12 @@ def main():
                              "repo": str(repo), "min_free_bytes": 1024, "job_timeout_secs": args.timeout_secs,
                              "provider_plugin": {"manifest": manifest}})
         title = ("Fix add() in calc.py to pass test_calc.py. Run python3 -m unittest -q. "
-                 "Send a Privateer task-linked message to reviewer using message.send, "
-                 "id=native-result, from=applications, to=reviewer, task_id=repair. "
+                 "Send a Privateer mail notice to reviewer using mail.send, "
+                 "id=native-result, from=applications, to=reviewer, kind=notice, task_id=repair. "
                  "Do not mark task done; caller verifies independently. Work only in this repository "
                  "and Privateer home. Do not install packages or change global settings.")
+        for ship in ("applications", "reviewer"):
+            call("ship.put", {"name": ship, "scope": "native canary"})
         call("task.create", {"id": "repair", "charter_id": "canary", "owner": "applications", "title": title})
         options = {"sandbox": "workspace-write", "ephemeral": True}
         if args.model:
@@ -64,7 +66,7 @@ def main():
         assert job["status"] == "succeeded" and job["exit_code"] == 0, {"status": job["status"], "exit_code": job["exit_code"], "reason": job.get("reason")}
         result = subprocess.run([sys.executable, "-m", "unittest", "-q"], cwd=repo, capture_output=True, text=True)
         assert result.returncode == 0, "Independent tests did not pass"
-        inbox = call("message.inbox", {"actor": "reviewer"})
+        inbox = call("mail.inbox", {"address": "reviewer"})
         assert any(m["id"] == "native-result" for m in inbox["messages"]), "Native agent did not record its task-linked result"
         call("task.update", {"id": "repair", "actor": "applications", "status": "done"})
         evidence.update({"passed": True, "native_plugin_job": job["status"], "independent_tests_passed": True,
