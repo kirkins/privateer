@@ -9,7 +9,7 @@ See [milestone status and validation](docs/milestone-1.md) for what is implement
 ## Terminal dashboard
 
 The optional Rust dashboard provides a nautical Bridge, Fleet, Logbook and Herdr
-terminal view, including a local animated sailboat and Calm presentation:
+terminal view. The home screen keeps its space for assignments and activity:
 
 ```sh
 cargo run --features dashboard --bin privateer-dashboard -- --demo

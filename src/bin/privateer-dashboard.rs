@@ -20,7 +20,6 @@ struct Options {
     socket: Option<PathBuf>,
     demo: bool,
     once: bool,
-    reduced: bool,
     ascii: bool,
     no_herdr: bool,
 }
@@ -40,12 +39,11 @@ fn options() -> Result<Option<Options>> {
             }
             "--demo" => out.demo = true,
             "--once" => out.once = true,
-            "--reduced-motion" => out.reduced = true,
             "--ascii" => out.ascii = true,
             "--no-herdr" => out.no_herdr = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard --home /absolute/home [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--reduced-motion   Static boat (m toggles in the dashboard)\n--ascii            Plain ASCII boat\n\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only home view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, acknowledgments, inference, or fleet updates."
+                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard --home /absolute/home [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only home view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, acknowledgments, inference, or fleet updates."
                 );
                 return Ok(None);
             }
@@ -185,8 +183,7 @@ fn run(opts: Options) -> Result<()> {
     let herdr = opts.socket.map(herdr_worker);
     let mut app = App {
         snapshot,
-        calm: true,
-        reduced_motion: opts.reduced,
+        compact: true,
         ascii: opts.ascii,
         demo: opts.demo,
         home_age: Some(0),
@@ -195,7 +192,6 @@ fn run(opts: Options) -> Result<()> {
     let mut home_updated = Instant::now();
     let mut herdr_updated: Option<Instant> = None;
     let mut terminal = ratatui::try_init()?;
-    let mut wave_tick = Instant::now();
     let result = (|| -> Result<()> {
         loop {
             if let Some(updates) = &home_updates {
@@ -230,18 +226,8 @@ fn run(opts: Options) -> Result<()> {
             app.home_age = Some(home_updated.elapsed().as_secs());
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
             app.selected = app.selected.min(app.selection_len().saturating_sub(1));
-            if wave_tick.elapsed() >= Duration::from_millis(220) {
-                if app.animation_active() {
-                    app.boat.advance();
-                }
-                wave_tick = Instant::now();
-            }
             terminal.draw(|frame| app.draw(frame))?;
-            if !event::poll(Duration::from_millis(if app.animation_active() {
-                220
-            } else {
-                1000
-            }))? {
+            if !event::poll(Duration::from_secs(1))? {
                 continue;
             }
             if let Event::Key(key) = event::read()? {
@@ -269,8 +255,7 @@ fn run(opts: Options) -> Result<()> {
                     KeyCode::Up | KeyCode::Char('k') => app.move_selection(false),
                     KeyCode::PageDown => app.scroll = app.scroll.saturating_add(8),
                     KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(8),
-                    KeyCode::Char('c') => app.calm = !app.calm,
-                    KeyCode::Char('m') => app.reduced_motion = !app.reduced_motion,
+                    KeyCode::Char('c') => app.compact = !app.compact,
                     KeyCode::Enter | KeyCode::Char('f') if app.tab == 3 => {
                         if let (Some(view), Some((_, sender))) = (&app.herdr, &herdr) {
                             if !app.selection_invalidated

@@ -160,10 +160,10 @@ fn render(app: &mut App, width: u16, height: u16) -> String {
 }
 
 #[test]
-fn calm_keeps_failures_visible_and_untrusted_controls_are_not_rendered() {
+fn compact_view_keeps_failures_visible_and_untrusted_controls_are_not_rendered() {
     let mut app = App {
         snapshot: Snapshot::demo(),
-        calm: true,
+        compact: true,
         home_age: Some(0),
         home_error: Some("disk unavailable\x1b[2J".into()),
         ..App::default()
@@ -172,7 +172,6 @@ fn calm_keeps_failures_visible_and_untrusted_controls_are_not_rendered() {
     assert!(text.contains("STATE UNAVAILABLE"));
     assert!(text.contains("Repeated connection facts"));
     assert!(!text.contains('\x1b'));
-    assert!(!app.animation_active());
     assert_eq!(clean("hello\x1b[2J\u{202e}world", 100), "hello[2Jworld");
     for (w, h) in [(1, 1), (20, 8), (40, 14), (80, 24)] {
         render(&mut app, w, h);
@@ -424,7 +423,7 @@ fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
     let mut app = App {
         snapshot: Snapshot::demo(),
         demo: true,
-        calm: true,
+        compact: true,
         home_age: Some(0),
         ..App::default()
     };

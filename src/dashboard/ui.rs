@@ -1,5 +1,4 @@
 use super::{
-    boat::Boat,
     herdr,
     model::{Snapshot, clean},
 };
@@ -22,11 +21,9 @@ pub struct App {
     pub tab: usize,
     pub selected: usize,
     pub scroll: u16,
-    pub calm: bool,
-    pub reduced_motion: bool,
+    pub compact: bool,
     pub ascii: bool,
     pub demo: bool,
-    pub boat: Boat,
     pub notice: String,
     pub selection_invalidated: bool,
 }
@@ -81,24 +78,11 @@ impl App {
         self.herdr = Some(view);
     }
 
-    pub fn animation_active(&self) -> bool {
-        self.tab == 0
-            && self.calm
-            && !self.reduced_motion
-            && self.home_error.is_none()
-            && self.home_age.is_some_and(|age| age < 5)
-            && self
-                .snapshot
-                .tasks
-                .get(self.selected)
-                .is_some_and(|t| t.status == "running")
-    }
-
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        if area.width < 40 || area.height < 14 {
+        if area.width < 40 || area.height < 11 {
             frame.render_widget(
-                Paragraph::new("PRIVATEER\nResize to at least 40 x 14.\nq: quit")
+                Paragraph::new("PRIVATEER\nResize to at least 40 x 11.\nq: quit")
                     .wrap(Wrap { trim: false }),
                 area,
             );
@@ -108,7 +92,6 @@ impl App {
             Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Min(3),
-            Constraint::Length(3),
             Constraint::Length(2),
         ])
         .split(area);
@@ -238,7 +221,7 @@ impl App {
                 ));
                 details.push(Line::from(""));
                 self.pending_lines(&mut details, None);
-                if !self.calm {
+                if !self.compact {
                     details.push(Line::from("Recent activity:"));
                     for event in self.snapshot.activity.iter().take(20) {
                         details.push(Line::from(format!(
@@ -331,61 +314,14 @@ impl App {
             Paragraph::new(details)
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll, 0))
-                .block(Block::bordered().title(if self.calm {
-                    "Calm waters · c for detail"
+                .block(Block::bordered().title(if self.compact {
+                    "Summary · c for detail"
                 } else {
                     "Activity and evidence"
                 })),
             cols[1],
         );
 
-        // Boat describes the selected task's recorded running state. Stop animation
-        // when observations are stale/unavailable, on other tabs, or when idle.
-        let active = self.tab == 0
-            && self.home_error.is_none()
-            && self.home_age.is_some_and(|age| age < 5)
-            && self
-                .snapshot
-                .tasks
-                .get(self.selected)
-                .is_some_and(|t| t.status == "running");
-        let sprite = self.boat.frame(
-            usize::from(area.width.saturating_sub(2)),
-            active,
-            self.reduced_motion || !self.calm,
-            self.ascii,
-        );
-        let sea = vec![
-            Line::styled(sprite[0].clone(), Style::default().fg(Color::Yellow)),
-            {
-                let chars = sprite[1].chars().collect::<Vec<_>>();
-                if let Some(start) = chars.iter().position(|c| matches!(c, '╲' | '\\')) {
-                    let end = (start + 5).min(chars.len());
-                    Line::from(vec![
-                        Span::styled(
-                            chars[..start].iter().collect::<String>(),
-                            Style::default().fg(Color::Blue),
-                        ),
-                        Span::styled(
-                            chars[start..end].iter().collect::<String>(),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                        Span::styled(
-                            chars[end..].iter().collect::<String>(),
-                            Style::default().fg(Color::Blue),
-                        ),
-                    ])
-                } else {
-                    Line::styled(sprite[1].clone(), Style::default().fg(Color::Blue))
-                }
-            },
-            Line::from(if active {
-                " Selected task recorded running · activity indicator, not progress"
-            } else {
-                " At anchor · no animation for idle or unavailable state"
-            }),
-        ];
-        frame.render_widget(Paragraph::new(sea), rows[3]);
         let feedback = if self.notice.is_empty() {
             "Viewing never acknowledges alerts or restarts workers."
         } else {
@@ -393,12 +329,10 @@ impl App {
         };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(
-                    " 1–4 views · ↑↓ select · PgUp/PgDn scroll · c calm · m motion · q quit",
-                ),
+                Line::from(" 1–4 views · ↑↓ select · PgUp/PgDn scroll · c details · q quit"),
                 Line::from(clean(feedback, 256)),
             ]),
-            rows[4],
+            rows[3],
         );
     }
 

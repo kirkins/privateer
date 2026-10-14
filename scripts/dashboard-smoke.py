@@ -56,7 +56,7 @@ def main():
         os.close(gate_write)
         drain(1.4)
         assert all(word in output for word in [b"PRIVATEER", b"DEMO", b"sample", b"data"]), "missing initial dashboard view"
-        for key in [b"2", b"3", b"4", b"f", b"1", b"c", b"m"]:
+        for key in [b"2", b"3", b"4", b"f", b"1", b"c"]:
             os.write(terminal, key)
             drain(0.15)
         resize(20, 8)
@@ -77,7 +77,7 @@ def main():
         for flag in [termios.ECHO, termios.ICANON, termios.ISIG]:
             assert (before[3] & flag) == (after[3] & flag), "terminal mode was not restored"
         assert b"\x1b[?1049l" in output, "alternate screen was not restored"
-        print("Dashboard PTY smoke passed: render, navigation, resize, motion toggle, quit and terminal restoration.")
+        print("Dashboard PTY smoke passed: render, navigation, resize, detail toggle, quit and terminal restoration.")
     finally:
         if not reaped:
             os.kill(pid, signal.SIGKILL)

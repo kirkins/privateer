@@ -66,23 +66,24 @@ statuses may be stale because this UI deliberately does not reconcile processes.
 | `1`–`4`, Tab | Bridge, Fleet, Logbook, Terminals |
 | Up/Down, `j`/`k` | Select assignment or terminal |
 | Page Up/Down | Scroll details |
-| `c` | Toggle Calm: hide/show additional routine activity on Bridge |
-| `m` | Toggle reduced motion |
+| `c` | Hide/show additional routine activity on Bridge |
 | Enter, `f` in Terminals | Focus the selected existing agent |
 | `q`, Escape, Ctrl-C | Exit the dashboard; workers continue |
 
-Calm starts on. It keeps grouped pending issues visible and places routine
-facts in Logbook; it never deletes facts or acknowledges an alert. Failed
-sources remain visibly unavailable while the last snapshot is retained with
-its age. The Calm and motion toggles are session-local in this slice.
+The compact summary starts on. Grouped pending issues remain visible and routine
+facts stay available in Logbook; viewing never deletes facts or acknowledges an
+alert. Failed sources remain visibly unavailable while the last snapshot is
+retained with its age. The details toggle is session-local.
 
-The sailboat uses slow movement over blue water. It animates only on Bridge
-when the selected task's recent **recorded** state is running, and stops on
-stale/unavailable state, other views, idle state or reduced motion. It is an
-activity decoration, not a percentage or a health guarantee. Its local 220 ms
-clock does not create events or model calls. `--reduced-motion` selects a static
-boat; `--ascii` uses a plain ASCII boat/attention marker. Terminals narrower than
-40 columns or 14 rows get a resize notice rather than a broken layout.
+The home screen has no boat or animation/status band: those three rows are
+available to assignments and details. `--ascii` uses a plain ASCII attention
+marker. Terminals narrower than 40 columns or 11 rows get a resize notice rather
+than a broken layout.
+
+The tested Rust boat module is retained for a future Calm experience, where the
+boat can identify that mode and replace an existing working indicator. The
+current dashboard detail toggle is not First Mate's transcript-level Calm
+function. No animation timer or motion controls run in the dashboard.
 
 ## Reliability boundaries
 
@@ -115,7 +116,7 @@ boat; `--ascii` uses a plain ASCII boat/attention marker. Terminals narrower tha
 ## Reuse and next boundaries
 
 First Mate's Calm behavior and nautical working indicator inform the visual
-direction. The boat is a fresh Rust implementation, without importing the Pi
+direction. The reserved boat is a fresh Rust implementation, without importing the Pi
 renderer or its transcript patches. See [attribution](../THIRD_PARTY_NOTICES.md).
 Its Herdr regression scenarios also informed stale-identity checks and focus
 behavior; its shell backend and policy framework are not imported.
