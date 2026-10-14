@@ -1,4 +1,6 @@
 pub mod core;
+#[cfg(feature = "dashboard")]
+pub mod dashboard;
 pub mod jobs;
 pub mod peers;
 pub mod plugins;

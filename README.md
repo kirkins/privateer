@@ -6,6 +6,21 @@ The first milestone is durable machinery and an isolated working pilot. It does 
 
 See [milestone status and validation](docs/milestone-1.md) for what is implemented, demonstrated, and still needed before fleet replacement.
 
+## Terminal dashboard
+
+The optional Rust dashboard provides a nautical Bridge, Fleet, Logbook and Herdr
+terminal view, including a local animated sailboat and Calm presentation:
+
+```sh
+cargo run --features dashboard --bin privateer-dashboard -- --demo
+```
+
+Use `--home /absolute/privateer/home` to observe an existing home. Inside Herdr,
+the dashboard can inspect and focus existing agent terminals using the injected
+socket. It does not launch agents, send prompts, acknowledge alerts or migrate a
+fleet. Navigator chat and automatic agent activation are not connected yet.
+See [dashboard setup and boundaries](docs/dashboard.md).
+
 ## General runtime and optional integrations
 
 The core owns charters, tasks, custody, targeted messages, coalesced notifications, durable jobs, resource admission, and SSH transport. It contains no personal provider account, model, gateway address, machine name, or user path.

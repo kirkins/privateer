@@ -20,6 +20,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo check --locked --no-default-features --bin privateer
+      - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
       - run: python3 scripts/pilot.py --binary target/debug/privateer

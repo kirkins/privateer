@@ -1,0 +1,437 @@
+#![cfg(feature = "dashboard")]
+
+use privateer::{
+    dashboard::{
+        boat::Boat,
+        herdr::Client,
+        model::{Snapshot, clean},
+        ui::App,
+    },
+    dispatch,
+    store::Store,
+};
+use ratatui::{Terminal, backend::TestBackend};
+use serde_json::{Value, json};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixListener,
+    path::Path,
+    thread,
+    time::Duration,
+};
+
+fn fixture() -> (tempfile::TempDir, Store) {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let mut store = Store::open(&root.path().join("home")).unwrap();
+    dispatch(
+        &mut store,
+        "charter.put",
+        json!({"id":"project","objective":"Inspect dashboard","repo":repo,"min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "task.create",
+        json!({"id":"main","charter_id":"project","owner":"navigator","title":"Test the bridge"}),
+    )
+    .unwrap();
+    (root, store)
+}
+
+#[test]
+fn observations_preserve_pending_sequences_audit_and_job_records() {
+    let (_root, mut store) = fixture();
+    for n in 0..50 {
+        dispatch(&mut store,"event.emit",json!({"id":format!("fact-{n}"),"task_id":"main","issue_key":"route","kind":"blocked","payload":{"summary":format!("attempt {n}")}})).unwrap();
+    }
+    // If a job list were used, this intentionally orphaned record would be
+    // reconciled or fail parsing. The dashboard only reads its stored fields.
+    store
+        .connection()
+        .execute(
+            "INSERT INTO jobs(id,record) VALUES('job',?1)",
+            [json!({"task_id":"main","status":"running"}).to_string()],
+        )
+        .unwrap();
+    let before: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+        .unwrap();
+    let first = Snapshot::read(store.home()).unwrap();
+    assert_eq!(first.pending.len(), 1);
+    assert_eq!(first.pending[0].seq, 50);
+    assert_eq!(first.jobs[0].status, "running");
+    dispatch(&mut store,"event.emit",json!({"id":"newer","task_id":"main","issue_key":"route","kind":"blocked","payload":{"summary":"new fact"}})).unwrap();
+    let second = Snapshot::read(store.home()).unwrap();
+    assert_eq!(second.pending[0].seq, 51);
+    let after: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        dispatch(&mut store, "event.pending", json!({})).unwrap()["events"][0]["seq"],
+        51
+    );
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT record FROM jobs WHERE id='job'", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        json!({"task_id":"main","status":"running"}).to_string()
+    );
+}
+
+#[test]
+fn missing_home_is_not_created_and_symlink_home_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    assert!(Snapshot::read(&missing).is_err());
+    assert!(!missing.exists());
+    let (_fixture, store) = fixture();
+    let link = root.path().join("linked");
+    std::os::unix::fs::symlink(store.home(), &link).unwrap();
+    assert!(Snapshot::read(&link).is_err());
+}
+
+#[test]
+fn large_state_is_bounded_without_pruning_the_runtime() {
+    let (_root, store) = fixture();
+    for n in 0..205 {
+        store.connection().execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES(?1,'project','apps',?2,'open',0)",rusqlite::params![format!("task-{n:03}"),"x".repeat(3000)]).unwrap();
+    }
+    let view = Snapshot::read(store.home()).unwrap();
+    assert_eq!(view.tasks.len(), 200);
+    assert!(view.truncated);
+    assert!(view.tasks.iter().all(|t| t.title.len() <= 512));
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        206
+    );
+}
+
+#[test]
+fn boat_is_bounded_and_freezes_when_reduced_or_hidden() {
+    let mut boat = Boat::default();
+    for width in 0..150 {
+        for _ in 0..20 {
+            boat.advance();
+            assert!(
+                boat.frame(width, true, false, false)
+                    .iter()
+                    .all(|s| s.chars().count() == width)
+            );
+        }
+        assert!(
+            boat.frame(width, true, false, true)
+                .iter()
+                .all(|s| s.is_ascii() && s.len() == width)
+        );
+    }
+    let frame = boat.frame(50, true, true, false);
+    assert_eq!(frame, boat.frame(50, false, true, false));
+    assert_eq!(frame, boat.frame(50, false, true, false));
+    // A draw without a clock advance does not move the boat.
+    assert_eq!(
+        boat.frame(50, true, false, false),
+        boat.frame(50, true, false, false)
+    );
+}
+
+fn render(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn calm_keeps_failures_visible_and_untrusted_controls_are_not_rendered() {
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        calm: true,
+        home_age: Some(0),
+        home_error: Some("disk unavailable\x1b[2J".into()),
+        ..App::default()
+    };
+    let text = render(&mut app, 120, 34);
+    assert!(text.contains("STATE UNAVAILABLE"));
+    assert!(text.contains("Repeated connection facts"));
+    assert!(!text.contains('\x1b'));
+    assert!(!app.animation_active());
+    assert_eq!(clean("hello\x1b[2J\u{202e}world", 100), "hello[2Jworld");
+    for (w, h) in [(1, 1), (20, 8), (40, 14), (80, 24)] {
+        render(&mut app, w, h);
+    }
+}
+
+fn snapshot(terminal: &str) -> Value {
+    json!({"snapshot":{"version":"0.8.2","protocol":20,"panes":[{"pane_id":"w1:p1","terminal_id":terminal,"workspace_id":"w1","tab_id":"w1:t1","agent":"pi","agent_status":"working","title":"Worker"}]}})
+}
+
+fn server(path: &Path, replies: Vec<Value>) -> thread::JoinHandle<Vec<Value>> {
+    let listener = UnixListener::bind(path).unwrap();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut requests = Vec::new();
+        for reply in replies {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                json!({"id":request["id"],"result":reply})
+            )
+            .unwrap();
+            requests.push(request);
+        }
+        requests
+    })
+}
+
+#[test]
+fn herdr_snapshot_and_explicit_focus_use_correlated_structured_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api.sock");
+    let server = server(
+        &path,
+        vec![
+            snapshot("terminal-a"),
+            snapshot("terminal-a"),
+            json!({"type":"focused"}),
+        ],
+    );
+    let mut client = Client::connect(&path).unwrap();
+    let view = client.snapshot().unwrap();
+    client.focus(&view, &view.panes[0]).unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["session.snapshot", "session.snapshot", "agent.focus"]
+    );
+    assert_eq!(requests[2]["params"], json!({"target":"w1:p1"}));
+}
+
+#[test]
+fn replaced_terminal_is_not_focused_even_with_the_same_pane_id() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api.sock");
+    let server = server(&path, vec![snapshot("terminal-a"), snapshot("terminal-b")]);
+    let mut client = Client::connect(&path).unwrap();
+    let view = client.snapshot().unwrap();
+    assert!(
+        client
+            .focus(&view, &view.panes[0])
+            .unwrap_err()
+            .to_string()
+            .contains("occupant changed")
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn a_replaced_socket_requires_a_new_observation_before_focus() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api.sock");
+    let first = server(&path, vec![snapshot("terminal-a")]);
+    let view = Client::connect(&path).unwrap().snapshot().unwrap();
+    first.join().unwrap();
+    // Keep the old inode allocated by renaming its socket path.
+    fs::rename(&path, root.path().join("old.sock")).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+    let mut client = Client::connect(&path).unwrap();
+    assert!(
+        client
+            .focus(&view, &view.panes[0])
+            .unwrap_err()
+            .to_string()
+            .contains("socket changed")
+    );
+    drop(listener);
+}
+
+#[test]
+fn malformed_old_and_uncorrelated_responses_fail_closed() {
+    for reply in [
+        json!({"snapshot":{"protocol":19,"panes":[]}}),
+        json!({"snapshot":{"protocol":20,"panes":[{}]}}),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("api.sock");
+        let server = server(&path, vec![reply]);
+        assert!(Client::connect(&path).unwrap().snapshot().is_err());
+        server.join().unwrap();
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"id":"another-request","result":snapshot("t")})
+        )
+        .unwrap();
+    });
+    assert!(
+        Client::connect(&path)
+            .unwrap()
+            .snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("ID mismatch")
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn silent_socket_times_out_without_holding_the_operator_loop() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        thread::sleep(Duration::from_millis(1100));
+    });
+    let started = std::time::Instant::now();
+    assert!(Client::connect(&path).unwrap().snapshot().is_err());
+    assert!(started.elapsed() < Duration::from_millis(1050));
+    server.join().unwrap();
+}
+
+#[test]
+fn demo_cli_never_opens_an_inherited_herdr_socket() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_privateer-dashboard"))
+        .args(["--demo", "--once"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["demo"], true);
+    assert!(result["herdr"].is_null());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn refresh_preserves_selected_identity_and_requires_reselection_after_replacement() {
+    use privateer::dashboard::herdr::{Pane, View};
+    let pane: Pane =
+        serde_json::from_value(snapshot("terminal-a")["snapshot"]["panes"][0].clone()).unwrap();
+    let mut other = pane.clone();
+    other.pane_id = "w2:p1".into();
+    other.terminal_id = "other".into();
+    let mut app = App {
+        tab: 3,
+        herdr: Some(View {
+            panes: vec![pane.clone()],
+            socket_identity: (1, 2),
+            ..View::default()
+        }),
+        ..App::default()
+    };
+    app.update_herdr(View {
+        panes: vec![other.clone(), pane.clone()],
+        socket_identity: (1, 2),
+        ..View::default()
+    });
+    assert_eq!(app.selected, 1);
+    assert!(!app.selection_invalidated);
+    let mut replaced = pane;
+    replaced.terminal_id = "replacement".into();
+    app.update_herdr(View {
+        panes: vec![other, replaced],
+        socket_identity: (1, 2),
+        ..View::default()
+    });
+    assert!(app.selection_invalidated);
+    app.move_selection(false);
+    assert!(!app.selection_invalidated);
+}
+
+#[test]
+fn oversized_and_slow_drip_socket_responses_are_bounded() {
+    for oversized in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            if oversized {
+                let _ = stream.write_all(&vec![b' '; 1_048_577]);
+            } else {
+                for _ in 0..15 {
+                    if stream.write_all(b" ").is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = Client::connect(&path).unwrap().snapshot();
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(1200));
+        if oversized {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("exceeds 1 MiB"), "{error:#}");
+        }
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        demo: true,
+        calm: true,
+        home_age: Some(0),
+        ..App::default()
+    };
+    let view = render(&mut app, 120, 34);
+    assert!(view.contains("DEMO / sample data"));
+    assert!(view.contains("Navigator chat and agent launch are not connected"));
+    if let Some(path) = std::env::var_os("PRIVATEER_DASHBOARD_PREVIEW") {
+        fs::write(path, view).unwrap();
+    }
+}
