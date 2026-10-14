@@ -1,8 +1,9 @@
 # Attribution
 
-Privateer's nautical working indicator and Calm presentation are inspired by
+Privateer's reserved nautical working indicator is inspired by
 First Mate, copyright (c) 2026 Kun Chen, licensed under MIT. The Rust boat is a
-new implementation informed by its appearance and behavior; no Pi renderer,
+new implementation retained for future Calm presentation; it is not rendered
+on the dashboard. Its appearance and behavior inform the design; no Pi renderer,
 transcript patch or First Mate shell runtime is bundled. The notice below is
 retained for attribution of the visual adaptation.
 
