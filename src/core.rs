@@ -52,10 +52,12 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
     let previous = previous
         .map(|s| serde_json::from_str::<Value>(&s))
         .transpose()?;
-    let mut charter = previous.unwrap_or_else(|| json!({
-        "id":id,"actions":DEFAULT_ACTIONS,"active":true,"production_requires_approval":true,
-        "max_delegation_depth":4,"job_timeout_secs":900,"min_free_bytes":2147483648_u64,"max_heavy_jobs":1
-    }));
+    let mut charter = previous.unwrap_or_else(|| {
+        json!({
+            "id":id,"actions":DEFAULT_ACTIONS,"active":true,"production_requires_approval":true,
+            "max_delegation_depth":4,"job_timeout_secs":900,"min_free_bytes":2147483648_u64
+        })
+    });
     charter["revision"] = json!(charter.get("revision").and_then(Value::as_u64).unwrap_or(0) + 1);
     for key in [
         "objective",
@@ -116,9 +118,13 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
     for (key, min, max) in [
         ("max_delegation_depth", 0, 16),
         ("job_timeout_secs", 1, 86400),
-        ("max_heavy_jobs", 1, 64),
+        ("max_heavy_jobs", 1, 1024),
         ("min_free_bytes", 0, u64::MAX),
     ] {
+        // An optional per-charter share of the host's heavy work.
+        if key == "max_heavy_jobs" && charter.get(key).is_none_or(Value::is_null) {
+            continue;
+        }
         let n = charter[key]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("{key} must be an unsigned integer"))?;
