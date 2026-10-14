@@ -1,4 +1,10 @@
-# Privateer
+<h1 align="center">Privateer</h1>
+
+<h3 align="center">Independent ships. Working under your charter.</h3>
+
+<p align="center">
+  <img alt="Privateer fleet: the captain, liaison, peer ships, and their first mates and crews" src="assets/banner.png" width="100%" />
+</p>
 
 Privateer is a fresh Rust runtime for independent peer agents working under a charter. One conversational agent is your familiar point of contact; departments can coordinate directly and keep working while that conversation is busy. Every outcome has a recorded owner.
 
