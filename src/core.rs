@@ -429,8 +429,9 @@ fn history_prune(store: &Store, args: &Value) -> Result<Value> {
         tx.execute("DELETE FROM audit WHERE time_ms < ?1", [cutoff])?;
     }
     let (jobs, jobs_still_reserved, directories) = crate::jobs::prune(store, cutoff, dry_run)?;
+    let mail = crate::mail::prune(store, cutoff, dry_run)?;
     let mut result = json!({"before_ms":cutoff,"dry_run":dry_run,"events":events,"audit":audit,
-        "jobs":jobs,"jobs_still_reserved":jobs_still_reserved});
+        "jobs":jobs,"jobs_still_reserved":jobs_still_reserved,"mail":mail});
     if dry_run {
         return Ok(result);
     }
@@ -651,9 +652,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 store
                     .connection()
                     .query_row("SELECT COUNT(*) FROM pending", [], |r| r.get(0))?;
-            Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"home":store.home(),"open_tasks":tasks,"event_facts":facts,"pending_notifications":pending}),
-            )
+            let mut status = json!({"version":env!("CARGO_PKG_VERSION"),"home":store.home(),"open_tasks":tasks,"event_facts":facts,"pending_notifications":pending});
+            for (key, value) in crate::mail::summary(store)?.as_object().unwrap() {
+                status[key] = value.clone();
+            }
+            Ok(status)
         }
         _ => bail!("unknown command {command}"),
     }

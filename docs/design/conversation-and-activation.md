@@ -25,7 +25,7 @@ Two questions decide much of the project's future shape:
 | Term | Meaning |
 |---|---|
 | **Captain** | The person. A first-class participant with an address, a mailbox, a front door for plugins and a delivery policy. |
-| **Ship** | One Privateer home: charter, repositories, mailbox, first mate and crew. Ships are peers. |
+| **Ship** | An identity with its own mailbox, first mate and crew, working under charters on its tasks. A home hosts one or more ships. Ships are peers. |
 | **First mate** | A ship's coordinating agent. Woken by the ship's mailbox and its crew's outcomes; speaks for the ship; manages its crew. |
 | **Crew** | Workers a first mate starts as supervised jobs for its tasks. |
 | **Liaison** | An ordinary ship with a liaison charter that the captain chooses as their default recipient. |
@@ -54,6 +54,8 @@ The captain is the one genuinely special participant. Making the person first-cl
 Switching between "everything through the liaison" on a phone and "talk to any ship directly" at a desk is a policy change, not a different system.
 
 ## Ships and the directory
+
+A ship is an identity, not a process or a home: one Privateer home can host several ships (as the terminal dashboard presents them), or each ship can have its own home, possibly on another machine. The directory records where each ship lives.
 
 The directory lists every ship the fleet knows, readable by all ships, not only the liaison:
 
