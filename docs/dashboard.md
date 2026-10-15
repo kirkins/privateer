@@ -3,9 +3,13 @@
 The dashboard is a Rust TUI that runs inside Herdr or an ordinary terminal.
 Its home lists active ships from the per-user fleet registry (`fleet.list`),
 reading each existing home read-only. Missing homes stay visible as unavailable
-and are never recreated. It shows scope, harness, attended presence, dispatcher
-lock status, open requests, unread ship mail and the three latest wakes. Fleet overview is the home destination;
-the sidebar always shows ships. Each ship has Bridge, Assignments, Terminals
+and are never recreated. Its table shows each ship's attended presence, open
+requests, unread ship mail, pending issues, assignments (`+n` incoming),
+dispatcher status and latest wake, dropping the last columns on narrow
+terminals; each Bridge adds scope, harness and the three latest wakes. Fleet
+overview is the home destination; the sidebar always shows ships, marked
+● aboard, ○ not aboard or ✕ unavailable with a few words on what needs
+attention, and lists the liaison first. Each ship has Bridge, Assignments, Terminals
 and Logbook views. Remote peers are not discovered.
 
 The dashboard supports observation, navigation, captain mail, attended boarding
@@ -265,7 +269,7 @@ continuity. Demo terminals are labeled sample data and never connect to a socket
 
 | Key / action | Result |
 |---|---|
-| Click a ship | Open its workspace |
+| Click a ship (sidebar or fleet table row) | Open its workspace |
 | `b` / Board | Focus its bound first mate or launch `privateer start` in a new Herdr tab |
 | `n`, `x`, `d` | New ship, confirmed retirement, dispatcher status/start/stop |
 | Click Fleet overview; `0` or Home | Return to the fleet home |

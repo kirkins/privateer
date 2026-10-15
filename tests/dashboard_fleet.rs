@@ -1188,7 +1188,7 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     assert!(mailbox.errors.is_empty());
     let empty = screen(&mut app);
     assert!(empty.contains("LIVE / fleet · captain mail"));
-    assert!(empty.contains("0 messages"));
+    assert!(empty.contains("No messages"));
     assert!(!empty.contains("READ-ONLY / local home"));
     assert!(!empty.contains("Not connected"));
     for (folder, from) in [(&apps, "apps"), (&infra, "infra")] {
@@ -1201,7 +1201,7 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     mailbox.refresh(&proxy, &app.snapshot, None);
     app.mail = mailbox.messages.clone();
     let populated = screen(&mut app);
-    assert!(populated.contains("2 messages"));
+    assert!(populated.contains("2 unread"));
     assert!(!populated.contains("Not connected"));
     fs::rename(infra.join(".privateer"), infra.join("saved-home")).unwrap();
     app.update_snapshot(fleet::read(&registry, None).unwrap());
@@ -1221,7 +1221,7 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
         }
         let failed = screen(&mut app);
         assert!(failed.contains("LIVE / fleet · captain mail"));
-        assert!(failed.contains("2 messages · errors: 1"));
+        assert!(failed.contains("2 unread · 1 error"));
         assert!(failed.contains("MAILBOX UNAVAILABLE"));
         assert!(!failed.contains("READ-ONLY / local home"));
         assert!(!failed.contains("Not connected"));
@@ -1231,7 +1231,7 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     app.update_snapshot(fleet::read(&registry, None).unwrap());
     mailbox.refresh(&proxy, &app.snapshot, None);
     app.mail_errors = mailbox.errors.clone();
-    assert!(screen(&mut app).contains("2 messages · errors: 2"));
+    assert!(screen(&mut app).contains("2 unread · 2 errors"));
     for folder in [&apps, &infra] {
         fs::rename(folder.join("saved-home"), folder.join(".privateer")).unwrap();
     }
@@ -1240,7 +1240,7 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     app.mail = mailbox.messages;
     app.mail_errors = mailbox.errors;
     let recovered = screen(&mut app);
-    assert!(recovered.contains("2 messages"));
+    assert!(recovered.contains("2 unread"));
     assert!(!recovered.contains("MAILBOX UNAVAILABLE"));
     assert!(app.mail_errors.is_empty());
 }
@@ -2003,4 +2003,77 @@ fn primary_ship_actions_remain_visible_at_a_standard_terminal_width() {
     for action in ["[b Board]", "[n New ship]", "[x Retire]", "[d Dispatcher]"] {
         assert!(text.contains(action), "{action} was clipped");
     }
+}
+
+#[test]
+fn fleet_home_tabulates_live_ships_liaison_first_and_rows_open_their_workspace() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use privateer::dashboard::{fleet, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    let zeta = m.root.join("zeta");
+    fs::create_dir(&zeta).unwrap();
+    m.cli(
+        &zeta,
+        &["init", "--ship", "zeta", "--harness", "codex", "--liaison"],
+    );
+    m.json(
+        &apps,
+        "mail.send",
+        json!({"from":"apps","to":"captain","kind":"request","body":"Ship it?"}),
+    );
+    fs::rename(infra.join(".privateer"), infra.join("saved-home")).unwrap();
+    let snapshot = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
+    let order: Vec<_> = snapshot.ships.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(order, ["zeta", "apps", "infra"]);
+    let mut app = App {
+        snapshot,
+        ..App::default()
+    };
+    let rows = |app: &mut App, width: u16| -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(width, 34)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..34)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    };
+    let lines = rows(&mut app, 120);
+    let view = lines.join("\n");
+    let header = lines
+        .iter()
+        .position(|l| l.contains("Ship") && l.contains("Aboard") && l.contains("Last wake"))
+        .expect("fleet table header");
+    assert!(lines[header + 1].contains("zeta ★"), "{view}");
+    assert!(lines[header + 2].contains("○ —"), "{view}");
+    assert!(lines[header + 3].contains("✕ unavailable"), "{view}");
+    assert!(view.contains("infra unavailable: ship home is missing"));
+    assert!(view.contains("liaison · 1 task"), "{view}");
+    assert!(view.contains("1 req · 1 task"), "{view}");
+    assert!(view.contains("home unavailable"));
+    assert!(
+        !view.contains("Scope of apps"),
+        "per-ship prose left the home"
+    );
+
+    // Clicking a table row opens that ship's workspace.
+    let column = lines[header][..lines[header].find("Ship").unwrap()]
+        .chars()
+        .count() as u16;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row: header as u16 + 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.ship.as_deref(), Some("apps"));
+    assert_eq!(app.tab, 0);
+
+    // Narrow terminals drop the lowest-priority columns, never the ship.
+    app.select_ship(None);
+    let narrow = rows(&mut app, 80).join("\n");
+    assert!(narrow.contains("Aboard") && narrow.contains("Requests"));
+    assert!(!narrow.contains("Last wake") && !narrow.contains("Dispatcher"));
 }

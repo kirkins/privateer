@@ -2,6 +2,7 @@ use super::{
     captain::{Composer, Exchange, Mail},
     herdr,
     model::{Snapshot, Task, clean, count},
+    overview,
 };
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -9,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, List, ListItem, ListState, Paragraph, Table, TableState, Tabs, Wrap},
 };
 use std::{
     path::{Path, PathBuf},
@@ -74,6 +75,8 @@ pub struct MouseMap {
     ship_offset: usize,
     list: Rect,
     list_offset: usize,
+    fleet: Rect,
+    fleet_offset: usize,
     details: Rect,
 }
 
@@ -441,6 +444,12 @@ impl App {
                     if index <= self.snapshot.ships.len() + 1 {
                         self.select_navigation(index);
                     }
+                } else if self.mouse.fleet.contains(point) {
+                    let index =
+                        self.mouse.fleet_offset + usize::from(event.row - self.mouse.fleet.y);
+                    if index < self.snapshot.ships.len() {
+                        self.select_navigation(index + 2);
+                    }
                 } else if let Some((_, tab)) =
                     self.mouse.tabs.iter().find(|(r, _)| r.contains(point))
                 {
@@ -530,8 +539,12 @@ impl App {
                 )),
                 Line::from(if self.snapshot.ships.is_empty() && !self.demo {
                     "No ships yet · n: create your first ship (a liaison is suggested)"
+                } else if !overview::observed(&self.snapshot) {
+                    "Select a ship to enter its workspace."
+                } else if self.ascii {
+                    "Select a ship to enter its workspace; * aboard · o not aboard · x unavailable"
                 } else {
-                    "Select a ship to enter its workspace. i: Inbox · l: Talk to liaison"
+                    "Select a ship to enter its workspace; ● aboard · ○ not aboard · ✕ unavailable"
                 }),
                 Line::from(""),
             ];
@@ -562,40 +575,15 @@ impl App {
             }
             lines.push(Line::from(""));
             for ship in &self.snapshot.ships {
-                let owned = self
-                    .snapshot
-                    .tasks
-                    .iter()
-                    .filter(|t| t.owner == ship.id)
-                    .count();
-                let incoming = self
-                    .snapshot
-                    .tasks
-                    .iter()
-                    .filter(|t| t.handoff_to.as_ref() == Some(&ship.id))
-                    .count();
-                let pending = self
-                    .snapshot
-                    .pending
-                    .iter()
-                    .filter(|n| n.owner == ship.id)
-                    .count();
-                lines.push(Line::styled(
-                    format!(
-                        "{}{}",
-                        clean(&ship.name, 160),
-                        if ship.liaison { " · Liaison" } else { "" }
-                    ),
-                    Style::default().fg(Color::Yellow),
-                ));
-                lines.push(Line::from(format!(
-                    "{owned} owned · {} · {}",
-                    count(incoming, "incoming handoff", "incoming handoffs"),
-                    count(pending, "pending issue", "pending issues")
-                )));
-                lines.push(Line::from(clean(&ship.description, 512)));
-                if let Some(live) = &ship.live {
-                    lines.extend(super::fleet::lines(live));
+                if let Some(error) = ship.live.as_ref().and_then(|l| l.error.as_ref()) {
+                    lines.push(Line::styled(
+                        format!(
+                            "{} unavailable: {}",
+                            clean(&ship.name, 160),
+                            clean(error, 512)
+                        ),
+                        Style::default().fg(Color::Red),
+                    ));
                 }
             }
             lines.extend(self.pending_lines());
@@ -910,36 +898,23 @@ impl App {
         let cols = Layout::horizontal([Constraint::Percentage(27), Constraint::Percentage(73)])
             .split(rows[1]);
         let mut items = vec![
-            ListItem::new(vec![Line::from("Fleet overview"), Line::from("All ships")]),
+            ListItem::new(vec![
+                Line::from("Fleet overview"),
+                Line::from(count(self.snapshot.ships.len(), "ship", "ships")),
+            ]),
             ListItem::new(vec![
                 Line::from("Captain's inbox"),
-                Line::from(if self.demo {
-                    "Sample decisions / replies".into()
-                } else if self.mail_errors.is_empty() {
-                    format!("{} messages", self.mail.len())
-                } else {
-                    format!(
-                        "{} messages · errors: {}",
-                        self.mail.len(),
-                        self.mail_errors.len()
-                    )
-                }),
+                Line::from(overview::inbox(&self.mail, self.mail_errors.len())),
             ]),
         ];
         for s in &self.snapshot.ships {
-            let assignments = self
-                .snapshot
-                .tasks
-                .iter()
-                .filter(|t| t.owner == s.id)
-                .count();
             items.push(ListItem::new(vec![
-                Line::from(clean(&s.name, 160)),
-                Line::from(format!(
-                    "{} · {}",
-                    if s.liaison { "Liaison" } else { "Peer ship" },
-                    count(assignments, "assignment", "assignments")
-                )),
+                Line::from(vec![
+                    overview::presence(s, self.ascii),
+                    Span::raw(" "),
+                    Span::raw(clean(&s.name, 160)),
+                ]),
+                Line::from(format!("  {}", overview::summary(s, &self.snapshot))),
             ]));
         }
         let block = Block::bordered()
@@ -1045,6 +1020,31 @@ impl App {
             }
         };
         let has_list = self.inbox_open || (self.ship.is_some() && matches!(self.tab, 1 | 2));
+        if !self.inbox_open && self.ship.is_none() && !self.snapshot.ships.is_empty() {
+            let rows = self.snapshot.ships.len() as u16;
+            let parts = Layout::vertical([
+                Constraint::Length((rows + 3).min((body.height / 2).max(5))),
+                Constraint::Min(1),
+            ])
+            .split(body);
+            let block = Block::bordered().title("Ships").border_style(border(false));
+            let inner = block.inner(parts[0]);
+            let (header, rows, widths) = overview::table(&self.snapshot, inner.width, self.ascii);
+            let mut state = TableState::default();
+            frame.render_stateful_widget(
+                Table::new(rows, widths).header(header).block(block),
+                parts[0],
+                &mut state,
+            );
+            self.mouse.fleet = Rect::new(
+                inner.x,
+                inner.y.saturating_add(1),
+                inner.width,
+                inner.height.saturating_sub(1),
+            );
+            self.mouse.fleet_offset = state.offset();
+            body = parts[1];
+        }
         if has_list {
             let parts = Layout::vertical([
                 Constraint::Length((body.height / 2).max(4)),
