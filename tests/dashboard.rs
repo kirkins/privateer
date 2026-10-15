@@ -1099,7 +1099,7 @@ fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
     let screen = render(&mut app, 120, 34);
     assert!(screen.contains("No ships yet · n: create your first ship"));
     assert!(screen.contains("0 ships · 0 assignments · 0 pending issues"));
-    assert!(!screen.contains("[l Liaison]"));
+    assert!(!screen.contains("[l Talk to liaison]"));
     let mut demo = App {
         snapshot: Snapshot::demo(),
         demo: true,
@@ -1108,6 +1108,41 @@ fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
     let screen = render(&mut demo, 120, 34);
     assert!(screen.contains("[l Talk to liaison]"));
     assert!(screen.contains("1 pending issue\n") || screen.contains("· 1 pending issue "));
+}
+
+#[test]
+fn fleet_overview_says_how_to_talk_to_the_liaison() {
+    use privateer::dashboard::{fleet::ShipState, model::Ship};
+    let mut app = App {
+        snapshot: Snapshot {
+            ships: vec![Ship {
+                id: "contact".into(),
+                name: "contact".into(),
+                liaison: true,
+                live: Some(ShipState {
+                    home: "/isolated/it's/.privateer".into(),
+                    ..ShipState::default()
+                }),
+                ..Ship::default()
+            }],
+            ..Snapshot::default()
+        },
+        ..App::default()
+    };
+    let screen = render(&mut app, 160, 34);
+    assert!(
+        screen.contains(
+            "Talk to contact directly: privateer --home '/isolated/it'\"'\"'s/.privateer' start"
+        ),
+        "{screen}"
+    );
+    assert!(screen.contains("[l Talk to liaison]") && screen.contains("l talk to liaison"));
+    app.herdr_configured = true;
+    let screen = render(&mut app, 160, 34);
+    assert!(
+        screen.contains("l: talk to contact · opens its first mate in a Herdr tab"),
+        "{screen}"
+    );
 }
 
 #[test]
