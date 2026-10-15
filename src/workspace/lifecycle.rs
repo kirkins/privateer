@@ -134,7 +134,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let task = required(&args, "task_id")?;
             let charter = store.authorize(task, "spawn")?;
             let repo = fs::canonicalize(required(&charter, "repo")?)?;
-            let exec = execution(store, task, &repo, true, None)?;
+            let selected = args
+                .get("cwd")
+                .map(|v| v.as_str().context("cwd must be an absolute path"))
+                .transpose()?
+                .unwrap_or(repo.to_str().context("repository path is not UTF-8")?);
+            ensure!(Path::new(selected).is_absolute(), "cwd must be absolute");
+            let selected = fs::canonicalize(selected)?;
+            let exec = execution(store, task, &repo, &selected, true, None)?;
             ensure!(
                 exec.lease_id.is_some(),
                 "workspace.acquire requires a Git repository"

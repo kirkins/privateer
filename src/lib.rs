@@ -86,6 +86,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             // Plan against the task checkout; first-mate wakes have a durable
             // wake row and keep their existing ship repository.
             args.as_object_mut().unwrap().remove("_workspace_lease_id");
+            args.as_object_mut().unwrap().remove("_workspace_cwd");
             use sha2::{Digest, Sha256};
             let request_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&args)?));
             if let Some(existing) = jobs::agent_replay(store, &args, &request_hash)? {
@@ -96,15 +97,25 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("charter repo missing"))?,
             )?;
+            let selected = match args.get("cwd") {
+                Some(cwd) => std::fs::canonicalize(
+                    cwd.as_str()
+                        .ok_or_else(|| anyhow::anyhow!("cwd must be a directory path"))?,
+                )?,
+                None => repo.clone(),
+            };
             let execution = workspace::execution(
                 store,
                 &task,
                 &repo,
+                &selected,
                 !workspace::is_wake(store, &args)?,
                 None,
             )?;
             if let Some(lease) = &execution.lease_id {
                 args["_workspace_lease_id"] = serde_json::json!(lease);
+            } else {
+                args["_workspace_cwd"] = serde_json::json!(execution.root);
             }
             drop(execution);
             let plan = plugins::dispatch(store, "plugin.command", args.clone())?;

@@ -61,6 +61,7 @@ impl Lock {
 struct Workspace {
     task_id: String,
     generation: String,
+    charter_repo: PathBuf,
     repo: PathBuf,
     git_repo: PathBuf,
     pool: PathBuf,
@@ -76,6 +77,7 @@ struct Workspace {
 
 pub(crate) struct Execution {
     pub(crate) root: PathBuf,
+    pub(crate) source_root: PathBuf,
     pub(crate) lease_id: Option<String>,
     pub(crate) _lock: Option<Lock>,
 }
@@ -242,13 +244,19 @@ fn binary(store: &Store) -> Result<PathBuf> {
     )
 }
 
-fn acquire_locked(store: &Store, task: &str, repo: &Path, lock: &Lock) -> Result<Workspace> {
+fn acquire_locked(
+    store: &Store,
+    task: &str,
+    charter_repo: &Path,
+    repo: &Path,
+    lock: &Lock,
+) -> Result<Workspace> {
     owner(store, task)?;
     let old = load(store, task)?;
     let mut w = if let Some(w) = old.filter(|w| w.state != "released") {
         ensure!(
-            w.repo == repo,
-            "charter repository changed; release its previous workspace first"
+            w.charter_repo == charter_repo && w.repo == repo,
+            "charter or task project changed; release its previous workspace first"
         );
         w
     } else {
@@ -292,6 +300,7 @@ fn acquire_locked(store: &Store, task: &str, repo: &Path, lock: &Lock) -> Result
         let w = Workspace {
             task_id: task.into(),
             generation: generation.clone(),
+            charter_repo: charter_repo.into(),
             repo: repo.into(),
             git_repo,
             pool: fs::canonicalize(pool)?,
@@ -378,7 +387,7 @@ fn disk_admission(store: &Store, task: &str, pool: &Path) -> Result<()> {
 
 pub(crate) fn contains_cwd(store: &Store, task: &str, repo: &Path, cwd: &Path) -> Result<bool> {
     match load(store, task)? {
-        Some(w) if w.state == "ready" && w.repo == repo => Ok(cwd.starts_with(root(&w)?)),
+        Some(w) if w.state == "ready" && w.charter_repo == repo => Ok(cwd.starts_with(root(&w)?)),
         _ => Ok(false),
     }
 }
@@ -399,19 +408,29 @@ pub(crate) fn execution(
     store: &Store,
     task: &str,
     repo: &Path,
+    selected: &Path,
     isolate: bool,
     expected: Option<&str>,
 ) -> Result<Execution> {
     owner(store, task)?;
+    ensure!(selected.is_dir(), "cwd must be an existing directory");
     if !isolate {
         return Ok(Execution {
             root: repo.into(),
+            source_root: repo.into(),
             lease_id: None,
             _lock: None,
         });
     }
     let lock = Lock::acquire(store)?;
     let exists = load(store, task)?;
+    ensure!(
+        selected.starts_with(repo)
+            || exists.as_ref().is_some_and(
+                |w| w.charter_repo == repo && root(w).is_ok_and(|r| selected.starts_with(r))
+            ),
+        "cwd must stay inside charter repository or its task workspace"
+    );
     if let Some(expected) = expected {
         ensure!(
             exists.as_ref().and_then(|w| w.lease_id.as_deref()) == Some(expected)
@@ -421,17 +440,39 @@ pub(crate) fn execution(
     }
     // Ordinary non-Git charters remain usable without a Treehouse install.
     // A present .git ancestor that Git cannot read is an error, not fallback.
-    let has_marker = repo
+    let selected = if let Some(w) = &exists {
+        ensure!(
+            w.charter_repo == repo,
+            "charter repository changed; release its previous workspace first"
+        );
+        if w.state != "released" {
+            ensure!(
+                selected == repo
+                    || selected.starts_with(&w.repo)
+                    || root(w).is_ok_and(|path| selected.starts_with(path)),
+                "this task is bound to another project; create a child task or release its workspace first"
+            );
+            w.repo.clone()
+        } else if selected == repo {
+            w.repo.clone()
+        } else {
+            selected.to_owned()
+        }
+    } else {
+        selected.to_owned()
+    };
+    let has_marker = selected
         .ancestors()
         .any(|p| p.join(".git").symlink_metadata().is_ok());
-    if !has_marker && exists.is_none() {
+    if !has_marker && exists.as_ref().is_none_or(|w| w.state == "released") {
         return Ok(Execution {
-            root: repo.into(),
+            root: selected.clone(),
+            source_root: selected,
             lease_id: None,
             _lock: Some(lock),
         });
     }
-    let w = acquire_locked(store, task, repo, &lock)?;
+    let w = acquire_locked(store, task, repo, &selected, &lock)?;
     crate::jobs::workspace_previous_owner_idle(
         store,
         task,
@@ -439,6 +480,7 @@ pub(crate) fn execution(
     )?;
     Ok(Execution {
         root: root(&w)?,
+        source_root: w.repo,
         lease_id: w.lease_id,
         _lock: Some(lock),
     })
@@ -449,7 +491,7 @@ pub(crate) fn planning_root(
     repo: &Path,
     lease: &str,
 ) -> Result<PathBuf> {
-    let exec = execution(store, task, repo, true, Some(lease))?;
+    let exec = execution(store, task, repo, repo, true, Some(lease))?;
     Ok(exec.root)
 }
 pub(crate) fn validate_job(
@@ -463,7 +505,7 @@ pub(crate) fn validate_job(
         let lock = Lock::acquire(store)?;
         let w = load(store, task)?.context("job workspace record missing")?;
         ensure!(
-            w.repo == repo && w.lease_id.as_deref() == Some(lease),
+            w.charter_repo == repo && w.lease_id.as_deref() == Some(lease),
             "job workspace lease or charter changed"
         );
         validate(&lock, &w)?;

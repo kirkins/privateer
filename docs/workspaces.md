@@ -10,6 +10,19 @@ Only one crew harness can hold a task checkout at a time. Create a child task
 for another independent coding worker; that harness's build/test jobs can use
 its existing task workspace.
 
+A ship's charter can cover its whole folder while its projects are nested Git
+repositories. Set `cwd` to the project directory for the first `job.start`,
+`agent.start` or explicit `workspace.acquire`. Privateer detects Git there and
+pins the task to that source directory. Later jobs that omit `cwd` reuse the
+task checkout. Another project requires a separate task or an explicit release
+before retargeting. Paths outside the charter remain refused. A non-Git `cwd`
+runs directly in its declared directory.
+
+```sh
+privateer --home /absolute/home job.start \
+  --json '{"task_id":"repair","cwd":"/absolute/ship/projects/app","command":["cargo","test"],"heavy":true,"wait_for_capacity":true}'
+```
+
 Install [Treehouse](https://github.com/kunchenguid/treehouse#install) on PATH.
 The CLI must support `get --lease --json`, `status --json`, `--worktree-path`,
 and conditional return with `--if-lease-id` and `--if-lease-holder`. The local

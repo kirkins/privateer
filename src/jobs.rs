@@ -894,15 +894,18 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         store,
         task_id,
         &repo,
+        &requested_cwd,
         !(agent && crate::workspace::is_wake(store, &args)?),
         expected_workspace,
     )?;
     let cwd = if requested_cwd.starts_with(&workspace.root) {
         requested_cwd.clone()
+    } else if requested_cwd == repo {
+        workspace.root.clone()
     } else {
         workspace.root.join(
             requested_cwd
-                .strip_prefix(&repo)
+                .strip_prefix(&workspace.source_root)
                 .context("cwd must stay inside charter repository or its task workspace")?,
         )
     };

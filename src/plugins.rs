@@ -227,6 +227,14 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
             &source_repo,
             lease.as_str().context("workspace lease must be a string")?,
         )?
+    } else if let Some(cwd) = args.get("_workspace_cwd") {
+        let cwd =
+            Path::new(cwd.as_str().context("workspace cwd must be a path")?).canonicalize()?;
+        ensure!(
+            cwd.is_dir() && cwd.starts_with(&source_repo),
+            "plugin cwd escapes charter repository"
+        );
+        cwd
     } else {
         source_repo.clone()
     };

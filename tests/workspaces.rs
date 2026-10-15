@@ -428,13 +428,17 @@ fn installed_treehouse_contract() {
         json!({"resource_home":f.root.join("ledger"),"treehouse_binary":binary}).to_string(),
     )
     .unwrap();
-    let w = f.acquire("one");
+    f.ok("charter.put", json!({"id":"mission","repo":f.root}));
+    let w = f.ok("workspace.acquire", json!({"task_id":"one","cwd":f.repo}));
     assert_eq!(f.acquire("one")["lease_id"], w["lease_id"]);
     let j = f.start("one", "real", "test -f file.txt");
     assert_eq!(j["workspace_lease_id"], w["lease_id"]);
     assert_eq!(f.wait("real")["status"], "succeeded");
     assert_eq!(f.release(&w, false)["state"], "released");
-    assert_ne!(f.acquire("two")["lease_id"], w["lease_id"]);
+    assert_ne!(
+        f.ok("workspace.acquire", json!({"task_id":"two","cwd":f.repo}))["lease_id"],
+        w["lease_id"]
+    );
 }
 
 #[test]
@@ -850,6 +854,15 @@ fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
     f.ok("charter.put", json!({"id":"mission","min_free_bytes":0}));
     assert!(
         !f.run(
+            "workspace.acquire",
+            json!({"task_id":"one","cwd":f.repo.join("file.txt")})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
+    assert!(
+        !f.run(
             "job.start",
             json!({"task_id":"one","cwd":f.root,"command":["/bin/true"],"heavy":false})
         )
@@ -909,4 +922,75 @@ fn repeated_release_attempts_never_overwrite_an_archived_snapshot() {
         ),
         second_head
     );
+}
+
+#[test]
+fn projects_inside_a_non_git_ship_get_workspaces_and_nested_jobs_reuse_them() {
+    let f = Fixture::new();
+    f.ok("charter.put", json!({"id":"mission","repo":f.root}));
+    let first = f.ok("job.start",json!({"task_id":"one","id":"project","cwd":f.repo,"command":["/bin/sh","-c","printf project > file.txt"],"heavy":false}));
+    assert_eq!(f.wait("project")["status"], "succeeded");
+    assert_ne!(first["cwd"], json!(f.repo));
+    assert!(first["workspace_lease_id"].is_string());
+    let nested = f.start(
+        "one",
+        "nested-project",
+        "test \"$(cat file.txt)\" = project",
+    );
+    assert_eq!(f.wait("nested-project")["status"], "succeeded");
+    assert_eq!(nested["cwd"], first["cwd"]);
+    assert_eq!(nested["workspace_lease_id"], first["workspace_lease_id"]);
+    assert_eq!(
+        fs::read_to_string(f.repo.join("file.txt")).unwrap(),
+        "base\n"
+    );
+    let w = f.acquire("one");
+    assert_eq!(w["charter_repo"], json!(f.root));
+    assert_eq!(w["repo"], json!(f.repo));
+}
+
+#[test]
+fn a_project_selector_routes_agent_planning_but_cannot_escape_or_retarget() {
+    let f = Fixture::new();
+    f.ok("charter.put", json!({"id":"mission","repo":f.root}));
+    let adapter = f.root.join("project-adapter.py");
+    fs::write(&adapter,"import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=['/bin/sh','-c','pwd > project-cwd'],cwd=r['context']['repo'],env_names=[]))))\n").unwrap();
+    let manifest = f.root.join("project-manifest.json");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"project","executable":["/usr/bin/python3",adapter]})
+            .to_string(),
+    )
+    .unwrap();
+    let agent = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"project-agent","cwd":f.repo,"manifest":manifest}),
+    );
+    assert_eq!(f.wait("project-agent")["status"], "succeeded");
+    assert_ne!(agent["cwd"], json!(f.repo));
+    let cwd = Path::new(agent["cwd"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(cwd.join("project-cwd")).unwrap().trim(),
+        cwd.to_str().unwrap()
+    );
+    assert!(!f.repo.join("project-cwd").exists());
+    let other = f.root.join("other-project");
+    fs::create_dir(&other).unwrap();
+    assert!(
+        !f.run(
+            "job.start",
+            json!({"task_id":"one","cwd":other,"command":["/bin/true"],"heavy":false})
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !f.run(
+            "agent.start",
+            json!({"task_id":"two","cwd":f.root.parent().unwrap(),"manifest":manifest})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"two"})).is_null());
 }
