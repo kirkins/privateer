@@ -253,3 +253,14 @@ fn start_runs_the_harness_as_the_ship_while_holding_presence() {
     );
     assert_eq!(ship.presence()["attended"], false);
 }
+
+#[test]
+fn a_failed_attended_launch_releases_its_presence() {
+    let ship = Ship::new();
+    let output = ship
+        .command(&["start", "privateer-nonexistent-test-harness"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(ship.presence()["attended"], false);
+}

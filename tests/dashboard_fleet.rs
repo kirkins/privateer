@@ -218,3 +218,51 @@ fn captain_mail_keeps_home_identity_replies_and_acknowledges_only_read_prefix() 
     mailbox.refresh(&proxy, &snapshot, None);
     assert!(!mailbox.messages.iter().any(|m| m.id == "decision"));
 }
+
+#[test]
+fn retirement_rejects_a_name_that_now_belongs_to_a_different_home() {
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let out = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &apps)
+        .args([
+            "ship.retire",
+            "--json",
+            &json!({"name":"apps","expected_home":m.root.join("other/.privateer")}).to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        m.json(&apps, "fleet.list", json!({}))["ships"][0]["retired_ms"],
+        Value::Null
+    );
+}
+
+#[test]
+fn management_forms_require_explicit_retirement_and_never_mutate_demo() {
+    use crossterm::event::KeyCode;
+    use privateer::dashboard::{fleet, forms::Kind, ui::App};
+    let m = Machine::new();
+    m.ship("apps");
+    let mut app = App {
+        snapshot: fleet::read(&m.root.join("fleet.sqlite"), None).unwrap(),
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    app.manage(Kind::Retire);
+    app.edit_form(KeyCode::Enter);
+    assert!(app.action.is_none());
+    for c in "apps".chars() {
+        app.edit_form(KeyCode::Char(c));
+    }
+    app.edit_form(KeyCode::Enter);
+    let action = app.action.take().unwrap();
+    assert_eq!(action.verb, "ship.retire");
+    assert_eq!(action.args["name"], "apps");
+    app.form = None;
+    app.demo = true;
+    app.manage(Kind::New);
+    assert!(app.form.is_none());
+    assert!(app.action.is_none());
+}

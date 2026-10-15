@@ -40,6 +40,17 @@ pub fn json(binary: &Path, home: &Path, verb: &str, args: &Value) -> Result<Valu
     serde_json::from_slice(&run(cmd)?).context("invalid Privateer JSON response")
 }
 
+pub fn service(binary: &Path, home: &Path, action: &str) -> Result<Vec<u8>> {
+    existing_home(home)?;
+    ensure!(
+        matches!(action, "status" | "start" | "stop"),
+        "invalid service action"
+    );
+    let mut cmd = Command::new(binary);
+    cmd.arg("--home").arg(home).arg("service").arg(action);
+    run(cmd)
+}
+
 pub fn run(mut cmd: Command) -> Result<Vec<u8>> {
     use std::os::unix::process::CommandExt;
     cmd.stdin(Stdio::null())

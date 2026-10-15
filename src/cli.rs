@@ -457,21 +457,30 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         .map_or(harness.as_str(), |(binary, _)| binary)
         .to_owned();
     let folder = home.parent().context("ship folder")?;
-    let mut child = std::process::Command::new(&binary)
+    // Hold presence before the child can read its mailbox or race serve.
+    let holder = format!("start:{}", std::process::id());
+    crate::presence::attend(&store, &ship, &holder, 90, Some(&harness))?;
+    let child = std::process::Command::new(&binary)
         .args(passthrough)
         .current_dir(folder)
         .env("PRIVATEER_ROLE", "agent")
         .env("PRIVATEER_ACTOR", &ship)
         .spawn()
-        .with_context(|| format!("cannot start {binary}; is it installed?"))?;
+        .with_context(|| format!("cannot start {binary}; is it installed?"));
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            crate::presence::leave(&store, &ship, &holder)?;
+            return Err(error);
+        }
+    };
     // Ctrl-C belongs to the harness; this process must live to release
     // presence afterwards.
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
-    let holder = format!("start:{}", std::process::id());
-    crate::presence::attend(&store, &ship, &holder, 90, Some(&harness))?;
+
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let heartbeat = {
         let (stop, home, ship, holder, harness) = (
