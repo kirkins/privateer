@@ -285,3 +285,49 @@ fn liaison_preset_is_read_message_delegate_and_keeps_captain_edits() {
             .unwrap();
     assert_eq!(config["preset"], "liaison");
 }
+
+#[test]
+fn generated_first_mate_commands_work_from_a_folder_with_shell_metacharacters() {
+    let folder = Folder::new("contact's $(touch escaped)");
+    folder.ok(&[
+        "init",
+        "--ship",
+        "contact",
+        "--liaison",
+        "--harness",
+        "codex",
+    ]);
+    let text = fs::read_to_string(folder.ship.join("AGENTS.md")).unwrap();
+    let prefix = text
+        .split_once("Run Privateer as `")
+        .unwrap()
+        .1
+        .split_once(" COMMAND")
+        .unwrap()
+        .0;
+    // Execute the generated public shell interface, rather than merely asserting
+    // that its source contains quoting tokens.
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{prefix} ship.bearings --json '{{\"ship\":\"contact\"}}'"
+        ))
+        .current_dir(&folder.ship)
+        .env("PRIVATEER_FLEET", folder.root.join("fleet.sqlite"))
+        .env("PRIVATEER_RESOURCE_HOME", folder.root.join("ledger"))
+        .env("PRIVATEER_SERVICE", "none")
+        .env_remove("PRIVATEER_ROLE")
+        .env_remove("PRIVATEER_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["ship"],
+        "contact"
+    );
+    assert!(!folder.ship.join("escaped").exists());
+}

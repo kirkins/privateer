@@ -33,13 +33,14 @@ See [dashboard setup and boundaries](docs/dashboard.md).
 
 ## Quick start
 
-A ship is a dedicated folder. Make one and go aboard with a single command:
+Inside Herdr, bare `privateer` opens the fleet dashboard and first-run setup.
+Outside Herdr, use a dedicated ship folder:
 
 ```sh
 cargo install --locked --path . --features dashboard  # installs privateer + privateer-dashboard
 mkdir -p ~/ships/infra && cd ~/ships/infra
-privateer                           # first time: asks, makes the folder a ship, starts its background
-                                    # dispatcher, and opens its first mate in your installed harness
+privateer                           # outside Herdr: asks, makes this folder a ship, ensures its
+                                    # dispatcher, and opens its first mate; inside Herdr: dashboard
 privateer                           # inside Herdr: fleet dashboard; elsewhere: first mate
 privateer start                     # always talk to this ship directly
 ```

@@ -158,6 +158,19 @@ fn flags(args: &[String], with_value: &[&str]) -> Result<Flags> {
     Ok(out)
 }
 
+/// Generated instructions and native hook schemas carry shell command text.
+fn shell_token(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.:".contains(&b))
+    {
+        text.into()
+    } else {
+        format!("'{}'", text.replace('\'', "'\"'\"'"))
+    }
+}
+
 fn instructions(ship: &str, scope: &str, cli: &str) -> String {
     let scope = if scope.is_empty() {
         String::new()
@@ -230,7 +243,7 @@ fn claude_settings(folder: &Path, binary: &str) -> Result<()> {
         .as_object_mut()
         .context("hooks must be an object")?;
     for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
-        let command = format!("{binary} hook claude {event}");
+        let command = format!("{} hook claude {event}", shell_token(binary));
         let entries = hooks
             .entry(event)
             .or_insert_with(|| json!([]))
@@ -313,7 +326,11 @@ pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)
     fs::create_dir_all(folder.join("projects"))?;
     let mut store = Store::open(home)?;
     let binary = std::env::current_exe()?;
-    let cli = format!("{} --home {}", binary.display(), store.home().display());
+    let cli = format!(
+        "{} --home {}",
+        shell_token(&binary.to_string_lossy()),
+        shell_token(&store.home().to_string_lossy())
+    );
 
     let liaison = setup.liaison
         || fs::read(home.join("config.json"))
