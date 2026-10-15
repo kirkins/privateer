@@ -52,6 +52,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
 
+class FixtureHTTPServer(http.server.ThreadingHTTPServer):
+    def __init__(self, *args):
+        self.requests = []
+        self.connections = 0
+        super().__init__(*args)
+
+    def get_request(self):
+        accepted = super().get_request()
+        self.connections += 1
+        return accepted
+
+
 class Native(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -68,8 +80,7 @@ class Native(unittest.TestCase):
         self.repo.mkdir()
         self.agent = self.base / 'agent'
         self.agent.mkdir()
-        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        self.server.requests = []
+        self.server = FixtureHTTPServer(('127.0.0.1', 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.server.server_close)
@@ -176,6 +187,7 @@ class Native(unittest.TestCase):
             self.assertTrue(a.result()['selected'])
             self.assertFalse(b.result()['selected'])
         self.assertEqual(self.server.requests.count('/lookup'), 4)
+        self.assertEqual(self.server.connections, 4, 'no additional/idle ambient MCP TCP connections')
         print(json.dumps({'native_pi': '1.2.0', 'inventory': 'selected/empty/attended/hosted-crew/concurrent',
                           'ambient_mcp_connections': 0, 'api_calls': self.server.requests.count('/lookup')}))
 
@@ -192,6 +204,7 @@ class Native(unittest.TestCase):
         self.assertNotIn('"fixture":"bundle-inventory"', run.stdout.replace(' ', ''))
         self.assertIn('required-integration-unavailable', run.stderr)
         self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.server.connections, 0)
 
     def test_api_script_errors_timeouts_redirects_and_redaction(self):
         for path in ('/redirect', '/error', '/slow', '/large'):

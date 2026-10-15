@@ -118,6 +118,30 @@ class Bundles(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.plan()
 
+    def test_sticky_ancestor_exception_is_root_owned_directory_only(self):
+        from types import SimpleNamespace
+        import stat
+        path = Path('/controlled-temp/skill')
+        def info(mode, uid):
+            return SimpleNamespace(st_mode=mode, st_uid=uid)
+        for mode, uid, allowed in (
+                (stat.S_IFDIR | 0o1777, 0, True),
+                (stat.S_IFDIR | 0o1777, 1, False),
+                (stat.S_IFDIR | 0o0777, 0, False),
+                (stat.S_IFDIR | 0o0775, 0, False),
+                (stat.S_IFLNK | 0o1777, 0, False)):
+            metadata = {Path('/'): info(stat.S_IFDIR | 0o755, 0),
+                        path.parent: info(mode, uid),
+                        path: info(stat.S_IFDIR | 0o700, os.geteuid())}
+            with self.subTest(mode=mode, uid=uid), \
+                    patch.object(Path, 'lstat', autospec=True, side_effect=lambda p: metadata[p]), \
+                    patch.object(Path, 'stat', autospec=True, side_effect=lambda p: metadata[p]):
+                if allowed:
+                    self.assertEqual(bundles.safe_path(str(path), directory=True), path)
+                else:
+                    with self.assertRaises(ValueError):
+                        bundles.safe_path(str(path), directory=True)
+
     def test_skill_frontmatter_cannot_silently_rename_or_skip(self):
         path = Path(self.a['root']) / 'SKILL.md'
         for text in ('bad', '---\nname: selected\n---\n', '---\nname: other\ndescription: demo\n---\n',
@@ -185,6 +209,10 @@ class Bundles(unittest.TestCase):
         with patch.dict(os.environ, self.env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
             native_launch.launch('pi', ['pi', '-e', crew, '--', 'brief'], bundles=self.plan([]))
         probe.assert_not_called()
+        for flags in (['-e', crew, '-e', crew], ['-e', crew + '.spoof'], ['--extension', crew], ['-e' + crew]):
+            with self.subTest(flags=flags), patch.dict(os.environ, env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
+                native_launch.launch('pi', ['pi', *flags, '--', 'brief'], bundles=self.plan([]))
+            probe.assert_not_called()
 
     def test_ambient_packages_and_prompt_files_refuse_before_native_probe(self):
         for directory in (self.agent, self.repo / '.pi'):
