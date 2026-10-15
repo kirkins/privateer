@@ -64,13 +64,17 @@ fn kill(pid: &Value, group: bool) {
     unsafe { libc::kill(if group { -pid } else { pid }, libc::SIGKILL) };
 }
 
-/// Wait until a recorded process is gone (or only a zombie).
+/// Wait until a recorded process is gone (or only a zombie), on Linux and
+/// macOS alike.
 fn gone(pid: &Value) {
     let until = Instant::now() + Duration::from_secs(10);
-    let path = format!("/proc/{}/stat", pid.as_i64().unwrap());
-    while let Ok(stat) = fs::read_to_string(&path) {
-        let state = stat.rsplit_once(')').unwrap().1.split_whitespace().next();
-        if matches!(state, Some("Z" | "X")) {
+    loop {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        if stat.trim().is_empty() || stat.trim().starts_with('Z') {
             return;
         }
         assert!(Instant::now() < until, "process {pid} survived");
