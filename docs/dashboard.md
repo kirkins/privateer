@@ -104,6 +104,42 @@ There is no inferred binding based on similar labels or matching owners. A
 Herdr `done` state does not mark a task done or prove a passing PR. Stored job
 statuses may be stale because this UI deliberately does not reconcile processes.
 
+## First run and everyday entry
+
+Bare `privateer` opens an executable `privateer-dashboard` installed beside it
+or on PATH, in ordinary terminals as well as Herdr. With a current ship, its
+dispatcher is ensured first. `privateer start` always opens the harness directly.
+Only a missing dashboard retains the legacy harness/initialization flow.
+Standalone observation, inbox and onboarding need no Herdr socket; Board still
+requires an explicitly selected or inherited socket and validated bindings.
+
+With an empty fleet, the interactive dashboard welcomes the captain and suggests
+`liaison` at `~/ships/liaison`. Name and folder are editable; the suggested folder
+tracks the name until changed explicitly. Choose among supported installed
+harnesses (←/→ cycles Harness), and choose `liaison` or an ordinary `ship` role.
+Tab moves fields, Delete/Ctrl-U clears a field, Enter creates, and Escape skips
+without creating a home or fleet registry. `n` reopens setup in an empty fleet.
+A missing harness keeps setup open with guidance, without initializing anything.
+
+Creation uses `privateer init --ship NAME --harness ID [--liaison]` in the chosen
+folder, then `privateer service start`. With a configured Herdr connection,
+Board waits for the created ship's name and canonical home to appear in the
+registry, with fresh, valid home and Herdr observations. Temporary observation
+failures retain the request until the action queue accepts it. If the name now
+maps to a different home, automatic Board is cancelled.
+The chosen dedicated folder must be empty. If initialization succeeds before
+service startup fails, the ship remains available through existing ship and dispatcher management; onboarding
+does not reinitialize it or change its role.
+Without a configured Herdr socket, creation succeeds and displays a shell-quoted
+`privateer --home HOME start` command to talk to its first mate directly.
+
+See [Getting aboard](architecture.md#getting-aboard) for the liaison preset,
+generated onboarding checklist and initialization refresh policy, and
+[The fleet](architecture.md#the-fleet) for agent-created ship authority.
+
+The same runtime guide covers bare `privateer` and direct `privateer start`
+entry. Installation is covered under [Build and preview](#build-and-preview).
+
 ## Boarding and management
 
 Select a ship and press `b` (or click Board). A live exact binding focuses its
@@ -137,10 +173,10 @@ explicit/inherited Herdr socket; a
 regular terminal still shows state and supports mail and management.
 
 `n` opens New ship (name, scope, optional absolute folder, harness), using an
-existing available ship as its creator. For an empty fleet, create the first
-ship through the [quick start](../README.md#quick-start); dashboard onboarding
-is a later step. Leaving the folder empty creates a sibling of the creator's
-folder. Use Tab or Up/Down to select a field, Enter to submit and Escape to cancel.
+existing available ship as its creator. In an empty fleet, it opens
+[first-run setup](#first-run-and-everyday-entry). Leaving the New ship folder
+empty creates a sibling of the creator's folder. Use Tab or Up/Down to select a
+field, Enter to submit and Escape to cancel.
 `x` opens Retire: type the exact selected ship name to confirm;
 its folder is kept.
 Retirement refuses if the fleet name now belongs to a different home. `d` opens
@@ -168,9 +204,14 @@ entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
 
-One optional `liaison: true` ship supplies the contact badge and shortcut. This
-is presentation configuration, not a grant of authority or an implementation of
-the captain's runtime delivery policy.
+One optional `liaison: true` ship in `dashboard.json` explicitly selects the
+contact badge and shortcut. If no explicit contact is configured, exactly one
+ship with the `init --liaison` preset supplies that contact. Multiple preset
+ships remain ordinary boardable fleet entries until an explicit contact is
+selected; the dashboard does not choose a preferred ship. Explicit contact
+claims still must agree across homes. Contact selection is presentation
+configuration, not a grant of authority or an implementation of the captain's
+runtime delivery policy.
 
 See [the example registry](../examples/dashboard.json). Its `id` must match the
 runtime's exact task-owner identity. Names, descriptions and terminal bindings
@@ -219,6 +260,8 @@ continuity. Demo terminals are labeled sample data and never connect to a socket
 | Key / action | Result |
 |---|---|
 | Click a ship | Open its workspace |
+| `b` / Board | Focus its bound first mate or launch `privateer start` in a new Herdr tab |
+| `n`, `x`, `d` | New ship, confirmed retirement, dispatcher status/start/stop |
 | Click Fleet overview; `0` or Home | Return to the fleet home |
 | `1`–`4`, Tab after selecting a ship | Bridge, Assignments, Terminals, Logbook |
 | Click an assignment/terminal | Select its details |

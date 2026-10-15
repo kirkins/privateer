@@ -5,8 +5,8 @@
 //! folder is its charter's repository root, with the projects it works on
 //! cloned into `projects/`. `init` turns a folder into a ship with sensible
 //! defaults and writes the instructions that make any harness launched there
-//! its first mate. JSON commands for agents and RPC are unchanged.
-use crate::store::{Store, identifier};
+//! its first mate.
+use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::fs;
@@ -46,8 +46,26 @@ pub fn discover_home() -> Option<PathBuf> {
 }
 
 fn on_path(binary: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            dir.join(binary).is_file()
+                && dir
+                    .join(binary)
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// Supported harnesses installed on this machine, in the runtime's normal order.
+pub fn installed_harnesses() -> Result<Vec<String>> {
+    let plugins = plugins_dir()?;
+    Ok(HARNESSES
+        .iter()
+        .filter(|(binary, id)| on_path(binary) && plugins.join(id).join("manifest.json").is_file())
+        .map(|(_, id)| (*id).to_owned())
+        .collect())
 }
 
 /// The bundled adapters: `PRIVATEER_PLUGINS`, a `plugins/` directory beside
@@ -140,6 +158,19 @@ fn flags(args: &[String], with_value: &[&str]) -> Result<Flags> {
     Ok(out)
 }
 
+/// Generated instructions and native hook schemas carry shell command text.
+fn shell_token(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.:".contains(&b))
+    {
+        text.into()
+    } else {
+        format!("'{}'", text.replace('\'', "'\"'\"'"))
+    }
+}
+
 fn instructions(ship: &str, scope: &str, cli: &str) -> String {
     let scope = if scope.is_empty() {
         String::new()
@@ -153,6 +184,10 @@ fn instructions(ship: &str, scope: &str, cli: &str) -> String {
 You are the first mate of the Privateer ship **{ship}**.{scope} The captain, the person you are talking to, gives you direction. Ships are peers: you coordinate with other ships through mail, never by command, and you run your own crew as supervised jobs. This file is written by `privateer init`; remove the first line to keep your own edits.
 
 Run Privateer as `{cli} COMMAND --json '{{...}}'`.
+
+Use your agent identity for mail and delegation through these JSON commands or
+`privateer ship new|retire`. Bare `privateer`, `init`, `start`, `service`, the
+dashboard and `project add` are captain commands; ask the captain to run them.
 
 ## At the start of every session
 
@@ -218,7 +253,7 @@ fn claude_settings(folder: &Path, binary: &str) -> Result<()> {
         .as_object_mut()
         .context("hooks must be an object")?;
     for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
-        let command = format!("{binary} hook claude {event}");
+        let command = format!("{} hook claude {event}", shell_token(binary));
         let entries = hooks
             .entry(event)
             .or_insert_with(|| json!([]))
@@ -341,6 +376,7 @@ pub(crate) struct Setup {
     pub objective: Option<String>,
     /// Who made it, recorded in the fleet list.
     pub created_by: String,
+    pub liaison: bool,
 }
 
 /// Make (or update) the ship whose state lives in `home`, returning its name,
@@ -360,13 +396,18 @@ pub(crate) fn setup_unlinked(home: &Path, setup: &Setup) -> Result<(String, Stri
 
 fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, String, bool)> {
     let folder = home.parent().context("ship folder")?.to_path_buf();
-    let ship = match &setup.ship {
-        Some(name) => {
-            identifier(name)?;
-            name.clone()
-        }
+    let existing = fs::read(home.join("config.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+    let ship = match setup.ship.clone().or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|c| c["ship"].as_str().map(str::to_owned))
+    }) {
+        Some(name) => name,
         None => ship_name(&folder)?,
     };
+    identifier(&ship)?;
     crate::mail::unreserved(&ship)?;
     let plugins = plugins_dir()?;
     let harness = detect_harness(&plugins, setup.harness.as_ref())?;
@@ -379,16 +420,28 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     fs::create_dir_all(folder.join("projects"))?;
     let mut store = Store::open(home)?;
     let binary = crate::executable::installed()?;
-    let cli = format!("{} --home {}", binary.display(), store.home().display());
+    let cli = format!(
+        "{} --home {}",
+        shell_token(&binary.to_string_lossy()),
+        shell_token(&store.home().to_string_lossy())
+    );
 
-    crate::dispatch(&mut store, "init", json!({"ship": ship}))?;
+    let liaison = setup.liaison || existing.as_ref().is_some_and(|c| c["preset"] == "liaison");
+    let mut config = json!({"ship":ship});
+    if liaison {
+        config["preset"] = json!("liaison");
+    }
+    crate::dispatch(&mut store, "init", config)?;
     // The shared ledger must exist before a sandboxed first mate is planned.
     crate::jobs::ensure_ledger(&store)?;
     // Created once; later edits to the charter are the captain's to keep.
     if store.charter(&ship).is_err() {
         let mut charter = json!({"id": ship,
-            "objective": setup.objective.clone().unwrap_or_else(|| format!("Work as the ship {ship}")),
+            "objective": setup.objective.clone().unwrap_or_else(|| if liaison {"Help the captain onboard, read fleet state, relay mail and delegate work to peers".into()} else {format!("Work as the ship {ship}")}),
             "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600});
+        if liaison {
+            charter["actions"] = json!(["inspect", "spawn", "message"]);
+        }
         if let Some(actions) = &setup.actions {
             charter["actions"] = actions.clone();
         }
@@ -434,7 +487,11 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     let agents = folder.join("AGENTS.md");
     let ours = fs::read_to_string(&agents).map_or(true, |t| t.starts_with(GENERATED));
     if ours {
-        fs::write(&agents, instructions(&ship, &scope, &cli))?;
+        let mut text = instructions(&ship, &scope, &cli);
+        if liaison {
+            text.push_str(&liaison_instructions(&ship));
+        }
+        fs::write(&agents, text)?;
     }
     let claude = folder.join("CLAUDE.md");
     if !claude.exists() {
@@ -460,6 +517,7 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
             scope: flags.values.get("scope").cloned(),
             harness: flags.values.get("harness").cloned(),
             created_by: "captain".into(),
+            liaison: flags.switches.iter().any(|s| s == "liaison"),
             ..Setup::default()
         },
     )?;
@@ -485,6 +543,36 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
         "  privateer ask {ship} \"...\"           or send it a request from anywhere in this folder"
     );
     Ok(())
+}
+
+fn liaison_instructions(ship: &str) -> String {
+    format!(
+        r#"
+## Liaison: the captain's optional contact
+
+You are an ordinary peer, with read (`inspect`), message and delegate (`spawn`)
+actions by default. Keep turns short and stay responsive. Route implementation
+to a ship that accepts ownership; do not implement, build, merge or deploy under
+this charter. A contact role grants no command over another ship.
+
+## Onboarding the captain
+
+1. Ask what the captain works on, their projects, priorities and preferences.
+2. Inspect `fleet.list` and propose useful ships with scopes and charters. Ask
+   which proposals they want before creating those ships with `ship.create`.
+3. New ships created by you inherit only your charter's actions. Explain any
+   implementation authority they need and have the captain grant it explicitly;
+   never widen your own charter or claim a child has rights you do not hold.
+4. Ask the captain to add the chosen repositories with `privateer project add <git url>`.
+5. Explain the dashboard's inbox, direct messages and Board action, and the
+   direct `privateer start` path. The captain can talk to any ship directly.
+6. Keep the captain's lasting preferences in {ship}'s `ship` note, and the
+   onboarding progress in its `captain` note. Resume from those records.
+
+The captain may use a different ship first or skip this checklist. Do not claim
+onboarding happened until the conversation and runtime records support it.
+"#
+    )
 }
 
 fn print_mail(message: &Value) {
@@ -656,11 +744,44 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Bare `privateer`: get aboard. Inside a ship, make sure its dispatcher is
-/// running and talk to its first mate. Elsewhere, offer to make this folder a
-/// ship first; without a terminal to ask in (or `--yes`), print help.
-pub fn board(home: Option<PathBuf>, yes: bool) -> Result<()> {
+fn dashboard_binary() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let beside = std::env::current_exe()
+        .ok()?
+        .with_file_name("privateer-dashboard");
+    let candidates =
+        std::iter::once(beside).chain(std::env::var_os("PATH").into_iter().flat_map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|p| p.join("privateer-dashboard"))
+                .collect::<Vec<_>>()
+        }));
+    candidates.into_iter().find(|p| {
+        p.is_file()
+            && p.metadata()
+                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    })
+}
+fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(binary);
+    if let Some(home) = home {
+        command.arg("--home").arg(home);
+    }
+    Err(command.exec()).context("open the Privateer dashboard")
+}
+
+/// Bare `privateer` opens the installed dashboard. If it is unavailable,
+/// ensure this ship's dispatcher and talk to its first mate, offering to create
+/// the ship first when needed; without a terminal or `--yes`, print help.
+pub fn board(home: Option<PathBuf>, yes: bool, caller: Caller) -> Result<()> {
+    caller.require_operator("bare privateer")?;
     use std::io::{IsTerminal, Write};
+    let dashboard = dashboard_binary();
+    if home.is_none() {
+        if let Some(binary) = &dashboard {
+            return open_dashboard(binary, None);
+        }
+    }
     let home = match home {
         Some(home) => home,
         None => {
@@ -702,11 +823,17 @@ pub fn board(home: Option<PathBuf>, yes: bool) -> Result<()> {
         .context("this folder's ship is unknown; run `privateer init` here")?;
     drop(store);
     println!("Dispatcher: {}", crate::service::ensure(&home, &ship)?);
+    if let Some(binary) = dashboard {
+        return open_dashboard(&binary, Some(&home));
+    }
     start(&home, &[])
 }
 
 /// Run a human command. `home` is the discovered or given ship home.
-pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
+pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -> Result<()> {
+    if matches!(verb, "init" | "start" | "service" | "project") {
+        caller.require_operator(verb)?;
+    }
     if verb == "init" {
         let home = match home {
             Some(home) => home,
@@ -720,9 +847,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
     if verb == "start" {
         return start(&home, args);
     }
+    let mut store = Store::open_as(&home, caller)?;
     if verb == "ship" {
         let flags = flags(args, &["scope", "folder", "harness", "objective"])?;
-        let mut store = Store::open(&home)?;
         let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] | privateer ship retire NAME";
         let name = flags.positional.get(1).context(usage)?;
         match flags.positional.first().map(String::as_str) {
@@ -755,7 +882,6 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
         return Ok(());
     }
     if verb == "service" {
-        let store = Store::open(&home)?;
         let ship = crate::presence::folder_ship(&store)
             .context("this folder's ship is unknown; run `privateer init` here")?;
         drop(store);
@@ -768,7 +894,10 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
         println!("{report}");
         return Ok(());
     }
-    let mut store = Store::open(&home)?;
+    let address = match store.caller() {
+        Caller::Operator => "captain".to_owned(),
+        Caller::Agent { actor } => actor.clone(),
+    };
     let flags = flags(args, &[])?;
     let p = &flags.positional;
     match verb {
@@ -778,6 +907,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             println!("Home: {}", home.display());
             for ship in ships["ships"].as_array().into_iter().flatten() {
                 let name = ship["name"].as_str().unwrap_or("");
+                if matches!(store.caller(), Caller::Agent { .. }) && name != address {
+                    continue;
+                }
                 if ship["location"] == "here" {
                     let bearings = crate::context::bearings(&store, name)?;
                     print!("{}", bearings["text"].as_str().unwrap_or(""));
@@ -788,10 +920,15 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
                     println!("Ship {name}: behind peer {}", ship["location"]["peer"]);
                 }
             }
-            let captain = crate::dispatch(&mut store, "mail.inbox", json!({"address": "captain"}))?;
+            let inbox = crate::dispatch(&mut store, "mail.inbox", json!({"address": address}))?;
             println!(
-                "Captain's unread mail: {}   open requests: {}   undelivered mail: {}",
-                captain["messages"].as_array().map_or(0, Vec::len),
+                "{}'s unread mail: {}   open requests: {}   undelivered mail: {}",
+                if matches!(store.caller(), Caller::Operator) {
+                    "Captain"
+                } else {
+                    &address
+                },
+                inbox["messages"].as_array().map_or(0, Vec::len),
                 status["open_requests"],
                 status["undelivered_mail"]
             );
@@ -855,7 +992,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             let sent = crate::dispatch(
                 &mut store,
                 "mail.send",
-                json!({"from": "captain", "to": to, "kind": kind, "body": body}),
+                json!({"from": address, "to": to, "kind": kind, "body": body}),
             )?;
             let delivery = sent["delivery"]
                 .as_str()
@@ -874,11 +1011,11 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             let inbox = crate::dispatch(
                 &mut store,
                 "mail.inbox",
-                json!({"address": "captain", "all": all}),
+                json!({"address": address, "all": all}),
             )?;
             let messages = inbox["messages"].as_array().cloned().unwrap_or_default();
             if messages.is_empty() {
-                println!("No new mail, captain.");
+                println!("No new mail, {address}.");
             }
             for message in &messages {
                 print_mail(message);
@@ -888,7 +1025,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
                 crate::dispatch(
                     &mut store,
                     "mail.ack",
-                    json!({"address": "captain", "through_seq": last}),
+                    json!({"address": address, "through_seq": last}),
                 )?;
                 println!("\nAnswer with: privateer reply <id> \"...\"");
             }
@@ -905,7 +1042,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             crate::dispatch(
                 &mut store,
                 "mail.send",
-                json!({"from": "captain", "to": message["from"], "kind": kind,
+                json!({"from": address, "to": message["from"], "kind": kind,
                     "correlation": id, "body": body}),
             )?;
             println!("Sent {kind} to {}.", message["from"].as_str().unwrap_or(""));

@@ -150,6 +150,122 @@ fn empty_fleet_startup_creates_no_state() {
 }
 
 #[test]
+fn preset_contacts_are_inferred_only_when_unique_and_explicit_claims_still_validate() {
+    use privateer::dashboard::{model::Snapshot, ui::App};
+
+    fn contact(snapshot: Snapshot, expected: Option<&str>) {
+        assert!(snapshot.presentation_error.is_none());
+        let contacts: Vec<_> = snapshot
+            .ships
+            .iter()
+            .filter(|ship| ship.liaison)
+            .map(|ship| ship.id.as_str())
+            .collect();
+        assert_eq!(contacts, expected.into_iter().collect::<Vec<_>>());
+        let mut app = App {
+            snapshot,
+            ..App::default()
+        };
+        app.open_liaison();
+        assert_eq!(app.ship.as_deref(), expected);
+        if expected.is_none() {
+            assert!(app.notice.contains("No liaison configured"));
+        }
+        for id in ["alpha", "beta", "gamma"] {
+            if app.snapshot.ships.iter().any(|ship| ship.id == id) {
+                app.select_ship(Some(id.into()));
+                assert!(!app.binding_ambiguous());
+            }
+        }
+    }
+
+    let m = Machine::new();
+    let snapshot =
+        || serde_json::from_value::<Snapshot>(m.dashboard()["snapshot"].clone()).unwrap();
+    let mut configs = Vec::new();
+    for name in ["alpha", "beta"] {
+        let folder = m.root.join(name);
+        fs::create_dir(&folder).unwrap();
+        m.cli(
+            &folder,
+            &["init", "--ship", name, "--harness", "codex", "--liaison"],
+        );
+        let config = folder.join(".privateer/config.json");
+        configs.push((config.clone(), fs::read(config).unwrap()));
+        let observed = snapshot();
+        assert_eq!(
+            observed
+                .ships
+                .iter()
+                .filter(|ship| ship.live.as_ref().is_some_and(|live| live.liaison))
+                .count(),
+            configs.len()
+        );
+        contact(observed, if name == "alpha" { Some("alpha") } else { None });
+    }
+    m.ship("gamma");
+    contact(snapshot(), None);
+    let alpha = m.root.join("alpha/.privateer/dashboard.json");
+    let beta = m.root.join("beta/.privateer/dashboard.json");
+    for preferred in ["gamma", "alpha", "beta"] {
+        fs::write(
+            &alpha,
+            json!({"ships":[{"id":preferred,"name":preferred,"liaison":true}]}).to_string(),
+        )
+        .unwrap();
+        contact(snapshot(), Some(preferred));
+    }
+    fs::write(
+        &beta,
+        json!({"ships":[{"id":"alpha","name":"Alpha","liaison":true}]}).to_string(),
+    )
+    .unwrap();
+    let conflicted = snapshot();
+    assert!(
+        conflicted
+            .presentation_error
+            .as_ref()
+            .unwrap()
+            .contains("only one ship may be the liaison")
+    );
+    let mut app = App {
+        snapshot: conflicted,
+        ..App::default()
+    };
+    for id in ["alpha", "beta", "gamma"] {
+        app.select_ship(Some(id.into()));
+        assert!(app.binding_ambiguous());
+    }
+    let terminal = json!({"pane_id":"shared-pane","terminal_id":"shared-terminal"});
+    fs::write(
+        &alpha,
+        json!({"ships":[{"id":"alpha","name":"Alpha","terminals":[terminal]}]}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        &beta,
+        json!({"ships":[{"id":"beta","name":"Beta","terminals":[terminal]}]}).to_string(),
+    )
+    .unwrap();
+    let conflicted = snapshot();
+    assert!(
+        conflicted
+            .presentation_error
+            .as_ref()
+            .unwrap()
+            .contains("a pane can belong to only one ship")
+    );
+    app.update_snapshot(conflicted);
+    assert!(app.binding_ambiguous());
+    fs::remove_file(alpha).unwrap();
+    fs::remove_file(beta).unwrap();
+    contact(snapshot(), None);
+    for (path, bytes) in configs {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn fleet_uses_each_home_and_never_resurrects_a_missing_ship() {
     use std::os::fd::AsRawFd;
     let m = Machine::new();

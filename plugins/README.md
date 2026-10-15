@@ -320,8 +320,8 @@ Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `
 ## Attended native sessions
 
 `privateer start pi`, `privateer start pi-signed` and `privateer start omp`
-explicitly load the optional `attended/mail.ts` extension. Bare `privateer`
-does the same when that ship selects one of these harnesses. Native options
+explicitly load the optional `attended/mail.ts` extension. For bare `privateer`
+entry behavior, see [Getting aboard](../docs/architecture.md#getting-aboard). Native options
 follow `--`, for example `privateer start pi -- --model provider/model`.
 The selected CLI must be installed; signed Pi never falls back to ordinary Pi.
 Native credentials, provider routes and extension configuration stay unchanged.

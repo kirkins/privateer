@@ -11,7 +11,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const TABS: [&str; 4] = ["1 Bridge", "2 Assignments", "3 Terminals", "4 Logbook"];
 
@@ -32,6 +32,21 @@ pub struct MouseMap {
     details: Rect,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoardTarget {
+    pub ship: String,
+    pub home: PathBuf,
+}
+
+impl BoardTarget {
+    pub fn from_ship(ship: &super::model::Ship) -> Option<Self> {
+        Some(Self {
+            ship: ship.id.clone(),
+            home: std::fs::canonicalize(&ship.live.as_ref()?.home).ok()?,
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct App {
     pub inbox_open: bool,
@@ -42,6 +57,7 @@ pub struct App {
     pub composer: Option<Composer>,
     pub form: Option<super::forms::Form>,
     pub board_requested: bool,
+    pub pending_board: Option<BoardTarget>,
     pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
     pub herdr: Option<herdr::View>,
@@ -949,6 +965,10 @@ impl App {
             body = parts[1];
         }
         let mut lines = self.details();
+        if !self.notice.is_empty() {
+            lines.insert(0, Line::from(clean(&self.notice, 8192)));
+            lines.insert(1, Line::from(""));
+        }
         if self.snapshot.truncated {
             lines.push(Line::styled(
                 "Bounded snapshot; older records remain in the runtime.",

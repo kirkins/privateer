@@ -21,24 +21,37 @@ sidebar. Each ship has its own Bridge, Assignments, Terminals and Logbook views:
 cargo run --features dashboard --bin privateer-dashboard -- --demo
 ```
 
-Run without `--demo` to use the registered fleet and captain inbox. Click a ship,
-then its workspace tabs; `0` returns to Fleet overview. See the
-[dashboard guide](docs/dashboard.md) for boarding, ship management, live mail
-and Herdr boundaries.
+The dashboard reads your local fleet, aggregates the captain's real inbox, and
+can board a ship in Herdr, create or retire ships, and manage dispatchers. An
+empty fleet offers a liaison or another first ship in a dedicated folder.
+All changes go through Privateer commands. Demo mode stays sample-only.
+Click a ship, then its workspace tabs; `0` returns home, `i` opens the inbox,
+`m` messages, and `b` boards. Herdr uses only the injected or explicitly selected
+socket, with exact pane bindings. Injection of mail into agent panes is proposed
+but remains disabled pending a safe server-side occupant guard.
+See [dashboard setup and boundaries](docs/dashboard.md).
+
 
 ## Quick start
 
-A ship is a dedicated folder. Make one and go aboard with a single command:
+Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
+Herdr. With no current ship, first-run setup offers a dedicated ship folder.
 
 ```sh
-cargo install --locked --path .     # from this checkout; puts `privateer` in ~/.cargo/bin
-mkdir -p ~/ships/infra && cd ~/ships/infra
-privateer                           # first time: asks, makes the folder a ship, starts its background
-                                    # dispatcher, and opens its first mate in your installed harness
-privateer                           # every time after: straight to the first mate
+cargo install --locked --path . --features dashboard  # installs privateer + privateer-dashboard
+privateer                           # fleet dashboard and first-run setup
+cd ~/ships/liaison                   # after creating this ship in setup
+privateer start                     # talk to this ship's first mate directly
 ```
 
-The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. Scripts can use `privateer --yes` to skip the question.
+The dashboard uses an executable installed beside the runtime or on PATH.
+If it is missing, bare `privateer` keeps the legacy flow: in a ship folder it
+ensures the dispatcher and opens the harness; elsewhere it offers to initialize
+the current folder first (`--yes` skips that question). Without a configured
+Herdr socket, dashboard observation, inbox and setup remain available; creation
+shows a quoted `privateer --home HOME start` command for direct access.
+
+The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. In the legacy flow, scripts can use `privateer --yes` to skip the initialization question.
 
 For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable).
 
@@ -106,6 +119,6 @@ Native SSH handles authentication and host verification. The remote executable a
 
 SQLite transactions preserve local state and custody. Job supervisors own process groups, bound logs and deadlines, and use a host-wide capacity ledger. A busy navigator is not a lock on department work. Notification acknowledgments cover only the observed sequence, so newer facts remain pending.
 
-Charters govern this workflow under the operating-system account running Privateer. They are not an adversarial credential sandbox. Agents launched by Privateer run with an agent role that refuses operator commands (charter changes, approvals, peer and resource configuration) and binds actor names to their own identity; this guards against confused agents, not deliberate evasion. Model reasoning still comes from the chosen harness; this milestone has not established a fully autonomous multi-harness fleet. Read [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
+Charters govern this workflow under the operating-system account running Privateer. They are not an adversarial credential sandbox. See [Operators and agents](docs/architecture.md#operators-and-agents) for caller identity checks, operator restrictions and their limits. Model reasoning still comes from the chosen harness; this milestone has not established a fully autonomous multi-harness fleet. Read [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
 
 Privateer is inspired by First Mate's orchestration and Corsair's experiments, but starts with a new codebase rather than inheriting their shell runtime.

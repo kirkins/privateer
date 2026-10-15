@@ -186,7 +186,7 @@ fn receipts(
 
 /// Errors are fail-open for the captain's native prompt, without copying hook
 /// payloads, account information or message bodies into diagnostics.
-pub fn hook(home: Option<&Path>, event: &str) -> i32 {
+pub fn hook(home: Option<&Path>, event: &str, caller: Result<Caller>) -> i32 {
     let mut bytes = Vec::new();
     let result = std::io::stdin().take(65_537).read_to_end(&mut bytes);
     let output = (|| -> Result<Value> {
@@ -198,7 +198,7 @@ pub fn hook(home: Option<&Path>, event: &str) -> i32 {
         let Some(home) = home else {
             return Ok(json!({"continue":true}));
         };
-        handle(home, event, &input)
+        handle(home, event, &input, caller?)
     })();
     match output {
         Ok(output) => println!("{output}"),
@@ -213,7 +213,7 @@ pub fn hook(home: Option<&Path>, event: &str) -> i32 {
     0
 }
 
-fn handle(home: &Path, event: &str, input: &Value) -> Result<Value> {
+fn handle(home: &Path, event: &str, input: &Value, caller: Caller) -> Result<Value> {
     let empty = || json!({"continue":true});
     if std::env::var_os("PRIVATEER_JOB").is_some()
         || std::env::var("PRIVATEER_ATTENDED_HARNESS").as_deref() != Ok("cursor")
@@ -226,19 +226,12 @@ fn handle(home: &Path, event: &str, input: &Value) -> Result<Value> {
         holder.starts_with("start:") && holder.len() <= 200,
         "Cursor wrapper identity missing"
     );
-    let mut store = Store::open(home)?;
+    let mut store = Store::open_as(home, caller)?;
     let ship = crate::presence::folder_ship(&store).context("Cursor ship unknown")?;
-    let caller = Caller::resolve(
-        std::env::var("PRIVATEER_ROLE").ok().as_deref(),
-        std::env::var("PRIVATEER_ACTOR").ok().as_deref(),
-        None,
-        None,
-    )?;
     ensure!(
-        matches!(&caller,Caller::Agent { actor } if actor == &ship),
+        matches!(store.caller(),Caller::Agent { actor } if actor == &ship),
         "Cursor hook actor mismatch"
     );
-    store.set_caller(caller);
     let session = uuid(input, "conversation_id")?;
     let generation = uuid(input, "generation_id")?;
     ensure!(
