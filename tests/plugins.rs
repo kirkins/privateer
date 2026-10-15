@@ -773,7 +773,26 @@ fn cancellation_reaches_the_execed_harness_and_its_descendants() {
         fs::create_dir(&fakebin).unwrap();
         let ready = f.repo.join("ready.json");
         let fake = fakebin.join(harness);
-        fs::write(&fake, format!("#!/usr/bin/env python3\nimport json,os,time\nchild=os.fork()\nif child==0:\n    time.sleep(30)\nelse:\n    open({:?},'w').write(json.dumps([os.getpid(),child]))\n    time.sleep(30)\n", ready.display().to_string())).unwrap();
+        // Expose the file-creation/write window deterministically. Readiness
+        // means a complete PID record, not merely an existing file.
+        fs::write(
+            &fake,
+            format!(
+                r#"#!/usr/bin/env python3
+import json,os,time
+child=os.fork()
+if child==0:
+    time.sleep(30)
+else:
+    with open({:?},'w') as stream:
+        time.sleep(0.1)
+        stream.write(json.dumps([os.getpid(),child]))
+    time.sleep(30)
+"#,
+                ready.display().to_string()
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
         let start = Command::new(env!("CARGO_BIN_EXE_privateer"))
             .args([
@@ -796,14 +815,19 @@ fn cancellation_reaches_the_execed_harness_and_its_descendants() {
             String::from_utf8_lossy(&start.stderr)
         );
         let until = Instant::now() + Duration::from_secs(3);
-        while !ready.exists() && Instant::now() < until {
+        let pids = loop {
+            let pids = fs::read_to_string(&ready)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Vec<i32>>(&s).ok())
+                .filter(|pids| pids.len() == 2 && pids.iter().all(|pid| *pid > 1));
+            if pids.is_some() || Instant::now() >= until {
+                break pids;
+            }
             std::thread::sleep(Duration::from_millis(20));
-        }
-        let pids = fs::read_to_string(&ready)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<i32>>(&s).ok());
+        };
         privateer::dispatch(&mut f.store, "job.cancel", json!({"id":"native-cancel"})).unwrap();
-        let pids = pids.expect("fake native harness did not start");
+        let pids =
+            pids.unwrap_or_else(|| panic!("fake {harness} did not publish a complete PID record"));
         let until = Instant::now() + Duration::from_secs(3);
         for pid in pids {
             loop {
