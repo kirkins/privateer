@@ -257,6 +257,77 @@ fn ensure_lines(path: &Path, lines: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Add this optional adapter's hooks beside existing project hooks. No
+/// global Cursor config, credentials, provider route or trust store is changed.
+fn cursor_settings(folder: &Path, binary: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = folder.join(".cursor");
+    let path = dir.join("hooks.json");
+    for item in [&dir, &path] {
+        ensure!(
+            !item
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink()),
+            "Cursor hook configuration cannot be a symlink"
+        );
+    }
+    let mut settings: Value = match fs::read(&path) {
+        Ok(raw) => {
+            ensure!(raw.len() <= 65_536, "Cursor hooks configuration too large");
+            serde_json::from_slice(&raw)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            json!({"version":1,"hooks":{}})
+        }
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(settings["version"] == 1, "unsupported Cursor hooks version");
+    let hooks = settings
+        .as_object_mut()
+        .context("Cursor hooks must hold an object")?
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("Cursor hooks must be an object")?;
+    for event in ["sessionStart", "beforeSubmitPrompt", "stop", "sessionEnd"] {
+        let entries = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .context("Cursor hook entries must be a list")?;
+        let suffix = format!(" hook cursor {event}");
+        entries.retain(|e| !e["command"].as_str().is_some_and(|s| s.ends_with(&suffix)));
+        let command = format!(
+            "'{}'{suffix}",
+            binary.to_string_lossy().replace('\'', "'\\''")
+        );
+        let mut entry = json!({"type":"command","command":command,"timeout":30});
+        if event == "stop" {
+            entry["timeout"] = json!(28_800);
+            entry["loop_limit"] = Value::Null;
+        }
+        entries.push(entry);
+    }
+    fs::create_dir_all(&dir)?;
+    let temp = dir.join(format!(".privateer-hooks-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(&settings)?)?;
+        file.sync_all()?;
+        fs::rename(&temp, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Turn the current folder into a ship. Safe to run again: it updates the
 /// ship's settings and rewrites only files it generated.
 /// What to make a ship with; unset fields fall back to sensible defaults.
@@ -506,6 +577,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .arg(&harness)
             .arg(&binary)
             .arg("--standalone");
+    } else if harness == "cursor" {
+        cursor_settings(folder, &control)?;
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg(&harness)
+            .arg(&binary);
     }
     command
         .args(passthrough)

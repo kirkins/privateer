@@ -408,6 +408,28 @@ fn muse_msp_plans_exact_resume_and_runtime_roots_without_changing_native_default
 }
 
 #[test]
+fn claude_grants_the_privateer_cli_without_relying_on_workspace_trust() {
+    // A ship made by ship.create is never opened interactively, so Claude
+    // ignores its settings.json allow list. The grant must be on argv.
+    let mut f = Fixture::new();
+    let mut args = f.args(&example("claude"));
+    args["options"] = json!({"permission_mode":"acceptEdits"});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+    let argv: Vec<&str> = plan["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let exe = std::env::current_exe().unwrap();
+    let grant = format!("Bash({}:*)", exe.display());
+    let flag = argv.iter().position(|a| *a == "--allowedTools").unwrap();
+    assert_eq!(argv[flag + 1], grant);
+    // The grant must not be read as part of the prompt.
+    assert!(flag < argv.iter().position(|a| *a == "--").unwrap());
+}
+
+#[test]
 fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_identity() {
     let mut f = Fixture::new();
     let fakebin = f.base().join("bin");

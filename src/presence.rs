@@ -269,7 +269,16 @@ pub fn claude_hook(home: Option<&Path>, event: &str) -> i32 {
 fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
     // A supervised crew job may inherit this project's Claude settings and
     // the captain's environment. It has a brief, not an attended mailbox.
-    if std::env::var_os("PRIVATEER_JOB").is_some() {
+    if std::env::var_os("PRIVATEER_JOB").is_some()
+        || std::env::var("PRIVATEER_ATTENDED_HARNESS").as_deref() == Ok("cursor")
+    {
+        return Ok(0);
+    }
+    let input: Value = serde_json::from_str(payload).unwrap_or(json!({}));
+    // Cursor can import this project's Claude compatibility hooks even when
+    // started directly. Its native payload must never claim a Claude lease
+    // or consume Claude's presentation cursor behind the attended adapter.
+    if input.get("cursor_version").is_some() {
         return Ok(0);
     }
     let mut store = Store::open(home)?;
@@ -285,7 +294,6 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
     if let crate::store::Caller::Agent { actor } = store.caller() {
         ensure!(actor == &ship, "hook actor must be this folder's ship");
     }
-    let input: Value = serde_json::from_str(payload).unwrap_or(json!({}));
     let wrapped = std::env::var("PRIVATEER_PRESENCE_HOLDER").ok();
     let holder = wrapped.clone().unwrap_or_else(|| {
         format!(
