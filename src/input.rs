@@ -1,4 +1,5 @@
-//! Human-authored command arguments. Machine protocols continue to use JSON.
+//! Bounded, JSON-compatible human-authored YAML and JSON files.
+//! Machine protocols continue to use JSON.
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
@@ -15,7 +16,8 @@ const MAX_NODES: usize = 10_000;
 const MAX_DEPTH: usize = 64;
 const MAX_SCALAR_BYTES: usize = 1_048_576;
 
-pub(crate) fn read_file(path: &Path) -> Result<Value> {
+/// Read one object from a regular YAML/YML/JSON file using the CLI input limits.
+pub fn read_file(path: &Path) -> Result<Value> {
     let yaml = match path.extension().and_then(|ext| ext.to_str()) {
         Some("yaml" | "yml") => true,
         Some("json") => false,

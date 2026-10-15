@@ -323,12 +323,13 @@ def run(binary, runtime):
 
             def board_until(count, message):
                 def requested():
-                    if server.creates >= count:
-                        return True
-                    tui.keys(b"0jj\rb")
-                    return server.creates >= count
+                    if server.creates < count:
+                        tui.keys(b"0jj\rb")
+                    # tab.create precedes pane.send_input; wait for the child
+                    # before inspecting it or checking startup behavior.
+                    return len(server.children) >= count
                 tui.until(requested, message, timeout=25)
-                assert server.creates == count
+                assert server.creates == len(server.children) == count
 
             def finish(pane_number):
                 (root / f"release-w1:p{pane_number}").touch()

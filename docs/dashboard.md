@@ -197,14 +197,14 @@ contact in the demo and has no special authority. The demo also includes Apps,
 Infrastructure and an idle Research ship.
 
 Live fleet ships come from active registry entries, with scope and status read
-from their own homes. The optional private `<home>/dashboard.json` supplies
+from their own homes. The optional private `<home>/dashboard.yaml` supplies
 presentation names and exact terminal bindings. Fleet and single-home views also
 include observed owner/handoff identities. A registry
 entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
 
-One optional `liaison: true` ship in `dashboard.json` explicitly selects the
+One optional `liaison: true` ship in the presentation registry explicitly selects the
 contact badge and shortcut. If no explicit contact is configured, exactly one
 ship with the `init --liaison` preset supplies that contact. Multiple preset
 ships remain ordinary boardable fleet entries until an explicit contact is
@@ -213,11 +213,17 @@ claims still must agree across homes. Contact selection is presentation
 configuration, not a grant of authority or an implementation of the captain's
 runtime delivery policy.
 
-See [the example registry](../examples/dashboard.json). Its `id` must match the
-runtime's exact task-owner identity. Names, descriptions and terminal bindings
-are presentation configuration. The dashboard reads the file without creating
-or modifying it. It accepts at most 64 KiB, 200 configured ships and 32 terminal
-bindings per ship. Duplicate identities and a pane bound to multiple ships are
+Copy and edit [the example registry](../examples/dashboard.yaml) as
+`<home>/dashboard.yaml`. The `.yml` suffix and existing `dashboard.json` files
+are also supported; keep only one registry file in each home. Multiple files
+are rejected so an old configuration cannot silently shadow another. Each `id`
+must match the runtime's exact task-owner identity. Names, descriptions and
+terminal bindings are presentation configuration. The dashboard reads the file
+without creating or modifying it. All three suffixes use the
+[CLI input reader and limits](../README.md#general-runtime-and-optional-integrations),
+including duplicate-key and alias-expansion checks. The registry must be a
+regular file; symlinks are rejected. It accepts at most 200 configured ships and
+32 terminal bindings per ship. Duplicate identities and a pane bound to multiple ships are
 rejected. Missing configuration falls back to observed owners.
 Pane ownership and liaison uniqueness are also checked across assembled fleet
 homes, including manual claims against automatic presence bindings. Claims from
