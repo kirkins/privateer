@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
@@ -36,7 +38,7 @@ impl Ship {
         ship
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = support::command(BIN);
         command
             .args(args)
             .current_dir(&self.folder)
@@ -184,7 +186,7 @@ fn claude_hooks_deliver_mail_to_the_session_once_and_track_presence() {
 #[test]
 fn hooks_never_break_the_harness_outside_a_ship() {
     let ship = Ship::new();
-    let mut child = Command::new(BIN)
+    let mut child = support::command(BIN)
         .args(["hook", "claude", "Stop"])
         .current_dir(&ship.root)
         .env_remove("PRIVATEER_HOME")
@@ -410,7 +412,7 @@ fn failed_start_releases_presence() {
 
 #[test]
 fn attended_mail_extension_uses_real_mail_and_native_lifecycle_contracts() {
-    let output = Command::new("node")
+    let output = support::command("node")
         .arg("tests/attended-mail.mjs")
         .arg(BIN)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
