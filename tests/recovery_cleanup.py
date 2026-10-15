@@ -69,7 +69,7 @@ def main():
             evidence["rescue_cleanup"] = pilot.evidence["cleanup"]
         write_json(root / "evidence.json", evidence)
     print(json.dumps({"passed": evidence["passed"], "native_inference": False,
-                      "evidence": str(root / "evidence.json")}))
+                      "evidence": str(root / "evidence.json"), "error": evidence.get("error")}))
     return 0 if evidence["passed"] else 1
 
 

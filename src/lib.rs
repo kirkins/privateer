@@ -21,6 +21,7 @@ pub mod presence;
 pub mod project;
 pub mod service;
 pub mod store;
+pub mod workspace;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -61,6 +62,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
+        "workspace" => workspace::dispatch(store, command, args),
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
@@ -75,6 +77,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "wake" => activation::dispatch(store, command, args),
         "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
+            let mut args = args;
             let task = args
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -82,6 +85,41 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .to_owned();
             let charter = store.authorize(&task, "spawn")?;
             let owner = store.task(&task)?["owner"].clone();
+            // Plan against the task checkout; first-mate wakes have a durable
+            // wake row and keep their existing ship repository.
+            args.as_object_mut().unwrap().remove("_workspace_lease_id");
+            args.as_object_mut().unwrap().remove("_workspace_cwd");
+            use sha2::{Digest, Sha256};
+            let request_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&args)?));
+            if let Some(existing) = jobs::agent_replay(store, &args, &request_hash)? {
+                return Ok(existing);
+            }
+            let repo = std::fs::canonicalize(
+                charter["repo"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("charter repo missing"))?,
+            )?;
+            let selected = match args.get("cwd") {
+                Some(cwd) => std::fs::canonicalize(
+                    cwd.as_str()
+                        .ok_or_else(|| anyhow::anyhow!("cwd must be a directory path"))?,
+                )?,
+                None => repo.clone(),
+            };
+            let execution = workspace::execution(
+                store,
+                &task,
+                &repo,
+                &selected,
+                !workspace::is_wake(store, &args)?,
+                None,
+            )?;
+            if let Some(lease) = &execution.lease_id {
+                args["_workspace_lease_id"] = serde_json::json!(lease);
+            } else {
+                args["_workspace_cwd"] = serde_json::json!(execution.root);
+            }
+            drop(execution);
             let plan = plugins::dispatch(store, "plugin.command", args.clone())?;
             // The launched harness acts as the task owner, under the agent role.
             let mut job = serde_json::json!({
@@ -90,6 +128,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "cwd": plan["cwd"],
                 "cleanup_descendants": true,
                 "agent_actor": owner,
+                "agent_request_hash": request_hash,
                 // The harness mostly waits on its model; builds it runs go
                 // through job.start with heavy and wait_for_capacity.
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))
@@ -98,6 +137,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 if let Some(value) = args.get(key) {
                     job[key] = value.clone();
                 }
+            }
+            if let Some(lease) = args.get("_workspace_lease_id") {
+                job["workspace_lease_id"] = lease.clone();
             }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();

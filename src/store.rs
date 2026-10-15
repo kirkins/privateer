@@ -158,6 +158,7 @@ impl Store {
             caller: Caller::Operator,
         };
         crate::jobs::init(&store)?;
+        crate::workspace::init(&store)?;
         crate::peers::init(&store)?;
         crate::mail::init(&store)?;
         crate::activation::init(&store)?;

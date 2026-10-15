@@ -34,6 +34,8 @@ fn two_ship_fixture_recovers_without_duplicate_work_or_surviving_payloads() {
     for assertion in [
         "baseline_regression_fails",
         "accepted_task_has_one_owner",
+        "repair_uses_leased_workspace",
+        "source_checkout_unchanged",
         "crew_decision_answered",
         "payload_survives_dispatcher_interruption",
         "repair_finishes_while_dispatcher_is_down",
