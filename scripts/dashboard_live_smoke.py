@@ -447,6 +447,42 @@ def onboarding(binary, runtime):
             if tui:
                 tui.close()
             server.close()
+        replacement_root = root / "replacement"
+        replacement_root.mkdir()
+        replacement_env = dict(env, HOME=str(replacement_root), XDG_CONFIG_HOME=str(replacement_root / "config"),
+                               PRIVATEER_FLEET=str(replacement_root / "fleet.sqlite"), PRIVATEER_RESOURCE_HOME=str(replacement_root / "ledger"))
+        replacement_server = Herdr(replacement_root, replacement_env)
+        replacement_server.protocol = 19
+        replacement = None
+        try:
+            replacement = Tui(binary, replacement_env, ["--herdr-socket", str(replacement_server.path)])
+            replacement.until(lambda: "HERDR UNAVAILABLE" in replacement.screen(), "replacement scenario needs a failed Herdr observation")
+            original_folder = replacement_root / "original"
+            original_home = original_folder / ".privateer"
+            replacement.keys(b"\x15contact\t\x15" + str(original_folder).encode() + b"\t\t\x15liaison\r")
+            replacement.until(lambda: (original_home / "privateer.sqlite").is_file(), "original ship was not created")
+            replacement.until(lambda: "Bridge" in replacement.screen(), "original ship was not observed")
+            def replacement_command(home, arguments):
+                return subprocess.run([str(runtime), "--home", str(home), *arguments], cwd=replacement_root,
+                                      env=replacement_env, capture_output=True, check=True, timeout=10).stdout
+            replacement_command(original_home, ["ship", "retire", "contact"])
+            new_folder = replacement_root / "new-home"
+            new_home = new_folder / ".privateer"
+            replacement_command(new_home, ["init", "--ship", "contact", "--harness", "codex", "--liaison"])
+            members = json.loads(replacement_command(new_home, ["fleet.list", "--json", '{}']))["ships"]
+            assert len(members) == 1 and Path(members[0]["home"]) == new_home.resolve()
+            replacement_server.protocol = 20
+            replacement.until(lambda: "automatic Board cancelled" in replacement.screen(), "a replacement registry mapping did not cancel the pending Board", timeout=25)
+            replacement.until(lambda: "HERDR UNAVAILABLE" not in replacement.screen(), "replacement scenario did not reconnect", timeout=25)
+            replacement.drain(2.5)
+            assert replacement_server.creates == 0 and replacement_server.focuses == 0
+            assert not (replacement_root / "harness-started").exists()
+            assert not json.loads(replacement_command(new_home, ["ship.presence", "--json", '{"ship":"contact"}']))["attended"]
+            assert not replacement_server.errors, replacement_server.errors
+        finally:
+            if replacement:
+                replacement.close()
+            replacement_server.close()
         for original_role in ["ship", "liaison"]:
             occupied_root = root / f"occupied-{original_role}"
             occupied_root.mkdir()
@@ -494,7 +530,8 @@ def onboarding(binary, runtime):
                 plain.keys(b"\x15apps\t\t\t\x15" + role.encode() + b"\r")
                 plain_home = plain_root / "ships/apps/.privateer"
                 plain.until(lambda: (plain_home / "privateer.sqlite").is_file(), f"{role} first ship was not created")
-                command = "privateer --home " + shlex.quote(str(plain_home)) + " start"
+                canonical_home = plain_home.resolve(strict=True)
+                command = "privateer --home " + shlex.quote(str(canonical_home)) + " start"
                 def details():
                     return " ".join(" ".join(line.split("│")[-2] for line in plain.screen().splitlines()
                                              if line.count("│") >= 2).split())
@@ -503,7 +540,7 @@ def onboarding(binary, runtime):
                 plain.drain(2.2)
                 screen = details()
                 displayed = screen.split("run: ", 1)[1].split(" start", 1)[0] + " start"
-                assert shlex.split(displayed) == ["privateer", "--home", str(plain_home), "start"]
+                assert shlex.split(displayed) == ["privateer", "--home", str(canonical_home), "start"]
                 assert not (plain_root / "harness-started").exists(), "no-socket creation launched a session"
                 config = json.loads((plain_home / "config.json").read_text())
                 assert (config.get("preset") == "liaison") == (role == "liaison")
@@ -517,4 +554,4 @@ def onboarding(binary, runtime):
                 assert not (plain_root / "escaped").exists()
             finally:
                 plain.close()
-        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
+        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")

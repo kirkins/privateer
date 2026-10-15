@@ -85,6 +85,7 @@ pub fn initialize(
         cmd.arg("--liaison");
     }
     let report = String::from_utf8_lossy(&run(cmd)?).into_owned();
+    let home = std::fs::canonicalize(home)?;
     let dispatcher = String::from_utf8_lossy(&service(binary, &home, "start")?).into_owned();
     Ok(
         serde_json::json!({"ship":name,"home":home,"harness":harness,"liaison":liaison,"report":report,"dispatcher":dispatcher}),
