@@ -97,6 +97,25 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if let Some(existing) = jobs::agent_replay(store, &args, &request_hash)? {
                 return Ok(existing);
             }
+            // Crew default to their ship's first-mate harness and model, the
+            // route the captain chose, unless the charter pins a provider.
+            if args.get("manifest").is_none()
+                && charter.get("provider_plugin").is_none_or(Value::is_null)
+            {
+                let profile = owner
+                    .as_str()
+                    .and_then(|ship| {
+                        mail::dispatch(store, "ship.show", serde_json::json!({"name": ship})).ok()
+                    })
+                    .map(|ship| ship["first_mate"].clone())
+                    .filter(|profile| profile["manifest"].is_string());
+                if let Some(profile) = profile {
+                    args["manifest"] = profile["manifest"].clone();
+                    if args.get("options").is_none() && profile["options"].is_object() {
+                        args["options"] = profile["options"].clone();
+                    }
+                }
+            }
             let repo = std::fs::canonicalize(
                 charter["repo"]
                     .as_str()

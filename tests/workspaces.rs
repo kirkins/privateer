@@ -995,3 +995,45 @@ fn a_project_selector_routes_agent_planning_but_cannot_escape_or_retarget() {
     );
     assert!(f.ok("workspace.status", json!({"task_id":"two"})).is_null());
 }
+
+#[test]
+fn crew_default_to_their_first_mates_harness_and_model() {
+    let f = Fixture::new();
+    let adapter = f.root.join("adapter.py");
+    // The plan records the options it was given, inside the task checkout.
+    fs::write(&adapter,"import json,sys\nr=json.loads(sys.stdin.readline()); c=r['context']\nprint(json.dumps({'id':r['id'],'version':1,'ok':True,'result':{'argv':['/bin/sh','-c','printf %s \"$0\" > crew-options',json.dumps(r['options'],sort_keys=True)], 'cwd':c['repo'],'env_names':[]}}))\n").unwrap();
+    let manifest = f.root.join("manifest.json");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"fixture","executable":["/usr/bin/python3",adapter]})
+            .to_string(),
+    )
+    .unwrap();
+    f.ok(
+        "task.create",
+        json!({"id":"duty","charter_id":"mission","owner":"ship","title":"duty"}),
+    );
+    f.ok(
+        "ship.put",
+        json!({"name":"ship","first_mate":{"manifest":manifest,"duty_task":"duty","options":{"model":"chosen","provider":"route"}}}),
+    );
+    let crew = f.ok("agent.start", json!({"task_id":"one","id":"crew"}));
+    assert_eq!(f.wait("crew")["status"], "succeeded");
+    let cwd = Path::new(crew["cwd"].as_str().unwrap());
+    assert_ne!(cwd, f.repo.as_path());
+    assert_eq!(
+        fs::read_to_string(cwd.join("crew-options")).unwrap(),
+        r#"{"model": "chosen", "provider": "route"}"#
+    );
+    // Explicit options still win.
+    let other = f.ok(
+        "agent.start",
+        json!({"task_id":"two","id":"other","options":{"model":"other"}}),
+    );
+    assert_eq!(f.wait("other")["status"], "succeeded");
+    let cwd = Path::new(other["cwd"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(cwd.join("crew-options")).unwrap(),
+        r#"{"model": "other"}"#
+    );
+}
