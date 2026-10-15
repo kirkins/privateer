@@ -253,6 +253,12 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
         .into_iter()
         .find(|m| m.name == name)
         .with_context(|| format!("no active ship named {name} in the fleet"))?;
+    if let Some(expected) = args.get("expected_home").and_then(Value::as_str) {
+        ensure!(
+            member.home == Path::new(expected),
+            "ship home changed since selection; refresh before retiring"
+        );
+    }
     if let Caller::Agent { actor } = store.caller() {
         ensure!(
             &member.created_by == actor,
@@ -270,10 +276,14 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
     } else {
         "its folder was already gone".into()
     };
-    conn.execute(
-        "UPDATE ships SET retired_ms=?2 WHERE name=?1",
-        params![name, Store::now_ms()],
+    let changed = conn.execute(
+        "UPDATE ships SET retired_ms=?2 WHERE name=?1 AND home=?3 AND retired_ms IS NULL",
+        params![name, Store::now_ms(), member.home.to_string_lossy()],
     )?;
+    ensure!(
+        changed == 1,
+        "fleet entry changed during retirement; refresh before retrying"
+    );
     let peer = format!("fleet-{name}");
     for other in members(&conn)? {
         if !other.home.is_dir() {

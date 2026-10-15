@@ -46,6 +46,10 @@ impl Cursor {
         c.args(args)
             .current_dir(&self.folder)
             .env("HOME", self.root.join("user"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("PRIVATEER_SERVICE", "none")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH")
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"));
         c
@@ -487,6 +491,14 @@ fn crew_foreign_harness_and_stale_identity_cannot_claim_or_drain_the_mailbox() {
 #[test]
 fn cursor_start_preserves_existing_project_hooks_routes_and_native_arguments() {
     let c = Cursor::new();
+    // Hook tests need an active session; start must claim an unattended ship.
+    let left: Value = serde_json::from_str(&c.ok(&[
+        "ship.leave",
+        "--json",
+        &json!({"ship":c.ship(),"holder":HOLDER}).to_string(),
+    ]))
+    .unwrap();
+    assert_eq!(left["left"], true);
     fs::create_dir_all(c.folder.join(".cursor")).unwrap();
     let config = c.folder.join(".cursor/hooks.json");
     fs::write(&config,json!({"version":1,"extra":"keep","hooks":{"stop":[{"command":"custom-command","timeout":9}]}}).to_string()).unwrap();

@@ -1,6 +1,6 @@
 # Handoff: the dashboard as home, and onboarding
 
-Status: **steps 1–2 implemented; steps 3–7 pending**, written 14 October 2026. See [dashboard setup and boundaries](../dashboard.md) for current behavior. Read [conversation and activation](conversation-and-activation.md) for the overall design and [architecture](../architecture.md) for what exists. This document is self-contained enough to start from; where it names a command, that command exists today unless marked *new*.
+Status: **steps 1–4 implemented; steps 5–7 pending**, written 14 October 2026. See [dashboard setup and boundaries](../dashboard.md) for current behavior. Read [conversation and activation](conversation-and-activation.md) for the overall design and [architecture](../architecture.md) for what exists. This document is self-contained enough to start from; where it names a command, that command exists today unless marked *new*.
 
 ## Goal
 
@@ -27,15 +27,13 @@ Replace the placeholder with the real mailbox, aggregated across fleet homes: fo
 
 ### 3. Boarding a ship
 
-Give each ship a **Board** action:
-
-- If a live pane is already bound to the ship, focus it (existing `agent.focus` path).
-- Otherwise open one: create a Herdr tab in the ship's folder (`herdr tab create --cwd <folder> --label <ship>`, or the socket equivalent) and run `privateer start` in it. Check the installed Herdr API (`herdr api`, `herdr --skill`) for the exact way to launch a command or agent in the new pane; `herdr agent start` starts a supported agent in an existing pane.
-- Bind the new pane to the ship automatically instead of requiring hand-edited pane ids, and show presence from `ship.presence`.
+Implemented; see [Boarding and management](../dashboard.md#boarding-and-management)
+for the launch protocol, automatic bindings and navigation safety boundaries.
 
 ### 4. Ship management
 
-From the fleet home: **New ship** (a small form calling `ship.create`), **Retire** (with confirmation, calling `ship.retire`; say that the folder is kept), and **Dispatcher** status/start/stop via `privateer service`. Mutations go through Privateer commands, never direct database writes.
+Implemented; the forms and confirmation rules are documented under
+[Boarding and management](../dashboard.md#boarding-and-management).
 
 ### 5. Onboarding
 

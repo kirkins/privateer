@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the real demo TUI in an isolated PTY; no Herdr/fleet access."""
+"""Exercise demo and live TUIs in isolated PTYs with private fake Herdr/fleet state."""
 import argparse
 import errno
 import fcntl
@@ -17,7 +17,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/privateer-dashboard")
     args = parser.parse_args()
-    binary = str(Path(args.binary).resolve())
+    binary = Path(args.binary).resolve()
+    demo(str(binary))
+    from dashboard_live_smoke import run
+    run(binary, binary.with_name("privateer"))
+
+
+def demo(binary):
     gate_read, gate_write = os.pipe()
     pid, terminal = pty.fork()
     if pid == 0:

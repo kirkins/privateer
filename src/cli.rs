@@ -596,7 +596,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         .env("PRIVATEER_ATTENDED_HARNESS", &harness)
         .env("PRIVATEER_PRESENCE_HOLDER", &holder);
     // The child can invoke a startup hook immediately after spawn.
-    crate::presence::attend(&store, &ship, &holder, 90, Some(&harness))?;
+    crate::presence::claim(&store, &ship, &holder, 90, Some(&harness))?;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {

@@ -52,7 +52,7 @@ fn options() -> Result<Option<Options>> {
             "--no-herdr" => out.no_herdr = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: liaison; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only fleet view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, inference, or fleet updates. Live mail uses Privateer commands."
+                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: liaison; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nFleet observations are read-only. b: Board; n: New ship; x: Retire; d: Dispatcher.\nMail and management use Privateer commands. No input injection or model calls."
                 );
                 return Ok(None);
             }
@@ -81,6 +81,14 @@ struct Sample<T> {
     value: Result<T>,
     at: Instant,
     notice: Option<String>,
+}
+enum HerdrAction {
+    Focus(Focus),
+    Board {
+        home: PathBuf,
+        name: String,
+        observed: View,
+    },
 }
 struct Focus {
     observed: View,
@@ -143,9 +151,34 @@ fn mail_worker(
             };
             let mut sent = false;
             let completed_send = matches!(&action, Some(MailAction::Send(_)));
-            let notice=action.map(|a| match a {
-                MailAction::Read(mail)=>match mailbox.mark_read(&binary,&mail) {Ok(())=>"Marked read; earlier unseen mail remains unread.".into(),Err(e)=>format!("Acknowledgment failed: {e}")},
-                MailAction::Send(a)=>match privateer::dashboard::command::json(&binary,&a.home,&a.verb,&a.args) {Ok(_)=>{sent=true;"Message delivered to Privateer; the runtime records delivery and replies.".into()},Err(e)=>format!("Message command failed: {e}; draft retained with the same id for retry")}
+            let notice = action.map(|a| match a {
+                MailAction::Read(mail) => match mailbox.mark_read(&binary, &mail) {
+                    Ok(()) => "Marked read; earlier unseen mail remains unread.".into(),
+                    Err(e) => format!("Acknowledgment failed: {e}"),
+                },
+                MailAction::Send(a) => {
+                    let result = if a.verb == "service" {
+                        privateer::dashboard::command::service(
+                            &binary,
+                            &a.home,
+                            a.args["action"].as_str().unwrap_or(""),
+                        )
+                        .map(|v| json!({"report":String::from_utf8_lossy(&v)}))
+                    } else {
+                        privateer::dashboard::command::json(&binary, &a.home, &a.verb, &a.args)
+                    };
+                    match result {
+                        Ok(value) => {
+                            sent = true;
+                            format!(
+                                "{}: {}",
+                                a.verb,
+                                privateer::dashboard::model::clean(&value.to_string(), 1000)
+                            )
+                        }
+                        Err(e) => format!("{} failed: {e}; form/draft retained", a.verb),
+                    }
+                }
             });
             let errors = match fleet::read(&registry, fallback.as_deref()) {
                 Ok(snapshot) => {
@@ -171,12 +204,13 @@ fn mail_worker(
     (receive, actions)
 }
 
-fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<Focus>) {
+fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrAction>) {
     let (send, receive) = mpsc::sync_channel(1);
-    let (focus, commands) = mpsc::sync_channel::<Focus>(1);
+    let (focus, commands) = mpsc::sync_channel::<HerdrAction>(1);
     thread::spawn(move || {
         let mut delay = Duration::ZERO;
         let mut failures = 0_u32;
+        let mut launching = std::collections::BTreeMap::<PathBuf, (String, Instant)>::new();
         loop {
             let action = match commands.recv_timeout(delay) {
                 Ok(action) => Some(action),
@@ -186,12 +220,55 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<Focus>) {
             let mut notice = None;
             let value = (|| {
                 let mut client = Client::connect(&path)?;
+                let binary = privateer::dashboard::command::binary()?;
+                launching.retain(|home, (name, deadline)| {
+                    Instant::now() < *deadline
+                        && !privateer::dashboard::command::json(
+                            &binary,
+                            home,
+                            "ship.presence",
+                            &json!({"ship":name}),
+                        )
+                        .is_ok_and(|presence| presence["attended"] == true)
+                });
                 if let Some(action) = action {
-                    notice = Some(match client.focus(&action.observed, &action.pane) {
-                        Ok(()) => {
-                            "Opened agent terminal in Herdr; use Herdr navigation to return.".into()
-                        }
-                        Err(error) => format!("Terminal was not opened: {error}"),
+                    let result = match action {
+                        HerdrAction::Focus(action) => client.focus(&action.observed, &action.pane),
+                        HerdrAction::Board {
+                            home,
+                            name,
+                            observed,
+                        } => (|| -> Result<()> {
+                            privateer::dashboard::command::existing_home(&home)?;
+                            let presence = privateer::dashboard::command::json(
+                                &binary,
+                                &home,
+                                "ship.presence",
+                                &json!({"ship":name}),
+                            )?;
+                            if presence["attended"] == true {
+                                launching.remove(&home);
+                            }
+                            ensure!(
+                                presence["attended"] != true,
+                                "a session is already aboard; refresh its binding or reach it directly"
+                            );
+                            ensure!(
+                                !launching.contains_key(&home),
+                                "launch already submitted; wait for startup before retrying"
+                            );
+                            let folder = home.parent().context("ship folder")?;
+                            launching.insert(
+                                home.clone(),
+                                (name.clone(), Instant::now() + Duration::from_secs(15)),
+                            );
+                            client.board(&observed, folder, &name, &binary, &home)?;
+                            Ok(())
+                        })(),
+                    };
+                    notice = Some(match result {
+                        Ok(()) => "Boarding in Herdr; use Herdr navigation to return.".into(),
+                        Err(e) => format!("Board action failed: {e}"),
                     });
                 }
                 client.snapshot()
@@ -219,6 +296,56 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<Focus>) {
         }
     });
     (receive, focus)
+}
+
+fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
+    if app.demo {
+        app.notice = "Demo only; no ship launched.".into();
+        return;
+    }
+    let (Some(view), Some(sender)) = (&app.herdr, sender) else {
+        app.notice = "Board needs an explicitly configured Herdr connection.".into();
+        return;
+    };
+    if app.herdr_error.is_some()
+        || app.herdr_age.is_none_or(|age| age >= 10)
+        || app.selection_invalidated
+    {
+        app.notice = "Refresh Herdr and select the ship again.".into();
+        return;
+    }
+    if app.binding_ambiguous() {
+        app.notice =
+            "Pane is bound to more than one ship; resolve the exact bindings before boarding."
+                .into();
+        return;
+    }
+    let action = if let Some(pane) = app.scoped_panes().first() {
+        Some(HerdrAction::Focus(Focus {
+            observed: view.clone(),
+            pane: (*pane).clone(),
+        }))
+    } else {
+        app.snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == app.ship.as_ref())
+            .and_then(|s| {
+                s.live
+                    .as_ref()
+                    .filter(|l| l.error.is_none())
+                    .map(|l| HerdrAction::Board {
+                        home: l.home.clone(),
+                        name: s.id.clone(),
+                        observed: view.clone(),
+                    })
+            })
+    };
+    app.notice = if action.is_some_and(|a| sender.try_send(a).is_ok()) {
+        "Checking ship and terminal before boarding…".into()
+    } else {
+        "Board action unavailable or already pending.".into()
+    };
 }
 
 fn run(opts: Options) -> Result<()> {
@@ -313,6 +440,7 @@ fn run(opts: Options) -> Result<()> {
                     }
                     if update.sent {
                         app.composer = None;
+                        app.form = None;
                     }
                     redraw = true;
                 }
@@ -337,6 +465,10 @@ fn run(opts: Options) -> Result<()> {
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
             if opts.demo {
                 app.herdr_age = Some(0);
+            }
+            if app.board_requested {
+                app.board_requested = false;
+                request_board(&mut app, herdr.as_ref().map(|(_, sender)| sender));
             }
             if let Some(action) = app.action.take() {
                 if let Some((_, sender)) = &mailbox {
@@ -373,6 +505,20 @@ fn run(opts: Options) -> Result<()> {
                     continue;
                 }
                 redraw = true;
+                if app.form.is_some() {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        app.edit_form(key.code);
+                    }
+                    continue;
+                }
                 if app.composer.is_some() {
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -396,6 +542,14 @@ fn run(opts: Options) -> Result<()> {
                     KeyCode::Char('i') => app.open_inbox(),
                     KeyCode::Char('l') => app.open_liaison(),
                     KeyCode::Char('m') => app.compose(),
+                    KeyCode::Char('b') if app.ship.is_some() => app.board_requested = true,
+                    KeyCode::Char('n') => app.manage(privateer::dashboard::forms::Kind::New),
+                    KeyCode::Char('x') if app.ship.is_some() => {
+                        app.manage(privateer::dashboard::forms::Kind::Retire)
+                    }
+                    KeyCode::Char('d') if app.ship.is_some() => {
+                        app.manage(privateer::dashboard::forms::Kind::Dispatcher)
+                    }
                     KeyCode::Char('r') if app.inbox_open => app.reply(),
                     KeyCode::Enter if app.inbox_open => {
                         if let (Some(mail), Some((_, sender))) =
@@ -445,10 +599,10 @@ fn run(opts: Options) -> Result<()> {
                             {
                                 if let Some(pane) = app.selected_pane() {
                                     app.notice = if sender
-                                        .try_send(Focus {
+                                        .try_send(HerdrAction::Focus(Focus {
                                             observed: view.clone(),
                                             pane: pane.clone(),
-                                        })
+                                        }))
                                         .is_ok()
                                     {
                                         "Checking terminal identity before opening…".into()

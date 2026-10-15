@@ -1,4 +1,5 @@
 #![cfg(feature = "dashboard")]
+mod support;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -17,9 +18,10 @@ impl Machine {
         Self { _temp: temp, root }
     }
     fn command(&self, binary: &str, folder: &Path) -> Command {
-        let mut c = Command::new(binary);
+        let mut c = support::command(binary);
         c.current_dir(folder)
             .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env("PRIVATEER_SERVICE", "none")
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
@@ -49,7 +51,7 @@ impl Machine {
     fn proxy(&self) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let proxy = self.root.join("privateer-proxy");
-        fs::write(&proxy,format!("#!/bin/sh\nexport HOME='{}' PRIVATEER_FLEET='{}/fleet.sqlite' PRIVATEER_SERVICE=none PRIVATEER_RESOURCE_HOME='{}/ledger'\nunset PRIVATEER_ROLE PRIVATEER_ACTOR PRIVATEER_HOME HERDR_ENV HERDR_SOCKET_PATH\nexec '{}' \"$@\"\n",self.root.display(),self.root.display(),self.root.display(),env!("CARGO_BIN_EXE_privateer"))).unwrap();
+        fs::write(&proxy,format!("#!/bin/sh\nexport HOME='{}' XDG_CONFIG_HOME='{}/config' PRIVATEER_FLEET='{}/fleet.sqlite' PRIVATEER_SERVICE=none PRIVATEER_RESOURCE_HOME='{}/ledger'\nunset PRIVATEER_ROLE PRIVATEER_ACTOR PRIVATEER_HOME PRIVATEER_JOB PRIVATEER_PRESENCE_HOLDER PRIVATEER_WAKE PRIVATEER_CONTROL_CLI PRIVATEER_ATTENDED_HARNESS HERDR_ENV HERDR_SOCKET_PATH\nexec '{}' \"$@\"\n",self.root.display(),self.root.display(),self.root.display(),self.root.display(),env!("CARGO_BIN_EXE_privateer"))).unwrap();
         fs::set_permissions(&proxy, fs::Permissions::from_mode(0o755)).unwrap();
         proxy
     }
@@ -552,6 +554,71 @@ fn bounded_mailbox_admits_unread_mail_and_retains_evicted_read_markers() {
 }
 
 #[test]
+fn bounded_mailbox_keeps_kind_priority_across_homes_and_failed_refreshes() {
+    use privateer::dashboard::{command, fleet, mailbox::Mailbox};
+    let m = Machine::new();
+    let homes: Vec<_> = (0..6).map(|i| m.ship(&format!("s{i}"))).collect();
+    let proxy = m.proxy();
+    for (i, home) in homes.iter().take(5).enumerate() {
+        m.send_batch(home, (0..command::MAIL_PAGE_LIMIT).map(|n| {
+            json!({"id":format!("notice-{n}"),"from":format!("s{i}"),"to":"captain","kind":"notice","body":format!("Notice {n}")})
+        }).collect());
+    }
+    m.json(
+        &homes[5],
+        "mail.send",
+        json!({"id":"last-notice","from":"s5","to":"captain","kind":"notice","body":"Notice"}),
+    );
+    m.json(
+        &homes[5],
+        "mail.send",
+        json!({"id":"question","from":"captain","to":"s5","kind":"request","body":"Status?"}),
+    );
+    m.json(&homes[5], "mail.send", json!({"id":"reply","from":"s5","to":"captain","kind":"reply","correlation":"question","body":"Ready"}));
+    for kind in ["request", "decision"] {
+        m.json(
+            &homes[5],
+            "mail.send",
+            json!({"id":kind,"from":"s5","to":"captain","kind":kind,"body":"Needs attention"}),
+        );
+    }
+    let mut snapshot = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
+    let mut mailbox = Mailbox::default();
+    mailbox.refresh(&proxy, &snapshot, None);
+    assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
+    for failed in [false, true] {
+        if failed {
+            snapshot.ships[5].live.as_mut().unwrap().error = Some("offline".into());
+            mailbox.refresh(&proxy, &snapshot, None);
+            assert_eq!(mailbox.errors.len(), 1);
+        }
+        assert_eq!(mailbox.messages.len(), 1000);
+        assert_eq!(
+            mailbox
+                .messages
+                .iter()
+                .take(3)
+                .map(|m| m.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["decision", "request", "reply"]
+        );
+        for mail in mailbox.messages.iter().take(3) {
+            assert_eq!(mail.home.as_ref(), Some(&homes[5].join(".privateer")));
+            assert_eq!(mail.from, "s5");
+            assert!(!mail.acknowledged);
+        }
+        assert!(!mailbox.messages.iter().any(|m| m.id == "last-notice"));
+        for home in homes.iter().take(5) {
+            assert!(
+                mailbox.messages.iter().any(
+                    |m| m.id == "notice-0" && m.home.as_ref() == Some(&home.join(".privateer"))
+                )
+            );
+        }
+    }
+}
+
+#[test]
 fn failed_fleet_observations_retain_mail_show_errors_and_never_open_missing_homes() {
     use privateer::dashboard::{fleet, mailbox::Mailbox, ui::App};
     let m = Machine::new();
@@ -575,14 +642,16 @@ fn failed_fleet_observations_retain_mail_show_errors_and_never_open_missing_home
     let failed = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
     assert!(
         failed
-            .ships
-            .iter()
-            .all(|s| s.live.as_ref().unwrap().error.is_some())
+            .presentation_error
+            .as_ref()
+            .unwrap()
+            .contains("invalid dashboard.json")
     );
-    let must_not_run = m.root.join("must-not-run");
-    mailbox.refresh(&must_not_run, &failed, Some(&infra.join(".privateer")));
+    assert!(failed.ships[0].live.as_ref().unwrap().error.is_none());
+    assert!(failed.ships[1].live.as_ref().unwrap().error.is_some());
+    mailbox.refresh(&proxy, &failed, Some(&infra.join(".privateer")));
     assert_eq!(mailbox.messages.len(), 2);
-    assert_eq!(mailbox.errors.len(), 2);
+    assert_eq!(mailbox.errors.len(), 1);
     assert!(mailbox.errors.iter().all(|e| !e.contains("launch command")));
     assert!(!infra.join(".privateer").exists());
     let mut app = App {
@@ -1201,6 +1270,20 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     let config = |id: &str, pane: &str, terminal: &str, liaison: bool| json!({"ships":[{"id":id,"name":"Shared display label","liaison":liaison,"terminals":[{"pane_id":pane,"terminal_id":terminal}]}]});
     let apps_config = apps.join(".privateer/dashboard.json");
     let infra_config = infra.join(".privateer/dashboard.json");
+    let herdr = View::demo();
+    m.json(
+        &apps,
+        "ship.attend",
+        json!({"ship":"apps","holder":"automatic","ttl_secs":3600}),
+    );
+    let binding = json!({"socket":"/isolated/socket","socket_identity":herdr.socket_identity,"pane":herdr.panes[1]});
+    rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE presence SET binding=?1 WHERE ship='apps'",
+            [binding.to_string()],
+        )
+        .unwrap();
     fs::write(
         &apps_config,
         config("apps", "demo:apps", "demo-terminal-apps", true).to_string(),
@@ -1248,7 +1331,7 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     );
     let mut app = App {
         snapshot: fleet::read(&registry, None).unwrap(),
-        herdr: Some(View::demo()),
+        herdr: Some(herdr),
         ..App::default()
     };
     app.open_liaison();
@@ -1301,10 +1384,24 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
             app.snapshot
                 .ships
                 .iter()
-                .all(|ship| !ship.liaison && ship.terminals.is_empty())
+                .all(|ship| !ship.liaison && ship.terminals.len() == 1)
+        );
+        assert_eq!(
+            serde_json::to_value(
+                app.snapshot.ships[0]
+                    .live
+                    .as_ref()
+                    .unwrap()
+                    .binding
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap(),
+            binding
         );
         for id in ["apps", "infra"] {
             app.select_ship(Some(id.into()));
+            assert!(app.binding_ambiguous());
             for tab in [0, 2] {
                 app.select_tab(tab);
                 assert!(app.scoped_panes().is_empty());
@@ -1312,6 +1409,17 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
                 assert!(screen(&mut app).contains("PRESENTATION UNAVAILABLE"));
             }
         }
+        let mut truncated = App {
+            snapshot: app.snapshot.clone(),
+            herdr: app.herdr.clone(),
+            ..App::default()
+        };
+        truncated.snapshot.ships.truncate(1);
+        truncated.snapshot.truncated = true;
+        truncated.select_ship(Some("apps".into()));
+        assert!(truncated.binding_ambiguous());
+        assert!(truncated.scoped_panes().is_empty());
+        assert!(truncated.selected_pane().is_none());
         app.select_ship(None);
         app.open_liaison();
         assert!(app.ship.is_none());
@@ -1352,6 +1460,125 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
 }
 
 #[test]
+fn foreign_and_invalid_local_claims_block_navigation_without_hiding_durable_work() {
+    use privateer::dashboard::{herdr::View, model::Snapshot, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    for (folder, owner) in [(&apps, "apps"), (&infra, "infra")] {
+        m.json(
+            folder,
+            "task.create",
+            json!({"id":"work","charter_id":owner,"owner":owner,"title":"Recorded work"}),
+        );
+        m.json(folder, "event.emit", json!({"id":"fact","task_id":"work","issue_key":"review","kind":"blocked","payload":{"summary":"Durable fact"}}));
+        m.job(folder, "work", "job");
+        m.json(
+            folder,
+            "mail.send",
+            json!({"from":owner,"to":"captain","kind":"notice","body":"Still visible"}),
+        );
+    }
+    m.json(
+        &apps,
+        "task.handoff",
+        json!({"id":"work","actor":"apps","target":"infra"}),
+    );
+    m.json(&apps, "task.accept", json!({"id":"work","actor":"infra"}));
+    let herdr = View::demo();
+    let pane = &herdr.panes[1];
+    let binding =
+        json!({"socket":"/isolated/socket","socket_identity":herdr.socket_identity,"pane":pane});
+    m.json(
+        &apps,
+        "ship.attend",
+        json!({"ship":"apps","holder":"automatic","ttl_secs":3600}),
+    );
+    rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE presence SET binding=?1 WHERE ship='apps'",
+            [binding.to_string()],
+        )
+        .unwrap();
+    let apps_config = apps.join(".privateer/dashboard.json");
+    let infra_config = infra.join(".privateer/dashboard.json");
+    let terminal = json!({"pane_id":pane.pane_id,"terminal_id":pane.terminal_id});
+    let own = json!({"id":"apps","name":"Apps","liaison":true});
+    let foreign = json!({"id":"infra","name":"Infra","terminals":[terminal]});
+    let conflicting = json!({"id":"apps","name":"Apps","liaison":true,"terminals":[terminal]});
+    let baseline = m.dashboard()["snapshot"].clone();
+    let mut overflow = vec![own.clone()];
+    overflow.extend((0..198).map(|i| json!({"id":format!("peer-{i}"),"name":"Peer"})));
+    overflow.push(json!({"id":"crew","name":"Crew","terminals":[terminal]}));
+    for (source, config, peer) in [
+        (&apps_config, json!({"ships":[own, foreign]}).to_string(), "infra"),
+        (&apps_config, json!({"ships":[own, {"id":"infra","name":"Infra","terminals":[{"pane_id":pane.pane_id,"terminal_id":"older-terminal"}]}]}).to_string(), "infra"),
+        (&apps_config, json!({"ships":[own, {"id":"crew","name":"Crew","terminals":[terminal]}]}).to_string(), "crew"),
+        (&apps_config, json!({"ships":[conflicting, foreign]}).to_string(), "infra"),
+        (&infra_config, json!({"ships":[conflicting, foreign]}).to_string(), "infra"),
+        (&apps_config, json!({"ships":[own, {"id":"infra","name":"","terminals":[terminal]}]}).to_string(), "infra"),
+        (&apps_config, "invalid JSON".into(), ""),
+        (&apps_config, json!({"ships":overflow}).to_string(), ""),
+    ] {
+        fs::write(&apps_config, json!({"ships":[own]}).to_string()).unwrap();
+        fs::write(&infra_config, "{\"ships\":[]}").unwrap();
+        fs::write(source, config).unwrap();
+        let result = m.dashboard();
+        let snapshot: Snapshot = serde_json::from_value(result["snapshot"].clone()).unwrap();
+        assert!(snapshot.presentation_error.is_some());
+        for section in ["tasks", "pending", "activity", "jobs", "custody"] {
+            assert_eq!(result["snapshot"][section], baseline[section], "{section}");
+        }
+        assert!(result["mail_errors"].as_array().unwrap().is_empty());
+        assert_eq!(result["mail"].as_array().unwrap().len(), 2);
+        if !peer.is_empty() {
+            assert!(snapshot.ships.iter().any(|ship| ship.id == peer && ship.terminals.iter().any(|b| b.pane_id == pane.pane_id)));
+        }
+        let mut app = App { snapshot, herdr: Some(herdr.clone()), ..App::default() };
+        for id in ["apps", peer].into_iter().filter(|id| !id.is_empty()) {
+            app.select_ship(Some(id.into()));
+            assert!(app.binding_ambiguous(), "{id}");
+            for tab in [0, 2] {
+                app.select_tab(tab);
+                assert!(app.scoped_panes().is_empty(), "{id}");
+                assert!(app.selected_pane().is_none(), "{id}");
+            }
+        }
+        app.select_ship(None);
+        app.open_liaison();
+        assert!(app.selected_pane().is_none());
+    }
+    for path in [&apps_config, &infra_config] {
+        fs::write(
+            path,
+            json!({"ships":[{"id":"apps","name":"Apps","liaison":true,"terminals":[terminal]}]})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let recovered = m.dashboard();
+    assert!(recovered["snapshot"]["presentation_error"].is_null());
+    let mut app = App {
+        snapshot: serde_json::from_value(recovered["snapshot"].clone()).unwrap(),
+        herdr: Some(herdr.clone()),
+        ..App::default()
+    };
+    app.open_liaison();
+    assert_eq!(app.selected_pane(), Some(pane));
+    assert_eq!(
+        app.snapshot
+            .ships
+            .iter()
+            .find(|s| s.id == "apps")
+            .unwrap()
+            .terminals
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn local_presentation_metadata_and_terminal_fields_still_require_valid_configuration() {
     use privateer::dashboard::model::Snapshot;
     let m = Machine::new();
@@ -1373,7 +1600,7 @@ fn local_presentation_metadata_and_terminal_fields_still_require_valid_configura
         assert!(error.contains(reason), "{error}");
         let fleet = m.dashboard();
         assert!(
-            fleet["snapshot"]["ships"][0]["live"]["error"]
+            fleet["snapshot"]["presentation_error"]
                 .as_str()
                 .unwrap()
                 .contains(reason)
@@ -1487,4 +1714,174 @@ fn mailbox_refresh_preserves_scroll_by_home_and_id_and_resets_after_ack_and_repl
     app.update_mail(Vec::new(), Vec::new());
     assert_eq!(app.selected, selected);
     assert_eq!(app.scroll, 12);
+}
+
+#[test]
+fn retirement_rejects_a_name_that_now_belongs_to_a_different_home() {
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let out = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &apps)
+        .args([
+            "ship.retire",
+            "--json",
+            &json!({"name":"apps","expected_home":m.root.join("other/.privateer")}).to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        m.json(&apps, "fleet.list", json!({}))["ships"][0]["retired_ms"],
+        Value::Null
+    );
+}
+
+#[test]
+fn management_forms_require_explicit_retirement_and_never_mutate_demo() {
+    use crossterm::event::KeyCode;
+    use privateer::dashboard::{fleet, forms::Kind, ui::App};
+    let m = Machine::new();
+    m.ship("apps");
+    let mut app = App {
+        snapshot: fleet::read(&m.root.join("fleet.sqlite"), None).unwrap(),
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    app.manage(Kind::Retire);
+    app.edit_form(KeyCode::Enter);
+    assert!(app.action.is_none());
+    for c in "apps".chars() {
+        app.edit_form(KeyCode::Char(c));
+    }
+    app.edit_form(KeyCode::Enter);
+    let action = app.action.take().unwrap();
+    assert_eq!(action.verb, "ship.retire");
+    assert_eq!(action.args["name"], "apps");
+    app.form = None;
+    app.demo = true;
+    app.manage(Kind::New);
+    assert!(app.form.is_none());
+    assert!(app.action.is_none());
+}
+
+#[test]
+fn retirement_cannot_mark_a_replacement_home_retired_after_dispatcher_stop() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    let m = Machine::new();
+    let old = m.ship("apps");
+    let systemctl = m.root.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &old)
+        .args(["service", "start"])
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .output()
+        .unwrap();
+    assert!(started.status.success());
+    let barrier = m.root.join("stop-entered");
+    let release = m.root.join("release-stop");
+    let blocked = m.root.join("blocked-systemctl");
+    fs::write(
+        &blocked,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n",
+            barrier.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut first = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &old)
+        .args([
+            "ship.retire",
+            "--json",
+            &json!({"name":"apps","expected_home":old.join(".privateer")}).to_string(),
+        ])
+        .env("PRIVATEER_SYSTEMCTL", &blocked)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !barrier.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !barrier.exists() {
+        fs::write(&release, "").unwrap();
+        let _ = first.wait();
+        panic!("retirement never reached isolated dispatcher stop");
+    }
+    // A second operator completes retirement and reuses the name while the
+    // first command is in its external dispatcher boundary.
+    let second = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &old)
+        .args(["ship.retire", "--json", "{\"name\":\"apps\"}"])
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .output()
+        .unwrap();
+    let replacement = m.root.join("replacement");
+    fs::create_dir(&replacement).unwrap();
+    let initialized = if second.status.success() {
+        m.command(env!("CARGO_BIN_EXE_privateer"), &replacement)
+            .args(["init", "--ship", "apps", "--harness", "codex"])
+            .output()
+            .unwrap()
+    } else {
+        second
+    };
+    fs::write(release, "").unwrap();
+    let finished = first.wait_with_output().unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    assert!(
+        !finished.status.success(),
+        "stale retirement must refuse: {}",
+        String::from_utf8_lossy(&finished.stdout)
+    );
+    assert!(String::from_utf8_lossy(&finished.stderr).contains("entry changed"));
+    let entry = m.json(&replacement, "fleet.list", json!({}))["ships"][0].clone();
+    assert_eq!(entry["retired_ms"], Value::Null);
+    assert_eq!(
+        entry["home"],
+        replacement.join(".privateer").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        m.json(&replacement, "charter.show", json!({"id":"apps"}))["active"],
+        true
+    );
+}
+
+#[test]
+fn primary_ship_actions_remain_visible_at_a_standard_terminal_width() {
+    use privateer::dashboard::{fleet, ui::App};
+    use ratatui::{Terminal, backend::TestBackend};
+    let m = Machine::new();
+    m.ship("apps");
+    let mut app = App {
+        snapshot: fleet::read(&m.root.join("fleet.sqlite"), None).unwrap(),
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let text = (0..34)
+        .map(|y| {
+            (0..120)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for action in ["[b Board]", "[n New ship]", "[x Retire]", "[d Dispatcher]"] {
+        assert!(text.contains(action), "{action} was clipped");
+    }
 }

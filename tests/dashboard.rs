@@ -796,3 +796,214 @@ fn ship_registry_keeps_idle_peers_and_rejects_ambiguous_terminal_ownership() {
     fs::write(&path, "x".repeat(65537)).unwrap();
     assert!(Snapshot::read(store.home()).is_err());
 }
+
+#[test]
+fn boarding_never_sends_launch_input_after_the_new_pane_changes() {
+    let (root, store) = fixture();
+    let socket = root.path().join("launch.sock");
+    let shell = json!({"pane_id":"w1:p9","terminal_id":"new-terminal","workspace_id":"w1","tab_id":"w1:t9","agent":null,"agent_status":"unknown"});
+    let empty = json!({"snapshot":{"version":"test","protocol":20,"panes":[]}});
+    let mut changed = shell.clone();
+    changed["terminal_id"] = json!("replaced-terminal");
+    let worker = server(
+        &socket,
+        vec![
+            empty.clone(),
+            empty,
+            json!({"root_pane":shell}),
+            json!({"snapshot":{"version":"test","protocol":20,"panes":[changed]}}),
+        ],
+    );
+    let mut client = Client::connect(&socket).unwrap();
+    let observed = client.snapshot().unwrap();
+    assert!(
+        client
+            .board(
+                &observed,
+                store.home().parent().unwrap(),
+                "apps",
+                Path::new(env!("CARGO_BIN_EXE_privateer")),
+                store.home()
+            )
+            .is_err()
+    );
+    let requests = worker.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "session.snapshot",
+            "session.snapshot",
+            "tab.create",
+            "session.snapshot"
+        ]
+    );
+}
+
+#[test]
+fn automatic_bindings_require_socket_terminal_location_and_pinned_session() {
+    use privateer::herdr::{Binding, View};
+    let view = View::demo();
+    let pane = view.panes[0].clone();
+    let mut binding = Binding {
+        socket: "/isolated/socket".into(),
+        socket_identity: view.socket_identity,
+        pane: pane.clone(),
+    };
+    assert!(binding.matches(&view, &pane));
+    let mut changed = pane.clone();
+    changed.terminal_id = "replacement".into();
+    assert!(!binding.matches(&view, &changed));
+    changed = pane.clone();
+    changed.tab_id = "different-tab".into();
+    assert!(!binding.matches(&view, &changed));
+    let mut other = view.clone();
+    other.socket_identity = (9, 9);
+    assert!(!binding.matches(&other, &pane));
+    binding.pane.agent_session = Some(json!({"value":"original"}));
+    changed = pane;
+    changed.agent_session = Some(json!({"value":"replacement"}));
+    assert!(!binding.matches(&view, &changed));
+}
+
+#[test]
+fn manual_selection_cannot_bypass_known_automatic_pane_identity() {
+    use privateer::dashboard::{
+        fleet::ShipState,
+        herdr::{Binding, View},
+        model::{Ship, TerminalBinding},
+    };
+    let mut original = View::demo();
+    original.panes[0].agent_session = Some(json!({"kind":"id","value":"original"}));
+    let bound = original.panes[0].clone();
+    let unrelated = original.panes[1].clone();
+    let ship = Ship {
+        id: "owner".into(),
+        name: "Owner".into(),
+        liaison: true,
+        terminals: [&bound, &unrelated]
+            .into_iter()
+            .map(|pane| TerminalBinding {
+                pane_id: pane.pane_id.clone(),
+                terminal_id: pane.terminal_id.clone(),
+            })
+            .chain(std::iter::once(TerminalBinding {
+                pane_id: "moved".into(),
+                terminal_id: bound.terminal_id.clone(),
+            }))
+            .collect(),
+        live: Some(ShipState {
+            binding: Some(Binding {
+                socket: "/isolated/socket".into(),
+                socket_identity: original.socket_identity,
+                pane: bound.clone(),
+            }),
+            ..ShipState::default()
+        }),
+        ..Ship::default()
+    };
+    let mut app = App {
+        snapshot: Snapshot {
+            ships: vec![ship],
+            ..Snapshot::default()
+        },
+        herdr: Some(original.clone()),
+        ..App::default()
+    };
+    for dimension in [
+        "socket",
+        "pane",
+        "terminal",
+        "workspace",
+        "tab",
+        "session",
+        "missing-session",
+    ] {
+        let mut changed = original.clone();
+        match dimension {
+            "socket" => changed.socket_identity = (9, 9),
+            "pane" => changed.panes[0].pane_id = "moved".into(),
+            "terminal" => changed.panes[0].terminal_id = "replacement".into(),
+            "workspace" => changed.panes[0].workspace_id = "replacement".into(),
+            "tab" => changed.panes[0].tab_id = "replacement".into(),
+            "session" => {
+                changed.panes[0].agent_session = Some(json!({"kind":"id","value":"replacement"}))
+            }
+            "missing-session" => changed.panes[0].agent_session = None,
+            _ => unreachable!(),
+        }
+        app.herdr = Some(changed);
+        app.select_ship(None);
+        app.open_liaison();
+        assert_eq!(app.ship.as_deref(), Some("owner"));
+        assert_eq!(app.scoped_panes(), vec![&unrelated], "{dimension}");
+        for tab in [0, 2] {
+            app.select_tab(tab);
+            assert_eq!(app.selected_pane(), Some(&unrelated), "{dimension}");
+        }
+        app.herdr = Some(original.clone());
+        app.select_ship(None);
+        app.open_liaison();
+        assert_eq!(app.selected_pane(), Some(&bound), "{dimension}");
+        assert_eq!(app.scoped_panes().len(), 2);
+    }
+    app.snapshot.ships.push(Ship {
+        id: "other".into(),
+        name: "Other".into(),
+        terminals: vec![TerminalBinding {
+            pane_id: bound.pane_id.clone(),
+            terminal_id: bound.terminal_id.clone(),
+        }],
+        ..Ship::default()
+    });
+    app.herdr.as_mut().unwrap().panes[0].agent_session =
+        Some(json!({"kind":"id","value":"replacement"}));
+    app.select_ship(Some("other".into()));
+    assert!(app.binding_ambiguous());
+    assert!(app.scoped_panes().is_empty());
+    assert!(app.selected_pane().is_none());
+}
+
+#[test]
+fn automatic_presence_bindings_cannot_give_one_live_pane_to_two_ships() {
+    use privateer::dashboard::{
+        fleet::ShipState,
+        herdr::{Binding, View},
+        model::Ship,
+    };
+    let view = View::demo();
+    let binding = Binding {
+        socket: "/isolated/socket".into(),
+        socket_identity: view.socket_identity,
+        pane: view.panes[0].clone(),
+    };
+    let ships = ["apps", "infra"]
+        .into_iter()
+        .map(|name| Ship {
+            id: name.into(),
+            name: name.into(),
+            live: Some(ShipState {
+                binding: Some(binding.clone()),
+                attended: true,
+                ..ShipState::default()
+            }),
+            ..Ship::default()
+        })
+        .collect();
+    let mut app = App {
+        snapshot: Snapshot {
+            ships,
+            ..Snapshot::default()
+        },
+        herdr: Some(view),
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    assert!(app.binding_ambiguous());
+    assert!(app.scoped_panes().is_empty());
+    assert!(render(&mut app, 132, 38).contains("Ambiguous pane ownership"));
+    app.select_ship(Some("infra".into()));
+    assert!(app.scoped_panes().is_empty());
+}
