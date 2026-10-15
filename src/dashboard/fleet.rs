@@ -1,6 +1,6 @@
 //! Bounded fleet observations. Never open a runtime Store: even fleet discovery
 //! must work before the first home exists, without initializing state.
-use super::model::{ROW_LIMIT, Ship, Snapshot, validate_ships};
+use super::model::{ROW_LIMIT, Ship, Snapshot, validate_navigation};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -162,7 +162,7 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     out.jobs.truncate(ROW_LIMIT);
     out.custody.truncate(ROW_LIMIT);
     out.include_observed_ships();
-    if let Err(error) = validate_ships(&out.ships) {
+    if let Err(error) = validate_navigation(&out.ships) {
         out.presentation_error = Some(error.to_string());
         for ship in &mut out.ships {
             ship.terminals.clear();

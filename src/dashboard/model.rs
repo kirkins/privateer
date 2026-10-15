@@ -91,18 +91,8 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
         registry.ships.len() <= 200,
         "dashboard registry exceeds 200 ships"
     );
-    validate_ships(&registry.ships)?;
-    Ok(registry.ships)
-}
-
-pub(super) fn validate_ships(ships: &[Ship]) -> Result<()> {
     let mut ids = BTreeSet::new();
-    let mut terminals = BTreeSet::new();
-    ensure!(
-        ships.iter().filter(|s| s.liaison).count() <= 1,
-        "only one ship may be the liaison"
-    );
-    for ship in ships {
+    for ship in &registry.ships {
         crate::store::identifier(&ship.id)?;
         ensure!(ids.insert(ship.id.clone()), "duplicate ship identity");
         ensure!(
@@ -121,11 +111,23 @@ pub(super) fn validate_ships(ships: &[Ship]) -> Result<()> {
                     && terminal.terminal_id.len() <= 160,
                 "invalid terminal binding"
             );
-            ensure!(
-                terminals.insert(terminal.pane_id.clone()),
-                "a pane can belong to only one ship"
-            );
         }
+    }
+    validate_navigation(&registry.ships)?;
+    Ok(registry.ships)
+}
+
+pub(super) fn validate_navigation(ships: &[Ship]) -> Result<()> {
+    ensure!(
+        ships.iter().filter(|s| s.liaison).count() <= 1,
+        "only one ship may be the liaison"
+    );
+    let mut terminals = BTreeSet::new();
+    for terminal in ships.iter().flat_map(|ship| &ship.terminals) {
+        ensure!(
+            terminals.insert(terminal.pane_id.clone()),
+            "a pane can belong to only one ship"
+        );
     }
     Ok(())
 }

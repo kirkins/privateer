@@ -194,6 +194,22 @@ impl App {
             }
         }
     }
+    pub fn update_mail(&mut self, messages: Vec<Mail>, errors: Vec<String>) {
+        let selected = self
+            .mail
+            .get(self.selected)
+            .map(|m| (m.home.clone(), m.id.clone()));
+        self.mail = messages;
+        self.mail_errors = errors;
+        if self.inbox_open {
+            let index = selected
+                .and_then(|(home, id)| self.mail.iter().position(|m| m.home == home && m.id == id));
+            self.selected = index.unwrap_or(0);
+            if index.is_none() {
+                self.scroll = 0;
+            }
+        }
+    }
     pub fn update_snapshot(&mut self, snapshot: Snapshot) {
         let task_id = self.selected_task().map(|t| (t.home.clone(), t.id.clone()));
         self.snapshot = snapshot;

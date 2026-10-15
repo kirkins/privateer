@@ -466,7 +466,7 @@ fn full_pages_of_large_valid_mail_can_be_loaded_read_and_answered() {
 
 #[test]
 fn bounded_mailbox_admits_unread_mail_and_retains_evicted_read_markers() {
-    use privateer::dashboard::{command, fleet, mailbox::Mailbox};
+    use privateer::dashboard::{command, fleet, mailbox::Mailbox, ui::App};
     let m = Machine::new();
     let homes: Vec<_> = (0..6).map(|i| m.ship(&format!("s{i}"))).collect();
     let proxy = m.proxy();
@@ -496,6 +496,18 @@ fn bounded_mailbox_admits_unread_mail_and_retains_evicted_read_markers() {
         .unwrap()
         .clone();
     mailbox.mark_read(&proxy, &read).unwrap();
+    let mut app = App {
+        snapshot: snapshot.clone(),
+        mail: mailbox.messages.clone(),
+        ..App::default()
+    };
+    app.open_inbox();
+    app.selected = app
+        .mail
+        .iter()
+        .position(|mail| mail.id == read.id && mail.home == read.home)
+        .unwrap();
+    app.scroll = 40;
     assert_eq!(
         m.json(&homes[5], "mail.inbox", json!({"address":"captain"}))["acknowledged_through"],
         0
@@ -513,6 +525,8 @@ fn bounded_mailbox_admits_unread_mail_and_retains_evicted_read_markers() {
     assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
     assert_eq!(mailbox.messages.len(), 1000);
     assert!(!mailbox.messages.iter().any(|m| m.id == decision["id"]));
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.scroll, 0);
     m.json(
         &homes[0],
         "mail.ack",
@@ -1198,7 +1212,34 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     )
     .unwrap();
     let registry = m.root.join("fleet.sqlite");
+    let scope = "é".repeat(300);
+    m.cli(
+        &apps,
+        &[
+            "init",
+            "--ship",
+            "apps",
+            "--harness",
+            "codex",
+            "--scope",
+            &scope,
+        ],
+    );
+    assert_eq!(
+        m.json(&apps, "ship.show", json!({"name":"apps"}))["scope"],
+        scope
+    );
     let baseline = m.dashboard()["snapshot"].clone();
+    assert!(baseline["presentation_error"].is_null());
+    assert_eq!(
+        baseline["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ship| ship["id"] == "apps")
+            .unwrap()["description"],
+        scope
+    );
     let mut app = App {
         snapshot: fleet::read(&registry, None).unwrap(),
         herdr: Some(View::demo()),
@@ -1207,6 +1248,7 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     app.open_liaison();
     assert_eq!(app.ship.as_deref(), Some("apps"));
     assert_eq!(app.selected_pane().unwrap().pane_id, "demo:apps");
+    assert!(screen(&mut app).contains(&"é".repeat(30)));
     app.select_ship(Some("infra".into()));
     assert_eq!(app.selected_pane().unwrap().pane_id, "demo:infrastructure");
     for (pane, terminal, liaison, reason) in [
@@ -1301,4 +1343,142 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     assert_eq!(app.ship.as_deref(), Some("infra"));
     assert_eq!(app.selected_pane().unwrap().pane_id, "demo:infrastructure");
     assert!(!screen(&mut app).contains("PRESENTATION UNAVAILABLE"));
+}
+
+#[test]
+fn local_presentation_metadata_and_terminal_fields_still_require_valid_configuration() {
+    use privateer::dashboard::model::Snapshot;
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let home = apps.join(".privateer");
+    let config = home.join("dashboard.json");
+    for (ship, reason) in [
+        (
+            json!({"id":"apps","name":"Apps","description":"é".repeat(300)}),
+            "invalid ship name/description length",
+        ),
+        (
+            json!({"id":"apps","name":"Apps","terminals":[{"pane_id":"pane","terminal_id":""}]}),
+            "invalid terminal binding",
+        ),
+    ] {
+        fs::write(&config, json!({"ships":[ship]}).to_string()).unwrap();
+        let error = Snapshot::read(&home).unwrap_err().to_string();
+        assert!(error.contains(reason), "{error}");
+        let fleet = m.dashboard();
+        assert!(
+            fleet["snapshot"]["ships"][0]["live"]["error"]
+                .as_str()
+                .unwrap()
+                .contains(reason)
+        );
+    }
+    fs::write(&config, json!({"ships":[{"id":"apps","name":"Apps","description":"Valid local description","terminals":[{"pane_id":"pane","terminal_id":"terminal"}]}]}).to_string()).unwrap();
+    assert_eq!(
+        Snapshot::read(&home)
+            .unwrap()
+            .ships
+            .iter()
+            .find(|ship| ship.id == "apps")
+            .unwrap()
+            .terminals
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn mailbox_refresh_preserves_scroll_by_home_and_id_and_resets_after_ack_and_reply() {
+    use privateer::dashboard::{fleet, mailbox::Mailbox, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    let proxy = m.proxy();
+    let apps_home = apps.join(".privateer");
+    let infra_home = infra.join(".privateer");
+    let notice_body = format!("{}LONG-NOTICE-END", "Full notice line\n".repeat(100));
+    m.json(
+        &apps,
+        "mail.send",
+        json!({"id":"same-id","from":"apps","to":"captain","kind":"notice","body":notice_body}),
+    );
+    m.json(&infra, "mail.send", json!({"id":"same-id","from":"infra","to":"captain","kind":"notice","body":"Replacement from infra"}));
+    let snapshot = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
+    let mut mailbox = Mailbox::default();
+    mailbox.refresh(&proxy, &snapshot, None);
+    assert!(mailbox.errors.is_empty());
+    let mut app = App {
+        snapshot: snapshot.clone(),
+        ..App::default()
+    };
+    app.open_inbox();
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.mail[app.selected].home.as_ref(), Some(&apps_home));
+    assert!(scroll_to(&mut app, "LONG-NOTICE-END"));
+    let offset = app.scroll;
+    assert!(offset > 0);
+    let mut reordered = mailbox.messages.clone();
+    reordered.reverse();
+    app.update_mail(reordered, Vec::new());
+    assert_eq!(app.selected, 1);
+    assert_eq!(app.scroll, offset);
+    assert_eq!(app.mail[app.selected].home.as_ref(), Some(&apps_home));
+    mailbox.refresh(&m.root.join("missing-binary"), &snapshot, None);
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.mail_errors.len(), 2);
+    assert_eq!(app.scroll, offset);
+    assert_eq!(app.mail[app.selected].home.as_ref(), Some(&apps_home));
+    mailbox.refresh(&proxy, &snapshot, None);
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.scroll, offset);
+    assert!(screen(&mut app).contains("LONG-NOTICE-END"));
+    mailbox.mark_read(&proxy, &app.mail[app.selected]).unwrap();
+    mailbox.refresh(&proxy, &snapshot, None);
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.mail[app.selected].id, "same-id");
+    assert_eq!(app.mail[app.selected].home.as_ref(), Some(&infra_home));
+    assert_eq!(app.scroll, 0);
+    assert!(screen(&mut app).contains("Replacement from infra"));
+    assert_eq!(
+        m.json(&infra, "mail.inbox", json!({"address":"captain"}))["acknowledged_through"],
+        0
+    );
+    app.scroll = 8;
+    mailbox.mark_read(&proxy, &app.mail[app.selected]).unwrap();
+    mailbox.refresh(&proxy, &snapshot, None);
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert!(app.mail.is_empty());
+    assert_eq!(app.scroll, 0);
+    assert!(screen(&mut app).contains("No messages for the captain"));
+    let request_body = format!("{}REQUEST-END", "Full request line\n".repeat(100));
+    m.json(
+        &infra,
+        "mail.send",
+        json!({"id":"request","from":"infra","to":"captain","kind":"request","body":request_body}),
+    );
+    m.json(&apps, "mail.send", json!({"id":"after-reply","from":"apps","to":"captain","kind":"notice","body":"After reply details"}));
+    mailbox.refresh(&proxy, &snapshot, None);
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.mail[app.selected].id, "request");
+    assert!(scroll_to(&mut app, "REQUEST-END"));
+    let offset = app.scroll;
+    mailbox.mark_read(&proxy, &app.mail[app.selected]).unwrap();
+    mailbox.refresh(&proxy, &snapshot, None);
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.mail[app.selected].id, "request");
+    assert!(app.mail[app.selected].acknowledged);
+    assert_eq!(app.scroll, offset);
+    m.json(&infra, "mail.send", json!({"from":"captain","to":"infra","kind":"reply","correlation":"request","body":"Proceed"}));
+    mailbox.refresh(&proxy, &snapshot, None);
+    app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    assert_eq!(app.mail[app.selected].id, "after-reply");
+    assert_eq!(app.scroll, 0);
+    assert!(screen(&mut app).contains("After reply details"));
+    app.select_ship(Some("apps".into()));
+    app.select_tab(1);
+    app.scroll = 12;
+    let selected = app.selected;
+    app.update_mail(Vec::new(), Vec::new());
+    assert_eq!(app.selected, selected);
+    assert_eq!(app.scroll, 12);
 }

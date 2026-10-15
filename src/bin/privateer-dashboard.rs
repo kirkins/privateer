@@ -304,19 +304,7 @@ fn run(opts: Options) -> Result<()> {
             }
             if let Some((updates, _)) = &mailbox {
                 while let Ok(update) = updates.try_recv() {
-                    let selected = app
-                        .mail
-                        .get(app.selected)
-                        .map(|m| (m.home.clone(), m.id.clone()));
-                    app.mail = update.messages;
-                    app.mail_errors = update.errors;
-                    if app.inbox_open {
-                        app.selected = selected
-                            .and_then(|(home, id)| {
-                                app.mail.iter().position(|m| m.home == home && m.id == id)
-                            })
-                            .unwrap_or(0);
-                    }
+                    app.update_mail(update.messages, update.errors);
                     if let Some(notice) = update.notice {
                         app.notice = notice;
                     }
