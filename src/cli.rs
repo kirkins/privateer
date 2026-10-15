@@ -427,14 +427,16 @@ fn text(positional: &[String], from: usize, usage: &str) -> Result<String> {
 /// `privateer start [HARNESS] [-- ARGS]`: talk to the ship's first mate.
 /// Launches the harness in the ship folder as the ship (agent role) and holds
 /// the ship's presence lease while it runs, so `serve` leaves the mail to
-/// this session. Works with any harness; Claude Code also gets mail at each
-/// prompt and turn end through the hooks `init` installs.
+/// this session. Claude uses hooks; Pi-family sessions receive the optional
+/// native mail extension explicitly, without changing native configuration.
 fn start(home: &Path, args: &[String]) -> Result<()> {
     let (ours, passthrough) = match args.iter().position(|a| a == "--") {
         Some(at) => (&args[..at], &args[at + 1..]),
         None => (args, &args[args.len()..]),
     };
     let mut store = Store::open(home)?;
+    let canonical_home = store.home().to_path_buf();
+    let home = canonical_home.as_path();
     let ship = crate::presence::folder_ship(&store)
         .context("this folder's ship is unknown; run `privateer init` here")?;
     let profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
@@ -457,29 +459,56 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         .map_or(harness.as_str(), |(binary, _)| binary)
         .to_owned();
     let folder = home.parent().context("ship folder")?;
-    let mut child = std::process::Command::new(&binary)
+    let holder = format!("start:{}", std::process::id());
+    let control = std::env::current_exe()?;
+    let mut command = std::process::Command::new(&binary);
+    if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        let extension = plugins.join("attended/mail.ts");
+        ensure!(
+            extension.is_file(),
+            "attended mail adapter missing from {}",
+            plugins.display()
+        );
+        command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg(&harness)
+            .arg(&binary)
+            .arg("-e")
+            .arg(extension);
+    }
+    command
         .args(passthrough)
         .current_dir(folder)
         .env("PRIVATEER_ROLE", "agent")
         .env("PRIVATEER_ACTOR", &ship)
-        .spawn()
-        .with_context(|| format!("cannot start {binary}; is it installed?"))?;
+        .env("PRIVATEER_HOME", home)
+        .env("PRIVATEER_CONTROL_CLI", control)
+        .env("PRIVATEER_ATTENDED_HARNESS", &harness)
+        .env("PRIVATEER_PRESENCE_HOLDER", &holder);
+    // The child can invoke a startup hook immediately after spawn.
+    crate::presence::attend(&store, &ship, &holder, 90, Some(&harness))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = crate::presence::leave(&store, &ship, &holder);
+            return Err(error).with_context(|| format!("cannot start {binary}; is it installed?"));
+        }
+    };
     // Ctrl-C belongs to the harness; this process must live to release
     // presence afterwards.
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
-    let holder = format!("start:{}", std::process::id());
-    crate::presence::attend(&store, &ship, &holder, 90, Some(&harness))?;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let heartbeat = {
-        let (stop, home, ship, holder, harness) = (
+        let (stop, home, ship, holder) = (
             stop.clone(),
             home.to_path_buf(),
             ship.clone(),
             holder.clone(),
-            harness.clone(),
         );
         std::thread::spawn(move || {
             let Ok(store) = Store::open(&home) else {
@@ -492,7 +521,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
-                let _ = crate::presence::attend(&store, &ship, &holder, 90, Some(&harness));
+                if !crate::presence::refresh(&store, &ship, &holder, 90).unwrap_or(false) {
+                    return;
+                }
             }
         })
     };

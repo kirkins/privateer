@@ -559,6 +559,36 @@ fn inbox(store: &Store, args: &Value) -> Result<Value> {
     Ok(json!({"address": address, "acknowledged_through": acknowledged, "messages": messages}))
 }
 
+/// A bounded notification snapshot, not a read/acknowledgement of message
+/// bodies. One native wake can point at an entire arrival burst.
+fn pending(store: &Store, args: &Value) -> Result<Value> {
+    let address = required(args, "address")?;
+    local_address(store, address)?;
+    let acknowledged = cursor(store, address)?;
+    let after = args
+        .get("after_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(acknowledged)
+        .max(0);
+    let (count, through, actionable): (i64,i64,i64) = store.connection().query_row(
+        "SELECT COUNT(*), COALESCE(MAX(seq), ?2), COALESCE(SUM(CASE WHEN kind <> 'notice' OR urgency <> 'low' THEN 1 ELSE 0 END),0)
+         FROM mail WHERE recipient=?1 AND seq>?2 AND COALESCE(delivery,'received')='received'",
+        params![address,after], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let mut statement=store.connection().prepare(
+        "SELECT seq,id,sender,kind,urgency,task_id FROM mail WHERE recipient=?1 AND seq>?2 AND seq<=?3
+         AND COALESCE(delivery,'received')='received'
+         ORDER BY seq DESC LIMIT 6")?;
+    let headers=statement.query_map(params![address,after,through], |r| Ok(json!({
+        "seq":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,"from":r.get::<_,String>(2)?,
+        "kind":r.get::<_,String>(3)?,"urgency":r.get::<_,String>(4)?,"task_id":r.get::<_,Option<String>>(5)?
+    })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(
+        json!({"address":address,"after_seq":after,"acknowledged_through":acknowledged,
+        "count":count,"through_seq":through,"actionable":actionable,"headers":headers}),
+    )
+}
+
 fn ack(store: &Store, args: &Value) -> Result<Value> {
     let address = required(args, "address")?;
     local_address(store, address)?;
@@ -689,6 +719,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "mail.send" => send(store, &args),
         "mail.inbox" => inbox(store, &args),
+        "mail.pending" => pending(store, &args),
         "mail.ack" => ack(store, &args),
         "mail.show" => show(store, &args),
         "mail.requests" => requests(store, &args),

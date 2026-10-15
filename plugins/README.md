@@ -243,6 +243,41 @@ private configuration.
 
 Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `danger-full-access`) and boolean `ephemeral`. They are omitted by default, preserving native user configuration. Choosing `workspace-write` adds only the local Privateer operational home with `--add-dir`, so the agent can write its durable task and message records as well as work in the repository. `ephemeral:true` suppresses native Codex session persistence while Privateer retains its job records. This does not change global harness preferences.
 
+## Attended native sessions
+
+`privateer start pi`, `privateer start pi-signed` and `privateer start omp`
+explicitly load the optional `attended/mail.ts` extension. Bare `privateer`
+does the same when that ship selects one of these harnesses. Native options
+follow `--`, for example `privateer start pi -- --model provider/model`.
+The selected CLI must be installed; signed Pi never falls back to ordinary Pi.
+Native credentials, provider routes and extension configuration stay unchanged.
+Starting the native CLI directly does not install this integration.
+
+One compact notification covers a mailbox arrival burst, with at most six
+headers and no bodies. Full mail stays in the durable inbox. Polls are bounded
+and single flight; busy sessions show a footer count instead of queuing turns.
+New actionable mail can wake an idle session; low-priority notices wait for
+the next normal prompt. Native custom-message receipts suppress duplicate
+notifications on resume. Notification is never acknowledgement: the mate must
+read, handle and acknowledge the mail itself. `/privateer-mail pause`, `resume`
+and `status` control automatic delivery. A native error or interruption pauses
+automatic wakes until an explicit resume or the next normal prompt.
+
+The launching wrapper registers presence before starting the CLI and refreshes
+only its own holder. A replacement session cannot be reclaimed by an old
+heartbeat. Claude hooks share the wrapper's holder when launched this way;
+raw Claude hooks retain their existing lifecycle. While presence is live,
+`serve` leaves work with the attended session.
+
+Real CLI/extension fixtures cover a thousand-message burst, busy/idle delivery,
+resume receipts, failed queues, native error boundaries, holder replacement and
+shutdown. Pi 1.1.0 has also passed a live isolated interactive file/reply/ack
+canary using existing OpenAI OAuth. These checks do not establish live OMP
+model availability or signed-Pi qualification on a machine without that wrapper.
+OMP 18.8.9 has loaded the extension and displayed a low-priority notice in its
+native terminal without a model turn. Its live model/tool path remains
+unqualified under the account limitation noted above.
+
 ## Gateway Pi adapter
 
 `gateway-pi` is an optional integration for people routing Pi through a private gateway. Copy `config.example.json` outside the source checkout, edit its endpoint/provider/model/Pi configuration path, and set mode `0600`. Both adapter config and Pi models file must be private and user-owned. Keep API keys in Pi's private native configuration, never in the gateway adapter config or command options.

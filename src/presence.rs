@@ -75,6 +75,20 @@ pub fn leave(store: &Store, ship: &str, holder: &str) -> Result<bool> {
     )? == 1)
 }
 
+/// A heartbeat may extend its own lease, never reclaim a replacement.
+pub fn refresh(store: &Store, ship: &str, holder: &str, ttl_secs: u64) -> Result<bool> {
+    local_ship(store, ship)?;
+    ensure!(
+        (1..=MAX_TTL_SECS).contains(&ttl_secs),
+        "ttl_secs must be 1..{MAX_TTL_SECS}"
+    );
+    let now = Store::now_ms();
+    Ok(store.connection().execute(
+        "UPDATE presence SET expires_ms=?3 WHERE ship=?1 AND holder=?2 AND expires_ms>?4",
+        params![ship, holder, now + ttl_secs as i64 * 1000, now],
+    )? == 1)
+}
+
 /// Whether a live session is aboard.
 pub fn attended(store: &Store, ship: &str) -> Result<bool> {
     Ok(store.connection().query_row(
@@ -226,14 +240,25 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
     let Some(ship) = folder_ship(&store) else {
         return Ok(0);
     };
+    if let crate::store::Caller::Agent { actor } = store.caller() {
+        ensure!(actor == &ship, "hook actor must be this folder's ship");
+    }
     let input: Value = serde_json::from_str(payload).unwrap_or(json!({}));
-    let holder = format!(
-        "claude:{}",
-        input["session_id"].as_str().unwrap_or("unknown")
-    );
+    let wrapped = std::env::var("PRIVATEER_PRESENCE_HOLDER").ok();
+    let holder = wrapped.clone().unwrap_or_else(|| {
+        format!(
+            "claude:{}",
+            input["session_id"].as_str().unwrap_or("unknown")
+        )
+    });
+    if wrapped.is_some() && !refresh(&store, &ship, &holder, 90)? {
+        return Ok(0);
+    }
     match event {
         "SessionStart" => {
-            attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            if wrapped.is_none() {
+                attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            }
             let bearings = crate::context::bearings(&store, &ship)?;
             print!(
                 "You are the first mate of the ship {ship}; the captain is aboard.\n{}",
@@ -246,7 +271,9 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
             Ok(0)
         }
         "UserPromptSubmit" => {
-            attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            if wrapped.is_none() {
+                attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            }
             let mail = present(&store, &ship)?;
             if !mail.is_empty() {
                 print!("{}", render(&ship, &mail));
@@ -254,7 +281,9 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
             Ok(0)
         }
         "Stop" => {
-            attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            if wrapped.is_none() {
+                attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            }
             let mail = present(&store, &ship)?;
             if mail.is_empty() {
                 return Ok(0);
@@ -264,7 +293,9 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
             Ok(2)
         }
         "SessionEnd" => {
-            leave(&store, &ship, &holder)?;
+            if wrapped.is_none() {
+                leave(&store, &ship, &holder)?;
+            }
             Ok(0)
         }
         _ => Ok(0),
