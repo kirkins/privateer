@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--harness", help="Optional expected manifest id")
     parser.add_argument("--options-json", help="Native adapter options (never credentials)")
     parser.add_argument("--check-resume", action="store_true", help="Verify exact session continuation and conversation recall")
+    parser.add_argument("--check-job", action="store_true", help="Require the tiny fixture test to run as a recorded light job")
     parser.add_argument("--model", help="Optional existing native model choice")
     parser.add_argument("--timeout-secs", type=int, default=240)
     args = parser.parse_args()
@@ -58,7 +59,8 @@ def main():
 
     try:
         (repo / "calc.py").write_text("def add(a, b):\n    return a - b\n")
-        (repo / "test_calc.py").write_text("import unittest\nfrom calc import add\nclass TestAddition(unittest.TestCase):\n    def test_positive_and_negative(self):\n        self.assertEqual(add(3, 2), 5)\n        self.assertEqual(add(-3, 2), -1)\n")
+        test_source = "import unittest\nfrom calc import add\nclass TestAddition(unittest.TestCase):\n    def test_positive_and_negative(self):\n        self.assertEqual(add(3, 2), 5)\n        self.assertEqual(add(-3, 2), -1)\n"
+        (repo / "test_calc.py").write_text(test_source)
         (repo / ".gitignore").write_text("__pycache__/\n")
         for command in (["git", "init", "-q", str(repo)],
                         ["git", "-C", str(repo), "add", "."],
@@ -66,6 +68,9 @@ def main():
             subprocess.run(command, check=True, capture_output=True)
         assert subprocess.run([sys.executable, "-m", "unittest", "-q"], cwd=repo, capture_output=True).returncode != 0
         call("init", {"resource_home": str(root / "ledger")})
+        # Create the isolated shared ledger before planning sandbox grants,
+        # as the human-facing `privateer init` command does for a real ship.
+        call("resource.status")
         binding = {"manifest": manifest}
         if args.config:
             config_path = pathlib.Path(args.config).expanduser()
@@ -75,14 +80,18 @@ def main():
         call("charter.put", {"id": "canary", "objective": "Repair and report an isolated arithmetic regression",
                              "repo": str(repo), "min_free_bytes": 1024, "job_timeout_secs": args.timeout_secs,
                              "provider_plugin": binding})
-        title = ("Fix add() in calc.py to pass test_calc.py. Run python3 -m unittest -q. "
-                 "Send a Privateer mail notice to reviewer using mail.send, "
-                 "id=native-result, from=applications, to=reviewer, kind=notice, task_id=repair. "
-                 "Do not mark task done; caller verifies independently. Work only in this repository "
-                 "and Privateer home. Do not install packages or change global settings.")
+        title = ("Fix calc.add; test with python3 -m unittest -q. Do not delegate, install or change settings. "
+                 "Send mail.send id=native-result,from=applications,to=reviewer,kind=notice,task_id=repair. "
+                 "Leave task open. Only use this repo and Privateer home. ")
+        if args.check_job:
+            started.append("native-test")
+            title += ('Run the test through job.start id=native-test,task_id=repair,heavy=false,'
+                      'command=["python3","-m","unittest","-q"]; wait for job.status. ')
         recall = secrets.token_hex(8)
         if args.check_resume:
             title = f"Remember token {recall} for our next turn; do not write it to a file. " + title
+        if len(title) > 512:
+            raise ValueError("qualification instructions exceed the runtime's title bound")
         for ship in ("applications", "reviewer"):
             call("ship.put", {"name": ship, "scope": "native canary"})
         call("task.create", {"id": "repair", "charter_id": "canary", "owner": "applications", "title": title})
@@ -97,8 +106,14 @@ def main():
         if args.check_resume and options.get("ephemeral"):
             raise ValueError("resume qualification needs native session persistence")
         job = run_job("repair", "native-repair", options)
+        assert (repo / "test_calc.py").read_text() == test_source, "Native agent changed the acceptance tests"
         result = subprocess.run([sys.executable, "-m", "unittest", "-q"], cwd=repo, capture_output=True, text=True)
         assert result.returncode == 0, "Independent tests did not pass"
+        if args.check_job:
+            recorded = call("job.status", {"id": "native-test"})
+            assert recorded["status"] == "succeeded" and recorded["exit_code"] == 0 and recorded["task_id"] == "repair", "Native agent did not finish the recorded fixture test job"
+            assert recorded["command"] == ["python3", "-m", "unittest", "-q"] and recorded["cwd"] == str(repo) and recorded["heavy"] is False, "Recorded fixture job did not match the requested test"
+            evidence["runtime_light_job_verified"] = True
         inbox = call("mail.inbox", {"address": "reviewer"})
         expected = {"id": "native-result", "from": "applications", "to": "reviewer",
                     "kind": "notice", "task_id": "repair"}

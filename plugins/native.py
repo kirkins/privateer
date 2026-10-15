@@ -215,6 +215,10 @@ def build(harness, request):
                 if not home.is_dir():
                     raise ValueError("operational home missing")
                 argv += ["--add-dir", str(home)]
+                for extra in request["context"]["control"].get("writable", []):
+                    extra = Path(extra).resolve()
+                    if extra != home and extra.is_dir():
+                        argv += ["--add-dir", str(extra)]
         if boolean(options, "force"):
             argv += ["--force"]
         if boolean(options, "trust"):
