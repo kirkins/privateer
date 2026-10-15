@@ -226,6 +226,44 @@ fn mouse_navigation_selects_visible_tabs_rows_and_details_without_opening_agents
 }
 
 #[test]
+fn every_tab_label_is_clickable_on_the_single_row_tab_bar() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        compact: true,
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    for (tab, label) in [
+        (0, "1 Bridge"),
+        (1, "2 Assignments"),
+        (2, "3 Terminals"),
+        (3, "4 Logbook"),
+    ] {
+        app.select_tab((tab + 1) % 4);
+        let screen = render(&mut app, 120, 34);
+        let (row, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(label))
+            .unwrap();
+        assert_eq!(row, 3, "tab labels sit on the single tab row");
+        let start = line.find(label).unwrap();
+        let start = line[..start].chars().count() as u16;
+        let end = start + label.chars().count() as u16 - 1;
+        for column in [start, end] {
+            app.select_tab((tab + 1) % 4);
+            app.handle_mouse(mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row as u16,
+            ));
+            assert_eq!(app.tab, tab, "click on {label:?} at column {column}");
+        }
+    }
+}
+
+#[test]
 fn mouse_selection_tracks_the_scrolled_list_instead_of_its_first_record() {
     let mut snapshot = Snapshot::demo();
     let template = snapshot.tasks[0].clone();
