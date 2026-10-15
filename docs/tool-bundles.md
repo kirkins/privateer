@@ -49,7 +49,7 @@ An explicit crew request is independent:
 
 `bundle.configure {"registry": ...}` validates before atomically recording the
 registry and immutable ref history in the home's SQLite metadata. Its audit
-contains only refs/count-independent status, not paths or file contents. This is
+contains only refs and status, not paths or file contents. This is
 an operator-only configuration command, not authority an agent can give itself.
 No registry is installed/enabled by shipping this code.
 
@@ -94,8 +94,8 @@ version instead. Removal revokes future selection. An already recorded agent-job
 replay returns that same job rather than planning another launch.
 
 Resource paths must be absolute, regular/user-owned, without symlink components
-or group/world-writable components (the sticky `/tmp` parent is allowed for
-fixtures). Trees are limited to 128 entries/2 MiB; registry/selection/plan sizes
+or group/world-writable components (root-owned sticky temporary-directory
+ancestors are allowed for fixtures). Trees are limited to 128 entries/2 MiB; registry/selection/plan sizes
 are bounded. Pins are rechecked before native execution; drift anywhere in the
 approved registry refuses new selection, including explicit empty selection.
 There is no per-run directory or credential material to leak or clean up.

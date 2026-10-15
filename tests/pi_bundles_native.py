@@ -63,7 +63,7 @@ class Native(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='privateer-pi-inventory-')
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        self.base = Path(self.temp.name).resolve()
         self.repo = self.base / 'repo'
         self.repo.mkdir()
         self.agent = self.base / 'agent'

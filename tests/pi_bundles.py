@@ -21,7 +21,7 @@ class Bundles(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='privateer-bundles-')
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        self.base = Path(self.temp.name).resolve()
         self.repo = self.base / 'repo'
         self.repo.mkdir()
         self.agent = self.base / 'agent'
@@ -102,6 +102,8 @@ class Bundles(unittest.TestCase):
 
     def test_unsafe_missing_symlink_and_writable_paths(self):
         root = Path(self.a['root'])
+        with self.assertRaises(ValueError):
+            bundles.safe_path(str(root / '..' / root.name), directory=True)
         for path in (root / 'client.py', root):
             mode = path.stat().st_mode
             path.chmod(0o777)
@@ -124,6 +126,17 @@ class Bundles(unittest.TestCase):
             self.a['sha256'] = bundles.tree_digest(path.parent)
             with self.assertRaises(ValueError):
                 self.plan()
+
+    def test_yaml_forms_cannot_silently_change_description_type(self):
+        path = Path(self.a['root']) / 'SKILL.md'
+        for description in ('true', '[]', '{name: value}', '&alias value', '|', '123', 'bad: mapping'):
+            path.write_text(f'---\nname: selected\ndescription: {description}\n---\n')
+            self.a['sha256'] = bundles.tree_digest(path.parent)
+            with self.subTest(description=description), self.assertRaises(ValueError):
+                self.plan()
+        path.write_text('---\nname: selected\ndescription: "Quoted, Unicode \\u03b1: supported."\n---\n')
+        self.a['sha256'] = bundles.tree_digest(path.parent)
+        self.plan()
 
     def test_tree_is_bounded(self):
         (Path(self.a['root']) / 'huge').write_bytes(b'x' * (bundles.MAX_BYTES + 1))

@@ -43,12 +43,14 @@ def strings(value, allowed, maximum=32):
 def safe_path(value, directory=False):
     require(isinstance(value, str) and len(value) <= 4096)
     path = Path(value)
-    require(path.is_absolute() and str(path) == value and not any(c in value for c in "\0\n\r"))
+    require(path.is_absolute() and str(path) == value and '..' not in path.parts
+            and not any(c in value for c in "\0\n\r"))
     # Reject symlinks at every component, not just at the final file.
     for part in [*reversed(path.parents), path]:
         info = part.lstat()
         require(not stat.S_ISLNK(info.st_mode) and (not info.st_mode & 0o022
-                or (part == Path('/tmp') and info.st_mode & stat.S_ISVTX)))
+                or (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX
+                    and info.st_uid == 0)))
     info = path.stat()
     require((stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
             and info.st_uid == os.geteuid())
