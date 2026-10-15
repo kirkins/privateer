@@ -1,0 +1,18 @@
+# Optional presentation registry: copy to <home>/dashboard.yaml and edit.
+# IDs must match runtime task-owner identities. This grants no authority.
+ships:
+  - id: navigator
+    name: Navigator
+    liaison: true
+    description: A familiar point of contact; an equal peer
+    terminals: []
+  - id: apps
+    name: Apps
+    description: Application work
+    terminals:
+      - pane_id: REPLACE_WITH_ACTUAL_PANE_ID
+        terminal_id: REPLACE_WITH_ACTUAL_TERMINAL_ID
+  - id: research
+    name: Research
+    description: Available for assignments
+    terminals: []

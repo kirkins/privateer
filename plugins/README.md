@@ -483,6 +483,10 @@ protocol fixture does not qualify an attended adapter.
 
 `gateway-pi` is an optional integration for people routing Pi through a private gateway. Copy `config.example.json` outside the source checkout, edit its endpoint/provider/model/Pi configuration path, and set mode `0600`. Both adapter config and Pi models file must be private and user-owned. Keep API keys in Pi's private native configuration, never in the gateway adapter config or command options.
 
+This example stays JSON because the adapter's private configuration reader and
+Pi's native `models.json` require JSON; CLI `--file` YAML support does not change
+those configuration formats. Plugin manifests also remain JSON.
+
 The adapter verifies that the chosen Pi file is the active `PI_CODING_AGENT_DIR/models.json` (or `~/.pi/agent/models.json`), its provider uses the exact configured endpoint, and the model exists under that provider. Its launcher repeats these checks immediately before invoking Pi with explicit provider and model. It has no fallback. Endpoint URLs cannot contain credentials, query strings or fragments. Configuration and exceptions are not returned in diagnostic output.
 
 Gateway Pi accepts the same Pi session/mode/effort options, while binding provider
