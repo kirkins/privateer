@@ -232,9 +232,7 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
             .ships
             .iter_mut()
             .filter(|ship| ship.live.as_ref().is_some_and(|live| live.liaison));
-        if let Some(candidate) = candidates.next()
-            && candidates.next().is_none()
-        {
+        if let (Some(candidate), None) = (candidates.next(), candidates.next()) {
             candidate.liaison = true;
         }
     }
