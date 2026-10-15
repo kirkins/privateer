@@ -58,8 +58,10 @@ privateer --home /absolute/private/home charter.put --file examples/charter.yaml
 
 Edit the [example charter](examples/charter.yaml) for your repository first.
 `--file` accepts `.yaml`, `.yml` and `.json`, containing one object with unique
-string keys and JSON-compatible values. Files and normalized JSON arguments are
-limited to 64 KiB, with at most 64 nesting levels, 10,000 nodes (including keys),
+string keys and JSON-compatible values. Plain YAML numbers must fit JSON integer
+or finite floating-point ranges; quote numeric-looking text or use `!!str` to
+keep it as a string. Files and normalized JSON arguments are limited to 64 KiB,
+with at most 64 nesting levels, 10,000 nodes (including keys),
 and 1 MiB of expanded scalar/key data. Parsing finishes before a home is opened.
 YAML supplies data: it does not read includes, run constructors or expand
 environment variables. Local custom tags are rejected; standard core tags and

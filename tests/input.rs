@@ -149,6 +149,161 @@ fn file_input_preserves_json_types_and_treats_annotations_as_inert_data() {
 }
 
 #[test]
+fn reused_yaml_anchor_names_keep_the_latest_scalar_sequence_and_mapping() {
+    let files = Files::new();
+    files.json("ship.put", json!({"name":"apps"}));
+    files.json("ship.put", json!({"name":"infra"}));
+    let path = files.file("anchors.yaml", "id: anchors\nfrom: apps\nto: infra\nkind: notice\nbody: aliases\npayload:\n  scalar:\n    one: &a inspect\n    before: *a\n    two: &a implement\n    three: &b cleanup\n    latest: *a\n    distinct: *b\n    keys: {*a : value}\n  sequence:\n    one: &a [inspect]\n    before: *a\n    two: &a [inspect, implement]\n    three: &b [inspect, cleanup]\n    latest: *a\n    distinct: *b\n  mapping:\n    one: &a {actions: [inspect]}\n    before: *a\n    two: &a {actions: [inspect, implement]}\n    three: &b {actions: [inspect, cleanup]}\n    latest: *a\n    distinct: *b\n");
+    let sent = files.read("mail.send", &path);
+    let stored = files.json("mail.show", json!({"id":"anchors"}));
+    for message in [sent, stored] {
+        for (shape, old, latest, distinct) in [
+            (
+                "scalar",
+                json!("inspect"),
+                json!("implement"),
+                json!("cleanup"),
+            ),
+            (
+                "sequence",
+                json!(["inspect"]),
+                json!(["inspect", "implement"]),
+                json!(["inspect", "cleanup"]),
+            ),
+            (
+                "mapping",
+                json!({"actions":["inspect"]}),
+                json!({"actions":["inspect", "implement"]}),
+                json!({"actions":["inspect", "cleanup"]}),
+            ),
+        ] {
+            assert_eq!(message["payload"][shape]["before"], old);
+            assert_eq!(message["payload"][shape]["latest"], latest);
+            assert_eq!(message["payload"][shape]["distinct"], distinct);
+        }
+        assert_eq!(
+            message["payload"]["scalar"]["keys"],
+            json!({"implement":"value"})
+        );
+    }
+    let repo = files.temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    for (id, anchors, actions) in [
+        (
+            "scalar",
+            "one: &a inspect\ntwo: &a implement\nthree: &b cleanup",
+            "[inspect, *a]",
+        ),
+        (
+            "sequence",
+            "one: &a [inspect]\ntwo: &a [inspect, implement]\nthree: &b [inspect, cleanup]",
+            "*a",
+        ),
+    ] {
+        let path = files.file("charter.yaml", format!("id: {id}\nrepo: {}\nobjective: correct permissions\n{anchors}\nactions: {actions}\n", json!(repo)));
+        assert_eq!(
+            files.read("charter.put", &path)["actions"],
+            json!(["inspect", "implement"])
+        );
+        assert_eq!(
+            files.json("charter.show", json!({"id":id}))["actions"],
+            json!(["inspect", "implement"])
+        );
+    }
+}
+
+#[test]
+fn yaml_numeric_overflow_is_rejected_for_values_and_keys_before_home_creation() {
+    let files = Files::new();
+    for literal in [
+        "1e999",
+        "+1e999",
+        "-1e999",
+        "1.0e999",
+        "+1.0e999",
+        "-1.0e999",
+        "18446744073709551616",
+        "+18446744073709551616",
+        "-9223372036854775809",
+        "340282366920938463463374607431768211456",
+        "0x100000000000000000000000000000000",
+        "+0x100000000000000000000000000000000",
+        "-0x100000000000000000000000000000000",
+        "0o2000000000000000000000",
+        "0b10000000000000000000000000000000000000000000000000000000000000000",
+    ] {
+        for document in [
+            format!("ship: {literal}\n"),
+            format!("{literal}: ignored\nship: safe\n"),
+            format!("data: &a {literal}\nship: *a\n"),
+        ] {
+            files.rejected("overflow.yaml", document, "JSON");
+        }
+    }
+    for document in [
+        "ship: !!float '1e999'\n",
+        "ship: !!int '0x100000000000000000000000000000000'\n",
+        "!!float '1e999': ignored\n",
+        "!!int '18446744073709551616': ignored\n",
+    ] {
+        files.rejected("tagged-overflow.yaml", document, "JSON");
+    }
+}
+
+#[test]
+fn quoted_numeric_text_and_explicit_strings_keep_their_values_and_keys() {
+    let files = Files::new();
+    files.json("ship.put", json!({"name":"apps"}));
+    files.json("ship.put", json!({"name":"infra"}));
+    for literal in [
+        "1e999",
+        "+1e999",
+        "-1e999",
+        "18446744073709551616",
+        "0x100000000000000000000000000000000",
+    ] {
+        for spelling in [
+            json!(literal).to_string(),
+            format!("'{literal}'"),
+            format!("!!str {literal}"),
+            format!("!<tag:yaml.org,2002:str> {literal}"),
+        ] {
+            let path = files.file("strings.yml", format!("from: apps\nto: infra\nkind: notice\nbody: strings\npayload:\n  value: &s {spelling}\n  alias: *s\n  keys: {{{spelling}: preserved}}\n"));
+            let sent = files.read("mail.send", &path);
+            assert_eq!(sent["payload"]["value"], literal);
+            assert_eq!(sent["payload"]["alias"], literal);
+            assert_eq!(sent["payload"]["keys"][literal], "preserved");
+        }
+    }
+    let path = files.file("core.yml", "from: apps\nto: infra\nkind: notice\nbody: core\npayload:\n  values: [True, FALSE, Null, ~, 0x10, -0x10, +0o10, 0b10, +42, -9223372036854775808, 1e2, .5, 1., -.5, 012]\n  tags: [!!str true, !!int '42', !!float '42', !!bool 'True', !!null null]\n");
+    let sent = files.read("mail.send", &path);
+    assert_eq!(
+        sent["payload"]["values"],
+        json!([
+            true,
+            false,
+            null,
+            null,
+            16,
+            -16,
+            8,
+            2,
+            42,
+            i64::MIN,
+            100.0,
+            0.5,
+            1.0,
+            -0.5,
+            12
+        ])
+    );
+    assert_eq!(
+        sent["payload"]["tags"],
+        json!(["true", 42, 42.0, true, null])
+    );
+}
+
+#[test]
 fn malformed_or_ambiguous_files_are_rejected_before_home_creation() {
     let files = Files::new();
     for (name, bytes, reason) in [
@@ -161,6 +316,16 @@ fn malformed_or_ambiguous_files_are_rejected_before_home_creation() {
         ),
         ("numeric-key.yaml", "1: value\n", "string object key"),
         ("boolean-key.yaml", "true: value\n", "string object key"),
+        (
+            "alias-key.yaml",
+            "data: &a 1\n? *a\n: value\n",
+            "string object key",
+        ),
+        (
+            "alias-duplicate.yaml",
+            "data: &a name\nname: first\n? *a\n: second\n",
+            "duplicate",
+        ),
         (
             "complex-key.yaml",
             "? [x, y]\n: value\n",
@@ -246,6 +411,7 @@ fn file_input_bounds_bytes_depth_nodes_keys_and_alias_expansion() {
         "scalar/key data exceeds 1 MiB",
     );
     files.rejected("recursive.yaml", "data: &data [*data]\n", "nesting");
+    files.rejected("collection-aliases.yaml", "a: &a [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\nc: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nd: [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]\n", "10000 nodes");
     files.rejected(
         "escaping.yaml",
         format!("data: |+\n{}", "\n".repeat(40_000)),

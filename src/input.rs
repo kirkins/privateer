@@ -8,6 +8,8 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
+mod yaml;
+
 const MAX_BYTES: usize = 65_536;
 const MAX_NODES: usize = 10_000;
 const MAX_DEPTH: usize = 64;
@@ -33,22 +35,18 @@ pub(crate) fn read_file(path: &Path) -> Result<Value> {
     let mut bytes = Vec::new();
     file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= MAX_BYTES, "argument file exceeds 64 KiB");
-    let mut budget = Budget {
-        nodes: MAX_NODES,
-        scalar_bytes: MAX_SCALAR_BYTES,
-    };
-    let seed = Node {
-        budget: &mut budget,
-        depth: 0,
-    };
+    let mut budget = Budget::new();
     let value = if yaml {
-        seed.deserialize(yaml_serde::Deserializer::from_slice(&bytes))
+        yaml::parse(&bytes, &mut budget)
             .map_err(|error| anyhow::anyhow!("invalid YAML argument file: {error}"))?
     } else {
         let mut parser = serde_json::Deserializer::from_slice(&bytes);
-        let value = seed
-            .deserialize(&mut parser)
-            .map_err(|error| anyhow::anyhow!("invalid JSON argument file: {error}"))?;
+        let value = Node {
+            budget: &mut budget,
+            depth: 0,
+        }
+        .deserialize(&mut parser)
+        .map_err(|error| anyhow::anyhow!("invalid JSON argument file: {error}"))?;
         parser.end()?;
         value
     };
@@ -62,8 +60,6 @@ pub(crate) fn read_file(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
-/// Charge every key, scalar and collection before constructing its value.
-/// YAML aliases therefore consume the same budget as expanded ordinary data.
 struct Node<'a> {
     budget: &'a mut Budget,
     depth: usize,
@@ -75,26 +71,34 @@ struct Budget {
 }
 
 impl Budget {
-    fn scalar<E: de::Error>(&mut self, bytes: usize) -> std::result::Result<(), E> {
+    fn new() -> Self {
+        Self {
+            nodes: MAX_NODES,
+            scalar_bytes: MAX_SCALAR_BYTES,
+        }
+    }
+
+    fn node(&mut self, depth: usize) -> Result<()> {
+        ensure!(depth < MAX_DEPTH, "argument nesting exceeds 64 levels");
+        self.nodes = self
+            .nodes
+            .checked_sub(1)
+            .context("arguments exceed 10000 nodes")?;
+        Ok(())
+    }
+
+    fn scalar(&mut self, bytes: usize) -> Result<()> {
         self.scalar_bytes = self
             .scalar_bytes
             .checked_sub(bytes)
-            .ok_or_else(|| E::custom("expanded scalar/key data exceeds 1 MiB"))?;
+            .context("expanded scalar/key data exceeds 1 MiB")?;
         Ok(())
     }
 }
 
 impl Node<'_> {
     fn charge<E: de::Error>(&mut self) -> std::result::Result<(), E> {
-        if self.depth >= MAX_DEPTH {
-            return Err(E::custom("argument nesting exceeds 64 levels"));
-        }
-        self.budget.nodes = self
-            .budget
-            .nodes
-            .checked_sub(1)
-            .ok_or_else(|| E::custom("arguments exceed 10000 nodes"))?;
-        Ok(())
+        self.budget.node(self.depth).map_err(E::custom)
     }
 }
 
@@ -118,49 +122,30 @@ impl<'de> Visitor<'de> for Node<'_> {
     }
 
     fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Value, E> {
-        self.budget.scalar(1)?;
+        self.budget.scalar(1).map_err(E::custom)?;
         Ok(Value::Bool(value))
     }
     fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Value, E> {
-        self.budget.scalar(8)?;
+        self.budget.scalar(8).map_err(E::custom)?;
         Ok(Value::Number(value.into()))
     }
     fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Value, E> {
-        self.budget.scalar(8)?;
+        self.budget.scalar(8).map_err(E::custom)?;
         Ok(Value::Number(value.into()))
     }
-    fn visit_i128<E: de::Error>(self, value: i128) -> std::result::Result<Value, E> {
-        self.budget.scalar(16)?;
-        i64::try_from(value)
-            .map(|n| Value::Number(n.into()))
-            .map_err(|_| E::custom("integer is outside the JSON number range"))
-    }
-    fn visit_u128<E: de::Error>(self, value: u128) -> std::result::Result<Value, E> {
-        self.budget.scalar(16)?;
-        u64::try_from(value)
-            .map(|n| Value::Number(n.into()))
-            .map_err(|_| E::custom("integer is outside the JSON number range"))
-    }
     fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Value, E> {
-        self.budget.scalar(8)?;
+        self.budget.scalar(8).map_err(E::custom)?;
         Number::from_f64(value)
             .map(Value::Number)
             .ok_or_else(|| E::custom("number must be finite and representable in JSON"))
     }
     fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Value, E> {
-        self.budget.scalar(value.len())?;
+        self.budget.scalar(value.len()).map_err(E::custom)?;
         Ok(Value::String(value.to_owned()))
     }
-    fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Value, E> {
-        self.budget.scalar(value.len())?;
-        Ok(Value::String(value))
-    }
     fn visit_unit<E: de::Error>(self) -> std::result::Result<Value, E> {
-        self.budget.scalar(1)?;
+        self.budget.scalar(1).map_err(E::custom)?;
         Ok(Value::Null)
-    }
-    fn visit_none<E: de::Error>(self) -> std::result::Result<Value, E> {
-        self.visit_unit()
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Value, A::Error> {
         let mut values = Vec::new();
@@ -201,7 +186,6 @@ impl<'de> DeserializeSeed<'de> for Key<'_> {
         parser: D,
     ) -> std::result::Result<String, D::Error> {
         self.0.charge()?;
-        // deserialize_string can coerce YAML numeric/bool keys into strings.
         parser.deserialize_any(self)
     }
 }
@@ -213,11 +197,7 @@ impl<'de> Visitor<'de> for Key<'_> {
         out.write_str("a string object key")
     }
     fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<String, E> {
-        self.0.budget.scalar(value.len())?;
+        self.0.budget.scalar(value.len()).map_err(E::custom)?;
         Ok(value.to_owned())
-    }
-    fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<String, E> {
-        self.0.budget.scalar(value.len())?;
-        Ok(value)
     }
 }
