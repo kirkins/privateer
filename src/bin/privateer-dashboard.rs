@@ -12,7 +12,7 @@ use privateer::dashboard::{
     herdr::{Client, Pane, View},
     mailbox::{Action, Mailbox},
     model::Snapshot,
-    ui::{App, BoardTarget},
+    ui::{App, BoardTarget, PendingBoard},
 };
 use serde_json::json;
 use std::{
@@ -360,6 +360,7 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) -> boo
         .find(|s| Some(&s.id) == app.ship.as_ref());
     let target = selected.and_then(BoardTarget::from_ship);
     if app.pending_board.as_ref().is_some_and(|pending| {
+        let pending = pending.target();
         Some(&pending.ship) == app.ship.as_ref() && Some(pending) != target.as_ref()
     }) {
         app.notice = "Ship home changed or is unavailable; automatic Board withheld.".into();
@@ -459,7 +460,7 @@ fn run(opts: Options) -> Result<()> {
             .find(|ship| ship.liaison && Some(&ship.id) == app.ship.as_ref())
         {
             if herdr.is_some() {
-                app.pending_board = BoardTarget::from_ship(ship);
+                app.pending_board = BoardTarget::from_ship(ship).map(PendingBoard::Liaison);
             } else {
                 request_board(&mut app, None);
             }
@@ -499,7 +500,7 @@ fn run(opts: Options) -> Result<()> {
                         app.mail_pending = false;
                     }
                     if let Some(ship) = update.board {
-                        app.pending_board = Some(ship);
+                        app.pending_board = Some(PendingBoard::Onboarding(ship));
                     }
                     if update.sent {
                         app.composer = None;
@@ -529,29 +530,43 @@ fn run(opts: Options) -> Result<()> {
             if opts.demo {
                 app.herdr_age = Some(0);
             }
-            if let Some((pending, observed)) = app
+            if let Some(pending) = app
                 .pending_board
                 .as_ref()
-                .and_then(|pending| {
-                    app.snapshot
-                        .ships
-                        .iter()
-                        .find(|s| s.id == pending.ship)
-                        .and_then(BoardTarget::from_ship)
-                        .map(|observed| (pending.clone(), observed))
-                })
                 .filter(|_| app.home_error.is_none() && app.home_age.is_some_and(|age| age < 10))
             {
-                if observed != pending {
+                let target = pending.target().clone();
+                let observed = app
+                    .snapshot
+                    .ships
+                    .iter()
+                    .find(|s| s.id == target.ship)
+                    .and_then(BoardTarget::from_ship);
+                let liaison_changed = matches!(pending, PendingBoard::Liaison(_))
+                    && (app.snapshot.presentation_error.is_some()
+                        || app.snapshot.ships.iter().filter(|s| s.liaison).count() != 1
+                        || !app
+                            .snapshot
+                            .ships
+                            .iter()
+                            .any(|s| s.liaison && s.id == target.ship)
+                        || observed.as_ref() != Some(&target));
+                if liaison_changed {
                     app.pending_board = None;
-                    app.notice = "Ship home changed; automatic Board cancelled.".into();
-                } else if herdr.is_some() {
-                    app.select_ship(Some(pending.ship.clone()));
-                    app.board_requested = true;
-                } else {
-                    app.select_ship(Some(pending.ship.clone()));
-                    app.notice = format!("Created {}.", pending.ship);
-                    app.pending_board = None;
+                    app.notice =
+                        "Liaison changed or unavailable; automatic Board cancelled.".into();
+                } else if let Some(observed) = observed {
+                    if observed != target {
+                        app.pending_board = None;
+                        app.notice = "Ship home changed; automatic Board cancelled.".into();
+                    } else if herdr.is_some() {
+                        app.select_ship(Some(target.ship.clone()));
+                        app.board_requested = true;
+                    } else {
+                        app.select_ship(Some(target.ship.clone()));
+                        app.notice = format!("Created {}.", target.ship);
+                        app.pending_board = None;
+                    }
                 }
             }
             if app.board_requested {
@@ -564,7 +579,7 @@ fn run(opts: Options) -> Result<()> {
                             .find(|s| Some(&s.id) == app.ship.as_ref())
                             .and_then(BoardTarget::from_ship)
                             .as_ref()
-                            == Some(pending)
+                            == Some(pending.target())
                     })
                 {
                     app.pending_board = None;
@@ -822,7 +837,7 @@ mod tests {
             home: std::fs::canonicalize(&original).unwrap(),
         };
         let mut app = ready_app();
-        app.pending_board = Some(expected.clone());
+        app.pending_board = Some(PendingBoard::Onboarding(expected.clone()));
         let ship = app
             .snapshot
             .ships

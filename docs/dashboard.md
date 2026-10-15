@@ -115,7 +115,9 @@ selected liaison, it automatically opens the liaison's first mate in a new tab
 or focuses its verified live pane. The dashboard remains available in its
 original tab through Herdr navigation. Startup waits for fresh observations and
 pins the selected ship's canonical home; it never chooses between conflicting
-contacts. A queued attempt runs once; after a launch failure, use `l` to retry.
+contacts. A pending startup attempt is cancelled if fresh fleet observations
+remove, change or make that contact ambiguous, even during a Herdr outage.
+A queued attempt runs once; after a launch failure, use `l` to retry.
 Running `privateer-dashboard` directly keeps the observational entry behavior;
 `--once` stays read-only even with `--board-liaison`.
 Standalone observation, inbox and onboarding need no Herdr socket; Board still

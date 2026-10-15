@@ -52,6 +52,19 @@ impl BoardTarget {
     }
 }
 
+pub enum PendingBoard {
+    Onboarding(BoardTarget),
+    Liaison(BoardTarget),
+}
+
+impl PendingBoard {
+    pub fn target(&self) -> &BoardTarget {
+        match self {
+            Self::Onboarding(target) | Self::Liaison(target) => target,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct App {
     pub inbox_open: bool,
@@ -62,7 +75,7 @@ pub struct App {
     pub composer: Option<Composer>,
     pub form: Option<super::forms::Form>,
     pub board_requested: bool,
-    pub pending_board: Option<BoardTarget>,
+    pub pending_board: Option<PendingBoard>,
     pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
     pub herdr: Option<herdr::View>,
