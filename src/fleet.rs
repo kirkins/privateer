@@ -18,7 +18,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-fn registry_path() -> Result<PathBuf> {
+pub fn registry_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("PRIVATEER_FLEET") {
         return Ok(PathBuf::from(path));
     }

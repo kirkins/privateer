@@ -7,8 +7,10 @@ use crossterm::{
     execute,
 };
 use privateer::dashboard::{
-    captain::sample_mail,
+    captain::{Mail, sample_mail},
+    fleet,
     herdr::{Client, Pane, View},
+    mailbox::{Action, Mailbox},
     model::Snapshot,
     ui::App,
 };
@@ -50,7 +52,7 @@ fn options() -> Result<Option<Options>> {
             "--no-herdr" => out.no_herdr = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard --home /absolute/home [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: liaison; m: demo Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only home view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, acknowledgments, inference, or fleet updates."
+                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: liaison; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nRead-only fleet view. Enter in Terminals focuses an existing agent; no launches,\ninput injection, inference, or fleet updates. Live mail uses Privateer commands."
                 );
                 return Ok(None);
             }
@@ -65,10 +67,7 @@ fn options() -> Result<Option<Options>> {
     if !out.demo && out.home.is_none() {
         out.home = std::env::var_os("PRIVATEER_HOME").map(PathBuf::from);
     }
-    ensure!(
-        out.demo || out.home.is_some(),
-        "provide --home or PRIVATEER_HOME, or use --demo"
-    );
+
     if out.socket.is_none() && std::env::var("HERDR_ENV").as_deref() == Ok("1") {
         out.socket = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from);
     }
@@ -95,11 +94,11 @@ impl Drop for MouseCapture {
     }
 }
 
-fn state_worker(home: PathBuf) -> Receiver<Sample<Snapshot>> {
+fn state_worker(registry: PathBuf, home: Option<PathBuf>) -> Receiver<Sample<Snapshot>> {
     let (send, receive) = mpsc::sync_channel(1);
     thread::spawn(move || {
         loop {
-            let value = Snapshot::read(&home);
+            let value = fleet::read(&registry, home.as_deref());
             if send
                 .send(Sample {
                     value,
@@ -114,6 +113,62 @@ fn state_worker(home: PathBuf) -> Receiver<Sample<Snapshot>> {
         }
     });
     receive
+}
+
+enum MailAction {
+    Send(Action),
+    Read(Mail),
+}
+struct MailUpdate {
+    messages: Vec<Mail>,
+    errors: Vec<String>,
+    notice: Option<String>,
+    sent: bool,
+    completed_send: bool,
+}
+fn mail_worker(
+    registry: PathBuf,
+    fallback: Option<PathBuf>,
+    binary: PathBuf,
+) -> (Receiver<MailUpdate>, SyncSender<MailAction>) {
+    let (send, receive) = mpsc::sync_channel(1);
+    let (actions, commands) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut mailbox = Mailbox::default();
+        loop {
+            let action = match commands.recv_timeout(Duration::from_secs(2)) {
+                Ok(a) => Some(a),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(_) => break,
+            };
+            let mut sent = false;
+            let completed_send = matches!(&action, Some(MailAction::Send(_)));
+            let notice=action.map(|a| match a {
+                MailAction::Read(mail)=>match mailbox.mark_read(&binary,&mail) {Ok(())=>"Marked read; earlier unseen mail remains unread.".into(),Err(e)=>format!("Acknowledgment failed: {e}")},
+                MailAction::Send(a)=>match privateer::dashboard::command::json(&binary,&a.home,&a.verb,&a.args) {Ok(_)=>{sent=true;"Message delivered to Privateer; the runtime records delivery and replies.".into()},Err(e)=>format!("Message command failed: {e}; draft retained with the same id for retry")}
+            });
+            let errors = match fleet::read(&registry, fallback.as_deref()) {
+                Ok(snapshot) => {
+                    mailbox.refresh(&binary, &snapshot, fallback.as_deref());
+                    mailbox.errors.clone()
+                }
+                Err(e) => vec![e.to_string()],
+            };
+            if send
+                .send(MailUpdate {
+                    messages: mailbox.messages.clone(),
+                    errors,
+                    notice,
+                    sent,
+                    completed_send,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (receive, actions)
 }
 
 fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<Focus>) {
@@ -170,9 +225,12 @@ fn run(opts: Options) -> Result<()> {
     let snapshot = if opts.demo {
         Snapshot::demo()
     } else {
-        Snapshot::read(opts.home.as_ref().unwrap())
-            .context("open existing Privateer home read-only")?
+        fleet::read(&privateer::fleet::registry_path()?, opts.home.as_deref())
+            .context("read existing fleet homes")?
     };
+    let binary = (!opts.demo)
+        .then(privateer::dashboard::command::binary)
+        .transpose()?;
     if opts.once {
         let (herdr, error) = match opts.socket.as_ref() {
             Some(path) => match Client::connect(path).and_then(|mut c| c.snapshot()) {
@@ -181,10 +239,14 @@ fn run(opts: Options) -> Result<()> {
             },
             None => (None, None),
         };
+        let mut mailbox = Mailbox::default();
+        if let Some(binary) = &binary {
+            mailbox.refresh(binary, &snapshot, opts.home.as_deref());
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"demo":opts.demo,"read_only":true,"snapshot":snapshot,"herdr":herdr,"herdr_error":error})
+                &json!({"demo":opts.demo,"read_only":true,"snapshot":snapshot,"herdr":herdr,"herdr_error":error,"mail":if opts.demo {sample_mail()} else {mailbox.messages},"mail_errors":mailbox.errors})
             )?
         );
         return Ok(());
@@ -193,7 +255,18 @@ fn run(opts: Options) -> Result<()> {
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive dashboard requires a terminal; use --once for JSON"
     );
-    let home_updates = opts.home.map(state_worker);
+    let mailbox = binary.map(|binary| {
+        mail_worker(
+            privateer::fleet::registry_path().unwrap(),
+            opts.home.clone(),
+            binary,
+        )
+    });
+    let home_updates = if opts.demo {
+        None
+    } else {
+        Some(state_worker(privateer::fleet::registry_path()?, opts.home))
+    };
     let herdr = opts.socket.map(herdr_worker);
     let mut app = App {
         snapshot,
@@ -229,6 +302,21 @@ fn run(opts: Options) -> Result<()> {
             } else {
                 home_updated = Instant::now();
             }
+            if let Some((updates, _)) = &mailbox {
+                while let Ok(update) = updates.try_recv() {
+                    app.update_mail(update.messages, update.errors);
+                    if let Some(notice) = update.notice {
+                        app.notice = notice;
+                    }
+                    if update.completed_send {
+                        app.mail_pending = false;
+                    }
+                    if update.sent {
+                        app.composer = None;
+                    }
+                    redraw = true;
+                }
+            }
             if let Some((updates, _)) = &herdr {
                 while let Ok(update) = updates.try_recv() {
                     redraw = true;
@@ -249,6 +337,16 @@ fn run(opts: Options) -> Result<()> {
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
             if opts.demo {
                 app.herdr_age = Some(0);
+            }
+            if let Some(action) = app.action.take() {
+                if let Some((_, sender)) = &mailbox {
+                    if sender.try_send(MailAction::Send(action)).is_ok() {
+                        app.mail_pending = true;
+                        app.notice = "Sending through Privateer…".into();
+                    } else {
+                        app.notice = "Mailbox action already pending; draft retained.".into();
+                    }
+                }
             }
             app.selected = app.selected.min(app.selection_len().saturating_sub(1));
             if redraw || last_draw.elapsed() >= Duration::from_secs(1) {
@@ -298,6 +396,19 @@ fn run(opts: Options) -> Result<()> {
                     KeyCode::Char('i') => app.open_inbox(),
                     KeyCode::Char('l') => app.open_liaison(),
                     KeyCode::Char('m') => app.compose(),
+                    KeyCode::Char('r') if app.inbox_open => app.reply(),
+                    KeyCode::Enter if app.inbox_open => {
+                        if let (Some(mail), Some((_, sender))) =
+                            (app.mail.get(app.selected), &mailbox)
+                        {
+                            app.notice = if sender.try_send(MailAction::Read(mail.clone())).is_ok()
+                            {
+                                "Recording read…".into()
+                            } else {
+                                "Mailbox action already pending.".into()
+                            };
+                        }
+                    }
                     KeyCode::Left => app.focus_content = false,
                     KeyCode::Right => app.focus_content = app.ship.is_some() || app.inbox_open,
                     KeyCode::Char('1'..='4') => {

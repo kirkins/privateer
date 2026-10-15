@@ -1,6 +1,6 @@
 # Handoff: the dashboard as home, and onboarding
 
-Status: **handoff for implementation**, written 14 October 2026. Read [conversation and activation](conversation-and-activation.md) for the overall design and [architecture](../architecture.md) for what exists. This document is self-contained enough to start from; where it names a command, that command exists today unless marked *new*.
+Status: **steps 1–2 implemented; steps 3–7 pending**, written 14 October 2026. See [dashboard setup and boundaries](../dashboard.md) for current behavior. Read [conversation and activation](conversation-and-activation.md) for the overall design and [architecture](../architecture.md) for what exists. This document is self-contained enough to start from; where it names a command, that command exists today unless marked *new*.
 
 ## Goal
 
@@ -11,9 +11,9 @@ A person should be able to install Privateer, type `privateer`, and land somewhe
 - **Ships are folders.** `privateer init` (or bare `privateer`, which asks first) makes the current folder a ship: state in `<folder>/.privateer`, the folder is the charter's repository root, projects go in `projects/`. It writes `AGENTS.md`, `CLAUDE.md`, Claude permissions and hooks, starts the ship's dispatcher (`privateer service status|start|stop`; a systemd user service where available, otherwise detached), and registers the ship in the fleet.
 - **The fleet.** A per-user registry lists every ship on the machine: `fleet.list` returns `{registry, ships:[{name, home, created_by, created_ms, retired_ms}]}`. Ships are linked both ways automatically, so they can mail each other. `ship.create {name, scope?, objective?, folder?, harness?}` makes a sibling ship from inside a ship (`privateer ship new NAME`); `ship.retire {name}` retires one, keeping its folder. An agent's new ship gets at most its own charter's actions.
 - **Talking to a ship.** `privateer start [HARNESS]` launches the ship's harness in its folder as its first mate, holding the ship's presence lease (`ship.presence {ship}` shows it) so the dispatcher leaves mail to the live session. Claude Code sessions also get mail at each prompt and turn end through hooks.
-- **The captain's mail.** `captain` is a mailbox in each home. Ships send it requests, notices and decisions; `privateer inbox` reads and acknowledges it, `privateer reply ID TEXT` answers, `privateer ask SHIP TEXT` / `tell` send. JSON equivalents: `mail.inbox {"address":"captain"}`, `mail.ack`, `mail.send {"from":"captain",...}`, `mail.show`. Captain mail does not cross homes yet: each home holds the captain mail its ships sent there.
+- **The captain's mail.** `captain` is a mailbox in each home. Ships send it requests, notices and decisions; `privateer inbox` reads and acknowledges it, `privateer reply ID TEXT` answers, `privateer ask SHIP TEXT` / `tell` send. JSON equivalents: `mail.inbox {"address":"captain"}`, `mail.ack`, `mail.send {"from":"captain",...}`, `mail.show`.
 - **Per-ship state.** `ship.bearings {ship}` (open tasks, requests owed and owing, unacknowledged mail, ship knowledge note, plus a ready `text` rendering), `wake.list {ship}` (recent wakes: mode, status, usage), `note.list/get`, `focus.digest`, `status`.
-- **The dashboard** (`src/dashboard/`, `docs/dashboard.md`) reads **one** home read-only, shows ships as owner identities in that home, and can *focus* Herdr panes bound by hand in `<home>/dashboard.json`. Its live captain inbox is still a placeholder ("unavailable until the runtime's front door is connected"), and it cannot launch agents.
+- **The dashboard** (`src/dashboard/`): see [dashboard setup and boundaries](../dashboard.md) for its current capabilities.
 
 ## What to build
 

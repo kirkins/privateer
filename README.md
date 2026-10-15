@@ -21,13 +21,9 @@ sidebar. Each ship has its own Bridge, Assignments, Terminals and Logbook views:
 cargo run --features dashboard --bin privateer-dashboard -- --demo
 ```
 
-Use `--home /absolute/privateer/home` to observe an existing home. Inside Herdr,
-the dashboard can inspect and focus existing agent terminals using the injected
-socket. It does not launch agents, send prompts, acknowledge alerts or migrate a
-fleet. Navigator chat and automatic agent activation are not connected yet.
-Click a ship, then its workspace tabs; `0` returns to Fleet overview. Keyboard
-navigation and mouse-wheel scrolling remain available.
-See [dashboard setup and boundaries](docs/dashboard.md).
+Run without `--demo` to use the registered fleet and captain inbox. Click a ship,
+then its workspace tabs; `0` returns to Fleet overview. See
+[dashboard setup, live mail controls and Herdr boundaries](docs/dashboard.md).
 
 ## Quick start
 
