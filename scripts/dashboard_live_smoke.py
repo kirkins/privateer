@@ -269,7 +269,7 @@ def run(binary, runtime):
             tui.until(lambda: b"question" in tui.output or b"Please" in tui.output, "captain mail did not load")
             tui.keys(b"irGo ahead\r")
             tui.until(lambda: command("mail.show", {"id": "question"})["state"] == "answered", "reply did not close the real request")
-            tui.until(lambda: "mail.send:" in tui.screen(), "reply completion did not reach the UI")
+            tui.until(lambda: "Reply sent to apps." in tui.screen(), "reply completion did not reach the UI")
             tui.keys(b"0jj\rb")
             tui.until(lambda: (root / "harness-started").exists(), "Board did not run privateer start")
             tui.until(lambda: command("ship.presence", {"ship": "apps"})["attended"], "Board did not hold presence")
@@ -309,15 +309,15 @@ def run(binary, runtime):
             tui.until(lambda: server.focuses == 2, "Board did not focus after identity recovery")
             tui.keys(b"1")
             tui.keys(b"d\r")
-            tui.until(lambda: "service:" in tui.screen(), "dispatcher completion did not reach the UI")
+            tui.until(lambda: "Dispatcher for apps" in tui.screen(), "dispatcher completion did not reach the UI")
             tui.keys(b"nnewworker\tScope of worker\r")
             tui.until(lambda: "newworker" in active(), "New ship did not call ship.create")
-            tui.until(lambda: "ship.create:" in tui.screen(), "creation completion did not reach the UI")
+            tui.until(lambda: "Created newworker in" in tui.screen(), "creation completion did not reach the UI")
             tui.drain(1.2)
             tui.keys(b"0jjj\rxnewworker\r")
             tui.until(lambda: "newworker" not in active(), "Retire did not call ship.retire")
             assert (root / "newworker" / ".privateer").is_dir(), "retirement deleted the folder"
-            tui.until(lambda: "ship.retire:" in tui.screen(), "retirement completion did not reach the UI")
+            tui.until(lambda: "Retired newworker; its folder is kept." in tui.screen(), "retirement completion did not reach the UI")
             presentation.write_text(json.dumps({"ships": [own]}))
             tui.drain(1.2)
 
@@ -615,11 +615,11 @@ def onboarding(binary, runtime):
                 def details():
                     return " ".join(" ".join(line.split("│")[-2] for line in plain.screen().splitlines()
                                              if line.count("│") >= 2).split())
-                plain.until(lambda: "Created apps. No Herdr connection configured; run: " + command
+                plain.until(lambda: "Created apps." in details() and "Talk to its first mate directly: " + command
                             in details(), "creation success and direct start command were not shown")
                 plain.drain(2.2)
                 screen = details()
-                displayed = screen.split("run: ", 1)[1].split(" start", 1)[0] + " start"
+                displayed = screen.split("directly: ", 1)[1].split(" start", 1)[0] + " start"
                 assert shlex.split(displayed) == ["privateer", "--home", str(canonical_home), "start"]
                 assert not (plain_root / "harness-started").exists(), "no-socket creation launched a session"
                 config = json.loads((plain_home / "config.json").read_text())

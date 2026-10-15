@@ -11,9 +11,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 const TABS: [&str; 4] = ["1 Bridge", "2 Assignments", "3 Terminals", "4 Logbook"];
+/// How long an outcome notice stays visible once nothing is waiting on it.
+pub const NOTICE_TTL: Duration = Duration::from_secs(8);
 
 fn origin(home: Option<&Path>) -> String {
     home.map_or_else(String::new, |home| {
@@ -74,6 +79,9 @@ pub struct App {
     pub ascii: bool,
     pub demo: bool,
     pub notice: String,
+    pub notice_shown: String,
+    pub notice_at: Option<Instant>,
+    pub herdr_configured: bool,
     pub selection_invalidated: bool,
     pub mouse: MouseMap,
 }
@@ -90,6 +98,7 @@ impl App {
             if self.ship.is_none() || id.is_none() {
                 self.tab = 0;
             }
+            self.notice.clear();
             self.ship = id;
             self.selected = 0;
             self.scroll = 0;
@@ -105,11 +114,36 @@ impl App {
         }
         if tab < TABS.len() && self.tab != tab {
             self.tab = tab;
+            self.notice.clear();
             self.selected = 0;
             self.scroll = 0;
             self.selection_invalidated = false;
         }
         self.focus_content = true;
+    }
+    /// Expire an outcome notice after `NOTICE_TTL`, unless a form, draft or
+    /// command still depends on it. Returns whether the notice was cleared.
+    pub fn tick_notice(&mut self, now: Instant) -> bool {
+        if self.notice != self.notice_shown {
+            self.notice_shown = self.notice.clone();
+            self.notice_at = Some(now);
+            return false;
+        }
+        let waiting = self.form.is_some() || self.composer.is_some() || self.mail_pending;
+        if self.notice.is_empty()
+            || waiting
+            || self
+                .notice_at
+                .is_some_and(|at| now.duration_since(at) < NOTICE_TTL)
+        {
+            if waiting {
+                self.notice_at = Some(now);
+            }
+            return false;
+        }
+        self.notice.clear();
+        self.notice_shown.clear();
+        true
     }
     pub fn ship_index(&self) -> usize {
         self.ship
@@ -305,7 +339,10 @@ impl App {
             .as_ref()
             .is_some_and(|id| !self.snapshot.ships.iter().any(|s| &s.id == id))
         {
+            // A refresh is not navigation: keep the outcome that removed the ship.
+            let notice = std::mem::take(&mut self.notice);
             self.select_ship(None);
+            self.notice = notice;
         }
         if self.tab == 1 {
             self.selected = task_id
@@ -562,15 +599,22 @@ impl App {
                         Style::default().fg(Color::Red),
                     ));
                 }
-                lines.push(Line::from(if self.scoped_panes().is_empty() {
-                    "b: Board this ship in Herdr."
-                } else {
-                    "Open the primary terminal with f, or choose Terminals to inspect its crew."
-                }));
+                let home = ship
+                    .live
+                    .as_ref()
+                    .filter(|live| live.error.is_none())
+                    .map(|live| std::fs::canonicalize(&live.home).unwrap_or(live.home.clone()));
                 lines.push(Line::from(if self.demo {
-                    "Conversation and agent launch are not connected in this preview."
+                    "Conversation and agent launch are not connected in this preview.".into()
+                } else if let Some(home) = home.filter(|_| !self.herdr_configured) {
+                    format!(
+                        "Board needs Herdr. Talk to its first mate directly: privateer --home '{}' start",
+                        clean(&home.to_string_lossy(), 4096).replace('\'', "'\"'\"'")
+                    )
+                } else if self.scoped_panes().is_empty() {
+                    "b: Board · launch its first mate in a new Herdr tab".into()
                 } else {
-                    "b: Board or focus the first mate · f: focus a selected terminal"
+                    "b or f: open its first mate's terminal · 3: Terminals for its crew".into()
                 }));
 
                 lines.push(Line::styled(
@@ -978,7 +1022,15 @@ impl App {
         }
         let mut lines = self.details();
         if !self.notice.is_empty() {
-            lines.insert(0, Line::from(clean(&self.notice, 8192)));
+            lines.insert(
+                0,
+                Line::styled(
+                    clean(&self.notice, 8192),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
             lines.insert(1, Line::from(""));
         }
         if self.snapshot.truncated {
@@ -1018,10 +1070,9 @@ impl App {
             });
         let status = error.unwrap_or_else(|| {
             format!(
-                "State {} · Herdr {} · {}",
+                "State {} · Herdr {}",
                 age(self.home_age),
-                age(self.herdr_age),
-                clean(&self.notice, 160)
+                age(self.herdr_age)
             )
         });
         frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.snapshot.presentation_error.is_some()||self.home_error.is_some()||self.herdr_error.is_some()||!self.mail_errors.is_empty(){Color::Red}else{Color::Gray}))]),rows[2]);

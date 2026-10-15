@@ -68,6 +68,7 @@ impl App {
             Kind::Dispatcher => vec![("Action: status / start / stop", "status".into())],
             Kind::Onboard => return self.onboard(),
         };
+        self.notice.clear();
         self.form = Some(Form {
             kind,
             ship: ship.id.clone(),

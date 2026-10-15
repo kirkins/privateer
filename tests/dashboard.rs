@@ -1009,6 +1009,49 @@ fn automatic_presence_bindings_cannot_give_one_live_pane_to_two_ships() {
 }
 
 #[test]
+fn outcome_notices_expire_clear_on_navigation_and_render_once() {
+    use privateer::dashboard::ui::NOTICE_TTL;
+    use std::time::Instant;
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        demo: true,
+        ..App::default()
+    };
+    let start = Instant::now();
+    app.notice = "Reply sent to apps.".into();
+    assert!(!app.tick_notice(start));
+    assert!(!app.tick_notice(start + NOTICE_TTL / 2));
+    let screen = render(&mut app, 120, 34);
+    assert_eq!(screen.matches("Reply sent to apps.").count(), 1);
+    assert!(app.tick_notice(start + NOTICE_TTL));
+    assert!(app.notice.is_empty());
+
+    // An open form or draft keeps the outcome it is waiting on.
+    app.notice = "mail.send failed: timeout; form/draft retained".into();
+    app.select_ship(Some("apps".into()));
+    app.compose();
+    app.notice = "mail.send failed: timeout; form/draft retained".into();
+    app.tick_notice(start);
+    assert!(!app.tick_notice(start + NOTICE_TTL * 3));
+    assert!(render(&mut app, 120, 34).contains("form/draft retained"));
+    app.composer = None;
+    assert!(!app.tick_notice(start + NOTICE_TTL * 3));
+    assert!(app.tick_notice(start + NOTICE_TTL * 5));
+
+    // Navigation starts with a clean slate; refresh does not.
+    app.notice = "Demo replies are sample-only.".into();
+    app.select_ship(None);
+    assert!(app.notice.is_empty());
+    app.select_ship(Some("apps".into()));
+    app.notice = "Retired apps; its folder is kept.".into();
+    let mut snapshot = Snapshot::demo();
+    snapshot.ships.retain(|s| s.id != "apps");
+    app.update_snapshot(snapshot);
+    assert!(app.ship.is_none());
+    assert_eq!(app.notice, "Retired apps; its folder is kept.");
+}
+
+#[test]
 fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
     let mut app = App::default();
     let screen = render(&mut app, 120, 34);
