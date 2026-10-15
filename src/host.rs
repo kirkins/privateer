@@ -65,6 +65,7 @@ pub(crate) fn launch(store: &Store, ship: &str, harness: &str) -> Result<Value> 
         &["start", "--hosted"],
     ) {
         Ok(pane) => {
+            settle(&mut client, &pane.workspace_id, "mate", ship);
             let launched = json!({"holder": holder, "pane": pane.pane_id,
                 "workspace": pane.workspace_id});
             store.audit(
@@ -93,7 +94,13 @@ pub(crate) fn hosts_crew(profile: &Value, harness: &str) -> bool {
 /// Run a crew job's supervisor in its own background space, labelled under
 /// its task. The supervisor claims the job there and gives the harness the
 /// pane's terminal.
-pub(crate) fn supervise(store: &Store, job: &str, task: &str, cwd: &Path) -> Result<()> {
+pub(crate) fn supervise(
+    store: &Store,
+    job: &str,
+    task: &str,
+    ship: &str,
+    cwd: &Path,
+) -> Result<()> {
     let socket = socket().context("no Herdr socket configured")?;
     let mut client = crate::herdr::Client::connect(&socket)?;
     let binary = crate::executable::installed()?;
@@ -105,9 +112,18 @@ pub(crate) fn supervise(store: &Store, job: &str, task: &str, cwd: &Path) -> Res
         &[],
         &["_job-supervise", job],
     )?;
+    settle(&mut client, &pane.workspace_id, "crew", ship);
     store.audit(
         "host.crew",
         &json!({"job_id": job, "task_id": task, "pane": pane.pane_id, "workspace": pane.workspace_id}),
     )?;
     Ok(())
+}
+
+/// Tag a new space and put it in its place in the sidebar. Presentation only:
+/// a refusal never undoes the launch.
+fn settle(client: &mut crate::herdr::Client, workspace: &str, role: &str, ship: &str) {
+    let _ = client
+        .tag(workspace, role, ship)
+        .and_then(|()| client.arrange());
 }

@@ -1116,7 +1116,13 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
     if job.hosted {
         // The supervisor claims the job from its own space; a space that never
         // runs it leaves the job unsupervised, and reconciliation fails it.
-        if let Err(error) = crate::host::supervise(store, &job.id, &job.task_id, &job.cwd) {
+        if let Err(error) = crate::host::supervise(
+            store,
+            &job.id,
+            &job.task_id,
+            job.agent_actor.as_deref().unwrap_or_default(),
+            &job.cwd,
+        ) {
             job = alter(store, &id, |j| {
                 j.status = "failed".into();
                 j.finished_ms = Some(Store::now_ms());
