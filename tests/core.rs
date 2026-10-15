@@ -306,6 +306,84 @@ fn changed_charter_invalidates_old_approval_without_resetting_omitted_limits() {
 }
 
 #[test]
+fn production_checks_and_approvals_recheck_authority_after_waiting_for_a_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    for change in ["revocation", "cancellation"] {
+        for command in ["delivery.check", "approval.consume", "approval.grant"] {
+            let (_temp, mut store) = fixture();
+            let grant = json!({"id":"permission","task_id":"main","artifact":"abc123",
+                "environment":"production","approver":"release-manager"});
+            dispatch(&mut store, "approval.grant", grant.clone()).unwrap();
+            // Open the command's connection before the changing transaction.
+            let mut other = Store::open(store.home()).unwrap();
+            WAITING.store(false, Ordering::SeqCst);
+            other
+                .connection()
+                .busy_handler(Some(|attempt| {
+                    WAITING.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
+                    attempt < 5_000
+                }))
+                .unwrap();
+            let tx = store.write_transaction().unwrap();
+            if change == "revocation" {
+                let mut charter = store.charter("project").unwrap();
+                charter["active"] = json!(false);
+                tx.execute(
+                    "UPDATE charters SET data=?1 WHERE id='project'",
+                    [charter.to_string()],
+                )
+                .unwrap();
+            } else {
+                tx.execute("UPDATE tasks SET status='cancelled' WHERE id='main'", [])
+                    .unwrap();
+            }
+            let args = match command {
+                "delivery.check" => json!({"task_id":"main","current_head":"abc123",
+                    "tested_head":"abc123","checks_passed":true,
+                    "deploys_production":true,"environment":"production"}),
+                "approval.consume" => grant,
+                _ => json!({"id":"late-approval","task_id":"main","artifact":"abc123",
+                    "environment":"production","approver":"release-manager"}),
+            };
+            let pending = std::thread::spawn(move || dispatch(&mut other, command, args));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !WAITING.load(Ordering::SeqCst)
+                && !pending.is_finished()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            tx.commit().unwrap();
+            let error = pending.join().unwrap().unwrap_err();
+            let reason = if change == "revocation" {
+                "revoked"
+            } else {
+                "terminal"
+            };
+            assert!(
+                WAITING.load(Ordering::SeqCst),
+                "{command} did not serialize with {change}"
+            );
+            assert!(
+                error.to_string().contains(reason),
+                "{command} after {change}: {error}"
+            );
+            let (approvals, consumed): (i64, i64) = store
+                .connection()
+                .query_row("SELECT COUNT(*), SUM(consumed) FROM approvals", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!((approvals, consumed), (1, 0), "{command} after {change}");
+        }
+    }
+}
+
+#[test]
 fn rpc_correlates_success_and_failure_without_panicking_on_bad_requests() {
     let (_temp, mut s) = fixture();
     assert_eq!(
