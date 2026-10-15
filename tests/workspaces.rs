@@ -859,3 +859,54 @@ fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
     assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
     assert_eq!(f.ok("job.list", json!({})), json!([]));
 }
+
+#[test]
+fn repeated_release_attempts_never_overwrite_an_archived_snapshot() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    let commit = |text: &str| {
+        fs::write(p.join("file.txt"), text).unwrap();
+        git(&p, &["add", "file.txt"]);
+        git(
+            &p,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "snapshot",
+            ],
+        );
+        git(&p, &["rev-parse", "HEAD"])
+    };
+    let first_head = commit("first");
+    fs::write(f.root.join("fail-before-return"), "").unwrap();
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"],"archive":true})
+        )
+        .status
+        .success()
+    );
+    let first_ref = f.ok("workspace.status", json!({"task_id":"one"}))["archive_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    git(&p, &["reset", "--hard", "main"]);
+    let second_head = commit("second");
+    let released = f.release(&w, true);
+    assert_ne!(released["archive_ref"], json!(first_ref));
+    assert_eq!(git(&f.repo, &["rev-parse", &first_ref]), first_head);
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        second_head
+    );
+}

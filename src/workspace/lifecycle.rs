@@ -62,9 +62,10 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     let head = git(&lock, &path, &["rev-parse", "HEAD"])?;
     if archive {
         let reference = format!(
-            "refs/privateer/workspaces/{}/{}",
+            "refs/privateer/workspaces/{}/{}/{}",
             hash(&store.home().to_string_lossy()),
-            w.generation
+            w.generation,
+            head
         );
         git(&lock, &w.git_repo, &["update-ref", &reference, &head])?;
         w.archive_ref = Some(reference);

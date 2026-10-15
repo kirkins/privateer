@@ -73,7 +73,9 @@ available for reuse under Treehouse's ordinary cleanup rules.
 
 To retain clean committed work that has not landed, explicitly pass
 `"archive":true` to release. Privateer saves HEAD under
-`refs/privateer/workspaces/<home-hash>/<generation>` before returning the lease.
+`refs/privateer/workspaces/<home-hash>/<generation>/<head>` before returning the lease.
+Each distinct snapshot has its own ref, including when a return fails and a
+later release attempt archives different work.
 That ref can reconstruct a checkout with `git worktree add --detach`. Archive
 mode still refuses uncommitted work and live/uncertain jobs. There is no
 force-discard command. A stale lease ID cannot return a newer acquisition.
