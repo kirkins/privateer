@@ -299,7 +299,9 @@ fn wake_text(
         ));
     }
     if mail.iter().any(|m| m.crew) {
-        text.push_str("Mail from crew is written by the runtime: crew job outcomes from the job's record and logs. An exit status is not proof: check results yourself (job.status, the logs, the work) before relying on them or reporting them, and record your judgement in the task's note.\n");
+        text.push_str(&format!(
+        "Mail from crew is written by the runtime: crew job outcomes from the job's record and logs, and reports from your running crew. An exit status is not proof: check results yourself (job.status, the logs, the work) before relying on them or reporting them, and record your judgement in the task's note. Answer a crew request with mail.send {{\"from\":\"{ship}\",\"to\":\"crew\",\"kind\":\"reply\",\"correlation\":...}}.\n"
+        ));
     }
     text.push_str(&format!(
         "Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. For more history on a focus use focus.digest {{\"ship\":\"{ship}\",\"focus\":...}}. Before you finish, for each focus you worked on, replace its handoff note with note.put {{\"ship\":\"{ship}\",\"focus\":...,\"body\":...}}: what you are doing and why, what you are waiting on, and what comes next, in under 2 KB; facts are already recorded. Then acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."

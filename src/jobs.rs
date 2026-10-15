@@ -1258,7 +1258,9 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 .env_remove("PRIVATEER_ACTOR");
         }
     }
-    cmd.args(&job.command[1..])
+    // Crew report through crew.report, which checks this job.
+    cmd.env("PRIVATEER_JOB", &job.id)
+        .args(&job.command[1..])
         .current_dir(&job.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1597,6 +1599,11 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         }
     }
     Ok(settled)
+}
+
+/// A job's current record, for crew reports.
+pub(crate) fn record(store: &Store, id: &str) -> Result<Value> {
+    Ok(public_job(&load(store, id)?))
 }
 
 fn cancel(store: &Store, id: &str) -> Result<Value> {
