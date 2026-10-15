@@ -22,8 +22,9 @@ const timers = new Set(), realSet = globalThis.setInterval, realClear = globalTh
 globalThis.setInterval = (fn,ms) => { assert.equal(ms,5000);const timer={fn,unref(){}};timers.add(timer);return timer; };
 globalThis.clearInterval = timer => timers.delete(timer);
 const stores = new Map(), memories = new Map(), handlers = new Map(), queue=[], offered=[];
+const admittedInputs = new Map();
 const rows = new Map(), pending = new Map(), info = new Map();
-let route={type:"session",sessionID:"ses_one"}, mode="base", busy=false, reject=false, storeFailure=false;
+let route={type:"session",sessionID:"ses_one"}, mode="base", busy=false, reject=false, storeFailure=false, tabs=[];
 let sequence=0, command, dispose, hold, holdStarted, admitThenReject=false, hideQueue=false, hideHistory=false, writes=0;
 const tick = async () => { for(const timer of [...timers])await timer.fn(); };
 const emit = (type,data) => { for(const fn of handlers.get(type)??[])fn({data}); };
@@ -42,7 +43,7 @@ const ctx = {
     memory(key,{initial}){if(!memories.has(key))memories.set(key,structuredClone(initial));const value=memories.get(key);return [value,fn=>fn(value)];},
     store(key,{initial}){if(!stores.has(key))stores.set(key,structuredClone(initial));const value=stores.get(key);return [value,async fn=>{if(storeFailure)throw Error("unavailable storage");writes++;fn(value);}];},
   },
-  ui:{router:{current:()=>route},slot:claim=>{assert.equal(claim.append,"prompt.footer.status");return()=>{};}},
+  ui:{router:{current:()=>route},tabs:{list:()=>tabs},slot:claim=>{assert.equal(claim.append,"prompt.footer.status");return()=>{};}},
   keymap:{mode:{current:()=>mode},layer:factory=>{command=factory().commands[0].run;}},
   data:{
     on(type,fn){const list=handlers.get(type)??[];list.push(fn);handlers.set(type,list);return()=>handlers.set(type,list.filter(x=>x!==fn));},
@@ -55,9 +56,11 @@ const ctx = {
     assert.equal(input.delivery,"queue");assert(options.signal instanceof AbortSignal);
     offered.push(input);if(hold){holdStarted?.();await hold;}
     if(reject)throw Error("admission uncertain");
-    const existing=queue.find(row=>row.id===input.id);
-    if(existing && (pending.get(input.sessionID)??[]).some(row=>row.id===input.id))
+    const existing=admittedInputs.get(input.id);
+    if(existing && ((pending.get(input.sessionID)??[]).some(row=>row.id===input.id)
+        || (rows.get(input.sessionID)??[]).some(row=>row.id===input.id)))
       return {id:input.id,sessionID:input.sessionID};
+    admittedInputs.set(input.id,input);
     queue.push(input);pending.set(input.sessionID,[...(pending.get(input.sessionID)??[]),
       {id:input.id,type:"user",payload:{metadata:input.metadata}}]);
     if(admitThenReject){admitThenReject=false;throw Error("response lost after durable admission");}
@@ -84,6 +87,13 @@ try {
   dispose();stores.clear();await load(false);await tick();assert.equal(queue.length,1,"native user metadata recovers a lost local cache");
   send();busy=true;await tick();assert.equal(queue.length,1);busy=false;mode="dialog";await tick();assert.equal(queue.length,1);
   mode="base";await tick();assert.equal(queue.length,2);settle(queue[1]);await tick();
+  const siblingMail=send();info.set("ses_sibling",{location:{directory:folder}});tabs=[{sessionID:"ses_sibling",busy:true}];
+  await tick();assert.equal(queue.length,2,"another busy conversation in the ship must finish before automatic mail");
+  tabs[0].busy=false;pending.set("ses_sibling",[{id:"msg_sibling",type:"user",payload:{metadata:{privateer_mail:{version:1,home,ship:"ship",session:"ses_sibling",through:siblingMail.seq}}}}]);
+  await tick();assert.equal(queue.length,2,"another tab's native ship wake must not be duplicated here");
+  pending.set("ses_sibling",[]);info.set("ses_sibling",{location:{directory:root}});tabs[0].busy=true;
+  await tick();assert.equal(queue.length,3,"a different workspace's tab does not block this ship");settle(queue[2]);await tick();tabs=[];
+  queue.pop(); // Reset this observer entry; native pending/receipt state is retained.
   const low=send({kind:"notice",urgency:"low"});await tick();assert.equal(queue.length,2,"low notices do not spend inference");
   send();await tick();assert.equal(queue.length,3);assert(queue[2].metadata.privateer_mail.through>low.seq);settle(queue[2]);await tick();
   emit("session.execution.failed",{sessionID:"ses_one"});send();await tick();assert.equal(queue.length,3);
