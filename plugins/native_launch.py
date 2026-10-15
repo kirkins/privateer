@@ -23,6 +23,9 @@ def native_environment():
 def launch(harness, argv):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
+    if harness == "opencode-v2":
+        os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),
+                                  *argv], native_environment())
     # Pi JSON mode may exit zero after an assistant error. Its event stream,
     # not the process status alone, must confirm a completed unattended run.
     flags = argv[:argv.index("--")] if "--" in argv else argv

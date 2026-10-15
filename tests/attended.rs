@@ -397,6 +397,54 @@ sys.exit(7)
 }
 
 #[test]
+fn opencode_v2_start_uses_the_versioned_launcher_and_private_server() {
+    let ship = Ship::new();
+    let record = ship.root.join("opencode.json");
+    let script = r#"#!/usr/bin/env python3
+import json,os,sys
+if sys.argv[1:]==['--version']:
+    print('opencode v2.0.29');raise SystemExit(0)
+with open(os.environ['OC_TEST_RECORD'],'w') as f:
+    json.dump({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('OC_TEST_ROUTE'),'foreign':os.getenv('CLAUDECODE')},f)
+"#;
+    let native = ship.root.join("bin/opencode");
+    fs::write(&native, script).unwrap();
+    fs::set_permissions(&native, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = ship
+        .command(&["start", "opencode-v2", "--", "--prompt", "literal; $value"])
+        .env("OC_TEST_RECORD", &record)
+        .env("OC_TEST_ROUTE", "https://gateway.example.invalid/v1")
+        .env("CLAUDECODE", "foreign")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let seen: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_eq!(
+        seen["argv"],
+        json!(["--standalone", "--prompt", "literal; $value"])
+    );
+    assert_eq!(seen["role"], "agent");
+    assert_eq!(seen["actor"], "infra");
+    assert_eq!(seen["route"], "https://gateway.example.invalid/v1");
+    assert!(seen["foreign"].is_null());
+    assert_eq!(ship.presence()["attended"], false);
+    fs::write(&native, "#!/bin/sh\nprintf '1.19.0\\n'\n").unwrap();
+    assert!(
+        !ship
+            .command(&["start", "opencode-v2"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
 fn failed_start_releases_presence() {
     let ship = Ship::new();
     assert!(

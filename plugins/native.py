@@ -15,6 +15,7 @@ PROFILES = {
     "omp": {"binary": "omp", "resume": "uuid-or-file", "effort": ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]},
     "claude": {"binary": "claude", "resume": "uuid", "effort": ["low", "medium", "high", "xhigh", "max"]},
     "opencode": {"binary": "opencode", "resume": "opencode", "effort": None},
+    "opencode-v2": {"binary": "opencode", "resume": "opencode", "effort": None},
     "gemini": {"binary": "gemini", "resume": "uuid", "effort": []},
     "cursor": {"binary": "cursor-agent", "resume": "uuid", "effort": []},
     "grok": {"binary": "grok", "resume": "uuid", "effort": None},
@@ -258,6 +259,26 @@ def build(harness, request):
         if resume:
             argv += ["--resume", resume]
         argv += ["--", prompt]
+    elif harness == "opencode-v2":
+        # V2 uses a different CLI/server/plugin contract. A private server
+        # keeps tools in this job's actor environment, outside a shared daemon.
+        if not headless and (model or effort):
+            # The full V2 TUI has no --model flag. Do not silently discard an
+            # explicit selection or substitute the different mini interface.
+            raise ValueError("select OpenCode V2 interactive models in the native TUI")
+        if effort:
+            if not model or "#" in model or len(effort) > 64 or not all(c.isascii() and (c.isalnum() or c in "-_") for c in effort):
+                raise ValueError("OpenCode V2 variant requires an unqualified explicit model")
+            model += "#" + effort
+        if headless:
+            argv += ["run", "--standalone", "--format", "json"]
+        else:
+            argv += [repo, "--standalone"]
+        if model:
+            argv += ["--model", model]
+        if resume:
+            argv += ["--session", resume]
+        argv += (["--", prompt] if headless else ["--prompt", prompt])
     elif harness == "opencode":
         if headless:
             argv += ["run", "--format", "json", "--dir", repo]

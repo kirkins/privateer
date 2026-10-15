@@ -456,11 +456,15 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             })
             .context("no first-mate harness configured; pass one: privateer start claude")?,
     };
-    let binary = HARNESSES
-        .iter()
-        .find(|(_, id)| *id == harness)
-        .map_or(harness.as_str(), |(binary, _)| binary)
-        .to_owned();
+    let binary = if harness == "opencode-v2" {
+        "opencode".to_owned()
+    } else {
+        HARNESSES
+            .iter()
+            .find(|(_, id)| *id == harness)
+            .map_or(harness.as_str(), |(binary, _)| binary)
+            .to_owned()
+    };
     let folder = home.parent().context("ship folder")?;
     let holder = format!("start:{}", std::process::id());
     let control = std::env::current_exe()?;
@@ -480,6 +484,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .arg(&binary)
             .arg("-e")
             .arg(extension);
+    } else if harness == "opencode-v2" {
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg(&harness)
+            .arg(&binary)
+            .arg("--standalone");
     }
     command
         .args(passthrough)
