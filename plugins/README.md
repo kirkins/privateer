@@ -22,6 +22,7 @@ stdin-detached `agent.start` job path.
 | `pi-signed` | `pi-signed` | Same as Pi; requires the selected wrapper | Yes |
 | `omp` | `omp` | Full session UUID or existing absolute session file, verified through RPC | Yes, fresh |
 | `opencode` | `opencode` | Native `ses_…` ID | Yes |
+| `opencode-v2` | `opencode` 2.x | Existing `ses_…` ID with matching saved directory | Yes, native model picker |
 | `gemini` | `gemini` | Full session UUID | Yes |
 | `cursor` | `cursor-agent` | Full chat UUID | Yes |
 | `grok` | `grok agent --no-leader stdio` (ACP for headless) | Full session UUID | Yes, native TUI plan |
@@ -66,6 +67,28 @@ The direct native launcher replaces itself with the selected CLI in the same pro
 It clears inherited foreign harness identity markers while preserving
 `PRIVATEER_ROLE`, `PRIVATEER_ACTOR`, authentication and provider configuration.
 A missing CLI fails without substituting another harness or model.
+
+The dogfooding focus is Claude, Codex, Pi and OpenCode V2. Other adapters remain
+available, but are outside the current qualification work. `opencode` keeps the
+V1 command contract; choose `opencode-v2` explicitly for V2. Its launch preflight
+checks the installed major version and uses `--standalone` so tool processes
+inherit this job's actor environment. Before an exact resume, the native API
+must confirm both the existing session ID and its saved directory. V2 otherwise
+creates a missing `--session` ID, which would silently lose conversation history.
+Shared servers, continuation pickers, forks and abbreviated resume flags are
+refused on this adapter path. It never edits authentication or provider routes.
+
+V2 headless variants use `model: "provider/model"` plus `effort: "variant"`,
+encoded as `provider/model#variant`. The full V2 TUI has no `--model` flag;
+interactive plans retain its native model picker and reject explicit model or
+effort options instead of silently dropping them. V2 JSON runs require matching
+session/message frames, a final `step_finish` with reason `stop`, complete JSONL
+and native exit zero. Provider errors, interrupted/truncated output and incomplete
+tool loops cannot produce successful jobs. Usage comes only from completed step
+records. These checks confirm a native turn, not task acceptance or delivery.
+V2 live repair, attended idle mail and exact-resume recall remain unqualified
+until their native pilots pass; command plans and subprocess fixtures alone do
+not establish those capabilities.
 
 Unattended Pi/signed Pi JSON runs use an event-checking bridge in that same
 job group. Pi may exit zero after exhausted provider retries, so process status

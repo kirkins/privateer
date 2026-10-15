@@ -129,6 +129,7 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
         "omp",
         "claude",
         "opencode",
+        "opencode-v2",
         "gemini",
         "cursor",
         "grok",
@@ -156,7 +157,7 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
             assert_eq!(planned["argv"][2], name);
         }
         assert_eq!(planned["env_names"], json!([]));
-        let resume = if name == "opencode" {
+        let resume = if matches!(name, "opencode" | "opencode-v2") {
             "ses_0123456789abc"
         } else {
             id
@@ -514,6 +515,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/msp_bridge.py",
         "tests/omp_rpc.py",
         "tests/agy_turn.py",
+        "tests/opencode_v2.py",
     ] {
         let output = Command::new("python3")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))

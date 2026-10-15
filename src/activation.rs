@@ -69,7 +69,7 @@ fn session_started(harness: &str, event: &Value) -> Option<String> {
         }
         "gemini" if kind == "init" => &event["session_id"],
         "agy" if kind == "init" => &event["conversation_id"],
-        "opencode" if kind == "step_start" => &event["sessionID"],
+        "opencode" | "opencode-v2" if kind == "step_start" => &event["sessionID"],
         "rovo" | "kimi" | "devin" | "grok" | "muse"
             if kind == "session.started" && event["harness"] == harness =>
         {

@@ -1,0 +1,1 @@
+{"schema_version":1,"id":"opencode-v2","executable":["python3","../native.py","opencode-v2"],"timeout_ms":2000,"max_output_bytes":65536}
