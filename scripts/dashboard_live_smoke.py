@@ -221,7 +221,7 @@ def run(binary, runtime):
         harness.chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k not in
                {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
-        env.update(HOME=str(root), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
+        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
                    PATH=str(bins) + ":/usr/bin:/bin")
 
@@ -286,7 +286,7 @@ def onboarding(binary, runtime):
         harness.chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k not in
                {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
-        env.update(HOME=str(root), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
+        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color", PATH=str(bins)+":/usr/bin:/bin")
         # Skipping first-run setup creates neither a home nor a registry.
         skipped = Tui(binary, env, ["--no-herdr"])
@@ -326,7 +326,7 @@ def onboarding(binary, runtime):
         # created and the explicit Board limitation is shown, not a hidden launch.
         plain_root = root / "plain"
         plain_root.mkdir()
-        plain_env = dict(env, HOME=str(plain_root), PRIVATEER_FLEET=str(plain_root / "fleet.sqlite"),
+        plain_env = dict(env, HOME=str(plain_root), XDG_CONFIG_HOME=str(plain_root / "config"), PRIVATEER_FLEET=str(plain_root / "fleet.sqlite"),
                          PRIVATEER_RESOURCE_HOME=str(plain_root / "ledger"))
         plain = Tui(binary, plain_env, ["--no-herdr"])
         try:

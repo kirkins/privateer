@@ -20,6 +20,7 @@ impl Machine {
         let mut c = Command::new(binary);
         c.current_dir(folder)
             .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env("PRIVATEER_SERVICE", "none")
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
