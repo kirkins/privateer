@@ -235,6 +235,7 @@ fn herdr_dashboard_entry_uses_installed_sibling_and_preserves_direct_start_and_f
             .current_dir(&place.folder)
             .env("PATH", &place.path)
             .env("HOME", &place.root)
+            .env("XDG_CONFIG_HOME", place.root.join("config"))
             .env("PRIVATEER_FLEET", place.root.join("fleet.sqlite"))
             .env("PRIVATEER_SERVICE", "none")
             .env("PRIVATEER_RESOURCE_HOME", place.root.join("ledger"))
