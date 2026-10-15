@@ -41,9 +41,8 @@ jobs. Ordinary non-Git jobs do not require it.
 
 Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
 Herdr. With no current ship, first-run setup offers a dedicated ship folder.
-With a configured Herdr connection and a unique liaison, entry opens or focuses
-your liaison's conversation and keeps the dashboard available in its original
-tab. Press `l` in the dashboard to return to the liaison. Running
+Entry shows the bridge without boarding anyone, so first mates keep answering
+mail headlessly. Press `l` in the dashboard to talk to your liaison. Running
 `privateer-dashboard` directly opens the observability view. See
 [entry conditions and fallback guidance](docs/dashboard.md#first-run-and-everyday-entry).
 

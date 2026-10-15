@@ -291,7 +291,8 @@ fn dashboard_entry_uses_installed_sibling_or_path_in_both_environments() {
             assert!(!place.folder.join(".privateer").exists());
             assert!(!place.root.join("fleet.sqlite").exists());
             assert!(place.probes().is_empty());
-            assert_eq!(fs::read_to_string(&probe).unwrap(), "--board-liaison\n");
+            // The bridge only: nothing boards, so no ship becomes attended.
+            assert_eq!(fs::read_to_string(&probe).unwrap().trim(), "");
         }
     }
     assert!(
@@ -306,11 +307,7 @@ fn dashboard_entry_uses_installed_sibling_or_path_in_both_environments() {
             let args = fs::read_to_string(&probe).unwrap();
             assert_eq!(
                 args.lines().collect::<Vec<_>>(),
-                [
-                    "--board-liaison",
-                    "--home",
-                    place.folder.join(".privateer").to_str().unwrap()
-                ]
+                ["--home", place.folder.join(".privateer").to_str().unwrap()]
             );
             assert_eq!(place.probes().len(), launches);
             assert!(run(binary, &["start"], herdr).status.success());
