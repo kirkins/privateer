@@ -1,6 +1,8 @@
 //! Bounded fleet observations. Never open a runtime Store: even fleet discovery
 //! must work before the first home exists, without initializing state.
-use super::model::{ROW_LIMIT, Ship, Snapshot, validate_navigation};
+use super::model::{
+    ROW_LIMIT, Ship, Snapshot, read_registry, validate_navigation, validate_registry,
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -122,8 +124,17 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
         ..Snapshot::default()
     };
     let mut observed_homes = BTreeSet::new();
+    let mut claims = Vec::new();
     for (name, home) in members.into_iter().take(ROW_LIMIT) {
         crate::store::identifier(&name)?;
+        let config = read_registry(&home);
+        let validation = config
+            .as_ref()
+            .map_err(|error| error.to_string())
+            .and_then(|ships| validate_registry(ships).map_err(|error| error.to_string()));
+        if let Err(error) = validation {
+            out.presentation_error = Some(error);
+        }
         let mut ship = Ship {
             id: name.clone(),
             name: name.clone(),
@@ -137,7 +148,7 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
             // READ_ONLY and the existence check both matter: never resurrect a
             // deleted ship, even when its registry entry survives.
             ensure!(home.is_dir(), "ship home is missing: {}", home.display());
-            let snapshot = Snapshot::read(&home)?;
+            let snapshot = Snapshot::read_work(&home)?;
             let live = state(&home, &name)?;
             let conn = connection(&home.join("privateer.sqlite"))?;
             let scope: Option<String> = conn
@@ -152,7 +163,11 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
         })();
         match observation {
             Ok((local, live, scope)) => {
-                if let Some(config) = local.ships.iter().find(|s| s.id == name) {
+                if let Some(config) = config
+                    .as_ref()
+                    .ok()
+                    .and_then(|ships| ships.iter().find(|s| s.id == name))
+                {
                     ship = config.clone();
                 }
                 ship.description = scope;
@@ -169,6 +184,25 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
             Err(e) => ship.live.as_mut().unwrap().error = Some(e.to_string()),
         }
         out.ships.push(ship);
+        if let Ok(config) = config {
+            claims.extend(config);
+        }
+    }
+    for mut claim in claims {
+        if let Some(ship) = out.ships.iter_mut().find(|ship| ship.id == claim.id) {
+            ship.liaison |= claim.liaison;
+            for terminal in claim.terminals {
+                if !ship.terminals.iter().any(|binding| {
+                    binding.pane_id == terminal.pane_id
+                        && binding.terminal_id == terminal.terminal_id
+                }) {
+                    ship.terminals.push(terminal);
+                }
+            }
+        } else {
+            claim.live = None;
+            out.ships.push(claim);
+        }
     }
     out.truncated |= out.tasks.len() > ROW_LIMIT
         || out.pending.len() > ROW_LIMIT
@@ -183,6 +217,8 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     out.include_observed_ships();
     if let Err(error) = validate_navigation(&out.ships) {
         out.presentation_error = Some(error.to_string());
+    }
+    if out.presentation_error.is_some() {
         for ship in &mut out.ships {
             ship.liaison = false;
         }

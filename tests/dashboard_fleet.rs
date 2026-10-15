@@ -641,14 +641,16 @@ fn failed_fleet_observations_retain_mail_show_errors_and_never_open_missing_home
     let failed = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
     assert!(
         failed
-            .ships
-            .iter()
-            .all(|s| s.live.as_ref().unwrap().error.is_some())
+            .presentation_error
+            .as_ref()
+            .unwrap()
+            .contains("invalid dashboard.json")
     );
-    let must_not_run = m.root.join("must-not-run");
-    mailbox.refresh(&must_not_run, &failed, Some(&infra.join(".privateer")));
+    assert!(failed.ships[0].live.as_ref().unwrap().error.is_none());
+    assert!(failed.ships[1].live.as_ref().unwrap().error.is_some());
+    mailbox.refresh(&proxy, &failed, Some(&infra.join(".privateer")));
     assert_eq!(mailbox.messages.len(), 2);
-    assert_eq!(mailbox.errors.len(), 2);
+    assert_eq!(mailbox.errors.len(), 1);
     assert!(mailbox.errors.iter().all(|e| !e.contains("launch command")));
     assert!(!infra.join(".privateer").exists());
     let mut app = App {
@@ -1457,6 +1459,125 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
 }
 
 #[test]
+fn foreign_and_invalid_local_claims_block_navigation_without_hiding_durable_work() {
+    use privateer::dashboard::{herdr::View, model::Snapshot, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    for (folder, owner) in [(&apps, "apps"), (&infra, "infra")] {
+        m.json(
+            folder,
+            "task.create",
+            json!({"id":"work","charter_id":owner,"owner":owner,"title":"Recorded work"}),
+        );
+        m.json(folder, "event.emit", json!({"id":"fact","task_id":"work","issue_key":"review","kind":"blocked","payload":{"summary":"Durable fact"}}));
+        m.job(folder, "work", "job");
+        m.json(
+            folder,
+            "mail.send",
+            json!({"from":owner,"to":"captain","kind":"notice","body":"Still visible"}),
+        );
+    }
+    m.json(
+        &apps,
+        "task.handoff",
+        json!({"id":"work","actor":"apps","target":"infra"}),
+    );
+    m.json(&apps, "task.accept", json!({"id":"work","actor":"infra"}));
+    let herdr = View::demo();
+    let pane = &herdr.panes[1];
+    let binding =
+        json!({"socket":"/isolated/socket","socket_identity":herdr.socket_identity,"pane":pane});
+    m.json(
+        &apps,
+        "ship.attend",
+        json!({"ship":"apps","holder":"automatic","ttl_secs":3600}),
+    );
+    rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE presence SET binding=?1 WHERE ship='apps'",
+            [binding.to_string()],
+        )
+        .unwrap();
+    let apps_config = apps.join(".privateer/dashboard.json");
+    let infra_config = infra.join(".privateer/dashboard.json");
+    let terminal = json!({"pane_id":pane.pane_id,"terminal_id":pane.terminal_id});
+    let own = json!({"id":"apps","name":"Apps","liaison":true});
+    let foreign = json!({"id":"infra","name":"Infra","terminals":[terminal]});
+    let conflicting = json!({"id":"apps","name":"Apps","liaison":true,"terminals":[terminal]});
+    let baseline = m.dashboard()["snapshot"].clone();
+    let mut overflow = vec![own.clone()];
+    overflow.extend((0..198).map(|i| json!({"id":format!("peer-{i}"),"name":"Peer"})));
+    overflow.push(json!({"id":"crew","name":"Crew","terminals":[terminal]}));
+    for (source, config, peer) in [
+        (&apps_config, json!({"ships":[own, foreign]}).to_string(), "infra"),
+        (&apps_config, json!({"ships":[own, {"id":"infra","name":"Infra","terminals":[{"pane_id":pane.pane_id,"terminal_id":"older-terminal"}]}]}).to_string(), "infra"),
+        (&apps_config, json!({"ships":[own, {"id":"crew","name":"Crew","terminals":[terminal]}]}).to_string(), "crew"),
+        (&apps_config, json!({"ships":[conflicting, foreign]}).to_string(), "infra"),
+        (&infra_config, json!({"ships":[conflicting, foreign]}).to_string(), "infra"),
+        (&apps_config, json!({"ships":[own, {"id":"infra","name":"","terminals":[terminal]}]}).to_string(), "infra"),
+        (&apps_config, "invalid JSON".into(), ""),
+        (&apps_config, json!({"ships":overflow}).to_string(), ""),
+    ] {
+        fs::write(&apps_config, json!({"ships":[own]}).to_string()).unwrap();
+        fs::write(&infra_config, "{\"ships\":[]}").unwrap();
+        fs::write(source, config).unwrap();
+        let result = m.dashboard();
+        let snapshot: Snapshot = serde_json::from_value(result["snapshot"].clone()).unwrap();
+        assert!(snapshot.presentation_error.is_some());
+        for section in ["tasks", "pending", "activity", "jobs", "custody"] {
+            assert_eq!(result["snapshot"][section], baseline[section], "{section}");
+        }
+        assert!(result["mail_errors"].as_array().unwrap().is_empty());
+        assert_eq!(result["mail"].as_array().unwrap().len(), 2);
+        if !peer.is_empty() {
+            assert!(snapshot.ships.iter().any(|ship| ship.id == peer && ship.terminals.iter().any(|b| b.pane_id == pane.pane_id)));
+        }
+        let mut app = App { snapshot, herdr: Some(herdr.clone()), ..App::default() };
+        for id in ["apps", peer].into_iter().filter(|id| !id.is_empty()) {
+            app.select_ship(Some(id.into()));
+            assert!(app.binding_ambiguous(), "{id}");
+            for tab in [0, 2] {
+                app.select_tab(tab);
+                assert!(app.scoped_panes().is_empty(), "{id}");
+                assert!(app.selected_pane().is_none(), "{id}");
+            }
+        }
+        app.select_ship(None);
+        app.open_liaison();
+        assert!(app.selected_pane().is_none());
+    }
+    for path in [&apps_config, &infra_config] {
+        fs::write(
+            path,
+            json!({"ships":[{"id":"apps","name":"Apps","liaison":true,"terminals":[terminal]}]})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let recovered = m.dashboard();
+    assert!(recovered["snapshot"]["presentation_error"].is_null());
+    let mut app = App {
+        snapshot: serde_json::from_value(recovered["snapshot"].clone()).unwrap(),
+        herdr: Some(herdr.clone()),
+        ..App::default()
+    };
+    app.open_liaison();
+    assert_eq!(app.selected_pane(), Some(pane));
+    assert_eq!(
+        app.snapshot
+            .ships
+            .iter()
+            .find(|s| s.id == "apps")
+            .unwrap()
+            .terminals
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn local_presentation_metadata_and_terminal_fields_still_require_valid_configuration() {
     use privateer::dashboard::model::Snapshot;
     let m = Machine::new();
@@ -1478,7 +1599,7 @@ fn local_presentation_metadata_and_terminal_fields_still_require_valid_configura
         assert!(error.contains(reason), "{error}");
         let fleet = m.dashboard();
         assert!(
-            fleet["snapshot"]["ships"][0]["live"]["error"]
+            fleet["snapshot"]["presentation_error"]
                 .as_str()
                 .unwrap()
                 .contains(reason)
