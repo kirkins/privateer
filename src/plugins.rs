@@ -202,7 +202,10 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
         .take(512)
         .collect();
     let executable = std::env::current_exe().context("cannot locate Privateer executable")?;
-    let mut context = json!({"task_id": id, "title": title, "repo": charter["repo"], "owner": task["owner"], "actions": charter["actions"], "control":{"version":1,"cli_argv":[executable,"--home",store.home()]}});
+    // A sandboxed harness must be able to write the home and the shared
+    // resource ledger to keep records and start crew jobs.
+    let writable = json!([store.home(), crate::jobs::ledger_dir(store)?]);
+    let mut context = json!({"task_id": id, "title": title, "repo": charter["repo"], "owner": task["owner"], "actions": charter["actions"], "control":{"version":1,"cli_argv":[executable,"--home",store.home()],"writable":writable}});
     // Wake-specific text goes after the stable brief, so the brief's bytes
     // stay identical across wakes and its prefix keeps hitting the cache.
     let mut text = brief(&context);
