@@ -308,7 +308,7 @@ fn output_is_drained_and_saved_logs_keep_their_head_and_tail() {
             "/bin/sh",
             "-c",
             "echo '{\"type\":\"session\",\"id\":\"first\"}'; \
-             i=0; while [ $i -lt 3072 ]; do head -c 1023 /dev/zero | tr '\\0' x; echo; i=$((i+1)); done; \
+             head -c 3142656 /dev/zero | tr '\\0' x | fold -w 1023; echo; \
              echo '{\"type\":\"agent_end\",\"usage\":{\"input\":7}}'; \
              dd if=/dev/zero bs=1048576 count=3 >&2 2>/dev/null",
         ],
