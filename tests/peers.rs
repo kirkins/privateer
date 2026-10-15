@@ -285,6 +285,8 @@ fn agent_role_travels_to_the_remote_home() {
     let fixture = TempDir::new().unwrap();
     let home = fixture.path().join("navigator");
     let remote = fixture.path().join("department");
+    // Provision as the operator: agent RPC may only open an existing home.
+    ok(&remote, "status", json!({}), None);
     let ssh = script(
         fixture.path(),
         "fake-ssh",
