@@ -119,9 +119,10 @@ impl Binding {
     }
 }
 
+/// Herdr answers one request per connection and then closes it, so each
+/// request opens its own stream to the socket this client first observed.
 pub struct Client {
     path: PathBuf,
-    reader: BufReader<UnixStream>,
     identity: (u64, u64),
     next_id: u64,
 }
@@ -129,11 +130,26 @@ pub struct Client {
 impl Client {
     pub fn connect(path: &Path) -> Result<Self> {
         ensure!(path.is_absolute(), "Herdr socket must be an absolute path");
-        let before = std::fs::metadata(path).context("Herdr socket unavailable")?;
-        let stream = UnixStream::connect(path).context("connect to configured Herdr socket")?;
-        let after = std::fs::metadata(path)?;
+        let metadata = std::fs::metadata(path).context("Herdr socket unavailable")?;
+        Ok(Self {
+            path: path.to_owned(),
+            identity: (metadata.dev(), metadata.ino()),
+            next_id: 0,
+        })
+    }
+
+    /// A fresh stream to the same socket inode this client was created for.
+    fn open(&self) -> Result<BufReader<UnixStream>> {
+        let before = std::fs::metadata(&self.path).context("Herdr socket unavailable")?;
         ensure!(
-            (before.dev(), before.ino()) == (after.dev(), after.ino()),
+            (before.dev(), before.ino()) == self.identity,
+            "Herdr socket changed; refresh"
+        );
+        let stream =
+            UnixStream::connect(&self.path).context("connect to configured Herdr socket")?;
+        let after = std::fs::metadata(&self.path)?;
+        ensure!(
+            (after.dev(), after.ino()) == self.identity,
             "Herdr socket changed during connection; refresh"
         );
         stream
@@ -142,12 +158,7 @@ impl Client {
         stream
             .set_read_timeout(Some(DEADLINE))
             .context("set Herdr read deadline")?;
-        Ok(Self {
-            path: path.to_owned(),
-            reader: BufReader::new(stream),
-            identity: (after.dev(), after.ino()),
-            next_id: 0,
-        })
+        Ok(BufReader::new(stream))
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -155,7 +166,8 @@ impl Client {
         let id = format!("privateer-dashboard-{}", self.next_id);
         let mut request = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
         request.push(b'\n');
-        self.reader.get_mut().write_all(&request)?;
+        let mut reader = self.open()?;
+        reader.get_mut().write_all(&request)?;
         let deadline = Instant::now() + DEADLINE;
         let mut response = Vec::new();
         loop {
@@ -165,9 +177,9 @@ impl Client {
             // poll enforces the total deadline without repeatedly resetting
             // SO_RCVTIMEO (macOS can refuse that after the peer has closed,
             // even while a large reply remains buffered).
-            if self.reader.buffer().is_empty() {
+            if reader.buffer().is_empty() {
                 let mut fd = libc::pollfd {
-                    fd: self.reader.get_ref().as_raw_fd(),
+                    fd: reader.get_ref().as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
@@ -182,7 +194,7 @@ impl Client {
                 }
                 ensure!(ready > 0, "Herdr response deadline exceeded");
             }
-            let block = self.reader.fill_buf().context("read Herdr response")?;
+            let block = reader.fill_buf().context("read Herdr response")?;
             ensure!(!block.is_empty(), "Herdr closed the response stream");
             let end = block.iter().position(|b| *b == b'\n').map(|i| i + 1);
             let n = end.unwrap_or(block.len());
@@ -191,7 +203,7 @@ impl Client {
                 "Herdr response exceeds 1 MiB"
             );
             response.extend_from_slice(&block[..n]);
-            self.reader.consume(n);
+            reader.consume(n);
             if end.is_some() {
                 break;
             }

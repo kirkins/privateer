@@ -313,14 +313,15 @@ fn snapshot(terminal: &str) -> Value {
 
 fn server(path: &Path, replies: Vec<Value>) -> thread::JoinHandle<Vec<Value>> {
     let listener = UnixListener::bind(path).unwrap();
+    // Like Herdr 0.8: one request per connection, then the server closes it.
     thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut reader = BufReader::new(stream);
         let mut requests = Vec::new();
         for reply in replies {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
