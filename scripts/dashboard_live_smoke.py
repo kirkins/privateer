@@ -221,7 +221,7 @@ def run(binary, runtime):
         harness.chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k not in
                {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
-        env.update(HOME=str(root), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
+        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
                    PATH=str(bins) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"))
 
