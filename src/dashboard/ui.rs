@@ -111,6 +111,37 @@ impl App {
             .get(self.selected)
             .map(|&i| &self.snapshot.tasks[i])
     }
+    fn binds(ship: &super::model::Ship, view: &herdr::View, pane: &herdr::Pane) -> bool {
+        ship.terminals
+            .iter()
+            .any(|b| b.pane_id == pane.pane_id && b.terminal_id == pane.terminal_id)
+            || ship
+                .live
+                .as_ref()
+                .and_then(|l| l.binding.as_ref())
+                .is_some_and(|b| b.matches(view, pane))
+    }
+    pub fn binding_ambiguous(&self) -> bool {
+        let Some(view) = &self.herdr else {
+            return false;
+        };
+        let Some(ship) = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == self.ship.as_ref())
+        else {
+            return false;
+        };
+        view.panes.iter().any(|p| {
+            Self::binds(ship, view, p)
+                && self
+                    .snapshot
+                    .ships
+                    .iter()
+                    .any(|other| other.id != ship.id && Self::binds(other, view, p))
+        })
+    }
     pub fn scoped_panes(&self) -> Vec<&herdr::Pane> {
         let Some(ship) = self
             .snapshot
@@ -141,6 +172,13 @@ impl App {
                     })
                     .filter(|p| automatic.is_none_or(|a| a.pane_id != p.pane_id)),
             )
+            .filter(|p| {
+                !self
+                    .snapshot
+                    .ships
+                    .iter()
+                    .any(|other| other.id != ship.id && Self::binds(other, view, p))
+            })
             .collect()
     }
 
@@ -446,6 +484,12 @@ impl App {
                     "{owned} owned assignments · {incoming} incoming handoffs"
                 )));
                 lines.push(Line::from(""));
+                if self.binding_ambiguous() {
+                    lines.push(Line::styled(
+                        "Ambiguous pane ownership; Board/focus disabled. Inspect exact bindings.",
+                        Style::default().fg(Color::Red),
+                    ));
+                }
                 lines.push(Line::from(if self.scoped_panes().is_empty() {
                     "b: Board this ship in Herdr."
                 } else {

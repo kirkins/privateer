@@ -304,6 +304,12 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
         app.notice = "Refresh Herdr and select the ship again.".into();
         return;
     }
+    if app.binding_ambiguous() {
+        app.notice =
+            "Pane is bound to more than one ship; resolve the exact bindings before boarding."
+                .into();
+        return;
+    }
     let action = if let Some(pane) = app.scoped_panes().first() {
         Some(HerdrAction::Focus(Focus {
             observed: view.clone(),
