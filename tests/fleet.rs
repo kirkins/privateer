@@ -191,6 +191,98 @@ fn an_agent_creates_ships_only_within_its_own_charter() {
 }
 
 #[test]
+fn an_agent_needs_an_active_spawn_charter_before_creating_a_ship() {
+    let machine = Machine::new();
+    let liaison = machine.ship("liaison");
+    for (child, change, reason) in [
+        (
+            "no-spawn",
+            json!({"id":"liaison","actions":["inspect","implement","test","message"]}),
+            "spawn",
+        ),
+        (
+            "revoked",
+            json!({"id":"liaison","actions":["inspect","spawn","implement"],"active":false}),
+            "revoked",
+        ),
+    ] {
+        machine.json(&liaison, "charter.put", change);
+        let output = machine.as_agent(&liaison, "liaison", "ship.create", json!({"name":child}));
+        assert!(
+            !output.status.success(),
+            "created {child} without authority"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(reason), "{error}");
+        assert!(!machine.ships.join(child).exists());
+        assert_eq!(machine.fleet(&liaison), ["liaison"]);
+    }
+}
+
+#[test]
+fn ship_creation_waits_for_committed_revocation_before_any_child_side_effect() {
+    use privateer::{
+        dispatch,
+        store::{Caller, Store},
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    let machine = Machine::new();
+    let liaison = machine.ship("liaison");
+    let store = Store::open(&liaison.join(".privateer")).unwrap();
+    // Open both connections before taking the lock, so store initialization
+    // cannot accidentally serialize an otherwise stale authority read.
+    let mut creating = Store::open(store.home()).unwrap();
+    creating.set_caller(Caller::Agent {
+        actor: "liaison".into(),
+    });
+    creating
+        .connection()
+        .busy_handler(Some(|attempt| {
+            WAITING.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            attempt < 5_000
+        }))
+        .unwrap();
+    let tx = store.write_transaction().unwrap();
+    let mut charter = store.charter("liaison").unwrap();
+    charter["active"] = json!(false);
+    tx.execute(
+        "UPDATE charters SET data=?1 WHERE id='liaison'",
+        [charter.to_string()],
+    )
+    .unwrap();
+    let folder = machine.ships.join("too-late");
+    let target = folder.clone();
+    let create = std::thread::spawn(move || {
+        // The unavailable adapter also keeps a regressed implementation from
+        // publishing anything outside this isolated folder before it fails.
+        dispatch(
+            &mut creating,
+            "ship.create",
+            json!({
+                "name":"too-late", "folder":target, "harness":"privateer-test-unavailable"
+            }),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !WAITING.load(Ordering::SeqCst) && !create.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    tx.commit().unwrap();
+    let error = create.join().unwrap().unwrap_err();
+    assert!(
+        WAITING.load(Ordering::SeqCst),
+        "creation never waited for the authority lock: {error}"
+    );
+    assert!(error.to_string().contains("revoked"), "{error}");
+    assert!(!folder.exists());
+    assert_eq!(machine.fleet(&liaison), ["liaison"]);
+}
+
+#[test]
 fn retiring_revokes_unlinks_and_keeps_the_folder() {
     let machine = Machine::new();
     let liaison = machine.ship("liaison");
