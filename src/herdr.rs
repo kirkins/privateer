@@ -447,6 +447,71 @@ impl Client {
         Ok(())
     }
 
+    /// Mark a space as Privateer's: `role` is `bridge`, `mate` or `crew`,
+    /// and `ship` the ship it belongs to.
+    pub fn tag(&mut self, workspace: &str, role: &str, ship: &str) -> Result<()> {
+        self.request(
+            "workspace.report_metadata",
+            json!({"workspace_id":workspace,"source":"privateer",
+                "tokens":{"privateer":role,"ship":ship}}),
+        )?;
+        Ok(())
+    }
+
+    /// Keep Privateer's spaces together at the top of the sidebar: the bridge
+    /// first, then each ship's first mate followed by its crew. Ships keep
+    /// their current order; other spaces are left alone below.
+    pub fn arrange(&mut self) -> Result<()> {
+        let listed = self.request("workspace.list", json!({}))?;
+        let spaces: Vec<(String, String, String)> = listed["workspaces"]
+            .as_array()
+            .context("workspace list missing")?
+            .iter()
+            .filter_map(|w| {
+                Some((
+                    w["workspace_id"].as_str()?.to_owned(),
+                    w["tokens"]["privateer"].as_str().unwrap_or("").to_owned(),
+                    w["tokens"]["ship"].as_str().unwrap_or("").to_owned(),
+                ))
+            })
+            .collect();
+        let mut ships: Vec<&str> = vec![];
+        for (_, role, ship) in &spaces {
+            if matches!(role.as_str(), "mate" | "crew") && !ships.contains(&ship.as_str()) {
+                ships.push(ship);
+            }
+        }
+        let of = |role: &str, ship: Option<&str>| -> Vec<String> {
+            spaces
+                .iter()
+                .filter(|(_, r, s)| r == role && ship.is_none_or(|ship| s == ship))
+                .map(|(id, _, _)| id.clone())
+                .collect()
+        };
+        let mut wanted: Vec<String> = of("bridge", None);
+        for ship in &ships {
+            wanted.extend(of("mate", Some(ship)));
+            wanted.extend(of("crew", Some(ship)));
+        }
+        let current: Vec<&String> = spaces
+            .iter()
+            .map(|(id, _, _)| id)
+            .take(wanted.len())
+            .collect();
+        if wanted.is_empty() || current.iter().copied().eq(wanted.iter()) {
+            return Ok(());
+        }
+        let before = spaces
+            .iter()
+            .map(|(id, _, _)| id)
+            .find(|id| !wanted.contains(id));
+        self.request(
+            "workspace.move_block",
+            json!({"workspace_ids":wanted,"before_workspace_id":before}),
+        )?;
+        Ok(())
+    }
+
     pub fn release_agent(&mut self, pane: &str, agent: &str) -> Result<()> {
         self.request(
             "pane.release_agent",
