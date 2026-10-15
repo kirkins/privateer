@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub const MAIL_PAGE_LIMIT: usize = 200;
+const OUTPUT_LIMIT: usize = MAIL_PAGE_LIMIT * (65_536 + 4096) + 1024;
+
 pub fn binary() -> Result<PathBuf> {
     let sibling = std::env::current_exe()?.with_file_name("privateer");
     Ok(if sibling.is_file() {
@@ -64,7 +67,7 @@ pub fn run(mut cmd: Command) -> Result<Vec<u8>> {
             let mut bytes = Vec::new();
             let result = pipe
                 .by_ref()
-                .take(1_048_577)
+                .take((OUTPUT_LIMIT + 1) as u64)
                 .read_to_end(&mut bytes)
                 .map(|_| bytes);
             let _ = send.send((error, result));
@@ -81,8 +84,8 @@ pub fn run(mut cmd: Command) -> Result<Vec<u8>> {
             while let Ok((error, bytes)) = recv.try_recv() {
                 let bytes = bytes?;
                 ensure!(
-                    bytes.len() <= 1_048_576,
-                    "command output exceeds 1 MiB; action outcome uncertain, refresh before retrying"
+                    bytes.len() <= OUTPUT_LIMIT,
+                    "command output exceeds {OUTPUT_LIMIT} bytes; action outcome uncertain, refresh before retrying"
                 );
                 if error {
                     errors = Some(bytes)

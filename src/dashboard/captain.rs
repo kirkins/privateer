@@ -114,7 +114,9 @@ impl App {
             _ => {
                 if let Some(draft) = &mut self.composer {
                     match key {
-                        KeyCode::Tab => draft.mode = draft.mode.next(),
+                        KeyCode::Tab if draft.correlation.is_none() => {
+                            draft.mode = draft.mode.next()
+                        }
                         KeyCode::Backspace => {
                             draft.body.pop();
                         }
@@ -185,7 +187,7 @@ impl App {
         let Some(draft) = self.composer.take() else {
             return;
         };
-        if !self.demo || draft.body.trim().is_empty() {
+        if !self.demo || (draft.mode != InputMode::Status && draft.body.trim().is_empty()) {
             self.notice = "No message sent.".into();
             return;
         }
@@ -239,12 +241,9 @@ impl App {
         let Some(draft) = self.composer.as_ref() else {
             return;
         };
-        if draft.body.trim().is_empty() || self.action.is_some() {
+        if self.action.is_some() {
             return;
         }
-        let Some(home) = draft.home.clone() else {
-            return;
-        };
         if draft.mode == InputMode::Status && draft.correlation.is_none() {
             self.notice = self
                 .snapshot
@@ -264,6 +263,12 @@ impl App {
             self.composer = None;
             return;
         }
+        if draft.body.trim().is_empty() {
+            return;
+        }
+        let Some(home) = draft.home.clone() else {
+            return;
+        };
         self.action = Some(super::mailbox::Action {
             home,
             verb: "mail.send".into(),
@@ -271,16 +276,16 @@ impl App {
         });
     }
     pub fn inbox_lines(&self) -> Vec<Line<'static>> {
+        let mut lines: Vec<_> = self
+            .mail_errors
+            .iter()
+            .map(|e| Line::from(format!("Mailbox unavailable: {}", clean(e, 512))))
+            .collect();
         let Some(mail) = self.mail.get(self.selected) else {
-            return std::iter::once(Line::from("No messages for the captain."))
-                .chain(
-                    self.mail_errors
-                        .iter()
-                        .map(|e| Line::from(format!("Mailbox unavailable: {}", clean(e, 512)))),
-                )
-                .collect();
+            lines.push(Line::from("No messages for the captain."));
+            return lines;
         };
-        vec![
+        lines.extend([
             Line::styled(
                 clean(&mail.subject, 160),
                 Style::default().fg(Color::Yellow),
@@ -299,7 +304,8 @@ impl App {
             } else {
                 "Enter: mark read · r: reply. A read acknowledges only the contiguous read prefix."
             }),
-        ]
+        ]);
+        lines
     }
     pub fn draw_composer(&self, frame: &mut Frame) {
         let Some(draft) = &self.composer else {
@@ -346,9 +352,18 @@ impl App {
                 }),
             )
         });
-        frame.render_widget(Paragraph::new(Line::from(modes.to_vec())), rows[0]);
         frame.render_widget(
-            Paragraph::new(match draft.mode {
+            Paragraph::new(if draft.correlation.is_some() {
+                Line::from("Reply")
+            } else {
+                Line::from(modes.to_vec())
+            }),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(if draft.correlation.is_some() {
+                "Answer this request in its originating home."
+            } else { match draft.mode {
                 InputMode::Status => "Read recorded state. No agent wake or inference.",
                 InputMode::Ask => {
                     "A side question, without assigning work. Live answers may use inference."
@@ -356,7 +371,7 @@ impl App {
                 InputMode::Message => {
                     "Address work or conversation to this ship. Live delivery would request a wake."
                 }
-            })
+            }})
             .wrap(Wrap { trim: false }),
             rows[1],
         );
@@ -400,6 +415,10 @@ impl App {
         frame.render_widget(
             Paragraph::new(if self.demo {
                 "Tab: mode · Enter: preview · Esc: cancel"
+            } else if draft.correlation.is_some() {
+                "Enter: reply · Esc: cancel"
+            } else if draft.mode == InputMode::Status {
+                "Tab: mode · Enter: status · Esc: cancel"
             } else {
                 "Tab: mode · Enter: send · Esc: cancel"
             }),
