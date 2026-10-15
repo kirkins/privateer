@@ -73,8 +73,10 @@ def build(harness, request):
         allowed |= {"sandbox", "ephemeral"}
     if harness in ("pi", "pi-signed", "omp"):
         allowed |= {"provider", "ephemeral"}
-    if harness in ("pi", "pi-signed"):
+    if harness in ("pi", "pi-signed", "omp"):
         allowed |= {"bare"}
+    if harness == "omp":
+        allowed |= {"permission_mode", "transport"}
     if harness in ("claude", "grok", "gemini"):
         allowed |= {"permission_mode"}
     if harness == "gemini":
@@ -176,12 +178,36 @@ def build(harness, request):
             argv += (["resume", resume] if headless else [resume])
         argv += ["--", prompt]
     elif harness in ("pi", "pi-signed", "omp"):
+        transport = "native"
+        if harness == "omp":
+            transport = selector(options, "transport", ["native", "rpc"]) or ("rpc" if headless else "native")
+            if transport == "rpc" and not headless:
+                raise ValueError("OMP RPC requires headless mode")
+            if resume and transport != "rpc":
+                raise ValueError("OMP resume requires verified RPC preflight")
+            # Worker-local overrides: never inherit "latest session", a plan
+            # prompt, or an automatic model handoff from personal settings.
+            argv += ["--config", str(Path(__file__).with_name("omp") / "session.yml"), "--no-prewalk", "--cwd", repo]
+            home = Path(request["context"]["control"]["cli_argv"][2]).resolve(strict=True)
+            if not home.is_dir():
+                raise ValueError("OMP operational home missing")
+            added = set()
+            for path in [home, *request["context"]["control"].get("writable", [])]:
+                path = Path(path).resolve()
+                if path.is_dir() and path not in added:
+                    argv += ["--add-dir", str(path)]
+                    added.add(path)
+            permissions = selector(options, "permission_mode", ["always-ask", "write", "yolo"])
+            if permissions:
+                argv += ["--approval-mode", permissions]
+            if boolean(options, "bare"):
+                argv += ["--no-extensions", "--no-skills", "--no-rules", "--no-title", "--no-lsp", "--no-pty"]
         if harness != "omp" and boolean(options, "bare"):
             # Per-run resource isolation; retain native authentication and
             # model/provider files, including any private gateway route.
             argv += ["--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
                      "--no-context-files", "--no-themes"]
-        if headless:
+        if headless and transport != "rpc":
             argv += ["--print"]
         provider = option(options, "provider")
         if provider and not model:
@@ -190,7 +216,9 @@ def build(harness, request):
             argv += ["--provider", provider]
         if model:
             argv += ["--model", model]
-        if headless:
+        if transport == "rpc":
+            argv += ["--mode", "rpc", "--no-ui"]
+        elif headless:
             argv += ["--mode", "json"]
         if effort:
             argv += ["--thinking", effort]
@@ -200,6 +228,11 @@ def build(harness, request):
             if resume:
                 raise ValueError("cannot resume an ephemeral session")
             argv += ["--no-session"]
+        if transport == "rpc":
+            payload = {"argv": argv, "cwd": repo, "prompt": prompt, "resume": resume,
+                       "model": model, "provider": provider, "effort": effort,
+                       "ephemeral": boolean(options, "ephemeral")}
+            return repo, [sys.executable, str(Path(__file__).with_name("omp_rpc.py")), "--request", json.dumps(payload)]
         argv += ["--", prompt]
     elif harness == "claude":
         if boolean(options, "bare"):
@@ -345,7 +378,7 @@ def build(harness, request):
 def handle(harness, request):
     repo, argv = build(harness, request)
     return {"valid": True} if request["method"] == "validate" else {
-        "argv": argv if len(argv) > 1 and argv[0] == sys.executable and argv[1] in [str(Path(__file__).with_name(name)) for name in ("acp.py", "msp.py")] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), harness, *argv],
+        "argv": argv if len(argv) > 1 and argv[0] == sys.executable and argv[1] in [str(Path(__file__).with_name(name)) for name in ("acp.py", "msp.py", "omp_rpc.py")] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), harness, *argv],
         "cwd": repo, "env_names": []}
 
 
@@ -357,6 +390,7 @@ if __name__ == "__main__":
                                 "structured_headless_output": name != "devin",
                                 "acp_transport": name in ("rovo", "kimi", "devin"),
                                 "msp_transport": name == "muse",
+                                "rpc_transport": name == "omp",
                                 "qualification": "command-plan; native pilots required"}
                           for name, p in PROFILES.items()}, indent=2))
     elif len(sys.argv) == 2 and sys.argv[1] in PROFILES:

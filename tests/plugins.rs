@@ -141,8 +141,17 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
         let mut args = f.args(&example(name));
         let planned = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
         assert_eq!(planned["cwd"], json!(f.repo));
-        if name == "rovo" {
-            assert!(planned["argv"][1].as_str().unwrap().ends_with("acp.py"));
+        if matches!(name, "rovo" | "omp") {
+            assert!(
+                planned["argv"][1]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(if name == "rovo" {
+                        "acp.py"
+                    } else {
+                        "omp_rpc.py"
+                    })
+            );
         } else {
             assert_eq!(planned["argv"][2], name);
         }
@@ -161,7 +170,7 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
             );
         } else {
             let resumed = resumed.unwrap();
-            if name == "rovo" {
+            if matches!(name, "rovo" | "omp") {
                 let payload: Value =
                     serde_json::from_str(resumed["argv"][3].as_str().unwrap()).unwrap();
                 assert_eq!(payload["resume"], resume);
@@ -237,6 +246,65 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
             args["options"] = invalid;
             assert!(plugins::dispatch(&mut f.store, "plugin.command", args.clone()).is_err());
         }
+    }
+}
+
+#[test]
+fn omp_workers_plan_native_permissions_and_verified_rpc_without_provider_configuration() {
+    let mut f = Fixture::new();
+    let mut args = f.args(&example("omp"));
+    args["options"] = json!({"model":"fixture/fixture-model","effort":"low","bare":true,"permission_mode":"write"});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+    assert!(plan["argv"][1].as_str().unwrap().ends_with("omp_rpc.py"));
+    let request: Value = serde_json::from_str(plan["argv"][3].as_str().unwrap()).unwrap();
+    let argv = request["argv"].as_array().unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|v| v[0] == "--approval-mode" && v[1] == "write")
+    );
+    assert!(
+        argv.windows(2)
+            .any(|v| v[0] == "--cwd" && v[1] == json!(f.repo))
+    );
+    assert_eq!(
+        argv.windows(2)
+            .filter(|v| v[0] == "--add-dir" && v[1] == json!(f.store.home()))
+            .count(),
+        1
+    );
+    assert!(argv.iter().any(|v| v == "--no-extensions"));
+    assert!(argv.iter().any(|v| v == "--no-prewalk"));
+    assert!(
+        !argv
+            .iter()
+            .any(|v| v == "--print" || v == "--continue" || v == "--auto-approve")
+    );
+    args["options"] = json!({"transport":"native"});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+    assert!(
+        plan["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--print")
+    );
+    assert!(
+        !plan["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--approval-mode")
+    );
+    for invalid in [
+        json!({"transport":"rpc","mode":"interactive"}),
+        json!({"transport":"native","resume":"46a81234-1234-4567-8123-123456789abc"}),
+        json!({"mode":"interactive","resume":"46a81234-1234-4567-8123-123456789abc"}),
+        json!({"permission_mode":"bypassPermissions"}),
+        json!({"bare":"true"}),
+        json!({"provider":"fixture"}),
+    ] {
+        args["options"] = invalid;
+        assert!(plugins::dispatch(&mut f.store, "plugin.command", args.clone()).is_err());
     }
 }
 
@@ -388,6 +456,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/acp_bridge.py",
         "tests/pi_turn.py",
         "tests/msp_bridge.py",
+        "tests/omp_rpc.py",
     ] {
         let output = Command::new("python3")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
@@ -481,7 +550,7 @@ for event in [
 
 #[test]
 fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contract() {
-    for harness in ["rovo", "muse"] {
+    for harness in ["rovo", "muse", "omp"] {
         let mut f = Fixture::new();
         fs::write(
             f.store.home().join("config.json"),
@@ -491,7 +560,16 @@ fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contr
         let fakebin = f.base().join("bin");
         fs::create_dir(&fakebin).unwrap();
         let server = fakebin.join(harness);
-        fs::write(&server,r#"#!/usr/bin/env python3
+        let script = if harness == "omp" {
+            format!(
+                "#!/usr/bin/env python3\nimport sys\nsys.path.insert(0,{:?})\nfrom omp_rpc import SERVER\nexec(SERVER)\n",
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests")
+                    .display()
+                    .to_string()
+            )
+        } else {
+            r#"#!/usr/bin/env python3
 import json,os,subprocess,sys
 harness=os.path.basename(sys.argv[0])
 sid='46a81234-1234-4567-8123-123456789abc'
@@ -523,7 +601,9 @@ for line in sys.stdin:
     else:raise RuntimeError('unexpected method')
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
     if method=='turn/start':print(json.dumps({'jsonrpc':'2.0','method':'turn/completed','params':{'sessionId':sid,'turnId':turn,'terminal':'completed'}}),flush=True)
-"#).unwrap();
+"#.to_owned()
+        };
+        fs::write(&server, script).unwrap();
         fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
         let options = if harness == "muse" {
             json!({"transport":"msp"})
@@ -547,6 +627,8 @@ for line in sys.stdin:
                 )
                 .env("STDIO_TEST_CLI", env!("CARGO_BIN_EXE_privateer"))
                 .env("STDIO_TEST_HOME", f.store.home())
+                .env("OMP_TEST_RUNTIME_CLI", env!("CARGO_BIN_EXE_privateer"))
+                .env("OMP_TEST_RUNTIME_HOME", f.store.home())
                 .output()
                 .unwrap();
             assert!(
@@ -578,10 +660,14 @@ for line in sys.stdin:
                 "{wake}"
             );
             assert_eq!(wake["session_id"], "46a81234-1234-4567-8123-123456789abc");
-            assert!(
-                wake["usage"].is_null(),
-                "unreported native usage must remain absent"
-            );
+            if harness == "omp" {
+                assert_eq!(wake["usage"], json!({"input":4,"output":2}));
+            } else {
+                assert!(
+                    wake["usage"].is_null(),
+                    "unreported native usage must remain absent"
+                );
+            }
             let request = privateer::dispatch(&mut f.store, "mail.show", json!({"id":id})).unwrap();
             assert_eq!(request["state"], "answered");
         }
@@ -839,7 +925,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
 
 #[test]
 fn cancellation_reaches_the_execed_harness_and_its_descendants() {
-    for harness in ["codex", "rovo", "pi", "muse"] {
+    for harness in ["codex", "rovo", "pi", "muse", "omp"] {
         let mut f = Fixture::new();
         fs::write(
             f.store.home().join("config.json"),

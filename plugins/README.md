@@ -20,7 +20,7 @@ stdin-detached `agent.start` job path.
 | `claude` | `claude` | Full session UUID | Yes |
 | `pi` | `pi` | Full session UUID or existing absolute session file | Yes |
 | `pi-signed` | `pi-signed` | Same as Pi; requires the selected wrapper | Yes |
-| `omp` | `omp` | Full session UUID or existing absolute session file | Yes |
+| `omp` | `omp` | Full session UUID or existing absolute session file, verified through RPC | Yes, fresh |
 | `opencode` | `opencode` | Native `ses_…` ID | Yes |
 | `gemini` | `gemini` | Full session UUID | Yes |
 | `cursor` | `cursor-agent` | Full chat UUID | Yes |
@@ -77,6 +77,36 @@ model retries or provider fallback are introduced. Native events are preserved;
 one final summary counts only authoritative completed-message and compaction
 usage, excluding repeated streaming snapshots. This confirms native run
 completion, not the task's acceptance criteria, test results or mail delivery.
+
+OMP headless runs use its native RPC interface (`--mode rpc --no-ui`) by
+default. The owned host is checked before the assignment prompt: an exact
+session, no queued/background work or active goal, and confirmed explicit
+model/provider/effort selections. Resume also verifies the native file's header
+identity and recorded repository. OMP can otherwise switch to a resumed
+conversation's repository; passing a working directory alone does not prevent
+that. The header reader accepts the current native title-slot prefix with a
+bounded two-record read. It never searches arbitrary transcript entries.
+
+The RPC bridge correlates admission and `prompt_result`, requires completed
+agent work, waits for quiescence, checks final state and the last assistant
+stop, then confirms clean host shutdown. A yielded foreground turn with pending
+background work is insufficient. Failed, aborted, local-only, truncated,
+mis-correlated and unconfirmed turns fail without adding provider retries.
+Only authoritative completed-message and compaction usage is counted; repeated
+snapshots stay nested events. Ephemeral turns do not advertise a durable session
+for later focus resumes. See the [native OMP 18.8.9 protocol](https://github.com/can1357/oh-my-pi/blob/v18.8.9/docs/rpc.md).
+
+OMP also accepts native `permission_mode` (`always-ask`, `write`, `yolo`),
+omitted by default, and boolean `bare`. Bare disables extension, skill and rule
+discovery, automatic titles, LSP and PTY tools for the invocation. Existing
+provider/authentication settings remain native. A tracked per-run overlay
+disables implicit latest-session resume, startup plan mode and automatic
+prewalk model handoff. The repository and existing operational home/ledger
+directories are explicit workspace roots. No personal config file is written.
+`transport: native` explicitly selects a fresh print run; interactive plans are
+fresh native commands. Resume requires the RPC preflight. Native extensions
+remain trusted code and may have their own startup effects; preflight gates
+the assignment prompt, not arbitrary extension behavior.
 
 Rovo uses its native ACP interface rather than a guessed positional prompt or
 the older `acli rovodev` CLI. Kimi and Devin optionally accept `transport: acp`;
@@ -164,6 +194,12 @@ not full lifecycle parity. The ACP adapter has real pipe/process fixtures for
 session identity, permissions, deadlines, cancellation and the existing
 activation/mail contract. Native Kimi and Devin initialization has been checked;
 live authenticated ACP turns, including Rovo, still require qualification.
+OMP 18.8.9 native RPC fresh-state, exact resume and cross-repository refusal
+have passed without sending a prompt. Protocol fixtures cover quiescence,
+usage, role enforcement, focused activation/mail and descendant cancellation.
+The Command Code repair attempt selected the requested model but returned
+insufficient credits; no further attempt was made on that account. Live OMP
+repair, tool results, task mail, recorded jobs and recall remain unqualified.
 Muse 1.4.4 has passed real native echo creation, exact resume and writer-lease
 refusal without a replacement session, plus protocol
 fixtures for focused activation, mail, role enforcement and descendant
