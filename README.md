@@ -31,6 +31,7 @@ socket, with exact pane bindings. Injection of mail into agent panes is proposed
 but remains disabled pending a safe server-side occupant guard.
 See [dashboard setup and boundaries](docs/dashboard.md).
 
+
 ## Quick start
 
 Inside Herdr, bare `privateer` opens the fleet dashboard and first-run setup.

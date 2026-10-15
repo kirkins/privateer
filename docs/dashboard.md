@@ -15,12 +15,14 @@ to work independently.
 ## Build and preview
 
 ```sh
-cargo build --locked --features dashboard --bin privateer-dashboard
+cargo build --locked --features dashboard --bins
 ./target/debug/privateer-dashboard --demo
 ./target/debug/privateer-dashboard --demo --once
 ```
 
 Install both binaries with `cargo install --locked --path . --features dashboard`.
+Live mailbox commands use `privateer` beside the dashboard binary, falling back
+to `privateer` on `PATH`.
 
 The dashboard dependencies are optional. Ordinary `cargo build --bin privateer`
 does not enable them. Ratatui 0.29/Crossterm 0.28 preserve the project's Rust 1.85
@@ -35,13 +37,22 @@ and notices. `i` opens it; Enter marks the selected message read and `r` replies
 to a request or decision in its originating home. Acknowledgment advances only
 through messages explicitly marked read, so a decision read out of sequence
 cannot clear earlier unseen notices. Read markers waiting on an earlier message
-are session-local. Acknowledged open requests remain visible until answered.
+are session-local and survive refreshes beyond the current inbox page until
+acknowledged. Refreshing a newly reachable page acknowledges only its contiguous
+prefix of explicitly marked messages. Acknowledged open requests remain visible
+until answered.
 Each refresh reads at most 200 unread messages and 200 open requests per home,
 with at most 1,000 displayed items overall. Mark items read to reach later mail;
-no hidden row is acknowledged. Failed homes show an error and retain their last
+list previews are bounded to 100 characters, while details retain the supported
+body and JSON payload. Scroll with Page Up/Down or the wheel to read long mail;
+payload-only messages include a JSON preview and readable payload details.
+Refresh preserves scroll only while the same message in the same home remains
+selected; selecting another message starts its details at the top.
+No unseen row is acknowledged. Failed homes show an error and retain their last
 mail observation. The UI uses bounded worker queues; commands have 15-second
-deadlines and 1 MiB output limits. Failed sends retain their draft and id for an
-idempotent retry; a deadline means the action's outcome needs checking.
+deadlines and bounded output sized for a full mail page. Failed sends retain
+their draft and id for an idempotent retry; a deadline means the action's outcome
+needs checking.
 
 Select any ship and press `m`: Status summarizes recorded state without a model
 call; Ask sends a request and Message a notice from `captain`. Replies use the
@@ -169,8 +180,8 @@ Infrastructure and an idle Research ship.
 
 Live fleet ships come from active registry entries, with scope and status read
 from their own homes. The optional private `<home>/dashboard.json` supplies
-presentation names and exact terminal bindings. The single-home fallback also
-includes observed owner/handoff identities. A registry
+presentation names and exact terminal bindings. Fleet and single-home views also
+include observed owner/handoff identities. A registry
 entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
@@ -185,6 +196,10 @@ are presentation configuration. The dashboard reads the file without creating
 or modifying it. It accepts at most 64 KiB, 200 configured ships and 32 terminal
 bindings per ship. Duplicate identities and a pane bound to multiple ships are
 rejected. Missing configuration falls back to observed owners.
+Pane ownership and liaison uniqueness are also checked across assembled fleet
+homes. Conflicting presentation configuration produces a visible source error
+and disables terminal bindings and liaison shortcuts until corrected; recorded
+work, originating homes and custody history remain visible.
 
 A terminal belongs to a ship through its live verified presence binding, or an
 exact `pane_id` + `terminal_id` binding in this presentation registry. The live presence binding is primary, otherwise the first configured binding is primary. Similar
@@ -196,8 +211,12 @@ Unbound Herdr panes are not presented as another ship's crew.
 Assignments appear only in their owning ship's Assignments view. An offered
 handoff also appears under the recipient as **Incoming**, with the current owner
 shown explicitly. Ownership changes only after the runtime records acceptance;
-this dashboard does not initiate or accept transfers. The same task ID, jobs and
-pending facts follow the current owner. Logbook includes current assignments'
+this dashboard does not initiate or accept transfers. Every task, notice, job,
+activity and custody row retains its originating home, including work delegated
+to an owner registered in another home or absent from the fleet registry. Task
+selection and job joins use the home plus local task ID, so identical IDs from
+different homes remain distinct across refreshes and handoffs. Jobs and pending
+facts follow the current owner. Logbook includes current assignments'
 events and custody audit rows involving the ship, preserving an outgoing ship's
 handoff reference. Audit rows identify actor/action and current owner; the UI
 does not invent historical target information the runtime did not record.
@@ -234,8 +253,9 @@ resizing clears stale targets. Mouse capture is released on exit.
 
 The compact summary starts on. Grouped pending issues remain visible and routine
 facts stay available in Logbook; viewing never deletes facts or acknowledges an
-alert. Failed sources remain visibly unavailable while the last snapshot is
-retained with its age. The details toggle is session-local.
+alert. State and Herdr worker errors retain the last snapshot with its age;
+an unavailable fleet home remains listed with an error. The details toggle is
+session-local.
 
 The home screen has no boat or animation/status band: those three rows are
 available to assignments and details. `--ascii` uses a plain ASCII attention
@@ -249,16 +269,17 @@ function. No animation timer or motion controls run in the dashboard.
 
 ## Reliability boundaries
 
-- SQLite opens an existing database with `READ_ONLY`; it does not call
-  `Store::open`, run migrations, chmod the home, touch the shared resource ledger,
-  run job reconciliation or alter task/event/approval state. SQLite may use its
-  normal WAL/shared-memory sidecars. A missing home is an error, not an implicit
-  initialization.
-- Each state section is bounded to 200 rows with a truncation notice. Queries
+- Fleet/task observation opens an existing database with `READ_ONLY`; it does
+  not call `Store::open`, run migrations, chmod the home, touch the shared
+  resource ledger, run job reconciliation or alter task/event/approval state.
+  SQLite may use its normal WAL/shared-memory sidecars. A missing home is an error, not an implicit
+  initialization. Mailbox commands use the Store behavior described above.
+- Fleet/task sections are bounded to 200 rows with a truncation notice. Queries
   bound long fields; SQLite uses a 100 ms busy timeout and a 500 ms progress
   deadline. Text displayed in the terminal has control and bidi-override
-  characters removed. The view reads selected summary/message fields rather than
-  full payloads, argv, provider configuration or environment variables. Summaries
+  characters removed. Task views read selected summary fields; mail details keep
+  the full supported body and JSON payload within the display's row bound.
+  Views omit argv, provider configuration and environment variables. Summaries
   and messages can contain private text; treat screenshots accordingly.
 - State and Herdr refresh in separate workers, each with a one-item result
   channel. A stalled source cannot block keyboard handling. Herdr snapshots
@@ -284,7 +305,7 @@ Its Herdr regression scenarios also informed stale-identity checks and focus
 behavior; its shell backend and policy framework are not imported.
 
 Future work includes persistent navigator conversation, explicit task-to-native
-session bindings, direct worker messaging with delivery evidence, push events,
+session bindings, native-session delivery evidence, push events,
 and interactive launch/recovery/resource admission. These need meaningful
 qualification; the dashboard does not claim them through its labels or demo.
 

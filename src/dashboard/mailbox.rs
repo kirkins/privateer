@@ -24,36 +24,36 @@ pub struct Mailbox {
 }
 impl Mailbox {
     pub fn refresh(&mut self, binary: &Path, snapshot: &Snapshot, fallback: Option<&Path>) {
-        let mut homes: BTreeSet<PathBuf> = snapshot
-            .ships
-            .iter()
-            .filter_map(|s| {
-                s.live
-                    .as_ref()
-                    .filter(|l| l.error.is_none())
-                    .map(|l| l.home.clone())
-            })
-            .collect();
+        let mut homes: BTreeMap<PathBuf, Option<&str>> = BTreeMap::new();
+        for live in snapshot.ships.iter().filter_map(|s| s.live.as_ref()) {
+            let error = homes.entry(live.home.clone()).or_default();
+            if live.error.is_some() {
+                *error = live.error.as_deref();
+            }
+        }
         if homes.is_empty() {
             if let Some(home) = fallback {
-                homes.insert(home.to_path_buf());
+                homes.insert(home.to_path_buf(), None);
             }
         }
         let mut messages = Vec::new();
         let mut errors = Vec::new();
-        for home in homes {
+        self.unread.retain(|home, _| homes.contains_key(home));
+        self.read.retain(|(home, _)| homes.contains_key(home));
+        for (home, error) in homes {
             let result = (|| -> Result<_> {
+                anyhow::ensure!(error.is_none(), "{}", error.unwrap_or_default());
                 let inbox = command::json(
                     binary,
                     &home,
                     "mail.inbox",
-                    &json!({"address":"captain","limit":200}),
+                    &json!({"address":"captain","limit":command::MAIL_PAGE_LIMIT}),
                 )?;
                 let requests = command::json(
                     binary,
                     &home,
                     "mail.requests",
-                    &json!({"address":"captain","state":"open","limit":200}),
+                    &json!({"address":"captain","state":"open","limit":command::MAIL_PAGE_LIMIT}),
                 )?;
                 let cursor = inbox["acknowledged_through"].as_i64().unwrap_or(0);
                 self.unread.insert(
@@ -79,19 +79,21 @@ impl Mailbox {
                 {
                     let id = m["id"].as_str().context("mail without id")?;
                     let seq = m["seq"].as_i64().context("mail without sequence")?;
+                    let body = m["body"].as_str().unwrap_or("");
+                    let preview = if body.is_empty() {
+                        m["payload"].to_string()
+                    } else {
+                        body.into()
+                    };
                     rows.insert(
                         seq,
                         Mail {
                             id: id.into(),
                             kind: m["kind"].as_str().unwrap_or("").into(),
                             from: m["from"].as_str().unwrap_or("").into(),
-                            subject: m["body"].as_str().unwrap_or("").chars().take(100).collect(),
-                            body: m["body"]
-                                .as_str()
-                                .unwrap_or("")
-                                .chars()
-                                .take(2048)
-                                .collect(),
+                            subject: preview.chars().take(100).collect(),
+                            body: body.into(),
+                            payload: m["payload"].clone(),
                             status: m["state"].as_str().unwrap_or("unread").into(),
                             home: Some(home.clone()),
                             seq,
@@ -99,6 +101,9 @@ impl Mailbox {
                         },
                     );
                 }
+                self.read
+                    .retain(|(read_home, seq)| read_home != &home || *seq > cursor);
+                self.ack_read(binary, &home)?;
                 Ok(rows.into_values().collect::<Vec<_>>())
             })();
             match result {
@@ -113,6 +118,17 @@ impl Mailbox {
                     );
                 }
             }
+            messages.sort_by_key(|m| {
+                (
+                    m.acknowledged
+                        || m.home
+                            .as_ref()
+                            .is_some_and(|home| self.read.contains(&(home.clone(), m.seq))),
+                    m.home.clone(),
+                    m.seq,
+                )
+            });
+            messages.truncate(1000);
         }
         messages.sort_by_key(|m| {
             (
@@ -126,21 +142,18 @@ impl Mailbox {
                 m.seq,
             )
         });
-        messages.truncate(1000);
         self.messages = messages;
         self.errors = errors;
-        self.read.retain(|(home, seq)| {
-            self.messages
-                .iter()
-                .any(|m| m.home.as_ref() == Some(home) && m.seq == *seq && !m.acknowledged)
-        });
     }
     pub fn mark_read(&mut self, binary: &Path, mail: &Mail) -> Result<()> {
         let home = mail.home.as_ref().context("sample message has no home")?;
         self.read.insert((home.clone(), mail.seq));
+        self.ack_read(binary, home)
+    }
+    fn ack_read(&self, binary: &Path, home: &Path) -> Result<()> {
         let mut through = None;
         for seq in self.unread.get(home).into_iter().flatten() {
-            if !self.read.contains(&(home.clone(), *seq)) {
+            if !self.read.contains(&(home.to_path_buf(), *seq)) {
                 break;
             }
             through = Some(*seq);
