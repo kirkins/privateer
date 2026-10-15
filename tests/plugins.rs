@@ -1,3 +1,5 @@
+mod support;
+
 use privateer::{plugins, store::Store};
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
@@ -129,6 +131,7 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
         "omp",
         "claude",
         "opencode",
+        "opencode-v2",
         "gemini",
         "cursor",
         "grok",
@@ -156,7 +159,7 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
             assert_eq!(planned["argv"][2], name);
         }
         assert_eq!(planned["env_names"], json!([]));
-        let resume = if name == "opencode" {
+        let resume = if matches!(name, "opencode" | "opencode-v2") {
             "ses_0123456789abc"
         } else {
             id
@@ -416,7 +419,7 @@ fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_id
     args["options"] = json!({"model":"fixture-model","permission_mode":"plan"});
     let plan = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
     let argv = plan["argv"].as_array().unwrap();
-    let output = Command::new(argv[0].as_str().unwrap())
+    let output = support::command(argv[0].as_str().unwrap())
         .args(argv[1..].iter().map(|v| v.as_str().unwrap()))
         .env_clear()
         .env(
@@ -450,7 +453,7 @@ fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_id
             .any(|a| a == "fixture-model")
     );
     // Empty PATH cannot fall back to another installed harness or provider.
-    let failed = Command::new(argv[0].as_str().unwrap())
+    let failed = support::command(argv[0].as_str().unwrap())
         .args(argv[1..].iter().map(|v| v.as_str().unwrap()))
         .env_clear()
         .env("PATH", f.base().join("missing-bin"))
@@ -493,7 +496,7 @@ assert session_started('agy',{'event':'init','conversation_id':identity,'init':{
 assert session_started('agy',{'event':'step_update','step_update':{'event':'init','conversation_id':identity}}) is None
 assert session_started('agy',{'type':'init','session_id':identity}) is None
 "#;
-    let output = Command::new("python3")
+    let output = support::command("python3")
         .args(["-c", script])
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"))
         .arg(f.base())
@@ -514,8 +517,9 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/msp_bridge.py",
         "tests/omp_rpc.py",
         "tests/agy_turn.py",
+        "tests/opencode_v2.py",
     ] {
-        let output = Command::new("python3")
+        let output = support::command("python3")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
             .output()
             .unwrap();
@@ -555,7 +559,7 @@ for event in [
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
     privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"Pi failure fixture","first_mate":{"manifest":example("pi"),"duty_task":"task","batch_secs":0,"max_delay_secs":0,"options":{"bare":true}}})).unwrap();
     privateer::dispatch(&mut f.store,"mail.send",json!({"id":"pi-work","from":"captain","to":"department","kind":"request","body":"Handle this fixture"})).unwrap();
-    let start = Command::new(env!("CARGO_BIN_EXE_privateer"))
+    let start = support::command(env!("CARGO_BIN_EXE_privateer"))
         .args([
             "--home",
             f.store.home().to_str().unwrap(),
@@ -675,7 +679,7 @@ for line in sys.stdin:
         privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"stdio protocol fixture","first_mate":{"manifest":example(harness),"options":options,"duty_task":"task","batch_secs":0,"max_delay_secs":0}})).unwrap();
         for (index, id) in ["stdio-work", "stdio-more"].into_iter().enumerate() {
             privateer::dispatch(&mut f.store,"mail.send",json!({"id":id,"from":"captain","to":"department","kind":"request","task_id":"task","body":"Handle the isolated protocol test"})).unwrap();
-            let tick = Command::new(env!("CARGO_BIN_EXE_privateer"))
+            let tick = support::command(env!("CARGO_BIN_EXE_privateer"))
                 .args([
                     "--home",
                     f.store.home().to_str().unwrap(),
@@ -853,7 +857,7 @@ fn charter_selected_provider_adapter_cannot_be_silently_switched() {
         )
         .is_err()
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_privateer"))
+    let output = support::command(env!("CARGO_BIN_EXE_privateer"))
         .args([
             "--home",
             f.store.home().to_str().unwrap(),
@@ -888,7 +892,7 @@ fn gateway_fixture(f: &Fixture) -> (PathBuf, PathBuf) {
     (agent, config)
 }
 fn gateway_call(f: &Fixture, agent: &Path, config: &Path, method: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_privateer"))
+    support::command(env!("CARGO_BIN_EXE_privateer"))
         .args([
             "--home",
             f.store.home().to_str().unwrap(),
@@ -915,7 +919,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
     assert!(!String::from_utf8_lossy(&output.stdout).contains("not-a-real-token"));
     let resume = "46a81234-1234-4567-8123-123456789abc";
     let gateway_options = |options: Value| {
-        Command::new(env!("CARGO_BIN_EXE_privateer"))
+        support::command(env!("CARGO_BIN_EXE_privateer"))
         .args(["--home", f.store.home().to_str().unwrap(), "plugin.command", "--json",
             &json!({"task_id":"task","manifest":example("gateway-pi"),"config":config,"options":options}).to_string()])
         .env("PI_CODING_AGENT_DIR", &agent).output().unwrap()
@@ -944,7 +948,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
     let argv = result["argv"].as_array().unwrap();
-    let mut process = Command::new(argv[0].as_str().unwrap());
+    let mut process = support::command(argv[0].as_str().unwrap());
     for arg in &argv[1..] {
         process.arg(arg.as_str().unwrap());
     }
@@ -976,7 +980,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
         &agent.join("models.json"),
         json!({"providers":{"fixture-route":{"baseUrl":"http://direct.example.invalid/v1","models":[{"id":"fixture-model"}]}}}),
     );
-    let mut process = Command::new(argv[0].as_str().unwrap());
+    let mut process = support::command(argv[0].as_str().unwrap());
     for arg in &argv[1..] {
         process.arg(arg.as_str().unwrap());
     }
@@ -1019,7 +1023,7 @@ else:
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-        let start = Command::new(env!("CARGO_BIN_EXE_privateer"))
+        let start = support::command(env!("CARGO_BIN_EXE_privateer"))
             .args([
                 "--home",
                 f.store.home().to_str().unwrap(),

@@ -49,7 +49,7 @@ The default charter allows implementation, testing, opening PRs, merging passing
 
 ## Build and try the isolated pilot
 
-Rust 1.85 or newer and Cargo are required. Unix systems are supported for process-group supervision. Python 3 and Git are used only by the isolated pilot and some process fixtures.
+Rust 1.85 or newer and Cargo are required. Unix systems are supported for process-group supervision. Python 3 is used by optional native adapters and process fixtures; Git is used by the pilot. Node 24 is required for the Pi/OMP extension tests. The extension runs inside the chosen harness in normal use.
 
 ```sh
 cargo build

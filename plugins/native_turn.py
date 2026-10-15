@@ -140,10 +140,79 @@ def requested_session(argv):
     return str(uuid.UUID(selected))
 
 
+class OpenCodeV2Turn(Turn):
+    """V2's run JSONL projection: a final stop step, never prose or exit alone.
+
+    Source contract: packages/cli/src/run/noninteractive.ts in OpenCode V2.
+    Execution success itself is not projected; combine the final step with the
+    CLI's zero exit. This does not establish a task's acceptance criteria.
+    """
+    def __init__(self, argv):
+        flags = argv[:argv.index("--")] if "--" in argv else argv
+        expected = flags[flags.index("--session")+1] if "--session" in flags else None
+        super().__init__(expected)
+        self.message = None
+        self.finished = set()
+        self.failed = False
+
+    def observe(self, value):
+        if not isinstance(value, dict):
+            raise ValueError("invalid-event")
+        identity = value.get("sessionID")
+        if (not isinstance(identity, str) or not identity.startswith("ses_")
+                or not identity[4:].isascii() or not identity[4:].isalnum()
+                or len(identity) > 512 or (self.expected and identity != self.expected)
+                or (self.session and identity != self.session)):
+            raise ValueError("session-identity")
+        kind = value.get("type")
+        if kind == "error":
+            self.failed = True
+            self.settled = False
+            return
+        part = value.get("part")
+        if not isinstance(part, dict) or part.get("sessionID") != identity:
+            raise ValueError("part-identity")
+        message = part.get("messageID")
+        if not isinstance(message, str) or not message or len(message) > 512:
+            raise ValueError("message-identity")
+        if kind == "step_start":
+            # Native provider retries project another start for the same
+            # assistant message without a finish for the rejected attempt.
+            if (part.get("type") != "step-start"
+                    or (self.message is not None and not self.settled and message != self.message)):
+                raise ValueError("step-start")
+            self.session, self.message = identity, message
+            self.settled, self.stop = False, None
+        elif kind == "step_finish":
+            if (self.session is None or message != self.message or self.settled
+                    or part.get("type") != "step-finish" or message in self.finished
+                    or len(self.finished) >= 10000):
+                raise ValueError("step-finish")
+            self.finished.add(message)
+            self.settled, self.stop = True, part.get("reason")
+            tokens = part.get("tokens")
+            if isinstance(tokens, dict):
+                usage = {key: tokens[key] for key in ("input", "output", "reasoning") if key in tokens}
+                cache = tokens.get("cache")
+                if isinstance(cache, dict):
+                    usage.update({new: cache[old] for old, new in (("read", "cacheRead"), ("write", "cacheWrite")) if old in cache})
+                self.add_usage(usage)
+        elif kind in ("text", "reasoning", "tool_use"):
+            if self.session is None or self.settled or message != self.message:
+                raise ValueError("part-outside-step")
+        else:
+            raise ValueError("unknown-native-event")
+
+    def complete(self):
+        return not self.failed and super().complete()
+
+
 def run(harness, argv):
-    if harness not in ("pi", "pi-signed", "agy") or not argv or argv[0] != harness:
+    binary = "opencode" if harness == "opencode-v2" else harness
+    if harness not in ("pi", "pi-signed", "agy", "opencode-v2") or not argv or argv[0] != binary:
         raise ValueError("invalid-native-command")
-    turn = AgyTurn(argv) if harness == "agy" else Turn(requested_session(argv))
+    turn = (OpenCodeV2Turn(argv) if harness == "opencode-v2" else
+            AgyTurn(argv) if harness == "agy" else Turn(requested_session(argv)))
     # The child stays in the owning job's group. Do not create a competing
     # process group, retry a model call, or infer task completion from prose.
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

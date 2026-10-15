@@ -11,6 +11,10 @@ contract. It is not an atomic authorization to deliver input. In particular,
 a new pane may be bound before Herdr has recognized its harness or native
 session. Such a binding must not authorize injection.
 
+Injection must be an explicit lease delivery mode, with exactly one presenter.
+Do not enable it alongside a native attended-mail extension, mod or hook. An
+unknown presenter or mode is not permission to inject.
+
 For injection, extend the lease with an explicitly qualified native session
 identity and expected harness. A runtime started in the bound pane must qualify
 that identity against its attended child; inherited pane ids alone cannot prove
@@ -27,6 +31,12 @@ and previous cursor. Build the batch using exactly the same cursor rules as
 hooks, including the mailbox acknowledgment cursor. Serialize injection with
 hook presentation so neither presents the same batch twice. Never move
 `mail.ack` on the captain's or agent's behalf.
+
+The proposed cursor must survive expiry, holder replacement and explicit release.
+Today `leave` deletes the presence row and its cursor. An injection implementation
+must instead retain presentation progress transactionally in an inactive record,
+clearing the live holder and binding, then reuse that cursor on the next lease.
+This is a proposed prerequisite; this PR does not change release semantics.
 
 The claim must precede the external effect to retain the existing *at most once
 presentation* rule. A crash between claim and prompt can leave mail unpresented;

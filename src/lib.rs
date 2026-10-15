@@ -3,6 +3,7 @@ pub mod admission;
 pub mod cli;
 pub mod context;
 pub mod core;
+pub mod crew;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod fleet;
@@ -65,6 +66,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "note" | "focus" => context::dispatch(store, command, args),
         "ship" | "mail" => mail::dispatch(store, command, args),
         "wake" => activation::dispatch(store, command, args),
+        "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let task = args
                 .get("task_id")

@@ -69,7 +69,7 @@ fn session_started(harness: &str, event: &Value) -> Option<String> {
         }
         "gemini" if kind == "init" => &event["session_id"],
         "agy" if kind == "init" => &event["conversation_id"],
-        "opencode" if kind == "step_start" => &event["sessionID"],
+        "opencode" | "opencode-v2" if kind == "step_start" => &event["sessionID"],
         "rovo" | "kimi" | "devin" | "grok" | "muse"
             if kind == "session.started" && event["harness"] == harness =>
         {
@@ -176,6 +176,7 @@ struct Mail {
     seq: i64,
     created_ms: i64,
     routine: bool,
+    crew: bool,
     focus: String,
     summary: String,
 }
@@ -208,7 +209,8 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
             summary.push_str(&format!(" correlation {correlation}"));
         }
         summary.push_str(&format!(" urgency {urgency}\n  {body}"));
-        if payload != "{}" && payload.len() <= 1024 {
+        // A crew report's body already states its payload.
+        if from != crate::mail::CREW && payload != "{}" && payload.len() <= 1024 {
             summary.push_str(&format!("\n  payload {payload}"));
         }
         let message = json!({"id": id, "from": from, "correlation": correlation,
@@ -219,6 +221,7 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
                 created_ms: r.get(9)?,
                 // Information-only notices wait for the next real wake.
                 routine: kind == "notice" && urgency == "low",
+                crew: from == crate::mail::CREW,
                 focus: String::new(),
                 summary,
             },
@@ -295,6 +298,11 @@ fn wake_text(
             mail.len() - shown
         ));
     }
+    if mail.iter().any(|m| m.crew) {
+        text.push_str(&format!(
+        "Mail from crew is written by the runtime: crew job outcomes from the job's record and logs, and reports from your running crew. An exit status is not proof: check results yourself (job.status, the logs, the work) before relying on them or reporting them, and record your judgement in the task's note. Answer a crew request with mail.send {{\"from\":\"{ship}\",\"to\":\"crew\",\"kind\":\"reply\",\"correlation\":...}}.\n"
+        ));
+    }
     text.push_str(&format!(
         "Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. For more history on a focus use focus.digest {{\"ship\":\"{ship}\",\"focus\":...}}. Before you finish, for each focus you worked on, replace its handoff note with note.put {{\"ship\":\"{ship}\",\"focus\":...,\"body\":...}}: what you are doing and why, what you are waiting on, and what comes next, in under 2 KB; facts are already recorded. Then acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."
     ));
@@ -351,6 +359,21 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
     };
     let mut settled = vec![];
     for (wake, job_id) in running {
+        // The wake is recorded before its job starts; a crash in between
+        // leaves no job to wait for.
+        let exists: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1)",
+            [&job_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            store.connection().execute(
+                "UPDATE wakes SET status='failed', finished_ms=?2, error=?3 WHERE id=?1",
+                params![wake, Store::now_ms(), "first mate job was never started"],
+            )?;
+            settled.push(json!({"wake": wake, "status": "failed", "usage": null}));
+            continue;
+        }
         let job = job_status(store, &job_id)?;
         let status = job["status"].as_str().unwrap_or("");
         if !matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out") {
@@ -583,30 +606,36 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     if let Some(config) = profile.get("config") {
         start["config"] = config.clone();
     }
-    let started = crate::dispatch(store, "agent.start", start);
-    let (status, error) = match &started {
-        Ok(_) => ("running", None),
-        Err(error) => ("failed", Some(format!("{error:#}"))),
-    };
+    // Record the wake, with its job id, before the job exists: its outcome
+    // must never be mistaken for crew and wake this first mate again.
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, focuses, harness, session_id)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?11, ?6, ?7, ?8, ?9, ?10, ?12, ?13)",
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id)
+         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9)",
         params![
             wake,
             name,
             primary,
             through,
-            started.is_ok().then_some(&wake),
-            status,
-            now,
-            error.is_some().then_some(now),
-            error,
-            json!(foci).to_string(),
             mode,
+            now,
+            json!(foci).to_string(),
             harness,
             resume
         ],
     )?;
+    let started = crate::dispatch(store, "agent.start", start);
+    let (status, error) = match &started {
+        Ok(_) => ("running", None),
+        Err(error) => ("failed", Some(format!("{error:#}"))),
+    };
+    if let Some(error) = &error {
+        store.connection().execute(
+            "UPDATE wakes SET status='failed', finished_ms=?2, error=?3,
+               job_id=CASE WHEN EXISTS(SELECT 1 FROM jobs WHERE id=?1) THEN job_id END
+             WHERE id=?1",
+            params![wake, Store::now_ms(), error],
+        )?;
+    }
     store.audit(
         "wake.started",
         &json!({"wake": wake, "ship": name, "through_seq": through, "status": status}),
@@ -617,16 +646,20 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     )
 }
 
-/// One dispatcher pass: deliver pending mail, settle finished wakes, wake
-/// the first mates that are due.
+/// One dispatcher pass: deliver pending mail, settle jobs whose supervisor
+/// vanished (recording their crew outcomes), settle finished wakes, wake the
+/// first mates that are due.
 pub fn tick(store: &mut Store) -> Result<Value> {
     let delivered = crate::dispatch(store, "mail.flush", json!({}))?;
+    let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
     let mut considered = vec![];
     for ship in ships(store)? {
         considered.push(consider(store, &ship)?);
     }
-    Ok(json!({"delivered": delivered, "settled": settled, "ships": considered}))
+    Ok(
+        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "ships": considered}),
+    )
 }
 
 /// Run the dispatcher. Only one runs per home, guarded by an exclusive lock
@@ -655,6 +688,9 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
     loop {
         let report = tick(store)?;
         let acted = report["settled"].as_array().is_some_and(|s| !s.is_empty())
+            || report["reconciled"]
+                .as_array()
+                .is_some_and(|s| !s.is_empty())
             || report["delivered"]["delivered"].as_u64().unwrap_or(0) > 0
             || report["ships"]
                 .as_array()

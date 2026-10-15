@@ -1,4 +1,5 @@
 #![cfg(feature = "dashboard")]
+mod support;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -17,7 +18,7 @@ impl Machine {
         Self { _temp: temp, root }
     }
     fn command(&self, binary: &str, folder: &Path) -> Command {
-        let mut c = Command::new(binary);
+        let mut c = support::command(binary);
         c.current_dir(folder)
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -50,7 +51,7 @@ impl Machine {
     fn proxy(&self) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let proxy = self.root.join("privateer-proxy");
-        fs::write(&proxy,format!("#!/bin/sh\nexport HOME='{}' XDG_CONFIG_HOME='{}/config' PRIVATEER_FLEET='{}/fleet.sqlite' PRIVATEER_SERVICE=none PRIVATEER_RESOURCE_HOME='{}/ledger'\nunset PRIVATEER_ROLE PRIVATEER_ACTOR PRIVATEER_HOME HERDR_ENV HERDR_SOCKET_PATH\nexec '{}' \"$@\"\n",self.root.display(),self.root.display(),self.root.display(),self.root.display(),env!("CARGO_BIN_EXE_privateer"))).unwrap();
+        fs::write(&proxy,format!("#!/bin/sh\nexport HOME='{}' XDG_CONFIG_HOME='{}/config' PRIVATEER_FLEET='{}/fleet.sqlite' PRIVATEER_SERVICE=none PRIVATEER_RESOURCE_HOME='{}/ledger'\nunset PRIVATEER_ROLE PRIVATEER_ACTOR PRIVATEER_HOME PRIVATEER_JOB PRIVATEER_PRESENCE_HOLDER PRIVATEER_WAKE PRIVATEER_CONTROL_CLI PRIVATEER_ATTENDED_HARNESS HERDR_ENV HERDR_SOCKET_PATH\nexec '{}' \"$@\"\n",self.root.display(),self.root.display(),self.root.display(),self.root.display(),env!("CARGO_BIN_EXE_privateer"))).unwrap();
         fs::set_permissions(&proxy, fs::Permissions::from_mode(0o755)).unwrap();
         proxy
     }
