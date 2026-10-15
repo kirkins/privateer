@@ -1067,3 +1067,32 @@ fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
     assert!(screen.contains("[l Talk to liaison]"));
     assert!(screen.contains("1 pending issue\n") || screen.contains("· 1 pending issue "));
 }
+
+#[test]
+fn a_message_leaving_the_inbox_yields_to_the_one_that_took_its_place() {
+    use privateer::dashboard::captain::Mail;
+    let mail = |id: &str| Mail {
+        id: id.into(),
+        kind: "notice".into(),
+        from: "apps".into(),
+        subject: id.into(),
+        body: id.into(),
+        payload: json!({}),
+        status: "unread".into(),
+        home: None,
+        seq: 0,
+        acknowledged: false,
+    };
+    let mut app = App::default();
+    app.open_inbox();
+    app.update_mail(vec![mail("a"), mail("b"), mail("c")], Vec::new());
+    app.selected = 1;
+    app.scroll = 4;
+    app.update_mail(vec![mail("a"), mail("c")], Vec::new());
+    assert_eq!(app.mail[app.selected].id, "c");
+    assert_eq!(app.scroll, 0);
+    app.update_mail(vec![mail("a")], Vec::new());
+    assert_eq!(app.mail[app.selected].id, "a");
+    app.update_mail(Vec::new(), Vec::new());
+    assert_eq!(app.selected, 0);
+}

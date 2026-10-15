@@ -446,6 +446,9 @@ fn replies_offer_only_reply_semantics_and_answer_in_the_originating_home() {
         app.open_inbox();
         app.selected = selected;
         app.reply();
+        let view = screen(&mut app);
+        assert!(view.contains(&format!("Reply to the {kind} from apps:")));
+        assert!(view.contains("“Please answer”"));
         app.edit_composer(KeyCode::Enter);
         assert!(app.action.is_none());
         assert!(app.composer.is_some());

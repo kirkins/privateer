@@ -325,7 +325,9 @@ impl App {
         if self.inbox_open {
             let index = selected
                 .and_then(|(home, id)| self.mail.iter().position(|m| m.home == home && m.id == id));
-            self.selected = index.unwrap_or(0);
+            // A message that left the inbox (read or answered) yields to the
+            // one that took its place, not to the top of the list.
+            self.selected = index.unwrap_or(self.selected.min(self.mail.len().saturating_sub(1)));
             if index.is_none() {
                 self.scroll = 0;
             }
