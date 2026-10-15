@@ -587,7 +587,7 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let duty = profile["duty_task"].as_str().unwrap_or("").to_owned();
     let task = primary
         .strip_prefix("task:")
-        .filter(|t| store.authorize(t, "spawn").is_ok() && store.authorize(t, "implement").is_ok())
+        .filter(|t| store.authorize(t, "spawn").is_ok())
         .map(str::to_owned)
         .unwrap_or(duty);
     let mut foci: Vec<String> = vec![];

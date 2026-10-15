@@ -246,13 +246,13 @@ const HOOK_TTL_SECS: u64 = 1_800;
 /// `privateer hook claude <Event>`: Claude Code hook entry point. It reads
 /// the hook payload on stdin and never breaks the session: any failure
 /// allows the event and is logged to `<home>/hooks.log`.
-pub fn claude_hook(home: Option<&Path>, event: &str) -> i32 {
+pub fn claude_hook(home: Option<&Path>, event: &str, caller: Result<crate::store::Caller>) -> i32 {
     let mut payload = String::new();
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut payload);
     let Some(home) = home else {
         return 0;
     };
-    match claude_hook_inner(home, event, &payload) {
+    match caller.and_then(|caller| claude_hook_inner(home, event, &payload, caller)) {
         Ok(code) => code,
         Err(error) => {
             let line = format!("{} {event}: {error:#}\n", Store::now_ms());
@@ -266,7 +266,12 @@ pub fn claude_hook(home: Option<&Path>, event: &str) -> i32 {
     }
 }
 
-fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
+fn claude_hook_inner(
+    home: &Path,
+    event: &str,
+    payload: &str,
+    caller: crate::store::Caller,
+) -> Result<i32> {
     // A supervised crew job may inherit this project's Claude settings and
     // the captain's environment. It has a brief, not an attended mailbox.
     if std::env::var_os("PRIVATEER_JOB").is_some()
@@ -281,13 +286,7 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
     if input.get("cursor_version").is_some() {
         return Ok(0);
     }
-    let mut store = Store::open(home)?;
-    store.set_caller(crate::store::Caller::resolve(
-        std::env::var("PRIVATEER_ROLE").ok().as_deref(),
-        std::env::var("PRIVATEER_ACTOR").ok().as_deref(),
-        None,
-        None,
-    )?);
+    let store = Store::open_as(home, caller)?;
     let Some(ship) = folder_ship(&store) else {
         return Ok(0);
     };

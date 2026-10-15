@@ -34,8 +34,10 @@ class Herdr:
         self.stopped = False
         self.panes, self.children, self.errors = [], [], []
         self.creates = self.focuses = 0
+        self.focused = []
         self.delay_next = False
         self.fail_next = False
+        self.protocol = 20
         self.expected_failures = set()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.accept, daemon=True)
@@ -67,7 +69,7 @@ class Herdr:
     def respond(self, request):
         method, params = request["method"], request["params"]
         if method == "session.snapshot":
-            return {"snapshot": {"version": "isolated-test", "protocol": 20, "panes": self.panes}}
+            return {"snapshot": {"version": "isolated-test", "protocol": self.protocol, "panes": self.panes}}
         if method == "tab.create":
             self.creates += 1
             n = self.creates
@@ -108,6 +110,7 @@ class Herdr:
         if method == "agent.focus":
             assert any(p["pane_id"] == params["target"] and p["agent"] == "codex" for p in self.panes)
             self.focuses += 1
+            self.focused.append(params["target"])
             return {"type": "agent_focused"}
         raise AssertionError(f"unexpected Herdr method: {method}")
 
@@ -128,19 +131,20 @@ class Herdr:
 
 
 class Tui:
-    def __init__(self, binary, env, args):
+    def __init__(self, binary, env, args, columns=132, cwd=None):
+        self.columns = columns
         gate_read, gate_write = os.pipe()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.close(gate_write)
             os.read(gate_read, 1)
             os.close(gate_read)
-            os.chdir(env["HOME"])
+            os.chdir(cwd or env["HOME"])
             os.execve(str(binary), [str(binary), *args], env)
         os.close(gate_read)
         self.reaped = False
         self.output = bytearray()
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 38, 132, 0, 0))
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 38, columns, 0, 0))
         os.write(gate_write, b"1")
         os.close(gate_write)
         self.drain(0.4)
@@ -175,7 +179,7 @@ class Tui:
     def screen(self):
         # Interpret cursor placement in Ratatui's incremental ANSI output.
         # Substrings in raw bytes miss text reused from the preceding frame.
-        rows, cols = 38, 132
+        rows, cols = 38, self.columns
         cells = [[" " for _ in range(cols)] for _ in range(rows)]
         row = col = 0
         def text(value):
@@ -228,7 +232,7 @@ class Tui:
 
 def run(binary, runtime):
     with tempfile.TemporaryDirectory(prefix="privateer-dash-", dir="/tmp") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         folder = root / "apps ' $fleet"
         folder.mkdir()
         bins = root / "bin"
@@ -240,7 +244,7 @@ def run(binary, runtime):
                            "while not (root/'release').exists() and not (root/f'release-{pane}').exists(): time.sleep(.05)\n")
         harness.chmod(0o755)
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("PRIVATEER_") and k not in {"HERDR_ENV", "HERDR_SOCKET_PATH"}}
+               if not k.startswith("PRIVATEER_") and not k.startswith("HERDR_")}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
                    PATH=os.pathsep.join([str(bins), str(Path(sys.executable).parent), os.environ.get("PATH", "/usr/bin:/bin")]))
@@ -388,3 +392,246 @@ def run(binary, runtime):
             server.close()
         assert not command("ship.presence", {"ship": "apps"})["attended"]
         print("Live dashboard PTY passed: captain reply, Board/start/presence/binding, retained-pane restart, failed/delayed startup guards, conflict and session rejection/recovery, focus, dispatcher status, new/retire; isolated fake Herdr only.")
+
+
+def onboarding(binary, runtime):
+    with tempfile.TemporaryDirectory(prefix="privateer-onboard-", dir="/tmp") as temporary:
+        root = Path(temporary).resolve()
+        bins = root / "bin"
+        bins.mkdir()
+        harness = bins / "codex"
+        harness.write_text("#!/usr/bin/env python3\nimport os,time\nfrom pathlib import Path\n"
+                           "Path(os.environ['HOME'],'harness-started').touch()\n"
+                           "while not Path(os.environ['HOME'],'release').exists(): time.sleep(.05)\n")
+        harness.chmod(0o755)
+        (bins / "privateer").symlink_to(runtime)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("PRIVATEER_") and not k.startswith("HERDR_")}
+        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
+                   PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color", PATH=str(bins)+":/usr/bin:/bin")
+        # Real bare-runtime entry works with every HERDR_* variable absent,
+        # as well as inside Herdr, before initializing the current folder.
+        for inside_herdr in [False, True]:
+            entry_root = root / ("herdr-entry" if inside_herdr else "ordinary-entry")
+            fresh = entry_root / "fresh"
+            user = entry_root / "user"
+            fresh.mkdir(parents=True)
+            user.mkdir()
+            entry_env = dict(env, HOME=str(user), XDG_CONFIG_HOME=str(entry_root / "config"),
+                             PRIVATEER_FLEET=str(entry_root / "fleet.sqlite"),
+                             PRIVATEER_RESOURCE_HOME=str(entry_root / "ledger"))
+            assert not any(key.startswith("HERDR_") for key in entry_env)
+            if inside_herdr:
+                entry_env["HERDR_ENV"] = "1"
+            skipped = Tui(runtime, entry_env, [], cwd=fresh)
+            try:
+                skipped.until(lambda: "Welcome" in skipped.screen(), "bare privateer did not open real welcome")
+                assert not list(fresh.iterdir()), "welcome initialized the current folder"
+                assert not (user / ".privateer").exists()
+                assert not (entry_root / "fleet.sqlite").exists()
+                assert not (user / "ships").exists()
+                assert not (user / "harness-started").exists()
+                skipped.keys(b"\x1b")
+            finally:
+                skipped.close()
+            assert not list(fresh.iterdir()), "skip initialized the current folder"
+            assert not (user / ".privateer").exists()
+            assert not (entry_root / "fleet.sqlite").exists()
+            assert not (user / "ships").exists()
+            assert not (user / "harness-started").exists()
+        server = Herdr(root, env)
+        server.protocol = 19
+        tui = None
+        folder = root / "custom contact ' folder"
+        home = folder / ".privateer"
+        try:
+            tui = Tui(binary, env, ["--herdr-socket", str(server.path)])
+            assert "liaison" in tui.screen() and "codex" in tui.screen()
+            tui.until(lambda: "HERDR UNAVAILABLE" in tui.screen(), "initial Herdr observation did not fail")
+            tui.keys(b"\x15contact\t\x15" + str(folder).encode() + b"\t\x1b[C\r")
+            tui.until(lambda: (home / "privateer.sqlite").is_file(), "onboarding did not initialize the chosen folder")
+            tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
+            tui.drain(2.2)
+            assert server.creates == 0 and not (root / "harness-started").exists()
+            server.protocol = 20
+            tui.until(lambda: (root / "harness-started").exists(), "onboarding did not automatically Board after Herdr recovery", timeout=25)
+            def query(verb, args):
+                out = subprocess.run([str(runtime), "--home", str(home), verb, "--json", json.dumps(args)],
+                                     env=env, capture_output=True, timeout=10)
+                assert out.returncode == 0, out.stderr.decode()
+                return json.loads(out.stdout)
+            tui.until(lambda: query("ship.presence", {"ship":"contact"})["attended"], "onboarded ship has no presence")
+            assert query("charter.show", {"id":"contact"})["actions"] == ["inspect", "spawn", "message"]
+            assert json.loads((home / "config.json").read_text())["preset"] == "liaison"
+            assert "Onboarding the captain" in (folder / "AGENTS.md").read_text()
+            tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
+            tui.drain(2.5)
+            assert server.creates == 1 and server.focuses == 0 and not server.errors, server.errors
+        finally:
+            if tui:
+                tui.close()
+            server.close()
+        multi_root = root / "multiple-presets"
+        multi_root.mkdir()
+        multi_env = dict(env, HOME=str(multi_root), XDG_CONFIG_HOME=str(multi_root / "config"),
+                         PRIVATEER_FLEET=str(multi_root / "fleet.sqlite"), PRIVATEER_RESOURCE_HOME=str(multi_root / "ledger"))
+        def multi_command(name, *arguments):
+            home = multi_root / name / ".privateer"
+            return subprocess.run([str(runtime), "--home", str(home), *arguments], cwd=multi_root,
+                                  env=multi_env, capture_output=True, check=True, timeout=10).stdout
+        for name in ["alpha", "beta", "gamma"]:
+            arguments = ["init", "--ship", name, "--harness", "codex"]
+            if name != "gamma":
+                arguments.append("--liaison")
+            multi_command(name, *arguments)
+        multi_server = Herdr(multi_root, multi_env)
+        multi = None
+        try:
+            multi = Tui(binary, multi_env, ["--herdr-socket", str(multi_server.path)])
+            multi.until(lambda: "gamma" in multi.screen(), "multiple preset fleet did not load")
+            multi.keys(b"l")
+            assert "No liaison configured" in multi.screen()
+            assert "PRESENTATION UNAVAILABLE" not in multi.screen()
+            for index, name in enumerate(["alpha", "beta", "gamma"]):
+                multi.keys(b"0" + b"j" * (index + 2) + b"\rb")
+                multi.until(lambda: json.loads(multi_command(name, "ship.presence", "--json", json.dumps({"ship":name})))["attended"],
+                            f"multiple presets blocked Board for {name}")
+                assert multi_server.creates == index + 1
+            multi.drain(2.5)
+            alpha_config = multi_root / "alpha/.privateer/dashboard.json"
+            beta_config = multi_root / "beta/.privateer/dashboard.json"
+            gamma = {"id":"gamma", "name":"gamma", "liaison":True}
+            alpha_config.write_text(json.dumps({"ships":[gamma]}))
+            multi.until(lambda: "Liaison · your default contact" in multi.screen(), "explicit contact did not override preset candidates")
+            multi.keys(b"lb")
+            multi.until(lambda: multi_server.focused == ["w1:p3"], "explicit contact did not focus the chosen ordinary ship")
+            beta_config.write_text(json.dumps({"ships":[{"id":"beta", "name":"beta", "liaison":True}]}))
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" in multi.screen(), "conflicting explicit contacts did not fail safely")
+            multi.keys(b"0jj\rbflf")
+            multi.drain(2.2)
+            assert (multi_server.creates, multi_server.focuses) == (3, 1)
+            beta_config.unlink()
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" not in multi.screen(), "explicit contact conflict did not recover")
+            bound = {key: multi_server.panes[0][key] for key in ("pane_id", "terminal_id")}
+            alpha_config.write_text(json.dumps({"ships":[dict(gamma, terminals=[bound])]}))
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" in multi.screen(), "manual claim against another preset's live pane was accepted")
+            multi.keys(b"bflf")
+            multi.drain(2.2)
+            assert (multi_server.creates, multi_server.focuses) == (3, 1)
+            alpha_config.unlink()
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" not in multi.screen(), "pane conflict did not recover")
+            multi.keys(b"l")
+            assert "No liaison configured" in multi.screen()
+            assert not multi_server.errors, multi_server.errors
+        finally:
+            if multi:
+                multi.close()
+            multi_server.close()
+        replacement_root = root / "replacement"
+        replacement_root.mkdir()
+        replacement_env = dict(env, HOME=str(replacement_root), XDG_CONFIG_HOME=str(replacement_root / "config"),
+                               PRIVATEER_FLEET=str(replacement_root / "fleet.sqlite"), PRIVATEER_RESOURCE_HOME=str(replacement_root / "ledger"))
+        replacement_server = Herdr(replacement_root, replacement_env)
+        replacement_server.protocol = 19
+        replacement = None
+        try:
+            replacement = Tui(binary, replacement_env, ["--herdr-socket", str(replacement_server.path)])
+            replacement.until(lambda: "HERDR UNAVAILABLE" in replacement.screen(), "replacement scenario needs a failed Herdr observation")
+            original_folder = replacement_root / "original"
+            original_home = original_folder / ".privateer"
+            replacement.keys(b"\x15contact\t\x15" + str(original_folder).encode() + b"\t\t\x15liaison\r")
+            replacement.until(lambda: (original_home / "privateer.sqlite").is_file(), "original ship was not created")
+            replacement.until(lambda: "Bridge" in replacement.screen(), "original ship was not observed")
+            def replacement_command(home, arguments):
+                return subprocess.run([str(runtime), "--home", str(home), *arguments], cwd=replacement_root,
+                                      env=replacement_env, capture_output=True, check=True, timeout=10).stdout
+            replacement_command(original_home, ["ship", "retire", "contact"])
+            new_folder = replacement_root / "new-home"
+            new_home = new_folder / ".privateer"
+            replacement_command(new_home, ["init", "--ship", "contact", "--harness", "codex", "--liaison"])
+            members = json.loads(replacement_command(new_home, ["fleet.list", "--json", '{}']))["ships"]
+            assert len(members) == 1 and Path(members[0]["home"]) == new_home.resolve()
+            replacement_server.protocol = 20
+            replacement.until(lambda: "automatic Board cancelled" in replacement.screen(), "a replacement registry mapping did not cancel the pending Board", timeout=25)
+            replacement.until(lambda: "HERDR UNAVAILABLE" not in replacement.screen(), "replacement scenario did not reconnect", timeout=25)
+            replacement.drain(2.5)
+            assert replacement_server.creates == 0 and replacement_server.focuses == 0
+            assert not (replacement_root / "harness-started").exists()
+            assert not json.loads(replacement_command(new_home, ["ship.presence", "--json", '{"ship":"contact"}']))["attended"]
+            assert not replacement_server.errors, replacement_server.errors
+        finally:
+            if replacement:
+                replacement.close()
+            replacement_server.close()
+        for original_role in ["ship", "liaison"]:
+            occupied_root = root / f"occupied-{original_role}"
+            occupied_root.mkdir()
+            occupied_env = dict(env, HOME=str(occupied_root), XDG_CONFIG_HOME=str(occupied_root / "config"),
+                                PRIVATEER_FLEET=str(occupied_root / "fleet.sqlite"), PRIVATEER_RESOURCE_HOME=str(occupied_root / "ledger"))
+            occupied = Tui(binary, occupied_env, ["--no-herdr"])
+            try:
+                occupied_folder = occupied_root / "desk"
+                occupied_folder.mkdir()
+                occupied_home = occupied_folder / ".privateer"
+                def invoke(arguments):
+                    return subprocess.run([str(runtime), "--home", str(occupied_home), *arguments],
+                                          env=occupied_env, cwd=occupied_root, capture_output=True, check=True, timeout=10).stdout
+                init = ["init", "--ship", "existing", "--harness", "codex"]
+                if original_role == "liaison":
+                    init.append("--liaison")
+                invoke(init)
+                invoke(["charter.put", "--json", json.dumps({"id":"existing", "actions":["inspect", "message"], "objective":"Captain edited"})])
+                config = (occupied_home / "config.json").read_bytes()
+                instructions = (occupied_folder / "AGENTS.md").read_bytes()
+                charter = json.loads(invoke(["charter.show", "--json", '{"id":"existing"}']))
+                registry = json.loads(invoke(["fleet.list", "--json", '{}']))
+                for index, requested_role in enumerate(["liaison" if original_role == "ship" else "ship", original_role]):
+                    if index:
+                        occupied.keys(b"\t")
+                    occupied.keys(b"\x15existing\t\x15" + str(occupied_folder).encode() + b"\t\t\x15" + requested_role.encode() + b"\r")
+                    occupied.drain(1.2)
+                    occupied.until(lambda: "choose an empty ship folder" in occupied.screen(), "onboarding accepted an initialized folder")
+                    assert (occupied_home / "config.json").read_bytes() == config
+                    assert (occupied_folder / "AGENTS.md").read_bytes() == instructions
+                    assert json.loads(invoke(["charter.show", "--json", '{"id":"existing"}'])) == charter
+                    assert json.loads(invoke(["fleet.list", "--json", '{}'])) == registry
+            finally:
+                occupied.keys(b"\x1b")
+                occupied.close()
+        for role, args in [("liaison", []), ("ship", ["--no-herdr"])]:
+            plain_root = root / f"offline {role}'s $(touch escaped)"
+            plain_root.mkdir()
+            plain_env = dict(env, HOME=str(plain_root), XDG_CONFIG_HOME=str(plain_root / "config"), PRIVATEER_FLEET=str(plain_root / "fleet.sqlite"),
+                             PRIVATEER_RESOURCE_HOME=str(plain_root / "ledger"))
+            # Keep path components unbroken so reading back the displayed shell
+            # command does not insert spaces at hard wraps in long worktrees.
+            plain = Tui(binary, plain_env, args, columns=max(132, 2 * len(str(plain_root)) + 80))
+            try:
+                plain.keys(b"\x15apps\t\t\t\x15" + role.encode() + b"\r")
+                plain_home = plain_root / "ships/apps/.privateer"
+                plain.until(lambda: (plain_home / "privateer.sqlite").is_file(), f"{role} first ship was not created")
+                canonical_home = plain_home.resolve(strict=True)
+                command = "privateer --home " + shlex.quote(str(canonical_home)) + " start"
+                def details():
+                    return " ".join(" ".join(line.split("│")[-2] for line in plain.screen().splitlines()
+                                             if line.count("│") >= 2).split())
+                plain.until(lambda: "Created apps. No Herdr connection configured; run: " + command
+                            in details(), "creation success and direct start command were not shown")
+                plain.drain(2.2)
+                screen = details()
+                displayed = screen.split("run: ", 1)[1].split(" start", 1)[0] + " start"
+                assert shlex.split(displayed) == ["privateer", "--home", str(canonical_home), "start"]
+                assert not (plain_root / "harness-started").exists(), "no-socket creation launched a session"
+                config = json.loads((plain_home / "config.json").read_text())
+                assert (config.get("preset") == "liaison") == (role == "liaison")
+                out = subprocess.run([str(runtime), "--home", str(plain_home), "charter.show", "--json", '{"id":"apps"}'],
+                                     env=plain_env, capture_output=True, check=True, timeout=10)
+                assert ("implement" in json.loads(out.stdout)["actions"]) == (role == "ship")
+                (plain_root / "release").touch()
+                subprocess.run(["sh", "-c", displayed], cwd=plain_root, env=plain_env,
+                               capture_output=True, check=True, timeout=10)
+                assert (plain_root / "harness-started").exists()
+                assert not (plain_root / "escaped").exists()
+            finally:
+                plain.close()
+        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")

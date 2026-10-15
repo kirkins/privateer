@@ -15,6 +15,7 @@ use std::{
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ShipState {
     pub home: PathBuf,
+    pub liaison: bool,
     pub binding: Option<crate::herdr::Binding>,
     pub harness: String,
     pub attended: bool,
@@ -44,6 +45,16 @@ pub fn connection(path: &Path) -> Result<Connection> {
 
 fn state(home: &Path, name: &str) -> Result<ShipState> {
     ensure!(home.is_dir(), "ship home is missing: {}", home.display());
+    use std::io::Read;
+    let config = home.join("config.json");
+    crate::store::reject_symlinks(&config)?;
+    let mut raw = Vec::new();
+    if let Ok(file) = std::fs::File::open(config) {
+        file.take(65_537).read_to_end(&mut raw)?;
+    }
+    ensure!(raw.len() <= 65_536, "ship config exceeds 64 KiB");
+    let liaison =
+        serde_json::from_slice::<serde_json::Value>(&raw).is_ok_and(|c| c["preset"] == "liaison");
     let conn = connection(&home.join("privateer.sqlite"))?;
     let description: Option<String> = conn.query_row(
         "SELECT json_extract(record,'$.first_mate.manifest') FROM ships WHERE name=?1 AND json_extract(record,'$.location')='here'",
@@ -88,6 +99,7 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
     let wakes = conn.prepare("SELECT substr(mode,1,40),substr(status,1,40) FROM wakes WHERE ship=?1 ORDER BY created_ms DESC LIMIT 3")?.query_map([name], |r| Ok(Wake {mode:r.get(0)?, status:r.get(1)?}))?.collect::<rusqlite::Result<_>>()?;
     Ok(ShipState {
         home: home.into(),
+        liaison,
         harness,
         binding,
         attended,
@@ -215,6 +227,17 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     out.jobs.truncate(ROW_LIMIT);
     out.custody.truncate(ROW_LIMIT);
     out.include_observed_ships();
+    if !out.ships.iter().any(|ship| ship.liaison) {
+        let mut candidates = out
+            .ships
+            .iter_mut()
+            .filter(|ship| ship.live.as_ref().is_some_and(|live| live.liaison));
+        if let Some(candidate) = candidates.next()
+            && candidates.next().is_none()
+        {
+            candidate.liaison = true;
+        }
+    }
     if let Err(error) = validate_navigation(&out.ships) {
         out.presentation_error = Some(error.to_string());
     }

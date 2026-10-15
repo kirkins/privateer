@@ -19,8 +19,9 @@ def main():
     args = parser.parse_args()
     binary = Path(args.binary).resolve()
     demo(str(binary))
-    from dashboard_live_smoke import run
+    from dashboard_live_smoke import run, onboarding
     run(binary, binary.with_name("privateer"))
+    onboarding(binary, binary.with_name("privateer"))
 
 
 def demo(binary):

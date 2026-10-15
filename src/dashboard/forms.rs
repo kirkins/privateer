@@ -16,6 +16,7 @@ pub enum Kind {
     New,
     Retire,
     Dispatcher,
+    Onboard,
 }
 pub struct Form {
     pub kind: Kind,
@@ -31,6 +32,10 @@ impl App {
             return;
         }
         if self.mail_pending {
+            return;
+        }
+        if self.snapshot.ships.is_empty() {
+            self.onboard();
             return;
         }
         let ship = self
@@ -61,6 +66,7 @@ impl App {
             ],
             Kind::Retire => vec![("Type the ship name to confirm", String::new())],
             Kind::Dispatcher => vec![("Action: status / start / stop", "status".into())],
+            Kind::Onboard => return self.onboard(),
         };
         self.form = Some(Form {
             kind,
@@ -69,6 +75,39 @@ impl App {
             fields,
             selected: 0,
         });
+    }
+    pub fn onboard(&mut self) {
+        if self.demo || self.mail_pending {
+            return;
+        }
+        let harnesses = crate::cli::installed_harnesses().unwrap_or_default();
+        let Some(root) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.notice = "HOME is needed for the suggested ship folder.".into();
+            return;
+        };
+        self.form = Some(Form {
+            kind: Kind::Onboard,
+            ship: "Welcome aboard Privateer".into(),
+            home: root.join("ships/liaison/.privateer"),
+            fields: vec![
+                ("Name", "liaison".into()),
+                (
+                    "Folder",
+                    root.join("ships/liaison").to_string_lossy().into_owned(),
+                ),
+                ("Harness", harnesses.first().cloned().unwrap_or_default()),
+                ("Role: liaison / ship", "liaison".into()),
+            ],
+            selected: 0,
+        });
+        self.notice = format!(
+            "Suggested: a liaison helps you set up the fleet. Installed harnesses: {}. Esc skips setup.",
+            if harnesses.is_empty() {
+                "none; install a supported harness first".into()
+            } else {
+                harnesses.join(", ")
+            }
+        );
     }
     pub fn edit_form(&mut self, key: KeyCode) {
         if self.mail_pending {
@@ -83,7 +122,21 @@ impl App {
             return;
         }
         let Some(form) = &mut self.form else { return };
+        let old_name = form.fields[0].1.clone();
         match key {
+            KeyCode::Delete => form.fields[form.selected].1.clear(),
+            KeyCode::Left | KeyCode::Right
+                if matches!(form.kind, Kind::Onboard) && form.selected == 2 =>
+            {
+                let harnesses = crate::cli::installed_harnesses().unwrap_or_default();
+                if !harnesses.is_empty() {
+                    let current = harnesses
+                        .iter()
+                        .position(|h| h == &form.fields[2].1)
+                        .unwrap_or(0);
+                    form.fields[2].1 = harnesses[(current + 1) % harnesses.len()].clone();
+                }
+            }
             KeyCode::Tab | KeyCode::Down => form.selected = (form.selected + 1) % form.fields.len(),
             KeyCode::Up => {
                 form.selected = (form.selected + form.fields.len() - 1) % form.fields.len()
@@ -99,10 +152,53 @@ impl App {
             }
             _ => {}
         }
+        if matches!(form.kind, Kind::Onboard) && form.selected == 0 {
+            if let Some(root) = std::env::var_os("HOME").map(PathBuf::from) {
+                if std::path::Path::new(&form.fields[1].1) == root.join("ships").join(&old_name) {
+                    form.fields[1].1 = root
+                        .join("ships")
+                        .join(&form.fields[0].1)
+                        .to_string_lossy()
+                        .into_owned();
+                }
+            }
+        }
     }
     pub fn submit_form(&mut self) {
         let Some(form) = &self.form else { return };
         let (verb, args) = match form.kind {
+            Kind::Onboard => {
+                let name = form.fields[0].1.trim();
+                let folder = PathBuf::from(form.fields[1].1.trim());
+                let harness = form.fields[2].1.trim();
+                let role = form.fields[3].1.trim();
+                if crate::store::identifier(name).is_err()
+                    || name == "captain"
+                    || !folder.is_absolute()
+                {
+                    self.notice = "Choose a valid ship name and absolute folder.".into();
+                    return;
+                }
+                if !crate::cli::installed_harnesses()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|h| h == harness)
+                {
+                    self.notice =
+                        "Choose an installed harness; use ←/→ on Harness to cycle.".into();
+                    return;
+                }
+                if !matches!(role, "liaison" | "ship") {
+                    self.notice = "Choose role liaison or ship.".into();
+                    return;
+                }
+                self.action = Some(Action {
+                    home: folder.join(crate::cli::STATE_DIR),
+                    verb: "init".into(),
+                    args: json!({"folder":folder,"name":name,"harness":harness,"liaison":role=="liaison"}),
+                });
+                return;
+            }
             Kind::New => {
                 let name = form.fields[0].1.trim();
                 if crate::store::identifier(name).is_err() || name == "captain" {
@@ -158,6 +254,7 @@ impl App {
             Kind::New => "New ship",
             Kind::Retire => "Retire ship · folder is kept",
             Kind::Dispatcher => "Dispatcher",
+            Kind::Onboard => "Welcome · your first ship (optional)",
         };
         frame.render_widget(Clear, popup);
         let mut lines = vec![Line::from(clean(&form.ship, 100))];
@@ -179,7 +276,7 @@ impl App {
         lines.push(Line::from(if self.mail_pending {
             "Command pending…"
         } else {
-            "Tab/↑↓: field · Enter: submit · Esc: cancel"
+            "Tab: field · Delete/Ctrl-U: clear · ←/→ harness · Enter: submit · Esc: skip/cancel"
         }));
         lines.push(Line::from(clean(&self.notice, 512)));
         frame.render_widget(

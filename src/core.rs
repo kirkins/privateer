@@ -485,6 +485,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 identifier(ship)?;
                 data["ship"] = json!(ship);
             }
+            if let Some(preset) = args.get("preset") {
+                if preset != "liaison" {
+                    bail!("unknown ship preset");
+                }
+                data["preset"] = preset.clone();
+            }
             let temp = store
                 .home()
                 .join(format!("config-{}.tmp", uuid::Uuid::new_v4()));

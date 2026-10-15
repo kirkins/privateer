@@ -43,6 +43,55 @@ pub fn json(binary: &Path, home: &Path, verb: &str, args: &Value) -> Result<Valu
     serde_json::from_slice(&run(cmd)?).context("invalid Privateer JSON response")
 }
 
+pub fn initialize(
+    binary: &Path,
+    folder: &Path,
+    name: &str,
+    harness: &str,
+    liaison: bool,
+) -> Result<Value> {
+    crate::store::Caller::from_env(None, None)?.require_operator("dashboard initialization")?;
+    crate::store::identifier(name)?;
+    ensure!(
+        !folder
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "choose a normalized ship folder without .."
+    );
+    ensure!(
+        folder.is_absolute()
+            && folder.parent().is_some()
+            && Some(folder) != std::env::var_os("HOME").as_deref().map(Path::new),
+        "choose a dedicated absolute ship folder"
+    );
+    crate::store::reject_symlinks(folder)?;
+    let home = folder.join(crate::cli::STATE_DIR);
+    ensure!(
+        !folder.exists() || std::fs::read_dir(folder)?.next().is_none(),
+        "choose an empty ship folder"
+    );
+    std::fs::create_dir_all(folder)?;
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(folder)
+        .env_remove("PRIVATEER_HOME")
+        .arg("--home")
+        .arg(&home)
+        .arg("init")
+        .arg("--ship")
+        .arg(name)
+        .arg("--harness")
+        .arg(harness);
+    if liaison {
+        cmd.arg("--liaison");
+    }
+    let report = String::from_utf8_lossy(&run(cmd)?).into_owned();
+    let home = std::fs::canonicalize(home)?;
+    let dispatcher = String::from_utf8_lossy(&service(binary, &home, "start")?).into_owned();
+    Ok(
+        serde_json::json!({"ship":name,"home":home,"harness":harness,"liaison":liaison,"report":report,"dispatcher":dispatcher}),
+    )
+}
+
 pub fn service(binary: &Path, home: &Path, action: &str) -> Result<Vec<u8>> {
     existing_home(home)?;
     ensure!(

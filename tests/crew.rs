@@ -285,7 +285,7 @@ fn jobs_that_end_in_the_capacity_queue_report_too() {
     fleet.ok(
         "resource.configure",
         json!({"max_heavy_jobs": 1, "max_load_per_cpu": 1024,
-            "min_available_memory_bytes": 0, "ramp_secs": 0}),
+            "min_available_memory_bytes": 0, "heavy_estimate":{"memory_bytes":0}, "ramp_secs": 0}),
         None,
     );
     let heavy = |id: &str, extra: Value| {

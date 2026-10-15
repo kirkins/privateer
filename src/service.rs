@@ -94,6 +94,19 @@ fn detached(home: &Path, binary: &Path) -> Result<()> {
         .append(true)
         .open(&log)?;
     let mut command = Command::new(binary);
+    for name in [
+        "PRIVATEER_ROLE",
+        "PRIVATEER_ACTOR",
+        "PRIVATEER_JOB",
+        "PRIVATEER_HOME",
+        "PRIVATEER_PRESENCE_HOLDER",
+        "PRIVATEER_WAKE",
+        "PRIVATEER_CONTROL_CLI",
+        "PRIVATEER_ATTENDED_HARNESS",
+        "PRIVATEER_CLAUDE_MAIL_UNTIL",
+    ] {
+        command.env_remove(name);
+    }
     command
         .arg("--home")
         .arg(home)

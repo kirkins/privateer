@@ -1,8 +1,13 @@
 mod support;
 
 use privateer::dispatch;
-use serde_json::json;
-use std::time::Duration;
+use serde_json::{Value, json};
+use std::{
+    fs,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 use support::{Fleet, now_settings};
 
 #[test]
@@ -235,7 +240,7 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
     let marker = fleet.root.join("slow-started.json");
     let script = fleet.root.join("slow-peer.py");
     fs::write(&script, format!(
-        "#!/usr/bin/env python3\nimport json, os, pathlib, sqlite3, time\nwith sqlite3.connect({:?}) as db:\n    wakes = db.execute(\"SELECT COUNT(*) FROM wakes\").fetchone()[0]\npathlib.Path({:?}).write_text(json.dumps({{\"pid\":os.getpid(),\"wakes\":wakes}}))\ntime.sleep(5)\n",
+        "#!/usr/bin/env python3\nimport json, os, pathlib, sqlite3, time\ntime.sleep(0.25)  # exercise cold interpreter startup\nwith sqlite3.connect({:?}) as db:\n    wakes = db.execute(\"SELECT COUNT(*) FROM wakes\").fetchone()[0]\npathlib.Path({:?}).write_text(json.dumps({{\"pid\":os.getpid(),\"wakes\":wakes}}))\ntime.sleep(5)\n",
         fleet.home.join("privateer.sqlite").to_string_lossy(), marker.to_string_lossy(),
     )).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -276,8 +281,9 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
     let started = Instant::now();
-    // Allow Python's cold start to record the marker on slower runners, while
-    // still cutting off the peer well before its five-second sleep completes.
+    // Budget for cold Python startup (including the injected delay), while
+    // remaining well below the fixture's five-second blocked call and the
+    // configured peer timeout. Production timeouts are unchanged.
     let first = tick(1000);
     assert!(started.elapsed() < Duration::from_secs(3), "{first}");
     assert_eq!(Fleet::infra(&first)["status"], "running", "{first}");
@@ -453,6 +459,11 @@ fn wakes_group_mail_by_focus_carry_handoff_notes_and_run_under_the_focus_task() 
 #[test]
 fn a_warm_single_focus_session_is_resumed_with_only_the_new_mail() {
     let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
     fleet.send(
         json!({"id":"q1","from":"apps","to":"infra","kind":"request","task_id":"infra-repair","body":"Start the repair?"}),
     );
@@ -465,6 +476,7 @@ fn a_warm_single_focus_session_is_resumed_with_only_the_new_mail() {
     );
     let woke = Fleet::infra(&fleet.tick());
     assert_eq!(woke["mode"], "resume", "{woke}");
+    assert_eq!(woke["task_id"], "infra-repair");
     let second = fleet.settle();
     assert_eq!(second["session_id"], session.as_str());
     // A resumed wake sends only the wake text: no brief, bearings or notes.
@@ -526,4 +538,226 @@ fn cold_mixed_rotated_or_failed_sessions_start_fresh() {
     fleet.configure(now_settings());
     assert_eq!(Fleet::infra(&fleet.tick())["mode"], "fresh");
     fleet.settle();
+}
+
+#[test]
+fn a_read_message_delegate_first_mate_wakes_without_implementation_authority() {
+    let mut fleet = Fleet::new(now_settings());
+    dispatch(
+        &mut fleet.store,
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+    )
+    .unwrap();
+    fleet.send(json!({"id":"liaison-question","from":"apps","to":"infra","kind":"request","task_id":"infra-repair","body":"Read and relay"}));
+    let woke = Fleet::infra(&fleet.tick());
+    assert_eq!(woke["status"], "running");
+    assert_eq!(woke["task_id"], "infra-repair");
+    let wake = fleet.settle();
+    assert_eq!(wake["status"], "succeeded", "{wake}");
+    assert_eq!(
+        dispatch(
+            &mut fleet.store,
+            "mail.show",
+            json!({"id":"liaison-question"})
+        )
+        .unwrap()["state"],
+        "answered"
+    );
+    let job = dispatch(&mut fleet.store, "job.status", json!({"id":wake["job_id"]})).unwrap();
+    assert_eq!(job["action"], "spawn");
+    assert_eq!(job["task_id"], "infra-repair");
+    for action in ["implement", "spawn"] {
+        let denied = dispatch(
+            &mut fleet.store,
+            "job.start",
+            json!({"task_id":"infra-duty","command":["sh","-c","exit 0"],"action":action}),
+        );
+        assert!(
+            denied.is_err(),
+            "ordinary jobs may not claim {action} under a liaison charter"
+        );
+    }
+}
+
+#[test]
+fn task_linked_liaison_wakes_stop_the_harness_and_child_when_authority_ends() {
+    fn active(pid: i64) -> bool {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8(output.stdout).unwrap();
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    }
+
+    for revoke in [false, true] {
+        let mut fleet = Fleet::new(now_settings());
+        fleet.ok(
+            "charter.put",
+            json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+            None,
+        );
+        fleet.ok(
+            "charter.put",
+            json!({"id":"liaison-focus","objective":"Coordinate a peer request",
+            "repo":fleet.root.join("repo"),"min_free_bytes":0,"job_timeout_secs":60,
+            "actions":["inspect","spawn","message"]}),
+            None,
+        );
+        fleet.ok(
+            "task.create",
+            json!({"id":"liaison-request","charter_id":"liaison-focus",
+            "owner":"infra","title":"Relay peer request"}),
+            None,
+        );
+        fs::write(fleet.root.join("mate.py"), r#"import json, os, pathlib, subprocess, sys
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+pathlib.Path(sys.argv[5]).write_text(json.dumps({'pid': os.getpid(), 'child': child.pid, 'owner': sys.argv[2]}))
+child.wait()
+"#).unwrap();
+        if revoke {
+            fleet.send(
+                json!({"id":"linked-request","from":"infra","to":"apps","kind":"request",
+                "task_id":"liaison-request","body":"Which peer can help?"}),
+            );
+            fleet.send(
+                json!({"id":"linked-reply","from":"apps","to":"infra","kind":"reply",
+                "correlation":"linked-request","body":"Please coordinate with us"}),
+            );
+        } else {
+            fleet.send(
+                json!({"id":"linked-request","from":"apps","to":"infra","kind":"request",
+                "task_id":"liaison-request","body":"Please coordinate with us"}),
+            );
+        }
+        let woke = Fleet::infra(&fleet.tick());
+        assert_eq!(woke["status"], "running", "{woke}");
+        let job_id = &woke["wake"];
+        let until = Instant::now() + Duration::from_secs(8);
+        let (running, processes) = loop {
+            let job = fleet.ok("job.status", json!({"id":job_id}), None);
+            let processes = fs::read(fleet.root.join("prompts.log"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+            if let Some(processes) = processes.filter(|_| job["status"] == "running") {
+                break (job, processes);
+            }
+            if Instant::now() >= until {
+                fleet.ok("job.cancel", json!({"id":job_id}), None);
+                panic!("harness did not start: {job}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let pid = processes["pid"].as_i64().unwrap();
+        let child = processes["child"].as_i64().unwrap();
+        let was_alive = active(pid) && active(child);
+        if revoke {
+            fleet.ok("charter.revoke", json!({"id":"liaison-focus"}), None);
+        } else {
+            fleet.ok(
+                "task.update",
+                json!({"id":"liaison-request","actor":"infra","status":"cancelled"}),
+                None,
+            );
+        }
+        let until = Instant::now() + Duration::from_secs(8);
+        let stopped = loop {
+            let job = fleet.ok("job.status", json!({"id":job_id}), None);
+            if job["status"] == "cancelled" || Instant::now() >= until {
+                break job;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let payload_alive = active(pid);
+        let child_alive = active(child);
+        fleet.ok("job.cancel", json!({"id":job_id}), None);
+        assert_eq!(woke["focus"], "task:liaison-request");
+        assert_eq!(woke["task_id"], "liaison-request");
+        assert_eq!(running["task_id"], "liaison-request");
+        assert_eq!(
+            fleet.ok("task.show", json!({"id":"liaison-request"}), None)["charter_id"],
+            "liaison-focus"
+        );
+        assert_eq!(running["action"], "spawn");
+        assert_eq!(running["agent_actor"], "infra");
+        assert_eq!(running["payload"]["pid"], processes["pid"]);
+        assert_eq!(processes["owner"], "infra");
+        assert!(
+            was_alive,
+            "harness and child must be running before authority ends"
+        );
+        assert_eq!(stopped["status"], "cancelled", "{stopped}");
+        let reason = stopped["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(if revoke {
+                "charter was revoked"
+            } else {
+                "task is terminal"
+            }),
+            "{reason}"
+        );
+        assert!(
+            !payload_alive,
+            "harness survived the end of its task authority"
+        );
+        assert!(
+            !child_alive,
+            "harness child survived the end of its task authority"
+        );
+        assert!(fleet.store.authorize("infra-duty", "spawn").is_ok());
+    }
+}
+
+#[test]
+fn liaison_wakes_keep_duty_fallback_for_ineligible_or_foreign_tasks() {
+    for ineligible in ["foreign", "no-spawn", "cancelled", "done", "revoked"] {
+        let mut fleet = Fleet::new(now_settings());
+        fleet.ok(
+            "charter.put",
+            json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+            None,
+        );
+        fleet.ok("charter.put", json!({"id":"focus","objective":"Coordinate request",
+            "repo":fleet.root.join("repo"),"min_free_bytes":0,"actions":["inspect","spawn","message"]}), None);
+        let owner = if ineligible == "foreign" {
+            "apps"
+        } else {
+            "infra"
+        };
+        fleet.ok(
+            "task.create",
+            json!({"id":"focus","charter_id":"focus","owner":owner,"title":"Peer request"}),
+            None,
+        );
+        match ineligible {
+            "no-spawn" => {
+                fleet.ok(
+                    "charter.put",
+                    json!({"id":"focus","actions":["inspect","message"]}),
+                    None,
+                );
+            }
+            "cancelled" | "done" => {
+                fleet.ok(
+                    "task.update",
+                    json!({"id":"focus","actor":"infra","status":ineligible}),
+                    None,
+                );
+            }
+            "revoked" => {
+                fleet.ok("charter.revoke", json!({"id":"focus"}), None);
+            }
+            _ => {}
+        }
+        fleet.send(json!({"id":"question","from":"apps","to":"infra","kind":"request","task_id":"focus","body":"Can you relay this?"}));
+        let woke = Fleet::infra(&fleet.tick());
+        let wake = fleet.settle();
+        assert_eq!(woke["task_id"], "infra-duty", "{ineligible}: {woke}");
+        assert_eq!(wake["status"], "succeeded", "{ineligible}: {wake}");
+        let job = fleet.ok("job.status", json!({"id":wake["job_id"]}), None);
+        assert_eq!(job["task_id"], "infra-duty");
+        assert_eq!(job["action"], "spawn");
+        assert_eq!(job["agent_actor"], "infra");
+    }
 }

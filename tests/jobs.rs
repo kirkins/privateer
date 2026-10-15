@@ -46,7 +46,7 @@ impl Fixture {
             &mut store,
             "resource.configure",
             json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,
-                "heavy_estimate":{"memory_bytes":64 * 1024 * 1024}}),
+                "heavy_estimate":{"memory_bytes":0}}),
         )
         .unwrap();
         let charter = json!({"id":"mission","objective":"isolated supervisor fixture","repo":self.repo,
@@ -1219,6 +1219,10 @@ fn waiting_jobs_start_in_arrival_order_and_others_cannot_jump_the_queue() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
     let other = fixture.home("other", 0);
+    assert_eq!(
+        ok(&home, "resource.status", json!({}))["settings"]["heavy_estimate"]["memory_bytes"],
+        0
+    );
     // The fixture allows one heavy job on the host.
     start(&home, "running", &["sleep", "1"]);
     let marker = fixture.repo.join("order.txt");
