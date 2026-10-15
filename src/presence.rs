@@ -74,10 +74,10 @@ pub fn attend(
     store.connection().execute(
         "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms, binding) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(ship) DO UPDATE SET
-           started_ms = CASE WHEN holder = excluded.holder THEN started_ms ELSE excluded.started_ms END,
+           started_ms = CASE WHEN holder = excluded.holder AND expires_ms > excluded.started_ms THEN started_ms ELSE excluded.started_ms END,
            holder = excluded.holder, harness = COALESCE(excluded.harness, harness),
            expires_ms = excluded.expires_ms,
-           binding = CASE WHEN holder=excluded.holder THEN binding ELSE excluded.binding END",
+           binding = CASE WHEN holder=excluded.holder AND expires_ms > excluded.started_ms THEN binding ELSE excluded.binding END",
         params![ship, holder, harness, now, now + ttl_secs as i64 * 1000,binding],
     )?;
     presence(store, ship)

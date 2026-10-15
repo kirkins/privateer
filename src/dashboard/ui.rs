@@ -129,6 +129,9 @@ impl App {
                 .is_some_and(|b| b.matches(view, pane))
     }
     pub fn binding_ambiguous(&self) -> bool {
+        if self.snapshot.presentation_error.is_some() {
+            return true;
+        }
         let Some(view) = &self.herdr else {
             return false;
         };
@@ -150,6 +153,9 @@ impl App {
         })
     }
     pub fn scoped_panes(&self) -> Vec<&herdr::Pane> {
+        if self.snapshot.presentation_error.is_some() {
+            return Vec::new();
+        }
         let Some(ship) = self
             .snapshot
             .ships

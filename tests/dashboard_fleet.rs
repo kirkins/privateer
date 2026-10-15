@@ -50,7 +50,7 @@ impl Machine {
     fn proxy(&self) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let proxy = self.root.join("privateer-proxy");
-        fs::write(&proxy,format!("#!/bin/sh\nexport HOME='{}' PRIVATEER_FLEET='{}/fleet.sqlite' PRIVATEER_SERVICE=none PRIVATEER_RESOURCE_HOME='{}/ledger'\nunset PRIVATEER_ROLE PRIVATEER_ACTOR PRIVATEER_HOME HERDR_ENV HERDR_SOCKET_PATH\nexec '{}' \"$@\"\n",self.root.display(),self.root.display(),self.root.display(),env!("CARGO_BIN_EXE_privateer"))).unwrap();
+        fs::write(&proxy,format!("#!/bin/sh\nexport HOME='{}' XDG_CONFIG_HOME='{}/config' PRIVATEER_FLEET='{}/fleet.sqlite' PRIVATEER_SERVICE=none PRIVATEER_RESOURCE_HOME='{}/ledger'\nunset PRIVATEER_ROLE PRIVATEER_ACTOR PRIVATEER_HOME HERDR_ENV HERDR_SOCKET_PATH\nexec '{}' \"$@\"\n",self.root.display(),self.root.display(),self.root.display(),self.root.display(),env!("CARGO_BIN_EXE_privateer"))).unwrap();
         fs::set_permissions(&proxy, fs::Permissions::from_mode(0o755)).unwrap();
         proxy
     }
@@ -550,6 +550,71 @@ fn bounded_mailbox_admits_unread_mail_and_retains_evicted_read_markers() {
         m.json(&homes[5], "mail.inbox", json!({"address":"captain"}))["acknowledged_through"],
         decision["seq"]
     );
+}
+
+#[test]
+fn bounded_mailbox_keeps_kind_priority_across_homes_and_failed_refreshes() {
+    use privateer::dashboard::{command, fleet, mailbox::Mailbox};
+    let m = Machine::new();
+    let homes: Vec<_> = (0..6).map(|i| m.ship(&format!("s{i}"))).collect();
+    let proxy = m.proxy();
+    for (i, home) in homes.iter().take(5).enumerate() {
+        m.send_batch(home, (0..command::MAIL_PAGE_LIMIT).map(|n| {
+            json!({"id":format!("notice-{n}"),"from":format!("s{i}"),"to":"captain","kind":"notice","body":format!("Notice {n}")})
+        }).collect());
+    }
+    m.json(
+        &homes[5],
+        "mail.send",
+        json!({"id":"last-notice","from":"s5","to":"captain","kind":"notice","body":"Notice"}),
+    );
+    m.json(
+        &homes[5],
+        "mail.send",
+        json!({"id":"question","from":"captain","to":"s5","kind":"request","body":"Status?"}),
+    );
+    m.json(&homes[5], "mail.send", json!({"id":"reply","from":"s5","to":"captain","kind":"reply","correlation":"question","body":"Ready"}));
+    for kind in ["request", "decision"] {
+        m.json(
+            &homes[5],
+            "mail.send",
+            json!({"id":kind,"from":"s5","to":"captain","kind":kind,"body":"Needs attention"}),
+        );
+    }
+    let mut snapshot = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
+    let mut mailbox = Mailbox::default();
+    mailbox.refresh(&proxy, &snapshot, None);
+    assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
+    for failed in [false, true] {
+        if failed {
+            snapshot.ships[5].live.as_mut().unwrap().error = Some("offline".into());
+            mailbox.refresh(&proxy, &snapshot, None);
+            assert_eq!(mailbox.errors.len(), 1);
+        }
+        assert_eq!(mailbox.messages.len(), 1000);
+        assert_eq!(
+            mailbox
+                .messages
+                .iter()
+                .take(3)
+                .map(|m| m.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["decision", "request", "reply"]
+        );
+        for mail in mailbox.messages.iter().take(3) {
+            assert_eq!(mail.home.as_ref(), Some(&homes[5].join(".privateer")));
+            assert_eq!(mail.from, "s5");
+            assert!(!mail.acknowledged);
+        }
+        assert!(!mailbox.messages.iter().any(|m| m.id == "last-notice"));
+        for home in homes.iter().take(5) {
+            assert!(
+                mailbox.messages.iter().any(
+                    |m| m.id == "notice-0" && m.home.as_ref() == Some(&home.join(".privateer"))
+                )
+            );
+        }
+    }
 }
 
 #[test]
@@ -1202,6 +1267,20 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     let config = |id: &str, pane: &str, terminal: &str, liaison: bool| json!({"ships":[{"id":id,"name":"Shared display label","liaison":liaison,"terminals":[{"pane_id":pane,"terminal_id":terminal}]}]});
     let apps_config = apps.join(".privateer/dashboard.json");
     let infra_config = infra.join(".privateer/dashboard.json");
+    let herdr = View::demo();
+    m.json(
+        &apps,
+        "ship.attend",
+        json!({"ship":"apps","holder":"automatic","ttl_secs":3600}),
+    );
+    let binding = json!({"socket":"/isolated/socket","socket_identity":herdr.socket_identity,"pane":herdr.panes[1]});
+    rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE presence SET binding=?1 WHERE ship='apps'",
+            [binding.to_string()],
+        )
+        .unwrap();
     fs::write(
         &apps_config,
         config("apps", "demo:apps", "demo-terminal-apps", true).to_string(),
@@ -1249,7 +1328,7 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     );
     let mut app = App {
         snapshot: fleet::read(&registry, None).unwrap(),
-        herdr: Some(View::demo()),
+        herdr: Some(herdr),
         ..App::default()
     };
     app.open_liaison();
@@ -1302,10 +1381,24 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
             app.snapshot
                 .ships
                 .iter()
-                .all(|ship| !ship.liaison && ship.terminals.is_empty())
+                .all(|ship| !ship.liaison && ship.terminals.len() == 1)
+        );
+        assert_eq!(
+            serde_json::to_value(
+                app.snapshot.ships[0]
+                    .live
+                    .as_ref()
+                    .unwrap()
+                    .binding
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap(),
+            binding
         );
         for id in ["apps", "infra"] {
             app.select_ship(Some(id.into()));
+            assert!(app.binding_ambiguous());
             for tab in [0, 2] {
                 app.select_tab(tab);
                 assert!(app.scoped_panes().is_empty());
@@ -1313,6 +1406,17 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
                 assert!(screen(&mut app).contains("PRESENTATION UNAVAILABLE"));
             }
         }
+        let mut truncated = App {
+            snapshot: app.snapshot.clone(),
+            herdr: app.herdr.clone(),
+            ..App::default()
+        };
+        truncated.snapshot.ships.truncate(1);
+        truncated.snapshot.truncated = true;
+        truncated.select_ship(Some("apps".into()));
+        assert!(truncated.binding_ambiguous());
+        assert!(truncated.scoped_panes().is_empty());
+        assert!(truncated.selected_pane().is_none());
         app.select_ship(None);
         app.open_liaison();
         assert!(app.ship.is_none());

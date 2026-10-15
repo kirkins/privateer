@@ -184,7 +184,6 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     if let Err(error) = validate_navigation(&out.ships) {
         out.presentation_error = Some(error.to_string());
         for ship in &mut out.ships {
-            ship.terminals.clear();
             ship.liaison = false;
         }
     }

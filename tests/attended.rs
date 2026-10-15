@@ -41,6 +41,9 @@ impl Ship {
             .args(args)
             .current_dir(&self.folder)
             .env("PATH", &self.path)
+            .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("PRIVATEER_SERVICE", "none")
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env_remove("PRIVATEER_HOME")
@@ -130,6 +133,136 @@ fn presence_leases_are_refreshed_released_and_expire() {
 }
 
 #[test]
+fn expired_reused_holder_rebinds_while_live_refresh_preserves_identity() {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::UnixListener,
+    };
+    let ship = Ship::new();
+    let socket = ship.root.join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        for pane in ["old", "new", "new", "claim"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "session.snapshot");
+            writeln!(stream, "{}", json!({"id":request["id"],"result":{"snapshot":{"version":"test","protocol":20,"panes":[{"pane_id":pane,"terminal_id":format!("terminal-{pane}"),"workspace_id":"workspace","tab_id":"tab","agent_status":"idle"}]}}})).unwrap();
+        }
+    });
+    let holder = "start:reused-pid";
+    let attend = |pane: &str| {
+        let output = ship
+            .command(&[
+                "ship.attend",
+                "--json",
+                &json!({"ship":"infra","holder":holder,"ttl_secs":60}).to_string(),
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_SOCKET_PATH", &socket)
+            .env("HERDR_PANE_ID", pane)
+            .env("HERDR_WORKSPACE_ID", "workspace")
+            .env("HERDR_TAB_ID", "tab")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let first = attend("old");
+    assert_eq!(first["lease"]["binding"]["pane"]["pane_id"], "old");
+    let store = privateer::store::Store::open(&ship.folder.join(".privateer")).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE presence SET started_ms=1, presented_through=7 WHERE ship='infra'",
+            [],
+        )
+        .unwrap();
+    let refresh = attend("new");
+    assert_eq!(refresh["lease"]["started_ms"], 1);
+    assert_eq!(refresh["lease"]["binding"], first["lease"]["binding"]);
+    assert!(!ship.command(&["start"]).output().unwrap().status.success());
+    assert_eq!(ship.presence(), refresh);
+    store
+        .connection()
+        .execute("UPDATE presence SET expires_ms=0 WHERE ship='infra'", [])
+        .unwrap();
+    let reclaimed = attend("new");
+    assert!(reclaimed["lease"]["started_ms"].as_i64().unwrap() > 1);
+    assert_eq!(reclaimed["lease"]["binding"]["pane"]["pane_id"], "new");
+    let presented: i64 = store
+        .connection()
+        .query_row(
+            "SELECT presented_through FROM presence WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(presented, 7);
+    store
+        .connection()
+        .execute(
+            "UPDATE presence SET started_ms=1, expires_ms=0 WHERE ship='infra'",
+            [],
+        )
+        .unwrap();
+    let probe = ship.root.join("claimed.json");
+    let harness = ship.root.join("bin/claim-probe");
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\n'{BIN}' ship.presence --json '{{\"ship\":\"infra\"}}' > '{}'\n",
+            probe.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = ship
+        .command(&["start", "claim-probe"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", &socket)
+        .env("HERDR_PANE_ID", "claim")
+        .env("HERDR_WORKSPACE_ID", "workspace")
+        .env("HERDR_TAB_ID", "tab")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let claimed: Value = serde_json::from_slice(&fs::read(probe).unwrap()).unwrap();
+    assert!(
+        claimed["lease"]["holder"]
+            .as_str()
+            .unwrap()
+            .starts_with("start:")
+    );
+    assert!(claimed["lease"]["started_ms"].as_i64().unwrap() > 1);
+    assert_eq!(claimed["lease"]["binding"]["pane"]["pane_id"], "claim");
+    assert_eq!(ship.presence()["attended"], false);
+    ship.json("ship.attend", json!({"ship":"infra","holder":holder}));
+    store
+        .connection()
+        .execute(
+            "UPDATE presence SET started_ms=1, expires_ms=0, binding=?1 WHERE ship='infra'",
+            [first["lease"]["binding"].to_string()],
+        )
+        .unwrap();
+    let unbound = ship.json("ship.attend", json!({"ship":"infra","holder":holder}));
+    assert!(unbound["lease"]["started_ms"].as_i64().unwrap() > 1);
+    assert!(unbound["lease"]["binding"].is_null());
+}
+
+#[test]
 fn init_installs_claude_hooks_once() {
     let ship = Ship::new();
     ship.ok(&["init"]);
@@ -182,10 +315,9 @@ fn claude_hooks_deliver_mail_to_the_session_once_and_track_presence() {
 #[test]
 fn hooks_never_break_the_harness_outside_a_ship() {
     let ship = Ship::new();
-    let mut child = Command::new(BIN)
-        .args(["hook", "claude", "Stop"])
+    let mut child = ship
+        .command(&["hook", "claude", "Stop"])
         .current_dir(&ship.root)
-        .env_remove("PRIVATEER_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
