@@ -2,8 +2,9 @@
 //! this runtime's image, while agents and persisted commands need an installed
 //! path that another process can execute after an upgrade.
 use anyhow::{Context, Result, ensure};
+use std::ffi::CString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 /// A durable command path. Never search PATH or forward a process-relative
@@ -19,8 +20,17 @@ pub(crate) fn installed() -> Result<PathBuf> {
         )
     };
     let metadata = fs::metadata(&path).with_context(recovery)?;
+    let c_path = CString::new(path.as_os_str().as_bytes()).with_context(recovery)?;
     ensure!(
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        metadata.is_file()
+            && unsafe {
+                libc::faccessat(
+                    libc::AT_FDCWD,
+                    c_path.as_ptr(),
+                    libc::X_OK,
+                    libc::AT_EACCESS,
+                )
+            } == 0,
         "{}",
         recovery()
     );
@@ -30,7 +40,7 @@ pub(crate) fn installed() -> Result<PathBuf> {
 #[cfg(target_os = "linux")]
 fn installed_path() -> Result<PathBuf> {
     use std::ffi::OsStr;
-    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use std::os::unix::fs::MetadataExt;
 
     for _ in 0..3 {
         let reported = std::env::current_exe().context("cannot locate Privateer executable")?;

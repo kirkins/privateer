@@ -1,11 +1,11 @@
-#![cfg(target_os = "linux")]
-
 mod support;
 
+#[cfg(target_os = "linux")]
 use privateer::{dispatch, service};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -62,6 +62,7 @@ fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn replacing_the_installation_does_not_break_a_dispatcher_mail_round_trip() {
     let mut installation = Installation::new();
     let mut dispatcher = Process(
@@ -158,6 +159,7 @@ impl Rpc {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn removing_the_installation_reports_an_actionable_control_cli_error_but_can_supervise_jobs() {
     let installation = Installation::new();
     let mut rpc = Rpc::new(&installation);
@@ -189,6 +191,7 @@ fn removing_the_installation_reports_an_actionable_control_cli_error_but_can_sup
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn a_replaced_rpc_process_emits_an_executable_control_cli_not_a_proc_self_alias() {
     let installation = Installation::new();
     // The old image can still have links elsewhere: link count alone cannot
@@ -217,6 +220,7 @@ fn a_replaced_rpc_process_emits_an_executable_control_cli_not_a_proc_self_alias(
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn a_literal_deleted_suffix_is_preserved_before_and_after_replacement() {
     let mut installation = Installation::new();
     let literal = installation.binary.with_file_name("privateer (deleted)");
@@ -238,20 +242,136 @@ fn a_literal_deleted_suffix_is_preserved_before_and_after_replacement() {
 
 #[test]
 fn a_nonexecutable_replacement_is_rejected_instead_of_advertised_to_agents() {
-    use std::os::unix::fs::PermissionsExt;
-
     let installation = Installation::new();
     let mut rpc = Rpc::new(&installation);
-    let next = installation.binary.with_extension("next");
-    fs::write(&next, b"not an executable").unwrap();
-    fs::set_permissions(&next, fs::Permissions::from_mode(0o644)).unwrap();
-    fs::rename(next, &installation.binary).unwrap();
-    let brief = rpc.call("agent.brief", json!({"task_id":"infra-duty"}));
-    assert_eq!(brief["ok"], false, "{brief}");
-    let error = brief["error"].as_str().unwrap();
-    assert!(error.contains("restart"), "{error}");
-    assert!(
-        error.contains(installation.binary.to_str().unwrap()),
-        "{error}"
+    let uid = unsafe { libc::geteuid() };
+    for (mode, executable) in [
+        (0o644, false),
+        (0o641, uid == 0),
+        (0o654, uid == 0),
+        (0o744, true),
+    ] {
+        let next = installation.binary.with_extension("next");
+        fs::copy(BIN, &next).unwrap();
+        fs::set_permissions(&next, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(fs::metadata(&next).unwrap().uid(), uid);
+        fs::rename(next, &installation.binary).unwrap();
+        let execution = installation
+            .command()
+            .args(["status", "--json", "{}"])
+            .output();
+        assert_eq!(
+            execution.as_ref().is_ok_and(|out| out.status.success()),
+            executable,
+            "mode {mode:o}: {execution:?}"
+        );
+        let brief = rpc.call("agent.brief", json!({"task_id":"infra-duty"}));
+        assert_eq!(brief["ok"], executable, "mode {mode:o}: {brief}");
+        if executable {
+            assert_eq!(
+                brief["result"]["context"]["control"]["cli_argv"][0],
+                installation.binary.to_str().unwrap()
+            );
+        } else {
+            let error = brief["error"].as_str().unwrap();
+            assert!(error.contains("restart"), "{error}");
+            assert!(
+                error.contains(installation.binary.to_str().unwrap()),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unavailable_supervisor_does_not_strand_jobs_or_capacity() {
+    let installation = Installation::new();
+    let mut rpc = Rpc::new(&installation);
+    assert_eq!(
+        rpc.call(
+            "resource.configure",
+            json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,
+                   "min_available_memory_bytes":0,"ramp_secs":0})
+        )["ok"],
+        true
+    );
+    #[cfg(not(target_os = "linux"))]
+    installation.replace();
+    fs::set_permissions(&installation.binary, fs::Permissions::from_mode(0o644)).unwrap();
+    for heavy in [false, true] {
+        for queued in [false, true] {
+            let id = format!("unspawned-{heavy}-{queued}");
+            let response = rpc.call(
+                "job.start",
+                json!({"id":id,"task_id":"infra-duty","heavy":heavy,
+                       "command":["/bin/echo","should-not-run"],
+                       "wait_for_capacity":queued,
+                       "estimate":{"cpus":1,"memory_bytes":if queued {u64::MAX} else {0}}}),
+            );
+            assert_eq!(response["ok"], false, "{response}");
+            let error = response["error"].as_str().unwrap();
+            #[cfg(not(target_os = "linux"))]
+            assert!(error.contains("restart"), "{error}");
+            assert!(
+                error.contains("supervisor") || error.contains("not executable"),
+                "{error}"
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let retry = rpc.call("job.retry", json!({"id":id,"new_id":format!("retry-{id}")}));
+                assert_eq!(retry["ok"], false, "{retry}");
+            }
+        }
+    }
+    let conn = installation.fleet.store.connection();
+    let jobs: Vec<String> = conn
+        .prepare("SELECT record FROM jobs")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(jobs.len(), 8);
+        for raw in jobs {
+            let job: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(job["status"], "failed", "{job}");
+            assert!(job["finished_ms"].is_number(), "{job}");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(jobs.is_empty(), "{jobs:?}");
+    let ledger =
+        rusqlite::Connection::open(installation.fleet.root.join("ledger/resources.sqlite"))
+            .unwrap();
+    let held: u64 = ledger
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM reservations) + (SELECT COUNT(*) FROM queue)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(held, 0);
+    fs::set_permissions(&installation.binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let args = json!({"id":"restored-supervisor","task_id":"infra-duty","heavy":true,
+                     "command":["/bin/echo","restored"],"estimate":{"cpus":1,"memory_bytes":0}});
+    let started = rpc.call("job.start", args.clone());
+    assert_eq!(started["ok"], true, "{started}");
+    let repeated = rpc.call("job.start", args);
+    assert_eq!(repeated["ok"], true, "{repeated}");
+    assert_eq!(
+        repeated["result"]["incarnation"],
+        started["result"]["incarnation"]
+    );
+    until(|| {
+        let status = rpc.call("job.status", json!({"id":"restored-supervisor"}));
+        assert_eq!(status["ok"], true, "{status}");
+        assert_ne!(status["result"]["status"], "failed", "{status}");
+        status["result"]["status"] == "succeeded"
+    });
+    assert_eq!(
+        rpc.call("resource.status", json!({}))["result"]["heavy_reserved"],
+        0
     );
 }
