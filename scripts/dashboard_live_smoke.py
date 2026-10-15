@@ -37,6 +37,7 @@ class Herdr:
         self.focused = []
         self.delay_next = False
         self.fail_next = False
+        self.first_snapshot_delay = 0
         self.protocol = 20
         self.expected_failures = set()
         self.lock = threading.Lock()
@@ -69,6 +70,8 @@ class Herdr:
     def respond(self, request):
         method, params = request["method"], request["params"]
         if method == "session.snapshot":
+            time.sleep(self.first_snapshot_delay)
+            self.first_snapshot_delay = 0
             return {"snapshot": {"version": "isolated-test", "protocol": self.protocol, "panes": self.panes}}
         if method == "tab.create":
             self.creates += 1
@@ -499,8 +502,8 @@ def onboarding(binary, runtime):
             tui.keys(b"0l")
             tui.until(lambda: server.focuses == 2, "Talk to liaison needed another Board action")
             screen = tui.screen().splitlines()
-            row, line = next((row, line) for row, line in enumerate(screen) if "[l Liaison]" in line)
-            column = line.index("[l Liaison]")
+            row, line = next((row, line) for row, line in enumerate(screen) if "[l Talk to liaison]" in line)
+            column = line.index("[l Talk to liaison]")
             tui.keys(f"\x1b[<0;{column+1};{row+1}M\x1b[<0;{column+1};{row+1}m".encode())
             tui.until(lambda: server.focuses == 3, "Talk to liaison click did not focus the conversation")
             tui.close()
@@ -601,6 +604,30 @@ def onboarding(binary, runtime):
                     if startup:
                         startup.close()
                     startup_server.close()
+        # Input during startup (a scroll over Navigation, a key) waits for the
+        # first Herdr observation instead of cancelling the liaison handoff.
+        early_root = root / "startup-early-input"
+        early_root.mkdir()
+        early_env = dict(env, HOME=str(early_root), XDG_CONFIG_HOME=str(early_root / "config"),
+                         PRIVATEER_FLEET=str(early_root / "fleet.sqlite"),
+                         PRIVATEER_RESOURCE_HOME=str(early_root / "ledger"))
+        subprocess.run([str(runtime), "--home", str(early_root / "contact/.privateer"), "init", "--ship", "contact",
+                        "--harness", "codex", "--liaison"], cwd=early_root, env=early_env, capture_output=True,
+                       check=True, timeout=10)
+        early_server = Herdr(early_root, early_env)
+        early_server.first_snapshot_delay = 0.6
+        early = None
+        try:
+            early = Tui(runtime, dict(early_env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(early_server.path)), [])
+            early.keys(b"\x1b[<64;10;8M")
+            early.until(lambda: early_server.creates == 1, "early input cancelled the startup liaison handoff")
+            early.until(lambda: (early_root / "harness-started").exists(), "startup handoff did not reach the harness")
+            assert "automatic Board cancelled" not in early.screen()
+            assert not early_server.errors, early_server.errors
+        finally:
+            if early:
+                early.close()
+            early_server.close()
         ordinary_root = root / "ordinary-onboarding"
         ordinary_root.mkdir()
         ordinary_env = dict(env, HOME=str(ordinary_root), XDG_CONFIG_HOME=str(ordinary_root / "config"),
