@@ -52,9 +52,7 @@ impl Ship {
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env_remove("PRIVATEER_HOME")
             .env_remove("PRIVATEER_ROLE")
-            .env_remove("PRIVATEER_ACTOR")
-            .env_remove("HERDR_ENV")
-            .env_remove("HERDR_SOCKET_PATH");
+            .env_remove("PRIVATEER_ACTOR");
         command
     }
     fn ok(&self, args: &[&str]) -> String {
