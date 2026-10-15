@@ -18,6 +18,8 @@ pub struct Mail {
     pub from: String,
     pub subject: String,
     pub body: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
     pub status: String,
     #[serde(default)]
     pub home: Option<std::path::PathBuf>,
@@ -30,6 +32,7 @@ pub struct Mail {
 pub fn sample_mail() -> Vec<Mail> {
     vec![
         Mail {
+            payload: serde_json::json!({}),
             home: None, seq: 0, acknowledged: false,
             id: "demo-decision".into(),
             kind: "Decision".into(),
@@ -39,6 +42,7 @@ pub fn sample_mail() -> Vec<Mail> {
             status: "Awaiting captain".into(),
         },
         Mail {
+            payload: serde_json::json!({}),
             home: None, seq: 0, acknowledged: false,
             id: "demo-reply".into(),
             kind: "Reply".into(),
@@ -48,6 +52,7 @@ pub fn sample_mail() -> Vec<Mail> {
             status: "Reply to your request".into(),
         },
         Mail {
+            payload: serde_json::json!({}),
             home: None, seq: 0, acknowledged: false,
             id: "demo-notice".into(),
             kind: "Notice".into(),
@@ -150,7 +155,10 @@ impl App {
             self.select_ship(Some(id));
             self.select_tab(0);
         } else {
-            self.notice = "No liaison configured; select any ship directly.".into();
+            self.notice = self.snapshot.presentation_error.as_ref().map_or_else(
+                || "No liaison configured; select any ship directly.".into(),
+                |error| format!("Presentation unavailable: {}", clean(error, 512)),
+            );
         }
     }
     pub fn compose(&mut self) {
@@ -297,7 +305,17 @@ impl App {
                 clean(&mail.status, 160)
             )),
             Line::from(""),
-            Line::from(clean(&mail.body, 2048)),
+        ]);
+        lines.extend(
+            mail.body
+                .split('\n')
+                .map(|line| Line::from(clean(line, usize::MAX))),
+        );
+        if !mail.payload.is_null() && mail.payload != serde_json::json!({}) {
+            lines.push(Line::from("Payload (JSON):"));
+            lines.push(Line::from(clean(&mail.payload.to_string(), usize::MAX)));
+        }
+        lines.extend([
             Line::from(""),
             Line::from(if self.demo {
                 "Sample mailbox · viewing does not acknowledge or answer this item."

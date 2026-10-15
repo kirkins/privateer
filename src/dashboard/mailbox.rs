@@ -79,19 +79,21 @@ impl Mailbox {
                 {
                     let id = m["id"].as_str().context("mail without id")?;
                     let seq = m["seq"].as_i64().context("mail without sequence")?;
+                    let body = m["body"].as_str().unwrap_or("");
+                    let preview = if body.is_empty() {
+                        m["payload"].to_string()
+                    } else {
+                        body.into()
+                    };
                     rows.insert(
                         seq,
                         Mail {
                             id: id.into(),
                             kind: m["kind"].as_str().unwrap_or("").into(),
                             from: m["from"].as_str().unwrap_or("").into(),
-                            subject: m["body"].as_str().unwrap_or("").chars().take(100).collect(),
-                            body: m["body"]
-                                .as_str()
-                                .unwrap_or("")
-                                .chars()
-                                .take(2048)
-                                .collect(),
+                            subject: preview.chars().take(100).collect(),
+                            body: body.into(),
+                            payload: m["payload"].clone(),
                             status: m["state"].as_str().unwrap_or("unread").into(),
                             home: Some(home.clone()),
                             seq,
@@ -116,18 +118,18 @@ impl Mailbox {
                     );
                 }
             }
+            messages.sort_by_key(|m| {
+                (
+                    m.acknowledged
+                        || m.home
+                            .as_ref()
+                            .is_some_and(|home| self.read.contains(&(home.clone(), m.seq))),
+                    m.home.clone(),
+                    m.seq,
+                )
+            });
+            messages.truncate(1000);
         }
-        messages.sort_by_key(|m| {
-            (
-                m.acknowledged
-                    || m.home
-                        .as_ref()
-                        .is_some_and(|home| self.read.contains(&(home.clone(), m.seq))),
-                m.home.clone(),
-                m.seq,
-            )
-        });
-        messages.truncate(1000);
         messages.sort_by_key(|m| {
             (
                 match m.kind.as_str() {

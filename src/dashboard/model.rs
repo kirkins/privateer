@@ -91,13 +91,18 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
         registry.ships.len() <= 200,
         "dashboard registry exceeds 200 ships"
     );
+    validate_ships(&registry.ships)?;
+    Ok(registry.ships)
+}
+
+pub(super) fn validate_ships(ships: &[Ship]) -> Result<()> {
     let mut ids = BTreeSet::new();
     let mut terminals = BTreeSet::new();
     ensure!(
-        registry.ships.iter().filter(|s| s.liaison).count() <= 1,
+        ships.iter().filter(|s| s.liaison).count() <= 1,
         "only one ship may be the liaison"
     );
-    for ship in &registry.ships {
+    for ship in ships {
         crate::store::identifier(&ship.id)?;
         ensure!(ids.insert(ship.id.clone()), "duplicate ship identity");
         ensure!(
@@ -122,7 +127,7 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
             );
         }
     }
-    Ok(registry.ships)
+    Ok(())
 }
 
 /// Terminal escape sequences and control bytes must never reach the renderer.
@@ -173,6 +178,8 @@ pub struct Job {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub presentation_error: Option<String>,
     pub ships: Vec<Ship>,
     pub custody: Vec<Custody>,
     pub tasks: Vec<Task>,
@@ -293,6 +300,7 @@ impl Snapshot {
 
     pub fn demo() -> Self {
         let mut sample = Self {
+            presentation_error: None,
             ships: vec![
                 Ship::demo(
                     "navigator",

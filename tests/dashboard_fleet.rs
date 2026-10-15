@@ -444,6 +444,12 @@ fn full_pages_of_large_valid_mail_can_be_loaded_read_and_answered() {
     mailbox.refresh(&proxy, &snapshot, None);
     assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
     assert_eq!(mailbox.messages.len(), command::MAIL_PAGE_LIMIT);
+    assert!(
+        mailbox
+            .messages
+            .iter()
+            .all(|mail| mail.body.len() == 65_000)
+    );
     mailbox
         .mark_read(&proxy, &mailbox.messages[0].clone())
         .unwrap();
@@ -907,6 +913,7 @@ fn read_requests_beyond_the_inbox_page_survive_refresh_and_ack_when_reachable() 
     assert_eq!(mailbox.errors.len(), 2);
     mailbox.refresh(&proxy, &snapshot, None);
     assert!(mailbox.errors.is_empty());
+    let arrival = m.json(&apps, "mail.send", json!({"id":"new-arrival","from":"apps","to":"captain","kind":"notice","body":"Arrived after the explicit reads"}));
     for i in 0..command::MAIL_PAGE_LIMIT {
         let notice = mailbox
             .messages
@@ -932,8 +939,9 @@ fn read_requests_beyond_the_inbox_page_survive_refresh_and_ack_when_reachable() 
     assert!(mailbox.errors.is_empty());
     let inbox = m.json(&apps, "mail.inbox", json!({"address":"captain"}));
     assert_eq!(inbox["acknowledged_through"], last_read["seq"]);
-    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 2);
     assert_eq!(inbox["messages"][0]["id"], unseen["id"]);
+    assert_eq!(inbox["messages"][1]["id"], arrival["id"]);
     assert_eq!(
         m.json(&infra, "mail.inbox", json!({"address":"captain"}))["acknowledged_through"],
         0
@@ -1027,4 +1035,270 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     assert!(recovered.contains("2 messages"));
     assert!(!recovered.contains("MAILBOX UNAVAILABLE"));
     assert!(app.mail_errors.is_empty());
+}
+
+fn scroll_to(app: &mut privateer::dashboard::ui::App, text: &str) -> bool {
+    for offset in (0..2000).step_by(8) {
+        app.scroll = offset;
+        let rendered = screen(app);
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\0'));
+        if rendered.contains(text) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn full_mail_bodies_and_payloads_are_readable_before_ack_and_after_leaving_the_inbox() {
+    use privateer::dashboard::{fleet, mailbox::Mailbox, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let proxy = m.proxy();
+    let body = format!(
+        "Start of full body\n{} BODY-MIDDLE {}\nFULL-BODY-END\x1b[2J\u{202e}\0",
+        "x".repeat(32_000),
+        "z".repeat(32_800)
+    );
+    let payload = json!({"choice":"approve or decline","note":format!("{} PAYLOAD-END \u{202e}", "y".repeat(10_000))});
+    m.json(&apps, "mail.send", json!({"id":"large-body","from":"apps","to":"captain","kind":"request","body":body,"payload":{"body_metadata":"BODY-PAYLOAD"}}));
+    let decision = m.json(&apps, "mail.send", json!({"id":"payload-only","from":"apps","to":"captain","kind":"decision","payload":payload}));
+    let snapshot = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
+    let mut mailbox = Mailbox::default();
+    for acknowledged in [false, true] {
+        if acknowledged {
+            m.json(
+                &apps,
+                "mail.ack",
+                json!({"address":"captain","through_seq":decision["seq"]}),
+            );
+            assert!(
+                m.json(&apps, "mail.inbox", json!({"address":"captain"}))["messages"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        mailbox.refresh(&proxy, &snapshot, None);
+        assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
+        assert_eq!(mailbox.messages.len(), 2);
+        assert!(
+            mailbox.messages.iter().all(
+                |mail| mail.subject.chars().count() <= 100 && mail.acknowledged == acknowledged
+            )
+        );
+        let full = mailbox
+            .messages
+            .iter()
+            .find(|mail| mail.id == "large-body")
+            .unwrap();
+        assert_eq!(full.body, body);
+        assert_eq!(full.payload, json!({"body_metadata":"BODY-PAYLOAD"}));
+        let payload_only = mailbox
+            .messages
+            .iter()
+            .find(|mail| mail.id == "payload-only")
+            .unwrap();
+        assert!(payload_only.body.is_empty());
+        assert!(!payload_only.subject.is_empty());
+        assert_eq!(payload_only.payload, payload);
+        let mut app = App {
+            snapshot: snapshot.clone(),
+            mail: mailbox.messages.clone(),
+            ..App::default()
+        };
+        app.open_inbox();
+        app.selected = app
+            .mail
+            .iter()
+            .position(|mail| mail.id == "large-body")
+            .unwrap();
+        assert!(scroll_to(&mut app, "BODY-MIDDLE"));
+        assert!(scroll_to(&mut app, "FULL-BODY-END"));
+        assert!(scroll_to(&mut app, "BODY-PAYLOAD"));
+        app.selected = app
+            .mail
+            .iter()
+            .position(|mail| mail.id == "payload-only")
+            .unwrap();
+        app.scroll = 0;
+        assert!(screen(&mut app).contains("Payload (JSON):"));
+        assert!(scroll_to(&mut app, "PAYLOAD-END"));
+        assert_eq!(
+            m.json(&apps, "mail.inbox", json!({"address":"captain"}))["acknowledged_through"],
+            if acknowledged {
+                decision["seq"].clone()
+            } else {
+                json!(0)
+            }
+        );
+    }
+    mailbox.refresh(&m.root.join("missing-binary"), &snapshot, None);
+    assert_eq!(mailbox.errors.len(), 1);
+    assert_eq!(
+        mailbox
+            .messages
+            .iter()
+            .find(|mail| mail.id == "large-body")
+            .unwrap()
+            .body,
+        body
+    );
+    assert_eq!(
+        mailbox
+            .messages
+            .iter()
+            .find(|mail| mail.id == "payload-only")
+            .unwrap()
+            .payload,
+        payload
+    );
+}
+
+#[test]
+fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recover() {
+    use privateer::dashboard::{fleet, herdr::View, model::Snapshot, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    for (folder, owner) in [(&apps, "apps"), (&infra, "infra")] {
+        m.json(
+            folder,
+            "task.create",
+            json!({"id":"build","charter_id":owner,"owner":owner,"title":format!("{owner} build")}),
+        );
+        m.json(folder, "event.emit", json!({"id":"fact","task_id":"build","issue_key":"build","kind":"blocked","payload":{"summary":format!("{owner} fact")}}));
+        m.job(folder, "build", &format!("{owner}-job"));
+    }
+    m.json(
+        &apps,
+        "task.handoff",
+        json!({"id":"build","actor":"apps","target":"infra"}),
+    );
+    m.json(&apps, "task.accept", json!({"id":"build","actor":"infra"}));
+    let config = |id: &str, pane: &str, terminal: &str, liaison: bool| json!({"ships":[{"id":id,"name":"Shared display label","liaison":liaison,"terminals":[{"pane_id":pane,"terminal_id":terminal}]}]});
+    let apps_config = apps.join(".privateer/dashboard.json");
+    let infra_config = infra.join(".privateer/dashboard.json");
+    fs::write(
+        &apps_config,
+        config("apps", "demo:apps", "demo-terminal-apps", true).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        &infra_config,
+        config(
+            "infra",
+            "demo:infrastructure",
+            "demo-terminal-infrastructure",
+            false,
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let registry = m.root.join("fleet.sqlite");
+    let baseline = m.dashboard()["snapshot"].clone();
+    let mut app = App {
+        snapshot: fleet::read(&registry, None).unwrap(),
+        herdr: Some(View::demo()),
+        ..App::default()
+    };
+    app.open_liaison();
+    assert_eq!(app.ship.as_deref(), Some("apps"));
+    assert_eq!(app.selected_pane().unwrap().pane_id, "demo:apps");
+    app.select_ship(Some("infra".into()));
+    assert_eq!(app.selected_pane().unwrap().pane_id, "demo:infrastructure");
+    for (pane, terminal, liaison, reason) in [
+        (
+            "demo:apps",
+            "demo-terminal-apps",
+            false,
+            "a pane can belong to only one ship",
+        ),
+        (
+            "demo:apps",
+            "different-terminal",
+            false,
+            "a pane can belong to only one ship",
+        ),
+        (
+            "demo:infrastructure",
+            "demo-terminal-infrastructure",
+            true,
+            "only one ship may be the liaison",
+        ),
+    ] {
+        fs::write(
+            &infra_config,
+            config("infra", pane, terminal, liaison).to_string(),
+        )
+        .unwrap();
+        Snapshot::read(&apps.join(".privateer")).unwrap();
+        Snapshot::read(&infra.join(".privateer")).unwrap();
+        let view = m.dashboard();
+        let failed = &view["snapshot"];
+        assert!(
+            failed["presentation_error"]
+                .as_str()
+                .unwrap()
+                .contains(reason)
+        );
+        for section in ["tasks", "pending", "activity", "jobs", "custody"] {
+            assert_eq!(failed[section], baseline[section], "{section}");
+        }
+        assert!(view["mail_errors"].as_array().unwrap().is_empty());
+        app.update_snapshot(fleet::read(&registry, None).unwrap());
+        assert!(
+            app.snapshot
+                .ships
+                .iter()
+                .all(|ship| !ship.liaison && ship.terminals.is_empty())
+        );
+        for id in ["apps", "infra"] {
+            app.select_ship(Some(id.into()));
+            for tab in [0, 2] {
+                app.select_tab(tab);
+                assert!(app.scoped_panes().is_empty());
+                assert!(app.selected_pane().is_none());
+                assert!(screen(&mut app).contains("PRESENTATION UNAVAILABLE"));
+            }
+        }
+        app.select_ship(None);
+        app.open_liaison();
+        assert!(app.ship.is_none());
+        assert!(app.notice.contains(reason));
+        app.compose();
+        assert!(app.composer.is_none());
+        assert_eq!(
+            app.snapshot
+                .tasks
+                .iter()
+                .filter(|task| task.id == "build" && task.owner == "infra")
+                .count(),
+            2
+        );
+    }
+    fs::write(
+        &apps_config,
+        config("apps", "demo:apps", "demo-terminal-apps", false).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        &infra_config,
+        config(
+            "infra",
+            "demo:infrastructure",
+            "demo-terminal-infrastructure",
+            true,
+        )
+        .to_string(),
+    )
+    .unwrap();
+    app.update_snapshot(fleet::read(&registry, None).unwrap());
+    assert!(app.snapshot.presentation_error.is_none());
+    app.open_liaison();
+    assert_eq!(app.ship.as_deref(), Some("infra"));
+    assert_eq!(app.selected_pane().unwrap().pane_id, "demo:infrastructure");
+    assert!(!screen(&mut app).contains("PRESENTATION UNAVAILABLE"));
 }

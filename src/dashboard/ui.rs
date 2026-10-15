@@ -842,9 +842,15 @@ impl App {
             body,
         );
         let error = self
-            .home_error
+            .snapshot
+            .presentation_error
             .as_ref()
-            .map(|e| format!("STATE UNAVAILABLE: {}", clean(e, 180)))
+            .map(|e| format!("PRESENTATION UNAVAILABLE: {}", clean(e, 180)))
+            .or_else(|| {
+                self.home_error
+                    .as_ref()
+                    .map(|e| format!("STATE UNAVAILABLE: {}", clean(e, 180)))
+            })
             .or_else(|| {
                 self.herdr_error
                     .as_ref()
@@ -863,7 +869,7 @@ impl App {
                 clean(&self.notice, 160)
             )
         });
-        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.home_error.is_some()||self.herdr_error.is_some()||!self.mail_errors.is_empty(){Color::Red}else{Color::Gray}))]),rows[2]);
+        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.snapshot.presentation_error.is_some()||self.home_error.is_some()||self.herdr_error.is_some()||!self.mail_errors.is_empty(){Color::Red}else{Color::Gray}))]),rows[2]);
         self.draw_composer(frame);
     }
 }

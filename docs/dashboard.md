@@ -42,7 +42,10 @@ prefix of explicitly marked messages. Acknowledged open requests remain visible
 until answered.
 Each refresh reads at most 200 unread messages and 200 open requests per home,
 with at most 1,000 displayed items overall. Mark items read to reach later mail;
-no unseen row is acknowledged. Failed homes show an error and retain their last
+list previews are bounded to 100 characters, while details retain the supported
+body and JSON payload. Scroll with Page Up/Down or the wheel to read long mail;
+payload-only messages include a JSON preview and readable payload details.
+No unseen row is acknowledged. Failed homes show an error and retain their last
 mail observation. The UI uses bounded worker queues; commands have 15-second
 deadlines and bounded output sized for a full mail page. Failed sends retain
 their draft and id for an idempotent retry; a deadline means the action's outcome
@@ -118,6 +121,10 @@ are presentation configuration. The dashboard reads the file without creating
 or modifying it. It accepts at most 64 KiB, 200 configured ships and 32 terminal
 bindings per ship. Duplicate identities and a pane bound to multiple ships are
 rejected. Missing configuration falls back to observed owners.
+Pane ownership and liaison uniqueness are also checked across assembled fleet
+homes. Conflicting presentation configuration produces a visible source error
+and disables terminal bindings and liaison shortcuts until corrected; recorded
+work, originating homes and custody history remain visible.
 
 A terminal belongs to a ship only through an exact `pane_id` + `terminal_id`
 binding in this registry. The first binding is its primary terminal. Similar
@@ -192,8 +199,9 @@ function. No animation timer or motion controls run in the dashboard.
 - Each state section is bounded to 200 rows with a truncation notice. Queries
   bound long fields; SQLite uses a 100 ms busy timeout and a 500 ms progress
   deadline. Text displayed in the terminal has control and bidi-override
-  characters removed. The view reads selected summary/message fields rather than
-  full payloads, argv, provider configuration or environment variables. Summaries
+  characters removed. Task views read selected summary fields; mail details keep
+  the full supported body and JSON payload within the display's row bound.
+  Views omit argv, provider configuration and environment variables. Summaries
   and messages can contain private text; treat screenshots accordingly.
 - State and Herdr refresh in separate workers, each with a one-item result
   channel. A stalled source cannot block keyboard handling. Herdr snapshots
