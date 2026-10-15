@@ -40,11 +40,13 @@ impl Fixture {
         )
         .unwrap();
         // These cases exercise supervision with one deterministic heavy slot;
-        // live load and memory admission is tested separately.
+        // live load and memory admission is tested separately. These tiny
+        // payloads must not inherit the production 2 GiB heavy-job estimate.
         privateer::dispatch(
             &mut store,
             "resource.configure",
-            json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0}),
+            json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,
+                   "heavy_estimate":{"memory_bytes":1_048_576}}),
         )
         .unwrap();
         let charter = json!({"id":"mission","objective":"isolated supervisor fixture","repo":self.repo,

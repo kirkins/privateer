@@ -61,18 +61,37 @@ fn until(mut condition: impl FnMut() -> bool) {
     }
 }
 
+// A concurrent fork can briefly retain a writable descriptor for a fixture
+// copy until its exec closes CLOEXEC descriptors. Retry only that transient
+// ETXTBSY; permission and missing-installation failures remain observable.
+fn retry_fixture_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match exec() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn replacing_the_installation_does_not_break_a_dispatcher_mail_round_trip() {
     let mut installation = Installation::new();
     let mut dispatcher = Process(
-        installation
-            .command()
-            .args(["serve", "--json", "{\"interval_secs\":1}"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+        retry_fixture_exec(|| {
+            installation
+                .command()
+                .args(["serve", "--json", "{\"interval_secs\":1}"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        })
+        .unwrap(),
     );
     until(|| {
         assert!(dispatcher.0.try_wait().unwrap().is_none());
@@ -125,14 +144,16 @@ struct Rpc {
 impl Rpc {
     fn new(installation: &Installation) -> Self {
         let mut process = Process(
-            installation
-                .command()
-                .arg("rpc")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
+            retry_fixture_exec(|| {
+                installation
+                    .command()
+                    .arg("rpc")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+            })
+            .unwrap(),
         );
         let input = process.0.stdin.take().unwrap();
         let output = BufReader::new(process.0.stdout.take().unwrap());
@@ -209,13 +230,15 @@ fn a_replaced_rpc_process_emits_an_executable_control_cli_not_a_proc_self_alias(
         .as_array()
         .unwrap();
     assert_eq!(argv[0], installation.binary.to_str().unwrap());
-    let output = installation
-        .command()
-        .arg("status")
-        .arg("--json")
-        .arg("{}")
-        .output()
-        .unwrap();
+    let output = retry_fixture_exec(|| {
+        installation
+            .command()
+            .arg("status")
+            .arg("--json")
+            .arg("{}")
+            .output()
+    })
+    .unwrap();
     assert!(output.status.success(), "{output:?}");
 }
 
@@ -256,10 +279,12 @@ fn a_nonexecutable_replacement_is_rejected_instead_of_advertised_to_agents() {
         fs::set_permissions(&next, fs::Permissions::from_mode(mode)).unwrap();
         assert_eq!(fs::metadata(&next).unwrap().uid(), uid);
         fs::rename(next, &installation.binary).unwrap();
-        let execution = installation
-            .command()
-            .args(["status", "--json", "{}"])
-            .output();
+        let execution = retry_fixture_exec(|| {
+            installation
+                .command()
+                .args(["status", "--json", "{}"])
+                .output()
+        });
         assert_eq!(
             execution.as_ref().is_ok_and(|out| out.status.success()),
             executable,

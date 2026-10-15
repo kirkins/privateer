@@ -70,10 +70,11 @@ fn installed_path() -> Result<PathBuf> {
     std::env::current_exe().context("cannot locate Privateer executable")
 }
 
-/// Reexec the *running image*, not the newly installed release. This keeps the
-/// internal supervisor protocol consistent even across an atomic replacement
-/// or removal. A proc alias is safe here because it is used only by this
-/// process's immediate exec, never serialized into a child agent's context.
+/// On Linux, reexec the *running image* to keep the internal supervisor
+/// protocol consistent across atomic replacement or removal. A proc alias is
+/// safe here because it is used only by this process's immediate exec, never
+/// serialized into a child agent's context. Other Unix platforms require the
+/// installed executable instead.
 pub(crate) fn supervisor() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
