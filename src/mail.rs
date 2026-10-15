@@ -387,6 +387,13 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             peer.as_ref().map(|_| "pending")
         ],
     )?;
+    if peer.is_some() {
+        let message = by_id(store, &id)?.context("message vanished")?;
+        ensure!(
+            envelope(&message).to_string().len() <= MAX_MESSAGE_BYTES,
+            "message exceeds 64 KiB"
+        );
+    }
     if kind == "reply" {
         tx.execute(
             "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3 WHERE id=?1",
@@ -433,7 +440,7 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
     let outcome = crate::peers::call_peer_with_timeout(
         store,
         peer,
-        &format!("deliver-{id}"),
+        &format!("deliver-{}", uuid::Uuid::new_v4()),
         "mail.deliver",
         envelope(&message),
         timeout,
