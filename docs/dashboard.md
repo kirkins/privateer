@@ -114,8 +114,11 @@ Bare `privateer` opens an executable `privateer-dashboard` installed beside it
 or on PATH, in ordinary terminals as well as Herdr. With a current ship, its
 dispatcher is ensured first. `privateer start` always opens the harness directly.
 Only a missing dashboard retains the legacy harness/initialization flow.
-Bare entry passes `--board-liaison`: with a configured Herdr connection and one
-selected liaison, it automatically opens the liaison's first mate in a new tab
+Bare entry opens the bridge only and never boards a first mate: a boarded ship
+is attended, and its mail waits for that session instead of headless wakes.
+Press `l` to talk to the liaison. Passed explicitly, `--board-liaison` does that
+on entry: with a configured Herdr connection and one
+selected liaison, it opens the liaison's first mate in a new tab
 or focuses its verified live pane. The dashboard remains available in its
 original tab through Herdr navigation. Startup waits for fresh observations and
 pins the selected ship's canonical home; it never chooses between conflicting

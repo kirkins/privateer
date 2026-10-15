@@ -871,8 +871,9 @@ fn dashboard_binary() -> Option<PathBuf> {
 }
 fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
     use std::os::unix::process::CommandExt;
+    // Only the bridge: boarding a first mate would attend its ship and hold
+    // its mail, so that stays the captain's explicit choice (l or b).
     let mut command = std::process::Command::new(binary);
-    command.arg("--board-liaison");
     if let Some(home) = home {
         command.arg("--home").arg(home);
     }

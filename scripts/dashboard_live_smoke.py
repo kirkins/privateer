@@ -489,16 +489,20 @@ def onboarding(binary, runtime):
             assert json.loads(once.stdout)["read_only"] is True
             assert server.creates == 1 and server.focuses == 0, "--once performed a startup action"
             tui = Tui(runtime, env, [], cwd=root)
-            tui.until(lambda: "to talk directly, run:" in tui.screen(), "ordinary entry did not explain how to reach the liaison")
+            tui.until(lambda: "Talk to contact directly" in tui.screen(), "ordinary entry did not explain how to reach the liaison")
             tui.keys(b"l")
+            tui.until(lambda: "to talk directly, run:" in tui.screen(), "Talk without Herdr did not explain how to reach the liaison")
             assert server.creates == 1 and server.focuses == 0, "ordinary entry discovered an unconfigured socket"
             tui.close()
             tui = None
             entry_env = dict(env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(server.path))
+            # Bare entry is the bridge only: boarding would attend the ship
+            # and hold its mail, so it waits for an explicit Talk.
             tui = Tui(runtime, entry_env, [], cwd=root)
-            tui.until(lambda: server.focuses == 1, "bare privateer did not automatically focus the liaison")
             tui.drain(2.5)
-            assert server.creates == 1 and server.focuses == 1
+            assert server.creates == 1 and server.focuses == 0, "bare privateer boarded a first mate"
+            tui.keys(b"l")
+            tui.until(lambda: server.focuses == 1, "Talk to liaison did not focus its live pane")
             tui.keys(b"0l")
             tui.until(lambda: server.focuses == 2, "Talk to liaison needed another Board action")
             screen = tui.screen().splitlines()
@@ -509,7 +513,7 @@ def onboarding(binary, runtime):
             tui.close()
             tui = None
             # End the attended session while retaining its old Herdr pane.
-            # Next entry must create a fresh conversation automatically.
+            # Talk must then create a fresh conversation.
             (root / "release").touch()
             for child in server.children:
                 _, error = child.communicate(timeout=5)
@@ -517,8 +521,11 @@ def onboarding(binary, runtime):
             (root / "release").unlink()
             (root / "harness-started").unlink()
             tui = Tui(runtime, entry_env, [], cwd=root)
-            tui.until(lambda: (root / "harness-started").exists(), "bare privateer did not open an offline liaison")
-            tui.until(lambda: query("ship.presence", {"ship":"contact"})["attended"], "automatic liaison launch did not claim presence")
+            tui.drain(2.5)
+            assert server.creates == 1, "bare privateer opened a conversation"
+            tui.keys(b"l")
+            tui.until(lambda: (root / "harness-started").exists(), "Talk did not open an offline liaison")
+            tui.until(lambda: query("ship.presence", {"ship":"contact"})["attended"], "liaison launch did not claim presence")
             assert query("ship.presence", {"ship":"contact"})["lease"]["binding"]["pane"]["pane_id"] == "w1:p2"
             tui.drain(2.5)
             assert server.creates == 2 and server.focuses == 3 and not server.errors, server.errors
@@ -544,14 +551,14 @@ def onboarding(binary, runtime):
                 startup = None
                 try:
                     if attended:
-                        startup = Tui(runtime, startup_entry, [])
+                        startup = Tui(binary, startup_entry, ["--board-liaison"])
                         startup.until(lambda: json.loads(startup_command("contact", "ship.presence", "--json", '{"ship":"contact"}'))["attended"],
                                       "startup fixture did not establish attended presence")
                         startup.close()
                         startup = None
                     counts = (startup_server.creates, startup_server.focuses)
                     startup_server.protocol = 19
-                    startup = Tui(runtime, startup_entry, [])
+                    startup = Tui(binary, startup_entry, ["--board-liaison"])
                     startup.until(lambda: "HERDR UNAVAILABLE" in startup.screen(), "startup did not observe the Herdr outage")
                     assert "No Herdr connection configured" not in startup.screen(), "configured outage was reported as missing context"
                     assert "Liaison · your default contact" in startup.screen()
@@ -618,7 +625,7 @@ def onboarding(binary, runtime):
         early_server.first_snapshot_delay = 0.6
         early = None
         try:
-            early = Tui(runtime, dict(early_env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(early_server.path)), [])
+            early = Tui(binary, dict(early_env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(early_server.path)), ["--board-liaison"])
             early.keys(b"\x1b[<64;10;8M")
             early.until(lambda: early_server.creates == 1, "early input cancelled the startup liaison handoff")
             early.until(lambda: (early_root / "harness-started").exists(), "startup handoff did not reach the harness")
@@ -821,4 +828,4 @@ def onboarding(binary, runtime):
                 assert not (plain_root / "escaped").exists()
             finally:
                 plain.close()
-        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, ordinary and liaison onboarding Board after Herdr recovery, bare entry opens/focuses the liaison with keyboard/mouse return and no duplicate launch, startup cancels ambiguous/removed/changed contacts and homes for idle and attended ships without resuming or retargeting, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
+        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, ordinary and liaison onboarding Board after Herdr recovery, bare entry stays on the bridge; Talk opens/focuses the liaison with keyboard/mouse return and no duplicate launch, startup cancels ambiguous/removed/changed contacts and homes for idle and attended ships without resuming or retargeting, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
