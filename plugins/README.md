@@ -292,6 +292,38 @@ heartbeat. Claude hooks share the wrapper's holder when launched this way;
 raw Claude hooks retain their existing lifecycle. While presence is live,
 `serve` leaves work with the attended session.
 
+`privateer start claude` loads the optional `attended-claude` native mod for
+Claude Code 2.1.287 or later (live checks used 2.1.300). It uses the native
+prompt API, never terminal keystrokes: idle actionable mail starts one turn;
+busy turns and unfinished drafts retain a single footer count. Low notices
+join the captain's next normal prompt. Native turn-start receipts and bounded
+transcript recovery preserve notification progress across resume; queue
+admission alone does not advance the delivery watermark. Busy and queued state
+also survive a mod reload within the same wrapper lifetime. Notification never
+acknowledges a message or claims task completion.
+
+`/privateer-mail pause|resume|status` works without a model turn. Errors,
+interruptions, refusals and declined native prompt admission pause automatic
+wakes. Only an explicit resume or a captain prompt permits recovery; background
+peer and scheduled events do not clear the pause. Native model and permission
+settings still apply; options follow `--`, for example
+`privateer start claude -- --permission-mode auto`. No permission bypass,
+provider selection, credential copy or global plugin installation is added.
+
+The loaded mod renews a short process-local heartbeat after checking its exact
+presence holder. Existing Claude settings hooks retain startup bearings and
+stand down for mail only while that heartbeat is fresh. Disabled/refused mods
+leave the legacy prompt/turn-end hooks available; an expired heartbeat restores
+them. Legacy hooks alone do not provide idle wakeups. An organization may
+restrict mods or classic-event hooks; native policy is respected.
+
+Claude 2.1.300 passed a live isolated idle-wake/file/reply/ack pilot, a draft-held
+request, and exact native resume without replaying a deliberately unacknowledged
+request. The native mod validator and real-mailbox fixtures cover burst
+coalescing, busy/reload boundaries, pause recovery, stale holders, failed
+admission and legacy fallback. These checks establish attended mail integration,
+not unattended fleet production readiness.
+
 Real CLI/extension fixtures cover a thousand-message burst, busy/idle delivery,
 resume receipts, failed queues, native error boundaries, holder replacement and
 shutdown. Pi 1.1.0 has also passed a live isolated interactive file/reply/ack
