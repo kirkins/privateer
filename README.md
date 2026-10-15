@@ -57,17 +57,22 @@ privateer --home /absolute/private/home charter.put --file examples/charter.yaml
 ```
 
 Edit the [example charter](examples/charter.yaml) for your repository first.
-`--file` accepts `.yaml`, `.yml` and `.json`, containing one object with unique
-string keys and JSON-compatible values. Plain YAML numbers must fit JSON integer
-or finite floating-point ranges; quote numeric-looking text or use `!!str` to
-keep it as a string. Files and normalized JSON arguments are limited to 64 KiB,
-with at most 64 nesting levels, 10,000 nodes (including keys),
-and 1 MiB of expanded scalar/key data. Parsing finishes before a home is opened.
+`--file` accepts regular UTF-8 `.yaml`, `.yml` and `.json` files, containing one
+object with unique string keys and JSON-compatible values. Plain YAML integers
+must fit `i64` or `u64`; floating-point numbers must fit finite `f64` values.
+Quote numeric-looking text or use `!!str` to keep it as a string, including in
+mapping keys. For `--file`, raw input and normalized JSON arguments are each
+limited to 64 KiB, with at most 64 nesting levels, 10,000 nodes (including keys),
+and 1 MiB of expanded scalar/key data. Nonrecursive YAML aliases are supported
+within these budgets. Parsing finishes before a home is opened.
 YAML supplies data: it does not read includes, run constructors or expand
 environment variables. Local custom tags are rejected; standard core tags and
 inert global annotations may be accepted or ignored as ordinary data. Existing
 command validation still applies. Use `--file` once, separately from `--json`;
-inline `--json` and all machine protocols and outputs continue to use JSON.
+it supplies command arguments, not runtime configuration. RPC, hooks and internal
+supervisors do not accept `--file`. Inline `--json` and all machine protocols and
+outputs continue to use JSON. To pass `--file` to a native harness, put it after
+the separator in `privateer start HARNESS -- --file PATH`.
 
 ## Build and try the isolated pilot
 
