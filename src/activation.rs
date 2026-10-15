@@ -496,6 +496,11 @@ fn warm_session(
 fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let name = ship["name"].as_str().context("ship name")?.to_owned();
     let profile = ship["first_mate"].clone();
+    if crate::permissions::paused(store, &name)? {
+        return Ok(
+            json!({"ship":name,"skipped":"tool permission question awaits captain or a policy change"}),
+        );
+    }
     let now = Store::now_ms();
     let running: bool = store.connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status='running')",

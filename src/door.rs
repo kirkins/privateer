@@ -587,6 +587,11 @@ impl<'a> Session<'a> {
             "ships" => self.ships(),
             "status" => self.status(),
             "waiting" => self.waiting(),
+            // Registered front doors carry the captain's explicit commands.
+            "permissions" if args.as_object().is_some_and(|a| a.is_empty()) => {
+                crate::permissions::load()
+            }
+            "permissions" => crate::permissions::set(&crate::store::Caller::Operator, args),
             _ => bail!("unknown door command {command:?}"),
         }
     }

@@ -15,8 +15,21 @@ use std::path::{Path, PathBuf};
 pub const STATE_DIR: &str = ".privateer";
 /// Commands that mean the human form when given without `--json`.
 pub const VERBS: &[&str] = &[
-    "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project", "start",
-    "hook", "service", "ship", "door",
+    "init",
+    "status",
+    "ships",
+    "ask",
+    "tell",
+    "inbox",
+    "reply",
+    "wakes",
+    "project",
+    "start",
+    "hook",
+    "service",
+    "ship",
+    "door",
+    "permissions",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -203,6 +216,8 @@ Use your agent identity for mail and delegation through these JSON commands or
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
 - Before you stop, replace the handoff note for each focus you worked on: `note.put {{"ship":"{ship}","focus":"task:<id>|thread:<id>|captain|ship","body":"..."}}`. Keep it under 2 KB and to judgement: what you are doing and why, what you are waiting on, what comes next. Facts are already recorded. Put lasting preferences and conventions in the `ship` note.
 - Repositories live in `projects/`. Add one with `project.add {{"url":"<git url>","name":"<optional>"}}`, or to a ship you created with `"target":"<ship>"`.
+- Reuse repository URLs from the task, existing projects or Git remotes before asking the captain to repeat them.
+- Tool permissions are launch policy, separate from your charter. Routine `git` and `gh` calls are pre-approved for Claude. If a tool is denied, report the blocker; do not send the captain hand-edit instructions for `.claude` settings. The captain can add a fleet rule with `privateer permissions allow 'Tool(rule)'`, or use `privateer permissions yolo` / Telegram `/yolo on` for every first mate. Agents cannot change this policy themselves. Settings apply on the next launch, including resumed wakes.
 - New area of work? Create a ship for it: `ship.create {{"name":"...","scope":"...","objective":"..."}}` (beside this folder; it gets your charter's actions, or the subset you pass as `"actions"`). Change a ship you created with `ship.actions {{"name":"...","actions":[...]}}`, within your own actions, and retire it with `ship.retire {{"name":"..."}}`. `fleet.list {{}}` shows every ship on this machine.
 
 ## Crew
@@ -655,7 +670,19 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let folder = home.parent().context("ship folder")?;
     let holder = format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4());
     let control = crate::executable::installed()?;
-    let mut command = std::process::Command::new(&binary);
+    let plugins = fs::canonicalize(plugins_dir()?)?;
+    let policy = serde_json::to_string(&crate::permissions::load()?)?;
+    let launch = || {
+        let mut command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg("--attended-policy")
+            .arg(&policy)
+            .arg(&harness)
+            .arg(&binary);
+        command
+    };
+    let mut command = launch();
     if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
         let plugins = fs::canonicalize(plugins_dir()?)?;
         let extension = plugins.join("attended/mail.ts");
@@ -664,13 +691,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             "attended mail adapter missing from {}",
             plugins.display()
         );
-        command = std::process::Command::new("python3");
-        command
-            .arg(plugins.join("native_launch.py"))
-            .arg(&harness)
-            .arg(&binary)
-            .arg("-e")
-            .arg(extension);
+        command = launch();
+        command.arg("-e").arg(extension);
     } else if harness == "claude" {
         let plugins = fs::canonicalize(plugins_dir()?)?;
         let plugin = plugins.join("attended-claude");
@@ -678,30 +700,15 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             plugin.join("hooks/hooks.json").is_file(),
             "Claude attended mail plugin missing"
         );
-        command = std::process::Command::new("python3");
-        command
-            .arg(plugins.join("native_launch.py"))
-            .arg(&harness)
-            .arg(&binary)
-            .arg("--plugin-dir")
-            .arg(plugin);
+        command = launch();
+        command.arg("--plugin-dir").arg(plugin);
     } else if harness == "opencode-v2" {
         let plugins = fs::canonicalize(plugins_dir()?)?;
         crate::opencode_mail::install(folder, &plugins)?;
-        command = std::process::Command::new("python3");
-        command
-            .arg(plugins.join("native_launch.py"))
-            .arg(&harness)
-            .arg(&binary)
-            .arg("--standalone");
+        command = launch();
+        command.arg("--standalone");
     } else if harness == "cursor" {
         cursor_settings(folder, &control)?;
-        let plugins = fs::canonicalize(plugins_dir()?)?;
-        command = std::process::Command::new("python3");
-        command
-            .arg(plugins.join("native_launch.py"))
-            .arg(&harness)
-            .arg(&binary);
     }
     command
         .args(passthrough)

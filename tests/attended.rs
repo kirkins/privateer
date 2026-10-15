@@ -632,15 +632,20 @@ with open(os.environ['CLAUDE_TEST_RECORD'],'w') as f:
         String::from_utf8_lossy(&output.stderr)
     );
     let seen: Value = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
-    assert_eq!(seen["argv"][0], "--plugin-dir");
+    let argv = seen["argv"].as_array().unwrap();
     assert!(
-        seen["argv"][1]
-            .as_str()
-            .unwrap()
-            .ends_with("plugins/attended-claude")
+        argv.windows(2).any(|a| a[0] == "--plugin-dir"
+            && a[1].as_str().unwrap().ends_with("plugins/attended-claude"))
     );
-    assert_eq!(seen["argv"][2], "--model");
-    assert_eq!(seen["argv"][3], "native-choice");
+    assert!(
+        argv.windows(2)
+            .any(|a| a[0] == "--model" && a[1] == "native-choice")
+    );
+    assert!(
+        argv.windows(2)
+            .any(|a| a[0] == "--permission-mode" && a[1] == "acceptEdits")
+    );
+    assert!(argv.contains(&json!("Bash(git *)")) && argv.contains(&json!("Bash(gh *)")));
     assert_eq!(seen["role"], "agent");
     assert_eq!(seen["actor"], "infra");
     assert_eq!(seen["route"], "https://provider.example.invalid");

@@ -41,6 +41,7 @@ HELP = (
     "/status — what each ship is doing, from records (wakes no one)\n"
     "/ships — the fleet's ships and what they handle\n"
     "/waiting — questions and decisions still waiting on you\n"
+    "/yolo on|off|status — tool approval mode for every first mate\n"
     "/voice [on|off] — speak messages as voice notes (needs [tts])\n"
     "/help — this message\n\n"
     "Photos and files are saved and the ship is handed their path. Voice notes are "
@@ -50,6 +51,7 @@ HELP = (
 COMMANDS = [
     {"command": "to", "description": "Send to a ship, or pick one"},
     {"command": "status", "description": "What the fleet is doing"},
+    {"command": "yolo", "description": "Fleet tool approvals: on, off or status"},
     {"command": "ships", "description": "The fleet's ships"},
     {"command": "waiting", "description": "What is waiting on you"},
     {"command": "voice", "description": "Toggle spoken messages"},
@@ -368,6 +370,13 @@ class Door:
                 self.cmd_ships()
             elif name == "waiting":
                 self.cmd_waiting()
+            elif name == "yolo":
+                if rest not in ("", "status", "on", "off"):
+                    self.say("Usage: /yolo on|off|status", reply_to=msg_id)
+                    return
+                args = {} if rest in ("", "status") else {"mode":"yolo" if rest == "on" else "standard"}
+                value = self.runtime.call("permissions", args)
+                self.say(f"Fleet tool mode: {value['mode']}. Applies to every first mate's next launch; running sessions keep their current mode.")
             elif name == "voice":
                 import tts
                 self.say(tts.voice_reply(self.cfg, rest))

@@ -16,6 +16,7 @@ pub mod jobs;
 pub mod mail;
 pub mod opencode_mail;
 pub mod peers;
+pub mod permissions;
 pub mod plugins;
 pub mod presence;
 pub mod project;
@@ -38,6 +39,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "resource.recover",
     "history.prune",
     "ship.put",
+    "permissions.set",
 ];
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -58,6 +60,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
     }
     match command.split('.').next().unwrap_or("") {
+        "permissions" => permissions::dispatch(store, command, args),
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),

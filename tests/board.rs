@@ -231,6 +231,10 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
         "{unit}"
     );
     assert!(unit.contains(&format!("Environment=\"PATH={}\"", place.path)));
+    assert!(unit.contains(&format!(
+        "Environment=\"PRIVATEER_FLEET={}\"",
+        place.root.join("fleet.sqlite").display()
+    )));
     assert!(text(&run(&["service", "status"])).contains(&format!("user service {name}")));
     let stopped = run(&["service", "stop"]);
     assert!(stopped.status.success(), "{}", text(&stopped));

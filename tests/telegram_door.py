@@ -243,6 +243,17 @@ def main() -> int:
                 m for m in telegram.sent() if "Fleet status" in m["text"]])[0]
             assert "liaison" in status["text"] and "ops" in status["text"], status
 
+            # Captain commands configure all ships without inference or settings edits.
+            telegram.message("/yolo on", user=999)
+            time.sleep(.5)
+            assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "standard"
+            telegram.message("/yolo on")
+            wait_for("fleet YOLO confirmation", lambda: [m for m in telegram.sent() if "Fleet tool mode: yolo" in m["text"]])
+            assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "yolo"
+            telegram.message("/yolo off")
+            wait_for("fleet standard confirmation", lambda: [m for m in telegram.sent() if "Fleet tool mode: standard" in m["text"]])
+            assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "standard"
+
             # A decision with options gets buttons; a button answers it.
             decision = fleet.call("ops", "mail.send", {
                 "from": "ops", "to": "captain", "kind": "decision", "body": "Which region?",

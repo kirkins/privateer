@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Replace this process with the chosen harness, clearing foreign identity only."""
 import os
+import json
 import sys
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def native_environment():
     return env
 
 
-def launch(harness, argv):
+def launch(harness, argv, control=None):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
     if harness == "opencode-v2":
@@ -32,6 +33,9 @@ def launch(harness, argv):
     # Pi JSON mode may exit zero after an assistant error. Its event stream,
     # not the process status alone, must confirm a completed unattended run.
     flags = argv[:argv.index("--")] if "--" in argv else argv
+    if harness == "claude" and "--print" in flags and "stream-json" in flags:
+        os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("claude_turn.py")),
+                                  "--control", json.dumps(control), *argv], native_environment())
     if harness in ("pi", "pi-signed") and "--print" in flags and any(
             flags[i:i+2] == ["--mode", "json"] for i in range(len(flags))):
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("native_turn.py")),
@@ -48,8 +52,30 @@ def launch(harness, argv):
 
 def main():
     try:
-        launch(sys.argv[1], sys.argv[2:])
-    except Exception:
+        args = sys.argv[1:]
+        if args[0] == "--attended-policy":
+            from tool_permissions import attended_argv
+            value, harness = json.loads(args[1]), args[2]
+            if harness not in PROFILES and value.get("mode") == "standard":
+                # Preserve the human CLI's existing custom-harness escape hatch.
+                os.execvpe(args[3], args[3:], native_environment())
+            launch(harness, attended_argv(harness, args[3:], value))
+        else:
+            if args[0] == "--opencode-yolo":
+                if args[1] != "opencode":
+                    raise ValueError("invalid permission environment")
+                os.environ["OPENCODE_PERMISSION"] = '{"*":"allow"}'
+                args = args[1:]
+            control = None
+            if args[0] == "--control":
+                control = json.loads(args[1])
+                args = args[2:]
+            launch(args[0], args[1:], control)
+    except Exception as error:
+        from tool_permissions import UnsupportedYolo
+        if isinstance(error, UnsupportedYolo):
+            print(UnsupportedYolo.public_message, file=sys.stderr)
+            return 2
         print("Native harness launch failed; check the selected CLI installation locally.", file=sys.stderr)
         return 2
 
