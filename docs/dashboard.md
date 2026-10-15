@@ -204,7 +204,7 @@ entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
 
-One optional `liaison: true` ship in `dashboard.json` explicitly selects the
+One optional `liaison: true` ship in the presentation registry explicitly selects the
 contact badge and shortcut. If no explicit contact is configured, exactly one
 ship with the `init --liaison` preset supplies that contact. Multiple preset
 ships remain ordinary boardable fleet entries until an explicit contact is
