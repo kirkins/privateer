@@ -1,6 +1,6 @@
 # Handoff: crew outcomes wake the first mate
 
-Status: **handoff for implementation**, written 14 October 2026. This is step 3 of the build order in [conversation and activation](conversation-and-activation.md). Read [architecture](../architecture.md) ("Waking first mates", "Attended mode") for what exists.
+Status: **outcomes implemented**; crew reports in progress (see [architecture](../architecture.md#crew-outcomes)); handoff written 14 October 2026. Where the implementation differs from this handoff is listed under [Implementation notes](#implementation-notes). This is step 3 of the build order in [conversation and activation](conversation-and-activation.md). Read [architecture](../architecture.md) ("Waking first mates", "Attended mode") for what exists.
 
 ## Goal
 
@@ -54,3 +54,13 @@ Extend the wake text and the generated `AGENTS.md` (`instructions` in `src/cli.r
 - A crew `decision` reaches the first mate; its reply is recorded and readable by the crew.
 - `ship.put` refuses the name `crew`, and no caller can send mail as `crew`.
 - Tests use real supervised subprocesses, as `tests/jobs.rs` and `tests/activation.rs` do.
+
+## Implementation notes
+
+- **One emission point, one transaction.** Every path that ends a job already changes it through `jobs::alter`, so the outcome is written there, inside the transaction that first sets a reported status. There is no window between status and mail for `reconcile` to repair; the idempotent id remains as a second guard.
+- **`orphaned` is reported, once.** It is the point at which nobody supervises the job or enforces its deadline. A later settlement of the same incarnation (for example to its leader's result) does not send a second outcome; the first mate checks `job.status` for that.
+- **Wake rows are recorded before the wake job starts.** `serve` used to insert the `wakes` row after `agent.start` returned, so a wake job that ended at once could be reported as crew and wake its own first mate. A wake row whose job never appeared (a crash in between) is settled as failed.
+- **`serve` reconciles unsupervised jobs.** Otherwise a vanished supervisor's outcome waited until someone asked for the job's status. Live supervisors are checked with a cheap process identity read and skipped; a job that cannot be inspected is reported in the pass instead of stopping the dispatcher.
+- **Bounds.** The whole outcome body, header and log tails, is at most 2,000 characters (the tail gets what the header leaves, up to 1,400 bytes, stderr first), so it fits a wake's and a hook's per-message limit; the hook limit was raised from 1,500 to 2,000 characters to match the wake. The payload is not repeated in the wake text.
+- **Cancellation records who asked** (`cancelled_by`), which decides `low` (the ship itself) or `normal` (the operator, or authority ending).
+- **Crew asking their first mate** (`crew.report`) follows separately, on top of outcomes.

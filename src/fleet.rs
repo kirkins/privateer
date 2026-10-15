@@ -163,10 +163,7 @@ fn caller_ship(store: &Store) -> Option<String> {
 fn create(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
-    ensure!(
-        name != crate::mail::CAPTAIN,
-        "captain is reserved for the person"
-    );
+    crate::mail::unreserved(name)?;
     let creator = caller_ship(store);
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
     if let Caller::Agent { actor } = store.caller() {

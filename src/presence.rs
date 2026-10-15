@@ -15,7 +15,8 @@ use std::io::Read;
 use std::path::Path;
 
 const MAX_TTL_SECS: u64 = 86_400;
-const BODY_CHARS: usize = 1_500;
+// As much of a message as a wake shows, so crew log tails survive.
+const BODY_CHARS: usize = 2_000;
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(

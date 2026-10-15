@@ -11,6 +11,9 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Value, json};
 
 pub const CAPTAIN: &str = "captain";
+/// The runtime's voice for a ship's crew: the outcomes of its jobs.
+/// Only the runtime writes as it (see `crew`); nobody can send as it.
+pub const CREW: &str = "crew";
 const KINDS: &[&str] = &["request", "reply", "notice", "decision"];
 const URGENCIES: &[&str] = &["low", "normal", "high"];
 const MAX_MESSAGE_BYTES: usize = 65_536;
@@ -75,6 +78,7 @@ fn ship(store: &Store, name: &str) -> Result<Option<Value>> {
 
 /// A mailbox this home holds: the captain's, or a ship hosted here.
 fn local_address(store: &Store, address: &str) -> Result<()> {
+    ensure!(address != CREW, "{CREW} has no mailbox");
     if address == CAPTAIN {
         return Ok(());
     }
@@ -85,10 +89,20 @@ fn local_address(store: &Store, address: &str) -> Result<()> {
     }
 }
 
+/// Refuse names no ship may take: the person's and the runtime's crew.
+pub fn unreserved(name: &str) -> Result<()> {
+    ensure!(name != CAPTAIN, "{CAPTAIN} is reserved for the person");
+    ensure!(
+        name != CREW,
+        "{CREW} is reserved for the runtime's crew mail"
+    );
+    Ok(())
+}
+
 fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
-    ensure!(name != CAPTAIN, "{CAPTAIN} is reserved for the person");
+    unreserved(name)?;
     let scope = args.get("scope").and_then(Value::as_str).unwrap_or("");
     ensure!(
         scope.chars().count() <= MAX_SCOPE_CHARS,
@@ -128,6 +142,37 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     )?;
     store.audit("ship.put", &json!({"name": name}))?;
     Ok(record)
+}
+
+/// Write a message from `crew` to a ship hosted here, inside the caller's
+/// transaction so it commits with the fact it reports. `message` holds id,
+/// to, kind (notice or request), task_id, body, payload and urgency. The id
+/// is the idempotency key: an existing message under it is left as it is,
+/// and false is returned.
+pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Result<bool> {
+    let text = |key: &str| message[key].as_str().context("invalid crew message");
+    let (kind, urgency) = (text("kind")?, text("urgency")?);
+    ensure!(
+        matches!(kind, "notice" | "request") && URGENCIES.contains(&urgency),
+        "invalid crew message"
+    );
+    let written = conn.execute(
+        "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO NOTHING",
+        params![
+            text("id")?,
+            CREW,
+            text("to")?,
+            kind,
+            text("task_id")?,
+            text("body")?,
+            message["payload"].to_string(),
+            urgency,
+            Store::now_ms(),
+            (kind == "request").then_some("open")
+        ],
+    )?;
+    Ok(written == 1)
 }
 
 const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms";
@@ -196,6 +241,8 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             "only the operator speaks as the captain"
         );
     }
+    ensure!(from != CREW, "only the runtime speaks as {CREW}");
+    ensure!(to != CREW, "{CREW} has no mailbox");
     local_address(store, from)?;
     let recipient = if to == CAPTAIN {
         None
@@ -452,6 +499,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     ensure!(
         kind != "decision" && from != CAPTAIN && to != CAPTAIN,
         "the captain's mail stays in its own home for now"
+    );
+    ensure!(
+        from != CREW && to != CREW,
+        "crew reports stay in their own home"
     );
     let sender = ship(store, from)?.with_context(|| format!("unknown ship {from}"))?;
     ensure!(

@@ -3,6 +3,7 @@ pub mod admission;
 pub mod cli;
 pub mod context;
 pub mod core;
+pub mod crew;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod fleet;
