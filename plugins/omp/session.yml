@@ -1,0 +1,6 @@
+# Per-invocation worker posture; authentication/provider settings stay native.
+autoResume: false
+plan:
+  defaultOnStartup: false
+prewalk:
+  enabled: false
