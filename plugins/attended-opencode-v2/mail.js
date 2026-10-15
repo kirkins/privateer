@@ -93,6 +93,20 @@ export default {
         && sequence(value.through) && value.through <= through ? value : undefined;
     }
 
+    function anotherOpenConversation(id) {
+      const tabs = ctx.ui.tabs.list();
+      if (tabs.length > 128) return true;
+      return tabs.some(tab => {
+        if (tab.sessionID === id) return false;
+        const info = ctx.data.session.get(tab.sessionID);
+        if (info?.location?.directory) {
+          try { if (realpathSync(info.location.directory) !== config.folder) return false; } catch { return true; }
+        }
+        return tab.busy || ctx.data.session.pending.list(tab.sessionID).slice(-128).some(row =>
+          receipt({ type: row.type, metadata: row.payload?.metadata }, tab.sessionID, Number.MAX_SAFE_INTEGER));
+      });
+    }
+
     async function snapshot(id, after = 0) {
       const value = await call("mail.pending", { address: config.ship, after_seq: after });
       if (!live() || selected() !== id) return;
@@ -175,6 +189,7 @@ export default {
       if (!refreshed || !live() || selected() !== id) return;
       if (state.paused) { status("⚓ mail paused; /privateer-mail resume"); return; }
       if (state.pending && !state.retry) { status("⚓ ship mail queued"); return; }
+      if (anotherOpenConversation(id)) { status("⚓ mail awaiting another conversation"); return; }
       if (refreshed.queued.length || ctx.data.session.status(id) !== "idle" || ctx.keymap.mode.current() !== "base") {
         status("⚓ ship mail awaiting idle"); return;
       }
@@ -184,7 +199,8 @@ export default {
       if (value) status(`⚓ ${value.count} new ship mail`);
       if (!value || !live() || selected() !== id || !value.actionable || !await owned(id)
           || state.paused || (state.pending && !state.retry) || ctx.data.session.status(id) !== "idle"
-          || ctx.data.session.pending.list(id).length || ctx.keymap.mode.current() !== "base") return;
+          || ctx.data.session.pending.list(id).length || ctx.keymap.mode.current() !== "base"
+          || anotherOpenConversation(id)) return;
       const retry = state.retry && state.pending;
       const input = notification(retry ? { ...value, through_seq: retry.through,
         headers: value.headers.filter(header => header.seq <= retry.through) } : value, id), record = state;

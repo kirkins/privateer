@@ -421,7 +421,8 @@ public TUI API, separately from the V1 plugin contract.
 The adapter polls the existing Rust mailbox every five seconds, holds one
 pending native input and combines a burst into at most six headers. It checks
 the current root conversation's workspace and the wrapper's exact presence
-holder, defers while busy or behind queued captain input, and admits with native
+holder, defers while busy, behind queued captain input, or while another open
+conversation in this ship is busy/has a queued ship wake, and admits with native
 `delivery: "queue"`. Low notices alone do not start inference. V2's public API
 does not expose the composer draft: direct queueing preserves it while the mail
 turn runs, rather than waiting for a blank composer. A native text footer and
