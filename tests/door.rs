@@ -522,6 +522,7 @@ fn door_start_installs_a_user_service_where_systemd_runs() {
         .collect();
     assert_eq!(units.len(), 1);
     let unit = fs::read_to_string(&units[0]).unwrap();
+    assert!(unit.contains("\nKillMode=control-group\n"), "{unit}");
     assert!(
         unit.contains(&format!("ExecStart=\"{BIN}\" door run fake\n")),
         "{unit}"

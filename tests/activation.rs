@@ -161,7 +161,8 @@ fn concurrent_legacy_activation_upgrades_preserve_history() {
             .execute_batch(
                 "ALTER TABLE wakes DROP COLUMN focuses;
              ALTER TABLE wakes DROP COLUMN harness;
-             ALTER TABLE wakes DROP COLUMN session_id;",
+             ALTER TABLE wakes DROP COLUMN session_id;
+             ALTER TABLE wakes DROP COLUMN dispatcher_generation;",
             )
             .unwrap();
         let barrier = Arc::new(Barrier::new(16));
@@ -190,10 +191,10 @@ fn concurrent_legacy_activation_upgrades_preserve_history() {
             assert_eq!(opener.join().unwrap().unwrap(), 17);
         }
         let columns: i64 = fleet.store.connection().query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('wakes') WHERE name IN ('focuses','harness','session_id')",
+            "SELECT COUNT(*) FROM pragma_table_info('wakes') WHERE name IN ('focuses','harness','session_id','dispatcher_generation')",
             [], |r| r.get(0),
         ).unwrap();
-        assert_eq!(columns, 3);
+        assert_eq!(columns, 4);
     }
 }
 
@@ -240,8 +241,8 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
     let marker = fleet.root.join("slow-started.json");
     let script = fleet.root.join("slow-peer.py");
     fs::write(&script, format!(
-        "#!/usr/bin/env python3\nimport json, os, pathlib, sqlite3, time\ntime.sleep(0.25)  # exercise cold interpreter startup\nwith sqlite3.connect({:?}) as db:\n    wakes = db.execute(\"SELECT COUNT(*) FROM wakes\").fetchone()[0]\npathlib.Path({:?}).write_text(json.dumps({{\"pid\":os.getpid(),\"wakes\":wakes}}))\ntime.sleep(5)\n",
-        fleet.home.join("privateer.sqlite").to_string_lossy(), marker.to_string_lossy(),
+        "#!{}\nimport json, os, pathlib, sqlite3, time\ntime.sleep(0.25)  # exercise cold interpreter startup\nwith sqlite3.connect({:?}) as db:\n    wakes = db.execute(\"SELECT COUNT(*) FROM wakes\").fetchone()[0]\npathlib.Path({:?}).write_text(json.dumps({{\"pid\":os.getpid(),\"wakes\":wakes}}))\ntime.sleep(5)\n",
+        support::python().display(), fleet.home.join("privateer.sqlite").to_string_lossy(), marker.to_string_lossy(),
     )).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     for (peer, executable) in [
