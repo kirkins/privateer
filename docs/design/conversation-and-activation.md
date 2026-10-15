@@ -143,13 +143,13 @@ Terminal integrations such as Herdr are **activation and observation backends**:
 
 ### Grouping, guards and acknowledgement
 
-- **Grouping:** a burst of messages and events becomes one wake carrying everything pending.
+- **Grouping:** implemented mail batching and bounded wake coverage follow [Waking first mates](../architecture.md#waking-first-mates); general event-driven activation remains proposed.
 - **No double wakes:** a ship whose first mate is already running is not woken again; new mail waits for its next inbox read, or is injected.
 - **Loop detection:** a flat fleet has no boss to stop two first mates politely replying to each other forever. Correlated conversations carry hop counts and per-conversation budgets, and the runtime refuses or escalates runaways.
 - **Budgets and quiet hours:** per-ship wake budgets (for example at most N wakes per hour) and quiet hours.
 - **Authority:** a revoked charter or a cancelled task means no wake.
 - **Capacity:** wakes go through admission and the capacity queue.
-- **Acknowledgement:** a wake hands the agent everything up to a given sequence number, and the agent acknowledges exactly what it saw; anything newer triggers the next wake.
+- **Acknowledgement:** implemented wake coverage and explicit mailbox acknowledgements are distinct; see [Waking first mates](../architecture.md#waking-first-mates) for their sequence and prompt bounds.
 
 Activation is where a fleet's inference cost lives: every wake is a model turn. How much context each wake carries, and whether it needs to happen at all, largely determine what the fleet costs to run.
 
