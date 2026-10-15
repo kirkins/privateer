@@ -621,3 +621,25 @@ fn a_created_ship_keeps_its_creators_model_route_on_the_same_harness() {
     );
     assert_eq!(other["options"], json!({}));
 }
+
+#[test]
+fn running_init_again_keeps_the_first_mates_model_for_the_same_harness() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let mut profile = machine.json(&apps, "ship.show", json!({"name":"apps"}))["first_mate"].take();
+    let chosen = json!({"sandbox":"workspace-write","provider":"openai","model":"chosen"});
+    profile["options"] = chosen.clone();
+    machine.json(
+        &apps,
+        "ship.put",
+        json!({"name":"apps","first_mate":profile}),
+    );
+    let options = || {
+        machine.json(&apps, "ship.show", json!({"name":"apps"}))["first_mate"]["options"].clone()
+    };
+
+    machine.ok(&apps, &["init"]);
+    assert_eq!(options(), chosen);
+    machine.ok(&apps, &["init", "--harness", "pi"]);
+    assert_eq!(options(), json!({}));
+}
