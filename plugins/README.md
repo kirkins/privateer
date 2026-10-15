@@ -45,7 +45,10 @@ focus; an adapter does not choose that policy or share sessions across tasks.
 
 Claude/Grok accept native `permission_mode`; Gemini maps it to `approval-mode`.
 No permission override is supplied by default. Claude's optional `bare: true`
-selects its native minimal launch mode for an isolated pilot. Cursor accepts
+selects its native minimal launch mode for an isolated pilot. Pi and signed Pi
+also accept `bare: true`: disable extensions, MCP, skills, templates, context
+files and themes for this invocation, keeping native provider/authentication
+configuration. Cursor accepts
 native `sandbox` (`enabled`/`disabled`) and boolean `trust`. Gemini's boolean
 `trust` selects per-run `--skip-trust`, without modifying the trust store. Devin
 accepts native `permission_mode`, boolean `sandbox` and boolean `trust`; its
@@ -53,10 +56,22 @@ accepts native `permission_mode`, boolean `sandbox` and boolean `trust`; its
 native text, not invented JSON events. Kimi's native `--prompt` selects its
 unattended mode; no conflicting `--auto` flag is appended.
 
-The native launcher replaces itself with the selected CLI in the same process group.
+The direct native launcher replaces itself with the selected CLI in the same process group.
 It clears inherited foreign harness identity markers while preserving
 `PRIVATEER_ROLE`, `PRIVATEER_ACTOR`, authentication and provider configuration.
 A missing CLI fails without substituting another harness or model.
+
+Unattended Pi/signed Pi JSON runs use an event-checking bridge in that same
+job group. Pi may exit zero after exhausted provider retries, so process status
+alone cannot confirm a run. The bridge requires an unchanged session identity,
+a final assistant `stop`, a non-aborted `agent_settled`, a complete JSONL stream
+and a zero native exit. Error, aborted, truncated and incomplete runs fail the
+job; native retries may recover before the final settled event. Explicit resume
+must match the requested UUID or the existing session file's header. No extra
+model retries or provider fallback are introduced. Native events are preserved;
+one final summary counts only authoritative completed-message and compaction
+usage, excluding repeated streaming snapshots. This confirms native run
+completion, not the task's acceptance criteria, test results or mail delivery.
 
 Rovo uses its native ACP interface rather than a guessed positional prompt or
 the older `acli rovodev` CLI. Kimi and Devin optionally accept `transport: acp`;

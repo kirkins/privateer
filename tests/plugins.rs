@@ -340,16 +340,96 @@ for harness in ('rovo','kimi','devin'):
 }
 
 #[test]
-fn native_acp_bridge_qualifies_real_pipe_and_process_boundaries() {
-    let output = Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/acp_bridge.py"))
+fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
+    for script in ["tests/acp_bridge.py", "tests/pi_turn.py"] {
+        let output = Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn pi_zero_exit_after_a_provider_error_records_a_failed_wake_not_a_warm_session() {
+    let mut f = Fixture::new();
+    fs::write(
+        f.store.home().join("config.json"),
+        json!({"resource_home":f.base().join("ledger")}).to_string(),
+    )
+    .unwrap();
+    let fakebin = f.base().join("bin");
+    fs::create_dir(&fakebin).unwrap();
+    let fake = fakebin.join("pi");
+    fs::write(
+        &fake,
+        r#"#!/usr/bin/env python3
+import json
+for event in [
+    {'type':'session','id':'46a81234-1234-4567-8123-123456789abc'},
+    {'type':'agent_start'},
+    {'type':'message_end','message':{'role':'assistant','stopReason':'error','usage':{'input':2}}},
+    {'type':'agent_end','willRetry':False},
+    {'type':'agent_settled','aborted':False},
+]:print(json.dumps(event),flush=True)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"Pi failure fixture","first_mate":{"manifest":example("pi"),"duty_task":"task","batch_secs":0,"max_delay_secs":0,"options":{"bare":true}}})).unwrap();
+    privateer::dispatch(&mut f.store,"mail.send",json!({"id":"pi-work","from":"captain","to":"department","kind":"request","body":"Handle this fixture"})).unwrap();
+    let start = Command::new(env!("CARGO_BIN_EXE_privateer"))
+        .args([
+            "--home",
+            f.store.home().to_str().unwrap(),
+            "serve",
+            "--json",
+            "{\"once\":true}",
+        ])
+        .env(
+            "PATH",
+            format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+        )
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
+        start.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&start.stderr)
     );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let wake = loop {
+        privateer::activation::tick(&mut f.store).unwrap();
+        let wakes =
+            privateer::dispatch(&mut f.store, "wake.list", json!({"ship":"department"})).unwrap();
+        let wake = &wakes["wakes"][0];
+        if wake["status"] != "running" {
+            break wake.clone();
+        }
+        assert!(Instant::now() < deadline, "Pi fixture wake did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(wake["status"], "failed", "{wake}");
+    assert_eq!(wake["usage"]["input"], 2);
+    let sessions: i64 = f
+        .store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE ship='department'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sessions, 0,
+        "a provider failure became a warm resumable session"
+    );
+    let mail = privateer::dispatch(&mut f.store, "mail.show", json!({"id":"pi-work"})).unwrap();
+    assert_eq!(mail["state"], "open");
 }
 
 #[test]
@@ -634,7 +714,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
     let fake = fakebin.join("pi");
     fs::write(
         &fake,
-        "#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n",
+        "#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps({'type':'session','id':'fixture-session','argv':sys.argv[1:]}))\nprint(json.dumps({'type':'message_end','message':{'role':'assistant','stopReason':'stop'}}))\nprint(json.dumps({'type':'agent_settled','aborted':False}))\n",
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
@@ -656,7 +736,14 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
         "{}",
         String::from_utf8_lossy(&launch.stderr)
     );
-    let actual: Value = serde_json::from_slice(&launch.stdout).unwrap();
+    let header: Value = serde_json::from_str(
+        String::from_utf8_lossy(&launch.stdout)
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let actual = &header["argv"];
     assert_eq!(actual[0], "--print");
     assert_eq!(actual[2], "fixture-route");
     assert_eq!(actual[4], "fixture-model");
@@ -675,7 +762,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
 
 #[test]
 fn cancellation_reaches_the_execed_harness_and_its_descendants() {
-    for harness in ["codex", "rovo"] {
+    for harness in ["codex", "rovo", "pi"] {
         let mut f = Fixture::new();
         fs::write(
             f.store.home().join("config.json"),

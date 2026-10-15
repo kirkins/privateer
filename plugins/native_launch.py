@@ -2,6 +2,7 @@
 """Replace this process with the chosen harness, clearing foreign identity only."""
 import os
 import sys
+from pathlib import Path
 
 from native import PROFILES
 
@@ -22,6 +23,13 @@ def native_environment():
 def launch(harness, argv):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
+    # Pi JSON mode may exit zero after an assistant error. Its event stream,
+    # not the process status alone, must confirm a completed unattended run.
+    flags = argv[:argv.index("--")] if "--" in argv else argv
+    if harness in ("pi", "pi-signed") and "--print" in flags and any(
+            flags[i:i+2] == ["--mode", "json"] for i in range(len(flags))):
+        os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("native_turn.py")),
+                                  harness, *argv], native_environment())
     # Keep PRIVATEER_ROLE/ACTOR and all native auth/provider configuration.
     # exec preserves the job's process identity, group and cancellation path.
     os.execvpe(argv[0], argv, native_environment())
