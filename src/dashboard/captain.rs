@@ -99,6 +99,8 @@ pub struct Composer {
     pub body: String,
     pub home: Option<std::path::PathBuf>,
     pub correlation: Option<String>,
+    /// The kind and subject of the message a reply answers.
+    pub answering: Option<(String, String)>,
     pub id: String,
 }
 
@@ -246,6 +248,7 @@ impl App {
             recipient: mail.from.clone(),
             home: mail.home.clone(),
             correlation: Some(mail.id.clone()),
+            answering: Some((mail.kind.clone(), mail.subject.clone())),
             id: uuid::Uuid::new_v4().to_string(),
             ..Composer::default()
         });
@@ -377,25 +380,29 @@ impl App {
             )
         });
         frame.render_widget(
-            Paragraph::new(if draft.correlation.is_some() {
-                Line::from("Reply")
-            } else {
-                Line::from(modes.to_vec())
+            Paragraph::new(match &draft.answering {
+                Some((kind, _)) => Line::styled(
+                    format!("Reply to the {} from {}:", clean(kind, 40), clean(name, 80)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                None => Line::from(modes.to_vec()),
             }),
             rows[0],
         );
         frame.render_widget(
-            Paragraph::new(if draft.correlation.is_some() {
-                "Answer this request in its originating home."
-            } else { match draft.mode {
-                InputMode::Status => "Read recorded state. No agent wake or inference.",
-                InputMode::Ask => {
-                    "A side question, without assigning work. Live answers may use inference."
+            Paragraph::new(match &draft.answering {
+                Some((_, subject)) => format!("“{}”", clean(subject, 160)),
+                None => match draft.mode {
+                    InputMode::Status => "Read recorded state. No agent wake or inference.",
+                    InputMode::Ask => {
+                        "A side question, without assigning work. Live answers may use inference."
+                    }
+                    InputMode::Message => {
+                        "Address work or conversation to this ship. Live delivery would request a wake."
+                    }
                 }
-                InputMode::Message => {
-                    "Address work or conversation to this ship. Live delivery would request a wake."
-                }
-            }})
+                .into(),
+            })
             .wrap(Wrap { trim: false }),
             rows[1],
         );
