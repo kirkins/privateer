@@ -667,6 +667,33 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             })
             .context("no first-mate harness configured; pass one: privateer start claude")?,
     };
+    // The captain's model and provider for this ship's harness, unless the
+    // session passes its own.
+    let options = &profile["first_mate"]["options"];
+    let own_harness = profile["first_mate"]["manifest"]
+        .as_str()
+        .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+        == Some(harness.as_str());
+    let chooses = |flag: &str| {
+        passthrough
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    let mut route: Vec<String> = vec![];
+    if own_harness && !chooses("--model") && !chooses("--provider") {
+        if matches!(harness.as_str(), "pi" | "pi-signed" | "omp")
+            && let Some(provider) = options["provider"].as_str()
+        {
+            route.extend(["--provider".to_owned(), provider.to_owned()]);
+        }
+        if matches!(
+            harness.as_str(),
+            "pi" | "pi-signed" | "omp" | "claude" | "codex" | "gemini" | "cursor"
+        ) && let Some(model) = options["model"].as_str()
+        {
+            route.extend(["--model".to_owned(), model.to_owned()]);
+        }
+    }
     let binary = if harness == "opencode-v2" {
         "opencode".to_owned()
     } else {
@@ -720,6 +747,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         cursor_settings(folder, &control)?;
     }
     command
+        .args(&route)
         .args(passthrough)
         .current_dir(folder)
         .env("PRIVATEER_ROLE", "agent")

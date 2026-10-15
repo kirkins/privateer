@@ -921,3 +921,52 @@ fn simultaneous_attended_starts_have_one_live_harness_and_lease_owner() {
     assert!(ended.success());
     assert_eq!(ship.presence()["attended"], false);
 }
+
+#[test]
+fn starting_a_ship_uses_its_first_mates_model_unless_the_captain_picks_one() {
+    let ship = Ship::new();
+    ship.ok(&["init", "--harness", "pi"]);
+    let home = ship.folder.join(".privateer");
+    let mut profile: Value =
+        serde_json::from_str(&ship.ok(&["ship.show", "--json", r#"{"name":"infra"}"#])).unwrap();
+    profile["first_mate"]["options"] = json!({"provider":"openai","model":"chosen"});
+    ship.ok(&[
+        "ship.put",
+        "--json",
+        &json!({"name":"infra","first_mate":profile["first_mate"]}).to_string(),
+    ]);
+    let probe = ship.root.join("argv.json");
+    let fake = ship.root.join("bin/pi");
+    fs::write(
+        &fake,
+        format!(
+            "#!/usr/bin/env python3\nimport json,sys\njson.dump(sys.argv[1:],open({:?},'w'))\n",
+            probe.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let argv = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["--home", home.to_str().unwrap(), "start"];
+        args.extend(extra);
+        let output = ship.command(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&fs::read(&probe).unwrap()).unwrap()
+    };
+    let routed = argv(&[]);
+    let at = routed
+        .iter()
+        .position(|a| a == "--provider")
+        .expect("provider");
+    assert_eq!(routed[at + 1..at + 4], ["openai", "--model", "chosen"]);
+    let own = argv(&["--", "--model", "mine"]);
+    assert!(
+        !own.iter().any(|a| a == "--provider" || a == "chosen"),
+        "{own:?}"
+    );
+    assert!(own.ends_with(&["--model".to_owned(), "mine".to_owned()]));
+}
