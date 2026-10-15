@@ -8,6 +8,8 @@ import sys
 import tempfile
 import time
 
+from recovery_fixture import configure_workspaces
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -76,6 +78,8 @@ def main():
                 "repo": str(repo), "max_heavy_jobs": 1, "min_free_bytes": 1024,
                 "job_timeout_secs": 20,
             })
+        configure_workspaces(root, homes.values())
+        evidence["workspace_backend"] = "test protocol fixture backed by real Git worktrees"
         # One shared heavy slot for the whole host makes the cross-home refusal
         # deterministic; live load and memory limits are left generous here.
         invoke(homes["navigator"], "resource.configure", {
@@ -172,12 +176,19 @@ def main():
         assert state["exit_code"] == 0, state
         invoke(homes["applications"], "task.update", {"id": "repair", "actor": "applications", "status": "done"})
         invoke(homes["infrastructure"], "task.update", {"id": "diagnosis", "actor": "infrastructure", "status": "done"})
-        tests = subprocess.run([python, "-m", "unittest", "-q"], cwd=repo, capture_output=True)
+        repair_repo = pathlib.Path(state["cwd"])
+        workspace = invoke(homes["applications"], "workspace.status", {"task_id": "repair"})
+        assert repair_repo == pathlib.Path(workspace["path"]) and repair_repo != repo
+        assert state["workspace_lease_id"] == workspace["lease_id"]
+        tests = subprocess.run([python, "-m", "unittest", "-q"], cwd=repair_repo, capture_output=True)
         assert tests.returncode == 0
-        head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+        assert (repo / "calc.py").read_text() == "def add(left, right):\n    return left - right\n"
+        head = subprocess.run(["git", "-C", str(repair_repo), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
         invoke(homes["navigator"], "task.update", {"id": "outcome", "actor": "navigator", "status": "done"})
         assert remote(homes["navigator"], "applications", "task.show", {"id": "repair"})["status"] == "done"
-        evidence.update({"passed": True, "detached_job": state["status"], "tested_head": head, "durable_outcome_owner": "navigator"})
+        evidence.update({"passed": True, "detached_job": state["status"], "tested_head": head,
+                         "repair_workspace": str(repair_repo), "source_checkout_unchanged": True,
+                         "durable_outcome_owner": "navigator"})
     except Exception as error:
         evidence.update({"passed": False, "error": str(error)})
         (root / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")

@@ -1,0 +1,997 @@
+mod support;
+
+use privateer::{dispatch, store::Store};
+use serde_json::{Value, json};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    thread,
+    time::{Duration, Instant},
+};
+
+const BIN: &str = env!("CARGO_BIN_EXE_privateer");
+struct Fixture {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+    repo: PathBuf,
+    home: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        fs::write(repo.join("file.txt"), "base\n").unwrap();
+        fs::write(repo.join(".gitignore"), "/cache/\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+        );
+        let script = root.join("treehouse");
+        fs::write(&script, include_str!("fixtures/treehouse.py")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let home = root.join("home");
+        let mut store = Store::open(&home).unwrap();
+        fs::write(
+            home.join("config.json"),
+            json!({"resource_home":root.join("ledger"),"treehouse_binary":script}).to_string(),
+        )
+        .unwrap();
+        dispatch(&mut store, "charter.put", json!({"id":"mission","objective":"isolated workspace fixture","repo":repo,"min_free_bytes":0,"job_timeout_secs":20})).unwrap();
+        for task in ["one", "two"] {
+            dispatch(
+                &mut store,
+                "task.create",
+                json!({"id":task,"charter_id":"mission","owner":"ship","title":task}),
+            )
+            .unwrap();
+        }
+        Self {
+            _temp: temp,
+            root,
+            repo,
+            home,
+        }
+    }
+    fn command(&self, verb: &str, args: Value) -> Command {
+        let mut c = support::command(BIN);
+        c.args([
+            "--home",
+            self.home.to_str().unwrap(),
+            verb,
+            "--json",
+            &args.to_string(),
+        ])
+        .env("HOME", &self.root)
+        .env(
+            "PATH",
+            format!(
+                "/usr/bin:/bin:{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("PRIVATEER_SERVICE", "none")
+        .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"));
+        c
+    }
+    fn run(&self, verb: &str, args: Value) -> Output {
+        self.command(verb, args).output().unwrap()
+    }
+    fn ok(&self, verb: &str, args: Value) -> Value {
+        parse(self.run(verb, args))
+    }
+    fn acquire(&self, task: &str) -> Value {
+        self.ok("workspace.acquire", json!({"task_id":task}))
+    }
+    fn release(&self, w: &Value, archive: bool) -> Value {
+        self.ok(
+            "workspace.release",
+            json!({"task_id":w["task_id"],"lease_id":w["lease_id"],"archive":archive}),
+        )
+    }
+    fn wait(&self, id: &str) -> Value {
+        let until = Instant::now() + Duration::from_secs(12);
+        loop {
+            let j = self.ok("job.status", json!({"id":id}));
+            if ["succeeded", "failed", "cancelled", "timed_out"]
+                .contains(&j["status"].as_str().unwrap())
+            {
+                return j;
+            }
+            assert!(Instant::now() < until, "job did not settle: {j}");
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+    fn start(&self, task: &str, id: &str, body: &str) -> Value {
+        self.ok(
+            "job.start",
+            json!({"task_id":task,"id":id,"command":["/bin/sh","-c",body],"heavy":false}),
+        )
+    }
+}
+fn parse(o: Output) -> Value {
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    serde_json::from_slice(&o.stdout).unwrap()
+}
+fn git(repo: &Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8(o.stdout).unwrap().trim().into()
+}
+fn path(w: &Value) -> PathBuf {
+    PathBuf::from(w["path"].as_str().unwrap())
+}
+
+#[test]
+fn git_jobs_are_isolated_per_task_and_reuse_a_durable_checkout() {
+    let f = Fixture::new();
+    let a = f.start("one", "a", "printf one > file.txt");
+    let b = f.start("two", "b", "printf two > file.txt");
+    assert_eq!(f.wait("a")["status"], "succeeded");
+    assert_eq!(f.wait("b")["status"], "succeeded");
+    assert_ne!(a["cwd"], b["cwd"]);
+    assert_eq!(
+        fs::read_to_string(f.repo.join("file.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(a["cwd"].as_str().unwrap()).join("file.txt")).unwrap(),
+        "one"
+    );
+    let again = f.start("one", "again", "test \"$(cat file.txt)\" = one");
+    assert_eq!(a["workspace_lease_id"], again["workspace_lease_id"]);
+    assert_eq!(f.wait("again")["status"], "succeeded");
+    assert_eq!(f.acquire("one")["state"], "ready");
+}
+
+#[test]
+fn concurrent_acquisition_and_separate_homes_do_not_double_book() {
+    let f = Fixture::new();
+    let a = f
+        .command("workspace.acquire", json!({"task_id":"one"}))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let b = f.acquire("one");
+    let a = parse(a.wait_with_output().unwrap());
+    assert_eq!(a["lease_id"], b["lease_id"]);
+    let home = f.root.join("another-home");
+    let mut other = Store::open(&home).unwrap();
+    fs::copy(f.home.join("config.json"), home.join("config.json")).unwrap();
+    dispatch(
+        &mut other,
+        "charter.put",
+        json!({"id":"mission","objective":"other","repo":f.repo,"min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut other,
+        "task.create",
+        json!({"id":"one","charter_id":"mission","owner":"ship","title":"one"}),
+    )
+    .unwrap();
+    let o = dispatch(&mut other, "workspace.acquire", json!({"task_id":"one"})).unwrap();
+    assert_ne!(o["path"], a["path"]);
+    assert_ne!(o["pool"], a["pool"]);
+}
+
+#[test]
+fn interrupted_allocation_recovers_the_existing_lease() {
+    let f = Fixture::new();
+    fs::write(f.root.join("fail-acquire-response"), "").unwrap();
+    assert!(
+        !f.run("workspace.acquire", json!({"task_id":"one"}))
+            .status
+            .success()
+    );
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "acquiring"
+    );
+    let w = f.acquire("one");
+    let slots: Value = serde_json::from_slice(
+        &fs::read(Path::new(w["pool"].as_str().unwrap()).join("fixture-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(slots.as_array().unwrap().len(), 1);
+    assert_eq!(w["lease_id"], slots[0]["lease_id"]);
+}
+
+#[test]
+fn killing_the_caller_does_not_race_its_still_allocating_helper() {
+    let f = Fixture::new();
+    fs::write(f.root.join("pause-acquire-response"), "").unwrap();
+    let mut child = f
+        .command("workspace.acquire", json!({"task_id":"one"}))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(8);
+    while !f.root.join("helper-acquired").exists() {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let w = f.acquire("one");
+    let slots: Value = serde_json::from_slice(
+        &fs::read(Path::new(w["pool"].as_str().unwrap()).join("fixture-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(slots.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn release_preserves_dirty_unlanded_and_archived_work() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    fs::write(p.join("file.txt"), "changed\n").unwrap();
+    let release = |archive| json!({"task_id":"one","lease_id":w["lease_id"],"archive":archive});
+    assert!(!f.run("workspace.release", release(true)).status.success());
+    git(&p, &["add", "file.txt"]);
+    git(
+        &p,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "work",
+        ],
+    );
+    assert!(!f.run("workspace.release", release(false)).status.success());
+    let head = git(&p, &["rev-parse", "HEAD"]);
+    let released = f.release(&w, true);
+    assert_eq!(released["state"], "released");
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        head
+    );
+    assert_eq!(f.release(&w, true)["state"], "released");
+    let new = f.acquire("one");
+    assert_ne!(w["lease_id"], new["lease_id"]);
+    assert!(!f.run("workspace.release", release(true)).status.success());
+    assert_eq!(f.acquire("one")["lease_id"], new["lease_id"]);
+}
+
+#[test]
+fn clean_release_reuses_ignored_caches_and_recovers_an_interrupted_return() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    fs::create_dir(p.join("cache")).unwrap();
+    fs::write(p.join("cache/build"), "warm").unwrap();
+    fs::write(f.root.join("fail-return-response"), "").unwrap();
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"]})
+        )
+        .status
+        .success()
+    );
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "releasing"
+    );
+    assert_eq!(f.release(&w, false)["state"], "released");
+    let new = f.acquire("two");
+    assert_eq!(new["path"], w["path"]);
+    assert_eq!(fs::read_to_string(p.join("cache/build")).unwrap(), "warm");
+}
+
+#[test]
+fn live_payloads_keep_the_workspace_after_the_supervisor_dies() {
+    let f = Fixture::new();
+    let j = f.start("one", "live", "sleep 20");
+    let until = Instant::now() + Duration::from_secs(8);
+    let running = loop {
+        let j = f.ok("job.status", json!({"id":"live"}));
+        if j["status"] == "running" {
+            break j;
+        }
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(20));
+    };
+    unsafe {
+        libc::kill(
+            running["supervisor"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    let w = f.acquire("one");
+    assert_eq!(w["lease_id"], j["workspace_lease_id"]);
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"]})
+        )
+        .status
+        .success()
+    );
+    f.ok("job.cancel", json!({"id":"live"}));
+    f.wait("live");
+    assert_eq!(f.release(&w, false)["state"], "released");
+}
+
+#[test]
+fn task_custody_controls_workspace_access_and_list_visibility() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let mut store = Store::open(&f.home).unwrap();
+    dispatch(
+        &mut store,
+        "task.handoff",
+        json!({"id":"one","actor":"ship","target":"other"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "task.accept",
+        json!({"id":"one","actor":"other"}),
+    )
+    .unwrap();
+    store.set_caller(privateer::store::Caller::Agent {
+        actor: "ship".into(),
+    });
+    assert!(dispatch(&mut store, "workspace.acquire", json!({"task_id":"one"})).is_err());
+    assert!(
+        dispatch(
+            &mut store,
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"]})
+        )
+        .is_err()
+    );
+    assert_eq!(
+        dispatch(&mut store, "workspace.list", json!({})).unwrap(),
+        json!([])
+    );
+    store.set_caller(privateer::store::Caller::Agent {
+        actor: "other".into(),
+    });
+    let same = dispatch(&mut store, "workspace.acquire", json!({"task_id":"one"})).unwrap();
+    assert_eq!(same["lease_id"], w["lease_id"]);
+    assert_eq!(same["owner"], "other");
+}
+
+#[test]
+fn provider_plans_run_inside_the_workspace_and_cannot_escape_it() {
+    let f = Fixture::new();
+    let adapter = f.root.join("adapter.py");
+    fs::write(&adapter,"import json,sys\nr=json.loads(sys.stdin.readline()); c=r['context']\nprint(json.dumps({'id':r['id'],'version':1,'ok':True,'result':{'argv':['/bin/sh','-c','pwd > agent-cwd'], 'cwd':c['repo'],'env_names':[]}}))\n").unwrap();
+    let manifest = f.root.join("manifest.json");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"fixture","executable":["/usr/bin/python3",adapter]})
+            .to_string(),
+    )
+    .unwrap();
+    let a = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"agent","manifest":manifest}),
+    );
+    assert_eq!(f.wait("agent")["status"], "succeeded");
+    let cwd = Path::new(a["cwd"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(cwd.join("agent-cwd")).unwrap().trim(),
+        cwd.to_str().unwrap()
+    );
+    assert!(!f.repo.join("agent-cwd").exists());
+    let script = fs::read_to_string(&adapter)
+        .unwrap()
+        .replace("'cwd':c['repo']", "'cwd':c['source_repo']");
+    fs::write(&adapter, script).unwrap();
+    assert!(
+        !f.run("agent.start", json!({"task_id":"two","manifest":manifest}))
+            .status
+            .success()
+    );
+}
+
+#[test]
+#[ignore = "requires an installed Treehouse with durable JSON leases"]
+fn installed_treehouse_contract() {
+    let f = Fixture::new();
+    let binary = std::env::var("PRIVATEER_TEST_TREEHOUSE")
+        .expect("set PRIVATEER_TEST_TREEHOUSE to an absolute Treehouse executable");
+    fs::write(
+        f.home.join("config.json"),
+        json!({"resource_home":f.root.join("ledger"),"treehouse_binary":binary}).to_string(),
+    )
+    .unwrap();
+    f.ok("charter.put", json!({"id":"mission","repo":f.root}));
+    let w = f.ok("workspace.acquire", json!({"task_id":"one","cwd":f.repo}));
+    assert_eq!(f.acquire("one")["lease_id"], w["lease_id"]);
+    let j = f.start("one", "real", "test -f file.txt");
+    assert_eq!(j["workspace_lease_id"], w["lease_id"]);
+    assert_eq!(f.wait("real")["status"], "succeeded");
+    assert_eq!(f.release(&w, false)["state"], "released");
+    assert_ne!(
+        f.ok("workspace.acquire", json!({"task_id":"two","cwd":f.repo}))["lease_id"],
+        w["lease_id"]
+    );
+}
+
+#[test]
+fn terminal_tasks_can_recover_an_allocation_without_launching_new_work() {
+    let f = Fixture::new();
+    fs::write(f.root.join("fail-acquire-response"), "").unwrap();
+    assert!(
+        !f.run("workspace.acquire", json!({"task_id":"one"}))
+            .status
+            .success()
+    );
+    let intent = f.ok("workspace.status", json!({"task_id":"one"}));
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+    assert!(
+        !f.run("workspace.acquire", json!({"task_id":"one"}))
+            .status
+            .success()
+    );
+    assert!(
+        !f.run(
+            "workspace.recover",
+            json!({"task_id":"one","generation":"stale"})
+        )
+        .status
+        .success()
+    );
+    let recovered = f.ok(
+        "workspace.recover",
+        json!({"task_id":"one","generation":intent["generation"]}),
+    );
+    assert_eq!(recovered["state"], "ready");
+    assert_eq!(f.release(&recovered, false)["state"], "released");
+}
+
+#[test]
+fn output_limits_stop_the_helper_group_and_keep_a_recoverable_intent() {
+    let f = Fixture::new();
+    fs::write(f.root.join("flood-helper"), "").unwrap();
+    let started = Instant::now();
+    assert!(
+        !f.run("workspace.acquire", json!({"task_id":"one"}))
+            .status
+            .success()
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let pid = fs::read_to_string(f.root.join("flood-child")).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let out = Command::new("ps")
+            .args(["-p", pid.trim(), "-o", "stat="])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(out.stdout).unwrap();
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            break;
+        }
+        assert!(Instant::now() < until, "helper descendant survived");
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::remove_file(f.root.join("flood-helper")).unwrap();
+    let intent = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(
+        f.ok(
+            "workspace.recover",
+            json!({"task_id":"one","generation":intent["generation"]})
+        )["state"],
+        "released"
+    );
+}
+
+#[test]
+fn custody_changes_stop_old_workers_before_the_new_owner_reuses_the_checkout() {
+    let f = Fixture::new();
+    f.ok("job.start", json!({"task_id":"one","id":"owner","command":["/bin/sleep","20"],"heavy":false,"agent_actor":"ship"}));
+    let until = Instant::now() + Duration::from_secs(8);
+    while f.ok("job.status", json!({"id":"owner"}))["status"] != "running" {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let w = f.acquire("one");
+    f.ok(
+        "task.handoff",
+        json!({"id":"one","actor":"ship","target":"other"}),
+    );
+    f.ok("task.accept", json!({"id":"one","actor":"other"}));
+    let acquired = f.run("workspace.acquire", json!({"task_id":"one"}));
+    if acquired.status.success() {
+        assert_eq!(
+            f.ok("job.status", json!({"id":"owner"}))["status"],
+            "cancelled"
+        );
+    }
+    assert_eq!(f.wait("owner")["status"], "cancelled");
+    assert_eq!(f.acquire("one")["lease_id"], w["lease_id"]);
+}
+
+#[test]
+fn queued_jobs_hold_their_own_workspace_until_cancelled() {
+    let f = Fixture::new();
+    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0}}));
+    let first = f.ok(
+        "job.start",
+        json!({"task_id":"one","id":"heavy","command":["/bin/sleep","3"],"heavy":true}),
+    );
+    let queued = f.ok("job.start", json!({"task_id":"two","id":"queued","command":["/bin/sh","-c","true"],"heavy":true,"wait_for_capacity":true}));
+    assert_eq!(queued["status"], "queued");
+    assert_ne!(queued["cwd"], first["cwd"]);
+    let w = f.acquire("two");
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"two","lease_id":w["lease_id"]})
+        )
+        .status
+        .success()
+    );
+    f.ok("job.cancel", json!({"id":"queued"}));
+    assert_eq!(f.wait("queued")["status"], "cancelled");
+    assert_eq!(f.release(&w, false)["state"], "released");
+    f.wait("heavy");
+}
+
+#[test]
+fn only_a_recorded_agent_wake_keeps_the_ship_repository() {
+    let f = Fixture::new();
+    let store = Store::open(&f.home).unwrap();
+    store.connection().execute("INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms) VALUES('wake','ship','ship',0,'wake','fresh','running',0),('ordinary','ship','ship',0,'ordinary','fresh','running',0)", []).unwrap();
+    let adapter = f.root.join("wake-adapter.py");
+    fs::write(&adapter, "import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'version':1,'ok':True,'result':{'argv':['/bin/sh','-c','true'],'cwd':r['context']['repo'],'env_names':[]}}))\n").unwrap();
+    let manifest = f.root.join("wake-manifest.json");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"wake-fixture","executable":["/usr/bin/python3",adapter]})
+            .to_string(),
+    )
+    .unwrap();
+    let wake = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"wake","manifest":manifest}),
+    );
+    assert_eq!(wake["cwd"], json!(f.repo));
+    assert!(wake["workspace_lease_id"].is_null());
+    let completed = f.wait("wake");
+    assert_eq!(completed["status"], "succeeded", "{completed}");
+    let ordinary = f.start("two", "ordinary", "true");
+    assert!(ordinary["workspace_lease_id"].is_string());
+    f.wait("ordinary");
+}
+
+#[test]
+fn agent_started_builds_share_the_task_checkout_and_correct_pwd() {
+    let f = Fixture::new();
+    let worker = f.root.join("nested-worker.py");
+    fs::write(&worker, r#"import json, os, pathlib, subprocess, sys, time
+c = json.loads(sys.argv[1])
+assert os.environ['PWD'] == os.getcwd()
+def call(verb, args):
+    return json.loads(subprocess.check_output(c['control']['cli_argv'] + [verb, '--json', json.dumps(args)]))
+job = call('job.start', dict(id='nested', task_id=c['task_id'], heavy=False,
+    command=['/bin/sh', '-c', 'test "$PWD" = "$(pwd)"; pwd > nested-cwd']))
+for _ in range(100):
+    job = call('job.status', dict(id='nested'))
+    if job['status'] == 'succeeded': break
+    time.sleep(.02)
+assert job['status'] == 'succeeded', job
+pathlib.Path('nested-record.json').write_text(json.dumps(job))
+"#).unwrap();
+    let adapter = f.root.join("nested-adapter.py");
+    fs::write(&adapter, format!("import json,sys\nr=json.loads(sys.stdin.readline());c=r['context']\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=['/usr/bin/python3',{},json.dumps(c)],cwd=c['repo'],env_names=[]))))\n",json!(worker))).unwrap();
+    let manifest = f.root.join("nested-manifest.json");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"nested","executable":["/usr/bin/python3",adapter]})
+            .to_string(),
+    )
+    .unwrap();
+    let parent = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"parent","manifest":manifest}),
+    );
+    assert_eq!(f.wait("parent")["status"], "succeeded");
+    let cwd = Path::new(parent["cwd"].as_str().unwrap());
+    let nested: Value =
+        serde_json::from_slice(&fs::read(cwd.join("nested-record.json")).unwrap()).unwrap();
+    assert_eq!(nested["cwd"], parent["cwd"]);
+    assert_eq!(nested["workspace_lease_id"], parent["workspace_lease_id"]);
+    assert_eq!(nested["agent_actor"], "ship");
+    assert_eq!(
+        fs::read_to_string(cwd.join("nested-cwd")).unwrap().trim(),
+        cwd.to_str().unwrap()
+    );
+}
+
+#[test]
+fn an_external_lease_replacement_cannot_be_returned_by_a_stale_record() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let state = Path::new(w["pool"].as_str().unwrap()).join("fixture-state.json");
+    let mut slots: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    slots[0]["lease_id"] = json!("replacement");
+    slots[0]["lease_holder"] = json!("other-holder");
+    fs::write(&state, slots.to_string()).unwrap();
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"],"archive":true})
+        )
+        .status
+        .success()
+    );
+    let preserved: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    assert_eq!(preserved[0]["lease_id"], "replacement");
+    assert_eq!(
+        fs::read_to_string(path(&w).join("file.txt")).unwrap(),
+        "base\n"
+    );
+    assert!(
+        !f.run("workspace.acquire", json!({"task_id":"one"}))
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn a_charter_subdirectory_stays_scoped_inside_its_task_worktree() {
+    let f = Fixture::new();
+    fs::create_dir(f.repo.join("component")).unwrap();
+    fs::write(f.repo.join("component/input"), "input").unwrap();
+    git(&f.repo, &["add", "component"]);
+    git(
+        &f.repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "component",
+        ],
+    );
+    f.ok(
+        "charter.put",
+        json!({"id":"mission","repo":f.repo.join("component")}),
+    );
+    let job = f.start("one", "subdir", "test -f input; pwd > output");
+    assert_eq!(f.wait("subdir")["status"], "succeeded");
+    let w = f.acquire("one");
+    assert_eq!(job["cwd"], json!(path(&w).join("component")));
+    assert!(!f.repo.join("component/output").exists());
+    assert!(!f.run("job.start",json!({"task_id":"one","id":"escape","cwd":path(&w),"command":["/bin/sh","-c","true"],"heavy":false})).status.success());
+}
+
+#[test]
+fn acquisition_uses_the_fresh_remote_default_even_from_a_feature_checkout() {
+    let f = Fixture::new();
+    let remote = f.root.join("remote.git");
+    git(
+        &f.root,
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            f.repo.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    git(
+        &f.repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let updater = f.root.join("updater");
+    git(
+        &f.root,
+        &[
+            "clone",
+            "--quiet",
+            remote.to_str().unwrap(),
+            updater.to_str().unwrap(),
+        ],
+    );
+    fs::write(updater.join("file.txt"), "fresh\n").unwrap();
+    git(&updater, &["add", "file.txt"]);
+    git(
+        &updater,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fresh",
+        ],
+    );
+    git(&updater, &["push", "--quiet", "origin", "main"]);
+    git(&f.repo, &["checkout", "--quiet", "-b", "unrelated"]);
+    let w = f.acquire("one");
+    assert_eq!(w["base_branch"], "main");
+    assert_eq!(
+        fs::read_to_string(path(&w).join("file.txt")).unwrap(),
+        "fresh\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.repo.join("file.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(git(&f.repo, &["branch", "--show-current"]), "unrelated");
+}
+
+#[test]
+fn replay_after_release_does_not_acquire_a_new_workspace_and_retry_stays_pinned() {
+    let f = Fixture::new();
+    let first = f.start("one", "failed", "exit 1");
+    assert_eq!(f.wait("failed")["status"], "failed");
+    let old = f.acquire("one");
+    f.release(&old, false);
+    let replay = f.start("one", "failed", "exit 1");
+    assert_eq!(replay["incarnation"], first["incarnation"]);
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "released"
+    );
+    let new = f.acquire("one");
+    assert_ne!(old["lease_id"], new["lease_id"]);
+    assert!(
+        !f.run("job.retry", json!({"id":"failed","new_id":"must-not-run"}))
+            .status
+            .success()
+    );
+    assert_eq!(f.acquire("one")["lease_id"], new["lease_id"]);
+    assert!(
+        f.ok("job.list", json!({}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|j| j["id"] != "must-not-run")
+    );
+}
+
+#[test]
+fn independent_harnesses_need_separate_tasks_but_can_run_in_parallel() {
+    let f = Fixture::new();
+    let adapter = f.root.join("parallel-adapter.py");
+    fs::write(&adapter,"import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=['/bin/sleep','2'],cwd=r['context']['repo'],env_names=[]))))\n").unwrap();
+    let manifest = f.root.join("parallel-manifest.json");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"parallel","executable":["/usr/bin/python3",adapter]})
+            .to_string(),
+    )
+    .unwrap();
+    let one = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"first","manifest":manifest}),
+    );
+    assert!(
+        !f.run(
+            "agent.start",
+            json!({"task_id":"one","id":"duplicate","manifest":manifest})
+        )
+        .status
+        .success()
+    );
+    let two = f.ok(
+        "agent.start",
+        json!({"task_id":"two","id":"second","manifest":manifest}),
+    );
+    assert_ne!(one["cwd"], two["cwd"]);
+    assert_eq!(f.wait("first")["status"], "succeeded");
+    assert_eq!(f.wait("second")["status"], "succeeded");
+    let w = f.acquire("one");
+    f.release(&w, false);
+    let replay = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"first","manifest":manifest}),
+    );
+    assert_eq!(replay["incarnation"], one["incarnation"]);
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "released"
+    );
+    assert!(
+        !f.run(
+            "agent.start",
+            json!({"task_id":"one","id":"first","manifest":manifest,"heavy":true})
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
+    let f = Fixture::new();
+    f.ok(
+        "charter.put",
+        json!({"id":"mission","min_free_bytes":u64::MAX}),
+    );
+    assert!(
+        !f.run(
+            "job.start",
+            json!({"task_id":"one","command":["/bin/sh","-c","true"],"heavy":false})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
+    f.ok("charter.put", json!({"id":"mission","min_free_bytes":0}));
+    assert!(
+        !f.run(
+            "workspace.acquire",
+            json!({"task_id":"one","cwd":f.repo.join("file.txt")})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
+    assert!(
+        !f.run(
+            "job.start",
+            json!({"task_id":"one","cwd":f.root,"command":["/bin/sh","-c","true"],"heavy":false})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
+    assert_eq!(f.ok("job.list", json!({})), json!([]));
+}
+
+#[test]
+fn repeated_release_attempts_never_overwrite_an_archived_snapshot() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    let commit = |text: &str| {
+        fs::write(p.join("file.txt"), text).unwrap();
+        git(&p, &["add", "file.txt"]);
+        git(
+            &p,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "snapshot",
+            ],
+        );
+        git(&p, &["rev-parse", "HEAD"])
+    };
+    let first_head = commit("first");
+    fs::write(f.root.join("fail-before-return"), "").unwrap();
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"],"archive":true})
+        )
+        .status
+        .success()
+    );
+    let first_ref = f.ok("workspace.status", json!({"task_id":"one"}))["archive_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    git(&p, &["reset", "--hard", "main"]);
+    let second_head = commit("second");
+    let released = f.release(&w, true);
+    assert_ne!(released["archive_ref"], json!(first_ref));
+    assert_eq!(git(&f.repo, &["rev-parse", &first_ref]), first_head);
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        second_head
+    );
+}
+
+#[test]
+fn projects_inside_a_non_git_ship_get_workspaces_and_nested_jobs_reuse_them() {
+    let f = Fixture::new();
+    f.ok("charter.put", json!({"id":"mission","repo":f.root}));
+    let first = f.ok("job.start",json!({"task_id":"one","id":"project","cwd":f.repo,"command":["/bin/sh","-c","printf project > file.txt"],"heavy":false}));
+    assert_eq!(f.wait("project")["status"], "succeeded");
+    assert_ne!(first["cwd"], json!(f.repo));
+    assert!(first["workspace_lease_id"].is_string());
+    let nested = f.start(
+        "one",
+        "nested-project",
+        "test \"$(cat file.txt)\" = project",
+    );
+    assert_eq!(f.wait("nested-project")["status"], "succeeded");
+    assert_eq!(nested["cwd"], first["cwd"]);
+    assert_eq!(nested["workspace_lease_id"], first["workspace_lease_id"]);
+    assert_eq!(
+        fs::read_to_string(f.repo.join("file.txt")).unwrap(),
+        "base\n"
+    );
+    let w = f.acquire("one");
+    assert_eq!(w["charter_repo"], json!(f.root));
+    assert_eq!(w["repo"], json!(f.repo));
+}
+
+#[test]
+fn a_project_selector_routes_agent_planning_but_cannot_escape_or_retarget() {
+    let f = Fixture::new();
+    f.ok("charter.put", json!({"id":"mission","repo":f.root}));
+    let adapter = f.root.join("project-adapter.py");
+    fs::write(&adapter,"import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=['/bin/sh','-c','pwd > project-cwd'],cwd=r['context']['repo'],env_names=[]))))\n").unwrap();
+    let manifest = f.root.join("project-manifest.json");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"project","executable":["/usr/bin/python3",adapter]})
+            .to_string(),
+    )
+    .unwrap();
+    let agent = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"project-agent","cwd":f.repo,"manifest":manifest}),
+    );
+    assert_eq!(f.wait("project-agent")["status"], "succeeded");
+    assert_ne!(agent["cwd"], json!(f.repo));
+    let cwd = Path::new(agent["cwd"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(cwd.join("project-cwd")).unwrap().trim(),
+        cwd.to_str().unwrap()
+    );
+    assert!(!f.repo.join("project-cwd").exists());
+    let other = f.root.join("other-project");
+    fs::create_dir(&other).unwrap();
+    assert!(
+        !f.run(
+            "job.start",
+            json!({"task_id":"one","cwd":other,"command":["/bin/sh","-c","true"],"heavy":false})
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !f.run(
+            "agent.start",
+            json!({"task_id":"two","cwd":f.root.parent().unwrap(),"manifest":manifest})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"two"})).is_null());
+}

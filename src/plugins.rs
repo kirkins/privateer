@@ -105,7 +105,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .cloned()
                 .context("plugin omitted result")?;
             if method == "command" {
-                result = command_result(&charter, &result)?;
+                result = command_result(&context, &result)?;
             } else {
                 ensure!(result["valid"] == true, "plugin validation did not pass");
                 // Export only protocol-defined facts. Adapter output is not an evidence/credential channel.
@@ -225,7 +225,26 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
     // A sandboxed harness must be able to write the home and the shared
     // resource ledger to keep records and start crew jobs.
     let writable = json!([store.home(), crate::jobs::ledger_dir(store)?]);
-    let mut context = json!({"task_id": id, "title": title, "repo": charter["repo"], "owner": task["owner"], "actions": charter["actions"], "control":{"version":1,"cli_argv":[executable,"--home",store.home()],"writable":writable}});
+    let source_repo = fs::canonicalize(charter["repo"].as_str().context("charter repo missing")?)?;
+    let repo = if let Some(lease) = args.get("_workspace_lease_id") {
+        crate::workspace::planning_root(
+            store,
+            id,
+            &source_repo,
+            lease.as_str().context("workspace lease must be a string")?,
+        )?
+    } else if let Some(cwd) = args.get("_workspace_cwd") {
+        let cwd =
+            Path::new(cwd.as_str().context("workspace cwd must be a path")?).canonicalize()?;
+        ensure!(
+            cwd.is_dir() && cwd.starts_with(&source_repo),
+            "plugin cwd escapes charter repository"
+        );
+        cwd
+    } else {
+        source_repo.clone()
+    };
+    let mut context = json!({"task_id": id, "title": title, "repo": repo,"source_repo":source_repo,"owner": task["owner"], "actions": charter["actions"], "control":{"version":1,"cli_argv":[executable,"--home",store.home()],"writable":writable}});
     // Wake-specific text goes after the stable brief, so the brief's bytes
     // stay identical across wakes and its prefix keeps hitting the cache.
     let mut text = brief(&context);

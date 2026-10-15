@@ -12,7 +12,7 @@ import tempfile
 import time
 
 import recovery_fixture
-from recovery_fixture import (Commands, TERMINAL, append, crew_args, group_members, repair_request,
+from recovery_fixture import (Commands, TERMINAL, append, configure_workspaces, crew_args, group_members, repair_request,
                               require, still_alive, wait_for, write_json)
 
 
@@ -103,6 +103,7 @@ class Pilot:
         baseline = self.commands.run([sys.executable, "-B", "-m", "unittest", "-q"],
                                      cwd=self.repo, expect=False, env=self.environment)
         self.check("baseline_regression_fails", baseline.returncode != 0)
+        self.source_head = self.commands.run(["git", "rev-parse", "HEAD"], cwd=self.repo, env=self.environment).stdout.strip()
         manifest = self.root / "manifest.json"
         write_json(manifest, {"schema_version": 1, "id": "recovery-fixture", "executable":
                               [sys.executable, str(self.root / "fixture-runtime.py"), "_adapter"],
@@ -118,6 +119,8 @@ class Pilot:
             self.call(ship, "ship.put", {"name": ship, "scope": "Isolated recovery fixture", "first_mate":
                 {"manifest": str(manifest), "duty_task": f"{ship}-duty", "options": {"root": str(self.root)},
                  "batch_secs": 0, "max_delay_secs": 0, "retry_backoff_secs": 1, "max_wakes_per_hour": 20}})
+        configure_workspaces(self.root, self.homes.values())
+        self.evidence["workspace_backend"] = "test protocol fixture backed by real Git worktrees"
         self.call("apps", "resource.configure", {"max_heavy_jobs": 1, "max_load_per_cpu": 1024,
                   "min_available_memory_bytes": 0, "ramp_secs": 0})
         for ship, other in (("review", "apps"), ("apps", "review")):
@@ -144,6 +147,10 @@ class Pilot:
         helper = json.loads((self.root / "helper.json").read_text())
         before = self.job()
         self.check("supervised_crew_running", before["status"] == "running" and before["payload"]["pid"] == ready["process"]["pid"], before)
+        workspace = self.call("apps", "workspace.status", {"task_id": "repair"})
+        repair_repo = Path(before["cwd"])
+        self.check("repair_uses_leased_workspace", repair_repo == Path(workspace["path"])
+                   and repair_repo != self.repo and before["workspace_lease_id"] == workspace["lease_id"], workspace)
         self.check("crew_decision_answered", self.call("apps", "crew.answer", {"id": ready["decision"]})["state"] == "answered", ready)
         self.stop_dispatcher("apps", abrupt=True)
         self.check("payload_survives_dispatcher_interruption", still_alive(ready["process"]) and still_alive(helper)
@@ -154,10 +161,15 @@ class Pilot:
             return job if job["status"] in TERMINAL else None
         result = wait_for(self.commands, "detached repair completion", finished_job)
         self.check("repair_finishes_while_dispatcher_is_down", result["status"] == "succeeded" and result["exit_code"] == 0, result)
-        self.commands.run([sys.executable, "-B", "-m", "unittest", "-q"], cwd=self.repo, env=self.environment)
-        head = self.commands.run(["git", "rev-parse", "HEAD"], cwd=self.repo, env=self.environment).stdout.strip()
+        self.commands.run([sys.executable, "-B", "-m", "unittest", "-q"], cwd=repair_repo, env=self.environment)
+        head = self.commands.run(["git", "rev-parse", "HEAD"], cwd=repair_repo, env=self.environment).stdout.strip()
         worker = json.loads((self.root / "worker-result.json").read_text())
-        self.check("independent_regression_passes_at_recorded_head", head == worker["tested_head"], worker)
+        self.check("independent_regression_passes_at_recorded_head", head == worker["tested_head"]
+                   and Path(worker["cwd"]) == repair_repo, worker)
+        source_head = self.commands.run(["git", "rev-parse", "HEAD"], cwd=self.repo, env=self.environment).stdout.strip()
+        source_status = self.commands.run(["git", "status", "--porcelain"], cwd=self.repo, env=self.environment).stdout
+        self.check("source_checkout_unchanged", source_head == self.source_head and not source_status
+                   and (self.repo / "calc.py").read_text() == "def add(left, right):\n    return left - right\n")
         replayed = self.call("apps", "job.start", crew_args(self.root, self.binary, self.homes["apps"]), "apps")
         self.check("job_replay_preserves_incarnation", replayed["incarnation"] == result["incarnation"])
         inbox = self.call("apps", "mail.inbox", {"address": "apps", "all": True, "limit": 1000})["messages"]
@@ -269,7 +281,8 @@ def main():
     pilot.evidence["dispatcher_logs"] = [str(path.relative_to(root)) for path in pilot.dispatcher_logs]
     write_json(root / "evidence.json", pilot.evidence)
     print(json.dumps({"passed": pilot.evidence["passed"], "native_inference": False,
-                      "directory": str(root), "evidence": str(root / "evidence.json")}))
+                      "directory": str(root), "evidence": str(root / "evidence.json"),
+                      "error": pilot.evidence.get("error"), "cleanup_errors": pilot.evidence["cleanup"]["errors"]}))
     return 0 if pilot.evidence["passed"] else 1
 
 

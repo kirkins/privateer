@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,6 +26,18 @@ def write_json(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
     temporary.replace(path)
+
+
+def configure_workspaces(root, homes):
+    """Pin the test protocol fixture; never depend on a user's Treehouse install."""
+    executable = root / "treehouse-fixture"
+    shutil.copyfile(Path(__file__).resolve().parents[1] / "tests/fixtures/treehouse.py", executable)
+    executable.chmod(0o700)
+    for home in homes:
+        path = home / "config.json"
+        config = json.loads(path.read_text())
+        config["treehouse_binary"] = str(executable)
+        write_json(path, config)
 
 
 def append(path, value):
@@ -220,13 +233,13 @@ def fixture_worker(root, binary, home):
     write_json(root / "worker-ready.json", {"process": process_identity(os.getpid()), "decision": decision["id"],
                                            "reply": answer["reply"]["id"]})
     wait_for(commands, "dispatcher interruption gate", lambda: (root / "release-repair").exists())
-    repo = root / "fixture"
+    repo = Path.cwd()
     (repo / "calc.py").write_text("def add(left, right):\n    return left + right\n")
     commands.run([sys.executable, "-B", "-m", "unittest", "-q"], cwd=repo)
     commands.run(["git", "add", "calc.py"], cwd=repo)
     commands.run(["git", "commit", "-qm", "Repair isolated addition regression"], cwd=repo)
     head = commands.run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
-    write_json(root / "worker-result.json", {"tested_head": head, "regression_passed": True,
+    write_json(root / "worker-result.json", {"tested_head": head, "cwd": str(repo), "regression_passed": True,
                                             "decision": decision["id"], "native_inference": False})
 
 

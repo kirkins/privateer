@@ -34,6 +34,11 @@ See [dashboard setup and boundaries](docs/dashboard.md).
 
 ## Quick start
 
+Git-backed coding jobs use built-in [Treehouse task workspaces](docs/workspaces.md)
+for separate checkouts, durable leases and explicit safe cleanup. Install
+[Treehouse](https://github.com/kunchenguid/treehouse#install) on PATH for those
+jobs. Ordinary non-Git jobs do not require it.
+
 Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
 Herdr. With no current ship, first-run setup offers a dedicated ship folder.
 With a configured Herdr connection and a unique liaison, entry opens or focuses
