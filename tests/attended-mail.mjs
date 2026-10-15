@@ -129,6 +129,17 @@ try {
   const headless = new AttendedMail(api,config,dependencies);
   headless.start({...ctx,hasUI:false});
   assert.equal(timers.size,0); assert.equal(headless.flight,undefined); headless.dispose();
+  // A hosted first mate has no captain to resume it, so it retries after a minute.
+  let clock = 0;
+  const hosted = new AttendedMail(api,{...config,holder:"replacement",hosted:true},{...dependencies,now:()=>clock});
+  hosted.start(ctx); await settle(hosted);
+  hosted.began(); hosted.messageEnded({message:{role:"assistant",stopReason:"error"}}); hosted.settled({});
+  assert.equal(hosted.paused,true);
+  const queued = sent.length; send(); await hosted.poll();
+  assert.equal(sent.length,queued);
+  clock += 60_000; await hosted.poll();
+  assert.equal(sent.length,queued+1);
+  hosted.dispose();
   // Native factory registers the correct terminal event and compact renderer.
   const saved = {...process.env};
   try {

@@ -148,6 +148,9 @@ pub fn profile(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
     let options = object.get("options").cloned().unwrap_or(json!({}));
     ensure!(options.is_object(), "first_mate.options must be an object");
     out.insert("options".into(), options);
+    if let Some(host) = object.get("host").filter(|v| !v.is_null()) {
+        out.insert("host".into(), crate::host::validate(host)?);
+    }
     for (name, default, min, max) in SETTINGS {
         let value = match object.get(*name).filter(|v| !v.is_null()) {
             Some(v) => v
@@ -539,7 +542,12 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // The captain's interactive session is the first mate while it is
     // aboard; its hooks or inbox reads deliver the mail instead.
     if crate::presence::attended(store, &name)? {
-        return Ok(json!({"ship": name, "skipped": "captain's session is aboard"}));
+        let skipped = if crate::presence::hosted(store, &name)? {
+            "its live first mate has the mail"
+        } else {
+            "captain's session is aboard"
+        };
+        return Ok(json!({"ship": name, "skipped": skipped}));
     }
     // A wake covers mail through its sequence whether or not the first mate
     // acknowledged it, so an agent that forgets to ack is not woken forever.
@@ -580,6 +588,15 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let overdue = now - oldest >= setting(&profile, "max_delay_secs") * 1000;
     if !quiet && !overdue {
         return Ok(json!({"ship": name, "skipped": "batching"}));
+    }
+    // A hosted first mate gets the mail in its live session; without the
+    // host, the headless wake below still runs.
+    let mut host_error = None;
+    if crate::host::hosted(&profile) {
+        match crate::host::launch(store, &name, &harness_id(&profile)) {
+            Ok(hosted) => return Ok(json!({"ship": name, "hosted": hosted})),
+            Err(error) => host_error = Some(format!("{error:#}")),
+        }
     }
     let last: Option<(String, Option<i64>)> = store
         .connection()
@@ -686,8 +703,41 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     )?;
     Ok(
         json!({"ship": name, "wake": wake, "status": status, "through_seq": through,
-        "focus": primary, "task_id": task, "focuses": foci, "mode": mode, "error": error}),
+        "focus": primary, "task_id": task, "focuses": foci, "mode": mode, "error": error,
+        "host_error": host_error}),
     )
+}
+
+/// When the dispatcher starts, give each hosted ship its live first mate so
+/// it is visible before any mail arrives.
+fn host_idle(store: &mut Store) -> Vec<Value> {
+    let mut launched = vec![];
+    for ship in ships(store).unwrap_or_default() {
+        let name = ship["name"].as_str().unwrap_or_default().to_owned();
+        if !crate::host::hosted(&ship["first_mate"])
+            || crate::presence::attended(store, &name).unwrap_or(true)
+        {
+            continue;
+        }
+        let running: bool = store
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status='running')",
+                [&name],
+                |r| r.get(0),
+            )
+            .unwrap_or(true);
+        if running {
+            continue;
+        }
+        launched.push(
+            match crate::host::launch(store, &name, &harness_id(&ship["first_mate"])) {
+                Ok(hosted) => json!({"ship": name, "hosted": hosted}),
+                Err(error) => json!({"ship": name, "host_error": format!("{error:#}")}),
+            },
+        );
+    }
+    launched
 }
 
 /// Local reconciliation and wakes run before bounded remote delivery, so a
@@ -758,6 +808,12 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         )?;
         tx.commit()?;
     }
+    if !once {
+        let hosted = host_idle(store);
+        if !hosted.is_empty() {
+            println!("{}", json!({"hosted": hosted}));
+        }
+    }
     loop {
         let report = tick_with_delivery_budget(store, Duration::from_millis(delivery_budget))?;
         let acted = report["settled"].as_array().is_some_and(|s| !s.is_empty())
@@ -768,9 +824,10 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
             || report["workspaces"]
                 .as_array()
                 .is_some_and(|w| !w.is_empty())
-            || report["ships"]
-                .as_array()
-                .is_some_and(|s| s.iter().any(|r| r.get("wake").is_some()));
+            || report["ships"].as_array().is_some_and(|s| {
+                s.iter()
+                    .any(|r| r.get("wake").is_some() || r.get("hosted").is_some())
+            });
         if once || acted {
             println!("{}", serde_json::to_string(&report)?);
         }

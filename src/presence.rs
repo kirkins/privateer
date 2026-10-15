@@ -78,7 +78,7 @@ pub fn attend(
            started_ms = CASE WHEN holder = excluded.holder AND expires_ms > excluded.started_ms THEN started_ms ELSE excluded.started_ms END,
            holder = excluded.holder, harness = COALESCE(excluded.harness, harness),
            expires_ms = excluded.expires_ms,
-           binding = CASE WHEN holder=excluded.holder AND expires_ms > excluded.started_ms THEN binding ELSE excluded.binding END",
+           binding = CASE WHEN holder=excluded.holder AND expires_ms > excluded.started_ms THEN COALESCE(binding, excluded.binding) ELSE excluded.binding END",
         params![ship, holder, harness, now, now + ttl_secs as i64 * 1000,binding],
     )?;
     presence(store, ship)
@@ -104,6 +104,26 @@ pub fn claim(
     Ok(lease)
 }
 
+/// A hosted session takes over the lease the dispatcher claimed while
+/// launching it, binding its pane. A lapsed launch lease is not reclaimed.
+pub fn adopt(store: &Store, ship: &str, holder: &str, ttl_secs: u64) -> Result<Value> {
+    ensure!(
+        holder.starts_with(HOSTED),
+        "a hosted session adopts only a dispatcher's launch lease"
+    );
+    let tx = store.write_transaction()?;
+    ensure!(
+        refresh(store, ship, holder, ttl_secs)?,
+        "the dispatcher's launch lease for {ship} has lapsed or was replaced"
+    );
+    let lease = attend(store, ship, holder, ttl_secs, None)?;
+    tx.commit()?;
+    Ok(lease)
+}
+
+/// Holders of sessions the dispatcher launched and owns, not the captain's.
+pub const HOSTED: &str = "host:";
+
 /// Release the lease if this holder still has it.
 pub fn leave(store: &Store, ship: &str, holder: &str) -> Result<bool> {
     Ok(store.connection().execute(
@@ -124,6 +144,15 @@ pub fn refresh(store: &Store, ship: &str, holder: &str, ttl_secs: u64) -> Result
         "UPDATE presence SET expires_ms=?3 WHERE ship=?1 AND holder=?2 AND expires_ms>?4",
         params![ship, holder, now + ttl_secs as i64 * 1000, now],
     )? == 1)
+}
+
+/// Whether the live session aboard is one the dispatcher hosts.
+pub fn hosted(store: &Store, ship: &str) -> Result<bool> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM presence WHERE ship=?1 AND expires_ms > ?2 AND holder LIKE 'host:%')",
+        params![ship, Store::now_ms()],
+        |r| r.get(0),
+    )?)
 }
 
 /// Whether a live session is aboard.

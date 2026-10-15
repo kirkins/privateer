@@ -556,11 +556,19 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
             "claude" => json!({"permission_mode": "acceptEdits"}),
             _ => json!({}),
         });
+    let mut first_mate = json!({"manifest": manifest, "duty_task": duty, "options": options});
+    // A hosted first mate stays hosted.
+    if let Some(host) = previous
+        .as_ref()
+        .map(|s| &s["first_mate"]["host"])
+        .filter(|h| !h.is_null())
+    {
+        first_mate["host"] = host.clone();
+    }
     crate::dispatch(
         &mut store,
         "ship.put",
-        json!({"name": ship, "scope": scope, "accepts": accepts, "first_mate":
-            {"manifest": manifest, "duty_task": duty, "options": options}}),
+        json!({"name": ship, "scope": scope, "accepts": accepts, "first_mate": first_mate}),
     )?;
 
     let agents = folder.join("AGENTS.md");
@@ -695,6 +703,10 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         Some(at) => (&args[..at], &args[at + 1..]),
         None => (args, &args[args.len()..]),
     };
+    // `--hosted`: the dispatcher launched this session in the terminal host
+    // and holds its lease; the session adopts it instead of claiming one.
+    let hosted = ours.iter().any(|a| a == "--hosted");
+    let ours: Vec<&String> = ours.iter().filter(|a| *a != "--hosted").collect();
     let mut store = Store::open(home)?;
     let canonical_home = store.home().to_path_buf();
     let home = canonical_home.as_path();
@@ -702,7 +714,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         .context("this folder's ship is unknown; run `privateer init` here")?;
     let profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
     let harness = match ours.first() {
-        Some(name) => name.clone(),
+        Some(name) => (*name).clone(),
         None => profile["first_mate"]["manifest"]
             .as_str()
             .and_then(crate::bundled::harness)
@@ -746,7 +758,18 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .to_owned()
     };
     let folder = home.parent().context("ship folder")?;
-    let holder = format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+    let holder = if hosted {
+        std::env::var("PRIVATEER_HOSTED_HOLDER")
+            .ok()
+            .filter(|h| h.starts_with(crate::presence::HOSTED))
+            .context("start --hosted is launched by the dispatcher")?
+    } else {
+        format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4())
+    };
+    // A hosted first mate carries on the ship folder's latest conversation.
+    if hosted && matches!(harness.as_str(), "pi" | "pi-signed") && !chooses("--session") {
+        route.push("--continue".to_owned());
+    }
     let control = crate::executable::installed()?;
     let plugins = fs::canonicalize(plugins_dir()?)?;
     let policy = serde_json::to_string(&crate::permissions::load()?)?;
@@ -798,8 +821,15 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         .env("PRIVATEER_CONTROL_CLI", control)
         .env("PRIVATEER_ATTENDED_HARNESS", &harness)
         .env("PRIVATEER_PRESENCE_HOLDER", &holder);
+    if hosted {
+        command.env("PRIVATEER_HOSTED", "1");
+    }
     // The child can invoke a startup hook immediately after spawn.
-    crate::presence::claim(&store, &ship, &holder, 90, Some(&harness))?;
+    if hosted {
+        crate::presence::adopt(&store, &ship, &holder, 90)?;
+    } else {
+        crate::presence::claim(&store, &ship, &holder, 90, Some(&harness))?;
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1055,7 +1085,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                 if ship["location"] == "here" {
                     let bearings = crate::context::bearings(&store, name)?;
                     print!("{}", bearings["text"].as_str().unwrap_or(""));
-                    if crate::presence::attended(&store, name)? {
+                    if crate::presence::hosted(&store, name)? {
+                        println!("{name}'s first mate is live in Herdr.");
+                    } else if crate::presence::attended(&store, name)? {
                         println!("The captain's session is aboard {name}.");
                     }
                 } else {
