@@ -49,7 +49,12 @@ selects its native minimal launch mode for an isolated pilot. Pi and signed Pi
 also accept `bare: true`: disable extensions, MCP, skills, templates, context
 files and themes for this invocation, keeping native provider/authentication
 configuration. Cursor accepts
-native `sandbox` (`enabled`/`disabled`) and boolean `trust`. Gemini's boolean
+native `sandbox` (`enabled`/`disabled`), boolean `trust` and boolean `force`.
+`force: true` maps to native `--force`: allow commands unless the native policy
+explicitly denies them. It is omitted by default. Explicit `sandbox: enabled`
+adds the current Privateer operational home and the runtime-declared shared
+resource ledger through `--add-dir`, allowing durable task/mail writes and job
+admission alongside repository work. Gemini's boolean
 `trust` selects per-run `--skip-trust`, without modifying the trust store. Devin
 accepts native `permission_mode`, boolean `sandbox` and boolean `trust`; its
 `autonomous` permission mode requires its sandbox. Devin headless output is
@@ -112,6 +117,10 @@ Other adapters can use the same canary with their manifest and native
 message. With `--check-resume`, it also requires native startup session evidence,
 the same session ID on the second run, and recall of prior conversation context.
 The isolated two-job test qualifies native continuity, not runtime focus routing.
+`--check-job` additionally requires the tiny fixture's tests to finish in a
+recorded light job under the same task. It checks the job's argv, cwd and result;
+this does not exercise admission of a heavy build. The canary creates its own
+ledger before planning sandbox grants, and rejects changed acceptance tests.
 Session-start decoding is currently implemented for Codex, Claude, Pi-family,
 OpenCode, Gemini, Cursor, AGY and the Rovo/Kimi/Devin ACP transport; an unknown
 format stays unqualified.
