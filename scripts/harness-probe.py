@@ -15,12 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins"))
 from native import PROFILES, build
 
 
-def check(argv):
+def check(argv, cwd=None):
     # Use files rather than pipes so inherited descriptors cannot hold a probe
     # open after its process exits. Do not export native diagnostics/auth text.
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout,
-                                   stderr=stderr, start_new_session=True)
+                                   stderr=stderr, cwd=cwd, start_new_session=True)
         try:
             code = process.wait(timeout=20)
         except subprocess.TimeoutExpired:
@@ -82,7 +82,11 @@ def main():
                     _, argv = build(name, {**request, "options": options})
                     # Before '--' so it is never mistaken for prompt text.
                     argv.insert(argv.index("--") if "--" in argv else len(argv), "--help")
-                    passed, reason = check(argv)
+                    if name == "opencode-v2":
+                        # V1 accepts unknown options with --help too. Exercise
+                        # the same read-only major-version preflight as launch.
+                        argv = [sys.executable, str(Path(__file__).resolve().parents[1] / "plugins" / "opencode_v2.py"), *argv]
+                    passed, reason = check(argv, cwd=repo)
                     result["cases"].append({"mode": mode, "resume": bool(resume), "passed": passed, "reason": reason})
             result["passed"] = installed and all(case["passed"] for case in result["cases"])
             results.append(result)
