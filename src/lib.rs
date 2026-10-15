@@ -5,6 +5,7 @@ pub mod context;
 pub mod core;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+pub mod fleet;
 pub mod jobs;
 pub mod mail;
 pub mod peers;
@@ -53,6 +54,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
+        "fleet" => fleet::dispatch(store, command, args),
+        "ship" if matches!(command, "ship.create" | "ship.retire") => {
+            fleet::dispatch(store, command, args)
+        }
         "ship" if matches!(command, "ship.attend" | "ship.leave" | "ship.presence") => {
             presence::dispatch(store, command, args)
         }

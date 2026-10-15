@@ -16,7 +16,7 @@ pub const STATE_DIR: &str = ".privateer";
 /// Commands that mean the human form when given without `--json`.
 pub const VERBS: &[&str] = &[
     "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project", "start",
-    "hook", "service",
+    "hook", "service", "ship",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -168,6 +168,7 @@ Run Privateer as `{cli} COMMAND --json '{{...}}'`.
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
 - Before you stop, replace the handoff note for each focus you worked on: `note.put {{"ship":"{ship}","focus":"task:<id>|thread:<id>|captain|ship","body":"..."}}`. Keep it under 2 KB and to judgement: what you are doing and why, what you are waiting on, what comes next. Facts are already recorded. Put lasting preferences and conventions in the `ship` note.
 - Repositories live in `projects/`; the captain adds them with `privateer project add <git url>`.
+- New area of work? Create a ship for it: `ship.create {{"name":"...","scope":"...","objective":"..."}}` (beside this folder; its charter can only have actions yours has). Retire ships you created with `ship.retire {{"name":"..."}}`. `fleet.list {{}}` shows every ship on this machine.
 
 ## Rules
 
@@ -252,10 +253,26 @@ fn ensure_lines(path: &Path, lines: &[&str]) -> Result<()> {
 
 /// Turn the current folder into a ship. Safe to run again: it updates the
 /// ship's settings and rewrites only files it generated.
-fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
-    let flags = flags(args, &["ship", "harness", "scope"])?;
+/// What to make a ship with; unset fields fall back to sensible defaults.
+#[derive(Default)]
+pub(crate) struct Setup {
+    pub ship: Option<String>,
+    pub scope: Option<String>,
+    pub harness: Option<String>,
+    /// Charter actions for a new charter; None means the default set.
+    pub actions: Option<Value>,
+    pub objective: Option<String>,
+    /// Who made it, recorded in the fleet list.
+    pub created_by: String,
+}
+
+/// Make (or update) the ship whose state lives in `home`, returning its name,
+/// harness and whether AGENTS.md is Privateer's. Safe to run again: it keeps
+/// the captain's charter edits, scope and accepted kinds, and rewrites only
+/// files it generated.
+pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)> {
     let folder = home.parent().context("ship folder")?.to_path_buf();
-    let ship = match flags.values.get("ship") {
+    let ship = match &setup.ship {
         Some(name) => {
             identifier(name)?;
             name.clone()
@@ -267,7 +284,7 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
         "captain is reserved for the person"
     );
     let plugins = plugins_dir()?;
-    let harness = detect_harness(&plugins, flags.values.get("harness"))?;
+    let harness = detect_harness(&plugins, setup.harness.as_ref())?;
     let manifest = plugins.join(&harness).join("manifest.json");
     ensure!(
         manifest.is_file(),
@@ -284,18 +301,18 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
     crate::jobs::ensure_ledger(&store)?;
     // Created once; later edits to the charter are the captain's to keep.
     if store.charter(&ship).is_err() {
-        crate::dispatch(
-            &mut store,
-            "charter.put",
-            json!({"id": ship, "objective": format!("Work as the ship {ship}"),
-                "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600}),
-        )?;
+        let mut charter = json!({"id": ship,
+            "objective": setup.objective.clone().unwrap_or_else(|| format!("Work as the ship {ship}")),
+            "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600});
+        if let Some(actions) = &setup.actions {
+            charter["actions"] = actions.clone();
+        }
+        crate::dispatch(&mut store, "charter.put", charter)?;
     }
     let previous = crate::dispatch(&mut store, "ship.show", json!({"name": ship})).ok();
-    let scope = flags
-        .values
-        .get("scope")
-        .cloned()
+    let scope = setup
+        .scope
+        .clone()
         .or_else(|| {
             previous
                 .as_ref()
@@ -340,7 +357,25 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
     }
     claude_settings(&folder, &binary.display().to_string())?;
     ensure_lines(&folder.join(".gitignore"), &[".privateer/", "projects/"])?;
+    // Join the fleet: ships on this machine find and mail each other.
+    crate::fleet::register(&ship, store.home(), &setup.created_by)?;
+    crate::fleet::link(&store, &ship)?;
+    Ok((ship, harness, ours))
+}
 
+fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
+    let flags = flags(args, &["ship", "harness", "scope"])?;
+    let folder = home.parent().context("ship folder")?.to_path_buf();
+    let (ship, harness, ours) = setup(
+        home,
+        &Setup {
+            ship: flags.values.get("ship").cloned(),
+            scope: flags.values.get("scope").cloned(),
+            harness: flags.values.get("harness").cloned(),
+            created_by: "captain".into(),
+            ..Setup::default()
+        },
+    )?;
     if quiet {
         println!(
             "Aye. {} is now the ship {ship}, crewed by {harness}.",
@@ -532,6 +567,40 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
     if verb == "start" {
         return start(&home, args);
     }
+    if verb == "ship" {
+        let flags = flags(args, &["scope", "folder", "harness", "objective"])?;
+        let mut store = Store::open(&home)?;
+        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] | privateer ship retire NAME";
+        let name = flags.positional.get(1).context(usage)?;
+        match flags.positional.first().map(String::as_str) {
+            Some("new") => {
+                let mut request = json!({"name": name});
+                for key in ["scope", "folder", "harness", "objective"] {
+                    if let Some(value) = flags.values.get(key) {
+                        request[key] = json!(value);
+                    }
+                }
+                let made = crate::dispatch(&mut store, "ship.create", request)?;
+                println!(
+                    "Aye. The ship {} is ready at {}, crewed by {}.\n  dispatcher: {}\n  talk to it:  cd {} && privateer",
+                    made["ship"].as_str().unwrap_or(""),
+                    made["folder"].as_str().unwrap_or(""),
+                    made["harness"].as_str().unwrap_or(""),
+                    made["dispatcher"].as_str().unwrap_or(""),
+                    made["folder"].as_str().unwrap_or("")
+                );
+            }
+            Some("retire") => {
+                let done = crate::dispatch(&mut store, "ship.retire", json!({"name": name}))?;
+                println!(
+                    "Retired {name}: charter revoked, {}. Its folder was kept.",
+                    done["dispatcher"].as_str().unwrap_or("")
+                );
+            }
+            _ => bail!(usage),
+        }
+        return Ok(());
+    }
     if verb == "service" {
         let store = Store::open(&home)?;
         let ship = crate::presence::folder_ship(&store)
@@ -585,6 +654,26 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             }
         }
         "ships" => {
+            let fleet = crate::dispatch(&mut store, "fleet.list", json!({}))?;
+            let active: Vec<_> = fleet["ships"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|s| s["retired_ms"].is_null())
+                .collect();
+            println!("Fleet on this machine ({} ships):", active.len());
+            for ship in active {
+                println!(
+                    "  {} at {} (created by {})",
+                    ship["name"].as_str().unwrap_or(""),
+                    Path::new(ship["home"].as_str().unwrap_or(""))
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    ship["created_by"].as_str().unwrap_or("")
+                );
+            }
+            println!("Known to this ship:");
             let ships = crate::dispatch(&mut store, "ship.list", json!({}))?;
             for ship in ships["ships"].as_array().into_iter().flatten() {
                 let place = if ship["location"] == "here" {
