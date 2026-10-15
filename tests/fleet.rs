@@ -344,3 +344,226 @@ fn a_deleted_ship_folder_frees_its_name_and_is_not_resurrected() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("already has a ship named apps"));
 }
+
+const DEFAULT_ACTIONS: [&str; 9] = [
+    "inspect",
+    "spawn",
+    "implement",
+    "test",
+    "publish_pr",
+    "merge_green",
+    "message",
+    "recovery",
+    "cleanup",
+];
+
+fn liaison(machine: &Machine) -> PathBuf {
+    let folder = machine.ships.join("liaison");
+    fs::create_dir_all(&folder).unwrap();
+    machine.ok(&folder, &["init", "--liaison"]);
+    folder
+}
+
+/// A one-commit repository to clone.
+fn repository(machine: &Machine) -> PathBuf {
+    let repo = machine.root.join("source.git");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .current_dir(machine.root.as_path())
+            .env("HOME", &machine.root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--quiet", "source.git"]);
+    fs::write(repo.join("README"), "hello\n").unwrap();
+    git(&["-C", "source.git", "add", "README"]);
+    git(&["-C", "source.git", "commit", "--quiet", "-m", "first"]);
+    repo
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn a_liaison_staffs_and_provisions_ships_for_the_captain() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    let repo = repository(&machine);
+    let made = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.create",
+        json!({"name":"tooling"}),
+    );
+    assert!(made.status.success(), "{}", stderr(&made));
+    let tooling = machine.ships.join("tooling");
+    // The captain's grant to the liaison passes to the ship it creates:
+    // working authority, without production deployment.
+    let charter = machine.json(&tooling, "charter.show", json!({"id":"tooling"}));
+    assert_eq!(charter["actions"], json!(DEFAULT_ACTIONS));
+
+    let url = repo.to_str().unwrap();
+    let added = machine.as_agent(
+        &liaison,
+        "liaison",
+        "project.add",
+        json!({"url":url,"target":"tooling"}),
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let added: Value = serde_json::from_slice(&added.stdout).unwrap();
+    assert_eq!(added["ship"], "tooling");
+    assert_eq!(added["project"], "source");
+    assert_eq!(added["by"], "liaison");
+    let projects = tooling.join("projects");
+    assert_eq!(
+        fs::read_to_string(projects.join("source/README")).unwrap(),
+        "hello\n"
+    );
+    let entries: Vec<_> = fs::read_dir(&projects)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["source"], "no staging clone is left behind");
+
+    // Its own folder, too, under another name.
+    let own = machine.as_agent(
+        &liaison,
+        "liaison",
+        "project.add",
+        json!({"url":url,"name":"notes"}),
+    );
+    assert!(own.status.success(), "{}", stderr(&own));
+    assert!(liaison.join("projects/notes/README").is_file());
+
+    for (args, reason) in [
+        // A ship the liaison did not create is not its to provision.
+        (json!({"url":url,"target":"apps"}), "only ships it created"),
+        (json!({"url":url,"target":"tooling"}), "already exists"),
+        (
+            json!({"url":"ext::sh -c true","target":"tooling","name":"x"}),
+            "run commands",
+        ),
+        (
+            json!({"url":url,"target":"tooling","name":".."}),
+            "cannot start with .",
+        ),
+    ] {
+        let refused = machine.as_agent(&liaison, "liaison", "project.add", args);
+        assert!(!refused.status.success());
+        assert!(stderr(&refused).contains(reason), "{}", stderr(&refused));
+    }
+    assert!(!apps.join("projects/source").exists());
+
+    // The captain's CLI adds to any ship in the fleet.
+    let out = machine.ok(&liaison, &["project", "add", url, "--ship", "apps"]);
+    assert!(out.contains("into apps's projects/source"), "{out}");
+    assert!(apps.join("projects/source/README").is_file());
+}
+
+#[test]
+fn ship_actions_change_only_created_ships_within_the_granters_actions() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    machine.ship("apps");
+    machine.json(
+        &liaison,
+        "charter.put",
+        json!({"id":"liaison","actions":["inspect","spawn","implement","message"]}),
+    );
+    let made = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.create",
+        json!({"name":"tooling","actions":["inspect"]}),
+    );
+    assert!(made.status.success(), "{}", stderr(&made));
+    let tooling = machine.ships.join("tooling");
+
+    let granted = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.actions",
+        json!({"name":"tooling","actions":["inspect","implement"]}),
+    );
+    assert!(granted.status.success(), "{}", stderr(&granted));
+    let charter = machine.json(&tooling, "charter.show", json!({"id":"tooling"}));
+    assert_eq!(charter["actions"], json!(["inspect", "implement"]));
+    assert_eq!(charter["active"], true);
+
+    for (name, actions, reason) in [
+        ("tooling", json!(["inspect", "merge_green"]), "merge_green"),
+        ("tooling", json!(["deploy_production"]), "deploy_production"),
+        ("apps", json!(["inspect"]), "only ships it created"),
+    ] {
+        let refused = machine.as_agent(
+            &liaison,
+            "liaison",
+            "ship.actions",
+            json!({"name":name,"actions":actions}),
+        );
+        assert!(!refused.status.success());
+        assert!(stderr(&refused).contains(reason), "{}", stderr(&refused));
+    }
+    // The ship cannot widen itself through its creator's command.
+    let itself = machine.as_agent(
+        &tooling,
+        "tooling",
+        "ship.actions",
+        json!({"name":"tooling","actions":["inspect","implement","test"]}),
+    );
+    assert!(!itself.status.success());
+
+    machine.json(
+        &liaison,
+        "charter.put",
+        json!({"id":"liaison","active":false}),
+    );
+    let revoked = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.actions",
+        json!({"name":"tooling","actions":["inspect"]}),
+    );
+    assert!(!revoked.status.success());
+    assert!(stderr(&revoked).contains("revoked"), "{}", stderr(&revoked));
+    let charter = machine.json(&tooling, "charter.show", json!({"id":"tooling"}));
+    assert_eq!(charter["actions"], json!(["inspect", "implement"]));
+}
+
+#[test]
+fn reinit_upgrades_only_an_unedited_contact_only_liaison() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    // A liaison made before the preset acted for the captain.
+    let store = Store::open(&liaison.join(".privateer")).unwrap();
+    let mut charter = store.charter("liaison").unwrap();
+    assert_eq!(charter["revision"], 1);
+    charter["actions"] = json!(["inspect", "spawn", "message"]);
+    store
+        .connection()
+        .execute(
+            "UPDATE charters SET data=?1 WHERE id='liaison'",
+            [charter.to_string()],
+        )
+        .unwrap();
+    drop(store);
+    machine.ok(&liaison, &["init"]);
+    let upgraded = machine.json(&liaison, "charter.show", json!({"id":"liaison"}));
+    assert_eq!(upgraded["actions"], json!(DEFAULT_ACTIONS));
+
+    // The captain's own choice of the same actions is kept.
+    machine.json(
+        &liaison,
+        "charter.put",
+        json!({"id":"liaison","actions":["inspect","spawn","message"]}),
+    );
+    machine.ok(&liaison, &["init"]);
+    let kept = machine.json(&liaison, "charter.show", json!({"id":"liaison"}));
+    assert_eq!(kept["actions"], json!(["inspect", "spawn", "message"]));
+}

@@ -61,22 +61,27 @@ Bare `privateer` is the everyday entry point. See
 installed dashboard entry, liaison handoff and onboarding conditions. When
 the dashboard is unavailable, the legacy flow applies: Inside a ship folder (any folder at or below one holding `.privateer`), it makes sure the ship's dispatcher is running and then runs `privateer start`. Elsewhere it asks whether to make the current folder a ship, naming it after the folder and choosing the first installed harness, then does the same; without a terminal to ask in it prints help, and `--yes` skips the question. It refuses to make the user's home directory or `/` a ship. The dispatcher is installed as a systemd user service where a user manager is available (the unit records the current `PATH`, where harnesses usually live, and `PRIVATEER_RESOURCE_HOME`/`PRIVATEER_PLUGINS` when set) and otherwise started as a detached process logging to `<home>/serve.log`, rotated at 1 MiB. A dispatcher holding `serve.lock` counts as running however it was started, so nothing starts twice. `privateer service status|start|stop` manages it; stopping a detached dispatcher signals the recorded process only while it still holds the lock and is that home's `serve`. `PRIVATEER_SERVICE=systemd|detached|none` overrides the choice.
 
-`privateer init --liaison` supplies an optional contact charter: `inspect`,
-`message` and `spawn`, with no implementation action, plus generated first-mate
-onboarding instructions. The generated checklist asks about work and preferences,
-proposes peer ships and charters, helps create them, asks the captain to add
-projects, and explains dashboard and direct access. It stores lasting preferences
-in the ship's `ship` note and onboarding progress in its `captain` note.
-Ordinary init retains the preset and uses the persisted ship identity unless a
-ship name is explicitly supplied with `--ship`. Existing charters remain
-captain-owned; independently authored `AGENTS.md` files are preserved, while Privateer-managed
+`privateer init --liaison` makes the captain's contact: a ship the captain
+reaches from the dashboard, a terminal or a front door, which acts on their
+behalf. Its charter holds the default actions of any captain-made ship
+(everything but `deploy_production`), so the ships it creates inherit working
+authority, and it can provision them itself: `ship.create`, `ship.actions` and
+`project.add` need no trip to the command line. Production deployment stays
+with the captain under explicit approval. Generated first-mate onboarding
+instructions ask about work and preferences, propose peer ships and actions,
+create them, add their repositories, and explain dashboard and direct access.
+They store lasting preferences in the ship's `ship` note and onboarding
+progress in its `captain` note. Ordinary init retains the preset and uses the
+persisted ship identity unless a ship name is explicitly supplied with
+`--ship`. Existing charters remain captain-owned: re-running init upgrades only
+a liaison still holding the earlier contact-only preset (`inspect`, `spawn`,
+`message`) at its first revision, never one the captain has edited.
+Independently authored `AGENTS.md` files are preserved, while Privateer-managed
 instructions are refreshed with the checklist when the preset is active.
-For delegated ship authority, see [The fleet](#the-fleet); the captain must
-explicitly grant implementation rights when needed.
 A validated `agent.start` harness job runs under `spawn`
-authority; ordinary `job.start` continues to require an implementation/test/
-recovery/cleanup action and cannot request `spawn`. This lets a read/message/
-delegate liaison process mail headlessly without granting implementation rights.
+authority; ordinary `job.start` requires an implementation/test/
+recovery/cleanup action and cannot request `spawn`, so a captain who narrows
+a liaison to read/message/delegate still has it process mail headlessly.
 The instruction checklist is not proof of a model-driven onboarding outcome.
 
 ### Replacing the installed executable
@@ -91,7 +96,7 @@ Compatibility between different releases of the external CLI protocol is not ver
 
 Every ship made with `privateer init` or `ship.create` joins a per-user fleet registry (`PRIVATEER_FLEET`, or `$XDG_STATE_HOME/privateer/fleet.sqlite`, default `~/.local/state/privateer/fleet.sqlite`), and is linked both ways with every other active ship: each home gets a local-transport peer `fleet-<name>` and a directory entry behind it, so ships mail each other without manual setup. A name belongs to one active ship; a ship whose folder was deleted no longer holds it, and linking never recreates a deleted folder. `fleet.list` shows the registry and `fleet.link` relinks this home.
 
-Ships can make ships, so the captain can grow a fleet from the first one. `ship.create` (`privateer ship new NAME`) makes a new ship folder, by default beside the creating ship's folder, with the creator's harness unless another is named, starts its dispatcher and links it. An agent needs active `spawn` authority to create ships, and a new ship's charter can hold only actions the creating ship's own charter has; the operator may set any. Creation checks authority under the creator's write lock before publishing the child, serializing that decision with revocation. Cross-home bootstrap and publication are not a distributed transaction, and child charter defaults remain unchanged. `ship.retire` revokes a ship's charter, stops its dispatcher, unlinks it and marks it retired, keeping its folder; an agent may retire only ships it created. The registry records who created each ship. `ship.retire` accepts optional `expected_home` to reject a name that now belongs to a different home; its final registry update also checks the originally selected home and active status after stopping the dispatcher.
+Ships can make ships, so the captain can grow a fleet from the first one. `ship.create` (`privateer ship new NAME`) makes a new ship folder, by default beside the creating ship's folder, with the creator's harness unless another is named, starts its dispatcher and links it. An agent needs active `spawn` authority to create ships, and a new ship's charter can hold only actions the creating ship's own charter has; the operator may set any. Creation checks authority under the creator's write lock before publishing the child, serializing that decision with revocation. Cross-home bootstrap and publication are not a distributed transaction, and child charter defaults remain unchanged. `ship.actions {name, actions}` replaces a ship's charter actions; an agent may change only ships it created, only to actions its own active charter has, under its write lock. `project.add {url, name?, target?}` (`privateer project add URL [NAME] [--ship SHIP]`) clones a repository into a ship's `projects/`: an agent may add to itself, or, with `spawn`, to ships it created; the operator to any fleet ship. The clone is staged in `projects/` and published by rename after authority is checked again under the caller's write lock; agent clones run without terminal or SSH prompts, `ext::`/`fd::` transports are refused, and HTTP(S) credentials in the address are redacted from replies and the audit log. `ship.retire` revokes a ship's charter, stops its dispatcher, unlinks it and marks it retired, keeping its folder; an agent may retire only ships it created. The registry records who created each ship. `ship.retire` accepts optional `expected_home` to reject a name that now belongs to a different home; its final registry update also checks the originally selected home and active status after stopping the dispatcher.
 
 After authorized creation, the child's dispatcher runs as an operator service.
 The detached launch clears the creator's execution identity while retaining
@@ -128,6 +133,6 @@ Passing-head checks bind delivery evidence to the current artifact. Production a
 
 ## Operators and agents
 
-Harnesses launched by `agent.start`, and any job an agent starts, run with `PRIVATEER_ROLE=agent` and `PRIVATEER_ACTOR` set to the task owner. Under that role, operator commands (`init`, `charter.put`, `charter.revoke`, `approval.grant`, `approval.consume`, `peer.put`, `resource.recover`) are refused, `actor`/`from` arguments must name the agent itself, and jobs can be started only for the agent's own tasks. `peer.call` passes the role to the remote home as `--role agent --actor NAME`, flags that can only narrow a caller, never widen it. The same caller checks apply to human CLI commands: agents cannot run bare `privateer`, the dashboard, `start`, `service` or `project add`, or directly initialize a home. Agents require an existing home; an explicit `--home` does not grant operator authority. Mail shortcuts use the agent's own address. `ship new|retire` retain the delegated creation and retirement limits described under [The fleet](#the-fleet), including bounded internal child initialization. This stops a confused or overeager agent from widening its charter or approving its own deployment. It is not a security boundary: an agent that deliberately clears its environment or edits the state database is outside it. Enforced separation needs a separate OS account or broker. Hard isolation from production credentials requires a separately enforced broker or account boundary.
+Harnesses launched by `agent.start`, and any job an agent starts, run with `PRIVATEER_ROLE=agent` and `PRIVATEER_ACTOR` set to the task owner. Under that role, operator commands (`init`, `charter.put`, `charter.revoke`, `approval.grant`, `approval.consume`, `peer.put`, `resource.recover`) are refused, `actor`/`from` arguments must name the agent itself, and jobs can be started only for the agent's own tasks. `peer.call` passes the role to the remote home as `--role agent --actor NAME`, flags that can only narrow a caller, never widen it. The same caller checks apply to human CLI commands: agents cannot run bare `privateer`, the dashboard, `start` or `service`, or directly initialize a home; `project add` applies the `project.add` limits. Agents require an existing home; an explicit `--home` does not grant operator authority. Mail shortcuts use the agent's own address. `ship new|retire` retain the delegated creation, action and retirement limits described under [The fleet](#the-fleet), including bounded internal child initialization. This stops a confused or overeager agent from widening its charter or approving its own deployment. It is not a security boundary: an agent that deliberately clears its environment or edits the state database is outside it. Enforced separation needs a separate OS account or broker. Hard isolation from production credentials requires a separately enforced broker or account boundary.
 
 The first milestone has no live forge merge/deployment adapter and no automatic fleet migration. A passing runtime pilot establishes behavior of the machinery; native model-driven execution is a separate qualification step.

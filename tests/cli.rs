@@ -7,6 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
+const DEFAULT_ACTIONS: [&str; 9] = [
+    "inspect",
+    "spawn",
+    "implement",
+    "test",
+    "publish_pr",
+    "merge_green",
+    "message",
+    "recovery",
+    "cleanup",
+];
 
 struct Folder {
     _temp: tempfile::TempDir,
@@ -71,6 +82,11 @@ impl Folder {
 fn ergonomic_agent_delegation_retains_identity_and_child_action_limits() {
     let folder = Folder::new("liaison");
     folder.ok(&["init", "--liaison", "--harness", "codex"]);
+    // A captain-narrowed liaison: children inherit only what it holds.
+    folder.json(
+        "charter.put",
+        json!({"id":"liaison","actions":["inspect","spawn","message"]}),
+    );
     let home = folder.ship.join(".privateer");
     let home = home.to_str().unwrap();
     for (i, (role, actor, flags)) in [
@@ -265,7 +281,6 @@ fn agent_operator_entry_is_rejected_before_fresh_state_or_launches() {
         vec!["service", "start"],
         vec!["service", "stop"],
         vec!["service", "status"],
-        vec!["project", "add", "unused"],
         vec!["serve"],
     ] {
         for herdr in [false, true] {
@@ -297,6 +312,26 @@ fn agent_operator_entry_is_rejected_before_fresh_state_or_launches() {
             }
         }
     }
+    // Agents may add projects, but only to an existing ship they may manage.
+    let output = folder
+        .command_in(
+            &folder.ship,
+            &[
+                "--home",
+                fresh.to_str().unwrap(),
+                "project",
+                "add",
+                "unused",
+            ],
+        )
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("existing ship home"));
+    assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+    assert!(!folder.root.join("fleet.sqlite").exists());
     for flags in [
         vec![
             "--role", "agent", "--actor", "liaison", "--role", "operator",
@@ -506,9 +541,10 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
                     && identity.contains(&format!("--home {} serve", home.display())),
                 "{identity}"
             );
+            // The liaison's ordinary authority passes to the ship it creates.
             assert_eq!(
                 call("charter.show", json!({"id":name}))["actions"],
-                json!(["inspect", "spawn", "message"])
+                json!(DEFAULT_ACTIONS)
             );
             let mut profile = call("ship.show", json!({"name":name}))["first_mate"].clone();
             profile["batch_secs"] = json!(0);
@@ -823,7 +859,7 @@ fn init_needs_a_harness_or_says_how_to_choose_one() {
 }
 
 #[test]
-fn liaison_preset_is_read_message_delegate_and_keeps_captain_edits() {
+fn liaison_preset_acts_for_the_captain_and_keeps_captain_edits() {
     let folder = Folder::new("desk");
     folder.ok(&[
         "init",
@@ -836,12 +872,15 @@ fn liaison_preset_is_read_message_delegate_and_keeps_captain_edits() {
         "Captain contact",
     ]);
     let charter = folder.json("charter.show", json!({"id":"contact"}));
-    assert_eq!(charter["actions"], json!(["inspect", "spawn", "message"]));
+    // Everything a captain-made ship holds; production stays with the captain.
+    assert_eq!(charter["actions"], json!(DEFAULT_ACTIONS));
     let emitted = fs::read_to_string(folder.ship.join("AGENTS.md")).unwrap();
     // AGENTS.md is the generated public first-mate interface, not a proxy
     // for successful model onboarding; the PTY separately proves creation.
     assert!(emitted.contains("Onboarding the captain"));
-    assert!(emitted.contains("never widen your own charter"));
+    assert!(emitted.contains("Production deployment stays with the captain"));
+    assert!(emitted.contains("project.add"));
+    assert!(!emitted.contains("ask the captain to run"));
     folder.ok(&["init", "--harness", "codex"]);
     assert!(
         fs::read_to_string(folder.ship.join("AGENTS.md"))
