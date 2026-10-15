@@ -129,12 +129,10 @@ impl App {
                 if matches!(form.kind, Kind::Onboard) && form.selected == 2 =>
             {
                 let harnesses = crate::cli::installed_harnesses().unwrap_or_default();
-                if !harnesses.is_empty() {
-                    let current = harnesses
-                        .iter()
-                        .position(|h| h == &form.fields[2].1)
-                        .unwrap_or(0);
-                    form.fields[2].1 = harnesses[(current + 1) % harnesses.len()].clone();
+                if let Some(next) =
+                    cycle_harness(&harnesses, &form.fields[2].1, key == KeyCode::Left)
+                {
+                    form.fields[2].1 = next;
                 }
             }
             KeyCode::Tab | KeyCode::Down => form.selected = (form.selected + 1) % form.fields.len(),
@@ -285,5 +283,46 @@ impl App {
                 .wrap(Wrap { trim: false }),
             popup,
         );
+    }
+}
+
+fn cycle_harness(harnesses: &[String], current: &str, backward: bool) -> Option<String> {
+    let len = harnesses.len();
+    if len == 0 {
+        return None;
+    }
+    let index = harnesses.iter().position(|h| h == current).unwrap_or(0);
+    let next = if backward {
+        (index + len - 1) % len
+    } else {
+        (index + 1) % len
+    };
+    Some(harnesses[next].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cycle_harness;
+
+    #[test]
+    fn harness_arrows_cycle_backward_and_forward_with_wrap() {
+        let harnesses = ["codex", "claude", "grok"].map(String::from);
+        assert_eq!(
+            cycle_harness(&harnesses, "codex", false).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            cycle_harness(&harnesses, "grok", false).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            cycle_harness(&harnesses, "codex", true).as_deref(),
+            Some("grok")
+        );
+        assert_eq!(
+            cycle_harness(&harnesses, "claude", true).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(cycle_harness(&[], "codex", true), None);
     }
 }

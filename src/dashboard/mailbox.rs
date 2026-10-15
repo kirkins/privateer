@@ -97,7 +97,7 @@ impl Mailbox {
                             id: id.into(),
                             kind: m["kind"].as_str().unwrap_or("").into(),
                             from: m["from"].as_str().unwrap_or("").into(),
-                            subject: preview.chars().take(100).collect(),
+                            subject: subject_line(&preview),
                             body: body.into(),
                             payload: m["payload"].clone(),
                             status: m["state"].as_str().unwrap_or("unread").into(),
@@ -163,5 +163,29 @@ impl Mailbox {
             )?;
         }
         Ok(())
+    }
+}
+
+fn subject_line(preview: &str) -> String {
+    preview
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(100)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subject_line;
+
+    #[test]
+    fn subject_collapses_line_breaks_and_whitespace() {
+        assert_eq!(
+            subject_line("ready.\nShould\tbe  one\n\nline \n"),
+            "ready. Should be one line"
+        );
+        assert_eq!(subject_line(&"x".repeat(150)).chars().count(), 100);
     }
 }

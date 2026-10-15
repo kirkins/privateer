@@ -1,7 +1,10 @@
 //! Captain-facing presentation with command-backed live mailbox actions.
 //! Demo interactions stay in memory without mailbox changes, wakes, terminal
 //! input or approvals.
-use super::{model::clean, ui::App};
+use super::{
+    model::{clean, count},
+    ui::App,
+};
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
@@ -202,9 +205,9 @@ impl App {
         }
         let response = match draft.mode {
             InputMode::Status => format!(
-                "Recorded sample state: {} owned assignments, {} pending issues. No model call or wake.",
-                self.snapshot.tasks.iter().filter(|t| t.owner == draft.recipient).count(),
-                self.snapshot.pending.iter().filter(|n| n.owner == draft.recipient).count()
+                "Recorded sample state: {}, {}. No model call or wake.",
+                count(self.snapshot.tasks.iter().filter(|t| t.owner == draft.recipient).count(), "owned assignment", "owned assignments"),
+                count(self.snapshot.pending.iter().filter(|n| n.owner == draft.recipient).count(), "pending issue", "pending issues")
             ),
             InputMode::Ask => "Side-question preview only. A connected harness would answer without creating fleet work; it may use inference.".into(),
             InputMode::Message => "Sample queued locally for preview. No agent was woken and no live message was delivered.".into(),
@@ -262,8 +265,8 @@ impl App {
                 .and_then(|s| s.live.as_ref())
                 .map(|l| {
                     format!(
-                        "{} open requests · {} unread mail · {}",
-                        l.requests,
+                        "{} · {} unread mail · {}",
+                        count(l.requests, "open request", "open requests"),
                         l.unread,
                         if l.attended { "aboard" } else { "not aboard" }
                     )

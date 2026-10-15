@@ -1,7 +1,7 @@
 use super::{
     captain::{Composer, Exchange, Mail},
     herdr,
-    model::{Snapshot, Task, clean},
+    model::{Snapshot, Task, clean, count},
 };
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -405,9 +405,9 @@ impl App {
             .collect::<Vec<_>>();
         let mut lines = vec![Line::styled(
             format!(
-                "{} {} pending issues",
+                "{} {}",
                 if self.ascii { "!" } else { "⚓" },
-                notices.len()
+                count(notices.len(), "pending issue", "pending issues")
             ),
             Style::default().fg(Color::Yellow),
         )];
@@ -440,12 +440,20 @@ impl App {
         else {
             let mut lines = vec![
                 Line::from(format!(
-                    "{} ships · {} assignments · {} pending issues",
-                    self.snapshot.ships.len(),
-                    self.snapshot.tasks.len(),
-                    self.snapshot.pending.len()
+                    "{} · {} · {}",
+                    count(self.snapshot.ships.len(), "ship", "ships"),
+                    count(self.snapshot.tasks.len(), "assignment", "assignments"),
+                    count(
+                        self.snapshot.pending.len(),
+                        "pending issue",
+                        "pending issues"
+                    )
                 )),
-                Line::from("Select a ship to enter its workspace. i: Inbox · l: Talk to liaison"),
+                Line::from(if self.snapshot.ships.is_empty() && !self.demo {
+                    "No ships yet · n: create your first ship (a liaison is suggested)"
+                } else {
+                    "Select a ship to enter its workspace. i: Inbox · l: Talk to liaison"
+                }),
                 Line::from(""),
             ];
             lines.push(Line::styled(
@@ -502,7 +510,9 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 ));
                 lines.push(Line::from(format!(
-                    "{owned} owned · {incoming} incoming handoffs · {pending} pending issues"
+                    "{owned} owned · {} · {}",
+                    count(incoming, "incoming handoff", "incoming handoffs"),
+                    count(pending, "pending issue", "pending issues")
                 )));
                 lines.push(Line::from(clean(&ship.description, 512)));
                 if let Some(live) = &ship.live {
@@ -541,7 +551,9 @@ impl App {
                     .filter(|t| t.handoff_to.as_ref() == Some(&ship.id))
                     .count();
                 lines.push(Line::from(format!(
-                    "{owned} owned assignments · {incoming} incoming handoffs"
+                    "{} · {}",
+                    count(owned, "owned assignment", "owned assignments"),
+                    count(incoming, "incoming handoff", "incoming handoffs")
                 )));
                 lines.push(Line::from(""));
                 if self.binding_ambiguous() {
@@ -762,7 +774,7 @@ impl App {
             ]),
         ];
         for s in &self.snapshot.ships {
-            let count = self
+            let assignments = self
                 .snapshot
                 .tasks
                 .iter()
@@ -771,9 +783,9 @@ impl App {
             items.push(ListItem::new(vec![
                 Line::from(clean(&s.name, 160)),
                 Line::from(format!(
-                    "{} · {count} assignment{}",
+                    "{} · {}",
                     if s.liaison { "Liaison" } else { "Peer ship" },
-                    if count == 1 { "" } else { "s" }
+                    count(assignments, "assignment", "assignments")
                 )),
             ]));
         }
@@ -796,17 +808,17 @@ impl App {
         self.mouse.ship_offset = state.offset();
         let mut body = cols[1];
         let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
-        let mut actions = vec![
-            ("[i Inbox]", 'i'),
-            (
+        let mut actions = vec![("[i Inbox]", 'i')];
+        if self.snapshot.ships.iter().any(|s| s.liaison) {
+            actions.push((
                 if self.demo {
                     "[l Talk to liaison]"
                 } else {
                     "[l Liaison]"
                 },
                 'l',
-            ),
-        ];
+            ));
+        }
         if !self.demo {
             actions.push(("[n New ship]", 'n'));
         }

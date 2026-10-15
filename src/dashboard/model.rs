@@ -162,6 +162,11 @@ pub(super) fn validate_navigation(ships: &[Ship]) -> Result<()> {
     Ok(())
 }
 
+/// A count with its noun, e.g. "1 pending issue" or "2 pending issues".
+pub fn count(n: usize, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
+}
+
 /// Terminal escape sequences and control bytes must never reach the renderer.
 pub fn clean(text: &str, limit: usize) -> String {
     text.chars()
