@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 
