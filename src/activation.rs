@@ -60,16 +60,17 @@ pub fn init(store: &Store) -> Result<()> {
 /// stream. Mirrors `session_started` in plugins/native_events.py; a harness
 /// not listed there stays unresumable.
 fn session_started(harness: &str, event: &Value) -> Option<String> {
-    let kind = event["type"].as_str()?;
+    let kind = event[if harness == "agy" { "event" } else { "type" }].as_str()?;
     let value = match harness {
         "codex" if kind == "thread.started" => &event["thread_id"],
         "pi" | "pi-signed" | "gateway-pi" | "omp" if kind == "session" => &event["id"],
         "claude" | "cursor" if kind == "system" && event["subtype"] == "init" => {
             &event["session_id"]
         }
-        "gemini" | "agy" if kind == "init" => &event["session_id"],
+        "gemini" if kind == "init" => &event["session_id"],
+        "agy" if kind == "init" => &event["conversation_id"],
         "opencode" if kind == "step_start" => &event["sessionID"],
-        "rovo" | "kimi" | "devin" | "muse"
+        "rovo" | "kimi" | "devin" | "grok" | "muse"
             if kind == "session.started" && event["harness"] == harness =>
         {
             &event["session_id"]

@@ -67,7 +67,7 @@ def build(harness, request):
     repo, prompt = context(request)
     options = request.get("options", {})
     allowed = {"model", "effort", "resume", "mode"}
-    if harness in ("rovo", "kimi", "devin"):
+    if harness in ("rovo", "kimi", "devin", "grok"):
         allowed |= {"transport", "acp_permissions"}
     if harness == "codex":
         allowed |= {"sandbox", "ephemeral"}
@@ -87,6 +87,8 @@ def build(harness, request):
         allowed |= {"permission_mode", "sandbox", "trust"}
     if harness == "cursor":
         allowed |= {"sandbox", "trust", "force"}
+    if harness == "agy":
+        allowed |= {"permission_mode", "skip_permissions", "sandbox", "disable_slash_commands"}
     if harness == "muse":
         allowed |= {"transport", "provider", "trust", "disable_sandbox", "sandbox_network",
                     "permission_mode", "bare", "msp_permissions", "msp_approval_mode"}
@@ -132,15 +134,22 @@ def build(harness, request):
             return repo, [sys.executable, str(Path(__file__).with_name("msp.py")), "--request", json.dumps(payload)]
         if resume or "msp_permissions" in options or "msp_approval_mode" in options:
             raise ValueError("MSP transport required for unattended resume")
-    if harness in ("rovo", "kimi", "devin"):
-        transport = selector(options, "transport", ["native", "acp"]) or ("acp" if harness == "rovo" else "native")
+    if harness in ("rovo", "kimi", "devin", "grok"):
+        transport = selector(options, "transport", ["native", "acp"]) or ("acp" if harness == "rovo" or (harness == "grok" and headless) else "native")
         if transport == "acp":
-            if not headless or set(options) - {"mode", "model", "resume", "transport", "acp_permissions"}:
+            accepted = {"mode", "model", "resume", "transport", "acp_permissions"}
+            if harness == "grok":
+                accepted.add("effort")
+            if not headless or set(options) - accepted:
                 raise ValueError("unsupported ACP options")
             permissions = selector(options, "acp_permissions", ["deny", "allow_once"]) or "deny"
             payload = {"binary": profile["binary"], "cwd": repo, "prompt": prompt, "model": model,
                        "resume": resume, "permissions": "auto" if permissions == "allow_once" else "ask"}
+            if harness == "grok":
+                payload["effort"] = effort
             return repo, [sys.executable, str(Path(__file__).with_name("acp.py")), "--request", json.dumps(payload)]
+        if harness == "grok" and headless:
+            raise ValueError("Grok headless jobs require their own ACP host")
         if harness == "rovo" or "acp_permissions" in options:
             raise ValueError("ACP transport required")
 
@@ -310,6 +319,26 @@ def build(harness, request):
             argv += ["--resume", resume]
         argv += (["--output-format", "streaming-json", "--single", prompt] if headless else ["--", prompt])
     elif harness == "agy":
+        permissions = selector(options, "permission_mode", ["accept-edits", "plan"])
+        if permissions:
+            argv += ["--mode", permissions]
+        if boolean(options, "skip_permissions"):
+            argv += ["--dangerously-skip-permissions"]
+        if boolean(options, "sandbox"):
+            argv += ["--sandbox"]
+        home = Path(request["context"]["control"]["cli_argv"][2]).resolve(strict=True)
+        if not home.is_dir():
+            raise ValueError("AGY operational home missing")
+        added = set()
+        for path in [home, *request["context"]["control"].get("writable", [])]:
+            path = Path(path).resolve()
+            if path.is_dir() and path not in added:
+                argv += ["--add-dir", str(path)]
+                added.add(path)
+        if boolean(options, "disable_slash_commands"):
+            if not headless:
+                raise ValueError("AGY slash expansion control requires print mode")
+            argv += ["--disable-slash-commands"]
         if headless:
             argv += ["--output-format", "stream-json"]
         if model:
@@ -388,7 +417,7 @@ if __name__ == "__main__":
                                 "interactive_command": name not in ("kimi", "rovo"), "resume_selector": p["resume"],
                                 "effort": p["effort"], "live_injection": False,
                                 "structured_headless_output": name != "devin",
-                                "acp_transport": name in ("rovo", "kimi", "devin"),
+                                "acp_transport": name in ("rovo", "kimi", "devin", "grok"),
                                 "msp_transport": name == "muse",
                                 "rpc_transport": name == "omp",
                                 "qualification": "command-plan; native pilots required"}

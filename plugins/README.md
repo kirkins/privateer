@@ -24,7 +24,7 @@ stdin-detached `agent.start` job path.
 | `opencode` | `opencode` | Native `ses_…` ID | Yes |
 | `gemini` | `gemini` | Full session UUID | Yes |
 | `cursor` | `cursor-agent` | Full chat UUID | Yes |
-| `grok` | `grok` | Full session UUID | Yes |
+| `grok` | `grok agent --no-leader stdio` (ACP for headless) | Full session UUID | Yes, native TUI plan |
 | `agy` | `agy` | Native conversation ID | Yes |
 | `muse` | `muse` | Full session UUID with `transport: msp` | Yes, fresh |
 | `devin` | `devin` | Native session ID | Yes |
@@ -33,8 +33,9 @@ stdin-detached `agent.start` job path.
 
 Common options are `model`, `effort`, `resume` and `mode` (`headless` or
 `interactive`). Unsupported options are refused rather than silently dropped.
-`effort` uses native flags; OpenCode variants and Codex/Grok effort values are
-passed to the native CLI for model-specific validation. Gemini, Cursor, Devin
+`effort` uses native flags; OpenCode variants and Codex effort values are
+passed to the native CLI for model-specific validation. Grok headless choices
+require advertised ACP configuration. Gemini, Cursor, Devin
 and Kimi have no independent qualified effort flag here. Pi-family adapters
 also accept `provider` with an explicit `model`, plus boolean `ephemeral`.
 `resume` never selects the latest session or opens a picker. It supplies the
@@ -43,7 +44,7 @@ exists, belongs to a particular ship, or has been resumed successfully.
 The runtime chooses whether to resume or start fresh and binds sessions to a
 focus; an adapter does not choose that policy or share sessions across tasks.
 
-Claude/Grok accept native `permission_mode`; Gemini maps it to `approval-mode`.
+Claude and Grok's interactive plans accept native `permission_mode`; Gemini maps it to `approval-mode`.
 No permission override is supplied by default. Claude's optional `bare: true`
 selects its native minimal launch mode for an isolated pilot. Pi and signed Pi
 also accept `bare: true`: disable extensions, MCP, skills, templates, context
@@ -77,6 +78,16 @@ model retries or provider fallback are introduced. Native events are preserved;
 one final summary counts only authoritative completed-message and compaction
 usage, excluding repeated streaming snapshots. This confirms native run
 completion, not the task's acceptance criteria, test results or mail delivery.
+
+AGY print runs also use the bounded event-checking bridge. Native 1.3.4 uses
+`event: init` with `conversation_id`, followed by `step_update` and a terminal
+`result`. The bridge verifies conversation, cwd and any explicit model, requires
+the matching result's `SUCCESS`, complete JSONL and native exit zero, and counts
+only final aggregate usage. Failed, cancelled, mixed-conversation and incomplete
+runs cannot become successful jobs. AGY options include `permission_mode`
+(`accept-edits`, `plan`), boolean `skip_permissions`, boolean `sandbox` and
+headless-only `disable_slash_commands`. Existing operational home and ledger
+directories are passed with `--add-dir`; no trust/provider store is edited.
 
 OMP headless runs use its native RPC interface (`--mode rpc --no-ui`) by
 default. The owned host is checked before the assignment prompt: an exact
@@ -118,6 +129,15 @@ Only the exact requested session can be loaded, and only when the server
 advertises that capability. `end_turn` is required before reporting completion.
 Filesystem and terminal client methods are not advertised or executed. Native
 tools still run with the native harness's own privileges.
+
+Grok headless jobs use ACP through an owned `grok agent --no-leader stdio`
+host. They never attach to or stop a shared leader. Native session loading and
+reported cwd are checked, and `model`/`effort` require advertised choices and
+confirmed configuration. Grok's native permission mode remains an interactive
+option; ACP uses the one-time permission policy below. Explicit headless
+`transport: native` is refused because shared-leader payload ownership is not
+qualified. Closing an owned ACP host first sends stdin EOF, then gives graceful
+signal teardown a bounded chance before killing an unresponsive child.
 
 ACP permission requests default to cancellation. An explicit
 `acp_permissions: allow_once` may select an offered one-time grant; it never
@@ -187,7 +207,7 @@ recorded light job under the same task. It checks the job's argv, cwd and result
 this does not exercise admission of a heavy build. The canary creates its own
 ledger before planning sandbox grants, and rejects changed acceptance tests.
 Session-start decoding is currently implemented for Codex, Claude, Pi-family,
-OpenCode, Gemini, Cursor, AGY, Muse MSP and the Rovo/Kimi/Devin ACP transport; an unknown
+OpenCode, Gemini, Cursor, AGY, Muse MSP and the Rovo/Kimi/Devin/Grok ACP transport; an unknown
 format stays unqualified.
 
 This is progress toward the harness set in
@@ -196,6 +216,14 @@ not full lifecycle parity. The ACP adapter has real pipe/process fixtures for
 session identity, permissions, deadlines, cancellation and the existing
 activation/mail contract. Native Kimi and Devin initialization has been checked;
 live authenticated ACP turns, including Rovo, still require qualification.
+Grok 1.0.50 passed native initialization, fresh session, exact load and confirmed
+model/effort configuration with its owned host. The live repair attempt reached
+HTTP 429; it was not retried. Live Grok repair, mail, recorded jobs and recall
+remain unqualified. AGY 1.3.4 with an existing signed-in account passed live
+repair, independent unchanged tests, task-linked mail, a recorded light test
+job, exact conversation resume and recall with the result guard enabled.
+The resumed tool trace was checked for prior-record searches. This qualifies
+that headless path, not every model, sandbox profile or interactive attachment.
 OMP 18.8.9 native RPC fresh-state, exact resume and cross-repository refusal
 have passed without sending a prompt. Protocol fixtures cover quiescence,
 usage, role enforcement, focused activation/mail and descendant cancellation.

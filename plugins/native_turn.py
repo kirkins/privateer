@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Confirm Pi's terminal JSON events while the runtime owns job supervision."""
+"""Confirm native terminal JSON events while the runtime owns supervision."""
 import json
 import subprocess
 import sys
@@ -9,7 +9,7 @@ from pathlib import Path
 from native_launch import native_environment
 
 MAX_LINE = 1024 * 1024
-TOKEN_FIELDS = ("input", "output", "cacheRead", "cacheWrite", "totalTokens")
+TOKEN_FIELDS = ("input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens")
 
 
 class Turn:
@@ -70,6 +70,59 @@ class Turn:
         return self.session is not None and self.settled and self.stop == "stop"
 
 
+class AgyTurn(Turn):
+    def __init__(self, argv):
+        expected = argv[argv.index("--conversation") + 1] if "--conversation" in argv else None
+        super().__init__(expected)
+        self.cwd = Path.cwd().resolve()
+        self.model = argv[argv.index("--model") + 1] if "--model" in argv else None
+        self.result = False
+
+    def observe(self, value):
+        if not isinstance(value, dict):
+            raise ValueError("invalid-event")
+        kind = value.get("event")
+        if kind == "init":
+            if self.session is not None or self.result:
+                raise ValueError("duplicate-init")
+            identity = value.get("conversation_id")
+            if (not isinstance(identity, str) or not 0 < len(identity) <= 512
+                    or any(c.isspace() or ord(c) < 32 for c in identity)
+                    or (self.expected is not None and identity != self.expected)):
+                raise ValueError("conversation-identity")
+            info = value.get("init")
+            if (not isinstance(info, dict) or not isinstance(info.get("cwd"), str)
+                    or not Path(info["cwd"]).is_absolute() or Path(info["cwd"]).resolve() != self.cwd):
+                raise ValueError("conversation-workspace")
+            if self.model is not None and info.get("model") != self.model:
+                raise ValueError("model-unconfirmed")
+            self.session = identity
+        elif kind == "result":
+            if self.result or self.session is None:
+                raise ValueError("unexpected-result")
+            result = value.get("result")
+            if not isinstance(result, dict) or result.get("conversation_id") != self.session:
+                raise ValueError("result-identity")
+            self.result = True
+            self.settled = result.get("status") == "SUCCESS"
+            self.stop = "stop" if self.settled else None
+            usage = result.get("usage")
+            if isinstance(usage, dict):
+                self.add_usage({new: usage[old] for old, new in [
+                    ("input_tokens", "input"), ("output_tokens", "output"),
+                    ("cache_read_tokens", "cacheRead"), ("cache_write_tokens", "cacheWrite"),
+                    ("thinking_tokens", "reasoning"), ("total_tokens", "totalTokens")
+                ] if old in usage})
+        elif kind == "step_update":
+            if self.session is None or self.result:
+                raise ValueError("step-outside-turn")
+            step = value.get("step_update")
+            if not isinstance(step, dict) or step.get("conversation_id") != self.session:
+                raise ValueError("step-identity")
+        else:
+            raise ValueError("unknown-native-event")
+
+
 def requested_session(argv):
     flags = argv[:argv.index("--")] if "--" in argv else argv
     if "--session" not in flags:
@@ -88,9 +141,9 @@ def requested_session(argv):
 
 
 def run(harness, argv):
-    if harness not in ("pi", "pi-signed") or not argv or argv[0] != harness:
+    if harness not in ("pi", "pi-signed", "agy") or not argv or argv[0] != harness:
         raise ValueError("invalid-native-command")
-    turn = Turn(requested_session(argv))
+    turn = AgyTurn(argv) if harness == "agy" else Turn(requested_session(argv))
     # The child stays in the owning job's group. Do not create a competing
     # process group, retry a model call, or infer task completion from prose.
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -136,7 +189,7 @@ def main():
     try:
         return run(sys.argv[1], sys.argv[2:])
     except Exception:
-        print("\n" + json.dumps({"type": "native.turn.failed", "reason": "Native Pi completion was not confirmed."}), flush=True)
+        print("\n" + json.dumps({"type": "native.turn.failed", "reason": "Native completion was not confirmed."}), flush=True)
         return 2
 
 

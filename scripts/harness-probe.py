@@ -58,6 +58,10 @@ def main():
                 if profile["resume"]:
                     cases.append(("headless", "ses_0123456789abc" if name == "opencode" else "46a81234-1234-4567-8123-123456789abc"))
                 for mode, resume in cases:
+                    if name == "grok" and mode == "headless":
+                        passed, reason = check([profile["binary"], "agent", "--no-leader", "stdio", "--help"])
+                        result["cases"].append({"mode": "owned-acp-entry", "resume": False, "passed": passed, "reason": reason})
+                        continue
                     if name == "omp" and mode == "headless":
                         passed, reason = check([profile["binary"], "--mode", "rpc", "--no-ui", "--help"])
                         result["cases"].append({"mode": "rpc-entry", "resume": False, "passed": passed, "reason": reason})

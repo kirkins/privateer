@@ -11,9 +11,15 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = r'''#!/usr/bin/env python3
-import json,os,sys,time
+import json,os,sys,time,signal
 mode=os.environ['ACP_TEST_MODE']
 record=os.environ['ACP_TEST_RECORD']
+if os.path.basename(sys.argv[0])=='grok':
+    assert sys.argv[1:]==['agent','--no-leader','stdio']
+    open(record+'.argv','w').write(json.dumps(sys.argv[1:]))
+if mode=='needs-term':
+    def terminated(*_):open(record+'.terminated','w').write('flushed');sys.exit(0)
+    signal.signal(signal.SIGTERM,terminated)
 session='native-session-1'
 def send(value): print(json.dumps(value),flush=True)
 def reply(request,result): send({'jsonrpc':'2.0','id':request['id'],'result':result})
@@ -30,17 +36,19 @@ for line in sys.stdin:
     elif method=='session/new':
         if mode in ('startup-update','startup-other'):
             send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'other' if mode=='startup-other' else session,'update':{'sessionUpdate':'agent_message_chunk'}}})
-        result={'sessionId':session}
+        result={'sessionId':session,'_meta':{'currentWorkingDirectory':'/' if mode=='wrong-workspace' else os.getcwd()}}
         if mode=='legacy-model':result['models']={'availableModels':[{'modelId':'fixture-model'}]}
         elif mode!='no-model':result['configOptions']=[{'id':'engine','category':'model','type':'select','currentValue':'default','options':[{'group':'models','options':[{'value':'fixture-model','name':'Fixture'}]}]}]
+        if mode in ('effort','ignored-effort'):
+            result['configOptions'].append({'id':'thought','category':'thought_level','type':'select','currentValue':'high','options':[{'value':'low','name':'Low'}]})
         reply(request,result)
         if mode=='blocked-write':time.sleep(30)
     elif method=='session/load':
         session=request['params']['sessionId']
-        reply(request,{'sessionId':'changed-session'} if mode=='changed-resume' else {})
+        reply(request,{'sessionId':'changed-session'} if mode=='changed-resume' else {'_meta':{'currentWorkingDirectory':os.getcwd()}})
     elif method=='session/set_model': reply(request,{})
     elif method=='session/set_config_option':
-        reply(request,{'configOptions':[{'id':'engine','currentValue':'default' if mode=='ignored-model' else request['params']['value']}]})
+        reply(request,{'configOptions':[{'id':request['params']['configId'],'currentValue':'default' if mode=='ignored-model' or (mode=='ignored-effort' and request['params']['configId']=='thought') else request['params']['value']}]})
     elif method=='session/prompt':
         if mode=='wrong-session':
             send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'other','update':{'sessionUpdate':'agent_message_chunk'}}})
@@ -55,6 +63,8 @@ for line in sys.stdin:
         response=json.loads(sys.stdin.readline())
         with open(record,'a') as stream: stream.write(json.dumps(response)+'\n')
         reply(request,{'stopReason':'max_tokens' if mode=='incomplete' else 'end_turn'})
+if mode=='needs-term':
+    while True:time.sleep(1)
 '''
 
 
@@ -64,9 +74,10 @@ class Bridge(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        executable = self.bin / "rovo"
-        executable.write_text(SERVER)
-        executable.chmod(0o700)
+        for name in ('rovo','grok'):
+            executable = self.bin / name
+            executable.write_text(SERVER)
+            executable.chmod(0o700)
         self.record = self.root / "requests.jsonl"
         self.forbidden = self.root / "must-not-exist"
 
@@ -109,6 +120,26 @@ class Bridge(unittest.TestCase):
                 self.assertNotEqual(run.returncode, 0)
                 self.assertFalse(any(r.get('method') == 'session/prompt' for r in records))
                 self.assertFalse(any(e['type'] == 'turn.completed' for e in events))
+
+    def test_grok_owns_its_native_host_and_effort_requires_advertisement_and_confirmation(self):
+        run, _, records = self.invoke('effort',binary='grok',model='fixture-model',effort='low')
+        self.assertEqual(run.returncode,0,run.stdout)
+        self.assertEqual(json.loads(Path(str(self.record)+'.argv').read_text()),['agent','--no-leader','stdio'])
+        self.assertTrue(any(r.get('params',{}).get('configId')=='thought' for r in records))
+        for mode,effort in [('happy','low'),('effort','max'),('ignored-effort','low')]:
+            self.record.unlink()
+            run,_,records=self.invoke(mode,binary='grok',effort=effort)
+            self.assertNotEqual(run.returncode,0)
+            self.assertFalse(any(r.get('method')=='session/prompt' for r in records))
+        self.record.unlink()
+        run,_,records=self.invoke('wrong-workspace',binary='grok')
+        self.assertNotEqual(run.returncode,0)
+        self.assertFalse(any(r.get('method')=='session/prompt' for r in records))
+
+    def test_owned_host_gets_graceful_signal_teardown_if_stdin_eof_does_not_exit(self):
+        run, _, _ = self.invoke('needs-term',binary='grok')
+        self.assertEqual(run.returncode,0,run.stdout)
+        self.assertEqual(Path(str(self.record)+'.terminated').read_text(),'flushed')
 
     def test_resume_is_capability_gated_and_never_falls_back_to_new(self):
         run, events, records = self.invoke(resume="saved-session")
