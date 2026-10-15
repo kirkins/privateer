@@ -95,6 +95,11 @@ Every ship made with `privateer init` or `ship.create` joins a per-user fleet re
 
 Ships can make ships, so the captain can grow a fleet from the first one. `ship.create` (`privateer ship new NAME`) makes a new ship folder, by default beside the creating ship's folder, with the creator's harness unless another is named, starts its dispatcher and links it. An agent needs active `spawn` authority to create ships, and a new ship's charter can hold only actions the creating ship's own charter has; the operator may set any. Creation checks authority under the creator's write lock before publishing the child, serializing that decision with revocation. Cross-home bootstrap and publication are not a distributed transaction, and child charter defaults remain unchanged. `ship.retire` revokes a ship's charter, stops its dispatcher, unlinks it and marks it retired, keeping its folder; an agent may retire only ships it created. The registry records who created each ship. `ship.retire` accepts optional `expected_home` to reject a name that now belongs to a different home; its final registry update also checks the originally selected home and active status after stopping the dispatcher.
 
+After authorized creation, the child's dispatcher runs as an operator service.
+The detached launch clears the creator's execution identity while retaining
+configured fleet, resource, plugin and configuration paths. Its first-mate jobs
+run as agents bound to the child ship.
+
 ## Plugins and local configuration
 
 Optional executable plugins use JSON lines over stdio. They receive a minimal task context and return a validated command specification; they cannot widen the charter. Harness choice, model choice, provider routing, and private gateway policy live outside the core.

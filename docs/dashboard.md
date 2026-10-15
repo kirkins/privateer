@@ -116,8 +116,10 @@ A missing harness keeps setup open with guidance, without initializing anything.
 
 Creation uses `privateer init --ship NAME --harness ID [--liaison]` in the chosen
 folder, then `privateer service start`. With a configured Herdr connection,
-Board waits for the registered ship and fresh, valid home and Herdr observations;
-temporary observation failures retain the request until the action queue accepts it.
+Board waits for the created ship's name and canonical home to appear in the
+registry, with fresh, valid home and Herdr observations. Temporary observation
+failures retain the request until the action queue accepts it. If the name now
+maps to a different home, automatic Board is cancelled.
 The chosen dedicated folder must be empty. If initialization succeeds before
 service startup fails, the ship remains available through existing ship and dispatcher management; onboarding
 does not reinitialize it or change its role.
@@ -164,10 +166,10 @@ explicit/inherited Herdr socket; a
 regular terminal still shows state and supports mail and management.
 
 `n` opens New ship (name, scope, optional absolute folder, harness), using an
-existing available ship as its creator. For an empty fleet, create the first
-ship through the [quick start](../README.md#quick-start); dashboard onboarding
-is a later step. Leaving the folder empty creates a sibling of the creator's
-folder. Use Tab or Up/Down to select a field, Enter to submit and Escape to cancel.
+existing available ship as its creator. In an empty fleet, it opens
+[first-run setup](#first-run-and-everyday-entry). Leaving the New ship folder
+empty creates a sibling of the creator's folder. Use Tab or Up/Down to select a
+field, Enter to submit and Escape to cancel.
 `x` opens Retire: type the exact selected ship name to confirm;
 its folder is kept.
 Retirement refuses if the fleet name now belongs to a different home. `d` opens
