@@ -81,7 +81,9 @@ completion, not the task's acceptance criteria, test results or mail delivery.
 OMP headless runs use its native RPC interface (`--mode rpc --no-ui`) by
 default. The owned host is checked before the assignment prompt: an exact
 session, no queued/background work or active goal, and confirmed explicit
-model/provider/effort selections. Resume also verifies the native file's header
+model/provider/fixed-effort selections. Native `effort: auto` remains adaptive:
+the CLI startup flag is required, while RPC reports a current concrete tier.
+Live adaptive behavior still requires model qualification. Resume also verifies the native file's header
 identity and recorded repository. OMP can otherwise switch to a resumed
 conversation's repository; passing a working directory alone does not prevent
 that. The header reader accepts the current native title-slot prefix with a

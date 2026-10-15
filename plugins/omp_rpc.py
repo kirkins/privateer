@@ -40,7 +40,15 @@ def verify_state(state, request, identity=None):
             raise ProtocolError("model-unconfirmed")
     if provider and model.get("provider") != provider:
         raise ProtocolError("provider-unconfirmed")
-    if request.get("effort") and state.get("thinkingLevel") != request["effort"]:
+    effort = request.get("effort")
+    if effort == "auto":
+        # OMP reports the current concrete tier (e.g. high), not the adaptive
+        # selector. Require its native startup flag, without pinning a tier or
+        # claiming that an unobserved model turn exercised adaptation.
+        argv = request["argv"]
+        if not any(argv[i:i+2] == ["--thinking", "auto"] for i in range(len(argv))):
+            raise ProtocolError("adaptive-effort-not-requested")
+    elif effort and state.get("thinkingLevel") != effort:
         raise ProtocolError("effort-unconfirmed")
     return selected
 

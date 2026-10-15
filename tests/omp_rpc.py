@@ -133,6 +133,11 @@ class Bridge(unittest.TestCase):
                 run, _, records=self.invoke(mode,model='fixture-model',effort='low')
                 self.assertNotEqual(run.returncode,0)
                 self.assertFalse(any(r['type']=='prompt' for r in records))
+        run,_,_=self.invoke(effort='auto',argv=['omp','--mode','rpc','--thinking','auto'])
+        self.assertEqual(run.returncode,0,run.stdout)
+        run,_,records=self.invoke(effort='auto')
+        self.assertNotEqual(run.returncode,0)
+        self.assertFalse(any(r['type']=='prompt' for r in records))
 
     def test_exact_resume_checks_file_identity_and_recorded_repository_before_admission(self):
         saved=self.root/'saved.jsonl'
