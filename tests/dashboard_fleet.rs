@@ -267,3 +267,99 @@ fn management_forms_require_explicit_retirement_and_never_mutate_demo() {
     assert!(app.form.is_none());
     assert!(app.action.is_none());
 }
+
+#[test]
+fn retirement_cannot_mark_a_replacement_home_retired_after_dispatcher_stop() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    let m = Machine::new();
+    let old = m.ship("apps");
+    let systemctl = m.root.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &old)
+        .args(["service", "start"])
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .output()
+        .unwrap();
+    assert!(started.status.success());
+    let barrier = m.root.join("stop-entered");
+    let release = m.root.join("release-stop");
+    let blocked = m.root.join("blocked-systemctl");
+    fs::write(
+        &blocked,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n",
+            barrier.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut first = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &old)
+        .args([
+            "ship.retire",
+            "--json",
+            &json!({"name":"apps","expected_home":old.join(".privateer")}).to_string(),
+        ])
+        .env("PRIVATEER_SYSTEMCTL", &blocked)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !barrier.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !barrier.exists() {
+        fs::write(&release, "").unwrap();
+        let _ = first.wait();
+        panic!("retirement never reached isolated dispatcher stop");
+    }
+    // A second operator completes retirement and reuses the name while the
+    // first command is in its external dispatcher boundary.
+    let second = m
+        .command(env!("CARGO_BIN_EXE_privateer"), &old)
+        .args(["ship.retire", "--json", "{\"name\":\"apps\"}"])
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .output()
+        .unwrap();
+    let replacement = m.root.join("replacement");
+    fs::create_dir(&replacement).unwrap();
+    let initialized = if second.status.success() {
+        m.command(env!("CARGO_BIN_EXE_privateer"), &replacement)
+            .args(["init", "--ship", "apps", "--harness", "codex"])
+            .output()
+            .unwrap()
+    } else {
+        second
+    };
+    fs::write(release, "").unwrap();
+    let finished = first.wait_with_output().unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    assert!(
+        !finished.status.success(),
+        "stale retirement must refuse: {}",
+        String::from_utf8_lossy(&finished.stdout)
+    );
+    assert!(String::from_utf8_lossy(&finished.stderr).contains("entry changed"));
+    let entry = m.json(&replacement, "fleet.list", json!({}))["ships"][0].clone();
+    assert_eq!(entry["retired_ms"], Value::Null);
+    assert_eq!(
+        entry["home"],
+        replacement.join(".privateer").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        m.json(&replacement, "charter.show", json!({"id":"apps"}))["active"],
+        true
+    );
+}

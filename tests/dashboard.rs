@@ -865,3 +865,45 @@ fn automatic_bindings_require_socket_terminal_location_and_pinned_session() {
     changed.agent_session = Some(json!({"value":"replacement"}));
     assert!(!binding.matches(&view, &changed));
 }
+
+#[test]
+fn automatic_presence_bindings_cannot_give_one_live_pane_to_two_ships() {
+    use privateer::dashboard::{
+        fleet::ShipState,
+        herdr::{Binding, View},
+        model::Ship,
+    };
+    let view = View::demo();
+    let binding = Binding {
+        socket: "/isolated/socket".into(),
+        socket_identity: view.socket_identity,
+        pane: view.panes[0].clone(),
+    };
+    let ships = ["apps", "infra"]
+        .into_iter()
+        .map(|name| Ship {
+            id: name.into(),
+            name: name.into(),
+            live: Some(ShipState {
+                binding: Some(binding.clone()),
+                attended: true,
+                ..ShipState::default()
+            }),
+            ..Ship::default()
+        })
+        .collect();
+    let mut app = App {
+        snapshot: Snapshot {
+            ships,
+            ..Snapshot::default()
+        },
+        herdr: Some(view),
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    assert!(app.binding_ambiguous());
+    assert!(app.scoped_panes().is_empty());
+    assert!(render(&mut app, 132, 38).contains("Ambiguous pane ownership"));
+    app.select_ship(Some("infra".into()));
+    assert!(app.scoped_panes().is_empty());
+}

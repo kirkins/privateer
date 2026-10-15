@@ -83,6 +83,26 @@ pub fn attend(
     presence(store, ship)
 }
 
+/// Claim an unattended ship for a new runtime-launched session. The write
+/// transaction closes the race between dashboards observing no presence and
+/// starting their tabs; hooks may still refresh/replace a holder via attend.
+pub fn claim(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    ttl_secs: u64,
+    harness: Option<&str>,
+) -> Result<Value> {
+    let tx = store.write_transaction()?;
+    ensure!(
+        !attended(store, ship)?,
+        "a session is already aboard; Board its existing pane"
+    );
+    let lease = attend(store, ship, holder, ttl_secs, harness)?;
+    tx.commit()?;
+    Ok(lease)
+}
+
 /// Release the lease if this holder still has it.
 pub fn leave(store: &Store, ship: &str, holder: &str) -> Result<bool> {
     Ok(store.connection().execute(
