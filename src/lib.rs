@@ -10,6 +10,7 @@ pub mod dashboard;
 mod executable;
 pub mod fleet;
 pub mod herdr;
+pub mod input;
 pub mod jobs;
 pub mod mail;
 pub mod opencode_mail;

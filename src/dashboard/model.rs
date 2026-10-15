@@ -3,7 +3,6 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -72,21 +71,31 @@ pub(super) fn read_registry(home: &Path) -> Result<Vec<Ship>> {
     struct Registry {
         ships: Vec<Ship>,
     }
-    let path = home.join("dashboard.json");
-    reject_symlinks(&path)?;
-    if let Ok(meta) = std::fs::metadata(&path) {
-        ensure!(meta.is_file(), "dashboard registry must be a regular file");
+    let mut selected = None;
+    for name in ["dashboard.yaml", "dashboard.yml", "dashboard.json"] {
+        let path = home.join(name);
+        reject_symlinks(&path)?;
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                ensure!(meta.is_file(), "dashboard registry must be a regular file");
+                ensure!(
+                    selected.is_none(),
+                    "multiple dashboard registry files; keep only one of dashboard.yaml, dashboard.yml or dashboard.json"
+                );
+                selected = Some((path, name));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
+    let Some((path, name)) = selected else {
+        return Ok(Vec::new());
     };
-    let mut bytes = Vec::new();
-    file.take(65537).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 65536, "dashboard registry exceeds 64 KiB");
-    let registry: Registry =
-        serde_json::from_slice(&bytes).context("invalid dashboard.json ship registry")?;
+    let registry: Registry = (|| {
+        let value = crate::input::read_file(&path)?;
+        serde_json::from_value(value).map_err(anyhow::Error::from)
+    })()
+    .with_context(|| format!("invalid {name} ship registry"))?;
     Ok(registry.ships)
 }
 

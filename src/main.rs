@@ -1,13 +1,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use privateer::{
-    dispatch, rpc,
+    dispatch, input, rpc,
     store::{Caller, Store},
 };
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
-
-mod input;
 
 fn run() -> Result<()> {
     let mut tokens = std::env::args().skip(1);
