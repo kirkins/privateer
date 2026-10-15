@@ -100,6 +100,10 @@ struct Job {
     /// The supervised job whose agent started this one, when an agent did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started_by: Option<String>,
+    /// Crew hosted in the terminal host: the supervisor runs in its own
+    /// space and the harness gets that pane's terminal instead of log pipes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    hosted: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -997,6 +1001,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         leader_result: None,
         cancelled_by: None,
         started_by,
+        hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
     };
     let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -1039,7 +1044,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                     && existing.cleanup_descendants == job.cleanup_descendants
                     && existing.agent_actor == job.agent_actor
                     && existing.estimate == job.estimate
-                    && existing.wait_for_capacity == job.wait_for_capacity,
+                    && existing.wait_for_capacity == job.wait_for_capacity
+                    && existing.hosted == job.hosted,
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));
@@ -1106,6 +1112,25 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
     }
     if let Some(existing) = admitted? {
         return Ok(public_job(&existing));
+    }
+    if job.hosted {
+        // The supervisor claims the job from its own space; a space that never
+        // runs it leaves the job unsupervised, and reconciliation fails it.
+        if let Err(error) = crate::host::supervise(store, &job.id, &job.task_id, &job.cwd) {
+            job = alter(store, &id, |j| {
+                j.status = "failed".into();
+                j.finished_ms = Some(Store::now_ms());
+                j.reason = Some(format!("terminal host refused the crew: {error:#}"));
+            })?;
+            release(store, &job)?;
+            dequeue(store, &job)?;
+            return Err(error).context("open the crew's space in the terminal host");
+        }
+        store.audit(
+            "job.started",
+            &json!({"job_id": id, "task_id": task_id, "incarnation": job.incarnation, "hosted": true}),
+        )?;
+        return Ok(public_job(&job));
     }
     let mut cmd = Command::new(&executable);
     cmd.arg("--home")
@@ -1548,17 +1573,36 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     cmd.env("PRIVATEER_JOB", &job.id)
         .args(&job.command[1..])
         .current_dir(&job.cwd)
-        .env("PWD", &job.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        .env("PWD", &job.cwd);
+    if job.hosted {
+        // The harness keeps the pane's terminal, in its own foreground
+        // process group, so group signals still reach exactly its work.
+        cmd.env("PRIVATEER_HOSTED_CREW", "1");
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::isatty(0) == 1 {
+                    libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                    libc::tcsetpgrp(0, libc::getpid());
+                    libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+                }
+                Ok(())
+            });
+        }
+    } else {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -1580,16 +1624,25 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     update_reservation(store, &job)?;
     drop(workspace_lock);
     let stop = Arc::new(AtomicBool::new(false));
-    let out = capture(
-        child.stdout.take().context("stdout missing")?,
-        dir.join("stdout.log"),
-        stop.clone(),
-    )?;
-    let err = capture(
-        child.stderr.take().context("stderr missing")?,
-        dir.join("stderr.log"),
-        stop.clone(),
-    )?;
+    // A hosted harness writes to its pane; its history is its own session.
+    let (out, err) = if job.hosted {
+        fs::File::create(dir.join("stdout.log"))?;
+        fs::File::create(dir.join("stderr.log"))?;
+        (None, None)
+    } else {
+        (
+            Some(capture(
+                child.stdout.take().context("stdout missing")?,
+                dir.join("stdout.log"),
+                stop.clone(),
+            )?),
+            Some(capture(
+                child.stderr.take().context("stderr missing")?,
+                dir.join("stderr.log"),
+                stop.clone(),
+            )?),
+        )
+    };
     let deadline = Instant::now() + Duration::from_secs(job.timeout_secs);
     let mut outcome = "succeeded";
     let mut reason = None;
@@ -1683,12 +1736,18 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     // capacity or signal a potentially reused PGID; expose it as an orphan.
     let group_remains = group_alive(&payload)?;
     stop.store(true, Ordering::Relaxed);
-    let stdout_dropped = out
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout capture panicked"))??;
-    let stderr_dropped = err
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr capture panicked"))??;
+    let stdout_dropped = match out {
+        Some(out) => out
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout capture panicked"))??,
+        None => 0,
+    };
+    let stderr_dropped = match err {
+        Some(err) => err
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr capture panicked"))??,
+        None => 0,
+    };
     if outcome == "succeeded" && !status.success() {
         outcome = "failed";
     }
