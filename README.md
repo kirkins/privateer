@@ -8,7 +8,7 @@
 
 Privateer is a fresh Rust runtime for independent peer agents working under a charter. One conversational agent is your familiar point of contact; departments can coordinate directly and keep working while that conversation is busy. Every outcome has a recorded owner.
 
-The first milestone is durable machinery and an isolated working pilot. It does not install over an existing fleet, create production credentials, or run model inference automatically.
+The first milestone is durable machinery and an isolated working pilot. The pilot does not install over an existing fleet, create production credentials, or run model inference.
 
 See [milestone status and validation](docs/milestone-1.md) for what is implemented, demonstrated, and still needed before fleet replacement. The agreed direction for conversation and activation (the captain, ships and their first mates, mailboxes, channels and standing grants) is in [the conversation and activation design](docs/design/conversation-and-activation.md).
 
@@ -36,9 +36,11 @@ See [dashboard setup and boundaries](docs/dashboard.md).
 
 Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
 Herdr. With no current ship, first-run setup offers a dedicated ship folder.
-Inside Herdr, entry opens or focuses your liaison's conversation and keeps the
-dashboard available in its original tab. Press `l` in the dashboard to return to
-the liaison. Running `privateer-dashboard` directly opens the observability view.
+With a configured Herdr connection and a unique liaison, entry opens or focuses
+your liaison's conversation and keeps the dashboard available in its original
+tab. Press `l` in the dashboard to return to the liaison. Running
+`privateer-dashboard` directly opens the observability view. See
+[entry conditions and fallback guidance](docs/dashboard.md#first-run-and-everyday-entry).
 
 ```sh
 cargo install --locked --path . --features dashboard  # installs privateer + privateer-dashboard

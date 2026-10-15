@@ -56,15 +56,9 @@ While the captain talks to a ship's first mate in an interactive session, that s
 
 ## Getting aboard
 
-Bare `privateer` is the everyday entry point. In ordinary terminals and Herdr, if an
-executable `privateer-dashboard` is installed beside the runtime or on PATH, it
-opens the dashboard and requests the liaison's conversation through a configured
-Herdr connection, keeping the dashboard in its original tab. An exact live
-binding is focused; otherwise a new tab runs its first mate. Direct
-`privateer-dashboard` remains an observation-first entry. Without a Herdr
-connection, bare entry shows a direct start command for the liaison. With no current ship this happens before initialization,
-so onboarding can choose a dedicated folder. With a current ship its dispatcher
-is ensured first. `privateer start` remains the direct first-mate path. When
+Bare `privateer` is the everyday entry point. See
+[First run and everyday entry](dashboard.md#first-run-and-everyday-entry) for
+installed dashboard entry, liaison handoff and onboarding conditions. When
 the dashboard is unavailable, the legacy flow applies: Inside a ship folder (any folder at or below one holding `.privateer`), it makes sure the ship's dispatcher is running and then runs `privateer start`. Elsewhere it asks whether to make the current folder a ship, naming it after the folder and choosing the first installed harness, then does the same; without a terminal to ask in it prints help, and `--yes` skips the question. It refuses to make the user's home directory or `/` a ship. The dispatcher is installed as a systemd user service where a user manager is available (the unit records the current `PATH`, where harnesses usually live, and `PRIVATEER_RESOURCE_HOME`/`PRIVATEER_PLUGINS` when set) and otherwise started as a detached process logging to `<home>/serve.log`, rotated at 1 MiB. A dispatcher holding `serve.lock` counts as running however it was started, so nothing starts twice. `privateer service status|start|stop` manages it; stopping a detached dispatcher signals the recorded process only while it still holds the lock and is that home's `serve`. `PRIVATEER_SERVICE=systemd|detached|none` overrides the choice.
 
 `privateer init --liaison` supplies an optional contact charter: `inspect`,

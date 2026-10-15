@@ -118,14 +118,17 @@ pins the selected ship's canonical home; it never chooses between conflicting
 contacts. A pending startup attempt is cancelled if fresh fleet observations
 remove, change or make that contact ambiguous, even during a Herdr outage.
 A queued attempt runs once; after a launch failure, use `l` to retry.
+An unavailable configured Herdr connection leaves the attempt pending.
 Navigation to the fleet, inbox or another ship cancels a delayed startup handoff.
+Changing views or scrolling within the liaison's workspace preserves navigation
+and leaves the attempt pending.
 Running `privateer-dashboard` directly keeps the observational entry behavior;
 `--once` stays read-only even with `--board-liaison`.
 Standalone observation, inbox and onboarding need no Herdr socket; Board still
 requires an explicitly selected or inherited socket and validated bindings.
-Privateer does not launch Herdr from an ordinary terminal. Without a connection,
-bare entry selects the liaison and displays a quoted direct `privateer --home
-HOME start` command instead of launching a second terminal manager.
+Privateer does not launch Herdr from an ordinary terminal. If a liaison is
+selected but no socket is configured, bare entry displays a shell-quoted
+`privateer --home HOME start` command to talk directly.
 
 With an empty fleet, the interactive dashboard welcomes the captain and suggests
 `liaison` at `~/ships/liaison`. Name and folder are editable; the suggested folder
@@ -156,7 +159,7 @@ entry. Installation is covered under [Build and preview](#build-and-preview).
 
 ## Boarding and management
 
-Press `l` or click **Talk to liaison** to open or focus its native conversation
+Press `l` or click **Liaison** to open or focus its native conversation
 in one action. This uses the same verified Board path as any ship; `m` remains
 the dashboard's separate mailbox composer. Herdr discovers the harness after
 it starts in the created pane; fleet registration alone does not create a live
