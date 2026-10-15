@@ -24,9 +24,15 @@ def native_environment():
     return env
 
 
-def launch(harness, argv, control=None):
+def launch(harness, argv, control=None, bundles=None, attended=False):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
+    if bundles is not None:
+        if harness != "pi":
+            raise ValueError("bounded resources support only Pi")
+        from pi_bundles import preflight
+        mail = Path(__file__).resolve().parent / "attended/mail.ts" if attended else None
+        argv = preflight(bundles, argv, env=native_environment(), mail_extension=mail)
     if harness == "opencode-v2":
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),
                                   *argv], native_environment())
@@ -53,13 +59,17 @@ def launch(harness, argv, control=None):
 def main():
     try:
         args = sys.argv[1:]
+        bundles = None
+        if args[0] == "--tool-bundles":
+            bundles = json.loads(args[1])
+            args = args[2:]
         if args[0] == "--attended-policy":
             from tool_permissions import attended_argv
             value, harness = json.loads(args[1]), args[2]
-            if harness not in PROFILES and value.get("mode") == "standard":
+            if bundles is None and harness not in PROFILES and value.get("mode") == "standard":
                 # Preserve the human CLI's existing custom-harness escape hatch.
                 os.execvpe(args[3], args[3:], native_environment())
-            launch(harness, attended_argv(harness, args[3:], value))
+            launch(harness, attended_argv(harness, args[3:], value), bundles=bundles, attended=True)
         else:
             if args[0] == "--opencode-yolo":
                 if args[1] != "opencode":
@@ -70,7 +80,7 @@ def main():
             if args[0] == "--control":
                 control = json.loads(args[1])
                 args = args[2:]
-            launch(args[0], args[1:], control)
+            launch(args[0], args[1:], control, bundles=bundles)
     except Exception as error:
         from tool_permissions import UnsupportedYolo
         if isinstance(error, UnsupportedYolo):

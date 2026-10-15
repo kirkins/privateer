@@ -18,6 +18,12 @@ The version 1 manifest names an executable argv, bounded timeout and combined st
 
 Native adapters plan argv without shell interpolation. They use the user's installed harness and its existing authentication. Validation checks the command plan, not account login or model availability. No model is hardcoded. A plugin is trusted executable code, not a sandbox, and a native harness retains the privileges of its user.
 
+For opt-in Pi 1.2.0 **skills and supporting-script bundles**, see
+[explicit tool bundles](../docs/tool-bundles.md). `tool_bundles` is a top-level
+first-mate/agent-start selection, never an inherited harness option. Omission
+keeps legacy ambient loading; explicit `[]` requests the limited fail-closed
+bounded path. Optional MCP/tool extensions and credential injection are deferred.
+
 ## Front doors
 
 A front door is a different plugin type: a long-running adapter that carries the captain's conversation to a chat service, phone or voice, registered for the whole fleet with `privateer door add` and supervised by `privateer door run`. Its manifest says `"kind": "front-door"`; harness planning refuses it. The bundled [Telegram door](telegram/README.md) is the first. See [front doors](../docs/architecture.md#front-doors) for the protocol.
@@ -66,7 +72,10 @@ No permission override is supplied by default. Claude's optional `bare: true`
 selects its native minimal launch mode for an isolated pilot. Pi and signed Pi
 also accept `bare: true`: disable extensions, MCP, skills, templates, context
 files and themes for this invocation, keeping native provider/authentication
-configuration. Cursor accepts
+configuration. Those legacy bare flags alone do not prevent Pi 1.2 package
+resolution or ambient SYSTEM/APPEND prompt files; they are not the reviewed,
+pinned `tool_bundles` path and must not be advertised as resource isolation.
+Cursor accepts
 native `sandbox` (`enabled`/`disabled`), boolean `trust` and boolean `force`.
 `force: true` maps to native `--force`: allow commands unless the native policy
 explicitly denies them. It is omitted by default. Explicit `sandbox: enabled`

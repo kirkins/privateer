@@ -76,6 +76,19 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "validate"
             };
             let mut request = json!({"id": id, "version": 1, "method": method, "context": context, "options": options});
+            if let Some(selected) = args.get("tool_bundles") {
+                ensure!(
+                    manifest_path == fs::canonicalize(crate::bundled::resolve("bundled:pi")?)?,
+                    "bounded tool bundles support only the bundled Pi adapter"
+                );
+                let role = if crate::workspace::is_wake(store, &args)? {
+                    "first_mate"
+                } else {
+                    "crew"
+                };
+                request["context"]["tool_bundles"] =
+                    crate::tool_bundles::resolve(store, selected, role)?;
+            }
             request["context"]["tool_permissions"] = crate::permissions::for_store(store)?;
             if let Some(path) = config {
                 request["config_path"] = json!(path);
@@ -119,6 +132,41 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         _ => bail!("unknown plugin command: {command}"),
     }
+}
+
+/// Qualify registry/resources using the same bounded subprocess and redacted
+/// error boundary as native adapters. No native harness is executed here.
+pub(crate) fn bundle_request(
+    directory: &Path,
+    registry: &Value,
+    selected: Option<(&Value, &str)>,
+) -> Result<Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut request = json!({"id":id,"version":1,"method":"validate","registry":registry});
+    if let Some((selection, role)) = selected {
+        request["selection"] = selection.clone();
+        request["role"] = json!(role);
+    }
+    let manifest = Manifest {
+        schema_version: 1,
+        id: "pi-bundles".into(),
+        kind: None,
+        executable: vec![
+            "python3".into(),
+            directory.join("pi_bundles.py").to_string_lossy().into(),
+        ],
+        timeout_ms: 5_000,
+        max_output_bytes: 32_768,
+    };
+    let response = invoke(&manifest, directory, serde_json::to_vec(&request)?)?;
+    ensure!(
+        response["id"] == id
+            && response["version"] == 1
+            && response["ok"] == true
+            && response["result"]["valid"] == true,
+        "bounded Pi resource validation failed; inspect approved registry locally"
+    );
+    Ok(response["result"].clone())
 }
 
 /// A plugin's id and executable argv, as every manifest type declares them.

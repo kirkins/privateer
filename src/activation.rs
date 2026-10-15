@@ -148,6 +148,15 @@ pub fn profile(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
     let options = object.get("options").cloned().unwrap_or(json!({}));
     ensure!(options.is_object(), "first_mate.options must be an object");
     out.insert("options".into(), options);
+    if let Some(selected) = object.get("tool_bundles") {
+        crate::tool_bundles::selection(selected)?;
+        ensure!(
+            out["manifest"] == "bundled:pi",
+            "bounded tool bundles require bundled:pi"
+        );
+        crate::tool_bundles::resolve(store, selected, "first_mate")?;
+        out.insert("tool_bundles".into(), selected.clone());
+    }
     if let Some(host) = object.get("host").filter(|v| !v.is_null()) {
         out.insert("host".into(), crate::host::validate(host)?);
     }
@@ -648,7 +657,9 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // conversation is what makes long sessions costly and confused.
     let harness = harness_id(&profile);
     let resume = match foci.as_slice() {
-        [focus] => warm_session(store, &name, focus, &harness, &profile)?,
+        [focus] if profile.get("tool_bundles").is_none() => {
+            warm_session(store, &name, focus, &harness, &profile)?
+        }
         _ => None,
     };
     let text = wake_text(store, &wake, &name, &mail, through, resume.is_some())?;
@@ -656,6 +667,9 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         "id": wake, "task_id": task, "manifest": profile["manifest"],
         "options": profile["options"], "wake": text,
     });
+    if let Some(selected) = profile.get("tool_bundles") {
+        start["tool_bundles"] = selected.clone();
+    }
     if let Some(session) = &resume {
         // The resumed session already holds the brief and earlier turns:
         // send only the new wake text.

@@ -439,11 +439,23 @@ def build(harness, request):
     return repo, argv
 
 
+def options_resume(request):
+    return request.get("options", {}).get("resume") is not None
+
+
 def handle(harness, request):
     repo, argv = build(harness, request)
+    bundles = request["context"].get("tool_bundles")
+    if bundles is not None:
+        from pi_bundles import validate_plan
+        if harness != "pi" or options_resume(request):
+            raise ValueError("bounded resources require a fresh Pi run")
+        validate_plan(bundles)
     prefix = (["--control", json.dumps(request["context"].get("control"))] if harness == "claude" else [])
     if harness == "opencode" and policy(request["context"].get("tool_permissions"))["mode"] == "yolo":
         prefix = ["--opencode-yolo"]
+    if bundles is not None:
+        prefix += ["--tool-bundles", json.dumps(bundles, separators=(",", ":"))]
     return {"valid": True} if request["method"] == "validate" else {
         "argv": argv if len(argv) > 1 and argv[0] == sys.executable and argv[1] in [str(Path(__file__).with_name(name)) for name in ("acp.py", "msp.py", "omp_rpc.py")] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), *prefix, harness, *argv],
         "cwd": repo, "env_names": []}
