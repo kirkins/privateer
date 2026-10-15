@@ -420,6 +420,56 @@ fn a_crew_decision_reaches_the_first_mate_and_the_crew_reads_its_reply() {
     assert_eq!(outcomes_of(&mut fleet, "asker").len(), 1);
 }
 
+/// A crew that starts its own failing test job, follows it to the end, then
+/// keeps working until `release` exists.
+const WATCHING_CREW: &str = r#"import json, os, subprocess, sys, time
+binary, home, release = sys.argv[1], sys.argv[2], sys.argv[3]
+def call(command, args):
+    out = subprocess.run([binary, "--home", home, command, "--json", json.dumps(args)], capture_output=True, text=True)
+    if out.returncode:
+        sys.exit("%s failed: %s" % (command, out.stderr))
+    return json.loads(out.stdout)
+call("job.start", {"id": "crew-test", "task_id": "infra-repair", "heavy": False, "command": ["false"]})
+while call("job.status", {"id": "crew-test"})["status"] != "failed":
+    time.sleep(0.1)
+while not os.path.exists(release):
+    time.sleep(0.1)
+"#;
+
+#[test]
+fn a_job_its_crew_follows_waits_for_the_crew_instead_of_waking_the_first_mate() {
+    let mut fleet = Fleet::new(now_settings());
+    let script = fleet.root.join("crew.py");
+    fs::write(&script, WATCHING_CREW).unwrap();
+    let release = fleet.root.join("release");
+    fleet.ok(
+        "job.start",
+        json!({"id": "worker", "task_id": "infra-repair", "heavy": false,
+            "command": ["python3", script, support::BIN, fleet.home, release]}),
+        Some("infra"),
+    );
+    let until = Instant::now() + Duration::from_secs(30);
+    while outcomes_of(&mut fleet, "crew-test").is_empty() {
+        assert!(Instant::now() < until, "the crew's test job never ended");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The failure is the crew's to handle while it runs.
+    assert_eq!(outcomes_of(&mut fleet, "crew-test")[0]["urgency"], "low");
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "nothing wake-worthy"
+    );
+    // When the crew ends, the first mate wakes and sees both outcomes.
+    fs::write(&release, "").unwrap();
+    wait(&fleet, "worker", &["succeeded"]);
+    let woke = Fleet::infra(&fleet.tick());
+    assert_eq!(woke["status"], "running", "{woke}");
+    fleet.settle();
+    let prompt = fleet.prompts().pop().unwrap();
+    assert!(prompt.contains("Crew job crew-test failed"), "{prompt}");
+    assert!(prompt.contains("Crew job worker succeeded"), "{prompt}");
+}
+
 #[test]
 fn only_the_runtime_speaks_as_crew() {
     let mut fleet = Fleet::new(now_settings());
