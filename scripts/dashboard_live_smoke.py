@@ -129,6 +129,7 @@ class Tui:
             os.close(gate_write)
             os.read(gate_read, 1)
             os.close(gate_read)
+            os.chdir(env["HOME"])
             os.execve(str(binary), [str(binary), *args], env)
         os.close(gate_read)
         self.reaped = False
@@ -232,8 +233,8 @@ def run(binary, runtime):
                            "(root/'harness-started').touch()\n(root/f'harness-started-{pane}').touch()\n"
                            "while not (root/'release').exists() and not (root/f'release-{pane}').exists(): time.sleep(.05)\n")
         harness.chmod(0o755)
-        env = {k: v for k, v in os.environ.items() if k not in
-               {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "PRIVATEER_JOB", "PRIVATEER_PRESENCE_HOLDER", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("PRIVATEER_") and k not in {"HERDR_ENV", "HERDR_SOCKET_PATH"}}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
                    PATH=str(bins) + ":/usr/bin:/bin")
@@ -384,12 +385,12 @@ def onboarding(binary, runtime):
                            "Path(os.environ['HOME'],'harness-started').touch()\n"
                            "while not Path(os.environ['HOME'],'release').exists(): time.sleep(.05)\n")
         harness.chmod(0o755)
-        env = {k: v for k, v in os.environ.items() if k not in
-               {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "PRIVATEER_JOB", "PRIVATEER_PRESENCE_HOLDER", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("PRIVATEER_") and k not in {"HERDR_ENV", "HERDR_SOCKET_PATH"}}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color", PATH=str(bins)+":/usr/bin:/bin")
         # Skipping first-run setup creates neither a home nor a registry.
-        skipped = Tui(binary, env, ["--no-herdr"])
+        skipped = Tui(runtime, dict(env, HERDR_ENV="1"), [])
         try:
             assert "Welcome" in skipped.screen()
             skipped.keys(b"\x1b")
