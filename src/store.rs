@@ -23,6 +23,29 @@ pub enum Caller {
 }
 
 impl Caller {
+    pub fn from_env(flag_role: Option<&str>, flag_actor: Option<&str>) -> Result<Self> {
+        let env = |name: &str| -> Result<Option<String>> {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
+            }
+        };
+        Self::resolve(
+            env("PRIVATEER_ROLE")?.as_deref(),
+            env("PRIVATEER_ACTOR")?.as_deref(),
+            flag_role,
+            flag_actor,
+        )
+    }
+
+    pub fn require_operator(&self, command: &str) -> Result<()> {
+        if matches!(self, Self::Agent { .. }) {
+            bail!("{command} is an operator command; agents cannot run it");
+        }
+        Ok(())
+    }
+
     /// Combine the role marker from the environment (`PRIVATEER_ROLE`,
     /// `PRIVATEER_ACTOR`) with optional CLI flags. Either source can narrow the
     /// caller to an agent; neither can widen an agent back to an operator.
@@ -56,6 +79,15 @@ impl Caller {
 }
 
 impl Store {
+    pub fn open_as(home: &Path, caller: Caller) -> Result<Self> {
+        if matches!(caller, Caller::Agent { .. }) && !home.join("privateer.sqlite").is_file() {
+            bail!("agents require an existing ship home");
+        }
+        let mut store = Self::open(home)?;
+        store.set_caller(caller);
+        Ok(store)
+    }
+
     pub fn open(home: &Path) -> Result<Self> {
         if !home.is_absolute() {
             bail!("home must be an absolute path");

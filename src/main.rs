@@ -29,8 +29,22 @@ fn run() -> Result<()> {
         }
         match token.as_str() {
             "--yes" | "-y" => yes = true,
-            "--role" => role = Some(tokens.next().context("--role requires a role")?),
-            "--actor" => actor = Some(tokens.next().context("--actor requires an identity")?),
+            "--role" => {
+                let value = tokens.next().context("--role requires a role")?;
+                ensure!(
+                    role.as_ref().is_none_or(|r| r == &value),
+                    "conflicting role flags"
+                );
+                role = Some(value);
+            }
+            "--actor" => {
+                let value = tokens.next().context("--actor requires an identity")?;
+                ensure!(
+                    actor.as_ref().is_none_or(|a| a == &value),
+                    "conflicting actor flags"
+                );
+                actor = Some(value);
+            }
             "--home" => {
                 home = Some(PathBuf::from(
                     tokens.next().context("--home requires a path")?,
@@ -85,46 +99,37 @@ fn run() -> Result<()> {
     let home = home
         .or_else(|| std::env::var_os("PRIVATEER_HOME").map(PathBuf::from))
         .or_else(privateer::cli::discover_home);
-    // Bare `privateer` gets you aboard.
-    let Some(command) = command else {
-        return privateer::cli::board(home, yes);
-    };
+    let caller = Caller::from_env(role.as_deref(), actor.as_deref());
     // Harness hooks must never fail the harness: they exit with the code
     // the harness expects and log their own errors.
-    if command == "hook" {
+    if command.as_deref() == Some("hook") {
         let event = positional.get(1).map(String::as_str).unwrap_or("");
         let code = match positional.first().map(String::as_str) {
-            Some("claude") => privateer::presence::claude_hook(home.as_deref(), event),
-            Some("cursor") => privateer::cursor_mail::hook(home.as_deref(), event),
+            Some("claude") => privateer::presence::claude_hook(home.as_deref(), event, caller),
+            Some("cursor") => privateer::cursor_mail::hook(home.as_deref(), event, caller),
             _ => bail!("usage: privateer hook claude|cursor EVENT"),
         };
         std::process::exit(code);
     }
+    let caller = caller?;
+    let Some(command) = command else {
+        return privateer::cli::board(home, yes, caller);
+    };
     if !json_given && !file_given && privateer::cli::VERBS.contains(&command.as_str()) {
-        return privateer::cli::run(home, &command, &positional);
+        return privateer::cli::run(home, &command, &positional, caller);
     }
     ensure!(
         positional.is_empty(),
         "unexpected argument {}",
         positional.first().map(String::as_str).unwrap_or("")
     );
+    if privateer::OPERATOR_COMMANDS.contains(&command.as_str()) || command == "serve" {
+        caller.require_operator(&command)?;
+    }
     let home = home.context(
         "not inside a ship folder (no .privateer here or above); run `privateer init`, or pass --home",
     )?;
-    let mut store = Store::open(&home)?;
-    let env = |name: &str| -> Result<Option<String>> {
-        match std::env::var(name) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
-        }
-    };
-    store.set_caller(Caller::resolve(
-        env("PRIVATEER_ROLE")?.as_deref(),
-        env("PRIVATEER_ACTOR")?.as_deref(),
-        role.as_deref(),
-        actor.as_deref(),
-    )?);
+    let mut store = Store::open_as(&home, caller)?;
     if command == "_job-supervise" {
         return privateer::jobs::supervise(
             &mut store,

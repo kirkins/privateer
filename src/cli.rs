@@ -6,7 +6,7 @@
 //! cloned into `projects/`. `init` turns a folder into a ship with sensible
 //! defaults and writes the instructions that make any harness launched there
 //! its first mate. JSON commands for agents and RPC are unchanged.
-use crate::store::{Store, identifier};
+use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::fs;
@@ -184,6 +184,10 @@ fn instructions(ship: &str, scope: &str, cli: &str) -> String {
 You are the first mate of the Privateer ship **{ship}**.{scope} The captain, the person you are talking to, gives you direction. Ships are peers: you coordinate with other ships through mail, never by command, and you run your own crew as supervised jobs. This file is written by `privateer init`; remove the first line to keep your own edits.
 
 Run Privateer as `{cli} COMMAND --json '{{...}}'`.
+
+Use your agent identity for mail and delegation through these JSON commands or
+`privateer ship new|retire`. Bare `privateer`, `init`, `start`, `service`, the
+dashboard and `project add` are captain commands; ask the captain to run them.
 
 ## At the start of every session
 
@@ -559,7 +563,7 @@ this charter. A contact role grants no command over another ship.
 3. New ships created by you inherit only your charter's actions. Explain any
    implementation authority they need and have the captain grant it explicitly;
    never widen your own charter or claim a child has rights you do not hold.
-4. Help add the chosen repositories with `privateer project add <git url>`.
+4. Ask the captain to add the chosen repositories with `privateer project add <git url>`.
 5. Explain the dashboard's inbox, direct messages and Board action, and the
    direct `privateer start` path. The captain can talk to any ship directly.
 6. Keep the captain's lasting preferences in {ship}'s `ship` note, and the
@@ -772,7 +776,8 @@ fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
 /// Bare `privateer` opens the installed dashboard inside Herdr. Otherwise,
 /// ensure this ship's dispatcher and talk to its first mate, offering to create
 /// the ship first when needed; without a terminal or `--yes`, print help.
-pub fn board(home: Option<PathBuf>, yes: bool) -> Result<()> {
+pub fn board(home: Option<PathBuf>, yes: bool, caller: Caller) -> Result<()> {
+    caller.require_operator("bare privateer")?;
     use std::io::{IsTerminal, Write};
     let dashboard = dashboard_binary();
     if home.is_none() {
@@ -828,7 +833,10 @@ pub fn board(home: Option<PathBuf>, yes: bool) -> Result<()> {
 }
 
 /// Run a human command. `home` is the discovered or given ship home.
-pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
+pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -> Result<()> {
+    if matches!(verb, "init" | "start" | "service" | "project") {
+        caller.require_operator(verb)?;
+    }
     if verb == "init" {
         let home = match home {
             Some(home) => home,
@@ -842,9 +850,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
     if verb == "start" {
         return start(&home, args);
     }
+    let mut store = Store::open_as(&home, caller)?;
     if verb == "ship" {
         let flags = flags(args, &["scope", "folder", "harness", "objective"])?;
-        let mut store = Store::open(&home)?;
         let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] | privateer ship retire NAME";
         let name = flags.positional.get(1).context(usage)?;
         match flags.positional.first().map(String::as_str) {
@@ -877,7 +885,6 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
         return Ok(());
     }
     if verb == "service" {
-        let store = Store::open(&home)?;
         let ship = crate::presence::folder_ship(&store)
             .context("this folder's ship is unknown; run `privateer init` here")?;
         drop(store);
@@ -890,7 +897,10 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
         println!("{report}");
         return Ok(());
     }
-    let mut store = Store::open(&home)?;
+    let address = match store.caller() {
+        Caller::Operator => "captain".to_owned(),
+        Caller::Agent { actor } => actor.clone(),
+    };
     let flags = flags(args, &[])?;
     let p = &flags.positional;
     match verb {
@@ -900,6 +910,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             println!("Home: {}", home.display());
             for ship in ships["ships"].as_array().into_iter().flatten() {
                 let name = ship["name"].as_str().unwrap_or("");
+                if matches!(store.caller(), Caller::Agent { .. }) && name != address {
+                    continue;
+                }
                 if ship["location"] == "here" {
                     let bearings = crate::context::bearings(&store, name)?;
                     print!("{}", bearings["text"].as_str().unwrap_or(""));
@@ -910,10 +923,15 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
                     println!("Ship {name}: behind peer {}", ship["location"]["peer"]);
                 }
             }
-            let captain = crate::dispatch(&mut store, "mail.inbox", json!({"address": "captain"}))?;
+            let inbox = crate::dispatch(&mut store, "mail.inbox", json!({"address": address}))?;
             println!(
-                "Captain's unread mail: {}   open requests: {}   undelivered mail: {}",
-                captain["messages"].as_array().map_or(0, Vec::len),
+                "{}'s unread mail: {}   open requests: {}   undelivered mail: {}",
+                if matches!(store.caller(), Caller::Operator) {
+                    "Captain"
+                } else {
+                    &address
+                },
+                inbox["messages"].as_array().map_or(0, Vec::len),
                 status["open_requests"],
                 status["undelivered_mail"]
             );
@@ -977,7 +995,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             let sent = crate::dispatch(
                 &mut store,
                 "mail.send",
-                json!({"from": "captain", "to": to, "kind": kind, "body": body}),
+                json!({"from": address, "to": to, "kind": kind, "body": body}),
             )?;
             let delivery = sent["delivery"]
                 .as_str()
@@ -996,11 +1014,11 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             let inbox = crate::dispatch(
                 &mut store,
                 "mail.inbox",
-                json!({"address": "captain", "all": all}),
+                json!({"address": address, "all": all}),
             )?;
             let messages = inbox["messages"].as_array().cloned().unwrap_or_default();
             if messages.is_empty() {
-                println!("No new mail, captain.");
+                println!("No new mail, {address}.");
             }
             for message in &messages {
                 print_mail(message);
@@ -1010,7 +1028,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
                 crate::dispatch(
                     &mut store,
                     "mail.ack",
-                    json!({"address": "captain", "through_seq": last}),
+                    json!({"address": address, "through_seq": last}),
                 )?;
                 println!("\nAnswer with: privateer reply <id> \"...\"");
             }
@@ -1027,7 +1045,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             crate::dispatch(
                 &mut store,
                 "mail.send",
-                json!({"from": "captain", "to": message["from"], "kind": kind,
+                json!({"from": address, "to": message["from"], "kind": kind,
                     "correlation": id, "body": body}),
             )?;
             println!("Sent {kind} to {}.", message["from"].as_str().unwrap_or(""));

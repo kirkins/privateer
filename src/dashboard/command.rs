@@ -50,6 +50,7 @@ pub fn initialize(
     harness: &str,
     liaison: bool,
 ) -> Result<Value> {
+    crate::store::Caller::from_env(None, None)?.require_operator("dashboard initialization")?;
     crate::store::identifier(name)?;
     ensure!(
         !folder

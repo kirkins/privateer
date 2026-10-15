@@ -363,6 +363,7 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
 }
 
 fn run(opts: Options) -> Result<()> {
+    privateer::store::Caller::from_env(None, None)?.require_operator("dashboard")?;
     let snapshot = if opts.demo {
         Snapshot::demo()
     } else {

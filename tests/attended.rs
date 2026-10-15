@@ -9,6 +9,82 @@ use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 
+#[test]
+fn hook_caller_flags_preserve_fail_open_and_own_ship_checks() {
+    let ship = Ship::new();
+    for (flags, role, actor) in [
+        (vec!["--role", "agent", "--actor", "foreign"], None, None),
+        (
+            vec!["--role", "operator", "--actor", "foreign"],
+            Some("agent"),
+            Some("infra"),
+        ),
+        (vec!["--role", "invalid"], Some("agent"), Some("infra")),
+    ] {
+        let mut command = ship.command(&["hook", "claude", "SessionStart"]);
+        command.args(flags);
+        if let Some(role) = role {
+            command.env("PRIVATEER_ROLE", role);
+        }
+        if let Some(actor) = actor {
+            command.env("PRIVATEER_ACTOR", actor);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            ship.json("ship.presence", json!({"ship":"infra"}))["attended"],
+            false
+        );
+    }
+    let start = ship
+        .command(&[
+            "hook",
+            "claude",
+            "SessionStart",
+            "--role",
+            "agent",
+            "--actor",
+            "infra",
+        ])
+        .output()
+        .unwrap();
+    assert!(start.status.success());
+    assert_eq!(
+        ship.json("ship.presence", json!({"ship":"infra"}))["attended"],
+        true
+    );
+    let end = ship
+        .command(&[
+            "hook",
+            "claude",
+            "SessionEnd",
+            "--role",
+            "agent",
+            "--actor",
+            "infra",
+        ])
+        .output()
+        .unwrap();
+    assert!(end.status.success());
+    assert_eq!(
+        ship.json("ship.presence", json!({"ship":"infra"}))["attended"],
+        false
+    );
+    let cursor = ship
+        .command(&["hook", "cursor", "sessionStart", "--role", "invalid"])
+        .output()
+        .unwrap();
+    assert!(cursor.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cursor.stdout).unwrap()["continue"],
+        true
+    );
+}
+
 struct Ship {
     _temp: tempfile::TempDir,
     root: PathBuf,

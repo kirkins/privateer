@@ -34,8 +34,9 @@ impl Folder {
             path,
         }
     }
-    fn run_in(&self, dir: &Path, args: &[&str]) -> Output {
-        support::command(BIN)
+    fn command_in(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut command = support::command(BIN);
+        command
             .args(args)
             .current_dir(dir)
             .env("PATH", &self.path)
@@ -46,9 +47,11 @@ impl Folder {
             .env_remove("HERDR_SOCKET_PATH")
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
-            .env_remove("PRIVATEER_HOME")
-            .output()
-            .unwrap()
+            .env_remove("PRIVATEER_HOME");
+        command
+    }
+    fn run_in(&self, dir: &Path, args: &[&str]) -> Output {
+        self.command_in(dir, args).output().unwrap()
     }
     fn ok(&self, args: &[&str]) -> String {
         let output = self.run_in(&self.ship, args);
@@ -62,6 +65,291 @@ impl Folder {
     fn json(&self, command: &str, args: Value) -> Value {
         serde_json::from_str(&self.ok(&[command, "--json", &args.to_string()])).unwrap()
     }
+}
+
+#[test]
+fn ergonomic_agent_delegation_retains_identity_and_child_action_limits() {
+    let folder = Folder::new("liaison");
+    folder.ok(&["init", "--liaison", "--harness", "codex"]);
+    let home = folder.ship.join(".privateer");
+    let home = home.to_str().unwrap();
+    for (i, (role, actor, flags)) in [
+        (Some("agent"), Some("liaison"), vec![]),
+        (None, None, vec!["--role", "agent", "--actor", "liaison"]),
+        (Some("agent"), Some("liaison"), vec!["--role", "operator"]),
+        (Some("operator"), Some("liaison"), vec!["--role", "agent"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("worker-{i}");
+        let mut args = vec!["--home", home, "ship", "new", &name];
+        args.extend_from_slice(&flags);
+        let mut command = folder.command_in(&folder.root, &args);
+        if let Some(role) = role {
+            command.env("PRIVATEER_ROLE", role);
+        }
+        if let Some(actor) = actor {
+            command.env("PRIVATEER_ACTOR", actor);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let child = folder.root.join(&name).join(".privateer");
+        let output = folder.run_in(
+            &folder.root,
+            &[
+                "--home",
+                child.to_str().unwrap(),
+                "charter.show",
+                "--json",
+                &json!({"id":name}).to_string(),
+            ],
+        );
+        assert!(output.status.success());
+        let charter: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(charter["actions"], json!(["inspect", "spawn", "message"]));
+        let fleet = folder.json("fleet.list", json!({}));
+        let member = fleet["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap();
+        assert_eq!(member["created_by"], "liaison");
+        let denied = folder
+            .command_in(
+                &folder.root,
+                &[
+                    "--home",
+                    child.to_str().unwrap(),
+                    "job.start",
+                    "--json",
+                    &json!({"task_id":format!("{name}-duty"),"command":["true"]}).to_string(),
+                ],
+            )
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", &name)
+            .output()
+            .unwrap();
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("implement"));
+        let denied = folder
+            .command_in(
+                &folder.root,
+                &[
+                    "--home",
+                    child.to_str().unwrap(),
+                    "--role",
+                    "operator",
+                    "charter.put",
+                    "--json",
+                    &json!({"id":name,"actions":["implement"]}).to_string(),
+                ],
+            )
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", &name)
+            .output()
+            .unwrap();
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("operator command"));
+        let retired = folder
+            .command_in(
+                &folder.root,
+                &[
+                    "--home", home, "ship", "retire", &name, "--role", "operator",
+                ],
+            )
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "liaison")
+            .output()
+            .unwrap();
+        assert!(
+            retired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retired.stderr)
+        );
+        assert!(child.is_dir());
+    }
+    let denied = folder
+        .command_in(&folder.ship, &["ship", "retire", "liaison"])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert_eq!(
+        folder.json("charter.show", json!({"id":"liaison"}))["active"],
+        true
+    );
+    let sent = folder
+        .command_in(&folder.ship, &["tell", "captain", "As myself"])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let mail = folder.json("mail.inbox", json!({"address":"captain"}));
+    assert_eq!(mail["messages"][0]["from"], "liaison");
+    folder.json("mail.send", json!({"id":"captain-notice","from":"captain","to":"liaison","kind":"notice","body":"For your mailbox"}));
+    let inbox = folder
+        .command_in(&folder.ship, &["inbox"])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(
+        inbox.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    assert!(String::from_utf8_lossy(&inbox.stdout).contains("For your mailbox"));
+    folder.json("mail.send", json!({"id":"captain-question","from":"captain","to":"liaison","kind":"request","body":"Who can help?"}));
+    for args in [
+        vec!["reply", "captain-question", "A peer can help"],
+        vec!["ask", "captain", "Which project?"],
+        vec!["status"],
+    ] {
+        let output = folder
+            .command_in(&folder.ship, &args)
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "liaison")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let captain = folder.json("mail.inbox", json!({"address":"captain"}));
+    assert!(
+        captain["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["from"] == "liaison")
+    );
+    assert_eq!(captain["messages"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn agent_operator_entry_is_rejected_before_fresh_state_or_launches() {
+    let folder = Folder::new("desk");
+    let fresh = folder.ship.join(".privateer");
+    let output = folder
+        .command_in(&folder.ship, &[])
+        .env("HERDR_ENV", "1")
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+    for args in [
+        vec!["--yes"],
+        vec!["init", "--liaison", "--harness", "codex"],
+        vec!["init", "--json", "{}"],
+        vec!["start"],
+        vec!["service", "start"],
+        vec!["service", "stop"],
+        vec!["service", "status"],
+        vec!["project", "add", "unused"],
+        vec!["serve"],
+    ] {
+        for via_flags in [false, true] {
+            let mut argv = vec!["--home", fresh.to_str().unwrap()];
+            argv.extend_from_slice(&args);
+            let mut command = folder.command_in(&folder.ship, &argv);
+            command.env("HERDR_ENV", "1");
+            if via_flags {
+                command.args(["--role", "agent", "--actor", "liaison"]);
+            } else {
+                command
+                    .env("PRIVATEER_ROLE", "agent")
+                    .env("PRIVATEER_ACTOR", "liaison")
+                    .args(["--role", "operator"]);
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success(), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("operator command"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+            assert!(!folder.root.join("fleet.sqlite").exists());
+            assert!(!folder.root.join("config").exists());
+        }
+    }
+    for flags in [
+        vec![
+            "--role", "agent", "--actor", "liaison", "--role", "operator",
+        ],
+        vec!["--role", "agent", "--actor", "liaison", "--actor", "other"],
+        vec!["--role", "agent", "--actor", "other"],
+        vec!["--role", "invalid"],
+    ] {
+        let output = folder
+            .command_in(&folder.ship, &["init", "--harness", "codex"])
+            .args(flags)
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "liaison")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+    }
+    let output = folder
+        .command_in(&folder.ship, &["init", "--role", "agent"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("actor identity"));
+    assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+    let output = folder
+        .command_in(&folder.ship, &["--home", fresh.to_str().unwrap(), "rpc"])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!fresh.exists());
+}
+
+#[cfg(feature = "dashboard")]
+#[test]
+fn agent_dashboard_entry_does_not_create_fleet_or_home() {
+    let folder = Folder::new("desk");
+    let output = support::command(env!("CARGO_BIN_EXE_privateer-dashboard"))
+        .args([
+            "--once",
+            "--home",
+            folder.ship.join(".privateer").to_str().unwrap(),
+        ])
+        .current_dir(&folder.ship)
+        .env("HOME", &folder.root)
+        .env("XDG_CONFIG_HOME", folder.root.join("config"))
+        .env("PRIVATEER_FLEET", folder.root.join("fleet.sqlite"))
+        .env("PRIVATEER_RESOURCE_HOME", folder.root.join("ledger"))
+        .env("PRIVATEER_SERVICE", "none")
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_SOCKET_PATH")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("operator command"));
+    assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+    assert!(!folder.root.join("fleet.sqlite").exists());
 }
 
 #[test]
