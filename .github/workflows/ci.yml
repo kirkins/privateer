@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -39,3 +40,27 @@ jobs:
       - run: cargo check --locked --no-default-features --bin privateer
       - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
       - run: python3 scripts/pilot.py --binary target/debug/privateer
+  # A macOS arm64 release for machines without a Rust toolchain, in the
+  # versioned release layout: <commit>/bin and <commit>/share/privateer/plugins.
+  macos-release:
+    name: macOS arm64 release
+    if: github.event_name != 'pull_request'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - run: cargo build --release --locked --features dashboard
+      - name: Lay out the release
+        run: |
+          root="releases/$GITHUB_SHA"
+          mkdir -p "$root/bin" "$root/share/privateer"
+          cp target/release/privateer target/release/privateer-dashboard "$root/bin/"
+          cp -R plugins "$root/share/privateer/plugins"
+          # The image must know itself as this exact release.
+          "$root/bin/privateer" upgrade status | grep -q "\"running_commit\": \"$GITHUB_SHA\""
+          tar -czf privateer-macos-arm64.tar.gz -C releases "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: privateer-macos-arm64-${{ github.sha }}
+          path: privateer-macos-arm64.tar.gz
