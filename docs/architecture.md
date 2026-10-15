@@ -56,6 +56,12 @@ While the captain talks to a ship's first mate in an interactive session, that s
 
 ## Getting aboard
 
+Git-backed crew work uses built-in [task workspaces](workspaces.md). Privateer
+owns each task's durable Treehouse lease, plans its harness against the isolated
+checkout, and pins subsequent jobs to that lease. Workspace release verifies
+processes and preserved/landed work; it never follows from a process exit alone.
+First-mate wake and interactive sessions retain their existing ship repository.
+
 Bare `privateer` is the everyday entry point. See
 [First run and everyday entry](dashboard.md#first-run-and-everyday-entry) for
 installed dashboard entry, liaison handoff and onboarding conditions. When

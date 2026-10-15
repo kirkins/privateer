@@ -20,6 +20,7 @@ pub mod plugins;
 pub mod presence;
 pub mod service;
 pub mod store;
+pub mod workspace;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -60,6 +61,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
+        "workspace" => workspace::dispatch(store, command, args),
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
         "ship" if matches!(command, "ship.create" | "ship.retire") => {
@@ -73,6 +75,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "wake" => activation::dispatch(store, command, args),
         "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
+            let mut args = args;
             let task = args
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -80,6 +83,25 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .to_owned();
             let charter = store.authorize(&task, "spawn")?;
             let owner = store.task(&task)?["owner"].clone();
+            // Plan against the task checkout; first-mate wakes have a durable
+            // wake row and keep their existing ship repository.
+            args.as_object_mut().unwrap().remove("_workspace_lease_id");
+            let repo = std::fs::canonicalize(
+                charter["repo"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("charter repo missing"))?,
+            )?;
+            let execution = workspace::execution(
+                store,
+                &task,
+                &repo,
+                !workspace::is_wake(store, &args)?,
+                None,
+            )?;
+            if let Some(lease) = &execution.lease_id {
+                args["_workspace_lease_id"] = serde_json::json!(lease);
+            }
+            drop(execution);
             let plan = plugins::dispatch(store, "plugin.command", args.clone())?;
             // The launched harness acts as the task owner, under the agent role.
             let mut job = serde_json::json!({
@@ -96,6 +118,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 if let Some(value) = args.get(key) {
                     job[key] = value.clone();
                 }
+            }
+            if let Some(lease) = args.get("_workspace_lease_id") {
+                job["workspace_lease_id"] = lease.clone();
             }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();

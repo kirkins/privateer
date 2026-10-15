@@ -41,6 +41,12 @@ struct Job {
     incarnation: String,
     command: Vec<String>,
     cwd: PathBuf,
+    /// The caller's directory before mapping into its task worktree. Retained
+    /// so replaying a completed job ID never acquires a replacement lease.
+    #[serde(default)]
+    source_cwd: Option<PathBuf>,
+    #[serde(default)]
+    workspace_lease_id: Option<String>,
     action: String,
     heavy: bool,
     timeout_secs: u64,
@@ -626,11 +632,74 @@ fn check_plugin_binding(job: &Job, charter: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn check_workspace_owner(store: &Store, job: &Job) -> Result<()> {
+    if job.workspace_lease_id.is_some() {
+        if let Some(actor) = &job.agent_actor {
+            ensure!(
+                store.task(&job.task_id)?["owner"].as_str() == Some(actor),
+                "task custody changed; the old workspace worker must stop"
+            );
+        }
+    }
+    Ok(())
+}
 /// Only the validated agent.start path may start a harness under spawn.
 /// Public job.start cannot use this to bypass implementation authority.
 pub(crate) fn start_agent(store: &Store, mut args: Value) -> Result<Value> {
     args["action"] = json!("spawn");
     start(store, args, None, true)
+}
+
+/// Reconcile recorded groups before release; a dead supervisor is not proof
+/// that its payload stopped.
+pub(crate) fn workspace_idle(store: &Store, task: &str, lease: &str) -> Result<()> {
+    workspace_jobs_idle(store, task, lease, None)
+}
+
+pub(crate) fn workspace_previous_owner_idle(store: &Store, task: &str, lease: &str) -> Result<()> {
+    let owner = store.task(task)?["owner"]
+        .as_str()
+        .context("task owner missing")?
+        .to_owned();
+    workspace_jobs_idle(store, task, lease, Some(&owner))
+}
+
+fn workspace_jobs_idle(
+    store: &Store,
+    task: &str,
+    lease: &str,
+    current_owner: Option<&str>,
+) -> Result<()> {
+    let mut stmt = store.connection().prepare("SELECT record FROM jobs WHERE json_extract(record,'$.task_id')=?1 AND json_extract(record,'$.workspace_lease_id')=?2")?;
+    let raw = stmt.query_map(params![task, lease], |r| r.get::<_, String>(0))?;
+    let jobs: Vec<Job> = raw
+        .map(|r| Ok(serde_json::from_str(&r?)?))
+        .collect::<Result<_>>()?;
+    let mut reserved = Reserved::default();
+    for job in jobs {
+        if current_owner.is_some_and(|owner| {
+            job.agent_actor
+                .as_deref()
+                .is_none_or(|actor| actor == owner)
+        }) {
+            continue;
+        }
+        let job = reconcile(store, job, &mut reserved)?;
+        ensure!(
+            terminal(&job.status),
+            "workspace has an unfinished job {}; stop or settle it before release",
+            job.id
+        );
+        ensure!(
+            job.supervisor.as_ref().map(same_process).transpose()? != Some(true),
+            "workspace supervisor is still running"
+        );
+        ensure!(
+            job.payload.as_ref().map(group_alive).transpose()? != Some(true),
+            "workspace payload group is still running"
+        );
+    }
+    Ok(())
 }
 
 fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> Result<Value> {
@@ -684,16 +753,12 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .and_then(Value::as_str)
             .context("charter repo missing")?,
     )?;
-    let cwd = fs::canonicalize(
+    let requested_cwd = fs::canonicalize(
         args.get("cwd")
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| repo.clone()),
     )?;
-    ensure!(
-        cwd.is_dir() && cwd.starts_with(&repo),
-        "cwd must stay inside charter repository"
-    );
     let heavy = args.get("heavy").and_then(Value::as_bool).unwrap_or(true);
     let estimate = args
         .get("estimate")
@@ -750,11 +815,17 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         }
         Caller::Operator => requested_actor.map(str::to_owned),
     };
+    let expected_workspace = args
+        .get("workspace_lease_id")
+        .map(|v| v.as_str().context("workspace_lease_id must be a string"))
+        .transpose()?;
     if let Ok(existing) = load(store, &id) {
         ensure!(
             existing.task_id == task_id
                 && existing.command == command
-                && existing.cwd == cwd
+                && existing.source_cwd.as_ref().unwrap_or(&existing.cwd) == &requested_cwd
+                && expected_workspace
+                    .is_none_or(|lease| existing.workspace_lease_id.as_deref() == Some(lease))
                 && existing.heavy == heavy
                 && existing.action == action
                 && existing.plugin_binding == plugin_binding
@@ -766,6 +837,28 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         );
         return Ok(public_job(&existing));
     }
+    let workspace = crate::workspace::execution(
+        store,
+        task_id,
+        &repo,
+        !(agent && crate::workspace::is_wake(store, &args)?),
+        expected_workspace,
+    )?;
+    let cwd = if requested_cwd.starts_with(&workspace.root) {
+        requested_cwd.clone()
+    } else {
+        workspace.root.join(
+            requested_cwd
+                .strip_prefix(&repo)
+                .context("cwd must stay inside charter repository or its task workspace")?,
+        )
+    };
+    let cwd = fs::canonicalize(cwd)?;
+    ensure!(
+        cwd.is_dir() && cwd.starts_with(&workspace.root),
+        "cwd must stay inside charter repository or its task workspace"
+    );
+    let workspace_lease_id = workspace.lease_id.clone();
     let charter_timeout = charter
         .get("job_timeout_secs")
         .and_then(Value::as_u64)
@@ -797,6 +890,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         incarnation: Uuid::new_v4().to_string(),
         command,
         cwd,
+        source_cwd: Some(requested_cwd),
+        workspace_lease_id,
         action: action.to_owned(),
         heavy,
         timeout_secs,
@@ -836,6 +931,13 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
     let conn = store.connection();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let admitted = (|| -> Result<Option<Job>> {
+        let current = store.authorize(task_id, action)?;
+        ensure!(
+            fs::canonicalize(current["repo"].as_str().context("charter repo missing")?)? == repo,
+            "charter repository changed during workspace allocation"
+        );
+        check_plugin_binding(&job, &current)?;
+        check_workspace_owner(store, &job)?;
         let existing: Option<String> = conn
             .query_row("SELECT record FROM jobs WHERE id=?1", [&id], |r| r.get(0))
             .optional()?;
@@ -845,6 +947,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                 existing.task_id == task_id
                     && existing.command == job.command
                     && existing.cwd == job.cwd
+                    && existing.source_cwd == job.source_cwd
+                    && existing.workspace_lease_id == job.workspace_lease_id
                     && existing.heavy == heavy
                     && existing.action == action
                     && existing.plugin_binding == job.plugin_binding
@@ -855,6 +959,18 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));
+        }
+        if job.action == "spawn" && job.workspace_lease_id.is_some() {
+            let occupied: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE json_extract(record,'$.workspace_lease_id')=?1
+                 AND json_extract(record,'$.action')='spawn'
+                 AND json_extract(record,'$.status') IN ('starting','queued','launching','running','orphaned'))",
+                [&job.workspace_lease_id], |r| r.get(0),
+            )?;
+            ensure!(
+                !occupied,
+                "this task already has a workspace harness; create a child task for an independent coding worker"
+            );
         }
         let ledger = ledger(&ledger_path)?;
         match reserve(
@@ -1235,25 +1351,40 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         return Ok(());
     }
     // Re-check authority after detach, before any payload starts.
-    let spawn_authority = (|| -> Result<()> {
+    let spawn_authority = (|| -> Result<Option<crate::workspace::Lock>> {
         let charter = store.authorize(&job.task_id, &job.action)?;
         check_plugin_binding(&job, &charter)?;
+        check_workspace_owner(store, &job)?;
         let repo = fs::canonicalize(charter["repo"].as_str().context("charter repo missing")?)?;
+        let lock = crate::workspace::validate_job(
+            store,
+            &job.task_id,
+            &repo,
+            &job.cwd,
+            job.workspace_lease_id.as_deref(),
+        )?;
+        // Waiting on an allocation/release lock may outlive the earlier read.
+        let current = store.authorize(&job.task_id, &job.action)?;
         ensure!(
-            fs::canonicalize(&job.cwd)? == job.cwd && job.cwd.starts_with(repo),
-            "job cwd changed outside charter before spawn"
+            fs::canonicalize(current["repo"].as_str().context("charter repo missing")?)? == repo,
+            "charter repository changed before payload launch"
         );
-        Ok(())
+        check_plugin_binding(&job, &current)?;
+        check_workspace_owner(store, &job)?;
+        Ok(lock)
     })();
-    if let Err(error) = spawn_authority {
-        job = alter(store, id, |j| {
-            j.status = "failed".into();
-            j.finished_ms = Some(Store::now_ms());
-            j.reason = Some(format!("authority refused before spawn: {error}"));
-        })?;
-        release(store, &job)?;
-        return Ok(());
-    }
+    let workspace_lock = match spawn_authority {
+        Ok(lock) => lock,
+        Err(error) => {
+            job = alter(store, id, |j| {
+                j.status = "failed".into();
+                j.finished_ms = Some(Store::now_ms());
+                j.reason = Some(format!("authority refused before spawn: {error}"));
+            })?;
+            release(store, &job)?;
+            return Ok(());
+        }
+    };
     let dir = store
         .home()
         .join("jobs")
@@ -1276,6 +1407,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     cmd.env("PRIVATEER_JOB", &job.id)
         .args(&job.command[1..])
         .current_dir(&job.cwd)
+        .env("PWD", &job.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1305,6 +1437,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         j.status = "running".into();
     })?;
     update_reservation(store, &job)?;
+    drop(workspace_lock);
     let stop = Arc::new(AtomicBool::new(false));
     let out = capture(
         child.stdout.take().context("stdout missing")?,
@@ -1369,6 +1502,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         let authority_error = store
             .authorize_running(&job.task_id, &job.action)
             .and_then(|charter| check_plugin_binding(&job, &charter))
+            .and_then(|()| check_workspace_owner(store, &job))
             .err();
         if terminated_at.is_none()
             && (job.cancel_requested || authority_error.is_some() || Instant::now() >= deadline)
@@ -1889,6 +2023,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             if let Some(binding) = &old.plugin_binding {
                 next["plugin_binding"] = binding.clone();
+            }
+            if let Some(lease) = &old.workspace_lease_id {
+                next["workspace_lease_id"] = json!(lease);
             }
             start(store, next, Some(old_id.to_owned()), old.action == "spawn")
         }
