@@ -147,7 +147,7 @@ fn tag_kind(tag: Option<&Tag>) -> Result<Option<&str>> {
         return Ok(None);
     };
     ensure!(
-        !tag.handle.starts_with('!') && !(tag.handle.is_empty() && tag.suffix.starts_with('!')),
+        !(tag.handle.starts_with('!') || tag.handle.is_empty() && tag.suffix.starts_with('!')),
         "custom constructors are not supported"
     );
     let kind = if tag.is_yaml_core_schema() {
