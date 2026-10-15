@@ -584,7 +584,8 @@ fn only_a_recorded_agent_wake_keeps_the_ship_repository() {
     );
     assert_eq!(wake["cwd"], json!(f.repo));
     assert!(wake["workspace_lease_id"].is_null());
-    assert_eq!(f.wait("wake")["status"], "succeeded");
+    let completed = f.wait("wake");
+    assert_eq!(completed["status"], "succeeded", "{completed}");
     let ordinary = f.start("two", "ordinary", "true");
     assert!(ordinary["workspace_lease_id"].is_string());
     f.wait("ordinary");
