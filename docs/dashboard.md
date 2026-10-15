@@ -123,6 +123,8 @@ contacts. A pending startup attempt is cancelled if fresh fleet observations
 remove, change or make that contact ambiguous, even during a Herdr outage.
 A queued attempt runs once; after a launch failure, use `l` to retry.
 An unavailable configured Herdr connection leaves the attempt pending.
+Input waits up to 2 seconds for the first Herdr observation, so a keystroke or
+scroll during startup cannot cancel the handoff before its first attempt.
 Navigation to the fleet, inbox or another ship cancels a delayed startup handoff.
 Changing views or scrolling within the liaison's workspace preserves navigation
 and leaves the attempt pending.

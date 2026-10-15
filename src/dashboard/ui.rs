@@ -27,6 +27,21 @@ fn origin(home: Option<&Path>) -> String {
     })
 }
 
+/// The shell-quoted command that reaches a ship's first mate without Herdr.
+fn direct_start(ship: &super::model::Ship) -> Option<String> {
+    let home = ship
+        .live
+        .as_ref()
+        .filter(|live| live.error.is_none())?
+        .home
+        .clone();
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    Some(format!(
+        "privateer --home '{}' start",
+        clean(&home.to_string_lossy(), 4096).replace('\'', "'\"'\"'")
+    ))
+}
+
 fn border(focused: bool) -> Style {
     Style::default().fg(if focused {
         Color::Yellow
@@ -559,8 +574,21 @@ impl App {
                 } else {
                     "Select a ship to enter its workspace; ● aboard · ○ not aboard · ✕ unavailable"
                 }),
-                Line::from(""),
             ];
+            if let Some(liaison) = self.snapshot.ships.iter().find(|s| s.liaison) {
+                let name = clean(&liaison.name, 160);
+                lines.push(Line::styled(
+                    if self.demo {
+                        format!("l: talk to {name} · launch is not connected in this preview")
+                    } else if let Some(start) = direct_start(liaison).filter(|_| !self.herdr_configured) {
+                        format!("Talk to {name} directly: {start}")
+                    } else {
+                        format!("l: talk to {name} · opens its first mate in a Herdr tab; b boards any ship")
+                    },
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            lines.push(Line::from(""));
             lines.push(Line::styled(
                 "Captain's inbox",
                 Style::default().fg(Color::Cyan),
@@ -642,18 +670,10 @@ impl App {
                         Style::default().fg(Color::Red),
                     ));
                 }
-                let home = ship
-                    .live
-                    .as_ref()
-                    .filter(|live| live.error.is_none())
-                    .map(|live| std::fs::canonicalize(&live.home).unwrap_or(live.home.clone()));
                 lines.push(Line::from(if self.demo {
                     "Conversation and agent launch are not connected in this preview.".into()
-                } else if let Some(home) = home.filter(|_| !self.herdr_configured) {
-                    format!(
-                        "Board needs Herdr. Talk to its first mate directly: privateer --home '{}' start",
-                        clean(&home.to_string_lossy(), 4096).replace('\'', "'\"'\"'")
-                    )
+                } else if let Some(start) = direct_start(ship).filter(|_| !self.herdr_configured) {
+                    format!("Board needs Herdr. Talk to its first mate directly: {start}")
                 } else if self.scoped_panes().is_empty() {
                     "b: Board · launch its first mate in a new Herdr tab".into()
                 } else {
@@ -804,12 +824,13 @@ impl App {
                 ("0", "home"),
             ]
         } else if self.ship.is_none() {
-            let mut hints = vec![("↑↓", "select ship"), ("i", "inbox")];
+            let mut hints = Vec::new();
+            if self.snapshot.ships.iter().any(|s| s.liaison) {
+                hints.push(("l", "talk to liaison"));
+            }
+            hints.extend([("↑↓", "select ship"), ("i", "inbox")]);
             if !self.demo {
                 hints.push(("n", "new ship"));
-            }
-            if self.snapshot.ships.iter().any(|s| s.liaison) {
-                hints.push(("l", "liaison"));
             }
             hints
         } else {
@@ -949,14 +970,7 @@ impl App {
         let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
         let mut actions = vec![("[i Inbox]", 'i')];
         if self.snapshot.ships.iter().any(|s| s.liaison) {
-            actions.push((
-                if self.demo {
-                    "[l Talk to liaison]"
-                } else {
-                    "[l Liaison]"
-                },
-                'l',
-            ));
+            actions.push(("[l Talk to liaison]", 'l'));
         }
         if !self.demo {
             actions.push(("[n New ship]", 'n'));

@@ -23,6 +23,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Longest wait for the first Herdr observation before startup input is read.
+const STARTUP_INPUT_HOLD: Duration = Duration::from_secs(2);
+
 #[derive(Default)]
 struct Options {
     home: Option<PathBuf>,
@@ -470,8 +473,10 @@ fn run(opts: Options) -> Result<()> {
             }
         }
     }
-    let mut home_updated = Instant::now();
+    let started = Instant::now();
+    let mut home_updated = started;
     let mut herdr_updated: Option<Instant> = None;
+    let mut herdr_observed = false;
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<()> {
         let _mouse_capture = MouseCapture;
@@ -516,6 +521,7 @@ fn run(opts: Options) -> Result<()> {
             if let Some((updates, _)) = &herdr {
                 while let Ok(update) = updates.try_recv() {
                     redraw = true;
+                    herdr_observed = true;
                     if let Some(notice) = update.notice {
                         app.notice = notice;
                     }
@@ -615,6 +621,16 @@ fn run(opts: Options) -> Result<()> {
                 terminal.draw(|frame| app.draw(frame))?;
                 last_draw = Instant::now();
                 redraw = false;
+            }
+            // Leave startup input queued until Herdr is first observed, so a
+            // keystroke or scroll cannot cancel the liaison handoff before
+            // its first attempt. Navigation still cancels a delayed one.
+            if !herdr_observed
+                && matches!(app.pending_board, Some(PendingBoard::Liaison(_)))
+                && started.elapsed() < STARTUP_INPUT_HOLD
+            {
+                thread::sleep(Duration::from_millis(20));
+                continue;
             }
             if !event::poll(Duration::from_secs(1))? {
                 continue;
