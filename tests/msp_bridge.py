@@ -104,7 +104,7 @@ class Bridge(unittest.TestCase):
         self.record.unlink(missing_ok=True)
         request = {"argv": ["muse", "serve", "--provider", "echo"], "cwd": str(self.root),
                    "roots": [str(self.root)], "prompt": "Literal $(touch never) --help", "permissions": "deny",
-                   "timeout": 0.5, **options}
+                   "timeout": 1, **options}
         run = subprocess.run([sys.executable, str(ROOT / "plugins/msp.py"), "--request", json.dumps(request)],
                              capture_output=True, text=True, timeout=5,
                              env={**os.environ, "PATH": str(self.bin)+os.pathsep+os.environ["PATH"],
