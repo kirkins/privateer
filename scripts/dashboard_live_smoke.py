@@ -230,7 +230,7 @@ class Tui:
 
 def run(binary, runtime):
     with tempfile.TemporaryDirectory(prefix="privateer-dash-", dir="/tmp") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         folder = root / "apps ' $fleet"
         folder.mkdir()
         bins = root / "bin"
@@ -393,7 +393,7 @@ def run(binary, runtime):
 
 def onboarding(binary, runtime):
     with tempfile.TemporaryDirectory(prefix="privateer-onboard-", dir="/tmp") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         bins = root / "bin"
         bins.mkdir()
         harness = bins / "codex"
