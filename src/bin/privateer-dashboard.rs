@@ -210,7 +210,7 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrActio
     thread::spawn(move || {
         let mut delay = Duration::ZERO;
         let mut failures = 0_u32;
-        let mut launching = std::collections::BTreeMap::<PathBuf, Pane>::new();
+        let mut launching = std::collections::BTreeMap::<PathBuf, (String, Instant)>::new();
         loop {
             let action = match commands.recv_timeout(delay) {
                 Ok(action) => Some(action),
@@ -220,6 +220,17 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrActio
             let mut notice = None;
             let value = (|| {
                 let mut client = Client::connect(&path)?;
+                let binary = privateer::dashboard::command::binary()?;
+                launching.retain(|home, (name, deadline)| {
+                    Instant::now() < *deadline
+                        && !privateer::dashboard::command::json(
+                            &binary,
+                            home,
+                            "ship.presence",
+                            &json!({"ship":name}),
+                        )
+                        .is_ok_and(|presence| presence["attended"] == true)
+                });
                 if let Some(action) = action {
                     let result = match action {
                         HerdrAction::Focus(action) => client.focus(&action.observed, &action.pane),
@@ -229,30 +240,29 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrActio
                             observed,
                         } => (|| -> Result<()> {
                             privateer::dashboard::command::existing_home(&home)?;
-                            let view = client.snapshot()?;
-                            launching.retain(|_, pane| {
-                                view.panes.iter().any(|p| {
-                                    p.pane_id == pane.pane_id && p.terminal_id == pane.terminal_id
-                                })
-                            });
-                            ensure!(
-                                !launching.contains_key(&home),
-                                "launch already submitted; inspect the created pane before retrying"
-                            );
-                            let binary = privateer::dashboard::command::binary()?;
                             let presence = privateer::dashboard::command::json(
                                 &binary,
                                 &home,
                                 "ship.presence",
                                 &json!({"ship":name}),
                             )?;
+                            if presence["attended"] == true {
+                                launching.remove(&home);
+                            }
                             ensure!(
                                 presence["attended"] != true,
                                 "a session is already aboard; refresh its binding or reach it directly"
                             );
+                            ensure!(
+                                !launching.contains_key(&home),
+                                "launch already submitted; wait for startup before retrying"
+                            );
                             let folder = home.parent().context("ship folder")?;
-                            let pane = client.board(&observed, folder, &name, &binary, &home)?;
-                            launching.insert(home, pane);
+                            launching.insert(
+                                home.clone(),
+                                (name.clone(), Instant::now() + Duration::from_secs(15)),
+                            );
+                            client.board(&observed, folder, &name, &binary, &home)?;
                             Ok(())
                         })(),
                     };

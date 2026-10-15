@@ -16,6 +16,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -33,6 +34,8 @@ class Herdr:
         self.stopped = False
         self.panes, self.children, self.errors = [], [], []
         self.creates = self.focuses = 0
+        self.delay_next = False
+        self.expected_failures = set()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.accept, daemon=True)
         self.thread.start()
@@ -83,7 +86,15 @@ class Herdr:
             env.update(HERDR_ENV="1", HERDR_SOCKET_PATH=str(self.path), HERDR_PANE_ID=pane["pane_id"],
                        HERDR_TAB_ID=pane["tab_id"], HERDR_WORKSPACE_ID=pane["workspace_id"])
             # The real runtime owns the fake harness and presence lifecycle.
-            child = subprocess.Popen(argv[1:], cwd=self.cwd, env=env, stdin=subprocess.DEVNULL,
+            launch = argv[1:]
+            if self.delay_next:
+                self.delay_next = False
+                launch = [sys.executable, "-c",
+                          "import os,sys,time\nfrom pathlib import Path\n"
+                          "while not Path(sys.argv[1]).exists(): time.sleep(.02)\n"
+                          "os.execv(sys.argv[2],sys.argv[2:])\n",
+                          str(self.root / "allow-start"), *launch]
+            child = subprocess.Popen(launch, cwd=self.cwd, env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
             self.children.append(child)
             pane.update(agent="codex", agent_status="idle", agent_session={"kind": "id", "value": "isolated-session"})
@@ -96,10 +107,11 @@ class Herdr:
 
     def close(self):
         (self.root / "release").touch()
+        (self.root / "allow-start").touch()
         for child in self.children:
             try:
                 _, error = child.communicate(timeout=5)
-                assert child.returncode == 0, error.decode()
+                assert child.returncode == (1 if child.pid in self.expected_failures else 0), error.decode()
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
@@ -216,8 +228,9 @@ def run(binary, runtime):
         bins.mkdir()
         harness = bins / "codex"
         harness.write_text("#!/usr/bin/env python3\nimport os,time\nfrom pathlib import Path\n"
-                           "Path(os.environ['HOME'],'harness-started').touch()\n"
-                           "while not Path(os.environ['HOME'],'release').exists(): time.sleep(.05)\n")
+                           "root=Path(os.environ['HOME'])\npane=os.environ.get('HERDR_PANE_ID','headless')\n"
+                           "(root/'harness-started').touch()\n(root/f'harness-started-{pane}').touch()\n"
+                           "while not (root/'release').exists() and not (root/f'release-{pane}').exists(): time.sleep(.05)\n")
         harness.chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k not in
                {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
@@ -294,10 +307,68 @@ def run(binary, runtime):
             tui.until(lambda: "newworker" not in active(), "Retire did not call ship.retire")
             assert (root / "newworker" / ".privateer").is_dir(), "retirement deleted the folder"
             tui.until(lambda: "ship.retire:" in tui.screen(), "retirement completion did not reach the UI")
+            presentation.write_text(json.dumps({"ships": [own]}))
+            tui.drain(1.2)
+
+            def board_until(count, message):
+                def requested():
+                    if server.creates >= count:
+                        return True
+                    tui.keys(b"0jj\rb")
+                    return server.creates >= count
+                tui.until(requested, message, timeout=25)
+                assert server.creates == count
+
+            def finish(pane_number):
+                (root / f"release-w1:p{pane_number}").touch()
+                tui.until(lambda: not command("ship.presence", {"ship": "apps"})["attended"],
+                          "completed harness retained its presence")
+                assert server.children[pane_number-1].wait(timeout=5) == 0
+                assert any(p["pane_id"] == f"w1:p{pane_number}" for p in server.panes)
+
+            def bound_to(pane_number):
+                presence = command("ship.presence", {"ship": "apps"})
+                return presence["attended"] and presence["lease"]["binding"]["pane"]["pane_id"] == f"w1:p{pane_number}"
+
+            finish(1)
+            board_until(2, "Board could not restart after a completed harness left its pane")
+            tui.until(lambda: bound_to(2), "restart did not claim a fresh bound lease")
+            tui.until(lambda: (root / "harness-started-w1:p2").exists(), "restart did not run a fresh harness")
+            tui.drain(2.5)
+            finish(2)
+            harness_script = harness.read_text()
+            harness.write_text("#!/bin/sh\nexit 1\n")
+            board_until(3, "Board could not submit the failed-start scenario")
+            failed = server.children[2]
+            server.expected_failures.add(failed.pid)
+            assert failed.wait(timeout=5) == 1
+            assert not command("ship.presence", {"ship": "apps"})["attended"]
+            tui.keys(b"0jj\rbbb")
+            tui.until(lambda: "launch already submitted" in tui.screen(), "failed startup lost its uncertainty guard")
+            assert server.creates == 3
+            harness.write_text(harness_script)
+            server.delay_next = True
+            board_until(4, "failed startup permanently blocked Board")
+            assert not command("ship.presence", {"ship": "apps"})["attended"]
+            tui.keys(b"0jj\rbbb")
+            tui.until(lambda: "launch already submitted" in tui.screen(), "delayed startup did not retain its pending guard")
+            assert server.creates == 4
+            assert not (root / "harness-started-w1:p4").exists()
+            (root / "allow-start").touch()
+            tui.until(lambda: bound_to(4), "delayed startup did not claim presence when released")
+            tui.until(lambda: (root / "harness-started-w1:p4").exists(), "delayed startup did not run its harness")
+            competitor = subprocess.run([str(runtime), "start"], cwd=folder, env=env,
+                                        capture_output=True, timeout=5)
+            assert competitor.returncode != 0 and b"already aboard" in competitor.stderr
+            tui.keys(b"0jj\rbbb")
+            tui.drain(2.2)
+            assert server.creates == 4
+            assert sorted(p.name for p in root.glob("harness-started-*")) == [
+                "harness-started-w1:p1", "harness-started-w1:p2", "harness-started-w1:p4"]
             assert not server.errors, server.errors
         finally:
             if tui:
                 tui.close()
             server.close()
         assert not command("ship.presence", {"ship": "apps"})["attended"]
-        print("Live dashboard PTY passed: captain reply, Board/start/presence/binding, conflict and session rejection/recovery, focus, dispatcher status, new/retire; isolated fake Herdr only.")
+        print("Live dashboard PTY passed: captain reply, Board/start/presence/binding, retained-pane restart, failed/delayed startup guards, conflict and session rejection/recovery, focus, dispatcher status, new/retire; isolated fake Herdr only.")
