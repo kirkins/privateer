@@ -84,9 +84,10 @@ environment variables. Local custom tags are rejected; standard core tags and
 inert global annotations may be accepted or ignored as ordinary data. Existing
 command validation still applies. Use `--file` once, separately from `--json`;
 it supplies command arguments, not runtime configuration. RPC, hooks and internal
-supervisors do not accept `--file`. Inline `--json`, machine protocols, outputs
-and native plugin manifests keep their JSON formats. To pass `--file` to a native
-harness, put it after the separator in `privateer start HARNESS -- --file PATH`.
+supervisors do not accept `--file`. Inline `--json`, machine protocols and outputs
+continue to use JSON. Native integration configuration retains its
+[required formats](plugins/README.md). To pass `--file` to a native harness, put
+it after the separator in `privateer start HARNESS -- --file PATH`.
 
 ## Build and try the isolated pilot
 
