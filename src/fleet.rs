@@ -211,15 +211,30 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
     crate::mail::unreserved(name)?;
     let creator = caller_ship(store);
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
-    let harness = match args.get("harness").and_then(Value::as_str) {
-        Some(h) => Some(h.to_owned()),
-        None => creator.as_ref().and_then(|c| {
-            crate::mail::dispatch(store, "ship.show", json!({"name": c}))
-                .ok()?["first_mate"]["manifest"]
-                .as_str()
-                .and_then(|m| Path::new(m).parent()?.file_name()?.to_str().map(str::to_owned))
-        }),
-    };
+    let parent = creator.as_ref().and_then(|c| {
+        let profile =
+            crate::mail::dispatch(store, "ship.show", json!({"name": c})).ok()?["first_mate"]
+                .take();
+        let harness = profile["manifest"].as_str().and_then(|m| {
+            Path::new(m)
+                .parent()?
+                .file_name()?
+                .to_str()
+                .map(str::to_owned)
+        })?;
+        Some((harness, profile["options"].clone()))
+    });
+    let harness = args
+        .get("harness")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| parent.as_ref().map(|(h, _)| h.clone()));
+    // A child crewed like its creator keeps the creator's model and provider
+    // route: the captain chose it, and the creator cannot change it.
+    let options = parent
+        .filter(|(h, _)| Some(h) == harness.as_ref())
+        .map(|(_, options)| options)
+        .filter(Value::is_object);
     // Keep authority stable through local setup, before the child is published
     // or a dispatcher can run it. A previously committed revoke wins this lock
     // and leaves no child folder, registry entry or service behind.
@@ -274,6 +289,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
                 .map(str::to_owned),
             created_by: created_by.clone(),
             liaison: false,
+            options,
         },
     )?;
     store.audit(
