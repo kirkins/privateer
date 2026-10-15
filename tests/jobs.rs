@@ -296,31 +296,68 @@ fn disk_and_repository_limits_refuse_before_any_process_starts() {
 }
 
 #[test]
-fn output_is_drained_but_saved_logs_are_bounded() {
+fn output_is_drained_and_saved_logs_keep_their_head_and_tail() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
+    // A harness announces itself first and reports usage last; 3 MiB of
+    // streaming in between must not cost either end.
     start(
         &home,
         "noisy",
         &[
             "/bin/sh",
             "-c",
-            "dd if=/dev/zero bs=1048576 count=3 2>/dev/null; dd if=/dev/zero bs=1048576 count=3 >&2 2>/dev/null",
+            "echo '{\"type\":\"session\",\"id\":\"first\"}'; \
+             head -c 3142656 /dev/zero | tr '\\0' x | fold -w 1023; echo; \
+             echo '{\"type\":\"agent_end\",\"usage\":{\"input\":7}}'; \
+             dd if=/dev/zero bs=1048576 count=3 >&2 2>/dev/null",
         ],
     );
     let done = wait(&home, "noisy", &["succeeded"]);
     let logs = home
         .join("jobs/noisy")
         .join(done["incarnation"].as_str().unwrap());
-    assert_eq!(
-        fs::metadata(logs.join("stdout.log")).unwrap().len(),
-        1024 * 1024
-    );
-    assert_eq!(
-        fs::metadata(logs.join("stderr.log")).unwrap().len(),
-        1024 * 1024
-    );
+    let stdout = fs::read_to_string(logs.join("stdout.log")).unwrap();
+    assert!(stdout.len() <= 1024 * 1024, "{}", stdout.len());
+    assert!(stdout.starts_with("{\"type\":\"session\",\"id\":\"first\"}\n"));
+    assert!(stdout.ends_with("{\"type\":\"agent_end\",\"usage\":{\"input\":7}}\n"));
+    let marker: Value = stdout
+        .lines()
+        .find_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .filter(|v| v["type"] == "privateer.log.truncated")
+        })
+        .expect("truncation marker");
+    let dropped = marker["dropped_bytes"].as_u64().unwrap();
+    assert!(dropped > 1024 * 1024, "{dropped}");
+    assert_eq!(done["stdout_dropped_bytes"], dropped);
+    assert!(fs::metadata(logs.join("stderr.log")).unwrap().len() <= 1024 * 1024);
+    assert!(done["stderr_dropped_bytes"].as_u64().unwrap() > 0);
+    // Tail segments are folded into the log, not left beside it.
+    let mut names: Vec<_> = fs::read_dir(&logs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["stderr.log", "stdout.log"]);
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
+fn a_short_log_is_kept_whole_and_reports_nothing_dropped() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "quiet", &["/bin/sh", "-c", "echo hello"]);
+    let done = wait(&home, "quiet", &["succeeded"]);
+    let logs = home
+        .join("jobs/quiet")
+        .join(done["incarnation"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(logs.join("stdout.log")).unwrap(),
+        "hello\n"
+    );
+    assert!(done.get("stdout_dropped_bytes").is_none());
 }
 
 #[test]
