@@ -7,7 +7,7 @@ cargo build --locked --bin privateer
 python3 scripts/recovery-pilot.py --binary target/debug/privateer
 ```
 
-The script prints a small JSON summary with `passed`, `native_inference`, `directory` and `evidence`. The evidence directory is retained on success and failure. `--output /absolute/new-directory` chooses a new directory; existing paths are refused. `--timeout 90` sets the scenario deadline, from 30 to 300 seconds. Cleanup has a separate 20-second deadline. The normal Cargo integration suite runs the same pilot through `tests/recovery_pilot.rs` with its own compiled binary.
+The script prints a small JSON summary with `passed`, `native_inference`, `directory` and `evidence`. The evidence directory is retained on success and failure. `--output /absolute/new-directory` chooses a new directory; existing paths are refused. `--timeout 90` sets the scenario deadline, from 30 to 300 seconds. Cleanup switches to its own bounded command log and 20-second deadline before stopping dispatchers or querying jobs, so an exhausted scenario log or deadline cannot block payload cancellation. The normal Cargo integration suite runs the pilot and an exhausted-log/live-payload cleanup regression through `tests/recovery_pilot.rs` with its own compiled binary.
 
 ## Scenario and evidence
 
