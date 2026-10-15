@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 
+mod input;
+
 fn run() -> Result<()> {
     let mut tokens = std::env::args().skip(1);
     let mut home = None;
@@ -15,10 +17,16 @@ fn run() -> Result<()> {
     let mut internal_job = None;
     let mut positional: Vec<String> = vec![];
     let mut json_given = false;
+    let mut file_given = false;
     let mut yes = false;
     let mut role = None;
     let mut actor = None;
     while let Some(token) = tokens.next() {
+        if token == "--" && command.as_deref() == Some("start") {
+            positional.push(token);
+            positional.extend(tokens);
+            break;
+        }
         match token.as_str() {
             "--yes" | "-y" => yes = true,
             "--role" => role = Some(tokens.next().context("--role requires a role")?),
@@ -29,8 +37,16 @@ fn run() -> Result<()> {
                 ))
             }
             "--json" => {
+                ensure!(!file_given, "choose --json or --file, not both");
                 json_given = true;
                 args = serde_json::from_str(&tokens.next().context("--json requires JSON")?)?
+            }
+            "--file" => {
+                ensure!(!file_given, "--file cannot be repeated");
+                ensure!(!json_given, "choose --json or --file, not both");
+                file_given = true;
+                let path = PathBuf::from(tokens.next().context("--file requires a path")?);
+                args = input::read_file(&path)?;
             }
             "--version" => {
                 println!("privateer {}", env!("CARGO_PKG_VERSION"));
@@ -38,7 +54,7 @@ fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nprivateer [--yes]   get aboard: make this folder a ship if it is not one (asks first), make sure its\n                    background dispatcher runs, and open its first mate\nIn a ship folder, --home is found automatically:\nprivateer init | start | status | ships | ask SHIP TEXT | tell SHIP TEXT | inbox | reply ID TEXT | wakes |\n          project add URL | service [status|start|stop]\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, wake.list,\nnote.put/get/list, focus.digest,\nmail.send/inbox/outbox/pending/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\ncrew.report/answer, resource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
+                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path COMMAND --file args.yaml   YAML/YML/JSON object (64 KiB)\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nprivateer [--yes]   get aboard: make this folder a ship if it is not one (asks first), make sure its\n                    background dispatcher runs, and open its first mate\nIn a ship folder, --home is found automatically:\nprivateer init | start | status | ships | ask SHIP TEXT | tell SHIP TEXT | inbox | reply ID TEXT | wakes |\n          project add URL | service [status|start|stop]\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, wake.list,\nnote.put/get/list, focus.digest,\nmail.send/inbox/outbox/pending/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\ncrew.report/answer, resource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
                 );
                 return Ok(());
             }
@@ -56,6 +72,14 @@ fn run() -> Result<()> {
             _ => bail!("unexpected argument {token}"),
         }
     }
+    ensure!(
+        !file_given || command.is_some(),
+        "--file requires a command"
+    );
+    ensure!(
+        !file_given || !matches!(command.as_deref(), Some("rpc" | "hook" | "_job-supervise")),
+        "--file supplies command arguments; RPC, hooks and internal supervisors use their own input"
+    );
     // The ship home: --home, PRIVATEER_HOME, or the nearest .privateer above
     // the current directory.
     let home = home
@@ -76,7 +100,7 @@ fn run() -> Result<()> {
         };
         std::process::exit(code);
     }
-    if !json_given && privateer::cli::VERBS.contains(&command.as_str()) {
+    if !json_given && !file_given && privateer::cli::VERBS.contains(&command.as_str()) {
         return privateer::cli::run(home, &command, &positional);
     }
     ensure!(
