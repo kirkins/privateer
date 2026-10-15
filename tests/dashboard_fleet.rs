@@ -363,3 +363,29 @@ fn retirement_cannot_mark_a_replacement_home_retired_after_dispatcher_stop() {
         true
     );
 }
+
+#[test]
+fn primary_ship_actions_remain_visible_at_a_standard_terminal_width() {
+    use privateer::dashboard::{fleet, ui::App};
+    use ratatui::{Terminal, backend::TestBackend};
+    let m = Machine::new();
+    m.ship("apps");
+    let mut app = App {
+        snapshot: fleet::read(&m.root.join("fleet.sqlite"), None).unwrap(),
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let text = (0..34)
+        .map(|y| {
+            (0..120)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for action in ["[b Board]", "[n New ship]", "[x Retire]", "[d Dispatcher]"] {
+        assert!(text.contains(action), "{action} was clipped");
+    }
+}

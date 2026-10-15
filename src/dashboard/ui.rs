@@ -720,13 +720,30 @@ impl App {
         self.mouse.ship_offset = state.offset();
         let mut body = cols[1];
         let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
-        let mut actions = vec![("[i Inbox]", 'i'), ("[l Talk to liaison]", 'l')];
+        let mut actions = vec![
+            ("[i Inbox]", 'i'),
+            (
+                if self.demo {
+                    "[l Talk to liaison]"
+                } else {
+                    "[l Liaison]"
+                },
+                'l',
+            ),
+        ];
         if !self.demo {
             actions.push(("[n New ship]", 'n'));
         }
         if self.ship.is_some() {
             actions.push(("[b Board]", 'b'));
-            actions.push(("[m Message ship]", 'm'));
+            actions.push((
+                if self.demo {
+                    "[m Message ship]"
+                } else {
+                    "[m Message]"
+                },
+                'm',
+            ));
             if !self.demo {
                 actions.push(("[x Retire]", 'x'));
                 actions.push(("[d Dispatcher]", 'd'));
