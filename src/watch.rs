@@ -49,9 +49,8 @@ pub fn run(store: &mut Store, ship: &str) -> Result<()> {
     let record = crate::dispatch(store, "ship.show", json!({"name": ship}))?;
     let harness = record["first_mate"]["manifest"]
         .as_str()
-        .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
-        .unwrap_or("agent")
-        .to_owned();
+        .and_then(crate::bundled::harness)
+        .unwrap_or_else(|| "agent".to_owned());
     unsafe {
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             libc::signal(
