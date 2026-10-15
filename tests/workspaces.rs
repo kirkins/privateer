@@ -1037,3 +1037,51 @@ fn crew_default_to_their_first_mates_harness_and_model() {
         r#"{"model": "other"}"#
     );
 }
+
+#[test]
+fn the_dispatcher_releases_only_workspaces_whose_work_has_landed() {
+    let f = Fixture::new();
+    f.ok(
+        "task.create",
+        json!({"id":"fresh","charter_id":"mission","owner":"ship","title":"fresh"}),
+    );
+    let commit = |dir: &Path, file: &str, message: &str| {
+        fs::write(dir.join(file), "content\n").unwrap();
+        git(dir, &["add", file]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=F",
+                "-c",
+                "user.email=f@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ],
+        );
+    };
+    let landed = f.acquire("one");
+    commit(&path(&landed), "landed.txt", "work");
+    // Squash-merged: the same content lands on main as a different commit.
+    commit(&f.repo, "landed.txt", "squash of work");
+    let pending = f.acquire("two");
+    commit(&path(&pending), "pending.txt", "wip");
+    let fresh = f.acquire("fresh");
+
+    let report = f.ok("serve", json!({"once": true}));
+    let released: Vec<&str> = report["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["task_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(released, ["one"], "{report}");
+    let state = |task: &str| f.ok("workspace.status", json!({"task_id":task}))["state"].clone();
+    assert_eq!(state("one"), "released");
+    assert_eq!(state("two"), "ready");
+    assert_eq!(state("fresh"), "ready");
+    assert!(path(&pending).join("pending.txt").exists());
+    assert!(path(&fresh).is_dir());
+}
