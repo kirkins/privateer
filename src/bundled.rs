@@ -90,7 +90,7 @@ pub(crate) fn normalize(reference: &str) -> Result<String> {
                         && root.join("Cargo.toml").is_file()
                         && root.join("plugins/native.py").is_file())
             });
-        let bundled_contents = std::fs::read(&path)
+        let bundled_contents = std::fs::read(path)
             .ok()
             .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
             .is_some_and(|actual| {

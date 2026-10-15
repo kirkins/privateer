@@ -10,7 +10,6 @@ use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
-use std::path::Path;
 use std::time::Duration;
 
 /// Defaults for a first mate's activation settings, in seconds or counts.
