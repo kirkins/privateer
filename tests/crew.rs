@@ -290,7 +290,8 @@ fn jobs_that_end_in_the_capacity_queue_report_too() {
     );
     let heavy = |id: &str, extra: Value| {
         let mut args = json!({"id": id, "task_id": "infra-repair",
-            "command": ["sleep", "60"], "heavy": true});
+            "command": ["sleep", "60"], "heavy": true,
+            "estimate": {"cpus": 1, "memory_bytes": 67108864}});
         for (key, value) in extra.as_object().unwrap() {
             args[key] = value.clone();
         }
