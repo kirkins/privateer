@@ -613,12 +613,7 @@ fn a_created_ship_keeps_its_creators_model_route_on_the_same_harness() {
     );
     assert!(other.status.success(), "{}", stderr(&other));
     let other = first_mate("other");
-    assert!(
-        other["manifest"]
-            .as_str()
-            .unwrap()
-            .ends_with("pi/manifest.json")
-    );
+    assert_eq!(other["manifest"], "bundled:pi");
     assert_eq!(other["options"], json!({}));
 }
 

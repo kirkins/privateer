@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod admission;
+mod bundled;
 pub mod cli;
 pub mod context;
 pub mod core;
@@ -20,6 +21,7 @@ pub mod permissions;
 pub mod plugins;
 pub mod presence;
 pub mod project;
+pub mod releases;
 pub mod service;
 pub mod store;
 pub mod watch;
@@ -62,6 +64,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
     }
     match command.split('.').next().unwrap_or("") {
+        "upgrade" if command == "upgrade.status" => releases::status(),
         "permissions" => permissions::dispatch(store, command, args),
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),

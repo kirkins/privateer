@@ -92,6 +92,8 @@ The instruction checklist is not proof of a model-driven onboarding outcome.
 
 ### Replacing the installed executable
 
+[Versioned releases](releases.md) keep each running binary paired with its own bundled plugins. In that layout, persisted command paths use `current/bin/privateer`, while internal supervisors retain the running image. `privateer upgrade status` reports the selected and running commits separately and reads recorded fleet outcomes; it does not perform an upgrade.
+
 On Linux, a running dispatcher can outlive an atomic replacement of its installed binary. Job supervisors reexec the dispatcher's retained image through `/proc/self/exe`, so an upgrade does not mix versions of the internal supervisor protocol. Agent control argv, hooks, and newly recorded peer/service commands instead use the installed path: a `/proc/self/exe` alias must never be passed to another process as its control CLI. The resolver checks the running image identity before interpreting Linux's ` (deleted)` marker, preserves literal filenames with that suffix, and never searches `PATH` for a substitute.
 
 The installed replacement must remain a regular file executable by the runtime's effective credentials. If it is missing or not executable, control-command creation fails with the path and restore/restart guidance. On Linux, replacing or removing the installed file leaves the retained image available for ordinary job supervision, but changing execute access on that retained image can still prevent a supervisor launch. Other Unix platforms use the OS-reported installed path for supervisors and validate it before job admission. A supervisor spawn failure marks the admitted job failed and removes its capacity reservation or queue entry.

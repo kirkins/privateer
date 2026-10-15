@@ -67,7 +67,7 @@ Claude ships can run Git and GitHub CLI commands without per-folder permission e
 
 To talk to your liaison from your phone, add the Telegram front door: `privateer door add telegram --config ~/.config/privateer/telegram.toml && privateer door start telegram` (see [the Telegram door](plugins/telegram/README.md)). Front doors are fleet-wide adapters that carry the captain's mail; see [architecture](docs/architecture.md#front-doors).
 
-For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable).
+For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable). Versioned release identities, durable bundled-adapter references, and read-only `privateer upgrade status` are described in [releases](docs/releases.md); fleet upgrade execution is not implemented yet.
 
 ## General runtime and optional integrations
 

@@ -12,7 +12,11 @@ use std::path::PathBuf;
 /// Replacing the installation is trusted just as invoking that path anew is;
 /// this does not verify compatibility between different Privateer releases.
 pub(crate) fn installed() -> Result<PathBuf> {
-    let path = installed_path()?;
+    let image = installed_path()?;
+    let path = match crate::releases::Release::from_executable(&image) {
+        Some(release) => release.entrypoint("privateer")?,
+        None => image,
+    };
     let recovery = || {
         format!(
             "Privateer executable {} is unavailable or not executable; restore the installation and restart the dispatcher",
