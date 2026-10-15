@@ -108,10 +108,26 @@ impl Machine {
         );
         folder
     }
+    fn job(&self, folder: &Path, task: &str, id: &str) {
+        use std::time::{Duration, Instant};
+        self.json(folder, "job.start", json!({"task_id":task,"id":id,"command":["/bin/sh","-c",":"],"heavy":false,"timeout_secs":5}));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let job = self.json(folder, "job.status", json!({"id":id}));
+            if job["status"] == "succeeded" {
+                return;
+            }
+            assert!(Instant::now() < deadline, "job did not succeed: {job}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     fn dashboard(&self) -> Value {
+        self.dashboard_args(&["--once", "--no-herdr"])
+    }
+    fn dashboard_args(&self, args: &[&str]) -> Value {
         let out = self
             .command(env!("CARGO_BIN_EXE_privateer-dashboard"), &self.root)
-            .args(["--once", "--no-herdr"])
+            .args(args)
             .output()
             .unwrap();
         assert!(
@@ -569,4 +585,269 @@ fn failed_fleet_observations_retain_mail_show_errors_and_never_open_missing_home
     mailbox.refresh(&proxy, &recovered, None);
     assert_eq!(mailbox.errors.len(), 2);
     assert_eq!(mailbox.messages.len(), 2);
+}
+
+#[test]
+fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
+    use privateer::dashboard::{fleet, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    m.ship("infra");
+    let home = apps.join(".privateer");
+    for (id, owner) in [
+        ("delegated", "infra"),
+        ("transferred", "crew"),
+        ("unregistered", "crew"),
+    ] {
+        m.json(
+            &apps,
+            "task.create",
+            json!({"id":id,"owner":owner,"title":format!("Assignment {id}"),"charter_id":"apps"}),
+        );
+        m.json(&apps, "event.emit", json!({"id":format!("event-{id}"),"task_id":id,"issue_key":"review","kind":"blocked","payload":{"summary":format!("Fact {id}")}}));
+        m.job(&apps, id, &format!("job-{id}"));
+    }
+    m.json(
+        &apps,
+        "task.handoff",
+        json!({"id":"transferred","actor":"crew","target":"infra"}),
+    );
+    m.json(
+        &apps,
+        "task.accept",
+        json!({"id":"transferred","actor":"infra"}),
+    );
+    let view = m.dashboard();
+    let snapshot = &view["snapshot"];
+    assert!(view["mail_errors"].as_array().unwrap().is_empty());
+    for (id, owner) in [
+        ("delegated", "infra"),
+        ("transferred", "infra"),
+        ("unregistered", "crew"),
+    ] {
+        let rows: Vec<_> = snapshot["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["id"] == id)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["owner"], owner);
+        assert_eq!(rows[0]["home"], json!(home));
+        for section in ["pending", "activity", "jobs"] {
+            let rows: Vec<_> = snapshot[section]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["task_id"] == id)
+                .collect();
+            assert!(!rows.is_empty(), "missing {section} for {id}");
+            for row in rows {
+                assert_eq!(row["owner"], owner);
+                assert_eq!(row["home"], json!(home));
+            }
+        }
+    }
+    let custody: Vec<_> = snapshot["custody"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["task_id"] == "transferred")
+        .collect();
+    assert_eq!(custody.len(), 2);
+    assert!(
+        custody
+            .iter()
+            .any(|r| r["actor"] == "crew" && r["kind"] == "task.handoff")
+    );
+    assert!(
+        custody
+            .iter()
+            .any(|r| r["actor"] == "infra" && r["kind"] == "task.accept")
+    );
+    for row in custody {
+        assert_eq!(row["owner"], "infra");
+        assert_eq!(row["home"], json!(home));
+    }
+    let snapshot = serde_json::from_value(snapshot.clone()).unwrap();
+    let mut app = App {
+        snapshot,
+        compact: false,
+        ..App::default()
+    };
+    app.select_ship(Some("infra".into()));
+    app.select_tab(1);
+    assert_eq!(
+        app.assignment_indices()
+            .iter()
+            .filter(|&&i| app.snapshot.tasks[i].home.as_ref() == Some(&home))
+            .count(),
+        2
+    );
+    app.select_tab(0);
+    let bridge = screen(&mut app);
+    assert!(bridge.contains("Fact delegated"));
+    assert!(bridge.contains("job-delegated"));
+    assert!(bridge.contains(&home.display().to_string()));
+    app.select_tab(3);
+    let logbook = screen(&mut app);
+    assert!(logbook.contains("Fact transferred"));
+    assert!(logbook.contains("accepted responsibility"));
+    app.select_ship(Some("crew".into()));
+    app.select_tab(1);
+    assert_eq!(app.assignment_indices().len(), 1);
+    assert_eq!(app.selected_task().unwrap().id, "unregistered");
+    assert!(
+        app.snapshot
+            .ships
+            .iter()
+            .find(|s| s.id == "crew")
+            .unwrap()
+            .live
+            .is_none()
+    );
+    app.compose();
+    assert!(app.composer.is_none());
+    app.select_tab(3);
+    assert!(screen(&mut app).contains("offered a handoff"));
+    let local = fleet::read(&m.root.join("absent-registry.sqlite"), Some(&home)).unwrap();
+    assert!(local.tasks.iter().all(|r| r.home.as_ref() == Some(&home)));
+    assert!(local.pending.iter().all(|r| r.home.as_ref() == Some(&home)));
+    assert!(
+        local
+            .activity
+            .iter()
+            .all(|r| r.home.as_ref() == Some(&home))
+    );
+    assert!(local.jobs.iter().all(|r| r.home.as_ref() == Some(&home)));
+    assert!(local.custody.iter().all(|r| r.home.as_ref() == Some(&home)));
+}
+
+#[test]
+fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs() {
+    use privateer::dashboard::{fleet, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    let apps_home = apps.join(".privateer");
+    let infra_home = infra.join(".privateer");
+    for (folder, owner) in [(&apps, "apps"), (&infra, "infra")] {
+        m.json(
+            folder,
+            "task.create",
+            json!({"id":"build","owner":owner,"title":format!("{owner} build"),"charter_id":owner}),
+        );
+        m.json(folder, "event.emit", json!({"id":"same-event","task_id":"build","issue_key":"build","kind":"blocked","payload":{"summary":format!("{owner} build fact")}}));
+        m.job(folder, "build", &format!("{owner}-job"));
+    }
+    let registry = m.root.join("fleet.sqlite");
+    let mut app = App {
+        snapshot: fleet::read(&registry, None).unwrap(),
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    app.select_tab(1);
+    app.selected = app
+        .assignment_indices()
+        .iter()
+        .position(|&i| app.snapshot.tasks[i].id == "build")
+        .unwrap();
+    let assignment = screen(&mut app);
+    assert!(assignment.contains("Job apps-job"));
+    assert!(!assignment.contains("Job infra-job"));
+    assert!(assignment.contains(&apps_home.display().to_string()));
+    m.json(
+        &apps,
+        "task.handoff",
+        json!({"id":"build","actor":"apps","target":"infra"}),
+    );
+    app.update_snapshot(fleet::read(&registry, None).unwrap());
+    app.select_ship(Some("infra".into()));
+    app.select_tab(1);
+    assert_eq!(
+        app.assignment_indices()
+            .iter()
+            .filter(|&&i| app.snapshot.tasks[i].id == "build")
+            .count(),
+        2
+    );
+    app.selected = app
+        .assignment_indices()
+        .iter()
+        .position(|&i| {
+            app.snapshot.tasks[i].id == "build"
+                && app.snapshot.tasks[i].home.as_ref() == Some(&infra_home)
+        })
+        .unwrap();
+    app.update_snapshot(fleet::read(&registry, None).unwrap());
+    assert_eq!(
+        app.selected_task().unwrap().home.as_ref(),
+        Some(&infra_home)
+    );
+    assert_eq!(app.selected_task().unwrap().title, "infra build");
+    let assignment = screen(&mut app);
+    assert!(assignment.contains("Job infra-job"));
+    assert!(!assignment.contains("Job apps-job"));
+    app.selected = app
+        .assignment_indices()
+        .iter()
+        .position(|&i| {
+            app.snapshot.tasks[i].id == "build"
+                && app.snapshot.tasks[i].home.as_ref() == Some(&apps_home)
+        })
+        .unwrap();
+    let incoming = screen(&mut app);
+    assert!(incoming.contains("Offered to infra"));
+    assert!(incoming.contains("Job apps-job"));
+    assert!(!incoming.contains("Job infra-job"));
+    m.json(&apps, "task.accept", json!({"id":"build","actor":"infra"}));
+    let mut refreshed = fleet::read(&registry, None).unwrap();
+    refreshed.tasks.reverse();
+    app.update_snapshot(refreshed);
+    assert_eq!(app.selected_task().unwrap().home.as_ref(), Some(&apps_home));
+    assert_eq!(app.selected_task().unwrap().owner, "infra");
+    assert!(app.selected_task().unwrap().handoff_to.is_none());
+    let accepted = screen(&mut app);
+    assert!(accepted.contains("Job apps-job"));
+    assert!(!accepted.contains("Job infra-job"));
+    assert_eq!(
+        m.json(&infra, "task.show", json!({"id":"build"}))["owner"],
+        "infra"
+    );
+    let view = m.dashboard();
+    let snapshot = &view["snapshot"];
+    assert_eq!(
+        snapshot["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["id"] == "build")
+            .count(),
+        2
+    );
+    for section in ["pending", "activity", "jobs"] {
+        let rows: Vec<_> = snapshot[section]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["task_id"] == "build")
+            .collect();
+        assert_eq!(rows.len(), 2, "{section}");
+        assert!(rows.iter().any(|r| r["home"] == json!(apps_home)));
+        assert!(rows.iter().any(|r| r["home"] == json!(infra_home)));
+        assert!(rows.iter().all(|r| r["owner"] == "infra"));
+    }
+}
+
+#[test]
+fn demo_work_origins_stay_sample_only_without_creating_state() {
+    let m = Machine::new();
+    let view = m.dashboard_args(&["--demo", "--once"]);
+    assert_eq!(view["demo"], true);
+    for section in ["tasks", "pending", "activity", "jobs", "custody"] {
+        let rows = view["snapshot"][section].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row["home"].is_null()));
+    }
+    assert_eq!(fs::read_dir(&m.root).unwrap().count(), 0);
 }

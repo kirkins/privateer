@@ -98,8 +98,8 @@ Infrastructure and an idle Research ship.
 
 Live fleet ships come from active registry entries, with scope and status read
 from their own homes. The optional private `<home>/dashboard.json` supplies
-presentation names and exact terminal bindings. The single-home fallback also
-includes observed owner/handoff identities. A registry
+presentation names and exact terminal bindings. Fleet and single-home views also
+include observed owner/handoff identities. A registry
 entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
@@ -125,8 +125,12 @@ Unbound Herdr panes are not presented as another ship's crew.
 Assignments appear only in their owning ship's Assignments view. An offered
 handoff also appears under the recipient as **Incoming**, with the current owner
 shown explicitly. Ownership changes only after the runtime records acceptance;
-this dashboard does not initiate or accept transfers. The same task ID, jobs and
-pending facts follow the current owner. Logbook includes current assignments'
+this dashboard does not initiate or accept transfers. Every task, notice, job,
+activity and custody row retains its originating home, including work delegated
+to an owner registered in another home or absent from the fleet registry. Task
+selection and job joins use the home plus local task ID, so identical IDs from
+different homes remain distinct across refreshes and handoffs. Jobs and pending
+facts follow the current owner. Logbook includes current assignments'
 events and custody audit rows involving the ship, preserving an outgoing ship's
 handoff reference. Audit rows identify actor/action and current owner; the UI
 does not invent historical target information the runtime did not record.
