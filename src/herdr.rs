@@ -305,7 +305,7 @@ impl Client {
         let text = format!("exec {} --home {} start", quote(binary)?, quote(home)?);
         self.request(
             "pane.send_input",
-            json!({"pane_id":pane.pane_id,"text":text,"keys":["enter"]}),
+            json!({"pane_id":pane.pane_id,"text":text,"keys":["Enter"]}),
         )?;
         Ok(pane)
     }

@@ -76,7 +76,7 @@ class Herdr:
         if method == "pane.send_input":
             pane = next(p for p in self.panes if p["pane_id"] == params["pane_id"])
             assert pane["agent"] is None
-            assert params["keys"] == ["enter"]
+            assert params["keys"] == ["Enter"]
             argv = shlex.split(params["text"])
             assert argv[0] == "exec" and argv[-1] == "start" and argv[2] == "--home", argv
             env = dict(self.env, **self.extra_env)
