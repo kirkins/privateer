@@ -19,7 +19,7 @@ def session_started(harness, event):
         value = event.get("session_id")
     elif harness == "agy" and kind == "init":
         value = event.get("conversation_id")
-    elif harness == "opencode" and kind == "step_start":
+    elif harness in ("opencode", "opencode-v2") and kind == "step_start":
         value = event.get("sessionID")
     if isinstance(value, str) and 0 < len(value) <= 512 and not any(c.isspace() or ord(c) < 32 for c in value):
         return value

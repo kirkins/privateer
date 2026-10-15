@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
@@ -36,7 +38,7 @@ impl Ship {
         ship
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = support::command(BIN);
         command
             .args(args)
             .current_dir(&self.folder)
@@ -44,13 +46,13 @@ impl Ship {
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("PRIVATEER_SERVICE", "none")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH")
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env_remove("PRIVATEER_HOME")
             .env_remove("PRIVATEER_ROLE")
-            .env_remove("PRIVATEER_ACTOR")
-            .env_remove("HERDR_ENV")
-            .env_remove("HERDR_SOCKET_PATH");
+            .env_remove("PRIVATEER_ACTOR");
         command
     }
     fn ok(&self, args: &[&str]) -> String {
@@ -66,8 +68,12 @@ impl Ship {
         serde_json::from_str(&self.ok(&[command, "--json", &args.to_string()])).unwrap()
     }
     fn hook(&self, event: &str, session: &str) -> Output {
+        self.hook_with(event, session, &[])
+    }
+    fn hook_with(&self, event: &str, session: &str, envs: &[(&str, &str)]) -> Output {
         let mut child = self
             .command(&["hook", "claude", event])
+            .envs(envs.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -130,6 +136,439 @@ fn presence_leases_are_refreshed_released_and_expire() {
         .output()
         .unwrap();
     assert!(!refused.status.success());
+}
+
+#[test]
+fn init_installs_claude_hooks_once() {
+    let ship = Ship::new();
+    ship.ok(&["init"]);
+    let settings: Value =
+        serde_json::from_slice(&fs::read(ship.folder.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+        let entries = settings["hooks"][event].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{event}");
+        assert_eq!(
+            entries[0]["hooks"][0]["command"],
+            format!("{BIN} hook claude {event}")
+        );
+    }
+}
+
+#[test]
+fn claude_hooks_deliver_mail_to_the_session_once_and_track_presence() {
+    let ship = Ship::new();
+    let start = ship.hook("SessionStart", "s1");
+    assert!(start.status.success());
+    let context = String::from_utf8_lossy(&start.stdout);
+    assert!(
+        context.contains("first mate of the ship infra"),
+        "{context}"
+    );
+    assert!(context.contains("Bearings for infra"));
+    assert_eq!(ship.presence()["lease"]["holder"], "claude:s1");
+
+    ship.ok(&["ask", "infra", "Is", "staging", "healthy?"]);
+    let prompt = ship.hook("UserPromptSubmit", "s1");
+    assert!(String::from_utf8_lossy(&prompt.stdout).contains("Is staging healthy?"));
+    // Presented once: the next prompt does not repeat it.
+    let again = ship.hook("UserPromptSubmit", "s1");
+    assert!(!String::from_utf8_lossy(&again.stdout).contains("Is staging healthy?"));
+
+    // Mail arriving mid-turn keeps the first mate working at turn end, once.
+    ship.ok(&["tell", "infra", "Deploy", "window", "moved"]);
+    let stop = ship.hook("Stop", "s1");
+    assert_eq!(stop.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&stop.stderr).contains("Deploy window moved"));
+    let stop = ship.hook("Stop", "s1");
+    assert_eq!(stop.status.code(), Some(0));
+
+    let end = ship.hook("SessionEnd", "s1");
+    assert!(end.status.success());
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
+fn hooks_never_break_the_harness_outside_a_ship() {
+    let ship = Ship::new();
+    let mut child = support::command(BIN)
+        .args(["hook", "claude", "Stop"])
+        .current_dir(&ship.root)
+        .env_remove("PRIVATEER_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"not json").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn serve_leaves_an_attended_ship_to_its_session() {
+    let ship = Ship::new();
+    ship.json(
+        "ship.put",
+        json!({"name":"infra","first_mate":{"manifest": ship.json("ship.show", json!({"name":"infra"}))["first_mate"]["manifest"],
+            "duty_task":"infra-duty","options":{"sandbox":"workspace-write"},"batch_secs":0,"max_delay_secs":0}}),
+    );
+    ship.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"pane","ttl_secs":60}),
+    );
+    ship.ok(&["ask", "infra", "anything?"]);
+    let report: Value =
+        serde_json::from_str(&ship.ok(&["serve", "--json", r#"{"once":true}"#])).unwrap();
+    assert_eq!(report["ships"][0]["skipped"], "captain's session is aboard");
+    ship.json("ship.leave", json!({"ship":"infra","holder":"pane"}));
+    let report: Value =
+        serde_json::from_str(&ship.ok(&["serve", "--json", r#"{"once":true}"#])).unwrap();
+    assert_eq!(report["ships"][0]["status"], "running", "{report}");
+}
+
+#[test]
+fn start_runs_the_harness_as_the_ship_while_holding_presence() {
+    let ship = Ship::new();
+    let probe = ship.root.join("probe.txt");
+    let harness = ship.root.join("bin/fakeharness");
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\n{{ echo \"$PRIVATEER_ROLE $PRIVATEER_ACTOR $1\"; '{BIN}' ship.presence --json '{{\"ship\":\"infra\"}}'; }} > '{}'\nexit 7\n",
+            probe.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = ship
+        .command(&["start", "fakeharness", "--", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = fs::read_to_string(&probe).unwrap();
+    let (env, presence) = seen.split_once('\n').unwrap();
+    assert_eq!(env, "agent infra hello");
+    let presence: Value = serde_json::from_str(presence).unwrap();
+    assert_eq!(presence["attended"], true);
+    assert!(
+        presence["lease"]["holder"]
+            .as_str()
+            .unwrap()
+            .starts_with("start:")
+    );
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
+fn heartbeat_cannot_reclaim_a_replaced_or_released_holder() {
+    let ship = Ship::new();
+    let store = privateer::store::Store::open(&ship.folder.join(".privateer")).unwrap();
+    privateer::presence::attend(&store, "infra", "old", 60, Some("pi")).unwrap();
+    assert!(privateer::presence::refresh(&store, "infra", "old", 90).unwrap());
+    privateer::presence::attend(&store, "infra", "new", 60, Some("omp")).unwrap();
+    assert!(!privateer::presence::refresh(&store, "infra", "old", 90).unwrap());
+    assert_eq!(ship.presence()["lease"]["holder"], "new");
+    assert!(!privateer::presence::leave(&store, "infra", "old").unwrap());
+    assert!(privateer::presence::leave(&store, "infra", "new").unwrap());
+    assert!(!privateer::presence::refresh(&store, "infra", "new", 90).unwrap());
+    assert_eq!(ship.presence()["attended"], false);
+    privateer::presence::attend(&store, "infra", "expired", 60, Some("pi")).unwrap();
+    store
+        .connection()
+        .execute("UPDATE presence SET expires_ms=0 WHERE ship='infra'", [])
+        .unwrap();
+    assert!(!privateer::presence::refresh(&store, "infra", "expired", 90).unwrap());
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
+fn wrapped_hooks_share_the_parent_lease_and_stale_hooks_do_not_deliver_mail() {
+    let ship = Ship::new();
+    ship.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"start:123","ttl_secs":90}),
+    );
+    let envs = [
+        ("PRIVATEER_PRESENCE_HOLDER", "start:123"),
+        ("PRIVATEER_ROLE", "agent"),
+        ("PRIVATEER_ACTOR", "infra"),
+    ];
+    let start = ship.hook_with("SessionStart", "native-id", &envs);
+    assert!(start.status.success());
+    assert!(String::from_utf8_lossy(&start.stdout).contains("first mate"));
+    assert_eq!(ship.presence()["lease"]["holder"], "start:123");
+    ship.hook_with("SessionEnd", "native-id", &envs);
+    assert_eq!(ship.presence()["attended"], true);
+    ship.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"replacement","ttl_secs":90}),
+    );
+    ship.ok(&["ask", "infra", "private mail"]);
+    let stale = ship.hook_with("UserPromptSubmit", "native-id", &envs);
+    assert!(stale.stdout.is_empty());
+    assert_eq!(ship.presence()["lease"]["holder"], "replacement");
+    let wrong = ship.hook_with(
+        "UserPromptSubmit",
+        "wrong",
+        &[("PRIVATEER_ROLE", "agent"), ("PRIVATEER_ACTOR", "apps")],
+    );
+    assert!(wrong.stdout.is_empty());
+    assert_eq!(ship.presence()["lease"]["holder"], "replacement");
+    assert!(
+        String::from_utf8_lossy(&ship.hook("UserPromptSubmit", "current").stdout)
+            .contains("private mail")
+    );
+}
+
+#[test]
+fn pi_family_starts_with_the_optional_extension_and_preserves_native_routes() {
+    for harness in ["pi", "pi-signed", "omp"] {
+        let ship = Ship::new();
+        let probe = ship.root.join("native.json");
+        let fake = ship.root.join("bin").join(harness);
+        fs::write(&fake,format!(r#"#!/usr/bin/env python3
+import json,os,subprocess,sys
+env = {{k:os.environ.get(k) for k in ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_HOME","PRIVATEER_CONTROL_CLI","PRIVATEER_PRESENCE_HOLDER","PRIVATEER_ATTENDED_HARNESS","PI_CODING_AGENT_DIR","ZAI_BASE_URL","CLAUDECODE"]}}
+p = subprocess.run([os.environ["PRIVATEER_CONTROL_CLI"],"ship.presence","--json",'{{"ship":"infra"}}'],capture_output=True,text=True,check=True)
+with open({:?},"w") as out: json.dump({{"env":env,"argv":sys.argv[1:],"presence":json.loads(p.stdout)}},out)
+sys.exit(7)
+"#,probe.to_string_lossy())).unwrap();
+        fs::set_permissions(fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let home = ship.folder.join(".privateer");
+        let output = ship
+            .command(&[
+                "--home",
+                home.to_str().unwrap(),
+                "start",
+                harness,
+                "--",
+                "literal; $value",
+            ])
+            .env(
+                "PI_CODING_AGENT_DIR",
+                ship.root.join("native-provider-config"),
+            )
+            .env("ZAI_BASE_URL", "https://gateway.example.invalid/v1")
+            .env("CLAUDECODE", "foreign")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{harness}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let seen: Value = serde_json::from_slice(&fs::read(&probe).unwrap()).unwrap();
+        assert_eq!(seen["argv"][0], "-e");
+        assert!(
+            seen["argv"][1]
+                .as_str()
+                .unwrap()
+                .ends_with("plugins/attended/mail.ts")
+        );
+        assert_eq!(seen["argv"][2], "literal; $value");
+        assert_eq!(seen["env"]["PRIVATEER_ROLE"], "agent");
+        assert_eq!(seen["env"]["PRIVATEER_ACTOR"], "infra");
+        assert_eq!(seen["env"]["PRIVATEER_ATTENDED_HARNESS"], harness);
+        assert_eq!(
+            seen["env"]["PRIVATEER_HOME"],
+            ship.folder.join(".privateer").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            seen["env"]["PI_CODING_AGENT_DIR"],
+            ship.root
+                .join("native-provider-config")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            seen["env"]["ZAI_BASE_URL"],
+            "https://gateway.example.invalid/v1"
+        );
+        assert!(seen["env"]["CLAUDECODE"].is_null());
+        assert_eq!(seen["presence"]["attended"], true);
+        assert_eq!(
+            seen["presence"]["lease"]["holder"],
+            seen["env"]["PRIVATEER_PRESENCE_HOLDER"]
+        );
+        assert_eq!(ship.presence()["attended"], false);
+    }
+}
+
+#[test]
+fn opencode_v2_start_uses_the_versioned_launcher_and_private_server() {
+    let ship = Ship::new();
+    let record = ship.root.join("opencode.json");
+    let script = r#"#!/usr/bin/env python3
+import json,os,sys
+if sys.argv[1:]==['--version']:
+    print('opencode v2.0.29');raise SystemExit(0)
+with open(os.environ['OC_TEST_RECORD'],'w') as f:
+    json.dump({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('OC_TEST_ROUTE'),'foreign':os.getenv('CLAUDECODE')},f)
+"#;
+    let native = ship.root.join("bin/opencode");
+    fs::write(&native, script).unwrap();
+    fs::set_permissions(&native, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = ship
+        .command(&["start", "opencode-v2", "--", "--prompt", "literal; $value"])
+        .env("OC_TEST_RECORD", &record)
+        .env("OC_TEST_ROUTE", "https://gateway.example.invalid/v1")
+        .env("CLAUDECODE", "foreign")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let seen: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_eq!(
+        seen["argv"],
+        json!(["--standalone", "--prompt", "literal; $value"])
+    );
+    assert_eq!(seen["role"], "agent");
+    assert_eq!(seen["actor"], "infra");
+    assert_eq!(seen["route"], "https://gateway.example.invalid/v1");
+    assert!(seen["foreign"].is_null());
+    assert_eq!(ship.presence()["attended"], false);
+    fs::write(&native, "#!/bin/sh\nprintf '1.19.0\\n'\n").unwrap();
+    assert!(
+        !ship
+            .command(&["start", "opencode-v2"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
+fn claude_start_loads_the_optional_mod_and_clears_foreign_mail_health() {
+    let ship = Ship::new();
+    let native = ship.root.join("bin/claude");
+    let record = ship.root.join("claude.json");
+    fs::write(&native, r#"#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['CLAUDE_TEST_RECORD'],'w') as f:
+    json.dump({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('ANTHROPIC_BASE_URL'),'health':os.getenv('PRIVATEER_CLAUDE_MAIL_UNTIL'),'foreign':os.getenv('CLAUDECODE')},f)
+"#).unwrap();
+    fs::set_permissions(&native, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = ship
+        .command(&["start", "claude", "--", "--model", "native-choice"])
+        .env("CLAUDE_TEST_RECORD", &record)
+        .env("ANTHROPIC_BASE_URL", "https://provider.example.invalid")
+        .env("PRIVATEER_CLAUDE_MAIL_UNTIL", "9999999999999")
+        .env("CLAUDECODE", "foreign")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen: Value = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+    assert_eq!(seen["argv"][0], "--plugin-dir");
+    assert!(
+        seen["argv"][1]
+            .as_str()
+            .unwrap()
+            .ends_with("plugins/attended-claude")
+    );
+    assert_eq!(seen["argv"][2], "--model");
+    assert_eq!(seen["argv"][3], "native-choice");
+    assert_eq!(seen["role"], "agent");
+    assert_eq!(seen["actor"], "infra");
+    assert_eq!(seen["route"], "https://provider.example.invalid");
+    assert!(seen["health"].is_null());
+    assert!(seen["foreign"].is_null());
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
+fn crew_claude_hooks_never_take_the_captains_presence_or_mail() {
+    let ship = Ship::new();
+    ship.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"captain","ttl_secs":90}),
+    );
+    ship.json("mail.send", json!({"id":"pending-for-captain","from":"captain","to":"infra","kind":"request","body":"handle aboard"}));
+    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+        let output = ship.hook_with(
+            event,
+            "crew-session",
+            &[
+                ("PRIVATEER_JOB", "crew-job"),
+                ("PRIVATEER_PRESENCE_HOLDER", "captain"),
+            ],
+        );
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+    assert_eq!(ship.presence()["lease"]["holder"], "captain");
+    assert_eq!(
+        ship.json("mail.pending", json!({"address":"infra"}))["count"],
+        1
+    );
+    let normal = ship.hook_with(
+        "UserPromptSubmit",
+        "captain-session",
+        &[("PRIVATEER_PRESENCE_HOLDER", "captain")],
+    );
+    assert!(String::from_utf8_lossy(&normal.stdout).contains("pending-for-captain"));
+}
+
+#[test]
+fn failed_start_releases_presence() {
+    let ship = Ship::new();
+    assert!(
+        !ship
+            .command(&["start", "missing-native-harness"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
+fn attended_mail_extension_uses_real_mail_and_native_lifecycle_contracts() {
+    let output = support::command("node")
+        .arg("tests/attended-mail.mjs")
+        .arg(BIN)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Node 24 is required to validate the optional Pi/OMP adapter");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn claude_mail_mod_uses_real_mail_and_native_lifecycle_contracts() {
+    let output = Command::new("node")
+        .arg("tests/claude-attended.mjs")
+        .arg(BIN)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Node is required to validate the optional Claude mail mod");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -260,132 +699,6 @@ fn expired_reused_holder_rebinds_while_live_refresh_preserves_identity() {
     let unbound = ship.json("ship.attend", json!({"ship":"infra","holder":holder}));
     assert!(unbound["lease"]["started_ms"].as_i64().unwrap() > 1);
     assert!(unbound["lease"]["binding"].is_null());
-}
-
-#[test]
-fn init_installs_claude_hooks_once() {
-    let ship = Ship::new();
-    ship.ok(&["init"]);
-    let settings: Value =
-        serde_json::from_slice(&fs::read(ship.folder.join(".claude/settings.json")).unwrap())
-            .unwrap();
-    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
-        let entries = settings["hooks"][event].as_array().unwrap();
-        assert_eq!(entries.len(), 1, "{event}");
-        assert_eq!(
-            entries[0]["hooks"][0]["command"],
-            format!("{BIN} hook claude {event}")
-        );
-    }
-}
-
-#[test]
-fn claude_hooks_deliver_mail_to_the_session_once_and_track_presence() {
-    let ship = Ship::new();
-    let start = ship.hook("SessionStart", "s1");
-    assert!(start.status.success());
-    let context = String::from_utf8_lossy(&start.stdout);
-    assert!(
-        context.contains("first mate of the ship infra"),
-        "{context}"
-    );
-    assert!(context.contains("Bearings for infra"));
-    assert_eq!(ship.presence()["lease"]["holder"], "claude:s1");
-
-    ship.ok(&["ask", "infra", "Is", "staging", "healthy?"]);
-    let prompt = ship.hook("UserPromptSubmit", "s1");
-    assert!(String::from_utf8_lossy(&prompt.stdout).contains("Is staging healthy?"));
-    // Presented once: the next prompt does not repeat it.
-    let again = ship.hook("UserPromptSubmit", "s1");
-    assert!(!String::from_utf8_lossy(&again.stdout).contains("Is staging healthy?"));
-
-    // Mail arriving mid-turn keeps the first mate working at turn end, once.
-    ship.ok(&["tell", "infra", "Deploy", "window", "moved"]);
-    let stop = ship.hook("Stop", "s1");
-    assert_eq!(stop.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&stop.stderr).contains("Deploy window moved"));
-    let stop = ship.hook("Stop", "s1");
-    assert_eq!(stop.status.code(), Some(0));
-
-    let end = ship.hook("SessionEnd", "s1");
-    assert!(end.status.success());
-    assert_eq!(ship.presence()["attended"], false);
-}
-
-#[test]
-fn hooks_never_break_the_harness_outside_a_ship() {
-    let ship = Ship::new();
-    let mut child = ship
-        .command(&["hook", "claude", "Stop"])
-        .current_dir(&ship.root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"not json").unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(0));
-    assert!(output.stdout.is_empty());
-}
-
-#[test]
-fn serve_leaves_an_attended_ship_to_its_session() {
-    let ship = Ship::new();
-    ship.json(
-        "ship.put",
-        json!({"name":"infra","first_mate":{"manifest": ship.json("ship.show", json!({"name":"infra"}))["first_mate"]["manifest"],
-            "duty_task":"infra-duty","options":{"sandbox":"workspace-write"},"batch_secs":0,"max_delay_secs":0}}),
-    );
-    ship.json(
-        "ship.attend",
-        json!({"ship":"infra","holder":"pane","ttl_secs":60}),
-    );
-    ship.ok(&["ask", "infra", "anything?"]);
-    let report: Value =
-        serde_json::from_str(&ship.ok(&["serve", "--json", r#"{"once":true}"#])).unwrap();
-    assert_eq!(report["ships"][0]["skipped"], "captain's session is aboard");
-    ship.json("ship.leave", json!({"ship":"infra","holder":"pane"}));
-    let report: Value =
-        serde_json::from_str(&ship.ok(&["serve", "--json", r#"{"once":true}"#])).unwrap();
-    assert_eq!(report["ships"][0]["status"], "running", "{report}");
-}
-
-#[test]
-fn start_runs_the_harness_as_the_ship_while_holding_presence() {
-    let ship = Ship::new();
-    let probe = ship.root.join("probe.txt");
-    let harness = ship.root.join("bin/fakeharness");
-    fs::write(
-        &harness,
-        format!(
-            "#!/bin/sh\n{{ echo \"$PRIVATEER_ROLE $PRIVATEER_ACTOR $1\"; '{BIN}' ship.presence --json '{{\"ship\":\"infra\"}}'; }} > '{}'\nexit 7\n",
-            probe.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
-    let output = ship
-        .command(&["start", "fakeharness", "--", "hello"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(7),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let seen = fs::read_to_string(&probe).unwrap();
-    let (env, presence) = seen.split_once('\n').unwrap();
-    assert_eq!(env, "agent infra hello");
-    let presence: Value = serde_json::from_str(presence).unwrap();
-    assert_eq!(presence["attended"], true);
-    assert!(
-        presence["lease"]["holder"]
-            .as_str()
-            .unwrap()
-            .starts_with("start:")
-    );
-    assert_eq!(ship.presence()["attended"], false);
 }
 
 #[test]

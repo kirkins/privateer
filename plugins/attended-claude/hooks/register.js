@@ -1,0 +1,233 @@
+// Loaded per invocation by privateer start. No model, account or tool policies.
+const PREFIX = "privateer-mail:";
+let config, session, key, timer, flight, pending, prepared;
+let active = false, busy = false, paused = false, seen = 0, generation = 0, statusText;
+
+async function status($, text) {
+  if (text === statusText) return;
+  statusText = text;
+  await $.ui.status(text);
+}
+
+async function call($, command, args) {
+  const result = await $.process.run([config.cli, "--home", config.home, command, "--json", JSON.stringify(args)], {
+    timeoutMs: 3000, env: { PRIVATEER_ROLE: "agent", PRIVATEER_ACTOR: config.ship },
+  });
+  if (result.exitCode !== 0 || result.stdout.length > 65536) throw Error("mail probe failed");
+  return JSON.parse(result.stdout);
+}
+
+async function owned($, gen) {
+  const value = await call($, "ship.presence", { ship: config.ship });
+  return active && generation === gen && value.attended === true && value.lease?.holder === config.holder
+    && await $.session.id() === session;
+}
+
+async function healthy($) {
+  // Classic settings hooks stand down only while a loaded mod is healthy.
+  // No marker is set by the launcher: disabled/refused mods retain the old hooks.
+  await $.env.set("PRIVATEER_CLAUDE_MAIL_UNTIL", String(await $.clock.now() + 12000));
+}
+
+async function save($) {
+  await $.store.set(key, { through: seen, paused, busy, holder: config.holder,
+    pending: pending ? { text: pending.text, through: pending.through } : undefined });
+}
+
+function receipt(snapshot) {
+  return { home: config.home, ship: config.ship, session, through: snapshot.through_seq };
+}
+
+function marker(snapshot) { return PREFIX + JSON.stringify(receipt(snapshot)); }
+
+function message(snapshot) {
+  const inbox = [config.cli, "--home", config.home, "mail.inbox", "--json",
+    JSON.stringify({ address: config.ship, after_seq: snapshot.after_seq, limit: 40 })];
+  return `${marker(snapshot)}\n${snapshot.count} new mailbox arrivals for ${config.ship}. `
+    + `Read bodies with this argv: ${JSON.stringify(inbox)}. Page as needed; reply with correlation IDs, `
+    + `and acknowledge only handled messages. This notification is not an acknowledgement. `
+    + `Existing charter and production deployment approval rules apply. Headers: ${JSON.stringify(snapshot.headers)}`;
+}
+
+async function snapshot($, gen) {
+  if (!await owned($, gen)) {
+    if (active && gen === generation) {
+      await $.env.set("PRIVATEER_CLAUDE_MAIL_UNTIL", undefined);
+      await status($, "⚓ mail held by another session");
+    }
+    return;
+  }
+  const value = await call($, "mail.pending", { address: config.ship, after_seq: seen });
+  if (!active || gen !== generation) return;
+  if (value.address !== config.ship || ![value.count, value.actionable, value.through_seq,
+      value.after_seq, value.acknowledged_through].every(n => Number.isSafeInteger(n) && n >= 0)
+      || value.through_seq < value.after_seq || value.actionable > value.count
+      || !Array.isArray(value.headers) || value.headers.length > Math.min(6, value.count)) throw Error("invalid mailbox snapshot");
+  seen = Math.max(seen, value.acknowledged_through);
+  await healthy($);
+  await status($, paused ? `⚓ ${value.count} new mail • paused; /privateer-mail resume` : `⚓ ${value.count} new mail`);
+  return value;
+}
+
+async function deliver($, gen) {
+  const value = await snapshot($, gen);
+  if (!value || !value.actionable || busy || paused || pending || prepared) return;
+  if ((await $.prompt.read()).text.length || !await owned($, gen) || busy || paused || pending) return;
+  const item = { gen, text: message(value), through: value.through_seq };
+  pending = item;
+  try {
+    await save($);
+    const result = await $.prompt.submit({ text: item.text });
+    if (result.drop && pending === item) {
+      pending = undefined; paused = true; await save($);
+      await status($, "⚓ native delivery declined; /privateer-mail resume");
+    }
+    // A queued prompt is not delivery evidence. turn.start records the receipt.
+  } catch (error) {
+    if (pending === item) pending = undefined;
+    paused = true;
+    try { await save($); } catch { /* No delivery watermark advanced. */ }
+    throw error;
+  }
+}
+
+async function poll($) {
+  if (!active || flight) return;
+  const gen = generation;
+  const operation = deliver($, gen).catch(async () => {
+    if (active && gen === generation) await status($, "⚓ mail unavailable; inbox preserved; /privateer-mail resume");
+  });
+  flight = operation;
+  try { await operation; }
+  finally { if (flight === operation) flight = undefined; }
+}
+
+async function stop($) {
+  active = false; generation++;
+  timer?.cancel(); timer = undefined;
+  pending = undefined; prepared = undefined;
+  await $.env.set("PRIVATEER_CLAUDE_MAIL_UNTIL", undefined);
+}
+
+async function recover($, e, next) {
+  await stop($);
+  await status($, "⚓ attended mail inactive; native hooks retained");
+  return next(e);
+}
+
+async function bind($, interactive) {
+  if (interactive === false) return;
+  if (!config) {
+    const role = await $.env.get("PRIVATEER_ROLE");
+    const harness = await $.env.get("PRIVATEER_ATTENDED_HARNESS");
+    const job = await $.env.get("PRIVATEER_JOB");
+    config = { home: await $.env.get("PRIVATEER_HOME"), cli: await $.env.get("PRIVATEER_CONTROL_CLI"),
+      ship: await $.env.get("PRIVATEER_ACTOR"), holder: await $.env.get("PRIVATEER_PRESENCE_HOLDER") };
+    if (job || role !== "agent" || harness !== "claude" || !config.home?.startsWith("/")
+        || !config.cli?.startsWith("/") || !config.ship || !config.holder) { config = undefined; return; }
+  }
+  if (interactive === undefined && !(await $.session.surfaces()).length) return;
+  const id = await $.session.id();
+  if (active && session === id) { await healthy($); return; }
+  await stop($);
+  session = id;
+  key = PREFIX + JSON.stringify([config.home, config.ship, session]);
+  const stored = await $.store.get(key);
+  seen = Number.isSafeInteger(stored?.through) && stored.through >= 0 ? stored.through : 0;
+  paused = stored?.paused === true;
+  busy = stored?.holder === config.holder && stored?.busy === true;
+  if (stored?.holder === config.holder && typeof stored?.pending?.text === "string"
+      && stored.pending.text.length <= 65536 && Number.isSafeInteger(stored.pending.through)
+      && stored.pending.through > seen) pending = { ...stored.pending, gen: generation };
+  // Recover accepted wake receipts even if the process died before store.set.
+  for (const row of (await $.session.messages()).slice(-128)) {
+    if (row.role !== "user") continue;
+    for (const line of row.text.slice(0, 8192).split("\n")) {
+      const at = line.indexOf(PREFIX);
+      if (at < 0) continue;
+      try {
+        const data = JSON.parse(line.slice(at + PREFIX.length));
+        if (data.home === config.home && data.ship === config.ship && data.session === session
+            && Number.isSafeInteger(data.through) && data.through >= 0) seen = Math.max(seen, data.through);
+      } catch { /* Not a receipt. Never interpret arbitrary conversation text. */ }
+    }
+  }
+  active = true;
+  if (!await owned($, generation)) { await stop($); return; }
+  await healthy($);
+  // Bound this plugin's persistent receipt index; mail remains in SQLite.
+  const keys = (await $.store.keys()).filter(k => k.startsWith(PREFIX) && k !== key);
+  for (const old of keys.slice(0, Math.max(0, keys.length - 127))) await $.store.delete(old);
+  await $.command.register({ name: "privateer-mail", description: "Pause, resume or inspect ship mail", argumentHint: "pause|resume|status", immediate: true });
+  timer = $.clock.every(5000, async () => { await poll($); });
+}
+
+export function register(on) {
+  on("session.start", async ($, e, next) => {
+    await bind($, e.isInteractive);
+    const result = await next(e);
+    if (active) void poll($);
+    return result;
+  }).catch(($, e, next) => recover($, e, next));
+  on("classic.SessionStart", async ($, e, next) => {
+    await bind($);
+    return next(e);
+  }).catch(($, e, next) => recover($, e, next));
+  on("session.end", async ($, e, next) => { await stop($); return next(e); });
+  on("prompt.submit", async ($, e, next) => {
+    if (!config) return next(e);
+    await bind($);
+    if (e.origin?.kind === "plugin") {
+      if (e.origin.name === "privateer-mail" && (!active || paused || !pending
+          || pending.gen !== generation || !e.text.includes(pending.text)
+          || !await owned($, generation))) return { drop: "Privateer mail wake superseded or paused; inbox preserved." };
+      return next(e);
+    }
+    if (!active) return next(e);
+    if (!["composer", "bridge"].includes(e.origin?.kind)) return next(e);
+    // An actual captain prompt permits recovery; never add mail to a queued
+    // mid-turn submission or change the person's text or draft.
+    paused = false;
+    await save($);
+    if (busy || e.turnId || flight || pending) return next(e);
+    const gen = generation;
+    const value = await snapshot($, gen);
+    if (!value?.count || !await owned($, gen)) return next(e);
+    const item = { gen, text: e.text, through: value.through_seq };
+    prepared = item;
+    const result = await next({ ...e, context: [...(e.context ?? []), message(value)] });
+    if (result.drop && prepared === item) { prepared = undefined; paused = true; await save($); }
+    return result;
+  }).catch(($, e, next) => recover($, e, next));
+  on("turn.start", async ($, e, next) => {
+    if (active) {
+      busy = true;
+      const item = pending && e.text.includes(pending.text) ? pending : prepared?.text === e.text ? prepared : undefined;
+      if (item && item.gen === generation) {
+        seen = Math.max(seen, item.through);
+        if (item === pending) pending = undefined;
+        if (item === prepared) prepared = undefined;
+      }
+      await save($);
+    }
+    return next(e);
+  }).catch(($, e, next) => recover($, e, next));
+  on("turn.complete", async ($, e, next) => {
+    if (active && !e.agentId) {
+      busy = false;
+      if (e.isAborted || e.reason !== "answer") paused = true;
+      await save($);
+    }
+    return next(e);
+  }).catch(($, e, next) => recover($, e, next));
+  on("command.run", { command: "privateer-mail" }, async ($, e) => {
+    if (!active) return { text: "Privateer attended mail is inactive in this session." };
+    const arg = e.args.trim();
+    if (arg === "pause") paused = true;
+    else if (arg === "resume") paused = false;
+    await save($);
+    if (arg === "resume") void poll($);
+    await status($, paused ? "⚓ mail paused; /privateer-mail resume" : "⚓ mail enabled");
+    return { text: paused ? "Ship mail paused; messages remain in the inbox." : "Ship mail enabled." };
+  });
+}

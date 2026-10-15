@@ -163,12 +163,18 @@ Run Privateer as `{cli} COMMAND --json '{{...}}'`.
 ## Working
 
 - Mail as yourself: `mail.send {{"from":"{ship}","to":"<ship or captain>","kind":"request|notice|reply","body":"...","task_id":"<optional>"}}`; a reply sets `correlation` to the request id. `ship.list {{}}` shows who handles what.
-- Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`, then `job.status {{"id":"..."}}`.
+- Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`. You need not poll it: when it ends you get its outcome.
 - Delegate with `task.create {{"id":"...","owner":"<ship>","title":"...","charter_id":"{ship}"}}`; hand off with `task.handoff`, which takes effect when the recipient runs `task.accept`.
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
 - Before you stop, replace the handoff note for each focus you worked on: `note.put {{"ship":"{ship}","focus":"task:<id>|thread:<id>|captain|ship","body":"..."}}`. Keep it under 2 KB and to judgement: what you are doing and why, what you are waiting on, what comes next. Facts are already recorded. Put lasting preferences and conventions in the `ship` note.
 - Repositories live in `projects/`; the captain adds them with `privateer project add <git url>`.
 - New area of work? Create a ship for it: `ship.create {{"name":"...","scope":"...","objective":"..."}}` (beside this folder; its charter can only have actions yours has). Retire ships you created with `ship.retire {{"name":"..."}}`. `fleet.list {{}}` shows every ship on this machine.
+
+## Crew
+
+Crew are the jobs you start (`job.start`, or `agent.start` for another harness) on your tasks. When one finishes, fails, times out or is orphaned, the runtime mails you its outcome from `crew`, under the task's focus: status, exit code, reason, duration and the end of its logs, taken from the job's record. An exit status is not proof: check the result yourself (`job.status`, the logs, the work) before relying on it or reporting it, and record your judgement in the task's note. A crew member that needs a decision sends you a request from `crew`; answer it with `mail.send {{"from":"{ship}","to":"crew","kind":"reply","correlation":"<request id>","body":"..."}}`.
+
+If you are crew yourself (`PRIVATEER_JOB` is set and you were not woken as first mate), report to your first mate with `crew.report {{"kind":"progress","body":"..."}}`, or ask with `crew.report {{"kind":"decision","body":"..."}}` and read the answer with `crew.answer {{"id":"<returned id>","wait_secs":300}}`.
 
 ## Rules
 
@@ -279,10 +285,7 @@ pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)
         }
         None => ship_name(&folder)?,
     };
-    ensure!(
-        ship != crate::mail::CAPTAIN,
-        "captain is reserved for the person"
-    );
+    crate::mail::unreserved(&ship)?;
     let plugins = plugins_dir()?;
     let harness = detect_harness(&plugins, setup.harness.as_ref())?;
     let manifest = plugins.join(&harness).join("manifest.json");
@@ -427,14 +430,16 @@ fn text(positional: &[String], from: usize, usage: &str) -> Result<String> {
 /// `privateer start [HARNESS] [-- ARGS]`: talk to the ship's first mate.
 /// Launches the harness in the ship folder as the ship (agent role) and holds
 /// the ship's presence lease while it runs, so `serve` leaves the mail to
-/// this session. Works with any harness; Claude Code also gets mail at each
-/// prompt and turn end through the hooks `init` installs.
+/// this session. Claude uses hooks; Pi-family sessions receive the optional
+/// native mail extension explicitly, without changing native configuration.
 fn start(home: &Path, args: &[String]) -> Result<()> {
     let (ours, passthrough) = match args.iter().position(|a| a == "--") {
         Some(at) => (&args[..at], &args[at + 1..]),
         None => (args, &args[args.len()..]),
     };
     let mut store = Store::open(home)?;
+    let canonical_home = store.home().to_path_buf();
+    let home = canonical_home.as_path();
     let ship = crate::presence::folder_ship(&store)
         .context("this folder's ship is unknown; run `privateer init` here")?;
     let profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
@@ -451,27 +456,73 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             })
             .context("no first-mate harness configured; pass one: privateer start claude")?,
     };
-    let binary = HARNESSES
-        .iter()
-        .find(|(_, id)| *id == harness)
-        .map_or(harness.as_str(), |(binary, _)| binary)
-        .to_owned();
+    let binary = if harness == "opencode-v2" {
+        "opencode".to_owned()
+    } else {
+        HARNESSES
+            .iter()
+            .find(|(_, id)| *id == harness)
+            .map_or(harness.as_str(), |(binary, _)| binary)
+            .to_owned()
+    };
     let folder = home.parent().context("ship folder")?;
-    // Hold presence before the child can read its mailbox or race serve.
-    let holder = format!("start:{}", std::process::id());
-    crate::presence::claim(&store, &ship, &holder, 90, Some(&harness))?;
-    let child = std::process::Command::new(&binary)
+    let holder = format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+    let control = std::env::current_exe()?;
+    let mut command = std::process::Command::new(&binary);
+    if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        let extension = plugins.join("attended/mail.ts");
+        ensure!(
+            extension.is_file(),
+            "attended mail adapter missing from {}",
+            plugins.display()
+        );
+        command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg(&harness)
+            .arg(&binary)
+            .arg("-e")
+            .arg(extension);
+    } else if harness == "claude" {
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        let plugin = plugins.join("attended-claude");
+        ensure!(
+            plugin.join("hooks/hooks.json").is_file(),
+            "Claude attended mail plugin missing"
+        );
+        command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg(&harness)
+            .arg(&binary)
+            .arg("--plugin-dir")
+            .arg(plugin);
+    } else if harness == "opencode-v2" {
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg(&harness)
+            .arg(&binary)
+            .arg("--standalone");
+    }
+    command
         .args(passthrough)
         .current_dir(folder)
         .env("PRIVATEER_ROLE", "agent")
         .env("PRIVATEER_ACTOR", &ship)
-        .spawn()
-        .with_context(|| format!("cannot start {binary}; is it installed?"));
-    let mut child = match child {
+        .env("PRIVATEER_HOME", home)
+        .env("PRIVATEER_CONTROL_CLI", control)
+        .env("PRIVATEER_ATTENDED_HARNESS", &harness)
+        .env("PRIVATEER_PRESENCE_HOLDER", &holder);
+    // The child can invoke a startup hook immediately after spawn.
+    crate::presence::claim(&store, &ship, &holder, 90, Some(&harness))?;
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            crate::presence::leave(&store, &ship, &holder)?;
-            return Err(error);
+            let _ = crate::presence::leave(&store, &ship, &holder);
+            return Err(error).with_context(|| format!("cannot start {binary}; is it installed?"));
         }
     };
     // Ctrl-C belongs to the harness; this process must live to release
@@ -480,15 +531,13 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
-
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let heartbeat = {
-        let (stop, home, ship, holder, harness) = (
+        let (stop, home, ship, holder) = (
             stop.clone(),
             home.to_path_buf(),
             ship.clone(),
             holder.clone(),
-            harness.clone(),
         );
         std::thread::spawn(move || {
             let Ok(store) = Store::open(&home) else {
@@ -501,7 +550,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
-                let _ = crate::presence::attend(&store, &ship, &holder, 90, Some(&harness));
+                if !crate::presence::refresh(&store, &ship, &holder, 90).unwrap_or(false) {
+                    return;
+                }
             }
         })
     };

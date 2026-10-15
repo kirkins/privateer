@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -31,7 +33,7 @@ impl Machine {
         }
     }
     fn command(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = support::command(BIN);
         command
             .args(args)
             .current_dir(dir)

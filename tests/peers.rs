@@ -1,8 +1,10 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -11,7 +13,7 @@ fn binary() -> &'static str {
 }
 
 fn run(home: &Path, command: &str, args: Value, ssh: Option<&Path>) -> Output {
-    let mut process = Command::new(binary());
+    let mut process = support::command(binary());
     process.args([
         "--home",
         home.to_str().unwrap(),
@@ -26,7 +28,7 @@ fn run(home: &Path, command: &str, args: Value, ssh: Option<&Path>) -> Output {
 }
 
 fn run_rpc(home: &Path, command: &str, args: Value, ssh: &Path) -> Output {
-    let mut child = Command::new(binary())
+    let mut child = support::command(binary())
         .args(["--home", home.to_str().unwrap(), "rpc"])
         .env("PRIVATEER_SSH_EXECUTABLE", ssh)
         .stdin(Stdio::piped())
@@ -291,7 +293,7 @@ fn agent_role_travels_to_the_remote_home() {
     for host in [None, Some("department")] {
         put(&home, &remote, host, 10_000, 1_048_576, Path::new(binary()));
         let call = |command: &str, args: Value| -> Value {
-            let output = Command::new(binary())
+            let output = support::command(binary())
                 .args(["--home", home.to_str().unwrap(), "peer.call", "--json"])
                 .arg(json!({"name":"infrastructure","command":command,"args":args}).to_string())
                 .env("PRIVATEER_SSH_EXECUTABLE", &ssh)

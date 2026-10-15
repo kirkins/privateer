@@ -1,5 +1,7 @@
 #![cfg(feature = "dashboard")]
 
+mod support;
+
 use privateer::{
     dashboard::{
         boat::Boat,
@@ -420,7 +422,7 @@ fn demo_cli_never_opens_an_inherited_herdr_socket() {
     let path = root.path().join("api.sock");
     let listener = UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_privateer-dashboard"))
+    let output = support::command(env!("CARGO_BIN_EXE_privateer-dashboard"))
         .args(["--demo", "--once"])
         .env("HERDR_ENV", "1")
         .env("HERDR_SOCKET_PATH", &path)
