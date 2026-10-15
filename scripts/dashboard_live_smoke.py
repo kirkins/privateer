@@ -523,7 +523,7 @@ def onboarding(binary, runtime):
             if tui:
                 tui.close()
             server.close()
-        for change in ["ambiguous", "removed", "contact", "home"]:
+        for change in ["ambiguous", "removed", "contact", "home", "navigation"]:
             for attended in [False, True]:
                 startup_root = root / f"startup-{change}-{attended}"
                 startup_root.mkdir()
@@ -548,8 +548,11 @@ def onboarding(binary, runtime):
                     startup_server.protocol = 19
                     startup = Tui(runtime, startup_entry, [])
                     startup.until(lambda: "HERDR UNAVAILABLE" in startup.screen(), "startup did not observe the Herdr outage")
+                    assert "No Herdr connection configured" not in startup.screen(), "configured outage was reported as missing context"
                     assert "Liaison · your default contact" in startup.screen()
-                    if change in ["ambiguous", "contact"]:
+                    if change == "navigation":
+                        startup.keys(b"0")
+                    elif change in ["ambiguous", "contact"]:
                         arguments = ["init", "--ship", "other", "--harness", "codex"]
                         if change == "ambiguous":
                             arguments.append("--liaison")
@@ -563,16 +566,27 @@ def onboarding(binary, runtime):
                             startup_command("replacement", "init", "--ship", "contact", "--harness", "codex", "--liaison")
                     startup.until(lambda: "automatic Board cancelled" in startup.screen(),
                                   f"{change} liaison did not cancel startup Board")
+                    if change == "navigation":
+                        assert " / 1 Bridge" not in startup.screen().splitlines()[1], "startup stole fleet navigation"
+                        startup.keys(b"i")
+                        startup.until(lambda: "Captain's inbox · message details" in startup.screen(), "startup prevented inbox navigation")
                     startup_server.protocol = 20
                     startup.until(lambda: "HERDR UNAVAILABLE" not in startup.screen(), "startup did not observe Herdr recovery", timeout=25)
                     startup.drain(2.5)
                     assert (startup_server.creates, startup_server.focuses) == counts, (change, attended)
+                    if change == "navigation":
+                        assert "Captain's inbox · message details" in startup.screen(), "Herdr recovery stole inbox navigation"
+                        startup.keys(b"l")
+                        expected = (counts[0], counts[1] + 1) if attended else (1, 0)
+                        startup.until(lambda: (startup_server.creates, startup_server.focuses) == expected,
+                                      "explicit Talk did not work after cancelling automatic startup")
+                        startup.until(lambda: (startup_root / "harness-started").exists(), "explicit Talk did not reach the harness")
                     if change == "ambiguous":
                         startup_command("other", "ship", "retire", "other")
                         startup.until(lambda: "Liaison · your default contact" in startup.screen(), "unique contact did not recover")
                         startup.drain(2.5)
                         assert (startup_server.creates, startup_server.focuses) == counts, "cancelled startup intent resumed"
-                    assert (startup_root / "harness-started").exists() == attended
+                    assert (startup_root / "harness-started").exists() == (attended or change == "navigation")
                     assert not startup_server.errors, startup_server.errors
                 finally:
                     if startup:

@@ -118,6 +118,7 @@ pins the selected ship's canonical home; it never chooses between conflicting
 contacts. A pending startup attempt is cancelled if fresh fleet observations
 remove, change or make that contact ambiguous, even during a Herdr outage.
 A queued attempt runs once; after a launch failure, use `l` to retry.
+Navigation to the fleet, inbox or another ship cancels a delayed startup handoff.
 Running `privateer-dashboard` directly keeps the observational entry behavior;
 `--once` stays read-only even with `--board-liaison`.
 Standalone observation, inbox and onboarding need no Herdr socket; Board still

@@ -324,7 +324,7 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) -> boo
         app.notice = "Refresh Privateer state before boarding.".into();
         return false;
     }
-    let (Some(view), Some(sender)) = (&app.herdr, sender) else {
+    let Some(sender) = sender else {
         app.notice = app
             .snapshot
             .ships
@@ -338,6 +338,10 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) -> boo
                     target.home.to_string_lossy().replace('\'', "'\"'\"'")
                 ),
             );
+        return false;
+    };
+    let Some(view) = &app.herdr else {
+        app.notice = "Waiting for the configured Herdr connection before boarding…".into();
         return false;
     };
     if app.herdr_error.is_some()
@@ -555,6 +559,11 @@ fn run(opts: Options) -> Result<()> {
                     app.pending_board = None;
                     app.notice =
                         "Liaison changed or unavailable; automatic Board cancelled.".into();
+                } else if matches!(pending, PendingBoard::Liaison(_))
+                    && app.ship.as_ref() != Some(&target.ship)
+                {
+                    app.pending_board = None;
+                    app.notice = "Navigation changed; automatic Board cancelled.".into();
                 } else if let Some(observed) = observed {
                     if observed != target {
                         app.pending_board = None;
