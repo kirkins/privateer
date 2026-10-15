@@ -310,8 +310,8 @@ fn wake_text(
 }
 
 /// Normalize the token usage a harness printed as JSON lines on stdout.
-/// Codex reports per turn (`turn.completed`), Claude a cumulative `result`;
-/// anything else falls back to the last usage object seen.
+/// Codex and native guards report per turn (`turn.completed` or a failed
+/// native turn), Claude a cumulative `result`; otherwise use the last object.
 fn usage(log: &str) -> Option<Value> {
     let mut turns: Option<Map<String, Value>> = None;
     let mut result = None;
@@ -324,7 +324,7 @@ fn usage(log: &str) -> Option<Value> {
             continue;
         };
         match value["type"].as_str() {
-            Some("turn.completed") => {
+            Some("turn.completed" | "native.turn.failed") => {
                 let sum = turns.get_or_insert_with(Map::new);
                 for (key, n) in usage {
                     if let Some(n) = n.as_u64() {

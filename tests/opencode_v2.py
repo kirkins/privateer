@@ -137,6 +137,21 @@ class OpenCodeV2(unittest.TestCase):
         self.assertFalse(any(x[:1]==['api'] for x in calls))
         self.assertFalse((self.root/'launched.json').exists())
 
+    def test_inventory_probe_cannot_qualify_a_v1_binary_as_v2(self):
+        for version, expected in [('1.19.0',1),('2.0.29',0)]:
+            calls_path=self.root/'calls.jsonl'
+            calls_path.unlink(missing_ok=True)
+            run=subprocess.run([sys.executable,str(ROOT/'scripts/harness-probe.py'),'--harness','opencode-v2'],
+                cwd=self.root,capture_output=True,timeout=10,
+                env={**os.environ,'PATH':str(self.root)+os.pathsep+os.environ['PATH'],
+                     'OC_TEST_ROOT':str(self.root),'OC_TEST_VERSION':version})
+            self.assertEqual(run.returncode,expected,run.stdout+run.stderr)
+            report=json.loads(run.stdout)['results'][0]
+            self.assertEqual(report['passed'],version.startswith('2.'))
+            calls=[json.loads(x) for x in calls_path.read_text().splitlines()]
+            self.assertFalse(any(x[:1]==['api'] for x in calls))
+            self.assertFalse((self.root/'launched.json').exists())
+
     def test_inspection_bounds_and_timeout_reap_helpers(self):
         with self.assertRaises(ValueError):inspect([sys.executable,'-c','print("x"*100)'],limit=32)
         with self.assertRaises(ValueError):inspect([sys.executable,'-c','import time;time.sleep(10)'],seconds=.1)

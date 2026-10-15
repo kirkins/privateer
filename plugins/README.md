@@ -112,6 +112,20 @@ runs cannot become successful jobs. AGY options include `permission_mode`
 headless-only `disable_slash_commands`. Existing operational home and ledger
 directories are passed with `--add-dir`; no trust/provider store is edited.
 
+Gemini and Cursor print runs use that bridge too: one native init, matching
+explicit resume identity, complete JSONL, settled tool calls, one successful
+terminal result, and native exit zero. Cursor additionally confirms its reported
+working directory and session identity on every event. Gemini only reports
+identity at init; any additional projected identity must agree. Gemini warnings
+may recover, but fatal events, failed results, extra work after the result and
+truncated streams cannot become successful jobs. Native failed tool calls may
+recover before the final result. Only terminal aggregate token usage is counted;
+stream snapshots and Gemini's per-model breakdown do not count twice. These
+checks confirm native invocation completion, not task acceptance or correct
+provider/model routing. Cursor displays model names rather than CLI selectors;
+Gemini may route an `auto` choice. Neither is treated as exact model confirmation.
+Interactive launches keep their native terminal behavior.
+
 OMP headless runs use its native RPC interface (`--mode rpc --no-ui`) by
 default. The owned host is checked before the assignment prompt: an exact
 session, no queued/background work or active goal, and confirmed explicit
@@ -263,6 +277,30 @@ Interactive attachment/injection and per-harness supervision remain separate
 qualification work; command plans and scripted protocol fixtures do not claim
 a harness can already coordinate a ship autonomously. Provider routes remain
 private configuration.
+
+Worker qualification checkpoint (2026-10-14, America/Lima; account observations
+are from the last attempted native trial, not continuous account monitoring):
+
+| Harness | Native worker evidence | Remaining limit |
+|---|---|---|
+| Codex | Live repair, tests, mail, exact resume and recall | Broader models/profiles need their own trials |
+| Claude | Live repair, tests, mail, exact resume and recall | Native permission mode governs which tools can run |
+| Pi | Live repair, tests, mail, exact resume and recall | Other providers/profiles remain separate |
+| Cursor | Fresh guarded repair, unchanged independent tests, recorded light test job, mail, exact resume and recall on 2026.10.14-941492e (`auto`, native sandbox) | Other models/profiles remain separate |
+| AGY | Guarded repair, unchanged tests, recorded light test job, mail, exact resume and recall | Other models/profiles remain separate |
+| Gemini | Installed 0.63.0 parser; subprocess completion/failure, focused mail and exact-identity resume fixtures | Existing Google quota exhausted; live repair/recall pending |
+| OpenCode V1 | Installed parser and command plans | Live worker qualification pending |
+| OpenCode V2 | Explicit 2.x preflight, saved-workspace resume checks and completion fixtures | Copilot login expired, Google quota exhausted, OpenAI API key rejected; no new attempts on those accounts |
+| OMP | Native RPC initialization, exact resume and cross-repository refusal; subprocess lifecycle fixtures | Last live attempt lacked account credits |
+| Grok | Owned native ACP initialization, exact load and model/effort confirmation; subprocess lifecycle fixtures | Last live attempt returned HTTP 429 |
+| Muse | Native echo session/resume and writer-lease refusal; MSP lifecycle fixtures | Meta account billing verification returned HTTP 402; echo is not model/tool autonomy |
+| Pi signed | Pi-family command and native stream fixtures | Signed wrapper absent from this Mac's PATH; signing setup not substituted |
+| Kimi / Devin / Rovo | Command plans and ACP lifecycle fixtures; earlier Kimi/Devin initialization checks | CLIs absent from this Mac's PATH; authenticated turns pending |
+
+Account-blocked rows do not block work on other adapters and are not advertised
+as live-qualified. Standard help probes do not send prompts or check accounts.
+The OpenCode V2 probe includes its launch-time major-version check: finding the
+V1 `opencode` executable does not qualify V2, even when V1 accepts `--help`.
 
 Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `danger-full-access`) and boolean `ephemeral`. They are omitted by default, preserving native user configuration. Choosing `workspace-write` adds only the local Privateer operational home with `--add-dir`, so the agent can write its durable task and message records as well as work in the repository. `ephemeral:true` suppresses native Codex session persistence while Privateer retains its job records. This does not change global harness preferences.
 
