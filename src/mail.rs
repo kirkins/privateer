@@ -298,7 +298,12 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     );
     let task_id = optional_str(args, "task_id")?;
     if let Some(task) = task_id {
-        store.task(task)?;
+        store.task(task).map_err(|error| {
+            anyhow::anyhow!(
+                "{error:#}: task ids belong to the ship that holds them; to link another \
+                 ship's work, reply to its request with correlation instead of naming its task"
+            )
+        })?;
     }
     let request_kind = optional_str(args, "request_kind")?;
     if let Some(request_kind) = request_kind {

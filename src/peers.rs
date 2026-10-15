@@ -1,6 +1,7 @@
 //! A peer is an address, not an authority level. Native SSH carries the same
 //! one-request JSON-lines protocol used by the local CLI.
 use anyhow::{Context, Result, bail, ensure};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -333,7 +334,12 @@ pub(crate) fn call_peer_with_timeout(
             [name],
             |row| row.get(0),
         )
-        .context("peer not configured")?;
+        .optional()?
+        .with_context(|| {
+            format!(
+                "peer {name} is not configured; ships on this machine are peers named fleet-<ship>"
+            )
+        })?;
     let mut peer: Peer = serde_json::from_str(&config)?;
     validate(&peer)?;
     if let Some(timeout) = timeout {

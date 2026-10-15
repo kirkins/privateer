@@ -1443,3 +1443,21 @@ fn delivery_accepts_only_known_remote_senders_for_local_ships() {
         );
     }
 }
+
+#[test]
+fn naming_another_ships_task_or_peer_points_to_the_cross_ship_link() {
+    let (_temp, mut store) = fleet();
+    let wrong = err(send(
+        &mut store,
+        json!({"from":"apps","to":"infra","kind":"notice","task_id":"their-task","body":"done"}),
+    ));
+    assert!(wrong.contains("unknown task their-task"), "{wrong}");
+    assert!(wrong.contains("correlation"), "{wrong}");
+    let peer = err(dispatch(
+        &mut store,
+        "peer.call",
+        json!({"name":"infra","command":"status","args":{}}),
+    ));
+    assert!(peer.contains("peer infra is not configured"), "{peer}");
+    assert!(peer.contains("fleet-<ship>"), "{peer}");
+}
