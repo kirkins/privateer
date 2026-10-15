@@ -81,6 +81,228 @@ fn routine_notices_wait_for_the_next_real_wake() {
 }
 
 #[test]
+fn actionable_mail_after_a_full_routine_page_keeps_contiguous_wake_coverage() {
+    let mut fleet = Fleet::new(json!({"batch_secs":0,"max_delay_secs":0,"max_wakes_per_hour":1}));
+    for n in 0..205 {
+        fleet.send(
+            json!({"id":format!("routine-{n}"),"from":"apps","to":"infra",
+            "kind":"notice","urgency":"low","body":"Routine progress"}),
+        );
+    }
+    let request = fleet.send(json!({"id":"after-the-page","from":"apps","to":"infra",
+        "kind":"request","urgency":"high","body":"Please decide"}));
+    let first = Fleet::infra(&fleet.tick());
+    assert_eq!(first["status"], "running", "{first}");
+    assert_eq!(first["through_seq"], 200);
+    let settled = fleet.settle();
+    assert_eq!(settled["status"], "succeeded");
+    // A successful first page cannot acknowledge or cover the later request.
+    let inbox = fleet.ok("mail.inbox", json!({"address":"infra"}), None);
+    assert_eq!(inbox["acknowledged_through"], 200);
+    assert!(
+        inbox["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == request["id"])
+    );
+    assert_eq!(
+        fleet.ok("mail.show", json!({"id":request["id"]}), None)["state"],
+        "open"
+    );
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "hourly wake budget spent"
+    );
+    // When the budget permits another wake, it starts exactly after page one.
+    fleet.configure(now_settings());
+    assert_eq!(Fleet::infra(&fleet.tick())["through_seq"], request["seq"]);
+    fleet.settle();
+    assert_eq!(
+        fleet.ok("mail.show", json!({"id":request["id"]}), None)["state"],
+        "answered"
+    );
+    let history = fleet.ok(
+        "mail.inbox",
+        json!({"address":"infra","all":true,"limit":1000}),
+        None,
+    );
+    assert_eq!(history["messages"].as_array().unwrap().len(), 206);
+    let prompts = fleet.prompts();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts.iter().all(|prompt| prompt.len() < 32_768));
+    assert!(!prompts[0].contains("id after-the-page"));
+    assert!(prompts[1].contains("id after-the-page"));
+}
+
+#[test]
+fn concurrent_legacy_activation_upgrades_preserve_history() {
+    use privateer::store::Store;
+    use std::sync::{Arc, Barrier};
+    let fleet = Fleet::new(now_settings());
+    fleet
+        .store
+        .connection()
+        .execute(
+            "INSERT INTO wakes(id, ship, focus, through_seq, mode, status, created_ms)
+         VALUES('legacy', 'old-ship', 'ship', 17, 'fresh', 'succeeded', 1)",
+            [],
+        )
+        .unwrap();
+    for _ in 0..3 {
+        fleet
+            .store
+            .connection()
+            .execute_batch(
+                "ALTER TABLE wakes DROP COLUMN focuses;
+             ALTER TABLE wakes DROP COLUMN harness;
+             ALTER TABLE wakes DROP COLUMN session_id;",
+            )
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(16));
+        let openers: Vec<_> = (0..16)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let home = fleet.home.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&home)
+                        .map(|store| {
+                            store
+                                .connection()
+                                .query_row(
+                                    "SELECT through_seq FROM wakes WHERE id='legacy'",
+                                    [],
+                                    |r| r.get::<_, i64>(0),
+                                )
+                                .unwrap()
+                        })
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for opener in openers {
+            assert_eq!(opener.join().unwrap().unwrap(), 17);
+        }
+        let columns: i64 = fleet.store.connection().query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('wakes') WHERE name IN ('focuses','harness','session_id')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(columns, 3);
+    }
+}
+
+#[test]
+fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
+    use privateer::store::Store;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+    let mut fleet = Fleet::new(now_settings());
+    let remote_home = fleet.root.join("remote");
+    let mut remote = Store::open(&remote_home).unwrap();
+    dispatch(
+        &mut remote,
+        "peer.put",
+        json!({"name":"origin","transport":"local",
+        "executable":support::BIN,"home":fleet.home}),
+    )
+    .unwrap();
+    dispatch(
+        &mut remote,
+        "ship.put",
+        json!({"name":"apps","location":{"peer":"origin"}}),
+    )
+    .unwrap();
+    dispatch(&mut remote, "ship.put", json!({"name":"healthy"})).unwrap();
+    for (peer, ship) in [("slow", "slow-ship"), ("healthy", "healthy")] {
+        dispatch(
+            &mut fleet.store,
+            "peer.put",
+            json!({"name":peer,"transport":"local",
+            "executable":"/nonexistent/privateer","home":remote_home,"timeout_ms":5000}),
+        )
+        .unwrap();
+        dispatch(
+            &mut fleet.store,
+            "ship.put",
+            json!({"name":ship,"location":{"peer":peer}}),
+        )
+        .unwrap();
+        fleet.send(json!({"id":format!("out-{peer}"),"from":"apps","to":ship,
+            "kind":"notice","body":"queued while offline"}));
+    }
+    let marker = fleet.root.join("slow-started.json");
+    let script = fleet.root.join("slow-peer.py");
+    fs::write(&script, format!(
+        "#!/usr/bin/env python3\nimport json, os, pathlib, sqlite3, time\nwith sqlite3.connect({:?}) as db:\n    wakes = db.execute(\"SELECT COUNT(*) FROM wakes\").fetchone()[0]\npathlib.Path({:?}).write_text(json.dumps({{\"pid\":os.getpid(),\"wakes\":wakes}}))\ntime.sleep(5)\n",
+        fleet.home.join("privateer.sqlite").to_string_lossy(), marker.to_string_lossy(),
+    )).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    for (peer, executable) in [
+        ("slow", script.as_path()),
+        ("healthy", std::path::Path::new(support::BIN)),
+    ] {
+        dispatch(
+            &mut fleet.store,
+            "peer.put",
+            json!({"name":peer,"transport":"local",
+            "executable":executable,"home":remote_home,"timeout_ms":5000}),
+        )
+        .unwrap();
+    }
+    fleet
+        .store
+        .connection()
+        .execute_batch(
+            "UPDATE mail_delivery_retry SET next_attempt_ms=0,
+           last_attempt_ms=CASE peer WHEN 'slow' THEN 1 ELSE 2 END;",
+        )
+        .unwrap();
+    fleet.send(json!({"id":"local-request","from":"apps","to":"infra",
+        "kind":"request","body":"local work must start before remote delivery"}));
+    let tick = |budget| {
+        let output = fleet
+            .command()
+            .args(["serve", "--json"])
+            .arg(json!({"once":true,"delivery_budget_ms":budget}).to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let started = Instant::now();
+    let first = tick(100);
+    assert!(started.elapsed() < Duration::from_secs(2), "{first}");
+    assert_eq!(Fleet::infra(&first)["status"], "running", "{first}");
+    assert_eq!(first["delivered"]["attempted"], 1);
+    let observed: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
+    assert_eq!(
+        observed["wakes"], 1,
+        "local wake must precede the slow call"
+    );
+    // The capped peer call reaped its transport; no timed-out payload remains.
+    assert_eq!(
+        unsafe { libc::kill(observed["pid"].as_i64().unwrap() as i32, 0) },
+        -1
+    );
+    let second = tick(1000);
+    assert_eq!(second["delivered"]["delivered"], 1, "{second}");
+    assert_eq!(second["delivered"]["pending"], 1);
+    let inbox = dispatch(&mut remote, "mail.inbox", json!({"address":"healthy"})).unwrap();
+    assert_eq!(inbox["messages"][0]["id"], "out-healthy");
+    fleet.settle();
+    assert_eq!(
+        fleet.ok("mail.show", json!({"id":"local-request"}), None)["state"],
+        "answered"
+    );
+}
+
+#[test]
 fn batching_and_the_hourly_budget_defer_wakes() {
     let mut fleet = Fleet::new(json!({"batch_secs":3600,"max_delay_secs":3600}));
     fleet.send(json!({"from":"apps","to":"infra","kind":"notice","body":"one"}));
