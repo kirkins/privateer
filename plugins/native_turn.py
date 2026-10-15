@@ -123,6 +123,118 @@ class AgyTurn(Turn):
             raise ValueError("unknown-native-event")
 
 
+class ResultTurn(Turn):
+    """A single initialized native invocation with one final result."""
+    def __init__(self, argv):
+        flags = argv[:argv.index("--")] if "--" in argv else argv
+        expected = flags[flags.index("--resume") + 1] if "--resume" in flags else None
+        super().__init__(expected)
+        self.result = False
+        self.failed = False
+        self.tools = set()
+
+    def initialize(self, identity):
+        if self.session is not None or self.result:
+            raise ValueError("duplicate-init")
+        if (not isinstance(identity, str) or len(identity) != 36
+                or str(uuid.UUID(identity)) != identity.lower()
+                or (self.expected is not None and identity != self.expected)):
+            raise ValueError("session-identity")
+        self.session = identity
+
+    def active(self, value):
+        if self.session is None or self.result:
+            raise ValueError("event-outside-turn")
+        if "session_id" in value and value["session_id"] != self.session:
+            raise ValueError("changed-session")
+
+    def tool(self, identity, started):
+        if not isinstance(identity, str) or not 0 < len(identity) <= 512:
+            raise ValueError("tool-identity")
+        if started:
+            if identity in self.tools or len(self.tools) >= 1024:
+                raise ValueError("tool-start")
+            self.tools.add(identity)
+        else:
+            if identity not in self.tools:
+                raise ValueError("tool-result")
+            self.tools.remove(identity)
+
+    def finish(self, succeeded):
+        if self.tools:
+            raise ValueError("unfinished-tools")
+        self.result = True
+        self.settled = succeeded and not self.failed
+        self.stop = "stop" if self.settled else None
+
+
+class CursorTurn(ResultTurn):
+    """Cursor's documented stream-json init, tool pairs and terminal result."""
+    def observe(self, value):
+        if not isinstance(value, dict):
+            raise ValueError("invalid-event")
+        kind = value.get("type")
+        if kind == "system" and value.get("subtype") == "init":
+            self.initialize(value.get("session_id"))
+            cwd = value.get("cwd")
+            if (not isinstance(cwd, str) or not Path(cwd).is_absolute()
+                    or Path(cwd).resolve() != Path.cwd().resolve()):
+                raise ValueError("session-workspace")
+            # Native model aliases are reported as display names, not CLI IDs.
+            # Do not pretend an alias/display-name comparison validates routing.
+            return
+        self.active(value)
+        if value.get("session_id") != self.session:
+            raise ValueError("event-identity")
+        if kind == "result":
+            self.finish(value.get("subtype") == "success" and value.get("is_error") is False)
+            usage = value.get("usage")
+            if isinstance(usage, dict):
+                self.add_usage({new: usage[old] for old, new in (
+                    ("inputTokens", "input"), ("outputTokens", "output"),
+                    ("cacheReadTokens", "cacheRead"), ("cacheWriteTokens", "cacheWrite")
+                ) if old in usage})
+        elif kind == "tool_call":
+            subtype = value.get("subtype")
+            if subtype not in ("started", "completed"):
+                raise ValueError("tool-event")
+            self.tool(value.get("call_id"), subtype == "started")
+        elif kind == "error":
+            self.failed = True
+        elif kind not in ("user", "assistant", "thinking"):
+            raise ValueError("unknown-native-event")
+
+
+class GeminiTurn(ResultTurn):
+    """Gemini's stream JSON has identity at init, aggregate usage at result."""
+    def observe(self, value):
+        if not isinstance(value, dict):
+            raise ValueError("invalid-event")
+        kind = value.get("type")
+        if kind == "init":
+            self.initialize(value.get("session_id"))
+            return
+        self.active(value)
+        if kind == "result":
+            self.finish(value.get("status") == "success" and not value.get("error"))
+            stats = value.get("stats")
+            if isinstance(stats, dict):
+                # stats.models repeats these totals; never count both.
+                self.add_usage({new: stats[old] for old, new in (
+                    ("input_tokens", "input"), ("output_tokens", "output"),
+                    ("cached", "cacheRead"), ("total_tokens", "totalTokens")
+                ) if old in stats})
+        elif kind in ("tool_use", "tool_result"):
+            self.tool(value.get("tool_id"), kind == "tool_use")
+        elif kind == "error":
+            # A warning may precede recovery. An error remains a failure even
+            # if the CLI later projects a successful terminal envelope.
+            if value.get("severity") != "warning":
+                self.failed = True
+        elif kind != "message":
+            raise ValueError("unknown-native-event")
+
+
 def requested_session(argv):
     flags = argv[:argv.index("--")] if "--" in argv else argv
     if "--session" not in flags:
@@ -208,10 +320,12 @@ class OpenCodeV2Turn(Turn):
 
 
 def run(harness, argv):
-    binary = "opencode" if harness == "opencode-v2" else harness
-    if harness not in ("pi", "pi-signed", "agy", "opencode-v2") or not argv or argv[0] != binary:
+    binary = {"opencode-v2": "opencode", "cursor": "cursor-agent"}.get(harness, harness)
+    if harness not in ("pi", "pi-signed", "agy", "opencode-v2", "cursor", "gemini") or not argv or argv[0] != binary:
         raise ValueError("invalid-native-command")
     turn = (OpenCodeV2Turn(argv) if harness == "opencode-v2" else
+            CursorTurn(argv) if harness == "cursor" else
+            GeminiTurn(argv) if harness == "gemini" else
             AgyTurn(argv) if harness == "agy" else Turn(requested_session(argv)))
     # The child stays in the owning job's group. Do not create a competing
     # process group, retry a model call, or infer task completion from prose.

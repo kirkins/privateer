@@ -517,6 +517,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/msp_bridge.py",
         "tests/omp_rpc.py",
         "tests/agy_turn.py",
+        "tests/result_turn.py",
         "tests/opencode_v2.py",
     ] {
         let output = support::command("python3")
@@ -532,86 +533,8 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
 }
 
 #[test]
-fn pi_zero_exit_after_a_provider_error_records_a_failed_wake_not_a_warm_session() {
-    let mut f = Fixture::new();
-    fs::write(
-        f.store.home().join("config.json"),
-        json!({"resource_home":f.base().join("ledger")}).to_string(),
-    )
-    .unwrap();
-    let fakebin = f.base().join("bin");
-    fs::create_dir(&fakebin).unwrap();
-    let fake = fakebin.join("pi");
-    fs::write(
-        &fake,
-        r#"#!/usr/bin/env python3
-import json
-for event in [
-    {'type':'session','id':'46a81234-1234-4567-8123-123456789abc'},
-    {'type':'agent_start'},
-    {'type':'message_end','message':{'role':'assistant','stopReason':'error','usage':{'input':2}}},
-    {'type':'agent_end','willRetry':False},
-    {'type':'agent_settled','aborted':False},
-]:print(json.dumps(event),flush=True)
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-    privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"Pi failure fixture","first_mate":{"manifest":example("pi"),"duty_task":"task","batch_secs":0,"max_delay_secs":0,"options":{"bare":true}}})).unwrap();
-    privateer::dispatch(&mut f.store,"mail.send",json!({"id":"pi-work","from":"captain","to":"department","kind":"request","body":"Handle this fixture"})).unwrap();
-    let start = support::command(env!("CARGO_BIN_EXE_privateer"))
-        .args([
-            "--home",
-            f.store.home().to_str().unwrap(),
-            "serve",
-            "--json",
-            "{\"once\":true}",
-        ])
-        .env(
-            "PATH",
-            format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
-        )
-        .output()
-        .unwrap();
-    assert!(
-        start.status.success(),
-        "{}",
-        String::from_utf8_lossy(&start.stderr)
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let wake = loop {
-        privateer::activation::tick(&mut f.store).unwrap();
-        let wakes =
-            privateer::dispatch(&mut f.store, "wake.list", json!({"ship":"department"})).unwrap();
-        let wake = &wakes["wakes"][0];
-        if wake["status"] != "running" {
-            break wake.clone();
-        }
-        assert!(Instant::now() < deadline, "Pi fixture wake did not finish");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(wake["status"], "failed", "{wake}");
-    assert_eq!(wake["usage"]["input"], 2);
-    let sessions: i64 = f
-        .store
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE ship='department'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        sessions, 0,
-        "a provider failure became a warm resumable session"
-    );
-    let mail = privateer::dispatch(&mut f.store, "mail.show", json!({"id":"pi-work"})).unwrap();
-    assert_eq!(mail["state"], "open");
-}
-
-#[test]
-fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contract() {
-    for harness in ["rovo", "grok", "muse", "omp", "agy"] {
+fn native_zero_exit_after_a_provider_error_records_a_failed_wake_not_a_warm_session() {
+    for harness in ["pi", "cursor", "gemini"] {
         let mut f = Fixture::new();
         fs::write(
             f.store.home().join("config.json"),
@@ -620,18 +543,119 @@ fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contr
         .unwrap();
         let fakebin = f.base().join("bin");
         fs::create_dir(&fakebin).unwrap();
-        let server = fakebin.join(harness);
-        let script = if matches!(harness, "omp" | "agy") {
+        let fake = fakebin.join(if harness == "cursor" {
+            "cursor-agent"
+        } else {
+            harness
+        });
+        fs::write(
+        &fake,
+        r#"#!/usr/bin/env python3
+import json,os
+harness=os.path.basename(__file__)
+identity='46a81234-1234-4567-8123-123456789abc'
+events = [
+    {'type':'session','id':'46a81234-1234-4567-8123-123456789abc'},
+    {'type':'agent_start'},
+    {'type':'message_end','message':{'role':'assistant','stopReason':'error','usage':{'input':2}}},
+    {'type':'agent_end','willRetry':False},
+    {'type':'agent_settled','aborted':False},
+]
+if harness=='cursor-agent':
+    events=[{'type':'system','subtype':'init','session_id':identity,'cwd':os.getcwd()},
+            {'type':'result','subtype':'error','is_error':True,'session_id':identity,'usage':{'inputTokens':2}}]
+elif harness=='gemini':
+    events=[{'type':'init','session_id':identity},
+            {'type':'result','status':'error','stats':{'input_tokens':2}}]
+for event in events:print(json.dumps(event),flush=True)
+"#,
+    )
+    .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"Native failure fixture","first_mate":{"manifest":example(harness),"duty_task":"task","batch_secs":0,"max_delay_secs":0}})).unwrap();
+        privateer::dispatch(&mut f.store,"mail.send",json!({"id":"pi-work","from":"captain","to":"department","kind":"request","body":"Handle this fixture"})).unwrap();
+        let start = support::command(env!("CARGO_BIN_EXE_privateer"))
+            .args([
+                "--home",
+                f.store.home().to_str().unwrap(),
+                "serve",
+                "--json",
+                "{\"once\":true}",
+            ])
+            .env(
+                "PATH",
+                format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            start.status.success(),
+            "{}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let wake = loop {
+            privateer::activation::tick(&mut f.store).unwrap();
+            let wakes =
+                privateer::dispatch(&mut f.store, "wake.list", json!({"ship":"department"}))
+                    .unwrap();
+            let wake = &wakes["wakes"][0];
+            if wake["status"] != "running" {
+                break wake.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{harness} fixture wake did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(wake["status"], "failed", "{wake}");
+        assert_eq!(wake["usage"]["input"], 2);
+        let sessions: i64 = f
+            .store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE ship='department'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "a provider failure became a warm resumable session"
+        );
+        let mail = privateer::dispatch(&mut f.store, "mail.show", json!({"id":"pi-work"})).unwrap();
+        assert_eq!(mail["state"], "open");
+    }
+}
+
+#[test]
+fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contract() {
+    for harness in ["rovo", "grok", "muse", "omp", "agy", "cursor", "gemini"] {
+        let mut f = Fixture::new();
+        fs::write(
+            f.store.home().join("config.json"),
+            json!({"resource_home":f.base().join("ledger")}).to_string(),
+        )
+        .unwrap();
+        let fakebin = f.base().join("bin");
+        fs::create_dir(&fakebin).unwrap();
+        let server = fakebin.join(if harness == "cursor" {
+            "cursor-agent"
+        } else {
+            harness
+        });
+        let script = if matches!(harness, "omp" | "agy" | "cursor" | "gemini") {
             format!(
                 "#!/usr/bin/env python3\nimport sys\nsys.path.insert(0,{:?})\nfrom {} import SERVER\nexec(SERVER)\n",
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("tests")
                     .display()
                     .to_string(),
-                if harness == "omp" {
-                    "omp_rpc"
-                } else {
-                    "agy_turn"
+                match harness {
+                    "omp" => "omp_rpc",
+                    "agy" => "agy_turn",
+                    _ => "result_turn",
                 }
             )
         } else {
