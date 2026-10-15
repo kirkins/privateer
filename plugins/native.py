@@ -73,6 +73,8 @@ def build(harness, request):
         allowed |= {"sandbox", "ephemeral"}
     if harness in ("pi", "pi-signed", "omp"):
         allowed |= {"provider", "ephemeral"}
+    if harness in ("pi", "pi-signed"):
+        allowed |= {"bare"}
     if harness in ("claude", "grok", "gemini"):
         allowed |= {"permission_mode"}
     if harness == "gemini":
@@ -131,6 +133,11 @@ def build(harness, request):
             argv += (["resume", resume] if headless else [resume])
         argv += ["--", prompt]
     elif harness in ("pi", "pi-signed", "omp"):
+        if harness != "omp" and boolean(options, "bare"):
+            # Per-run resource isolation; retain native authentication and
+            # model/provider files, including any private gateway route.
+            argv += ["--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
+                     "--no-context-files", "--no-themes"]
         if headless:
             argv += ["--print"]
         provider = option(options, "provider")

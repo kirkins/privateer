@@ -117,7 +117,9 @@ def main():
                              "resumed_job": second["status"]})
         call("task.update", {"id": "repair", "actor": "applications", "status": "done"})
         evidence.update({"passed": True, "native_plugin_job": job["status"], "independent_tests_passed": True,
-                         "native_peer_message_recorded": True, "configured_model": args.model or "native default"})
+                         "native_peer_message_recorded": True, "configured_model": options.get("model") or "adapter or native default"})
+        if options.get("provider"):
+            evidence["configured_provider"] = options["provider"]
     except Exception as error:
         evidence.update({"passed": False, "error": str(error)})
         for job_id in started:
