@@ -3,12 +3,8 @@
 Status: proposal for review; injection is not enabled. Boarding and automatic
 presence bindings are implemented separately.
 
-A live presence lease records an optional `binding`: the explicit socket path,
-its device/inode incarnation, and the exact pane, terminal, workspace and tab
-identities returned by a protocol-checked Herdr snapshot. A native session id,
-when already observed, is pinned too. Refreshing the same holder preserves its
-binding; a replacement holder captures its own context. Lease expiry or release
-removes this binding from the dashboard. No labels establish ownership.
+The existing presence binding and its refresh/expiry rules are documented under
+[Boarding and management](../dashboard.md#boarding-and-management).
 
 This is sufficient for navigation using the existing snapshot/recheck/focus
 contract. It is not an atomic authorization to deliver input. In particular,
