@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use std::path::Path;
+use std::time::Duration;
 
 /// Defaults for a first mate's activation settings, in seconds or counts.
 const SETTINGS: &[(&str, u64, u64, u64)] = &[
@@ -28,31 +29,31 @@ const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;
 
 pub fn init(store: &Store) -> Result<()> {
-    store.connection().execute_batch(
+    let tx = store.write_transaction()?;
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS wakes(id TEXT PRIMARY KEY, ship TEXT NOT NULL, focus TEXT NOT NULL,
            through_seq INTEGER NOT NULL, job_id TEXT, mode TEXT NOT NULL, status TEXT NOT NULL,
            created_ms INTEGER NOT NULL, finished_ms INTEGER, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);",
     )?;
     for column in ["focuses", "harness", "session_id"] {
-        let present: bool = store.connection().query_row(
+        let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
             [column],
             |r| r.get(0),
         )?;
         if !present {
-            store
-                .connection()
-                .execute_batch(&format!("ALTER TABLE wakes ADD COLUMN {column} TEXT;"))?;
+            tx.execute_batch(&format!("ALTER TABLE wakes ADD COLUMN {column} TEXT;"))?;
         }
     }
     // One native session per ship and focus, so topics never share a
     // conversation.
-    store.connection().execute_batch(
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions(ship TEXT NOT NULL, focus TEXT NOT NULL, harness TEXT NOT NULL,
            session_id TEXT NOT NULL, wakes INTEGER NOT NULL, started_ms INTEGER NOT NULL,
            last_turn_ms INTEGER NOT NULL, PRIMARY KEY(ship, focus));",
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -174,7 +175,6 @@ fn ships(store: &Store) -> Result<Vec<Value>> {
 
 struct Mail {
     seq: i64,
-    created_ms: i64,
     routine: bool,
     crew: bool,
     focus: String,
@@ -185,7 +185,7 @@ struct Mail {
 /// each labelled with the focus it belongs to.
 fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
     let mut statement = store.connection().prepare(
-        "SELECT seq, id, sender, kind, correlation, request_kind, urgency, body, payload, created_ms, task_id
+        "SELECT seq, id, sender, kind, correlation, request_kind, urgency, body, payload, task_id
          FROM mail WHERE recipient=?1 AND COALESCE(delivery, 'received')='received' AND seq > ?2
          ORDER BY seq LIMIT 200",
     )?;
@@ -214,11 +214,10 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
             summary.push_str(&format!("\n  payload {payload}"));
         }
         let message = json!({"id": id, "from": from, "correlation": correlation,
-            "task_id": r.get::<_, Option<String>>(10)?});
+            "task_id": r.get::<_, Option<String>>(9)?});
         Ok((
             Mail {
                 seq: r.get(0)?,
-                created_ms: r.get(9)?,
                 // Information-only notices wait for the next real wake.
                 routine: kind == "notice" && urgency == "low",
                 crew: from == crate::mail::CREW,
@@ -527,13 +526,25 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         )
         .optional()?
         .unwrap_or(0);
-    let mail = new_mail(store, &name, woken_through.max(acknowledged))?;
-    let triggers: Vec<&Mail> = mail.iter().filter(|m| !m.routine).collect();
-    if triggers.is_empty() {
+    let after = woken_through.max(acknowledged);
+    // Eligibility covers the whole backlog, not just the bounded prompt
+    // page. A routine-only page must advance when actionable mail follows
+    // it, without claiming coverage of messages beyond that page.
+    let (oldest, newest): (Option<i64>, Option<i64>) = store.connection().query_row(
+        "SELECT MIN(created_ms), MAX(created_ms) FROM mail
+         WHERE recipient=?1 AND COALESCE(delivery, 'received')='received' AND seq>?2
+           AND (kind!='notice' OR urgency!='low')",
+        params![name, after],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let (Some(oldest), Some(newest)) = (oldest, newest) else {
+        return Ok(json!({"ship": name, "skipped": "nothing wake-worthy"}));
+    };
+    let mail = new_mail(store, &name, after)?;
+    if mail.is_empty() {
         return Ok(json!({"ship": name, "skipped": "nothing wake-worthy"}));
     }
-    let newest = triggers.iter().map(|m| m.created_ms).max().unwrap_or(now);
-    let oldest = triggers.iter().map(|m| m.created_ms).min().unwrap_or(now);
+    let triggers: Vec<&Mail> = mail.iter().filter(|m| !m.routine).collect();
     let quiet = now - newest >= setting(&profile, "batch_secs") * 1000;
     let overdue = now - oldest >= setting(&profile, "max_delay_secs") * 1000;
     if !quiet && !overdue {
@@ -571,6 +582,7 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         .iter()
         .min_by_key(|m| m.seq)
         .map(|m| m.focus.clone())
+        .or_else(|| mail.first().map(|m| m.focus.clone()))
         .unwrap_or_default();
     let duty = profile["duty_task"].as_str().unwrap_or("").to_owned();
     let task = primary
@@ -646,17 +658,20 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     )
 }
 
-/// One dispatcher pass: deliver pending mail, settle jobs whose supervisor
-/// vanished (recording their crew outcomes), settle finished wakes, wake the
-/// first mates that are due.
+/// Local reconciliation and wakes run before bounded remote delivery, so a
+/// failed or slow peer cannot hold local work behind its whole outbox.
 pub fn tick(store: &mut Store) -> Result<Value> {
-    let delivered = crate::dispatch(store, "mail.flush", json!({}))?;
+    tick_with_delivery_budget(store, Duration::from_millis(10_000))
+}
+
+fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Value> {
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
     let mut considered = vec![];
     for ship in ships(store)? {
         considered.push(consider(store, &ship)?);
     }
+    let delivered = crate::mail::flush_dispatcher(store, budget)?;
     Ok(
         json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "ships": considered}),
     )
@@ -680,13 +695,22 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         "another serve is already running for this home"
     );
     let once = args.get("once") == Some(&json!(true));
+    let delivery_budget = args
+        .get("delivery_budget_ms")
+        .map(|v| {
+            v.as_u64()
+                .filter(|ms| (1..=120_000).contains(ms))
+                .context("delivery_budget_ms must be 1..120000")
+        })
+        .transpose()?
+        .unwrap_or(10_000);
     let interval = args
         .get("interval_secs")
         .and_then(Value::as_u64)
         .unwrap_or(2)
         .clamp(1, 3600);
     loop {
-        let report = tick(store)?;
+        let report = tick_with_delivery_budget(store, Duration::from_millis(delivery_budget))?;
         let acted = report["settled"].as_array().is_some_and(|s| !s.is_empty())
             || report["reconciled"]
                 .as_array()
