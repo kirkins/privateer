@@ -47,6 +47,8 @@ struct Job {
     source_cwd: Option<PathBuf>,
     #[serde(default)]
     workspace_lease_id: Option<String>,
+    #[serde(default)]
+    agent_request_hash: Option<String>,
     action: String,
     heavy: bool,
     timeout_secs: u64,
@@ -598,7 +600,7 @@ fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<(
     Ok(())
 }
 #[allow(clippy::unnecessary_cast)] // statvfs field widths differ across supported Unix targets.
-fn free_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn free_bytes(path: &Path) -> Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -648,6 +650,41 @@ fn check_workspace_owner(store: &Store, job: &Job) -> Result<()> {
 pub(crate) fn start_agent(store: &Store, mut args: Value) -> Result<Value> {
     args["action"] = json!("spawn");
     start(store, args, None, true)
+}
+
+/// Replays of an agent request are historical facts, including after release.
+/// Compare the original request before allocating or re-planning a workspace.
+pub(crate) fn agent_replay(store: &Store, args: &Value, hash: &str) -> Result<Option<Value>> {
+    let Some(id) = args.get("id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let raw: Option<String> = store
+        .connection()
+        .query_row("SELECT record FROM jobs WHERE id=?1", [id], |r| r.get(0))
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let existing: Job = serde_json::from_str(&raw)?;
+    if existing.agent_request_hash.is_none() {
+        return Ok(None);
+    }
+    ensure!(
+        existing.action == "spawn"
+            && existing.agent_request_hash.as_deref() == Some(hash)
+            && args["task_id"].as_str() == Some(&existing.task_id),
+        "job id already belongs to different work"
+    );
+    let owner = store.task(&existing.task_id)?["owner"]
+        .as_str()
+        .context("task owner missing")?
+        .to_owned();
+    if let Caller::Agent { actor } = store.caller() {
+        ensure!(actor == &owner, "agent can only replay its own task jobs");
+    }
+    let charter = store.authorize(&existing.task_id, "spawn")?;
+    check_plugin_binding(&existing, &charter)?;
+    Ok(Some(public_job(&existing)))
 }
 
 /// Reconcile recorded groups before release; a dead supervisor is not proof
@@ -819,6 +856,17 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         .get("workspace_lease_id")
         .map(|v| v.as_str().context("workspace_lease_id must be a string"))
         .transpose()?;
+    let agent_request_hash = if agent {
+        args.get("agent_request_hash")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .context("agent_request_hash must be text")
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if let Ok(existing) = load(store, &id) {
         ensure!(
             existing.task_id == task_id
@@ -837,6 +885,11 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         );
         return Ok(public_job(&existing));
     }
+    ensure!(
+        requested_cwd.starts_with(&repo)
+            || crate::workspace::contains_cwd(store, task_id, &repo, &requested_cwd)?,
+        "cwd must stay inside charter repository or its task workspace"
+    );
     let workspace = crate::workspace::execution(
         store,
         task_id,
@@ -892,6 +945,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         cwd,
         source_cwd: Some(requested_cwd),
         workspace_lease_id,
+        agent_request_hash,
         action: action.to_owned(),
         heavy,
         timeout_secs,
@@ -949,6 +1003,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                     && existing.cwd == job.cwd
                     && existing.source_cwd == job.source_cwd
                     && existing.workspace_lease_id == job.workspace_lease_id
+                    && existing.agent_request_hash == job.agent_request_hash
                     && existing.heavy == heavy
                     && existing.action == action
                     && existing.plugin_binding == job.plugin_binding

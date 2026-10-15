@@ -86,6 +86,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             // Plan against the task checkout; first-mate wakes have a durable
             // wake row and keep their existing ship repository.
             args.as_object_mut().unwrap().remove("_workspace_lease_id");
+            use sha2::{Digest, Sha256};
+            let request_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&args)?));
+            if let Some(existing) = jobs::agent_replay(store, &args, &request_hash)? {
+                return Ok(existing);
+            }
             let repo = std::fs::canonicalize(
                 charter["repo"]
                     .as_str()
@@ -110,6 +115,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "cwd": plan["cwd"],
                 "cleanup_descendants": true,
                 "agent_actor": owner,
+                "agent_request_hash": request_hash,
                 // The harness mostly waits on its model; builds it runs go
                 // through job.start with heavy and wait_for_capacity.
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))

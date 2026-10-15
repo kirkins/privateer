@@ -33,6 +33,10 @@ clone's worktree, a replaced lease, a changed branch, or a path outside the
 managed pool is refused. A charter scoped to a repository subdirectory keeps
 that same scope inside the worktree. Existing jobs and retries remain pinned to
 their original lease; they cannot silently move into a recycled slot.
+Replaying an identical completed job/agent request ID returns its recorded
+result even after release, without acquiring another checkout. A retry with a
+new ID still requires the original lease; after release, use a fresh task or
+fresh agent planning rather than replaying an old plan into a recycled slot.
 
 An operator can set an absolute `treehouse_binary` in the home's private
 `config.json` when the CLI is not on the runtime's PATH. This affects new
@@ -109,3 +113,8 @@ PRIVATEER_TEST_TREEHOUSE=/absolute/path/to/treehouse \
 
 The installed-CLI check is explicitly skipped in ordinary CI when Treehouse is
 not provisioned. Neither check uses live ship homes or production installations.
+
+Treehouse provisioning hooks are trusted setup work inside the bounded helper,
+before payload resource admission. Schedule expensive setup as admitted jobs
+after allocation; a provisioning hook must not recursively acquire a workspace
+from the same home while the allocation lock is held.

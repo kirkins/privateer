@@ -810,4 +810,52 @@ fn independent_harnesses_need_separate_tasks_but_can_run_in_parallel() {
     assert_ne!(one["cwd"], two["cwd"]);
     assert_eq!(f.wait("first")["status"], "succeeded");
     assert_eq!(f.wait("second")["status"], "succeeded");
+    let w = f.acquire("one");
+    f.release(&w, false);
+    let replay = f.ok(
+        "agent.start",
+        json!({"task_id":"one","id":"first","manifest":manifest}),
+    );
+    assert_eq!(replay["incarnation"], one["incarnation"]);
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "released"
+    );
+    assert!(
+        !f.run(
+            "agent.start",
+            json!({"task_id":"one","id":"first","manifest":manifest,"heavy":true})
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
+    let f = Fixture::new();
+    f.ok(
+        "charter.put",
+        json!({"id":"mission","min_free_bytes":u64::MAX}),
+    );
+    assert!(
+        !f.run(
+            "job.start",
+            json!({"task_id":"one","command":["/bin/true"],"heavy":false})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
+    f.ok("charter.put", json!({"id":"mission","min_free_bytes":0}));
+    assert!(
+        !f.run(
+            "job.start",
+            json!({"task_id":"one","cwd":f.root,"command":["/bin/true"],"heavy":false})
+        )
+        .status
+        .success()
+    );
+    assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
+    assert_eq!(f.ok("job.list", json!({})), json!([]));
 }

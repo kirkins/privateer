@@ -287,6 +287,7 @@ fn acquire_locked(store: &Store, task: &str, repo: &Path, lock: &Lock) -> Result
         crate::store::reject_symlinks(&pool)?;
         fs::create_dir_all(&pool)?;
         fs::set_permissions(&pool, fs::Permissions::from_mode(0o700))?;
+        disk_admission(store, task, &pool)?;
         let generation = uuid::Uuid::new_v4().simple().to_string();
         let w = Workspace {
             task_id: task.into(),
@@ -319,24 +320,27 @@ fn acquire_locked(store: &Store, task: &str, repo: &Path, lock: &Lock) -> Result
         );
         let lease = match held.into_iter().next() {
             Some(v) => v,
-            None => serde_json::from_slice(&treehouse(
-                lock,
-                &w,
-                &[
-                    "get",
-                    "--lease",
-                    "--json",
-                    "--lease-holder",
-                    &w.holder,
-                    "--base",
-                    &w.base_branch,
-                    "--branch",
-                    &w.branch,
-                    "--worktree-path",
-                    "{pool}/{slot}/{repo}",
-                ],
-            )?)
-            .context("invalid Treehouse lease response")?,
+            None => {
+                disk_admission(store, task, &w.pool)?;
+                serde_json::from_slice(&treehouse(
+                    lock,
+                    &w,
+                    &[
+                        "get",
+                        "--lease",
+                        "--json",
+                        "--lease-holder",
+                        &w.holder,
+                        "--base",
+                        &w.base_branch,
+                        "--branch",
+                        &w.branch,
+                        "--worktree-path",
+                        "{pool}/{slot}/{repo}",
+                    ],
+                )?)
+                .context("invalid Treehouse lease response")?
+            }
         };
         w.path = Some(PathBuf::from(required(&lease, "path")?));
         let id = required(&lease, "lease_id")?;
@@ -355,6 +359,28 @@ fn acquire_locked(store: &Store, task: &str, repo: &Path, lock: &Lock) -> Result
     }
     validate(lock, &w)?;
     Ok(w)
+}
+
+fn disk_admission(store: &Store, task: &str, pool: &Path) -> Result<()> {
+    let task = store.task(task)?;
+    let charter = store.charter(required(&task, "charter_id")?)?;
+    let minimum = charter
+        .get("min_free_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(2 * 1024 * 1024 * 1024);
+    let available = crate::jobs::free_bytes(pool)?;
+    ensure!(
+        available >= minimum,
+        "workspace disk admission refused: {available} available, {minimum} required"
+    );
+    Ok(())
+}
+
+pub(crate) fn contains_cwd(store: &Store, task: &str, repo: &Path, cwd: &Path) -> Result<bool> {
+    match load(store, task)? {
+        Some(w) if w.state == "ready" && w.repo == repo => Ok(cwd.starts_with(root(&w)?)),
+        _ => Ok(false),
+    }
 }
 
 /// First-mate wake jobs stay in their ship repository. The wake row is written
