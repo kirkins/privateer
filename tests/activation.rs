@@ -487,3 +487,40 @@ fn cold_mixed_rotated_or_failed_sessions_start_fresh() {
     assert_eq!(Fleet::infra(&fleet.tick())["mode"], "fresh");
     fleet.settle();
 }
+
+#[test]
+fn a_read_message_delegate_first_mate_wakes_without_implementation_authority() {
+    let mut fleet = Fleet::new(now_settings());
+    dispatch(
+        &mut fleet.store,
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+    )
+    .unwrap();
+    fleet.send(json!({"id":"liaison-question","from":"apps","to":"infra","kind":"request","body":"Read and relay"}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    let wake = fleet.settle();
+    assert_eq!(wake["status"], "succeeded", "{wake}");
+    assert_eq!(
+        dispatch(
+            &mut fleet.store,
+            "mail.show",
+            json!({"id":"liaison-question"})
+        )
+        .unwrap()["state"],
+        "answered"
+    );
+    let job = dispatch(&mut fleet.store, "job.status", json!({"id":wake["job_id"]})).unwrap();
+    assert_eq!(job["action"], "spawn");
+    for action in ["implement", "spawn"] {
+        let denied = dispatch(
+            &mut fleet.store,
+            "job.start",
+            json!({"task_id":"infra-duty","command":["sh","-c","exit 0"],"action":action}),
+        );
+        assert!(
+            denied.is_err(),
+            "ordinary jobs may not claim {action} under a liaison charter"
+        );
+    }
+}

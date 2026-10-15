@@ -35,6 +35,7 @@ pub struct App {
     pub composer: Option<Composer>,
     pub form: Option<super::forms::Form>,
     pub board_requested: bool,
+    pub pending_board: Option<String>,
     pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
     pub herdr: Option<herdr::View>,

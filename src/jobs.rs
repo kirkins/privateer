@@ -604,7 +604,14 @@ fn check_plugin_binding(job: &Job, charter: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> {
+/// Only the validated agent.start path may start a harness under spawn.
+/// Public job.start cannot use this to bypass implementation authority.
+pub(crate) fn start_agent(store: &Store, mut args: Value) -> Result<Value> {
+    args["action"] = json!("spawn");
+    start(store, args, None, true)
+}
+
+fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> Result<Value> {
     ensure!(
         args.get("production").and_then(Value::as_bool) != Some(true),
         "production execution is not supported by the ordinary job runner"
@@ -618,7 +625,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         .and_then(Value::as_str)
         .unwrap_or("implement");
     ensure!(
-        matches!(action, "implement" | "test" | "recovery" | "cleanup"),
+        matches!(action, "implement" | "test" | "recovery" | "cleanup")
+            || (agent && action == "spawn"),
         "ordinary jobs require implement/test/recovery/cleanup action"
     );
     let charter = store.authorize(task_id, action)?;
@@ -1742,7 +1750,7 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
-        "job.start" => start(store, args, None),
+        "job.start" => start(store, args, None, false),
         "job.status" => {
             let id = args
                 .get("id")
@@ -1805,7 +1813,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if let Some(binding) = &old.plugin_binding {
                 next["plugin_binding"] = binding.clone();
             }
-            start(store, next, Some(old_id.to_owned()))
+            start(store, next, Some(old_id.to_owned()), old.action == "spawn")
         }
         "resource.recover" => recover(store, &args),
         // Host-wide and open to agents, which tune it to their person's wishes.

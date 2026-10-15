@@ -235,6 +235,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             created_by: created_by.clone(),
+            liaison: false,
         },
     )?;
     let dispatcher = crate::service::ensure(&home, &ship)?;

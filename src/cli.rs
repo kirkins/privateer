@@ -46,8 +46,26 @@ pub fn discover_home() -> Option<PathBuf> {
 }
 
 fn on_path(binary: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            dir.join(binary).is_file()
+                && dir
+                    .join(binary)
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// Supported harnesses installed on this machine, in the runtime's normal order.
+pub fn installed_harnesses() -> Result<Vec<String>> {
+    let plugins = plugins_dir()?;
+    Ok(HARNESSES
+        .iter()
+        .filter(|(binary, id)| on_path(binary) && plugins.join(id).join("manifest.json").is_file())
+        .map(|(_, id)| (*id).to_owned())
+        .collect())
 }
 
 /// The bundled adapters: `PRIVATEER_PLUGINS`, a `plugins/` directory beside
@@ -264,6 +282,7 @@ pub(crate) struct Setup {
     pub objective: Option<String>,
     /// Who made it, recorded in the fleet list.
     pub created_by: String,
+    pub liaison: bool,
 }
 
 /// Make (or update) the ship whose state lives in `home`, returning its name,
@@ -296,14 +315,26 @@ pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)
     let binary = std::env::current_exe()?;
     let cli = format!("{} --home {}", binary.display(), store.home().display());
 
-    crate::dispatch(&mut store, "init", json!({"ship": ship}))?;
+    let liaison = setup.liaison
+        || fs::read(home.join("config.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .is_some_and(|c| c["preset"] == "liaison");
+    let mut config = json!({"ship":ship});
+    if liaison {
+        config["preset"] = json!("liaison");
+    }
+    crate::dispatch(&mut store, "init", config)?;
     // The shared ledger must exist before a sandboxed first mate is planned.
     crate::jobs::ensure_ledger(&store)?;
     // Created once; later edits to the charter are the captain's to keep.
     if store.charter(&ship).is_err() {
         let mut charter = json!({"id": ship,
-            "objective": setup.objective.clone().unwrap_or_else(|| format!("Work as the ship {ship}")),
+            "objective": setup.objective.clone().unwrap_or_else(|| if liaison {"Help the captain onboard, read fleet state, relay mail and delegate work to peers".into()} else {format!("Work as the ship {ship}")}),
             "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600});
+        if liaison {
+            charter["actions"] = json!(["inspect", "spawn", "message"]);
+        }
         if let Some(actions) = &setup.actions {
             charter["actions"] = actions.clone();
         }
@@ -349,7 +380,11 @@ pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)
     let agents = folder.join("AGENTS.md");
     let ours = fs::read_to_string(&agents).map_or(true, |t| t.starts_with(GENERATED));
     if ours {
-        fs::write(&agents, instructions(&ship, &scope, &cli))?;
+        let mut text = instructions(&ship, &scope, &cli);
+        if liaison {
+            text.push_str(&liaison_instructions(&ship));
+        }
+        fs::write(&agents, text)?;
     }
     let claude = folder.join("CLAUDE.md");
     if !claude.exists() {
@@ -373,6 +408,7 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
             scope: flags.values.get("scope").cloned(),
             harness: flags.values.get("harness").cloned(),
             created_by: "captain".into(),
+            liaison: flags.switches.iter().any(|s| s == "liaison"),
             ..Setup::default()
         },
     )?;
@@ -398,6 +434,36 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
         "  privateer ask {ship} \"...\"           or send it a request from anywhere in this folder"
     );
     Ok(())
+}
+
+fn liaison_instructions(ship: &str) -> String {
+    format!(
+        r#"
+## Liaison: the captain's optional contact
+
+You are an ordinary peer, with read (`inspect`), message and delegate (`spawn`)
+actions by default. Keep turns short and stay responsive. Route implementation
+to a ship that accepts ownership; do not implement, build, merge or deploy under
+this charter. A contact role grants no command over another ship.
+
+## Onboarding the captain
+
+1. Ask what the captain works on, their projects, priorities and preferences.
+2. Inspect `fleet.list` and propose useful ships with scopes and charters. Ask
+   which proposals they want before creating those ships with `ship.create`.
+3. New ships created by you inherit only your charter's actions. Explain any
+   implementation authority they need and have the captain grant it explicitly;
+   never widen your own charter or claim a child has rights you do not hold.
+4. Help add the chosen repositories with `privateer project add <git url>`.
+5. Explain the dashboard's inbox, direct messages and Board action, and the
+   direct `privateer start` path. The captain can talk to any ship directly.
+6. Keep the captain's lasting preferences in {ship}'s `ship` note, and the
+   onboarding progress in its `captain` note. Resume from those records.
+
+The captain may use a different ship first or skip this checklist. Do not claim
+onboarding happened until the conversation and runtime records support it.
+"#
+    )
 }
 
 fn print_mail(message: &Value) {
@@ -512,11 +578,46 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+fn dashboard_binary() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
+        return None;
+    }
+    let beside = std::env::current_exe()
+        .ok()?
+        .with_file_name("privateer-dashboard");
+    let candidates =
+        std::iter::once(beside).chain(std::env::var_os("PATH").into_iter().flat_map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|p| p.join("privateer-dashboard"))
+                .collect::<Vec<_>>()
+        }));
+    candidates.into_iter().find(|p| {
+        p.is_file()
+            && p.metadata()
+                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    })
+}
+fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(binary);
+    if let Some(home) = home {
+        command.arg("--home").arg(home);
+    }
+    Err(command.exec()).context("open the Privateer dashboard")
+}
+
 /// Bare `privateer`: get aboard. Inside a ship, make sure its dispatcher is
 /// running and talk to its first mate. Elsewhere, offer to make this folder a
 /// ship first; without a terminal to ask in (or `--yes`), print help.
 pub fn board(home: Option<PathBuf>, yes: bool) -> Result<()> {
     use std::io::{IsTerminal, Write};
+    let dashboard = dashboard_binary();
+    if home.is_none() {
+        if let Some(binary) = &dashboard {
+            return open_dashboard(binary, None);
+        }
+    }
     let home = match home {
         Some(home) => home,
         None => {
@@ -558,6 +659,9 @@ pub fn board(home: Option<PathBuf>, yes: bool) -> Result<()> {
         .context("this folder's ship is unknown; run `privateer init` here")?;
     drop(store);
     println!("Dispatcher: {}", crate::service::ensure(&home, &ship)?);
+    if let Some(binary) = dashboard {
+        return open_dashboard(&binary, Some(&home));
+    }
     start(&home, &[])
 }
 

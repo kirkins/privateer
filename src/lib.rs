@@ -93,7 +93,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();
             }
-            jobs::dispatch(store, "job.start", job)
+            jobs::start_agent(store, job)
         }
         "agent" => plugins::dispatch(store, command, args),
         _ => core::dispatch(store, command, args),

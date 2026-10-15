@@ -212,3 +212,57 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
     assert!(log.contains(&format!("--user enable --now {name}")));
     assert!(log.contains(&format!("--user disable --now {name}")));
 }
+
+#[test]
+fn herdr_dashboard_entry_uses_installed_sibling_and_preserves_direct_start_and_fallback() {
+    let place = Place::new();
+    let binary = place.root.join("bin/privateer");
+    fs::copy(BIN, &binary).unwrap();
+    let dashboard = place.root.join("bin/privateer-dashboard");
+    let probe = place.root.join("dashboard-argv");
+    fs::write(
+        &dashboard,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", probe.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&dashboard, fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |args: &[&str], herdr: bool| {
+        let mut command = Command::new(&binary);
+        command
+            .args(args)
+            .current_dir(&place.folder)
+            .env("PATH", &place.path)
+            .env("HOME", &place.root)
+            .env("PRIVATEER_FLEET", place.root.join("fleet.sqlite"))
+            .env("PRIVATEER_SERVICE", "none")
+            .env("PRIVATEER_RESOURCE_HOME", place.root.join("ledger"))
+            .env_remove("PRIVATEER_HOME")
+            .env_remove("PRIVATEER_ROLE")
+            .env_remove("PRIVATEER_ACTOR")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH");
+        if herdr {
+            command.env("HERDR_ENV", "1");
+        }
+        command.output().unwrap()
+    };
+    let fresh = run(&[], true);
+    assert!(fresh.status.success(), "{}", text(&fresh));
+    assert!(!place.folder.join(".privateer").exists());
+    assert!(place.probes().is_empty());
+    assert_eq!(fs::read_to_string(&probe).unwrap(), "\n");
+    assert!(run(&["init", "--harness", "codex"], false).status.success());
+    assert!(run(&[], true).status.success());
+    let args = fs::read_to_string(&probe).unwrap();
+    assert_eq!(
+        args.lines().collect::<Vec<_>>(),
+        ["--home", place.folder.join(".privateer").to_str().unwrap()]
+    );
+    assert!(run(&["start"], true).status.success());
+    assert_eq!(place.probes().len(), 1);
+    assert!(run(&[], false).status.success());
+    assert_eq!(place.probes().len(), 2);
+    fs::remove_file(&dashboard).unwrap();
+    assert!(run(&[], true).status.success());
+    assert_eq!(place.probes().len(), 3);
+}

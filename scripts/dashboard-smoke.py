@@ -114,7 +114,8 @@ if __name__ == "__main__":
 
 # Keep the live path in the same CI entry point as the existing demo smoke.
 if __name__ == "__main__":
-    from dashboard_live_smoke import run
+    from dashboard_live_smoke import run, onboarding
     import sys
     live_binary = Path(sys.argv[sys.argv.index("--binary") + 1] if "--binary" in sys.argv else "target/debug/privateer-dashboard").resolve()
     run(live_binary, live_binary.with_name("privateer"))
+    onboarding(live_binary, live_binary.with_name("privateer"))

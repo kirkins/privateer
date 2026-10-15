@@ -253,3 +253,35 @@ fn init_needs_a_harness_or_says_how_to_choose_one() {
     let output = folder.run_in(&folder.ship, &["init", "--harness", "no-such-harness"]);
     assert!(!output.status.success());
 }
+
+#[test]
+fn liaison_preset_is_read_message_delegate_and_keeps_captain_edits() {
+    let folder = Folder::new("contact");
+    folder.ok(&["init", "--liaison", "--harness", "codex"]);
+    let charter = folder.json("charter.show", json!({"id":"contact"}));
+    assert_eq!(charter["actions"], json!(["inspect", "spawn", "message"]));
+    let emitted = fs::read_to_string(folder.ship.join("AGENTS.md")).unwrap();
+    // AGENTS.md is the generated public first-mate interface, not a proxy
+    // for successful model onboarding; the PTY separately proves creation.
+    assert!(emitted.contains("Onboarding the captain"));
+    assert!(emitted.contains("never widen your own charter"));
+    folder.ok(&["init", "--harness", "codex"]);
+    assert!(
+        fs::read_to_string(folder.ship.join("AGENTS.md"))
+            .unwrap()
+            .contains("Onboarding the captain")
+    );
+    folder.json(
+        "charter.put",
+        json!({"id":"contact","actions":["inspect","message"]}),
+    );
+    folder.ok(&["init", "--liaison"]);
+    assert_eq!(
+        folder.json("charter.show", json!({"id":"contact"}))["actions"],
+        json!(["inspect", "message"])
+    );
+    let config: Value =
+        serde_json::from_slice(&fs::read(folder.ship.join(".privateer/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["preset"], "liaison");
+}

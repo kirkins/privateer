@@ -8,9 +8,8 @@ lock status, open requests, unread ship mail and the three latest wakes. Fleet o
 the sidebar always shows ships. Each ship has Bridge, Assignments, Terminals
 and Logbook views. Remote peers are not discovered.
 
-This is an observation and navigation tool. It is not yet a model-driven conversational navigator, scheduler or interactive
-agent launcher. Installing it does not
-replace an existing fleet. The current headless harness/job interfaces continue
+This is an operator fleet home with mailbox commands, ship management and
+attended session boarding. Installing it does not replace an existing fleet. The current headless harness/job interfaces continue
 to work independently.
 
 ## Build and preview
@@ -89,6 +88,40 @@ Herdr pane observations are deliberately separate from Privateer task records.
 There is no inferred binding based on similar labels or matching owners. A
 Herdr `done` state does not mark a task done or prove a passing PR. Stored job
 statuses may be stale because this UI deliberately does not reconcile processes.
+
+## First run and everyday entry
+
+With an empty fleet, the interactive dashboard welcomes the captain and suggests
+`liaison` at `~/ships/liaison`. Name and folder are editable; the suggested folder
+tracks the name until changed explicitly. Choose among supported installed
+harnesses (←/→ cycles Harness), and choose `liaison` or an ordinary `ship` role.
+Tab moves fields, Delete/Ctrl-U clears a field, Enter creates, and Escape skips
+without creating a home or fleet registry. `n` reopens setup in an empty fleet.
+A missing harness keeps setup open with guidance, without initializing anything.
+
+Creation uses `privateer init --ship NAME --harness ID [--liaison]` in the chosen
+folder, then `privateer service start` and Board. Existing nonempty folders are
+refused unless they hold that same initialized ship (safe command retry).
+Without Herdr, creation succeeds and the Board limitation is shown; use
+`privateer start` in that folder to talk to its first mate.
+
+`privateer init --liaison` creates a default charter with `inspect`, `message`
+and `spawn` (read, communicate, delegate), without implementation authority. Its
+generated `AGENTS.md` asks about work and preferences, proposes peer ships and
+charters, helps create them and add projects, and explains direct dashboard
+access. New agent-created ships remain bounded by the creator's charter; the
+captain grants implementation rights explicitly when needed. The preset and
+checklist survive a later ordinary init; captain-edited charters and instruction
+files are preserved. It is a suggested agent interface, not evidence of an
+actual autonomous onboarding conversation.
+
+Inside Herdr (`HERDR_ENV=1`), bare `privateer` opens an executable
+`privateer-dashboard` beside the runtime or on PATH. An empty-fleet entry opens
+the dashboard before offering to initialize the current directory. An existing
+ship still gets its dispatcher ensured before the dashboard opens. Outside
+Herdr, or without an installed dashboard, existing behavior is preserved.
+`privateer start` always launches the harness directly. Install both binaries
+with `cargo install --locked --path . --features dashboard`.
 
 ## Boarding and management
 
@@ -176,6 +209,8 @@ continuity. Demo terminals are labeled sample data and never connect to a socket
 | Key / action | Result |
 |---|---|
 | Click a ship | Open its workspace |
+| `b` / Board | Focus its bound first mate or launch `privateer start` in a new Herdr tab |
+| `n`, `x`, `d` | New ship, confirmed retirement, dispatcher status/start/stop |
 | Click Fleet overview; `0` or Home | Return to the fleet home |
 | `1`–`4`, Tab after selecting a ship | Bridge, Assignments, Terminals, Logbook |
 | Click an assignment/terminal | Select its details |

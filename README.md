@@ -21,12 +21,14 @@ sidebar. Each ship has its own Bridge, Assignments, Terminals and Logbook views:
 cargo run --features dashboard --bin privateer-dashboard -- --demo
 ```
 
-Use `--home /absolute/privateer/home` to observe an existing home. Inside Herdr,
-the dashboard can inspect and focus existing agent terminals using the injected
-socket. It does not launch agents, send prompts, acknowledge alerts or migrate a
-fleet. Navigator chat and automatic agent activation are not connected yet.
-Click a ship, then its workspace tabs; `0` returns to Fleet overview. Keyboard
-navigation and mouse-wheel scrolling remain available.
+The dashboard reads your local fleet, aggregates the captain's real inbox, and
+can board a ship in Herdr, create or retire ships, and manage dispatchers. An
+empty fleet offers a liaison or another first ship in a dedicated folder.
+All changes go through Privateer commands. Demo mode stays sample-only.
+Click a ship, then its workspace tabs; `0` returns home, `i` opens the inbox,
+`m` messages, and `b` boards. Herdr uses only the injected or explicitly selected
+socket, with exact pane bindings. Injection of mail into agent panes is proposed
+but remains disabled pending a safe server-side occupant guard.
 See [dashboard setup and boundaries](docs/dashboard.md).
 
 ## Quick start
@@ -34,11 +36,12 @@ See [dashboard setup and boundaries](docs/dashboard.md).
 A ship is a dedicated folder. Make one and go aboard with a single command:
 
 ```sh
-cargo install --locked --path .     # from this checkout; puts `privateer` in ~/.cargo/bin
+cargo install --locked --path . --features dashboard  # installs privateer + privateer-dashboard
 mkdir -p ~/ships/infra && cd ~/ships/infra
 privateer                           # first time: asks, makes the folder a ship, starts its background
                                     # dispatcher, and opens its first mate in your installed harness
-privateer                           # every time after: straight to the first mate
+privateer                           # inside Herdr: fleet dashboard; elsewhere: first mate
+privateer start                     # always talk to this ship directly
 ```
 
 The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. Scripts can use `privateer --yes` to skip the question.

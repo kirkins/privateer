@@ -133,6 +133,7 @@ struct MailUpdate {
     notice: Option<String>,
     sent: bool,
     completed_send: bool,
+    board: Option<String>,
 }
 fn mail_worker(
     registry: PathBuf,
@@ -150,6 +151,7 @@ fn mail_worker(
                 Err(_) => break,
             };
             let mut sent = false;
+            let mut board = None;
             let completed_send = matches!(&action, Some(MailAction::Send(_)));
             let notice = action.map(|a| match a {
                 MailAction::Read(mail) => match mailbox.mark_read(&binary, &mail) {
@@ -157,7 +159,15 @@ fn mail_worker(
                     Err(e) => format!("Acknowledgment failed: {e}"),
                 },
                 MailAction::Send(a) => {
-                    let result = if a.verb == "service" {
+                    let result = if a.verb == "init" {
+                        privateer::dashboard::command::initialize(
+                            &binary,
+                            std::path::Path::new(a.args["folder"].as_str().unwrap_or("")),
+                            a.args["name"].as_str().unwrap_or(""),
+                            a.args["harness"].as_str().unwrap_or(""),
+                            a.args["liaison"] == true,
+                        )
+                    } else if a.verb == "service" {
                         privateer::dashboard::command::service(
                             &binary,
                             &a.home,
@@ -170,6 +180,9 @@ fn mail_worker(
                     match result {
                         Ok(value) => {
                             sent = true;
+                            if a.verb == "init" {
+                                board = value["ship"].as_str().map(str::to_owned);
+                            }
                             format!(
                                 "{}: {}",
                                 a.verb,
@@ -194,6 +207,7 @@ fn mail_worker(
                     notice,
                     sent,
                     completed_send,
+                    board,
                 })
                 .is_err()
             {
@@ -389,6 +403,9 @@ fn run(opts: Options) -> Result<()> {
         home_age: Some(0),
         ..App::default()
     };
+    if !opts.demo && app.snapshot.ships.is_empty() {
+        app.onboard();
+    }
     let mut home_updated = Instant::now();
     let mut herdr_updated: Option<Instant> = None;
     let mut terminal = ratatui::try_init()?;
@@ -434,6 +451,9 @@ fn run(opts: Options) -> Result<()> {
                     if update.completed_send {
                         app.mail_pending = false;
                     }
+                    if let Some(ship) = update.board {
+                        app.pending_board = Some(ship);
+                    }
                     if update.sent {
                         app.composer = None;
                         app.form = None;
@@ -461,6 +481,16 @@ fn run(opts: Options) -> Result<()> {
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
             if opts.demo {
                 app.herdr_age = Some(0);
+            }
+            if let Some(ship) = app
+                .pending_board
+                .as_ref()
+                .filter(|id| app.snapshot.ships.iter().any(|s| &s.id == *id))
+                .cloned()
+            {
+                app.pending_board = None;
+                app.select_ship(Some(ship));
+                app.board_requested = true;
             }
             if app.board_requested {
                 app.board_requested = false;
@@ -507,12 +537,17 @@ fn run(opts: Options) -> Result<()> {
                     {
                         break;
                     }
-                    if !key
+                    if key.code == KeyCode::Char('u')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        app.edit_form(KeyCode::Delete);
+                    } else if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     {
                         app.edit_form(key.code);
                     }
+
                     continue;
                 }
                 if app.composer.is_some() {

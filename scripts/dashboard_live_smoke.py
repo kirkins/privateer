@@ -223,7 +223,7 @@ def run(binary, runtime):
                {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
         env.update(HOME=str(root), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
-                   PATH=str(bins) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"))
+                   PATH=str(bins) + ":/usr/bin:/bin")
 
         def cli(*args, cwd=folder):
             result = subprocess.run([str(runtime), *args], cwd=cwd, env=env, capture_output=True, timeout=10)
@@ -272,3 +272,73 @@ def run(binary, runtime):
             server.close()
         assert not command("ship.presence", {"ship": "apps"})["attended"]
         print("Live dashboard PTY passed: captain reply, Board/start/presence/binding, focus, dispatcher status, new/retire; isolated fake Herdr only.")
+
+
+def onboarding(binary, runtime):
+    with tempfile.TemporaryDirectory(prefix="privateer-onboard-", dir="/tmp") as temporary:
+        root = Path(temporary)
+        bins = root / "bin"
+        bins.mkdir()
+        harness = bins / "codex"
+        harness.write_text("#!/usr/bin/env python3\nimport os,time\nfrom pathlib import Path\n"
+                           "Path(os.environ['HOME'],'harness-started').touch()\n"
+                           "while not Path(os.environ['HOME'],'release').exists(): time.sleep(.05)\n")
+        harness.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k not in
+               {"PRIVATEER_HOME", "PRIVATEER_ROLE", "PRIVATEER_ACTOR", "HERDR_ENV", "HERDR_SOCKET_PATH"}}
+        env.update(HOME=str(root), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
+                   PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color", PATH=str(bins)+":/usr/bin:/bin")
+        # Skipping first-run setup creates neither a home nor a registry.
+        skipped = Tui(binary, env, ["--no-herdr"])
+        try:
+            assert "Welcome" in skipped.screen()
+            skipped.keys(b"\x1b")
+            assert not (root / "fleet.sqlite").exists()
+            assert not (root / "ships").exists()
+        finally:
+            skipped.close()
+        server = Herdr(root, env)
+        tui = None
+        folder = root / "custom contact ' folder"
+        home = folder / ".privateer"
+        try:
+            tui = Tui(binary, env, ["--herdr-socket", str(server.path)])
+            assert "liaison" in tui.screen() and "codex" in tui.screen()
+            tui.keys(b"\x15contact\t\x15" + str(folder).encode() + b"\t\x1b[C\r")
+            tui.until(lambda: (home / "privateer.sqlite").is_file(), "onboarding did not initialize the chosen folder")
+            tui.until(lambda: (root / "harness-started").exists(), "onboarding did not automatically Board")
+            def query(verb, args):
+                out = subprocess.run([str(runtime), "--home", str(home), verb, "--json", json.dumps(args)],
+                                     env=env, capture_output=True, timeout=10)
+                assert out.returncode == 0, out.stderr.decode()
+                return json.loads(out.stdout)
+            tui.until(lambda: query("ship.presence", {"ship":"contact"})["attended"], "onboarded ship has no presence")
+            assert query("charter.show", {"id":"contact"})["actions"] == ["inspect", "spawn", "message"]
+            assert json.loads((home / "config.json").read_text())["preset"] == "liaison"
+            assert "Onboarding the captain" in (folder / "AGENTS.md").read_text()
+            tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
+            assert server.creates == 1 and not server.errors, server.errors
+        finally:
+            if tui:
+                tui.close()
+            server.close()
+        # A person may choose an ordinary ship first. No Herdr means it is
+        # created and the explicit Board limitation is shown, not a hidden launch.
+        plain_root = root / "plain"
+        plain_root.mkdir()
+        plain_env = dict(env, HOME=str(plain_root), PRIVATEER_FLEET=str(plain_root / "fleet.sqlite"),
+                         PRIVATEER_RESOURCE_HOME=str(plain_root / "ledger"))
+        plain = Tui(binary, plain_env, ["--no-herdr"])
+        try:
+            plain.keys(b"\x15apps\t\t\t\x15ship\r")
+            plain_home = plain_root / "ships/apps/.privateer"
+            plain.until(lambda: (plain_home / "privateer.sqlite").is_file(), "ordinary first ship was not created")
+            plain.until(lambda: "Board needs" in plain.screen(), "missing Herdr was not explained")
+            config = json.loads((plain_home / "config.json").read_text())
+            assert "preset" not in config
+            out = subprocess.run([str(runtime), "--home", str(plain_home), "charter.show", "--json", '{"id":"apps"}'],
+                                 env=plain_env, capture_output=True, check=True)
+            assert "implement" in json.loads(out.stdout)["actions"]
+        finally:
+            plain.close()
+        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness/automatic Board, ordinary first ship opt-out; no model calls.")
