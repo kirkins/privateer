@@ -67,3 +67,32 @@ fn two_ship_fixture_recovers_without_duplicate_work_or_surviving_payloads() {
     assert_eq!(evidence["binary_sha256"].as_str().unwrap().len(), 64);
     assert!(!evidence["tested_head"].as_str().unwrap().is_empty());
 }
+
+#[test]
+fn exhausted_scenario_log_and_deadline_do_not_block_live_payload_cleanup() {
+    let output = support::command("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/recovery_cleanup.py"))
+        .args(["--binary", env!("CARGO_BIN_EXE_privateer")])
+        .output()
+        .expect("Python 3 is required for the recovery cleanup regression");
+    assert!(
+        output.status.success(),
+        "cleanup regression failed; retained evidence location follows:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["passed"], true);
+    let evidence: Value =
+        serde_json::from_slice(&fs::read(summary["evidence"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(evidence["native_inference"], false);
+    assert_eq!(evidence["driver_log_bytes"], 1024 * 1024);
+    assert_eq!(evidence["cleanup"]["passed"], true);
+    assert_eq!(evidence["job_status"], "cancelled");
+    for collection in ["live_group_members", "reservations", "queue"] {
+        assert!(
+            evidence[collection].as_array().unwrap().is_empty(),
+            "{collection}"
+        );
+    }
+}

@@ -198,14 +198,16 @@ class Pilot:
         self.evidence["tested_head"] = head
 
     def cleanup(self):
+        # Scenario failure may have exhausted its deadline or evidence cap.
+        # Neither budget may prevent stopping a dispatcher or cancelling crew.
+        self.commands = Commands(self.root, "cleanup")
+        self.commands.settings["deadline_monotonic"] = time.monotonic() + 20
         errors, jobs, groups = [], {}, {}
         for ship in list(self.dispatchers):
             try:
                 self.stop_dispatcher(ship)
             except Exception as error:
                 errors.append(f"dispatcher {ship}: {error}")
-        # Cleanup has its own bounded deadline even when the scenario timed out.
-        self.commands.settings["deadline_monotonic"] = time.monotonic() + 20
         for ship in self.homes:
             if not (self.homes[ship] / "privateer.sqlite").exists():
                 continue
