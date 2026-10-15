@@ -467,6 +467,54 @@ def onboarding(binary, runtime):
             tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
             tui.drain(2.5)
             assert server.creates == 1 and server.focuses == 0 and not server.errors, server.errors
+            # Everyday entry must reach the native conversation, leaving this
+            # dashboard alive as the observability tab. Reopening must reuse
+            # the exact presence binding rather than start another first mate.
+            tui.close()
+            tui = None
+            tui = Tui(binary, env, ["--herdr-socket", str(server.path)])
+            tui.drain(2.5)
+            assert server.creates == 1 and server.focuses == 0, "direct dashboard entry launched or focused an agent"
+            tui.close()
+            tui = None
+            once = subprocess.run([str(binary), "--once", "--board-liaison", "--herdr-socket", str(server.path)],
+                                  env=env, capture_output=True, check=True, timeout=10)
+            assert json.loads(once.stdout)["read_only"] is True
+            assert server.creates == 1 and server.focuses == 0, "--once performed a startup action"
+            tui = Tui(runtime, env, [], cwd=root)
+            tui.until(lambda: "to talk directly, run:" in tui.screen(), "ordinary entry did not explain how to reach the liaison")
+            tui.keys(b"l")
+            assert server.creates == 1 and server.focuses == 0, "ordinary entry discovered an unconfigured socket"
+            tui.close()
+            tui = None
+            entry_env = dict(env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(server.path))
+            tui = Tui(runtime, entry_env, [], cwd=root)
+            tui.until(lambda: server.focuses == 1, "bare privateer did not automatically focus the liaison")
+            tui.drain(2.5)
+            assert server.creates == 1 and server.focuses == 1
+            tui.keys(b"0l")
+            tui.until(lambda: server.focuses == 2, "Talk to liaison needed another Board action")
+            screen = tui.screen().splitlines()
+            row, line = next((row, line) for row, line in enumerate(screen) if "[l Talk to liaison]" in line)
+            column = line.index("[l Talk to liaison]")
+            tui.keys(f"\x1b[<0;{column+1};{row+1}M\x1b[<0;{column+1};{row+1}m".encode())
+            tui.until(lambda: server.focuses == 3, "Talk to liaison click did not focus the conversation")
+            tui.close()
+            tui = None
+            # End the attended session while retaining its old Herdr pane.
+            # Next entry must create a fresh conversation automatically.
+            (root / "release").touch()
+            for child in server.children:
+                _, error = child.communicate(timeout=5)
+                assert child.returncode == 0, error.decode()
+            (root / "release").unlink()
+            (root / "harness-started").unlink()
+            tui = Tui(runtime, entry_env, [], cwd=root)
+            tui.until(lambda: (root / "harness-started").exists(), "bare privateer did not open an offline liaison")
+            tui.until(lambda: query("ship.presence", {"ship":"contact"})["attended"], "automatic liaison launch did not claim presence")
+            assert query("ship.presence", {"ship":"contact"})["lease"]["binding"]["pane"]["pane_id"] == "w1:p2"
+            tui.drain(2.5)
+            assert server.creates == 2 and server.focuses == 3 and not server.errors, server.errors
         finally:
             if tui:
                 tui.close()
@@ -503,7 +551,7 @@ def onboarding(binary, runtime):
             gamma = {"id":"gamma", "name":"gamma", "liaison":True}
             alpha_config.write_text(json.dumps({"ships":[gamma]}))
             multi.until(lambda: "Liaison · your default contact" in multi.screen(), "explicit contact did not override preset candidates")
-            multi.keys(b"lb")
+            multi.keys(b"l")
             multi.until(lambda: multi_server.focused == ["w1:p3"], "explicit contact did not focus the chosen ordinary ship")
             beta_config.write_text(json.dumps({"ships":[{"id":"beta", "name":"beta", "liaison":True}]}))
             multi.until(lambda: "PRESENTATION UNAVAILABLE" in multi.screen(), "conflicting explicit contacts did not fail safely")
@@ -634,4 +682,4 @@ def onboarding(binary, runtime):
                 assert not (plain_root / "escaped").exists()
             finally:
                 plain.close()
-        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
+        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, bare entry opens/focuses the liaison with keyboard/mouse return and no duplicate launch, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")

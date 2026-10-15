@@ -387,7 +387,7 @@ impl App {
                 {
                     match action {
                         'i' => self.open_inbox(),
-                        'l' => self.open_liaison(),
+                        'l' => self.talk_to_liaison(),
                         'm' => self.compose(),
                         'b' => self.board_requested = true,
                         'n' => self.manage(super::forms::Kind::New),

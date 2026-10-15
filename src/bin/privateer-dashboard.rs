@@ -31,6 +31,7 @@ struct Options {
     once: bool,
     ascii: bool,
     no_herdr: bool,
+    board_liaison: bool,
 }
 
 fn options() -> Result<Option<Options>> {
@@ -50,9 +51,10 @@ fn options() -> Result<Option<Options>> {
             "--once" => out.once = true,
             "--ascii" => out.ascii = true,
             "--no-herdr" => out.no_herdr = true,
+            "--board-liaison" => out.board_liaison = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: liaison; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nFleet observations are read-only. b: Board; n: New ship; x: Retire; d: Dispatcher.\nMail and management use Privateer commands. No input injection or model calls."
+                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--board-liaison    Open/focus the liaison on entry (used by bare privateer)\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: open/focus liaison conversation; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nFleet observations are read-only. b: Board; n: New ship; x: Retire; d: Dispatcher.\nMail and management use Privateer commands. Board launches the harness; no input to existing agents."
                 );
                 return Ok(None);
             }
@@ -323,7 +325,19 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) -> boo
         return false;
     }
     let (Some(view), Some(sender)) = (&app.herdr, sender) else {
-        app.notice = "Board needs an explicitly configured Herdr connection.".into();
+        app.notice = app
+            .snapshot
+            .ships
+            .iter()
+            .find(|ship| Some(&ship.id) == app.ship.as_ref())
+            .and_then(BoardTarget::from_ship)
+            .map_or_else(
+                || "Board needs an explicitly configured Herdr connection.".into(),
+                |target| format!(
+                    "No Herdr connection configured; to talk directly, run: privateer --home '{}' start",
+                    target.home.to_string_lossy().replace('\'', "'\"'\"'")
+                ),
+            );
         return false;
     };
     if app.herdr_error.is_some()
@@ -436,6 +450,20 @@ fn run(opts: Options) -> Result<()> {
     };
     if !opts.demo && app.snapshot.ships.is_empty() {
         app.onboard();
+    } else if opts.board_liaison && !opts.demo {
+        app.open_liaison();
+        if let Some(ship) = app
+            .snapshot
+            .ships
+            .iter()
+            .find(|ship| ship.liaison && Some(&ship.id) == app.ship.as_ref())
+        {
+            if herdr.is_some() {
+                app.pending_board = BoardTarget::from_ship(ship);
+            } else {
+                request_board(&mut app, None);
+            }
+        }
     }
     let mut home_updated = Instant::now();
     let mut herdr_updated: Option<Instant> = None;
@@ -620,7 +648,7 @@ fn run(opts: Options) -> Result<()> {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('0') | KeyCode::Home => app.select_ship(None),
                     KeyCode::Char('i') => app.open_inbox(),
-                    KeyCode::Char('l') => app.open_liaison(),
+                    KeyCode::Char('l') => app.talk_to_liaison(),
                     KeyCode::Char('m') => app.compose(),
                     KeyCode::Char('b') if app.ship.is_some() => app.board_requested = true,
                     KeyCode::Char('n') => app.manage(privateer::dashboard::forms::Kind::New),

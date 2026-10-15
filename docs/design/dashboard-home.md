@@ -64,4 +64,5 @@ The same actions without Herdr: a tmux window per ship running `privateer start`
 - Board on a ship with no pane opens a Herdr tab in its folder running `privateer start`, and the ship shows as aboard; Board again focuses that pane.
 - First run with an empty fleet walks through creating a liaison, following the documented [creation and Board conditions](../dashboard.md#first-run-and-everyday-entry).
 - With an executable dashboard installed beside the runtime or on PATH, bare `privateer` opens it in ordinary terminals and Herdr. `privateer start` is the direct harness command. Only a missing dashboard retains the legacy harness/initialization flow.
+- With a configured Herdr connection and a selected liaison, bare entry opens or focuses its conversation automatically, leaving the dashboard available in its original tab. `l` and **Talk to liaison** perform the same verified Board action. Direct dashboard entry remains observational.
 - Tests drive real binaries against temporary homes with a private `PRIVATEER_FLEET` and `PRIVATEER_SERVICE=none`; Herdr interactions are covered by the existing smoke-test approach.

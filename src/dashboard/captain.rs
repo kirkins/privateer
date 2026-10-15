@@ -167,6 +167,17 @@ impl App {
             );
         }
     }
+    pub fn talk_to_liaison(&mut self) {
+        self.open_liaison();
+        if self
+            .snapshot
+            .ships
+            .iter()
+            .any(|ship| ship.liaison && Some(&ship.id) == self.ship.as_ref())
+        {
+            self.board_requested = true;
+        }
+    }
     pub fn compose(&mut self) {
         if self.mail_pending {
             return;

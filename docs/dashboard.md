@@ -110,8 +110,19 @@ Bare `privateer` opens an executable `privateer-dashboard` installed beside it
 or on PATH, in ordinary terminals as well as Herdr. With a current ship, its
 dispatcher is ensured first. `privateer start` always opens the harness directly.
 Only a missing dashboard retains the legacy harness/initialization flow.
+Bare entry passes `--board-liaison`: with a configured Herdr connection and one
+selected liaison, it automatically opens the liaison's first mate in a new tab
+or focuses its verified live pane. The dashboard remains available in its
+original tab through Herdr navigation. Startup waits for fresh observations and
+pins the selected ship's canonical home; it never chooses between conflicting
+contacts. A queued attempt runs once; after a launch failure, use `l` to retry.
+Running `privateer-dashboard` directly keeps the observational entry behavior;
+`--once` stays read-only even with `--board-liaison`.
 Standalone observation, inbox and onboarding need no Herdr socket; Board still
 requires an explicitly selected or inherited socket and validated bindings.
+Privateer does not launch Herdr from an ordinary terminal. Without a connection,
+bare entry selects the liaison and displays a quoted direct `privateer --home
+HOME start` command instead of launching a second terminal manager.
 
 With an empty fleet, the interactive dashboard welcomes the captain and suggests
 `liaison` at `~/ships/liaison`. Name and folder are editable; the suggested folder
@@ -141,6 +152,12 @@ The same runtime guide covers bare `privateer` and direct `privateer start`
 entry. Installation is covered under [Build and preview](#build-and-preview).
 
 ## Boarding and management
+
+Press `l` or click **Talk to liaison** to open or focus its native conversation
+in one action. This uses the same verified Board path as any ship; `m` remains
+the dashboard's separate mailbox composer. Herdr discovers the harness after
+it starts in the created pane; fleet registration alone does not create a live
+Herdr agent.
 
 Select a ship and press `b` (or click Board). A live exact binding focuses its
 Herdr terminal. Otherwise Board creates a tab in the ship folder and launches

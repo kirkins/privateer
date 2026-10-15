@@ -36,6 +36,9 @@ See [dashboard setup and boundaries](docs/dashboard.md).
 
 Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
 Herdr. With no current ship, first-run setup offers a dedicated ship folder.
+Inside Herdr, entry opens or focuses your liaison's conversation and keeps the
+dashboard available in its original tab. Press `l` in the dashboard to return to
+the liaison. Running `privateer-dashboard` directly opens the observability view.
 
 ```sh
 cargo install --locked --path . --features dashboard  # installs privateer + privateer-dashboard
