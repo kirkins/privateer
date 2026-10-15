@@ -36,9 +36,6 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS mail_correlation ON mail(correlation);
          CREATE TABLE IF NOT EXISTS mail_cursor(address TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);",
     )?;
-    // Delivery state for mail crossing homes: NULL for mail that stays in
-    // this home, 'pending' or 'delivered' for outgoing copies, 'received' for
-    // mail delivered here by a peer.
     let tx = store.write_transaction()?;
     for (column, declaration) in [
         ("delivery", "TEXT"),
