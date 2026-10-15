@@ -35,6 +35,7 @@ class Herdr:
         self.panes, self.children, self.errors = [], [], []
         self.creates = self.focuses = 0
         self.delay_next = False
+        self.fail_next = False
         self.expected_failures = set()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.accept, daemon=True)
@@ -87,7 +88,12 @@ class Herdr:
                        HERDR_TAB_ID=pane["tab_id"], HERDR_WORKSPACE_ID=pane["workspace_id"])
             # The real runtime owns the fake harness and presence lifecycle.
             launch = argv[1:]
-            if self.delay_next:
+            if self.fail_next:
+                self.fail_next = False
+                # Fail before Privateer can claim presence. A harness that
+                # briefly ran may legitimately clear the startup guard.
+                launch = [sys.executable, "-c", "raise SystemExit(1)"]
+            elif self.delay_next:
                 self.delay_next = False
                 launch = [sys.executable, "-c",
                           "import os,sys,time\nfrom pathlib import Path\n"
@@ -237,7 +243,7 @@ def run(binary, runtime):
                if not k.startswith("PRIVATEER_") and k not in {"HERDR_ENV", "HERDR_SOCKET_PATH"}}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
-                   PATH=str(bins) + ":/usr/bin:/bin")
+                   PATH=os.pathsep.join([str(bins), str(Path(sys.executable).parent), os.environ.get("PATH", "/usr/bin:/bin")]))
 
         def cli(*args, cwd=folder):
             result = subprocess.run([str(runtime), *args], cwd=cwd, env=env, capture_output=True, timeout=10)
@@ -331,28 +337,36 @@ def run(binary, runtime):
                 presence = command("ship.presence", {"ship": "apps"})
                 return presence["attended"] and presence["lease"]["binding"]["pane"]["pane_id"] == f"w1:p{pane_number}"
 
+            def pending_guard(message):
+                def blocked():
+                    # A stale fleet observation can still route the first key
+                    # to the completed pane. Retry while the fresh observation
+                    # arrives, within the 15-second startup guard window.
+                    tui.keys(b"0jj\rb")
+                    # Let the worker result render before another key replaces
+                    # its notice with "Checking ship and terminal".
+                    tui.drain(1.0)
+                    return "launch already submitted" in tui.screen()
+                tui.until(blocked, message, timeout=8)
+
             finish(1)
             board_until(2, "Board could not restart after a completed harness left its pane")
             tui.until(lambda: bound_to(2), "restart did not claim a fresh bound lease")
             tui.until(lambda: (root / "harness-started-w1:p2").exists(), "restart did not run a fresh harness")
             tui.drain(2.5)
             finish(2)
-            harness_script = harness.read_text()
-            harness.write_text("#!/bin/sh\nexit 1\n")
+            server.fail_next = True
             board_until(3, "Board could not submit the failed-start scenario")
             failed = server.children[2]
             server.expected_failures.add(failed.pid)
             assert failed.wait(timeout=5) == 1
             assert not command("ship.presence", {"ship": "apps"})["attended"]
-            tui.keys(b"0jj\rbbb")
-            tui.until(lambda: "launch already submitted" in tui.screen(), "failed startup lost its uncertainty guard")
+            pending_guard("failed startup lost its uncertainty guard")
             assert server.creates == 3
-            harness.write_text(harness_script)
             server.delay_next = True
             board_until(4, "failed startup permanently blocked Board")
             assert not command("ship.presence", {"ship": "apps"})["attended"]
-            tui.keys(b"0jj\rbbb")
-            tui.until(lambda: "launch already submitted" in tui.screen(), "delayed startup did not retain its pending guard")
+            pending_guard("delayed startup did not retain its pending guard")
             assert server.creates == 4
             assert not (root / "harness-started-w1:p4").exists()
             (root / "allow-start").touch()
