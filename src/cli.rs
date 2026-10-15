@@ -378,7 +378,7 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     );
     fs::create_dir_all(folder.join("projects"))?;
     let mut store = Store::open(home)?;
-    let binary = std::env::current_exe()?;
+    let binary = crate::executable::installed()?;
     let cli = format!("{} --home {}", binary.display(), store.home().display());
 
     crate::dispatch(&mut store, "init", json!({"ship": ship}))?;
@@ -551,7 +551,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     };
     let folder = home.parent().context("ship folder")?;
     let holder = format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4());
-    let control = std::env::current_exe()?;
+    let control = crate::executable::installed()?;
     let mut command = std::process::Command::new(&binary);
     if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
         let plugins = fs::canonicalize(plugins_dir()?)?;

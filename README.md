@@ -40,6 +40,8 @@ privateer                           # every time after: straight to the first ma
 
 The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. Scripts can use `privateer --yes` to skip the question.
 
+For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable).
+
 ## General runtime and optional integrations
 
 The core owns charters, tasks, custody, targeted messages, coalesced notifications, durable jobs, resource admission, and SSH transport. It contains no personal provider account, model, gateway address, machine name, or user path.

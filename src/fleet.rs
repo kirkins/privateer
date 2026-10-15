@@ -107,7 +107,7 @@ fn reach(store: &mut Store, other: &str, other_home: &Path, scope: &str) -> Resu
         return Ok(false);
     }
     let peer = format!("fleet-{other}");
-    let binary = std::env::current_exe()?;
+    let binary = crate::executable::installed()?;
     crate::peers::dispatch(
         store,
         "peer.put",

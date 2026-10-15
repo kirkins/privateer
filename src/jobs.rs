@@ -781,6 +781,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
     );
     // An optional per-charter share of the host's heavy work.
     let charter_cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
+    let executable = crate::executable::supervisor()?;
     let ledger_path = ledger_path(store)?;
     let mut job = Job {
         id: id.clone(),
@@ -898,8 +899,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
     if let Some(existing) = admitted? {
         return Ok(public_job(&existing));
     }
-    let executable = std::env::current_exe()?;
-    let mut cmd = Command::new(executable);
+    let mut cmd = Command::new(&executable);
     cmd.arg("--home")
         .arg(store.home())
         .arg("_job-supervise")
@@ -936,10 +936,16 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
             job = alter(store, &id, |j| {
                 j.status = "failed".into();
                 j.finished_ms = Some(Store::now_ms());
-                j.reason = Some(format!("supervisor spawn failed: {error}"));
+                j.reason = Some(format!(
+                    "supervisor spawn failed using {}: {error}",
+                    executable.display()
+                ));
             })?;
             release(store, &job)?;
-            return Err(error.into());
+            dequeue(store, &job)?;
+            return Err(error).with_context(|| {
+                format!("spawn Privateer supervisor using {}", executable.display())
+            });
         }
     }
     store.audit(

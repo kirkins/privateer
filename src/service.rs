@@ -120,7 +120,7 @@ pub fn ensure(home: &Path, ship: &str) -> Result<String> {
     if running(home)? {
         return Ok("already running".into());
     }
-    let binary = std::env::current_exe()?;
+    let binary = crate::executable::installed()?;
     match mode().as_str() {
         "none" => Ok("not started (PRIVATEER_SERVICE=none)".into()),
         "systemd" => {
