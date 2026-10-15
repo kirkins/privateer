@@ -159,16 +159,29 @@ fn config(store: &Store) -> Result<Value> {
         Ok(json!({}))
     }
 }
-fn ledger_path(store: &Store) -> Result<PathBuf> {
+/// Where the shared resource ledger lives, without creating anything. A
+/// sandboxed first mate must be able to write there to start crew jobs.
+pub(crate) fn ledger_dir(store: &Store) -> Result<PathBuf> {
     let cfg = config(store)?;
-    let path = if let Some(p) = cfg.get("resource_home").and_then(Value::as_str) {
-        PathBuf::from(p)
-    } else if let Ok(p) = std::env::var("PRIVATEER_RESOURCE_HOME") {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from(std::env::var("HOME").context("HOME required for shared resource ledger")?)
+    Ok(
+        if let Some(p) = cfg.get("resource_home").and_then(Value::as_str) {
+            PathBuf::from(p)
+        } else if let Ok(p) = std::env::var("PRIVATEER_RESOURCE_HOME") {
+            PathBuf::from(p)
+        } else {
+            PathBuf::from(
+                std::env::var("HOME").context("HOME required for shared resource ledger")?,
+            )
             .join(".local/state/privateer-host")
-    };
+        },
+    )
+}
+/// Create (if needed) and validate the ledger directory; return the ledger.
+pub(crate) fn ensure_ledger(store: &Store) -> Result<PathBuf> {
+    ledger_path(store)
+}
+fn ledger_path(store: &Store) -> Result<PathBuf> {
+    let path = ledger_dir(store)?;
     ensure!(path.is_absolute(), "resource_home must be absolute");
     crate::store::reject_symlinks(&path)?;
     fs::create_dir_all(&path)?;

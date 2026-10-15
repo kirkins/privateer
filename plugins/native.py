@@ -119,6 +119,12 @@ def build(harness, request):
                 if not home.is_dir():
                     raise ValueError("operational home missing")
                 argv += ["--add-dir", str(home)]
+                # The runtime also names the shared resource ledger, which a
+                # first mate needs to start crew jobs.
+                for extra in request["context"]["control"].get("writable", []):
+                    extra = Path(extra).resolve()
+                    if extra != home and extra.is_dir():
+                        argv += ["--add-dir", str(extra)]
         if effort:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
         if boolean(options, "ephemeral"):

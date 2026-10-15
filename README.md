@@ -29,6 +29,20 @@ Click a ship, then its workspace tabs; `0` returns to Fleet overview. Keyboard
 navigation and mouse-wheel scrolling remain available.
 See [dashboard setup and boundaries](docs/dashboard.md).
 
+## Quick start
+
+A ship is a dedicated folder. Turn one into a ship, then talk to its first mate with any supported harness:
+
+```sh
+cargo build && export PATH=$PWD/target/debug:$PATH
+mkdir -p ~/ships/infra && cd ~/ships/infra
+privateer init                      # names the ship after the folder, detects your harness
+privateer project add <git url>     # repositories the ship works on go in projects/
+privateer serve                     # keep running: answers mail while you are away
+claude                              # or codex, pi, …: this session is infra's first mate
+privateer ask infra "..."           # or ask from anywhere in the folder; read answers with: privateer inbox
+```
+
 ## General runtime and optional integrations
 
 The core owns charters, tasks, custody, targeted messages, coalesced notifications, durable jobs, resource admission, and SSH transport. It contains no personal provider account, model, gateway address, machine name, or user path.

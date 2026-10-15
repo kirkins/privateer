@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod admission;
+pub mod cli;
 pub mod context;
 pub mod core;
 #[cfg(feature = "dashboard")]

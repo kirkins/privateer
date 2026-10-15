@@ -1,0 +1,550 @@
+//! Commands for people: `privateer init`, `ask`, `inbox` and friends.
+//!
+//! A ship is a dedicated folder. Its state lives in `<folder>/.privateer`,
+//! found from the current directory upward the way git finds `.git`, and the
+//! folder is its charter's repository root, with the projects it works on
+//! cloned into `projects/`. `init` turns a folder into a ship with sensible
+//! defaults and writes the instructions that make any harness launched there
+//! its first mate. JSON commands for agents and RPC are unchanged.
+use crate::store::{Store, identifier};
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub const STATE_DIR: &str = ".privateer";
+/// Commands that mean the human form when given without `--json`.
+pub const VERBS: &[&str] = &[
+    "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project",
+];
+const GENERATED: &str = "<!-- privateer:generated -->";
+/// Harness binaries in order of preference, with their bundled adapter ids.
+const HARNESSES: &[(&str, &str)] = &[
+    ("claude", "claude"),
+    ("codex", "codex"),
+    ("pi", "pi"),
+    ("omp", "omp"),
+    ("opencode", "opencode"),
+    ("gemini", "gemini"),
+    ("cursor-agent", "cursor"),
+    ("grok", "grok"),
+];
+
+/// The ship home for the current directory: the nearest `.privateer`.
+pub fn discover_home() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(STATE_DIR);
+        if candidate.join("privateer.sqlite").is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn on_path(binary: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file()))
+}
+
+/// The bundled adapters: `PRIVATEER_PLUGINS`, a `plugins/` directory beside
+/// or above the executable (a source checkout's target/ build), or the
+/// checkout the binary was built from.
+fn plugins_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("PRIVATEER_PLUGINS") {
+        return Ok(PathBuf::from(dir));
+    }
+    let executable = std::env::current_exe()?;
+    for dir in executable.ancestors().skip(1) {
+        for candidate in [dir.join("plugins"), dir.join("share/privateer/plugins")] {
+            if candidate.join("native.py").is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    // A binary installed with `cargo install --path` still finds the
+    // checkout it was built from.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+    if source.join("native.py").is_file() {
+        return Ok(source);
+    }
+    bail!("cannot find Privateer's bundled plugins; set PRIVATEER_PLUGINS to its plugins directory")
+}
+
+fn ship_name(folder: &Path) -> Result<String> {
+    let raw = folder
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("cannot name a ship after this folder; pass --ship NAME")?;
+    let name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    identifier(&name).with_context(|| format!("cannot name a ship {raw:?}; pass --ship NAME"))?;
+    Ok(name)
+}
+
+struct Flags {
+    positional: Vec<String>,
+    values: std::collections::HashMap<String, String>,
+    switches: Vec<String>,
+}
+
+fn flags(args: &[String], with_value: &[&str]) -> Result<Flags> {
+    let mut out = Flags {
+        positional: vec![],
+        values: Default::default(),
+        switches: vec![],
+    };
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(name) = arg.strip_prefix("--") {
+            if with_value.contains(&name) {
+                let value = iter
+                    .next()
+                    .with_context(|| format!("--{name} needs a value"))?;
+                out.values.insert(name.into(), value.clone());
+            } else {
+                out.switches.push(name.into());
+            }
+        } else {
+            out.positional.push(arg.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn instructions(ship: &str, scope: &str, cli: &str) -> String {
+    let scope = if scope.is_empty() {
+        String::new()
+    } else {
+        format!(" Its scope: {scope}.")
+    };
+    format!(
+        r#"{GENERATED}
+# First mate of {ship}
+
+You are the first mate of the Privateer ship **{ship}**.{scope} The captain, the person you are talking to, gives you direction. Ships are peers: you coordinate with other ships through mail, never by command, and you run your own crew as supervised jobs. This file is written by `privateer init`; remove the first line to keep your own edits.
+
+Run Privateer as `{cli} COMMAND --json '{{...}}'`.
+
+## At the start of every session
+
+1. `ship.bearings {{"ship":"{ship}"}}`: open tasks, requests owed and owing, ship knowledge.
+2. `mail.inbox {{"address":"{ship}"}}`: new mail. Answer requests, act on notices, then `mail.ack {{"address":"{ship}","through_seq":N}}`.
+3. `note.list {{"ship":"{ship}"}}` and `note.get {{"ship":"{ship}","focus":"task:<id>"}}`: the handoff notes you left for each focus.
+
+## Working
+
+- Mail as yourself: `mail.send {{"from":"{ship}","to":"<ship or captain>","kind":"request|notice|reply","body":"...","task_id":"<optional>"}}`; a reply sets `correlation` to the request id. `ship.list {{}}` shows who handles what.
+- Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`, then `job.status {{"id":"..."}}`.
+- Delegate with `task.create {{"id":"...","owner":"<ship>","title":"...","charter_id":"{ship}"}}`; hand off with `task.handoff`, which takes effect when the recipient runs `task.accept`.
+- History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
+- Before you stop, replace the handoff note for each focus you worked on: `note.put {{"ship":"{ship}","focus":"task:<id>|thread:<id>|captain|ship","body":"..."}}`. Keep it under 2 KB and to judgement: what you are doing and why, what you are waiting on, what comes next. Facts are already recorded. Put lasting preferences and conventions in the `ship` note.
+- Repositories live in `projects/`; the captain adds them with `privateer project add <git url>`.
+
+## Rules
+
+- Speak only as {ship}; never claim to be another ship or the captain.
+- Production deployment needs the captain's approval or a standing grant.
+- Do not claim a message, test, merge or deployment succeeded without evidence from Privateer or the tool.
+"#
+    )
+}
+
+/// Add Privateer's Bash permission to a Claude project settings file,
+/// keeping whatever else it holds.
+fn claude_settings(folder: &Path, binary: &str) -> Result<()> {
+    let path = folder.join(".claude/settings.json");
+    let mut settings: Value = match fs::read(&path) {
+        Ok(raw) => serde_json::from_slice(&raw).context("cannot read .claude/settings.json")?,
+        Err(_) => json!({}),
+    };
+    let rule = format!("Bash({binary}:*)");
+    let allow = settings
+        .as_object_mut()
+        .context(".claude/settings.json must hold an object")?
+        .entry("permissions")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("permissions must be an object")?
+        .entry("allow")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("permissions.allow must be a list")?;
+    if !allow.iter().any(|r| r == &json!(rule)) {
+        allow.push(json!(rule));
+    }
+    fs::create_dir_all(folder.join(".claude"))?;
+    fs::write(&path, serde_json::to_vec_pretty(&settings)?)?;
+    Ok(())
+}
+
+fn ensure_lines(path: &Path, lines: &[&str]) -> Result<()> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut text = existing.clone();
+    for line in lines {
+        if !existing.lines().any(|l| l.trim() == *line) {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    if text != existing {
+        fs::write(path, text)?;
+    }
+    Ok(())
+}
+
+/// Turn the current folder into a ship. Safe to run again: it updates the
+/// ship's settings and rewrites only files it generated.
+fn init(home: &Path, args: &[String]) -> Result<()> {
+    let flags = flags(args, &["ship", "harness", "scope"])?;
+    let folder = home.parent().context("ship folder")?.to_path_buf();
+    let ship = match flags.values.get("ship") {
+        Some(name) => {
+            identifier(name)?;
+            name.clone()
+        }
+        None => ship_name(&folder)?,
+    };
+    ensure!(
+        ship != crate::mail::CAPTAIN,
+        "captain is reserved for the person"
+    );
+    let plugins = plugins_dir()?;
+    let harness = match flags.values.get("harness") {
+        Some(id) => id.clone(),
+        None => HARNESSES
+            .iter()
+            .find(|(binary, id)| {
+                on_path(binary) && plugins.join(id).join("manifest.json").is_file()
+            })
+            .map(|(_, id)| (*id).to_owned())
+            .context(
+                "no supported AI harness found on PATH (claude, codex, pi, …); pass --harness ID",
+            )?,
+    };
+    let manifest = plugins.join(&harness).join("manifest.json");
+    ensure!(
+        manifest.is_file(),
+        "no bundled adapter for harness {harness} in {}",
+        plugins.display()
+    );
+    fs::create_dir_all(folder.join("projects"))?;
+    let mut store = Store::open(home)?;
+    let binary = std::env::current_exe()?;
+    let cli = format!("{} --home {}", binary.display(), store.home().display());
+
+    crate::dispatch(&mut store, "init", json!({}))?;
+    // The shared ledger must exist before a sandboxed first mate is planned.
+    crate::jobs::ensure_ledger(&store)?;
+    // Created once; later edits to the charter are the captain's to keep.
+    if store.charter(&ship).is_err() {
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id": ship, "objective": format!("Work as the ship {ship}"),
+                "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600}),
+        )?;
+    }
+    let previous = crate::dispatch(&mut store, "ship.show", json!({"name": ship})).ok();
+    let scope = flags
+        .values
+        .get("scope")
+        .cloned()
+        .or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|s| s["scope"].as_str().map(str::to_owned))
+        })
+        .unwrap_or_default();
+    let accepts = previous
+        .as_ref()
+        .map(|s| s["accepts"].clone())
+        .unwrap_or(json!([]));
+    let duty = format!("{ship}-duty");
+    if store.task(&duty).is_err() {
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id": duty, "charter_id": ship, "owner": ship,
+                "title": format!("{ship} first mate: mail and coordination")}),
+        )?;
+    }
+    // Headless first mates must be able to act: Codex writes inside its
+    // sandbox, Claude may edit files.
+    let options = match harness.as_str() {
+        "codex" => json!({"sandbox": "workspace-write"}),
+        "claude" => json!({"permission_mode": "acceptEdits"}),
+        _ => json!({}),
+    };
+    crate::dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name": ship, "scope": scope, "accepts": accepts, "first_mate":
+            {"manifest": manifest, "duty_task": duty, "options": options}}),
+    )?;
+
+    let agents = folder.join("AGENTS.md");
+    let ours = fs::read_to_string(&agents).map_or(true, |t| t.starts_with(GENERATED));
+    if ours {
+        fs::write(&agents, instructions(&ship, &scope, &cli))?;
+    }
+    let claude = folder.join("CLAUDE.md");
+    if !claude.exists() {
+        fs::write(&claude, "@AGENTS.md\n")?;
+    }
+    claude_settings(&folder, &binary.display().to_string())?;
+    ensure_lines(&folder.join(".gitignore"), &[".privateer/", "projects/"])?;
+
+    println!("Aye. {} is now the ship {ship}.", folder.display());
+    println!("  first mate harness: {harness} (change with: privateer init --harness ID)");
+    if !ours {
+        println!("  AGENTS.md exists and was not written by Privateer, so it was left alone.");
+    }
+    println!("\nNext:");
+    println!("  privateer project add <git url>    clone a repository for {ship} to work on");
+    println!(
+        "  privateer serve                     answer mail while you are away (keep it running)"
+    );
+    println!("  {harness}                              talk to {ship}'s first mate here");
+    println!(
+        "  privateer ask {ship} \"...\"           or send it a request from anywhere in this folder"
+    );
+    Ok(())
+}
+
+fn print_mail(message: &Value) {
+    let state = message["state"]
+        .as_str()
+        .map(|s| format!(" [{s}]"))
+        .unwrap_or_default();
+    println!(
+        "#{} {} from {}{}  ({})",
+        message["seq"],
+        message["kind"].as_str().unwrap_or(""),
+        message["from"].as_str().unwrap_or(""),
+        state,
+        message["id"].as_str().unwrap_or("")
+    );
+    for line in message["body"].as_str().unwrap_or("").lines() {
+        println!("    {line}");
+    }
+}
+
+fn text(positional: &[String], from: usize, usage: &str) -> Result<String> {
+    let body = positional[from.min(positional.len())..].join(" ");
+    ensure!(!body.trim().is_empty(), "usage: {usage}");
+    Ok(body)
+}
+
+/// Run a human command. `home` is the discovered or given ship home.
+pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
+    if verb == "init" {
+        let home = match home {
+            Some(home) => home,
+            None => std::env::current_dir()?.join(STATE_DIR),
+        };
+        return init(&home, args);
+    }
+    let home = home.context(
+        "not inside a ship folder (no .privateer found here or above); run `privateer init` to make this folder a ship",
+    )?;
+    let mut store = Store::open(&home)?;
+    let flags = flags(args, &[])?;
+    let p = &flags.positional;
+    match verb {
+        "status" => {
+            let status = crate::dispatch(&mut store, "status", json!({}))?;
+            let ships = crate::dispatch(&mut store, "ship.list", json!({}))?;
+            println!("Home: {}", home.display());
+            for ship in ships["ships"].as_array().into_iter().flatten() {
+                let name = ship["name"].as_str().unwrap_or("");
+                if ship["location"] == "here" {
+                    let bearings = crate::context::bearings(&store, name)?;
+                    print!("{}", bearings["text"].as_str().unwrap_or(""));
+                } else {
+                    println!("Ship {name}: behind peer {}", ship["location"]["peer"]);
+                }
+            }
+            let captain = crate::dispatch(&mut store, "mail.inbox", json!({"address": "captain"}))?;
+            println!(
+                "Captain's unread mail: {}   open requests: {}   undelivered mail: {}",
+                captain["messages"].as_array().map_or(0, Vec::len),
+                status["open_requests"],
+                status["undelivered_mail"]
+            );
+            let wakes = crate::dispatch(&mut store, "wake.list", json!({"limit": 3}))?;
+            for wake in wakes["wakes"].as_array().into_iter().flatten() {
+                println!(
+                    "Wake {} for {}: {} ({})",
+                    wake["id"].as_str().unwrap_or(""),
+                    wake["ship"].as_str().unwrap_or(""),
+                    wake["status"].as_str().unwrap_or(""),
+                    wake["mode"].as_str().unwrap_or("")
+                );
+            }
+        }
+        "ships" => {
+            let ships = crate::dispatch(&mut store, "ship.list", json!({}))?;
+            for ship in ships["ships"].as_array().into_iter().flatten() {
+                let place = if ship["location"] == "here" {
+                    "here".to_owned()
+                } else {
+                    format!("peer {}", ship["location"]["peer"].as_str().unwrap_or("?"))
+                };
+                let mate = ship["first_mate"]["manifest"]
+                    .as_str()
+                    .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+                    .map(|h| format!(", first mate: {h}"))
+                    .unwrap_or_default();
+                println!(
+                    "{} ({place}{mate}) {}",
+                    ship["name"].as_str().unwrap_or(""),
+                    ship["scope"].as_str().unwrap_or("")
+                );
+            }
+        }
+        "ask" | "tell" => {
+            let to = p
+                .first()
+                .with_context(|| format!("usage: privateer {verb} SHIP TEXT"))?;
+            let body = text(p, 1, &format!("privateer {verb} SHIP TEXT"))?;
+            let kind = if verb == "ask" { "request" } else { "notice" };
+            let sent = crate::dispatch(
+                &mut store,
+                "mail.send",
+                json!({"from": "captain", "to": to, "kind": kind, "body": body}),
+            )?;
+            let delivery = sent["delivery"]
+                .as_str()
+                .map(|d| format!(", delivery {d}"))
+                .unwrap_or_default();
+            println!(
+                "Sent {kind} {} to {to}{delivery}.",
+                sent["id"].as_str().unwrap_or("")
+            );
+            if verb == "ask" {
+                println!("Its answer will appear in `privateer inbox`.");
+            }
+        }
+        "inbox" => {
+            let all = flags.switches.iter().any(|s| s == "all");
+            let inbox = crate::dispatch(
+                &mut store,
+                "mail.inbox",
+                json!({"address": "captain", "all": all}),
+            )?;
+            let messages = inbox["messages"].as_array().cloned().unwrap_or_default();
+            if messages.is_empty() {
+                println!("No new mail, captain.");
+            }
+            for message in &messages {
+                print_mail(message);
+            }
+            // Shown is seen.
+            if let Some(last) = messages.last().and_then(|m| m["seq"].as_i64()) {
+                crate::dispatch(
+                    &mut store,
+                    "mail.ack",
+                    json!({"address": "captain", "through_seq": last}),
+                )?;
+                println!("\nAnswer with: privateer reply <id> \"...\"");
+            }
+        }
+        "reply" => {
+            let id = p.first().context("usage: privateer reply ID TEXT")?;
+            let body = text(p, 1, "privateer reply ID TEXT")?;
+            let message = crate::dispatch(&mut store, "mail.show", json!({"id": id}))?;
+            let kind = if message["state"] == "open" {
+                "reply"
+            } else {
+                "notice"
+            };
+            crate::dispatch(
+                &mut store,
+                "mail.send",
+                json!({"from": "captain", "to": message["from"], "kind": kind,
+                    "correlation": id, "body": body}),
+            )?;
+            println!("Sent {kind} to {}.", message["from"].as_str().unwrap_or(""));
+        }
+        "wakes" => {
+            let wakes = crate::dispatch(&mut store, "wake.list", json!({"limit": 10}))?;
+            let list = wakes["wakes"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("No wakes yet. Is `privateer serve` running?");
+            }
+            for wake in list {
+                let usage = wake["usage"]
+                    .as_object()
+                    .map(|u| {
+                        u.iter()
+                            .map(|(k, v)| format!("{k} {v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "{} {} {} {} {}{}",
+                    wake["id"].as_str().unwrap_or(""),
+                    wake["ship"].as_str().unwrap_or(""),
+                    wake["mode"].as_str().unwrap_or(""),
+                    wake["status"].as_str().unwrap_or(""),
+                    wake["focus"].as_str().unwrap_or(""),
+                    if usage.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{usage}]")
+                    }
+                );
+                if let Some(error) = wake["error"].as_str() {
+                    println!("    {error}");
+                }
+            }
+        }
+        "project" => {
+            ensure!(
+                p.first().map(String::as_str) == Some("add"),
+                "usage: privateer project add GIT_URL [NAME]"
+            );
+            let url = p
+                .get(1)
+                .context("usage: privateer project add GIT_URL [NAME]")?;
+            let name = match p.get(2) {
+                Some(name) => name.clone(),
+                None => url
+                    .trim_end_matches('/')
+                    .rsplit(['/', ':'])
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(".git")
+                    .to_owned(),
+            };
+            identifier(&name).context("pass a project NAME")?;
+            let folder = home.parent().context("ship folder")?;
+            let target = folder.join("projects").join(&name);
+            ensure!(!target.exists(), "{} already exists", target.display());
+            let status = std::process::Command::new("git")
+                .args(["clone", "--", url])
+                .arg(&target)
+                .status()
+                .context("run git clone")?;
+            ensure!(status.success(), "git clone failed");
+            println!("Cloned {url} into projects/{name}.");
+        }
+        _ => bail!("unknown command {verb}"),
+    }
+    Ok(())
+}

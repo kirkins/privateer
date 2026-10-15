@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use privateer::{
     dispatch, rpc,
     store::{Caller, Store},
@@ -13,6 +13,8 @@ fn run() -> Result<()> {
     let mut command = None;
     let mut args = json!({});
     let mut internal_job = None;
+    let mut positional: Vec<String> = vec![];
+    let mut json_given = false;
     let mut role = None;
     let mut actor = None;
     while let Some(token) = tokens.next() {
@@ -25,6 +27,7 @@ fn run() -> Result<()> {
                 ))
             }
             "--json" => {
+                json_given = true;
                 args = serde_json::from_str(&tokens.next().context("--json requires JSON")?)?
             }
             "--version" => {
@@ -41,13 +44,33 @@ fn run() -> Result<()> {
             _ if command.as_deref() == Some("_job-supervise") && internal_job.is_none() => {
                 internal_job = Some(token)
             }
+            // Human commands take positional arguments and flags of their own.
+            _ if command
+                .as_deref()
+                .is_some_and(|c| privateer::cli::VERBS.contains(&c)) =>
+            {
+                positional.push(token)
+            }
             _ => bail!("unexpected argument {token}"),
         }
     }
+    let command = command.context("command is required; use --help")?;
+    // The ship home: --home, PRIVATEER_HOME, or the nearest .privateer above
+    // the current directory.
     let home = home
         .or_else(|| std::env::var_os("PRIVATEER_HOME").map(PathBuf::from))
-        .context("--home or PRIVATEER_HOME is required")?;
-    let command = command.context("command is required; use --help")?;
+        .or_else(privateer::cli::discover_home);
+    if !json_given && privateer::cli::VERBS.contains(&command.as_str()) {
+        return privateer::cli::run(home, &command, &positional);
+    }
+    ensure!(
+        positional.is_empty(),
+        "unexpected argument {}",
+        positional.first().map(String::as_str).unwrap_or("")
+    );
+    let home = home.context(
+        "not inside a ship folder (no .privateer here or above); run `privateer init`, or pass --home",
+    )?;
     let mut store = Store::open(&home)?;
     let env = |name: &str| -> Result<Option<String>> {
         match std::env::var(name) {
