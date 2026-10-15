@@ -45,6 +45,9 @@ struct Service {
     /// Text the command line of the detached process must contain.
     marks: Vec<String>,
     what: String,
+    /// Wakes have independent supervisors; stopping a dispatcher is not a
+    /// cancellation. Doors, in contrast, must stop their adapters too.
+    preserve_children: bool,
 }
 
 fn dispatcher(home: &Path, ship: &str) -> Service {
@@ -65,6 +68,7 @@ fn dispatcher(home: &Path, ship: &str) -> Service {
         pid: home.join("serve.pid"),
         marks: vec!["serve".into(), home_text],
         what: "the dispatcher".into(),
+        preserve_children: true,
     }
 }
 
@@ -89,6 +93,7 @@ fn door(name: &str) -> Result<Service> {
         pid: dir.join("supervisor.pid"),
         marks: vec!["door".into(), "run".into(), name.into()],
         what: format!("the front door {name}"),
+        preserve_children: false,
     })
 }
 
@@ -153,8 +158,13 @@ fn unit(service: &Service, binary: &Path) -> String {
             }
         })
         .collect();
+    let kill_mode = if service.preserve_children {
+        "process"
+    } else {
+        "control-group"
+    };
     format!(
-        "[Unit]\nDescription={}\n\n[Service]\nExecStart={} {}\n{environment}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription={}\n\n[Service]\nExecStart={} {}\n{environment}KillMode={kill_mode}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
         service.description,
         quote(&binary.to_string_lossy()),
         args.join(" ")
@@ -293,6 +303,21 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
     let name = &service.unit;
     let unit = unit_dir()?.join(name);
     if unit.exists() {
+        if service.preserve_children {
+            // Older generated units used systemd's control-group default.
+            // Reload the safe stop policy BEFORE asking systemd to stop one;
+            // preserve its original executable, arguments and environment.
+            let previous = fs::read_to_string(&unit)?;
+            let safe = dispatcher_stop_policy(&previous)?;
+            fs::write(&unit, safe)?;
+            let status = Command::new(systemctl())
+                .args(["--user", "daemon-reload"])
+                .status()?;
+            ensure!(
+                status.success(),
+                "systemctl --user daemon-reload failed; not stopping dispatcher"
+            );
+        }
         let status = Command::new(systemctl())
             .args(["--user", "disable", "--now", name.as_str()])
             .status()?;
@@ -341,6 +366,38 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
         )
     }
     Ok(format!("{} was not running.", capitalized(&service.what)))
+}
+
+/// Upgrade only the stop policy of a previously generated dispatcher unit.
+fn dispatcher_stop_policy(unit: &str) -> Result<String> {
+    let mut service = false;
+    let mut found = false;
+    let mut lines = Vec::new();
+    for line in unit.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            service = trimmed == "[Service]";
+            if service {
+                found = true;
+                lines.push(line);
+                lines.push("KillMode=process");
+                continue;
+            }
+        }
+        if service
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "KillMode")
+        {
+            continue;
+        }
+        lines.push(line);
+    }
+    ensure!(
+        found,
+        "dispatcher unit has no [Service] section; not stopping it"
+    );
+    Ok(lines.join("\n") + "\n")
 }
 
 fn capitalized(text: &str) -> String {

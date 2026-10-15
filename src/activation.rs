@@ -35,7 +35,7 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, finished_ms INTEGER, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);",
     )?;
-    for column in ["focuses", "harness", "session_id"] {
+    for column in ["focuses", "harness", "session_id", "dispatcher_generation"] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
             [column],
@@ -425,6 +425,19 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
 /// replaces the old, a resumed one counts another wake); a failed wake drops
 /// the focus's session so the next wake starts fresh.
 fn bind_session(store: &Store, wake: &str, outcome: &str, log: &str) -> Result<()> {
+    // An adopted wake may finish after the new dispatcher starts. It still
+    // covers its mail, but must not restore (or delete) the new generation's
+    // native warmth. NULL generations are the legacy/pre-service epoch.
+    let current: bool = store.connection().query_row(
+        "SELECT COALESCE(dispatcher_generation, '') = COALESCE(
+           (SELECT value FROM metadata WHERE key='dispatcher_generation'), '')
+         FROM wakes WHERE id=?1",
+        [wake],
+        |r| r.get(0),
+    )?;
+    if !current {
+        return Ok(());
+    }
     let (ship, focuses, harness, requested): (
         String,
         Option<String>,
@@ -639,8 +652,9 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // Record the wake, with its job id, before the job exists: its outcome
     // must never be mistaken for crew and wake this first mate again.
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id)
-         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9)",
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, dispatcher_generation)
+         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9,
+           (SELECT value FROM metadata WHERE key='dispatcher_generation'))",
         params![
             wake,
             name,
@@ -730,6 +744,20 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         .and_then(Value::as_u64)
         .unwrap_or(2)
         .clamp(1, 3600);
+    // Only a resident service start is a dispatcher generation boundary.
+    // `serve --once` is a maintenance pass, not a restart: it must neither
+    // destroy warmth on every tick nor change the epoch of adopted wakes.
+    // Do this after taking serve.lock and validating arguments, before settle.
+    if !once {
+        let tx = store.write_transaction()?;
+        tx.execute("DELETE FROM sessions", [])?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES('dispatcher_generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+        tx.commit()?;
+    }
     loop {
         let report = tick_with_delivery_budget(store, Duration::from_millis(delivery_budget))?;
         let acted = report["settled"].as_array().is_some_and(|s| !s.is_empty())

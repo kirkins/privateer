@@ -26,6 +26,22 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Resolve the interpreter before changing HOME for a fixture. A shebang
+/// through `env python3` can otherwise enter a version-manager shim which
+/// refuses the isolated HOME's untrusted configuration instead of the script.
+pub fn python() -> PathBuf {
+    let output = command("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+}
+
 const ADAPTER: &str = r#"import json, sys
 r = json.loads(sys.stdin.readline())
 c, o = r["context"], r["options"]
