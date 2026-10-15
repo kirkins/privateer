@@ -680,8 +680,11 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         considered.push(consider(store, &ship)?);
     }
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
+    // Landed work frees its checkout without waking anyone.
+    let workspaces = crate::workspace::sweep(store)
+        .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "ships": considered}),
+        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "ships": considered, "workspaces": workspaces}),
     )
 }
 
@@ -724,6 +727,9 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
                 .as_array()
                 .is_some_and(|s| !s.is_empty())
             || report["delivered"]["delivered"].as_u64().unwrap_or(0) > 0
+            || report["workspaces"]
+                .as_array()
+                .is_some_and(|w| !w.is_empty())
             || report["ships"]
                 .as_array()
                 .is_some_and(|s| s.iter().any(|r| r.get("wake").is_some()));

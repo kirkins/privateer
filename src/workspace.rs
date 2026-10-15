@@ -4,6 +4,7 @@
 mod lifecycle;
 mod process;
 pub use lifecycle::dispatch;
+pub(crate) use lifecycle::sweep;
 
 use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, bail, ensure};

@@ -128,6 +128,89 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     public(store, &w)
 }
 
+/// How often the dispatcher looks for landed workspaces, and how long a
+/// task's jobs must have been finished first.
+const SWEEP_EVERY_MS: i64 = 10 * 60 * 1000;
+const SWEEP_GRACE_MS: i64 = 10 * 60 * 1000;
+
+/// Return workspaces whose work has landed, with no model call. A candidate
+/// is ready, its jobs have been finished for the grace period, and either its
+/// task is done or cancelled, or its branch has commits of its own (a fresh
+/// or fast-forwarded checkout proves nothing). `release` makes the decision:
+/// anything uncommitted, running or not landed is kept.
+pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
+    let now = Store::now_ms();
+    let last: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT value FROM metadata WHERE key='workspace_sweep_ms'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|v| v.parse().ok());
+    if last.is_some_and(|at| now - at < SWEEP_EVERY_MS) {
+        return Ok(vec![]);
+    }
+    store.connection().execute(
+        "INSERT INTO metadata(key,value) VALUES('workspace_sweep_ms',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [now.to_string()],
+    )?;
+    let records: Vec<String> = store
+        .connection()
+        .prepare("SELECT record FROM workspaces WHERE json_extract(record,'$.state')='ready'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut released = vec![];
+    for record in records {
+        let w: Workspace = serde_json::from_str(&record)?;
+        let (Some(lease), Some(path)) = (w.lease_id.clone(), w.path.clone()) else {
+            continue;
+        };
+        let (unfinished, last_finished): (i64, Option<i64>) = store.connection().query_row(
+            "SELECT COUNT(*) FILTER (WHERE json_extract(record,'$.finished_ms') IS NULL),
+                    MAX(json_extract(record,'$.finished_ms'))
+             FROM jobs WHERE json_extract(record,'$.task_id')=?1",
+            [&w.task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if unfinished > 0 || last_finished.is_some_and(|at| now - at < SWEEP_GRACE_MS) {
+            continue;
+        }
+        let finished = matches!(
+            store.task(&w.task_id)?["status"].as_str(),
+            Some("done" | "cancelled")
+        );
+        if !finished {
+            let own = (|| -> Result<u64> {
+                let lock = Lock::acquire(store)?;
+                let target = if git(&lock, &w.git_repo, &["remote", "get-url", "origin"]).is_ok() {
+                    git(&lock, &w.git_repo, &["fetch", "--quiet", "origin"])?;
+                    format!("refs/remotes/origin/{}", w.base_branch)
+                } else {
+                    format!("refs/heads/{}", w.base_branch)
+                };
+                Ok(git(
+                    &lock,
+                    &path,
+                    &["rev-list", "--count", &format!("{target}..HEAD")],
+                )?
+                .parse()?)
+            })();
+            if !own.is_ok_and(|n| n > 0) {
+                continue;
+            }
+        }
+        if release(store, &json!({"task_id": w.task_id, "lease_id": lease})).is_ok() {
+            let entry = json!({"task_id": w.task_id, "path": path, "branch": w.branch});
+            store.audit("workspace.auto_released", &entry)?;
+            released.push(entry);
+        }
+    }
+    Ok(released)
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "workspace.acquire" => {
