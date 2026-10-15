@@ -42,6 +42,7 @@ impl Ship {
             .current_dir(&self.folder)
             .env("PATH", &self.path)
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
+            .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env_remove("PRIVATEER_HOME")
             .env_remove("PRIVATEER_ROLE")
             .env_remove("PRIVATEER_ACTOR");

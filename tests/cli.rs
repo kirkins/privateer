@@ -38,6 +38,7 @@ impl Folder {
             .current_dir(dir)
             .env("PATH", &self.path)
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
+            .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env_remove("PRIVATEER_HOME")
             .output()
             .unwrap()
