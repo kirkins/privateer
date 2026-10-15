@@ -48,6 +48,8 @@ privateer start                     # always talk to this ship directly
 
 The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. Scripts can use `privateer --yes` to skip the question.
 
+For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable).
+
 ## General runtime and optional integrations
 
 The core owns charters, tasks, custody, targeted messages, coalesced notifications, durable jobs, resource admission, and SSH transport. It contains no personal provider account, model, gateway address, machine name, or user path.
@@ -55,6 +57,30 @@ The core owns charters, tasks, custody, targeted messages, coalesced notificatio
 Harnesses and provider routes are optional executable plugins. A private gateway belongs in a plugin's private configuration. Core jobs receive approved argv through the plugin interface; they do not invent a fallback provider. See [architecture](docs/architecture.md) and [plugin examples](plugins/).
 
 The default charter allows implementation, testing, opening PRs, merging passing work, routine recovery, cleanup, delegation, and messaging. Production requires approval of the exact artifact and environment. The current delivery check records workflow evidence; forge merge and production deployment adapters are future integrations.
+
+For human-authored command arguments, use a YAML or JSON file:
+
+```sh
+privateer --home /absolute/private/home charter.put --file examples/charter.yaml
+```
+
+Edit the [example charter](examples/charter.yaml) for your repository first.
+`--file` accepts regular UTF-8 `.yaml`, `.yml` and `.json` files, containing one
+object with unique string keys and JSON-compatible values. Plain YAML integers
+must fit `i64` or `u64`; floating-point numbers must fit finite `f64` values.
+Quote numeric-looking text or use `!!str` to keep it as a string, including in
+mapping keys. For `--file`, raw input and normalized JSON arguments are each
+limited to 64 KiB, with at most 64 nesting levels, 10,000 nodes (including keys),
+and 1 MiB of expanded scalar/key data. Nonrecursive YAML aliases are supported
+within these budgets. Parsing finishes before a home is opened.
+YAML supplies data: it does not read includes, run constructors or expand
+environment variables. Local custom tags are rejected; standard core tags and
+inert global annotations may be accepted or ignored as ordinary data. Existing
+command validation still applies. Use `--file` once, separately from `--json`;
+it supplies command arguments, not runtime configuration. RPC, hooks and internal
+supervisors do not accept `--file`. Inline `--json` and all machine protocols and
+outputs continue to use JSON. To pass `--file` to a native harness, put it after
+the separator in `privateer start HARNESS -- --file PATH`.
 
 ## Build and try the isolated pilot
 

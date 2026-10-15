@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """V2 preflight, exact resume and native completion across real subprocesses."""
 import json
+import copy
 import os
 from pathlib import Path
 import subprocess
@@ -23,12 +24,14 @@ with (root/'calls.jsonl').open('a') as f:f.write(json.dumps(sys.argv[1:])+'\n')
 if '--version' in sys.argv:
  print(os.environ.get('OC_TEST_VERSION','2.0.29'));raise SystemExit(0)
 if sys.argv[1:2]==['api']:
+ if sys.argv[3:4]==['session.message.list']:
+  print((root/'projection.json').read_text());raise SystemExit(0)
  data=json.loads((root/'metadata.json').read_text())
  if data is None:raise SystemExit(1)
  print(json.dumps({'data':data}));raise SystemExit(0)
 if '--help' in sys.argv:
  print('USAGE opencode [flags]');raise SystemExit(0)
-(root/'launched.json').write_text(json.dumps({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('OC_TEST_ROUTE'),'foreign':os.getenv('CLAUDECODE')}))
+(root/'launched.json').write_text(json.dumps({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('OC_TEST_ROUTE'),'foreign':os.getenv('CLAUDECODE'),'pwd':os.getenv('PWD'),'cwd':str(Path.cwd())}))
 sys.stdout.buffer.write((root/'stream.jsonl').read_bytes());sys.stdout.buffer.flush()
 raise SystemExit(int(os.environ.get('OC_TEST_EXIT','0')))
 '''
@@ -40,7 +43,8 @@ class OpenCodeV2(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         (self.root / "opencode").write_text(SERVER)
         (self.root / "opencode").chmod(0o700)
-        self.metadata = {"id":SESSION,"location":{"directory":str(self.root)}}
+        self.metadata = {"id":SESSION,"location":{"directory":str(self.root)},"time":{"idle":30},"outcome":"succeeded"}
+        self.projection = {"data": []}
 
     def tearDown(self):
         self.temp.cleanup()
@@ -57,6 +61,7 @@ class OpenCodeV2(unittest.TestCase):
 
     def launch(self, events=None, resume=None, extra=(), native_exit=0, version="2.0.29", raw=None):
         (self.root / "metadata.json").write_text(json.dumps(self.metadata))
+        (self.root / "projection.json").write_text(json.dumps(self.projection))
         (self.root / "stream.jsonl").write_bytes(raw if raw is not None else b"".join((json.dumps(e)+"\n").encode() for e in (events or [])))
         return subprocess.run([sys.executable,str(ROOT / "plugins/native_launch.py"),"opencode-v2","opencode",
                                "run","--standalone","--format","json",*(["--session",resume] if resume else []),
@@ -64,7 +69,7 @@ class OpenCodeV2(unittest.TestCase):
                               env={**os.environ,"PATH":str(self.root)+os.pathsep+os.environ['PATH'],
                                    "OC_TEST_ROOT":str(self.root),"OC_TEST_VERSION":version,"OC_TEST_EXIT":str(native_exit),
                                    "PRIVATEER_ROLE":"agent","PRIVATEER_ACTOR":"department",
-                                   "OC_TEST_ROUTE":"existing-gateway","CLAUDECODE":"foreign"})
+                                   "OC_TEST_ROUTE":"existing-gateway","CLAUDECODE":"foreign","PWD":"/stale-launcher-workspace"})
 
     def test_completed_turn_preserves_actor_route_literal_prompt_and_counts_authoritative_usage(self):
         run=self.launch(self.complete())
@@ -75,8 +80,75 @@ class OpenCodeV2(unittest.TestCase):
         record=json.loads((self.root/'launched.json').read_text())
         self.assertEqual(record['role'],'agent');self.assertEqual(record['actor'],'department')
         self.assertEqual(record['route'],'existing-gateway');self.assertIsNone(record['foreign'])
+        self.assertEqual(record['pwd'],str(self.root));self.assertEqual(record['cwd'],str(self.root))
         self.assertEqual(record['argv'][-1],'Literal $(touch forbidden)')
         self.assertFalse((self.root/'forbidden').exists())
+
+    def final_projection(self):
+        return {"data":[
+            {"id":"msg_idle","type":"idle","outcome":"succeeded","time":{"created":30}},
+            {"id":"msg_one","type":"assistant","finish":"stop","time":{"created":10,"completed":20},
+             "content":[{"type":"text","text":"done"}],
+             "tokens":{"input":3,"output":2,"reasoning":1,"cache":{"read":4,"write":0}}},
+        ]}
+
+    def test_missing_final_finish_requires_exact_native_success_projection_and_counts_usage_once(self):
+        self.projection=self.final_projection()
+        events=self.complete('msg_previous',reason='tool-calls')+self.complete()[:-1]
+        run=self.launch(events)
+        self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+        summary=json.loads(run.stdout.splitlines()[-1])
+        self.assertEqual(summary['completion_source'],'native-session-projection')
+        self.assertEqual(summary['session_id'],SESSION)
+        self.assertEqual(summary['usage'],{'input':7,'output':4,'reasoning':1,'cacheRead':5,'cacheWrite':0})
+        # Native output is preserved; the missing event is not fabricated in it.
+        self.assertEqual(sum(json.loads(l).get('type')=='step_finish' for l in run.stdout.splitlines()),1)
+        self.assertEqual(self.launch(self.complete()[:-1],resume=SESSION).returncode,0)
+        (self.root/'calls.jsonl').unlink()
+        run=self.launch(self.complete())
+        self.assertEqual(run.returncode,0,run.stdout)
+        self.assertNotIn('completion_source',json.loads(run.stdout.splitlines()[-1]))
+        calls=[json.loads(l) for l in (self.root/'calls.jsonl').read_text().splitlines()]
+        self.assertFalse(any(c[:1]==['api'] for c in calls),'complete streams need no projection lookup')
+
+    def test_projection_cannot_rescue_failed_truncated_or_terminal_nonstop_stream(self):
+        self.projection=self.final_projection()
+        bad=[([],0), (self.complete()[:-1],7), (self.complete(reason='length'),0),
+             (self.complete()[:-1]+[{'type':'error','sessionID':SESSION,'error':{}}],0),
+             (self.complete()[:-1]+[self.event('text',message='msg_other',text='other')],0)]
+        for events,native_exit in bad:
+            (self.root/'calls.jsonl').unlink(missing_ok=True)
+            run=self.launch(events,native_exit=native_exit)
+            self.assertNotEqual(run.returncode,0,run.stdout)
+            calls=[json.loads(l) for l in (self.root/'calls.jsonl').read_text().splitlines()]
+            self.assertFalse(any(c[:1]==['api'] for c in calls))
+        truncated=b''.join((json.dumps(e)+'\n').encode() for e in self.complete()[:-1])[:-1]
+        self.assertNotEqual(self.launch(raw=truncated).returncode,0)
+
+    def test_final_projection_refuses_stale_foreign_error_unsettled_or_oversized_records(self):
+        good=self.final_projection()
+        cases=[{}, {'data':[]}, {'data':good['data'][1:]}, {'data':list(reversed(good['data']))}]
+        changes=[(0,'type','assistant'),(0,'outcome','failed'),(0,'outcome','interrupted'),(0,'error',{}),
+                 (1,'id','msg_other'),(1,'type','user'),(1,'finish','tool-calls'),(1,'error',{}),
+                 (1,'retry',{}),(1,'time',{'created':10}), (1,'time',{'created':21,'completed':20}),
+                 (0,'time',{'created':19}), (0,'time',{'created':True}), (1,'content',None),
+                 (1,'content',[{'type':'tool','state':{'status':'running'}}]),
+                 (1,'content',[{'type':'tool','state':{'status':'streaming'}}]),
+                 (1,'content',[{'type':'unknown'}]), (1,'content',[{'type':'text','text':'x'*65536}])]
+        for index,key,value in changes:
+            altered=copy.deepcopy(good);altered['data'][index][key]=value;cases.append(altered)
+        for projection in cases:
+            self.projection=projection
+            self.assertNotEqual(self.launch(self.complete()[:-1]).returncode,0)
+        self.projection=good
+        base=copy.deepcopy(self.metadata)
+        cases=[None,{}]
+        for key,value in [('id','ses_other'),('location',{'directory':'/'}),('location',{'directory':'.'}),
+                          ('time',{'idle':31}),('outcome','failed'),('outcome','interrupted'),('outcome',None)]:
+            cases.append({**base,key:value})
+        for metadata in cases:
+            self.metadata=metadata
+            self.assertNotEqual(self.launch(self.complete()[:-1]).returncode,0)
 
     def test_multiple_tool_steps_need_a_final_stop_and_usage_is_not_double_counted(self):
         run=self.launch(self.complete(reason='tool-calls')+self.complete('msg_two'))

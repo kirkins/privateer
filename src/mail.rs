@@ -9,6 +9,7 @@ use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 
 pub const CAPTAIN: &str = "captain";
 /// The runtime's voice for a ship's crew: job outcomes and crew reports.
@@ -18,6 +19,9 @@ const KINDS: &[&str] = &["request", "reply", "notice", "decision"];
 const URGENCIES: &[&str] = &["low", "normal", "high"];
 const MAX_MESSAGE_BYTES: usize = 65_536;
 const MAX_SCOPE_CHARS: usize = 2_000;
+/// Extra local classifications cannot turn a bounded flush into a backlog
+/// scan. They do not consume its separate allowance for network attempts.
+const EXTRA_CLASSIFICATIONS: i64 = 50;
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -32,9 +36,6 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS mail_correlation ON mail(correlation);
          CREATE TABLE IF NOT EXISTS mail_cursor(address TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);",
     )?;
-    // Delivery state for mail crossing homes: NULL for mail that stays in
-    // this home, 'pending' or 'delivered' for outgoing copies, 'received' for
-    // mail delivered here by a peer.
     let tx = store.write_transaction()?;
     for (column, declaration) in [
         ("delivery", "TEXT"),
@@ -54,7 +55,9 @@ pub fn init(store: &Store) -> Result<()> {
         }
     }
     tx.execute_batch(
-        "CREATE INDEX IF NOT EXISTS mail_pending ON mail(delivery, seq) WHERE delivery='pending';",
+        "CREATE INDEX IF NOT EXISTS mail_pending ON mail(delivery, seq) WHERE delivery='pending';
+         CREATE TABLE IF NOT EXISTS mail_delivery_retry(peer TEXT PRIMARY KEY,
+           failures INTEGER NOT NULL, next_attempt_ms INTEGER NOT NULL, last_attempt_ms INTEGER NOT NULL);",
     )?;
     tx.commit()?;
     Ok(())
@@ -183,7 +186,7 @@ pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
 }
 
-const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms";
+const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms";
 
 fn message(r: &Row) -> rusqlite::Result<Value> {
     let payload: String = r.get(9)?;
@@ -197,6 +200,8 @@ fn message(r: &Row) -> rusqlite::Result<Value> {
         "urgency": r.get::<_, String>(10)?, "deadline_ms": r.get::<_, Option<i64>>(11)?,
         "created_ms": r.get::<_, i64>(12)?, "state": r.get::<_, Option<String>>(13)?,
         "answered_by": r.get::<_, Option<String>>(14)?, "answered_ms": r.get::<_, Option<i64>>(15)?,
+        "delivery": r.get::<_, Option<String>>(16)?, "delivery_attempts": r.get::<_, i64>(17)?,
+        "delivery_error": r.get::<_, Option<String>>(18)?, "delivered_ms": r.get::<_, Option<i64>>(19)?,
     }))
 }
 
@@ -384,6 +389,13 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             peer.as_ref().map(|_| "pending")
         ],
     )?;
+    if peer.is_some() {
+        let message = by_id(store, &id)?.context("message vanished")?;
+        ensure!(
+            envelope(&message).to_string().len() <= MAX_MESSAGE_BYTES,
+            "message exceeds 64 KiB"
+        );
+    }
     if kind == "reply" {
         tx.execute(
             "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3 WHERE id=?1",
@@ -394,7 +406,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     // Recorded first, delivered second: a failed attempt leaves the message
     // pending for mail.flush rather than losing it.
     if let Some(peer) = peer {
-        deliver_one(store, &id, &peer)?;
+        flush_pending(store, 1, false, None, Some(&peer))?;
     }
     Ok(annotate(
         by_id(store, &id)?.context("message vanished")?,
@@ -424,15 +436,53 @@ fn envelope(message: &Value) -> Value {
     envelope
 }
 
+enum Delivery {
+    Delivered,
+    Failed,
+    Quarantined,
+}
+
+/// Classify a legacy wire-invalid record without changing its facts or
+/// treating a local protocol violation as a failure of the peer.
+fn quarantine(store: &Store, id: &str, wire_bytes: usize) -> Result<()> {
+    let tx = store.write_transaction()?;
+    let changed = tx.execute(
+        "UPDATE mail SET delivery='quarantined', delivery_error=?2
+         WHERE id=?1 AND delivery='pending'",
+        params![
+            id,
+            format!(
+                "normalized envelope is {wire_bytes} bytes; limit is {MAX_MESSAGE_BYTES} bytes"
+            )
+        ],
+    )?;
+    if changed == 1 {
+        store.audit(
+            "mail.quarantined",
+            &json!({"id":id,"reason":"envelope_too_large",
+            "wire_bytes":wire_bytes,"limit_bytes":MAX_MESSAGE_BYTES}),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Try once to deliver a pending outgoing message; record the outcome.
-fn deliver_one(store: &Store, id: &str, peer: &str) -> Result<bool> {
+fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -> Result<Delivery> {
     let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
-    let outcome = crate::peers::call_peer(
+    let envelope = envelope(&message);
+    let wire_bytes = envelope.to_string().len();
+    if wire_bytes > MAX_MESSAGE_BYTES {
+        quarantine(store, id, wire_bytes)?;
+        return Ok(Delivery::Quarantined);
+    }
+    let outcome = crate::peers::call_peer_with_timeout(
         store,
         peer,
-        &format!("deliver-{id}"),
+        &format!("deliver-{}", uuid::Uuid::new_v4()),
         "mail.deliver",
-        envelope(&message),
+        envelope,
+        timeout,
     )
     .and_then(|response| match response["ok"].as_bool() {
         Some(true) => Ok(()),
@@ -444,7 +494,9 @@ fn deliver_one(store: &Store, id: &str, peer: &str) -> Result<bool> {
         ),
     });
     let delivered = outcome.is_ok();
-    store.connection().execute(
+    let now = Store::now_ms();
+    let tx = store.write_transaction()?;
+    tx.execute(
         "UPDATE mail SET delivery=CASE WHEN ?2 THEN 'delivered' ELSE delivery END,
            delivered_ms=CASE WHEN ?2 THEN ?3 ELSE delivered_ms END,
            delivery_attempts=delivery_attempts+1, delivery_error=?4
@@ -452,47 +504,118 @@ fn deliver_one(store: &Store, id: &str, peer: &str) -> Result<bool> {
         params![
             id,
             delivered,
-            Store::now_ms(),
-            outcome.err().map(|e| format!("{e:#}"))
+            now,
+            outcome
+                .err()
+                .map(|e| format!("{e:#}").chars().take(4096).collect::<String>())
         ],
     )?;
-    Ok(delivered)
+    // One peer's failure pauses its whole queue. Logical attempt ordering
+    // also distinguishes several attempts made within one clock millisecond.
+    let failures: u32 = tx.query_row(
+        "SELECT COALESCE((SELECT failures FROM mail_delivery_retry WHERE peer=?1), 0)",
+        [peer],
+        |r| r.get(0),
+    )?;
+    let (failures, next) = if delivered {
+        (0, 0)
+    } else {
+        let delay = 1_000_i64.saturating_mul(1_i64 << failures.min(6));
+        (
+            failures.saturating_add(1).min(7),
+            now.saturating_add(delay.min(60_000)),
+        )
+    };
+    tx.execute(
+        "INSERT INTO mail_delivery_retry(peer, failures, next_attempt_ms, last_attempt_ms)
+         VALUES(?1, ?2, ?3, ?4) ON CONFLICT(peer) DO UPDATE SET
+           failures=excluded.failures, next_attempt_ms=excluded.next_attempt_ms,
+           last_attempt_ms=MAX(excluded.last_attempt_ms, last_attempt_ms+1)",
+        params![peer, failures, next, now],
+    )?;
+    tx.commit()?;
+    Ok(if delivered {
+        Delivery::Delivered
+    } else {
+        Delivery::Failed
+    })
 }
 
-/// Retry delivery of pending outgoing mail, oldest first.
-fn flush(store: &Store, args: &Value) -> Result<Value> {
+/// Fair delivery across peers, FIFO within each peer. Explicit flushes
+/// bypass retry delays, but never retry one failed peer twice in a pass.
+fn flush_pending(
+    store: &Store,
+    max_attempts: i64,
+    manual: bool,
+    budget: Option<Duration>,
+    only_peer: Option<&str>,
+) -> Result<Value> {
     // An agent delivers only its own ship's mail; the receiving home would
     // refuse anything else from it.
     let sender = match store.caller() {
         Caller::Agent { actor } => Some(actor.clone()),
         Caller::Operator => None,
     };
-    let mut statement = store.connection().prepare(
-        "SELECT id, recipient FROM mail WHERE delivery='pending' AND (?1 IS NULL OR sender=?1)
-         ORDER BY seq LIMIT ?2",
-    )?;
-    let pending: Vec<(String, String)> = statement
-        .query_map(params![sender, limit(args, 50)], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let (mut delivered, mut still_pending) = (0, 0);
-    for (id, recipient) in pending {
-        let peer = ship(store, &recipient)?
-            .as_ref()
-            .and_then(remote_peer)
-            .map(str::to_owned);
-        let sent = match peer {
-            Some(peer) => deliver_one(store, &id, &peer)?,
-            None => false,
-        };
-        if sent {
-            delivered += 1;
-        } else {
-            still_pending += 1;
+    let deadline = budget.map(|budget| Instant::now() + budget);
+    let mut failed = vec![];
+    let (mut delivered, mut attempted, mut examined) = (0, 0, 0);
+    while attempted < max_attempts && examined < max_attempts + EXTRA_CLASSIFICATIONS {
+        let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+        if remaining.is_some_and(|left| left.is_zero()) {
+            break;
+        }
+        let next: Option<(String, String)> = store.connection().query_row(
+            "SELECT m.id, json_extract(s.record, '$.location.peer')
+             FROM mail m JOIN ships s ON s.name=m.recipient
+             LEFT JOIN mail_delivery_retry r ON r.peer=json_extract(s.record, '$.location.peer')
+             WHERE m.delivery='pending' AND (?1 IS NULL OR m.sender=?1)
+               AND json_extract(s.record, '$.location.peer') IS NOT NULL
+               AND (?2 OR COALESCE(r.next_attempt_ms, 0)<=?3)
+               AND (?4 IS NULL OR json_extract(s.record, '$.location.peer')=?4)
+               AND json_extract(s.record, '$.location.peer') NOT IN (SELECT value FROM json_each(?5))
+               AND NOT EXISTS (
+                 SELECT 1 FROM mail older JOIN ships os ON os.name=older.recipient
+                 WHERE older.delivery='pending' AND older.seq<m.seq
+                   AND json_extract(os.record, '$.location.peer')=json_extract(s.record, '$.location.peer'))
+             ORDER BY COALESCE(r.last_attempt_ms, 0), m.seq LIMIT 1",
+            params![sender, manual, Store::now_ms(), only_peer, json!(failed).to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((id, peer)) = next else { break };
+        let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+        if remaining.is_some_and(|left| left.is_zero()) {
+            break;
+        }
+        examined += 1;
+        match deliver_one(store, &id, &peer, remaining)? {
+            Delivery::Delivered => {
+                attempted += 1;
+                delivered += 1;
+            }
+            Delivery::Failed => {
+                attempted += 1;
+                failed.push(peer);
+            }
+            Delivery::Quarantined => {}
         }
     }
-    Ok(json!({"delivered": delivered, "pending": still_pending}))
+    let (pending, quarantined): (i64, i64) = store.connection().query_row(
+        "SELECT COALESCE(SUM(delivery='pending'),0), COALESCE(SUM(delivery='quarantined'),0)
+         FROM mail WHERE delivery IN ('pending','quarantined') AND (?1 IS NULL OR sender=?1)",
+        [sender],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(
+        json!({"delivered": delivered, "pending": pending, "attempted": attempted, "quarantined":quarantined}),
+    )
+}
+
+fn flush(store: &Store, args: &Value) -> Result<Value> {
+    flush_pending(store, limit(args, 50), true, None, None)
+}
+
+pub(crate) fn flush_dispatcher(store: &Store, budget: Duration) -> Result<Value> {
+    flush_pending(store, 50, false, Some(budget), None)
 }
 
 /// Accept mail a peer delivers for a ship hosted here. The sender must be a
@@ -690,6 +813,56 @@ fn show(store: &Store, args: &Value) -> Result<Value> {
     Ok(annotate(message, Store::now_ms()))
 }
 
+/// Outgoing headers are discoverable without loading large legacy bodies.
+/// Agents see only their own outgoing mail, including when no filter is set.
+fn outbox(store: &Store, args: &Value) -> Result<Value> {
+    let requested = optional_str(args, "from")?;
+    let sender = match store.caller() {
+        Caller::Agent { actor } => {
+            ensure!(
+                requested.is_none_or(|from| from == actor),
+                "agents read only their own outbox"
+            );
+            Some(actor.as_str())
+        }
+        Caller::Operator => requested,
+    };
+    let delivery = optional_str(args, "delivery")?;
+    ensure!(
+        delivery.is_none_or(|d| matches!(d, "pending" | "quarantined" | "delivered")),
+        "delivery must be pending, quarantined or delivered"
+    );
+    let after = args
+        .get("after_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let count = limit(args, 40).min(100) as usize;
+    let mut statement = store.connection().prepare(
+        "SELECT seq,id,sender,recipient,kind,correlation,task_id,request_kind,urgency,
+           deadline_ms,created_ms,state,delivery,delivery_attempts,substr(delivery_error,1,1024),delivered_ms
+         FROM mail WHERE delivery IN ('pending','quarantined','delivered')
+           AND (?1 IS NULL OR sender=?1) AND (?2 IS NULL OR delivery=?2) AND seq>?3
+         ORDER BY seq LIMIT ?4",
+    )?;
+    let mut messages: Vec<Value> = statement
+        .query_map(params![sender, delivery, after, count + 1], |r| {
+            Ok(json!({"seq":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,
+            "from":r.get::<_,String>(2)?,"to":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,
+            "correlation":r.get::<_,Option<String>>(5)?,"task_id":r.get::<_,Option<String>>(6)?,
+            "request_kind":r.get::<_,Option<String>>(7)?,"urgency":r.get::<_,String>(8)?,
+            "deadline_ms":r.get::<_,Option<i64>>(9)?,"created_ms":r.get::<_,i64>(10)?,
+            "state":r.get::<_,Option<String>>(11)?,"delivery":r.get::<_,String>(12)?,
+            "delivery_attempts":r.get::<_,i64>(13)?,"delivery_error":r.get::<_,Option<String>>(14)?,
+            "delivered_ms":r.get::<_,Option<i64>>(15)?}))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let more = messages.len() > count;
+    messages.truncate(count);
+    let next = more.then(|| messages.last().unwrap()["seq"].clone());
+    Ok(json!({"messages":messages,"next_after_seq":next}))
+}
+
 fn requests(store: &Store, args: &Value) -> Result<Value> {
     let address = required(args, "address")?;
     local_address(store, address)?;
@@ -735,13 +908,15 @@ pub fn summary(store: &Store) -> Result<Value> {
             .query_row("SELECT COUNT(*) FROM mail WHERE state='open'", [], |r| {
                 r.get(0)
             })?;
-    let undelivered: i64 = store.connection().query_row(
-        "SELECT COUNT(*) FROM mail WHERE delivery='pending'",
+    let (undelivered, quarantined): (i64, i64) = store.connection().query_row(
+        "SELECT COUNT(*), COALESCE(SUM(delivery='quarantined'),0) FROM mail
+         WHERE delivery IN ('pending','quarantined')",
         [],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok(
-        json!({"unacknowledged_mail": unread, "open_requests": open, "undelivered_mail": undelivered}),
+        json!({"unacknowledged_mail": unread, "open_requests": open, "undelivered_mail": undelivered,
+            "quarantined_mail":quarantined}),
     )
 }
 
@@ -750,7 +925,8 @@ pub fn summary(store: &Store) -> Result<Value> {
 pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
     // Mail held here counts once acknowledged; an outgoing copy once delivered.
     // Replies to crew have no mailbox to acknowledge them.
-    let stale = "created_ms < ?1 AND COALESCE(state, '') <> 'open' AND (delivery='delivered'
+    let stale = "created_ms < ?1 AND COALESCE(delivery,'received')<>'quarantined'
+        AND COALESCE(state, '') <> 'open' AND (delivery='delivered'
         OR recipient='crew'
         OR (COALESCE(delivery, 'received')='received'
             AND seq <= COALESCE((SELECT through_seq FROM mail_cursor WHERE address=mail.recipient), 0)))";
@@ -786,6 +962,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "mail.send" => send(store, &args),
         "mail.inbox" => inbox(store, &args),
+        "mail.outbox" => outbox(store, &args),
         "mail.pending" => pending(store, &args),
         "mail.ack" => ack(store, &args),
         "mail.show" => show(store, &args),

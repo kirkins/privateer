@@ -347,12 +347,29 @@ def run(harness, argv):
                 raise ValueError("event-size")
         # A missing final LF is a truncated stream, not a completion fact.
         native_status = child.wait()
-        success = native_status == 0 and not pending and turn.complete()
+        reconciled = False
+        projection_failed = False
+        if (harness == "opencode-v2" and native_status == 0 and not pending
+                and not turn.failed and turn.session and turn.message and not turn.settled):
+            from opencode_v2 import reconcile_final
+            try:
+                turn.observe(reconcile_final(turn.session, turn.message))
+                reconciled = True
+            except Exception:
+                # Inspection failure stays fail-closed while preserving usage
+                # already confirmed by earlier native steps. No provider data
+                # or subprocess stderr is included in this diagnostic.
+                projection_failed = True
+        success = native_status == 0 and not pending and not projection_failed and turn.complete()
         if pending:
             sys.stdout.buffer.write(b"\n")
             sys.stdout.buffer.flush()
         summary = {"type": "turn.completed" if success else "native.turn.failed",
                    "harness": harness, "session_id": turn.session, "native_exit_code": native_status}
+        if reconciled:
+            summary["completion_source"] = "native-session-projection"
+        if projection_failed:
+            summary["reason"] = "native-session-projection-unconfirmed"
         if turn.usage:
             summary["usage"] = turn.usage
         print(json.dumps(summary, separators=(",", ":")), flush=True)

@@ -326,12 +326,14 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     let task = required(&args, "task_id")?;
     let artifact = required(&args, "artifact")?;
     let environment = required(&args, "environment")?;
+    // Serialize the authority read with the grant or consumption: a charter
+    // revoked while this command waits for the write lock must not authorize it.
+    let tx = store.write_transaction()?;
     // The explicit approval supplies authority for this one artifact/environment.
     // It must not require widening every task's standing charter first.
     let charter = store.active_charter(task)?;
     let charter_hash = hash(&charter);
     let mut approver = None;
-    let tx = store.write_transaction()?;
     let id = if command == "approval.grant" {
         // The approver is recorded and must be someone other than the task's
         // owner, who would otherwise approve its own production change.
@@ -598,6 +600,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "approval.grant" | "approval.consume" => approval(store, command, args),
         "delivery.check" => {
             let task = required(&args, "task_id")?;
+            // Read authority and match/consume an approval under the same write
+            // lock as charter revocation and task changes.
+            let tx = store.write_transaction()?;
             let charter = store.authorize(task, "merge_green")?;
             let head = required(&args, "current_head")?;
             if args.get("tested_head").and_then(Value::as_str) != Some(head)
@@ -610,7 +615,6 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 let env = required(&args, "environment")?;
                 // The approval authorises one deployment: allowing it uses the
                 // approval up in the same transaction.
-                let tx = store.write_transaction()?;
                 let approval: Option<String> = tx.query_row("SELECT id FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3 AND charter_hash=?4 AND consumed=0 ORDER BY id LIMIT 1",params![task,head,env,hash(&charter)],|r|r.get(0)).optional()?;
                 let Some(approval) = approval else {
                     bail!("production requires approval of this exact artifact and environment");
@@ -623,9 +627,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     "approval.consumed_by_delivery",
                     &json!({"id":approval,"task_id":task,"artifact":head,"environment":env}),
                 )?;
-                tx.commit()?;
                 result["approval_id"] = json!(approval);
             }
+            tx.commit()?;
             Ok(result)
         }
         "history.prune" => history_prune(store, &args),

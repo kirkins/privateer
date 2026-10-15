@@ -107,7 +107,7 @@ fn reach(store: &mut Store, other: &str, other_home: &Path, scope: &str) -> Resu
         return Ok(false);
     }
     let peer = format!("fleet-{other}");
-    let binary = std::env::current_exe()?;
+    let binary = crate::executable::installed()?;
     crate::peers::dispatch(
         store,
         "peer.put",
@@ -159,21 +159,47 @@ fn caller_ship(store: &Store) -> Option<String> {
 }
 
 /// Create a ship from inside a ship. An agent's new ship gets at most its
-/// own charter's actions.
+/// own active charter's actions, including authority to spawn. Creation and
+/// revocation serialize on the creating home's write lock.
 fn create(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
     crate::mail::unreserved(name)?;
     let creator = caller_ship(store);
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
+    let harness = match args.get("harness").and_then(Value::as_str) {
+        Some(h) => Some(h.to_owned()),
+        None => creator.as_ref().and_then(|c| {
+            crate::mail::dispatch(store, "ship.show", json!({"name": c}))
+                .ok()?["first_mate"]["manifest"]
+                .as_str()
+                .and_then(|m| Path::new(m).parent()?.file_name()?.to_str().map(str::to_owned))
+        }),
+    };
+    // Keep authority stable through local setup, before the child is published
+    // or a dispatcher can run it. A previously committed revoke wins this lock
+    // and leaves no child folder, registry entry or service behind.
+    let authority = match store.caller() {
+        Caller::Agent { .. } => Some(store.write_transaction()?),
+        Caller::Operator => None,
+    };
     if let Caller::Agent { actor } = store.caller() {
-        let own = store.charter(actor)?["actions"].clone();
+        let charter = store.charter(actor)?;
+        ensure!(
+            charter["active"] == true,
+            "creating ship's charter was revoked"
+        );
+        let own = &charter["actions"];
         let own: Vec<&str> = own
             .as_array()
             .context("creating ship's charter has no actions")?
             .iter()
             .filter_map(Value::as_str)
             .collect();
+        ensure!(
+            own.contains(&"spawn"),
+            "ship.create requires spawn in the creating ship's charter"
+        );
         match &actions {
             Some(requested) => {
                 let requested = requested.as_array().context("actions must be a list")?;
@@ -208,19 +234,10 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         "{} already exists and is not empty",
         folder.display()
     );
-    let harness = match args.get("harness").and_then(Value::as_str) {
-        Some(h) => Some(h.to_owned()),
-        None => creator.as_ref().and_then(|c| {
-            crate::mail::dispatch(store, "ship.show", json!({"name": c}))
-                .ok()?["first_mate"]["manifest"]
-                .as_str()
-                .and_then(|m| Path::new(m).parent()?.file_name()?.to_str().map(str::to_owned))
-        }),
-    };
     fs::create_dir_all(&folder)?;
     let home = folder.join(crate::cli::STATE_DIR);
     let created_by = creator.clone().unwrap_or_else(|| "captain".into());
-    let (ship, harness, _) = crate::cli::setup(
+    let (ship, harness, _) = crate::cli::setup_unlinked(
         &home,
         &crate::cli::Setup {
             ship: Some(name.to_owned()),
@@ -235,12 +252,20 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
             liaison: false,
         },
     )?;
-    let dispatcher = crate::service::ensure(&home, &ship)?;
     store.audit(
         "ship.created",
         &json!({"ship": ship, "folder": folder, "by": created_by}),
     )?;
-    let charter = Store::open(&home)?.charter(&ship)?;
+    if let Some(authority) = authority {
+        authority.commit()?;
+    }
+    // Linking writes both homes through their own connections, after the
+    // creation's authority decision has committed.
+    register(&ship, &home, &created_by)?;
+    let child = Store::open(&home)?;
+    link(&child, &ship)?;
+    let dispatcher = crate::service::ensure(&home, &ship)?;
+    let charter = child.charter(&ship)?;
     Ok(json!({"ship": ship, "folder": folder, "harness": harness,
         "actions": charter["actions"], "created_by": created_by, "dispatcher": dispatcher}))
 }

@@ -311,6 +311,19 @@ pub(crate) fn call_peer(
     command: &str,
     args: Value,
 ) -> Result<Value> {
+    call_peer_with_timeout(store, name, id, command, args, None)
+}
+
+/// Automatic mailbox delivery may use only the dispatcher pass's remaining
+/// network budget. Explicit peer calls keep the configured timeout.
+pub(crate) fn call_peer_with_timeout(
+    store: &Store,
+    name: &str,
+    id: &str,
+    command: &str,
+    args: Value,
+    timeout: Option<Duration>,
+) -> Result<Value> {
     init(store)?;
     token(name, 64, "peer name")?;
     let config: String = store
@@ -321,8 +334,13 @@ pub(crate) fn call_peer(
             |row| row.get(0),
         )
         .context("peer not configured")?;
-    let peer: Peer = serde_json::from_str(&config)?;
+    let mut peer: Peer = serde_json::from_str(&config)?;
     validate(&peer)?;
+    if let Some(timeout) = timeout {
+        peer.timeout_ms = peer
+            .timeout_ms
+            .min(timeout.as_millis().clamp(1, 120_000) as u64);
+    }
     let response = call(&peer, id, command, args, store.caller())?;
     store.audit(
         "peer.called",

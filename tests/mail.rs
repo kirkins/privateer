@@ -474,6 +474,431 @@ fn pair() -> Pair {
     }
 }
 
+/// Seed an outgoing record as a previous binary could have committed it,
+/// without asking the new send-time validator to accept invalid wire bytes.
+fn seed_pending(store: &Store, args: &Value, created_ms: i64) {
+    store.connection().execute(
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,body,payload,urgency,created_ms,state,delivery)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,'normal',?8,?9,'pending')",
+        rusqlite::params![args["id"].as_str().unwrap(),args["from"].as_str().unwrap(),
+            args["to"].as_str().unwrap(),args["kind"].as_str().unwrap(),args["correlation"].as_str(),
+            args["body"].as_str().unwrap(),args["payload"].to_string(),created_ms,
+            (args["kind"] == "request").then_some("open")],
+    ).unwrap();
+}
+
+fn seed_legacy_oversize(store: &Store, mut args: Value) -> Value {
+    let now = Store::now_ms();
+    args["body"] = json!("");
+    args["payload"] = json!({"text":"\"\\\n船"});
+    let mut wire = json!({"id":args["id"],"from":args["from"],"to":args["to"],"kind":args["kind"],
+        "correlation":args["correlation"],"request_kind":null,"body":"","payload":args["payload"],
+        "urgency":"normal","deadline_ms":null,"created_ms":now});
+    args["body"] = json!("x".repeat(65_537 - wire.to_string().len()));
+    wire["body"] = args["body"].clone();
+    assert_eq!(wire.to_string().len(), 65_537);
+    assert!(
+        args.to_string().len() <= 65_536,
+        "the old send accepted these arguments"
+    );
+    seed_pending(store, &args, now);
+    args
+}
+
+fn original_facts(store: &Store, id: &str) -> String {
+    store.connection().query_row(
+        "SELECT json_array(seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,
+           urgency,deadline_ms,created_ms,state,answered_by,answered_ms) FROM mail WHERE id=?1",
+        [id], |r| r.get(0),
+    ).unwrap()
+}
+
+#[test]
+fn legacy_wire_oversize_is_preserved_and_unblocks_every_delivery_path() {
+    for mode in ["immediate", "manual", "dispatcher"] {
+        let Pair {
+            _temp,
+            mut a,
+            mut b,
+            ..
+        } = pair();
+        let originals: Vec<_> = [("legacy-notice", "notice"), ("legacy-request", "request")]
+            .into_iter()
+            .map(|(id, kind)| {
+                let args = seed_legacy_oversize(
+                    &a,
+                    json!({"id":id,"from":"apps","to":"infra","kind":kind}),
+                );
+                let facts = original_facts(&a, id);
+                (args, facts)
+            })
+            .collect();
+        let valid = json!({"id":"valid","from":"apps","to":"infra","kind":"notice",
+            "body":"valid later mail","payload":{}});
+        if mode == "immediate" {
+            let sent = send(&mut a, valid).unwrap();
+            let actual_delivery: String = a
+                .connection()
+                .query_row("SELECT delivery FROM mail WHERE id='valid'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                actual_delivery, "delivered",
+                "{mode}: valid mail must pass the legacy head"
+            );
+            assert_eq!(sent["delivery"], "delivered", "{mode}: {sent}");
+        } else {
+            seed_pending(&a, &valid, Store::now_ms());
+            let report = if mode == "manual" {
+                dispatch(&mut a, "mail.flush", json!({"limit":1})).unwrap()
+            } else {
+                privateer::activation::tick(&mut a).unwrap()["delivered"].clone()
+            };
+            assert_eq!(report["delivered"], 1, "{mode}: {report}");
+            assert_eq!(report["attempted"], 1);
+            assert_eq!(report["quarantined"], 2);
+            assert_eq!(report["pending"], 0);
+        }
+        let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+        assert_eq!(inbox["messages"].as_array().unwrap().len(), 1, "{mode}");
+        assert_eq!(inbox["messages"][0]["id"], "valid");
+        let calls: i64 = a
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM audit WHERE kind='peer.called'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 1, "only valid mail may reach the transport");
+        let status = dispatch(&mut a, "status", json!({})).unwrap();
+        assert_eq!(status["undelivered_mail"], 2);
+        assert_eq!(status["quarantined_mail"], 2);
+        assert_eq!(status["open_requests"], 1);
+        let home = a.home().to_owned();
+        drop(a);
+        let mut a = Store::open(&home).unwrap();
+        let again = dispatch(&mut a, "mail.flush", json!({})).unwrap();
+        assert_eq!(again["attempted"], 0);
+        assert_eq!(again["quarantined"], 2);
+        dispatch(
+            &mut a,
+            "history.prune",
+            json!({"before_ms":Store::now_ms()+1000}),
+        )
+        .unwrap();
+        for (args, facts) in originals {
+            let id = args["id"].as_str().unwrap();
+            assert_eq!(
+                original_facts(&a, id),
+                facts,
+                "{mode}: immutable facts for {id}"
+            );
+            let stored = dispatch(&mut a, "mail.show", json!({"id":id})).unwrap();
+            assert_eq!(stored["delivery"], "quarantined");
+            assert_eq!(stored["delivery_attempts"], 0);
+            assert!(stored["delivery_error"].as_str().unwrap().contains("65537"));
+            let replay = send(&mut a, args.clone()).unwrap();
+            assert_eq!(replay["duplicate"], true);
+            assert_eq!(replay["delivery"], "quarantined");
+            let mut changed = args;
+            changed["body"] = json!("replacement text requires a new id");
+            assert!(err(send(&mut a, changed)).contains("different message"));
+        }
+    }
+}
+
+#[test]
+fn legacy_quarantine_work_is_bounded_separately_from_transport_attempts() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    for n in 0..120 {
+        seed_legacy_oversize(
+            &a,
+            json!({"id":format!("poison-{n}"),"from":"apps","to":"infra","kind":"notice"}),
+        );
+    }
+    let valid = send(
+        &mut a,
+        json!({"id":"after-poison","from":"apps","to":"infra",
+        "kind":"notice","body":"eventual progress"}),
+    )
+    .unwrap();
+    assert_eq!(valid["delivery"], "pending");
+    let status = dispatch(&mut a, "status", json!({})).unwrap();
+    assert_eq!(
+        status["quarantined_mail"], 51,
+        "immediate send examines at most 1+50 records"
+    );
+    assert_eq!(status["undelivered_mail"], 121);
+    let second = dispatch(&mut a, "mail.flush", json!({"limit":1})).unwrap();
+    assert_eq!(second["attempted"], 0);
+    assert_eq!(second["quarantined"], 102);
+    assert_eq!(second["pending"], 19);
+    let third = privateer::activation::tick(&mut a).unwrap()["delivered"].clone();
+    assert_eq!(third["attempted"], 1);
+    assert_eq!(third["delivered"], 1);
+    assert_eq!(third["quarantined"], 120);
+    assert_eq!(third["pending"], 0);
+    let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+    assert_eq!(inbox["messages"][0]["id"], "after-poison");
+    let page = dispatch(
+        &mut a,
+        "mail.outbox",
+        json!({"delivery":"quarantined","limit":1000}),
+    )
+    .unwrap();
+    assert_eq!(page["messages"].as_array().unwrap().len(), 100);
+    let rest = dispatch(
+        &mut a,
+        "mail.outbox",
+        json!({"delivery":"quarantined","after_seq":page["next_after_seq"]}),
+    )
+    .unwrap();
+    assert_eq!(rest["messages"].as_array().unwrap().len(), 20);
+    assert!(rest["next_after_seq"].is_null());
+}
+
+#[test]
+fn quarantine_and_audit_commit_together_without_changing_peer_backoff() {
+    let Pair { _temp, mut a, .. } = pair();
+    seed_legacy_oversize(
+        &a,
+        json!({"id":"atomic","from":"apps","to":"infra","kind":"request"}),
+    );
+    a.connection()
+        .execute(
+            "INSERT INTO mail_delivery_retry VALUES('home-b',2,?1,123)",
+            [i64::MAX],
+        )
+        .unwrap();
+    a.connection()
+        .execute_batch(
+            "CREATE TRIGGER reject_quarantine_audit BEFORE INSERT ON audit
+         WHEN NEW.kind='mail.quarantined' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;",
+        )
+        .unwrap();
+    assert!(err(dispatch(&mut a, "mail.flush", json!({}))).contains("fixture audit failure"));
+    let pending = dispatch(&mut a, "mail.show", json!({"id":"atomic"})).unwrap();
+    assert_eq!(pending["delivery"], "pending");
+    assert!(pending["delivery_error"].is_null());
+    a.connection()
+        .execute_batch("DROP TRIGGER reject_quarantine_audit;")
+        .unwrap();
+    let flushed = dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    assert_eq!(flushed["quarantined"], 1);
+    assert_eq!(flushed["attempted"], 0);
+    let retry: (i64,i64,i64) = a.connection().query_row(
+        "SELECT failures,next_attempt_ms,last_attempt_ms FROM mail_delivery_retry WHERE peer='home-b'",
+        [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    assert_eq!(retry, (2, i64::MAX, 123));
+    let audits: i64 = a
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM audit WHERE kind='mail.quarantined'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(audits, 1);
+    assert_eq!(
+        dispatch(&mut a, "mail.show", json!({"id":"atomic"})).unwrap()["state"],
+        "open"
+    );
+}
+
+#[test]
+fn outbox_pages_only_the_senders_headers_and_bounds_error_display() {
+    let Pair { _temp, mut a, .. } = pair();
+    for (id, from) in [
+        ("apps-first", "apps"),
+        ("apps-second", "apps"),
+        ("research-private", "research"),
+    ] {
+        seed_legacy_oversize(
+            &a,
+            json!({"id":id,"from":from,"to":"infra","kind":"notice"}),
+        );
+    }
+    dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    let full_error = "private diagnostic ".repeat(1000);
+    a.connection()
+        .execute(
+            "UPDATE mail SET delivery_error=?1 WHERE id='research-private'",
+            [&full_error],
+        )
+        .unwrap();
+    a.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    let first = dispatch(
+        &mut a,
+        "mail.outbox",
+        json!({"delivery":"quarantined","limit":1}),
+    )
+    .unwrap();
+    assert_eq!(first["messages"][0]["id"], "apps-first");
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+    assert!(first["next_after_seq"].as_i64().is_some());
+    let second = dispatch(
+        &mut a,
+        "mail.outbox",
+        json!({"after_seq":first["next_after_seq"]}),
+    )
+    .unwrap();
+    assert_eq!(second["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(second["messages"][0]["id"], "apps-second");
+    assert!(second["next_after_seq"].is_null());
+    assert!(
+        !second["messages"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("body")
+    );
+    assert!(
+        !second["messages"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("payload")
+    );
+    assert!(dispatch(&mut a, "mail.outbox", json!({"from":"research"})).is_err());
+    assert!(dispatch(&mut a, "mail.outbox", json!({"from":"unknown"})).is_err());
+    assert!(dispatch(&mut a, "mail.show", json!({"id":"research-private"})).is_err());
+    assert_eq!(
+        dispatch(&mut a, "mail.flush", json!({})).unwrap()["quarantined"],
+        2
+    );
+    a.set_caller(Caller::Agent {
+        actor: "unknown".into(),
+    });
+    assert!(
+        dispatch(&mut a, "mail.outbox", json!({})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    a.set_caller(Caller::Operator);
+    assert!(
+        dispatch(&mut a, "mail.outbox", json!({"from":"unknown"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let research = dispatch(&mut a, "mail.outbox", json!({"from":"research"})).unwrap();
+    assert_eq!(research["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        research["messages"][0]["delivery_error"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        1024
+    );
+    assert_eq!(
+        dispatch(&mut a, "mail.show", json!({"id":"research-private"})).unwrap()["delivery_error"],
+        full_error
+    );
+    assert!(dispatch(&mut a, "mail.outbox", json!({"delivery":"received"})).is_err());
+}
+
+#[test]
+fn quarantining_a_legacy_reply_preserves_the_existing_conversation_states() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    send(
+        &mut a,
+        json!({"id":"legacy-thread","from":"apps","to":"infra","kind":"request","body":"question"}),
+    )
+    .unwrap();
+    let reply = seed_legacy_oversize(
+        &b,
+        json!({"id":"legacy-reply","from":"infra","to":"apps",
+        "kind":"reply","correlation":"legacy-thread"}),
+    );
+    b.connection().execute(
+        "UPDATE mail SET state='answered',answered_by='legacy-reply',answered_ms=?1 WHERE id='legacy-thread'",
+        [Store::now_ms()],
+    ).unwrap();
+    let thread_facts = original_facts(&b, "legacy-thread");
+    let reply_facts = original_facts(&b, "legacy-reply");
+    let valid = send(&mut b, json!({"id":"later-notice","from":"infra","to":"apps","kind":"notice","body":"coordination"})).unwrap();
+    assert_eq!(valid["delivery"], "delivered");
+    assert_eq!(original_facts(&b, "legacy-thread"), thread_facts);
+    assert_eq!(original_facts(&b, "legacy-reply"), reply_facts);
+    let quarantined = dispatch(&mut b, "mail.show", json!({"id":"legacy-reply"})).unwrap();
+    assert_eq!(quarantined["delivery"], "quarantined");
+    assert_eq!(quarantined["correlation"], "legacy-thread");
+    assert_eq!(
+        dispatch(&mut a, "mail.show", json!({"id":"legacy-thread"})).unwrap()["state"],
+        "open"
+    );
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"legacy-thread"})).unwrap()["state"],
+        "answered"
+    );
+    assert!(dispatch(&mut a, "mail.show", json!({"id":"legacy-reply"})).is_err());
+    assert_eq!(send(&mut b, reply).unwrap()["duplicate"], true);
+    assert!(
+        err(send(
+            &mut b,
+            json!({"id":"replacement-reply","from":"infra","to":"apps",
+        "kind":"reply","correlation":"legacy-thread","body":"short replacement"})
+        ))
+        .contains("already answered")
+    );
+}
+
+#[test]
+fn valid_wire_with_a_remote_size_error_stays_pending_with_backoff() {
+    use std::os::unix::fs::PermissionsExt;
+    let Pair {
+        _temp,
+        mut a,
+        b_home,
+        ..
+    } = pair();
+    let executable = _temp.path().join("refuse.py");
+    fs::write(&executable, "#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'temporary remote error: message exceeds 64 KiB'}))\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local","executable":executable,"home":b_home}),
+    )
+    .unwrap();
+    let sent = send(
+        &mut a,
+        json!({"id":"transient","from":"apps","to":"infra","kind":"notice","body":"valid wire"}),
+    )
+    .unwrap();
+    assert_eq!(sent["delivery"], "pending");
+    assert_eq!(sent["delivery_attempts"], 1);
+    let report = dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    assert_eq!(report["pending"], 1);
+    assert_eq!(report["quarantined"], 0);
+    assert_eq!(report["attempted"], 1);
+    let retry: (i64, i64) = a
+        .connection()
+        .query_row(
+            "SELECT failures,next_attempt_ms FROM mail_delivery_retry WHERE peer='home-b'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retry.0, 2);
+    assert!(retry.1 > 0);
+}
+
 #[test]
 fn requests_and_replies_cross_homes_and_close_both_copies() {
     let Pair {
@@ -510,6 +935,203 @@ fn requests_and_replies_cross_homes_and_close_both_copies() {
     );
     // A home cannot read a mailbox it does not hold.
     assert!(dispatch(&mut a, "mail.inbox", json!({"address":"infra"})).is_err());
+}
+
+#[test]
+fn long_message_ids_cross_homes_on_every_delivery_path() {
+    for mode in ["immediate", "manual", "dispatcher"] {
+        let Pair {
+            _temp,
+            mut a,
+            mut b,
+            b_home,
+        } = pair();
+        if mode != "immediate" {
+            dispatch(
+                &mut a,
+                "peer.put",
+                json!({"name":"home-b","transport":"local",
+                    "executable":"/nonexistent/privateer","home":b_home}),
+            )
+            .unwrap();
+        }
+        let request_id = "a".repeat(121);
+        let notice_id = "b".repeat(160);
+        for (id, kind) in [(&request_id, "request"), (&notice_id, "notice")] {
+            send(
+                &mut a,
+                json!({"id":id,"from":"apps","to":"infra","kind":kind,
+                    "body":"preserve identity","payload":{"text":"\"\\\n船"}}),
+            )
+            .unwrap();
+        }
+        if mode != "immediate" {
+            dispatch(
+                &mut a,
+                "peer.put",
+                json!({"name":"home-b","transport":"local",
+                    "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+            )
+            .unwrap();
+            let report = if mode == "manual" {
+                dispatch(&mut a, "mail.flush", json!({})).unwrap()
+            } else {
+                a.connection()
+                    .execute("UPDATE mail_delivery_retry SET next_attempt_ms=0", [])
+                    .unwrap();
+                privateer::activation::tick(&mut a).unwrap()["delivered"].clone()
+            };
+            assert_eq!(report["delivered"], 2, "{mode}: {report}");
+            assert_eq!(report["pending"], 0, "{mode}: {report}");
+        }
+        let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+        assert_eq!(inbox["messages"][0]["id"], request_id, "{mode}");
+        assert_eq!(inbox["messages"][1]["id"], notice_id, "{mode}");
+        assert_eq!(inbox["messages"][0]["payload"]["text"], "\"\\\n船");
+        let reply_id = "r".repeat(160);
+        send(
+            &mut b,
+            json!({"id":reply_id,"from":"infra","to":"apps","kind":"reply",
+                "correlation":request_id,"body":"answered"}),
+        )
+        .unwrap();
+        for store in [&mut a, &mut b] {
+            let request = dispatch(store, "mail.show", json!({"id":request_id})).unwrap();
+            assert_eq!(request["answered_by"], reply_id, "{mode}");
+            assert_eq!(request["state"], "answered", "{mode}");
+        }
+    }
+}
+
+#[test]
+fn outgoing_mail_is_limited_by_its_normalized_wire_bytes() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    let oversized = json!({"id":"large","from":"apps","to":"infra",
+        "kind":"notice","body":"x".repeat(65_450)});
+    assert!(oversized.to_string().len() < 65_536);
+    assert!(err(send(&mut a, oversized)).contains("64 KiB"));
+    assert!(dispatch(&mut a, "mail.show", json!({"id":"large"})).is_err());
+    send(
+        &mut a,
+        json!({"id":"thread","from":"apps","to":"infra","kind":"request","body":"context"}),
+    )
+    .unwrap();
+    for mode in ["body", "payload", "generated-id", "metadata"] {
+        let now = Store::now_ms();
+        let mut args = json!({"id":mode,"from":"apps","to":"infra",
+            "kind":"notice","body":"\"\\\n船","payload":{}});
+        let mut wire = json!({"id":mode,"from":"apps","to":"infra",
+            "kind":"notice","body":"\"\\\n船","payload":{},"correlation":null,
+            "request_kind":null,"urgency":"normal","deadline_ms":null,"created_ms":now});
+        if mode == "generated-id" {
+            args.as_object_mut().unwrap().remove("id");
+            wire["id"] = json!("00000000-0000-0000-0000-000000000000");
+        }
+        if mode == "metadata" {
+            for (key, value) in [
+                ("kind", json!("request")),
+                ("correlation", json!("thread")),
+                ("request_kind", json!("deploy")),
+                ("urgency", json!("high")),
+            ] {
+                args[key] = value.clone();
+                wire[key] = value;
+            }
+            args["reply_within_secs"] = json!(3600);
+            wire["deadline_ms"] = json!(now + 3_600_000);
+        }
+        if mode == "payload" {
+            args["payload"] = json!({"text":""});
+            wire["payload"] = args["payload"].clone();
+        }
+        let padding = "x".repeat(65_537 - wire.to_string().len());
+        let key = if mode == "payload" { "payload" } else { "body" };
+        let content = if mode == "payload" {
+            json!({"text":padding})
+        } else {
+            json!(format!("\"\\\n船{padding}"))
+        };
+        args[key] = content.clone();
+        wire[key] = content;
+        assert_eq!(wire.to_string().len(), 65_537, "{mode}");
+        assert!(args.to_string().len() <= 65_536, "{mode}");
+        assert!(err(send(&mut a, args.clone())).contains("64 KiB"), "{mode}");
+        assert_eq!(
+            dispatch(&mut a, "status", json!({})).unwrap()["undelivered_mail"],
+            0
+        );
+        if mode == "payload" {
+            let text = args["payload"]["text"].as_str().unwrap();
+            args["payload"]["text"] = json!(&text[..text.len() - 1]);
+        } else {
+            let text = args["body"].as_str().unwrap();
+            args["body"] = json!(&text[..text.len() - 1]);
+        }
+        let sent = send(&mut a, args).unwrap();
+        let received = dispatch(&mut b, "mail.show", json!({"id":sent["id"]})).unwrap();
+        for key in [
+            "id",
+            "body",
+            "payload",
+            "correlation",
+            "request_kind",
+            "urgency",
+            "deadline_ms",
+        ] {
+            assert_eq!(received[key], sent[key], "{mode}: {key}");
+        }
+        let duplicate = dispatch(
+            &mut a,
+            "mail.send",
+            json!({"id":sent["id"],
+            "from":"apps","to":"infra","kind":sent["kind"],"body":sent["body"],
+            "payload":sent["payload"],"correlation":sent["correlation"],
+            "request_kind":sent["request_kind"]}),
+        )
+        .unwrap();
+        assert_eq!(duplicate["duplicate"], true);
+    }
+}
+
+#[test]
+fn rejecting_an_oversized_remote_reply_keeps_the_request_open() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    send(
+        &mut a,
+        json!({"id":"question","from":"apps","to":"infra",
+        "kind":"request","body":"answer this"}),
+    )
+    .unwrap();
+    let oversized = json!({"id":"answer","from":"infra","to":"apps",
+        "kind":"reply","correlation":"question","body":"x".repeat(65_400)});
+    assert!(oversized.to_string().len() < 65_536);
+    assert!(err(send(&mut b, oversized)).contains("64 KiB"));
+    for store in [&mut a, &mut b] {
+        assert!(dispatch(store, "mail.show", json!({"id":"answer"})).is_err());
+        let request = dispatch(store, "mail.show", json!({"id":"question"})).unwrap();
+        assert_eq!(request["state"], "open");
+        assert_eq!(request["answered_by"], Value::Null);
+    }
+    send(
+        &mut b,
+        json!({"id":"answer","from":"infra","to":"apps",
+        "kind":"reply","correlation":"question","body":"answer"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut a, "mail.show", json!({"id":"question"})).unwrap()["state"],
+        "answered"
+    );
 }
 
 #[test]
@@ -567,6 +1189,216 @@ fn undeliverable_mail_stays_pending_until_flushed() {
     )
     .unwrap();
     assert_eq!(again["duplicate"], true);
+}
+
+#[test]
+fn an_unavailable_peers_backlog_does_not_hide_another_peers_mail() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        b_home,
+    } = pair();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"broken","transport":"local",
+        "executable":"/nonexistent/privateer","home":b_home}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "ship.put",
+        json!({"name":"blocked","location":{"peer":"broken"}}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local",
+        "executable":"/nonexistent/privateer","home":b_home}),
+    )
+    .unwrap();
+    for n in 0..60 {
+        send(
+            &mut a,
+            json!({"id":format!("blocked-{n}"),"from":"apps","to":"blocked",
+            "kind":"notice","body":"durable pending mail"}),
+        )
+        .unwrap();
+    }
+    send(
+        &mut a,
+        json!({"id":"reachable","from":"apps","to":"infra",
+        "kind":"notice","body":"this peer recovered"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local",
+        "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+    )
+    .unwrap();
+    // A manual flush retries a failed peer only once, then reaches the other
+    // peer even though the unavailable peer owns more than the page limit.
+    let report = dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    assert_eq!(report["delivered"], 1, "{report}");
+    assert_eq!(report["attempted"], 2);
+    assert_eq!(report["pending"], 60);
+    let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+    assert_eq!(inbox["messages"][0]["id"], "reachable");
+    let facts: i64 = a
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE delivery='pending' AND recipient='blocked'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(facts, 60);
+}
+
+#[test]
+fn automatic_delivery_backoff_survives_restart_and_preserves_peer_order() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        b_home,
+    } = pair();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local",
+        "executable":"/nonexistent/privateer","home":b_home}),
+    )
+    .unwrap();
+    for id in ["first", "second"] {
+        send(
+            &mut a,
+            json!({"id":id,"from":"apps","to":"infra",
+            "kind":"notice","body":id}),
+        )
+        .unwrap();
+    }
+    // Do not depend on finishing restart/configuration within the real
+    // one-second retry delay on a loaded machine.
+    a.connection()
+        .execute(
+            "UPDATE mail_delivery_retry SET next_attempt_ms=?1",
+            [i64::MAX],
+        )
+        .unwrap();
+    let home = a.home().to_owned();
+    drop(a);
+    let mut a = Store::open(&home).unwrap();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local",
+        "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+    )
+    .unwrap();
+    let paused = privateer::activation::tick(&mut a).unwrap();
+    assert_eq!(paused["delivered"]["attempted"], 0, "{paused}");
+    let attempts: Vec<i64> = a
+        .connection()
+        .prepare("SELECT delivery_attempts FROM mail ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(attempts, vec![1, 0]);
+    // Advance the durable retry clock without sleeping in the test.
+    a.connection()
+        .execute("UPDATE mail_delivery_retry SET next_attempt_ms=0", [])
+        .unwrap();
+    let delivered = privateer::activation::tick(&mut a).unwrap();
+    assert_eq!(delivered["delivered"]["delivered"], 2, "{delivered}");
+    assert_eq!(delivered["delivered"]["pending"], 0);
+    let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+    let ids: Vec<_> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["first", "second"]);
+}
+
+#[test]
+fn peer_order_does_not_allow_an_agent_to_deliver_or_bypass_another_senders_mail() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        b_home,
+    } = pair();
+    dispatch(&mut a, "ship.put", json!({"name":"research"})).unwrap();
+    dispatch(
+        &mut b,
+        "ship.put",
+        json!({"name":"research","location":{"peer":"home-a"}}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local",
+        "executable":"/nonexistent/privateer","home":b_home}),
+    )
+    .unwrap();
+    send(
+        &mut a,
+        json!({"id":"apps-first","from":"apps","to":"infra",
+        "kind":"notice","body":"first"}),
+    )
+    .unwrap();
+    a.set_caller(Caller::Agent {
+        actor: "research".into(),
+    });
+    send(
+        &mut a,
+        json!({"id":"research-second","from":"research","to":"infra",
+        "kind":"notice","body":"second"}),
+    )
+    .unwrap();
+    a.set_caller(Caller::Operator);
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local",
+        "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+    )
+    .unwrap();
+    a.set_caller(Caller::Agent {
+        actor: "research".into(),
+    });
+    let blocked = dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    assert_eq!(blocked["attempted"], 0);
+    assert_eq!(
+        blocked["pending"], 1,
+        "only this agent's pending mail is counted"
+    );
+    assert!(
+        dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    a.set_caller(Caller::Operator);
+    let delivered = dispatch(&mut a, "mail.flush", json!({})).unwrap();
+    assert_eq!(delivered["delivered"], 2);
+    let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
+    let ids: Vec<_> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["apps-first", "research-second"]);
 }
 
 #[test]
