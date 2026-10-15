@@ -32,7 +32,8 @@ struct Place {
 
 impl Place {
     /// The Pi ship "infra" with `first_mate.host = "herdr"`. Its `pi` records
-    /// how it was started and stays up until `release` exists.
+    /// how it was started; a first mate stays up until `release` exists, and
+    /// a hosted crew member ends at once.
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -43,7 +44,8 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
+                "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
                  printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
                  while [ ! -e '{root}/release' ]; do sleep 0.05; done\n",
                 root = root.display()
@@ -91,6 +93,21 @@ impl Place {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+    /// A command as the ship's agent, as its first mate runs them.
+    fn agent(&self, command: &str, args: Value) -> Value {
+        let output = self
+            .command(&[command, "--json", &args.to_string()])
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "infra")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
     }
     fn json(&self, command: &str, args: Value) -> Value {
         serde_json::from_str(&self.ok(&[command, "--json", &args.to_string()])).unwrap()
@@ -266,4 +283,71 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert!(report["wake"].is_string(), "{report}");
     assert!(report["host_error"].is_string(), "{report}");
     assert_eq!(place.wakes(), 1);
+}
+
+#[test]
+fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "task.create",
+        json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
+    );
+    let started = place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
+    assert_eq!(started["hosted"], true, "{started}");
+
+    // The supervisor runs in a background space under the task, and gives an
+    // interactive harness, with the crew extension, the pane's terminal.
+    let create = &herdr.calls("workspace.create")[0]["params"];
+    assert_eq!(create["label"], "└ infra-fix");
+    assert_eq!(create["focus"], false);
+    let mut job = Value::Null;
+    until("the crew to finish", || {
+        job = place.json("job.status", json!({"id":"crew-1"}));
+        job["status"] == "succeeded"
+    });
+    let argv = fs::read_to_string(place.root.join("crew-argv")).unwrap();
+    let argv: Vec<&str> = argv.lines().collect();
+    assert!(!argv.contains(&"--print"), "{argv:?}");
+    let extension = argv.iter().position(|a| *a == "-e").unwrap();
+    assert!(argv[extension + 1].ends_with("attended/crew.ts"));
+    assert!(extension < argv.iter().rposition(|a| *a == "--").unwrap());
+
+    // Custody is unchanged: the outcome reaches the first mate as crew mail.
+    let inbox = place.json("mail.inbox", json!({"address":"infra","all":true}));
+    let outcome = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["from"] == "crew" && m["payload"]["job_id"] == "crew-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(outcome["payload"]["status"], "succeeded");
+}
+
+#[test]
+fn a_hosted_crew_session_ends_when_its_work_settles() {
+    let output = support::command("node")
+        .arg("tests/hosted-crew.mjs")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Node is required to check the hosted crew extension");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

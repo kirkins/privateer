@@ -264,27 +264,28 @@ impl Client {
         self.launch(observed, folder, name, binary, home, &["start"])
     }
 
-    /// Open a background space for a ship's hosted first mate and run
-    /// `privateer start --hosted` there under the dispatcher's lease `holder`.
-    pub fn host(
+    /// Open a background space running `privateer --home HOME COMMAND...`:
+    /// a hosted first mate or a crew member's supervisor.
+    pub fn space(
         &mut self,
         folder: &Path,
-        name: &str,
+        label: &str,
         binary: &Path,
         home: &Path,
-        holder: &str,
+        env: &[(&str, &str)],
+        command: &[&str],
     ) -> Result<Pane> {
         let observed = self.snapshot()?;
         self.spawn(
             &observed,
             "workspace.create",
             folder,
-            name,
+            label,
             false,
-            &[("PRIVATEER_HOSTED_HOLDER", holder)],
+            env,
             binary,
             home,
-            &["start", "--hosted"],
+            command,
         )
     }
 

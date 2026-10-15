@@ -121,6 +121,27 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     }
                 }
             }
+            // Crew of a hosted ship run live in their own space, where the
+            // captain can watch and steer them, when the host answers.
+            let hosted = !workspace::is_wake(store, &args)? && {
+                let profile = owner
+                    .as_str()
+                    .and_then(|ship| {
+                        mail::dispatch(store, "ship.show", serde_json::json!({"name": ship})).ok()
+                    })
+                    .map(|ship| ship["first_mate"].clone())
+                    .unwrap_or_default();
+                args["manifest"]
+                    .as_str()
+                    .and_then(bundled::harness)
+                    .is_some_and(|harness| host::hosts_crew(&profile, &harness))
+            };
+            if hosted {
+                if !args["options"].is_object() {
+                    args["options"] = serde_json::json!({});
+                }
+                args["options"]["mode"] = serde_json::json!("interactive");
+            }
             let repo = std::fs::canonicalize(
                 charter["repo"]
                     .as_str()
@@ -147,7 +168,22 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 args["_workspace_cwd"] = serde_json::json!(execution.root);
             }
             drop(execution);
-            let plan = plugins::dispatch(store, "plugin.command", args.clone())?;
+            let mut plan = plugins::dispatch(store, "plugin.command", args.clone())?;
+            if hosted {
+                // The crew extension ends the session when its work settles.
+                let extension = cli::plugins_dir()?.join("attended/crew.ts");
+                let argv = plan["argv"]
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow::anyhow!("plan without argv"))?;
+                let at = argv
+                    .iter()
+                    .rposition(|a| a == "--")
+                    .ok_or_else(|| anyhow::anyhow!("interactive plan without a prompt"))?;
+                argv.splice(
+                    at..at,
+                    [serde_json::json!("-e"), serde_json::json!(extension)],
+                );
+            }
             // The launched harness acts as the task owner, under the agent role.
             let mut job = serde_json::json!({
                 "task_id": task,
@@ -170,6 +206,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();
+            }
+            if hosted {
+                job["hosted"] = serde_json::json!(true);
             }
             jobs::start_agent(store, job)
         }

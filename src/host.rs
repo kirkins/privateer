@@ -8,7 +8,7 @@
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// How long a launch may take to adopt its lease before it lapses.
 const LAUNCH_TTL_SECS: u64 = 60;
@@ -56,7 +56,14 @@ pub(crate) fn launch(store: &Store, ship: &str, harness: &str) -> Result<Value> 
     crate::presence::claim(store, ship, &holder, LAUNCH_TTL_SECS, Some(harness))?;
     let folder = store.home().parent().context("ship folder")?;
     let binary = crate::executable::installed()?;
-    match client.host(folder, ship, &binary, store.home(), &holder) {
+    match client.space(
+        folder,
+        ship,
+        &binary,
+        store.home(),
+        &[("PRIVATEER_HOSTED_HOLDER", &holder)],
+        &["start", "--hosted"],
+    ) {
         Ok(pane) => {
             let launched = json!({"holder": holder, "pane": pane.pane_id,
                 "workspace": pane.workspace_id});
@@ -71,4 +78,36 @@ pub(crate) fn launch(store: &Store, ship: &str, harness: &str) -> Result<Value> 
             Err(error)
         }
     }
+}
+
+/// Whether a ship's crew run live: its first mate is hosted, its harness can
+/// end a crew when the work settles, and the terminal host answers.
+pub(crate) fn hosts_crew(profile: &Value, harness: &str) -> bool {
+    hosted(profile)
+        && LIVE_HARNESSES.contains(&harness)
+        && socket()
+            .and_then(|s| crate::herdr::Client::connect(&s).ok())
+            .is_some_and(|mut c| c.snapshot().is_ok())
+}
+
+/// Run a crew job's supervisor in its own background space, labelled under
+/// its task. The supervisor claims the job there and gives the harness the
+/// pane's terminal.
+pub(crate) fn supervise(store: &Store, job: &str, task: &str, cwd: &Path) -> Result<()> {
+    let socket = socket().context("no Herdr socket configured")?;
+    let mut client = crate::herdr::Client::connect(&socket)?;
+    let binary = crate::executable::installed()?;
+    let pane = client.space(
+        cwd,
+        &format!("└ {task}"),
+        &binary,
+        store.home(),
+        &[],
+        &["_job-supervise", job],
+    )?;
+    store.audit(
+        "host.crew",
+        &json!({"job_id": job, "task_id": task, "pane": pane.pane_id, "workspace": pane.workspace_id}),
+    )?;
+    Ok(())
 }
