@@ -264,3 +264,50 @@ fn a_failed_attended_launch_releases_its_presence() {
     assert!(!output.status.success());
     assert_eq!(ship.presence()["attended"], false);
 }
+
+#[test]
+fn simultaneous_attended_starts_have_one_live_harness_and_lease_owner() {
+    use std::time::{Duration, Instant};
+    let ship = Ship::new();
+    let harness = ship.root.join("bin/controlled-mate");
+    let began = ship.root.join("began");
+    let release = ship.root.join("release");
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n",
+            began.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut first = ship
+        .command(&["start", "controlled-mate"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !began.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !began.exists() {
+        fs::write(&release, "").unwrap();
+        let _ = first.wait();
+        panic!("first attended harness did not start");
+    }
+    let owner = ship.presence()["lease"]["holder"].clone();
+    let second = ship
+        .command(&["start", "controlled-mate"])
+        .output()
+        .unwrap();
+    let still = ship.presence();
+    fs::write(release, "").unwrap();
+    let ended = first.wait().unwrap();
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("already aboard"));
+    assert_eq!(still["lease"]["holder"], owner);
+    assert!(ended.success());
+    assert_eq!(ship.presence()["attended"], false);
+}

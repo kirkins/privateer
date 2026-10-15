@@ -459,7 +459,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let folder = home.parent().context("ship folder")?;
     // Hold presence before the child can read its mailbox or race serve.
     let holder = format!("start:{}", std::process::id());
-    crate::presence::attend(&store, &ship, &holder, 90, Some(&harness))?;
+    crate::presence::claim(&store, &ship, &holder, 90, Some(&harness))?;
     let child = std::process::Command::new(&binary)
         .args(passthrough)
         .current_dir(folder)
