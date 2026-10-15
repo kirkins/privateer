@@ -17,14 +17,73 @@ const LOG_LIMIT: u64 = 1024 * 1024;
 
 /// Whether a dispatcher currently holds the home's serve lock.
 pub fn running(home: &Path) -> Result<bool> {
-    let path = home.join("serve.lock");
+    held(&home.join("serve.lock"))
+}
+
+/// Whether some process holds an exclusive lock on `path`.
+pub(crate) fn held(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    let lock = fs::OpenOptions::new().write(true).open(&path)?;
+    let lock = fs::OpenOptions::new().write(true).open(path)?;
     let free = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
     // Closing the descriptor releases a lock taken just to test it.
     Ok(!free)
+}
+
+/// A background process Privateer keeps running: a ship's dispatcher or a
+/// captain's front door. It holds `lock` for its whole life, so a held lock
+/// means running however it was started.
+struct Service {
+    lock: PathBuf,
+    unit: String,
+    description: String,
+    args: Vec<String>,
+    environment: &'static [&'static str],
+    log: PathBuf,
+    pid: PathBuf,
+    /// Text the command line of the detached process must contain.
+    marks: Vec<String>,
+    what: String,
+}
+
+fn dispatcher(home: &Path, ship: &str) -> Service {
+    let home_text = home.to_string_lossy().into_owned();
+    Service {
+        lock: home.join("serve.lock"),
+        unit: unit_name(home, ship),
+        description: format!("Privateer dispatcher for ship {ship}"),
+        args: vec!["--home".into(), home_text.clone(), "serve".into()],
+        environment: &["PATH", "PRIVATEER_RESOURCE_HOME", "PRIVATEER_PLUGINS"],
+        log: home.join("serve.log"),
+        pid: home.join("serve.pid"),
+        marks: vec!["serve".into(), home_text],
+        what: "the dispatcher".into(),
+    }
+}
+
+fn door(name: &str) -> Result<Service> {
+    let dir = crate::door::directory(name)?;
+    let registry = crate::fleet::registry_path()?;
+    let digest = Sha256::digest(registry.to_string_lossy().as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    Ok(Service {
+        lock: dir.join("lock"),
+        unit: format!("privateer-door-{name}-{short}.service"),
+        description: format!("Privateer front door {name}"),
+        args: vec!["door".into(), "run".into(), name.into()],
+        environment: &[
+            "PATH",
+            "PRIVATEER_FLEET",
+            "PRIVATEER_RESOURCE_HOME",
+            "PRIVATEER_PLUGINS",
+            "XDG_STATE_HOME",
+        ],
+        log: dir.join("supervisor.log"),
+        pid: dir.join("supervisor.pid"),
+        marks: vec!["door".into(), "run".into(), name.into()],
+        what: format!("the front door {name}"),
+    })
 }
 
 fn systemctl() -> String {
@@ -64,12 +123,11 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// A user service for the ship's dispatcher. A service does not see the
-/// login shell's PATH, where harnesses usually live, so it records the
-/// current one.
-fn unit(home: &Path, ship: &str, binary: &Path) -> String {
+/// A user service. A service does not see the login shell's PATH, where
+/// harnesses usually live, so it records the current one.
+fn unit(service: &Service, binary: &Path) -> String {
     let mut environment = String::new();
-    for name in ["PATH", "PRIVATEER_RESOURCE_HOME", "PRIVATEER_PLUGINS"] {
+    for name in service.environment {
         if let Ok(value) = std::env::var(name) {
             environment.push_str(&format!(
                 "Environment={}\n",
@@ -77,22 +135,32 @@ fn unit(home: &Path, ship: &str, binary: &Path) -> String {
             ));
         }
     }
+    // Paths are quoted; flags and names are plain words.
+    let args: Vec<String> = service
+        .args
+        .iter()
+        .map(|a| {
+            if a.starts_with('/') {
+                quote(a)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
     format!(
-        "[Unit]\nDescription=Privateer dispatcher for ship {ship}\n\n[Service]\nExecStart={} --home {} serve\n{environment}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription={}\n\n[Service]\nExecStart={} {}\n{environment}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        service.description,
         quote(&binary.to_string_lossy()),
-        quote(&home.to_string_lossy())
+        args.join(" ")
     )
 }
 
-fn detached(home: &Path, binary: &Path) -> Result<()> {
-    let log = home.join("serve.log");
-    if fs::metadata(&log).is_ok_and(|m| m.len() > LOG_LIMIT) {
-        fs::rename(&log, home.join("serve.log.1"))?;
+fn detached(service: &Service, binary: &Path) -> Result<()> {
+    let log = &service.log;
+    if fs::metadata(log).is_ok_and(|m| m.len() > LOG_LIMIT) {
+        fs::rename(log, log.with_extension("log.1"))?;
     }
-    let out = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)?;
+    let out = fs::OpenOptions::new().create(true).append(true).open(log)?;
     let mut command = Command::new(binary);
     for name in [
         "PRIVATEER_ROLE",
@@ -108,9 +176,7 @@ fn detached(home: &Path, binary: &Path) -> Result<()> {
         command.env_remove(name);
     }
     command
-        .arg("--home")
-        .arg(home)
-        .arg("serve")
+        .args(&service.args)
         .stdin(Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out);
@@ -123,24 +189,37 @@ fn detached(home: &Path, binary: &Path) -> Result<()> {
             Ok(())
         });
     }
-    let child = command.spawn().context("start the dispatcher")?;
-    fs::write(home.join("serve.pid"), child.id().to_string())?;
+    let child = command
+        .spawn()
+        .with_context(|| format!("start {}", service.what))?;
+    fs::write(&service.pid, child.id().to_string())?;
     Ok(())
 }
 
 /// Make sure the ship's dispatcher is running; report how.
 pub fn ensure(home: &Path, ship: &str) -> Result<String> {
-    if running(home)? {
+    start(&dispatcher(home, ship), &home.join("serve.log"))
+}
+
+/// Make sure a front door's supervisor is running; report how.
+pub fn ensure_door(name: &str) -> Result<String> {
+    let service = door(name)?;
+    let log = crate::door::directory(name)?.join("door.log");
+    start(&service, &log)
+}
+
+fn start(service: &Service, log: &Path) -> Result<String> {
+    if held(&service.lock)? {
         return Ok("already running".into());
     }
     let binary = crate::executable::installed()?;
     match mode().as_str() {
         "none" => Ok("not started (PRIVATEER_SERVICE=none)".into()),
         "systemd" => {
-            let name = unit_name(home, ship);
+            let name = &service.unit;
             let dir = unit_dir()?;
             fs::create_dir_all(&dir)?;
-            fs::write(dir.join(&name), unit(home, ship, &binary))?;
+            fs::write(dir.join(name), unit(service, &binary))?;
             for args in [
                 vec!["--user", "daemon-reload"],
                 vec!["--user", "enable", "--now", name.as_str()],
@@ -151,10 +230,10 @@ pub fn ensure(home: &Path, ship: &str) -> Result<String> {
             Ok(format!("installed as user service {name}"))
         }
         "detached" => {
-            detached(home, &binary)?;
+            detached(service, &binary)?;
             Ok(format!(
                 "started in the background (log: {})",
-                home.join("serve.log").display()
+                log.display()
             ))
         }
         other => bail!("PRIVATEER_SERVICE must be systemd, detached or none, not {other}"),
@@ -163,15 +242,26 @@ pub fn ensure(home: &Path, ship: &str) -> Result<String> {
 
 /// Describe the ship's dispatcher.
 pub fn status(home: &Path, ship: &str) -> Result<String> {
-    let unit = unit_dir()?.join(unit_name(home, ship));
-    let how = if unit.exists() {
-        format!("user service {}", unit_name(home, ship))
+    Ok(format!(
+        "Dispatcher for {ship}: {}.",
+        describe(&dispatcher(home, ship))?
+    ))
+}
+
+/// Describe a front door's supervisor.
+pub fn door_status(name: &str) -> Result<String> {
+    describe(&door(name)?)
+}
+
+fn describe(service: &Service) -> Result<String> {
+    let how = if unit_dir()?.join(&service.unit).exists() {
+        format!("user service {}", service.unit)
     } else {
         "no user service".into()
     };
     Ok(format!(
-        "Dispatcher for {ship}: {} ({how}).",
-        if running(home)? {
+        "{} ({how})",
+        if held(&service.lock)? {
             "running"
         } else {
             "not running"
@@ -182,8 +272,20 @@ pub fn status(home: &Path, ship: &str) -> Result<String> {
 /// Stop the ship's dispatcher: disable and remove its user service, or end
 /// the detached process recorded in serve.pid if it is still that process.
 pub fn stop(home: &Path, ship: &str) -> Result<String> {
-    let name = unit_name(home, ship);
-    let unit = unit_dir()?.join(&name);
+    halt(
+        &dispatcher(home, ship),
+        "perhaps `privateer serve` in a terminal",
+    )
+}
+
+/// Stop a front door's supervisor, which stops its adapter.
+pub fn stop_door(name: &str) -> Result<String> {
+    halt(&door(name)?, "perhaps `privateer door run` in a terminal")
+}
+
+fn halt(service: &Service, elsewhere: &str) -> Result<String> {
+    let name = &service.unit;
+    let unit = unit_dir()?.join(name);
     if unit.exists() {
         let status = Command::new(systemctl())
             .args(["--user", "disable", "--now", name.as_str()])
@@ -198,34 +300,47 @@ pub fn stop(home: &Path, ship: &str) -> Result<String> {
             .status();
         return Ok(format!("Stopped and removed user service {name}."));
     }
-    let pid_file = home.join("serve.pid");
-    if let Some(pid) = fs::read_to_string(&pid_file)
+    if let Some(pid) = fs::read_to_string(&service.pid)
         .ok()
         .and_then(|p| p.trim().parse::<i32>().ok())
     {
         // Only signal the recorded process while it still holds the lock and
-        // is this home's dispatcher, never a reused PID.
+        // is this service's process, never a reused PID.
         let command = Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "command="])
             .output()?;
         let line = String::from_utf8_lossy(&command.stdout);
-        if running(home)? && line.contains("serve") && line.contains(&*home.to_string_lossy()) {
+        if held(&service.lock)? && service.marks.iter().all(|m| line.contains(m.as_str())) {
             unsafe { libc::kill(pid, libc::SIGTERM) };
-            for _ in 0..50 {
-                if !running(home)? {
+            for _ in 0..100 {
+                if !held(&service.lock)? {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            let _ = fs::remove_file(&pid_file);
-            return Ok(format!("Stopped the dispatcher (pid {pid})."));
+            let _ = fs::remove_file(&service.pid);
+            ensure!(
+                !held(&service.lock)?,
+                "{} (pid {pid}) did not stop within 10 seconds",
+                service.what
+            );
+            return Ok(format!("Stopped {} (pid {pid}).", service.what));
         }
-        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&service.pid);
     }
-    if running(home)? {
+    if held(&service.lock)? {
         bail!(
-            "a dispatcher is running that Privateer did not start (perhaps `privateer serve` in a terminal); stop it there"
+            "{} is running but Privateer did not start it ({elsewhere}); stop it there",
+            service.what
         )
     }
-    Ok("The dispatcher was not running.".into())
+    Ok(format!("{} was not running.", capitalized(&service.what)))
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }

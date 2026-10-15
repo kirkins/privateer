@@ -18,6 +18,9 @@ use std::{
 struct Manifest {
     schema_version: u32,
     id: String,
+    /// `harness` (the default) or another plugin type, such as `front-door`.
+    #[serde(default)]
+    kind: Option<String>,
     executable: Vec<String>,
     #[serde(default = "default_timeout")]
     timeout_ms: u64,
@@ -49,20 +52,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "unsupported plugin manifest version"
             );
             ensure!(
-                !manifest.id.is_empty() && manifest.id.len() <= 128,
-                "invalid plugin id"
+                manifest.kind.as_deref().is_none_or(|k| k == "harness"),
+                "{} is a {} plugin, not a harness adapter",
+                manifest.id,
+                manifest.kind.as_deref().unwrap_or("")
             );
-            ensure!(
-                !manifest.executable.is_empty() && manifest.executable.len() <= 64,
-                "invalid plugin executable"
-            );
-            ensure!(
-                manifest
-                    .executable
-                    .iter()
-                    .all(|s| !s.is_empty() && !s.contains('\0') && s.len() <= 4096),
-                "invalid plugin executable argument"
-            );
+            valid_identity(&manifest.id, &manifest.executable)?;
             ensure!(
                 (1..=30_000).contains(&manifest.timeout_ms),
                 "plugin timeout outside allowed range"
@@ -71,22 +66,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 (128..=1_048_576).contains(&manifest.max_output_bytes),
                 "plugin output limit outside allowed range"
             );
-            let config = config_path
-                .map(|path| -> Result<PathBuf> {
-                    ensure!(
-                        !fs::symlink_metadata(&path)?.file_type().is_symlink(),
-                        "plugin configuration cannot be a symlink"
-                    );
-                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                    let metadata = fs::metadata(&path)?;
-                    ensure!(
-                        metadata.permissions().mode() & 0o077 == 0
-                            && metadata.uid() == unsafe { libc::geteuid() },
-                        "plugin configuration must be user-owned and private (mode 0600)"
-                    );
-                    Ok(path)
-                })
-                .transpose()?;
+            let config = config_path.map(|p| private_config(&p)).transpose()?;
             let options = args.get("options").cloned().unwrap_or_else(|| json!({}));
             ensure!(options.is_object(), "plugin options must be an object");
             let id = uuid::Uuid::new_v4().to_string();
@@ -133,6 +113,40 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         _ => bail!("unknown plugin command: {command}"),
     }
+}
+
+/// A plugin's id and executable argv, as every manifest type declares them.
+pub(crate) fn valid_identity(id: &str, executable: &[String]) -> Result<()> {
+    ensure!(!id.is_empty() && id.len() <= 128, "invalid plugin id");
+    ensure!(
+        !executable.is_empty() && executable.len() <= 64,
+        "invalid plugin executable"
+    );
+    ensure!(
+        executable
+            .iter()
+            .all(|s| !s.is_empty() && !s.contains('\0') && s.len() <= 4096),
+        "invalid plugin executable argument"
+    );
+    Ok(())
+}
+
+/// Private plugin configuration may name credentials: it must be a regular,
+/// user-owned file no one else can read, and not a symlink.
+pub(crate) fn private_config(path: &Path) -> Result<PathBuf> {
+    ensure!(
+        !fs::symlink_metadata(path)?.file_type().is_symlink(),
+        "plugin configuration cannot be a symlink"
+    );
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::metadata(path)?;
+    ensure!(
+        metadata.is_file()
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.uid() == unsafe { libc::geteuid() },
+        "plugin configuration must be user-owned and private (mode 0600)"
+    );
+    Ok(path.to_path_buf())
 }
 
 fn field<'a>(args: &'a Value, key: &str) -> Result<&'a str> {

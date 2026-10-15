@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "kind": "front-door",
+  "id": "telegram",
+  "executable": ["python3", "door.py"],
+  "config_required": true
+}

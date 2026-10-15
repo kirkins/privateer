@@ -16,7 +16,7 @@ pub const STATE_DIR: &str = ".privateer";
 /// Commands that mean the human form when given without `--json`.
 pub const VERBS: &[&str] = &[
     "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project", "start",
-    "hook", "service", "ship",
+    "hook", "service", "ship", "door",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -71,7 +71,7 @@ pub fn installed_harnesses() -> Result<Vec<String>> {
 /// The bundled adapters: `PRIVATEER_PLUGINS`, a `plugins/` directory beside
 /// or above the executable (a source checkout's target/ build), or the
 /// checkout the binary was built from.
-fn plugins_dir() -> Result<PathBuf> {
+pub(crate) fn plugins_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("PRIVATEER_PLUGINS") {
         return Ok(PathBuf::from(dir));
     }
@@ -128,13 +128,13 @@ fn ship_name(folder: &Path) -> Result<String> {
     Ok(name)
 }
 
-struct Flags {
-    positional: Vec<String>,
-    values: std::collections::HashMap<String, String>,
-    switches: Vec<String>,
+pub(crate) struct Flags {
+    pub positional: Vec<String>,
+    pub values: std::collections::HashMap<String, String>,
+    pub switches: Vec<String>,
 }
 
-fn flags(args: &[String], with_value: &[&str]) -> Result<Flags> {
+pub(crate) fn flags(args: &[String], with_value: &[&str]) -> Result<Flags> {
     let mut out = Flags {
         positional: vec![],
         values: Default::default(),

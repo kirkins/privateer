@@ -10,6 +10,10 @@ The version 1 manifest names an executable argv, bounded timeout and combined st
 
 Native adapters plan argv without shell interpolation. They use the user's installed harness and its existing authentication. Validation checks the command plan, not account login or model availability. No model is hardcoded. A plugin is trusted executable code, not a sandbox, and a native harness retains the privileges of its user.
 
+## Front doors
+
+A front door is a different plugin type: a long-running adapter that carries the captain's conversation to a chat service, phone or voice, registered for the whole fleet with `privateer door add` and supervised by `privateer door run`. Its manifest says `"kind": "front-door"`; harness planning refuses it. The bundled [Telegram door](telegram/README.md) is the first. See [front doors](../docs/architecture.md#front-doors) for the protocol.
+
 ## Native harnesses
 
 Select `plugins/<id>/manifest.json` through the existing plugin interface. Core

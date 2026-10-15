@@ -31,7 +31,7 @@ pub fn registry_path() -> Result<PathBuf> {
     Ok(state.join("privateer/fleet.sqlite"))
 }
 
-fn registry() -> Result<Connection> {
+pub(crate) fn registry() -> Result<Connection> {
     let path = registry_path()?;
     ensure!(
         path.is_absolute(),
@@ -50,13 +50,13 @@ fn registry() -> Result<Connection> {
     Ok(conn)
 }
 
-struct Member {
-    name: String,
-    home: PathBuf,
+pub(crate) struct Member {
+    pub name: String,
+    pub home: PathBuf,
     created_by: String,
 }
 
-fn members(conn: &Connection) -> Result<Vec<Member>> {
+pub(crate) fn members(conn: &Connection) -> Result<Vec<Member>> {
     let mut statement = conn.prepare(
         "SELECT name, home, created_by FROM ships WHERE retired_ms IS NULL ORDER BY name",
     )?;
