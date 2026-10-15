@@ -1,5 +1,6 @@
-//! An optional, read-only operator view. It never calls job reconciliation,
-//! consumes notifications, or owns an agent process.
+//! Optional fleet observations and a command-backed captain mailbox.
+//! Task observation never reconciles jobs or consumes task notifications;
+//! the dashboard does not own agent processes.
 pub mod boat;
 pub mod captain;
 pub mod fleet;

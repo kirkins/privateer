@@ -16,12 +16,14 @@ to work independently.
 ## Build and preview
 
 ```sh
-cargo build --locked --features dashboard --bin privateer-dashboard
+cargo build --locked --features dashboard --bins
 ./target/debug/privateer-dashboard --demo
 ./target/debug/privateer-dashboard --demo --once
 ```
 
 Install both binaries with `cargo install --locked --path . --features dashboard`.
+Live mailbox commands use `privateer` beside the dashboard binary, falling back
+to `privateer` on `PATH`.
 
 The dashboard dependencies are optional. Ordinary `cargo build --bin privateer`
 does not enable them. Ratatui 0.29/Crossterm 0.28 preserve the project's Rust 1.85
@@ -45,6 +47,8 @@ with at most 1,000 displayed items overall. Mark items read to reach later mail;
 list previews are bounded to 100 characters, while details retain the supported
 body and JSON payload. Scroll with Page Up/Down or the wheel to read long mail;
 payload-only messages include a JSON preview and readable payload details.
+Refresh preserves scroll only while the same message in the same home remains
+selected; selecting another message starts its details at the top.
 No unseen row is acknowledged. Failed homes show an error and retain their last
 mail observation. The UI uses bounded worker queues; commands have 15-second
 deadlines and bounded output sized for a full mail page. Failed sends retain
@@ -176,8 +180,9 @@ resizing clears stale targets. Mouse capture is released on exit.
 
 The compact summary starts on. Grouped pending issues remain visible and routine
 facts stay available in Logbook; viewing never deletes facts or acknowledges an
-alert. Failed sources remain visibly unavailable while the last snapshot is
-retained with its age. The details toggle is session-local.
+alert. State and Herdr worker errors retain the last snapshot with its age;
+an unavailable fleet home remains listed with an error. The details toggle is
+session-local.
 
 The home screen has no boat or animation/status band: those three rows are
 available to assignments and details. `--ascii` uses a plain ASCII attention
@@ -191,12 +196,12 @@ function. No animation timer or motion controls run in the dashboard.
 
 ## Reliability boundaries
 
-- SQLite opens an existing database with `READ_ONLY`; it does not call
-  `Store::open`, run migrations, chmod the home, touch the shared resource ledger,
-  run job reconciliation or alter task/event/approval state. SQLite may use its
-  normal WAL/shared-memory sidecars. A missing home is an error, not an implicit
-  initialization.
-- Each state section is bounded to 200 rows with a truncation notice. Queries
+- Fleet/task observation opens an existing database with `READ_ONLY`; it does
+  not call `Store::open`, run migrations, chmod the home, touch the shared
+  resource ledger, run job reconciliation or alter task/event/approval state.
+  SQLite may use its normal WAL/shared-memory sidecars. A missing home is an error, not an implicit
+  initialization. Mailbox commands use the Store behavior described above.
+- Fleet/task sections are bounded to 200 rows with a truncation notice. Queries
   bound long fields; SQLite uses a 100 ms busy timeout and a 500 ms progress
   deadline. Text displayed in the terminal has control and bidi-override
   characters removed. Task views read selected summary fields; mail details keep
@@ -227,7 +232,7 @@ Its Herdr regression scenarios also informed stale-identity checks and focus
 behavior; its shell backend and policy framework are not imported.
 
 Future work includes persistent navigator conversation, explicit task-to-native
-session bindings, direct worker messaging with delivery evidence, push events,
+session bindings, native-session delivery evidence, push events,
 and interactive launch/recovery/resource admission. These need meaningful
 qualification; the dashboard does not claim them through its labels or demo.
 

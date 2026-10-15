@@ -276,8 +276,12 @@ fn captain_mail_keeps_home_identity_replies_and_acknowledges_only_read_prefix() 
 }
 
 fn screen(app: &mut privateer::dashboard::ui::App) -> String {
+    screen_width(app, 120)
+}
+
+fn screen_width(app: &mut privateer::dashboard::ui::App, width: u16) -> String {
     use ratatui::{Terminal, backend::TestBackend};
-    let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(width, 34)).unwrap();
     terminal.draw(|frame| app.draw(frame)).unwrap();
     terminal
         .backend()
@@ -705,7 +709,9 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
         2
     );
     app.select_tab(0);
-    let bridge = screen(&mut app);
+    // Keep the complete origin visible even when the test root is a long
+    // isolated worktree path. Normal-width rendering is covered separately.
+    let bridge = screen_width(&mut app, 240);
     assert!(bridge.contains("Fact delegated"));
     assert!(bridge.contains("job-delegated"));
     assert!(bridge.contains(&home.display().to_string()));
@@ -772,7 +778,7 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
         .iter()
         .position(|&i| app.snapshot.tasks[i].id == "build")
         .unwrap();
-    let assignment = screen(&mut app);
+    let assignment = screen_width(&mut app, 240);
     assert!(assignment.contains("Job apps-job"));
     assert!(!assignment.contains("Job infra-job"));
     assert!(assignment.contains(&apps_home.display().to_string()));

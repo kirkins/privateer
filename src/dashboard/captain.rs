@@ -1,5 +1,6 @@
-//! Captain-facing presentation. Demo interactions stay in memory; no runtime
-//! mailbox, wake, terminal input or approval is synthesized by this module.
+//! Captain-facing presentation with command-backed live mailbox actions.
+//! Demo interactions stay in memory without mailbox changes, wakes, terminal
+//! input or approvals.
 use super::{model::clean, ui::App};
 use crossterm::event::KeyCode;
 use ratatui::{
