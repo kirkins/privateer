@@ -31,17 +31,17 @@ See [dashboard setup and boundaries](docs/dashboard.md).
 
 ## Quick start
 
-A ship is a dedicated folder. Turn one into a ship, then talk to its first mate with any supported harness:
+A ship is a dedicated folder. Make one and go aboard with a single command:
 
 ```sh
-cargo build && export PATH=$PWD/target/debug:$PATH
+cargo install --locked --path .     # from this checkout; puts `privateer` in ~/.cargo/bin
 mkdir -p ~/ships/infra && cd ~/ships/infra
-privateer init                      # names the ship after the folder, detects your harness
-privateer project add <git url>     # repositories the ship works on go in projects/
-privateer serve                     # keep running: answers mail while you are away
-privateer start                     # talk to infra's first mate (or run claude, codex, … here directly)
-privateer ask infra "..."           # or ask from anywhere in the folder; read answers with: privateer inbox
+privateer                           # first time: asks, makes the folder a ship, starts its background
+                                    # dispatcher, and opens its first mate in your installed harness
+privateer                           # every time after: straight to the first mate
 ```
+
+The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Scripts can use `privateer --yes` to skip the question.
 
 ## General runtime and optional integrations
 

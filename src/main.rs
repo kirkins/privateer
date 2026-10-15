@@ -15,10 +15,12 @@ fn run() -> Result<()> {
     let mut internal_job = None;
     let mut positional: Vec<String> = vec![];
     let mut json_given = false;
+    let mut yes = false;
     let mut role = None;
     let mut actor = None;
     while let Some(token) = tokens.next() {
         match token.as_str() {
+            "--yes" | "-y" => yes = true,
             "--role" => role = Some(tokens.next().context("--role requires a role")?),
             "--actor" => actor = Some(tokens.next().context("--actor requires an identity")?),
             "--home" => {
@@ -36,7 +38,7 @@ fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nIn a ship folder (made with `privateer init`), --home is found automatically:\nprivateer init | start | status | ships | ask SHIP TEXT | tell SHIP TEXT | inbox | reply ID TEXT | wakes | project add URL\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, wake.list,\nnote.put/get/list, focus.digest,\nmail.send/inbox/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\nresource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
+                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nprivateer [--yes]   get aboard: make this folder a ship if it is not one (asks first), make sure its\n                    background dispatcher runs, and open its first mate\nIn a ship folder, --home is found automatically:\nprivateer init | start | status | ships | ask SHIP TEXT | tell SHIP TEXT | inbox | reply ID TEXT | wakes |\n          project add URL | service [status|start|stop]\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, wake.list,\nnote.put/get/list, focus.digest,\nmail.send/inbox/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\nresource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
                 );
                 return Ok(());
             }
@@ -54,12 +56,15 @@ fn run() -> Result<()> {
             _ => bail!("unexpected argument {token}"),
         }
     }
-    let command = command.context("command is required; use --help")?;
     // The ship home: --home, PRIVATEER_HOME, or the nearest .privateer above
     // the current directory.
     let home = home
         .or_else(|| std::env::var_os("PRIVATEER_HOME").map(PathBuf::from))
         .or_else(privateer::cli::discover_home);
+    // Bare `privateer` gets you aboard.
+    let Some(command) = command else {
+        return privateer::cli::board(home, yes);
+    };
     // Harness hooks must never fail the harness: they exit with the code
     // the harness expects and log their own errors.
     if command == "hook" {
