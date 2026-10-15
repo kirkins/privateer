@@ -1,10 +1,11 @@
 //! Bounded fleet observations. Never open a runtime Store: even fleet discovery
 //! must work before the first home exists, without initializing state.
-use super::model::{ROW_LIMIT, Ship, Snapshot};
+use super::model::{ROW_LIMIT, Ship, Snapshot, validate_navigation};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -120,6 +121,7 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
         truncated: members.len() > ROW_LIMIT,
         ..Snapshot::default()
     };
+    let mut observed_homes = BTreeSet::new();
     for (name, home) in members.into_iter().take(ROW_LIMIT) {
         crate::store::identifier(&name)?;
         let mut ship = Ship {
@@ -155,27 +157,14 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
                 }
                 ship.description = scope;
                 ship.live = Some(live);
-                out.truncated |= local.truncated;
-                // These lists describe the registered ship's work in its own
-                // home; remote directory identities cannot establish custody.
-                out.tasks.extend(
-                    local
-                        .tasks
-                        .into_iter()
-                        .filter(|t| t.owner == name || t.handoff_to.as_deref() == Some(&name)),
-                );
-                out.pending
-                    .extend(local.pending.into_iter().filter(|n| n.owner == name));
-                out.activity
-                    .extend(local.activity.into_iter().filter(|n| n.owner == name));
-                out.jobs
-                    .extend(local.jobs.into_iter().filter(|j| j.owner == name));
-                out.custody.extend(
-                    local
-                        .custody
-                        .into_iter()
-                        .filter(|c| c.owner == name || c.actor == name),
-                );
+                if observed_homes.insert(home) {
+                    out.truncated |= local.truncated;
+                    out.tasks.extend(local.tasks);
+                    out.pending.extend(local.pending);
+                    out.activity.extend(local.activity);
+                    out.jobs.extend(local.jobs);
+                    out.custody.extend(local.custody);
+                }
             }
             Err(e) => ship.live.as_mut().unwrap().error = Some(e.to_string()),
         }
@@ -191,6 +180,16 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     out.activity.truncate(ROW_LIMIT);
     out.jobs.truncate(ROW_LIMIT);
     out.custody.truncate(ROW_LIMIT);
+    out.include_observed_ships();
+    if let Err(error) = validate_navigation(&out.ships) {
+        out.presentation_error = Some(error.to_string());
+        for ship in &mut out.ships {
+            ship.terminals.clear();
+            ship.liaison = false;
+        }
+    }
+    out.truncated |= out.ships.len() > ROW_LIMIT;
+    out.ships.truncate(ROW_LIMIT);
     Ok(out)
 }
 

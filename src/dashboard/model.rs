@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -57,6 +57,8 @@ impl Ship {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Custody {
+    #[serde(default)]
+    pub home: Option<PathBuf>,
     pub seq: i64,
     pub task_id: String,
     pub actor: String,
@@ -90,11 +92,6 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
         "dashboard registry exceeds 200 ships"
     );
     let mut ids = BTreeSet::new();
-    let mut terminals = BTreeSet::new();
-    ensure!(
-        registry.ships.iter().filter(|s| s.liaison).count() <= 1,
-        "only one ship may be the liaison"
-    );
     for ship in &registry.ships {
         crate::store::identifier(&ship.id)?;
         ensure!(ids.insert(ship.id.clone()), "duplicate ship identity");
@@ -114,13 +111,25 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
                     && terminal.terminal_id.len() <= 160,
                 "invalid terminal binding"
             );
-            ensure!(
-                terminals.insert(terminal.pane_id.clone()),
-                "a pane can belong to only one ship"
-            );
         }
     }
+    validate_navigation(&registry.ships)?;
     Ok(registry.ships)
+}
+
+pub(super) fn validate_navigation(ships: &[Ship]) -> Result<()> {
+    ensure!(
+        ships.iter().filter(|s| s.liaison).count() <= 1,
+        "only one ship may be the liaison"
+    );
+    let mut terminals = BTreeSet::new();
+    for terminal in ships.iter().flat_map(|ship| &ship.terminals) {
+        ensure!(
+            terminals.insert(terminal.pane_id.clone()),
+            "a pane can belong to only one ship"
+        );
+    }
+    Ok(())
 }
 
 /// Terminal escape sequences and control bytes must never reach the renderer.
@@ -135,6 +144,8 @@ pub fn clean(text: &str, limit: usize) -> String {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Task {
+    #[serde(default)]
+    pub home: Option<PathBuf>,
     pub id: String,
     pub owner: String,
     pub title: String,
@@ -145,6 +156,8 @@ pub struct Task {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Notice {
+    #[serde(default)]
+    pub home: Option<PathBuf>,
     #[serde(default)]
     pub owner: String,
     pub seq: i64,
@@ -157,6 +170,8 @@ pub struct Notice {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Job {
     #[serde(default)]
+    pub home: Option<PathBuf>,
+    #[serde(default)]
     pub owner: String,
     pub id: String,
     pub task_id: String,
@@ -165,6 +180,8 @@ pub struct Job {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub presentation_error: Option<String>,
     pub ships: Vec<Ship>,
     pub custody: Vec<Custody>,
     pub tasks: Vec<Task>,
@@ -224,6 +241,7 @@ impl Snapshot {
             let mut q = tx.prepare("SELECT substr(id,1,160),substr(owner,1,160),substr(title,1,512),status,handoff_to FROM tasks ORDER BY CASE WHEN status IN ('running','blocked','open') THEN 0 ELSE 1 END,id LIMIT 201")?;
             for row in q.query_map([], |r| {
                 Ok(Task {
+                    home: Some(home.to_path_buf()),
                     id: r.get(0)?,
                     owner: r.get(1)?,
                     title: r.get(2)?,
@@ -234,13 +252,14 @@ impl Snapshot {
                 snapshot.tasks.push(row?);
             }
         }
-        snapshot.pending = read_notices(&tx, true)?;
-        snapshot.activity = read_notices(&tx, false)?;
+        snapshot.pending = read_notices(&tx, home, true)?;
+        snapshot.activity = read_notices(&tx, home, false)?;
         {
             // Stored outcomes only. We do not probe processes or settle jobs.
             let mut q = tx.prepare("SELECT substr(j.id,1,160),substr(json_extract(j.record,'$.task_id'),1,160),substr(json_extract(j.record,'$.status'),1,40),substr(t.owner,1,160) FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') ORDER BY j.rowid DESC LIMIT 201")?;
             for row in q.query_map([], |r| {
                 Ok(Job {
+                    home: Some(home.to_path_buf()),
                     id: r.get(0)?,
                     task_id: r.get(1)?,
                     status: r.get(2)?,
@@ -255,6 +274,7 @@ impl Snapshot {
             snapshot.custody = q
                 .query_map([], |r| {
                     Ok(Custody {
+                        home: Some(home.to_path_buf()),
                         seq: r.get(0)?,
                         task_id: r.get(1)?,
                         actor: r.get(2)?,
@@ -282,6 +302,7 @@ impl Snapshot {
 
     pub fn demo() -> Self {
         let mut sample = Self {
+            presentation_error: None,
             ships: vec![
                 Ship::demo(
                     "navigator",
@@ -309,6 +330,7 @@ impl Snapshot {
                 ),
             ],
             custody: vec![Custody {
+                home: None,
                 seq: 5,
                 task_id: "app-build".into(),
                 actor: "apps".into(),
@@ -317,6 +339,7 @@ impl Snapshot {
             }],
             tasks: vec![
                 Task {
+                    home: None,
                     id: "navigation".into(),
                     owner: "navigator".into(),
                     title: "Coordinate the next voyage".into(),
@@ -324,6 +347,7 @@ impl Snapshot {
                     handoff_to: None,
                 },
                 Task {
+                    home: None,
                     id: "app-build".into(),
                     owner: "apps".into(),
                     title: "Investigate the failing build".into(),
@@ -331,6 +355,7 @@ impl Snapshot {
                     handoff_to: Some("infrastructure".into()),
                 },
                 Task {
+                    home: None,
                     id: "route-check".into(),
                     owner: "infrastructure".into(),
                     title: "Check the provider route".into(),
@@ -339,6 +364,7 @@ impl Snapshot {
                 },
             ],
             pending: vec![Notice {
+                home: None,
                 owner: "infrastructure".into(),
                 seq: 50,
                 task_id: "route-check".into(),
@@ -347,6 +373,7 @@ impl Snapshot {
                 summary: "Repeated connection facts appear as one pending issue".into(),
             }],
             activity: vec![Notice {
+                home: None,
                 owner: "apps".into(),
                 seq: 51,
                 task_id: "app-build".into(),
@@ -355,6 +382,7 @@ impl Snapshot {
                 summary: "Sample logbook outcome — demonstration data only".into(),
             }],
             jobs: vec![Job {
+                home: None,
                 owner: "apps".into(),
                 id: "build-1".into(),
                 task_id: "app-build".into(),
@@ -367,7 +395,7 @@ impl Snapshot {
     }
 }
 
-fn read_notices(conn: &Connection, pending: bool) -> Result<Vec<Notice>> {
+fn read_notices(conn: &Connection, home: &Path, pending: bool) -> Result<Vec<Notice>> {
     let join = if pending {
         "JOIN pending p ON p.seq=e.seq"
     } else {
@@ -379,6 +407,7 @@ fn read_notices(conn: &Connection, pending: bool) -> Result<Vec<Notice>> {
     let mut q = conn.prepare(&sql)?;
     Ok(q.query_map([], |r| {
         Ok(Notice {
+            home: Some(home.to_path_buf()),
             owner: r.get(5)?,
             seq: r.get(0)?,
             task_id: r.get(1)?,

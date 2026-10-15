@@ -11,8 +11,15 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
+use std::path::Path;
 
 const TABS: [&str; 4] = ["1 Bridge", "2 Assignments", "3 Terminals", "4 Logbook"];
+
+fn origin(home: Option<&Path>) -> String {
+    home.map_or_else(String::new, |home| {
+        format!(" · Home: {}", clean(&home.display().to_string(), 512))
+    })
+}
 
 #[derive(Default)]
 pub struct MouseMap {
@@ -238,8 +245,24 @@ impl App {
             }
         }
     }
+    pub fn update_mail(&mut self, messages: Vec<Mail>, errors: Vec<String>) {
+        let selected = self
+            .mail
+            .get(self.selected)
+            .map(|m| (m.home.clone(), m.id.clone()));
+        self.mail = messages;
+        self.mail_errors = errors;
+        if self.inbox_open {
+            let index = selected
+                .and_then(|(home, id)| self.mail.iter().position(|m| m.home == home && m.id == id));
+            self.selected = index.unwrap_or(0);
+            if index.is_none() {
+                self.scroll = 0;
+            }
+        }
+    }
     pub fn update_snapshot(&mut self, snapshot: Snapshot) {
-        let task_id = self.selected_task().map(|t| t.id.clone());
+        let task_id = self.selected_task().map(|t| (t.home.clone(), t.id.clone()));
         self.snapshot = snapshot;
         if self
             .ship
@@ -250,10 +273,10 @@ impl App {
         }
         if self.tab == 1 {
             self.selected = task_id
-                .and_then(|id| {
-                    self.assignment_indices()
-                        .iter()
-                        .position(|&i| self.snapshot.tasks[i].id == id)
+                .and_then(|(home, id)| {
+                    self.assignment_indices().iter().position(|&i| {
+                        self.snapshot.tasks[i].home == home && self.snapshot.tasks[i].id == id
+                    })
                 })
                 .unwrap_or(0);
         }
@@ -354,7 +377,7 @@ impl App {
         )];
         for n in notices {
             lines.push(Line::from(format!(
-                "{}{} / {} [#{}]",
+                "{}{} / {} [#{}]{}",
                 if self.ship.is_none() {
                     format!("{} / ", clean(&n.owner, 160))
                 } else {
@@ -362,7 +385,8 @@ impl App {
                 },
                 clean(&n.task_id, 160),
                 clean(&n.issue_key, 160),
-                n.seq
+                n.seq,
+                origin(n.home.as_deref())
             )));
             lines.push(Line::from(clean(&n.summary, 2048)));
         }
@@ -500,6 +524,7 @@ impl App {
                 } else {
                     "b: Board or focus the first mate · f: focus a selected terminal"
                 }));
+
                 lines.push(Line::styled(
                     if self.demo {
                         "m: Try Status / Ask / Message · local demo only"
@@ -521,9 +546,10 @@ impl App {
                 if !self.compact {
                     for job in self.snapshot.jobs.iter().filter(|j| j.owner == ship.id) {
                         lines.push(Line::from(format!(
-                            "Job {} · {}",
+                            "Job {} · {}{}",
                             clean(&job.id, 160),
-                            clean(&job.status, 40)
+                            clean(&job.status, 40),
+                            origin(job.home.as_deref())
                         )));
                     }
                 }
@@ -535,10 +561,11 @@ impl App {
                         Style::default().fg(Color::Yellow),
                     ));
                     lines.push(Line::from(format!(
-                        "Task: {} · Owner: {} · {}",
+                        "Task: {} · Owner: {} · {}{}",
                         clean(&task.id, 160),
                         clean(&task.owner, 160),
-                        clean(&task.status, 40)
+                        clean(&task.status, 40),
+                        origin(task.home.as_deref())
                     )));
                     if let Some(target) = &task.handoff_to {
                         lines.push(Line::from(format!(
@@ -547,11 +574,17 @@ impl App {
                             clean(&task.owner, 160)
                         )));
                     }
-                    for job in self.snapshot.jobs.iter().filter(|j| j.task_id == task.id) {
+                    for job in self
+                        .snapshot
+                        .jobs
+                        .iter()
+                        .filter(|j| j.home == task.home && j.task_id == task.id)
+                    {
                         lines.push(Line::from(format!(
-                            "Job {} · {}",
+                            "Job {} · {}{}",
                             clean(&job.id, 160),
-                            clean(&job.status, 40)
+                            clean(&job.status, 40),
+                            origin(job.home.as_deref())
                         )));
                     }
                 } else {
@@ -590,10 +623,11 @@ impl App {
                 for n in self.snapshot.activity.iter().filter(|n| n.owner == ship.id) {
                     lines.push(Line::styled(
                         format!(
-                            "#{} {} · {}",
+                            "#{} {} · {}{}",
                             n.seq,
                             clean(&n.task_id, 160),
-                            clean(&n.kind, 80)
+                            clean(&n.kind, 80),
+                            origin(n.home.as_deref())
                         ),
                         Style::default().fg(Color::Cyan),
                     ));
@@ -608,7 +642,7 @@ impl App {
                     .filter(|c| c.actor == ship.id || c.owner == ship.id)
                 {
                     lines.push(Line::from(format!(
-                        "{} · {} {} · current owner {}",
+                        "{} · {} {} · current owner {}{}",
                         clean(&c.task_id, 160),
                         clean(&c.actor, 160),
                         if c.kind == "task.accept" {
@@ -616,7 +650,8 @@ impl App {
                         } else {
                             "offered a handoff"
                         },
-                        clean(&c.owner, 160)
+                        clean(&c.owner, 160),
+                        origin(c.home.as_deref())
                     )));
                 }
             }
@@ -664,7 +699,7 @@ impl App {
                     Span::raw(if self.demo {
                         " DEMO / sample data"
                     } else {
-                        " READ-ONLY / local home"
+                        " LIVE / fleet · captain mail"
                     }),
                 ]),
                 Line::from(format!(" {scope}")),
@@ -678,9 +713,15 @@ impl App {
             ListItem::new(vec![
                 Line::from("Captain's inbox"),
                 Line::from(if self.demo {
-                    "Sample decisions / replies"
+                    "Sample decisions / replies".into()
+                } else if self.mail_errors.is_empty() {
+                    format!("{} messages", self.mail.len())
                 } else {
-                    "Not connected"
+                    format!(
+                        "{} messages · errors: {}",
+                        self.mail.len(),
+                        self.mail_errors.len()
+                    )
                 }),
             ]),
         ];
@@ -842,7 +883,11 @@ impl App {
                         };
                         ListItem::new(vec![
                             Line::from(clean(&t.title, 160)),
-                            Line::from(format!("{role} · {}", clean(&t.status, 40))),
+                            Line::from(format!(
+                                "{role} · {}{}",
+                                clean(&t.status, 40),
+                                origin(t.home.as_deref())
+                            )),
                         ])
                     })
                     .collect::<Vec<_>>()
@@ -900,13 +945,24 @@ impl App {
             body,
         );
         let error = self
-            .home_error
+            .snapshot
+            .presentation_error
             .as_ref()
-            .map(|e| format!("STATE UNAVAILABLE: {}", clean(e, 180)))
+            .map(|e| format!("PRESENTATION UNAVAILABLE: {}", clean(e, 180)))
+            .or_else(|| {
+                self.home_error
+                    .as_ref()
+                    .map(|e| format!("STATE UNAVAILABLE: {}", clean(e, 180)))
+            })
             .or_else(|| {
                 self.herdr_error
                     .as_ref()
                     .map(|e| format!("HERDR UNAVAILABLE: {}", clean(e, 180)))
+            })
+            .or_else(|| {
+                self.mail_errors
+                    .first()
+                    .map(|e| format!("MAILBOX UNAVAILABLE: {}", clean(e, 180)))
             });
         let status = error.unwrap_or_else(|| {
             format!(
@@ -916,7 +972,7 @@ impl App {
                 clean(&self.notice, 160)
             )
         });
-        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.home_error.is_some()||self.herdr_error.is_some(){Color::Red}else{Color::Gray}))]),rows[2]);
+        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.snapshot.presentation_error.is_some()||self.home_error.is_some()||self.herdr_error.is_some()||!self.mail_errors.is_empty(){Color::Red}else{Color::Gray}))]),rows[2]);
         self.draw_composer(frame);
         self.draw_form(frame);
     }
