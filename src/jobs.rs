@@ -23,6 +23,11 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const LOG_LIMIT: usize = 1024 * 1024;
+/// A log keeps its first bytes (where harnesses announce their session) and
+/// its most recent bytes (the latest activity and the final usage), in two
+/// rotating tail segments; the middle of a longer log is dropped.
+const LOG_HEAD: usize = LOG_LIMIT / 4;
+const LOG_SEGMENT: usize = (LOG_LIMIT - LOG_HEAD) / 2;
 const START_GRACE_MS: i64 = 30_000;
 const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
 const QUEUE_POLL: Duration = Duration::from_secs(1);
@@ -68,6 +73,11 @@ struct Job {
     plugin_binding: Option<Value>,
     #[serde(default)]
     cleanup_descendants: bool,
+    /// Bytes dropped from the middle of each log to keep it bounded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    stdout_dropped_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    stderr_dropped_bytes: u64,
     /// When set, the payload runs as this agent (PRIVATEER_ROLE=agent).
     #[serde(default)]
     agent_actor: Option<String>,
@@ -965,6 +975,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         group_anchors: vec![],
         plugin_binding,
         cleanup_descendants,
+        stdout_dropped_bytes: 0,
+        stderr_dropped_bytes: 0,
         agent_actor,
         estimate: estimate.clone(),
         wait_for_capacity,
@@ -1247,24 +1259,48 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
     }
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Copy a pipe into `path`, bounded to about `LOG_LIMIT`: the head goes
+/// straight to the file, later bytes to two rotating tail segments that are
+/// appended after a truncation marker when the pipe ends. Returns the number
+/// of bytes dropped between head and tail.
 fn capture(
     mut pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
     path: PathBuf,
     stop: Arc<AtomicBool>,
-) -> Result<thread::JoinHandle<Result<()>>> {
+) -> Result<thread::JoinHandle<Result<u64>>> {
     let fd = pipe.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     ensure!(
         flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
         "cannot bound log reader"
     );
+    let open_new = |path: &Path| {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+    };
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(path)?;
+        .open(&path)?;
+    let segment_path = move |n: u64| {
+        let mut name = path.clone().into_os_string();
+        name.push(format!(".tail{}", n % 2));
+        PathBuf::from(name)
+    };
     Ok(thread::spawn(move || {
-        let mut kept = 0usize;
+        let mut head = 0usize;
+        let mut segments = 0u64;
+        let mut segment: Option<(fs::File, usize)> = None;
+        let mut dropped = 0u64;
         let mut buf = [0u8; 8192];
         let mut stopping_bytes = 0usize;
         loop {
@@ -1274,9 +1310,26 @@ fn capture(
             match pipe.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let take = n.min(LOG_LIMIT.saturating_sub(kept));
+                    let take = n.min(LOG_HEAD - head);
                     file.write_all(&buf[..take])?;
-                    kept += take;
+                    head += take;
+                    let mut rest = &buf[take..n];
+                    while !rest.is_empty() {
+                        if segment.as_ref().is_none_or(|(_, len)| *len >= LOG_SEGMENT) {
+                            // The segment two rotations back is overwritten.
+                            if segments >= 2 {
+                                dropped +=
+                                    fs::metadata(segment_path(segments)).map_or(0, |m| m.len());
+                            }
+                            segment = Some((open_new(&segment_path(segments))?, 0));
+                            segments += 1;
+                        }
+                        let (out, len) = segment.as_mut().expect("segment opened above");
+                        let chunk = rest.len().min(LOG_SEGMENT - *len);
+                        out.write_all(&rest[..chunk])?;
+                        *len += chunk;
+                        rest = &rest[chunk..];
+                    }
                     if stop.load(Ordering::Relaxed) {
                         stopping_bytes += n;
                     }
@@ -1291,8 +1344,24 @@ fn capture(
                 Err(e) => return Err(e.into()),
             }
         }
+        drop(segment);
+        if segments > 0 {
+            if dropped > 0 {
+                // Its own line, so JSON-lines readers skip the cut edges.
+                writeln!(
+                    file,
+                    "\n{}",
+                    json!({"type": "privateer.log.truncated", "dropped_bytes": dropped})
+                )?;
+            }
+            for n in segments.saturating_sub(2)..segments {
+                let tail = segment_path(n);
+                std::io::copy(&mut fs::File::open(&tail)?, &mut file)?;
+                fs::remove_file(&tail)?;
+            }
+        }
         file.sync_all()?;
-        Ok(())
+        Ok(dropped)
     }))
 }
 
@@ -1600,9 +1669,11 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     // capacity or signal a potentially reused PGID; expose it as an orphan.
     let group_remains = group_alive(&payload)?;
     stop.store(true, Ordering::Relaxed);
-    out.join()
+    let stdout_dropped = out
+        .join()
         .map_err(|_| anyhow::anyhow!("stdout capture panicked"))??;
-    err.join()
+    let stderr_dropped = err
+        .join()
         .map_err(|_| anyhow::anyhow!("stderr capture panicked"))??;
     if outcome == "succeeded" && !status.success() {
         outcome = "failed";
@@ -1615,6 +1686,8 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         };
         j.exit_code = status.code();
         j.finished_ms = Some(Store::now_ms());
+        j.stdout_dropped_bytes = stdout_dropped;
+        j.stderr_dropped_bytes = stderr_dropped;
         if group_remains {
             j.leader_result = Some(LeaderResult {
                 status: outcome.into(),

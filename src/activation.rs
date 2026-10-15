@@ -384,7 +384,10 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
             .join(&job_id)
             .join(job["incarnation"].as_str().unwrap_or(""))
             .join("stdout.log");
-        let text = std::fs::read_to_string(log).unwrap_or_default();
+        // A bounded log can be cut inside a UTF-8 character; keep the rest.
+        let text = std::fs::read(log)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
         let reported = usage(&text);
         let outcome = if status == "succeeded" {
             "succeeded"
