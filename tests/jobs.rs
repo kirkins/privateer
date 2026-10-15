@@ -46,7 +46,7 @@ impl Fixture {
             &mut store,
             "resource.configure",
             json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,
-                   "heavy_estimate":{"memory_bytes":1_048_576}}),
+                "heavy_estimate":{"memory_bytes":64 * 1024 * 1024}}),
         )
         .unwrap();
         let charter = json!({"id":"mission","objective":"isolated supervisor fixture","repo":self.repo,
