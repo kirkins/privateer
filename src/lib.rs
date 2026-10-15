@@ -10,6 +10,7 @@ pub mod mail;
 pub mod peers;
 pub mod plugins;
 pub mod presence;
+pub mod service;
 pub mod store;
 
 use anyhow::{Result, bail};

@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 pub const STATE_DIR: &str = ".privateer";
 /// Commands that mean the human form when given without `--json`.
 pub const VERBS: &[&str] = &[
-    "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project", "start", "hook",
+    "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project", "start",
+    "hook", "service",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -71,6 +72,23 @@ fn plugins_dir() -> Result<PathBuf> {
         return Ok(source);
     }
     bail!("cannot find Privateer's bundled plugins; set PRIVATEER_PLUGINS to its plugins directory")
+}
+
+/// The harness a new ship's first mate will use: the one named, or the
+/// first supported harness installed.
+fn detect_harness(plugins: &Path, named: Option<&String>) -> Result<String> {
+    match named {
+        Some(id) => Ok(id.clone()),
+        None => HARNESSES
+            .iter()
+            .find(|(binary, id)| {
+                on_path(binary) && plugins.join(id).join("manifest.json").is_file()
+            })
+            .map(|(_, id)| (*id).to_owned())
+            .context(
+                "no supported AI harness found on PATH (claude, codex, pi, …); pass --harness ID",
+            ),
+    }
 }
 
 fn ship_name(folder: &Path) -> Result<String> {
@@ -234,7 +252,7 @@ fn ensure_lines(path: &Path, lines: &[&str]) -> Result<()> {
 
 /// Turn the current folder into a ship. Safe to run again: it updates the
 /// ship's settings and rewrites only files it generated.
-fn init(home: &Path, args: &[String]) -> Result<()> {
+fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
     let flags = flags(args, &["ship", "harness", "scope"])?;
     let folder = home.parent().context("ship folder")?.to_path_buf();
     let ship = match flags.values.get("ship") {
@@ -249,18 +267,7 @@ fn init(home: &Path, args: &[String]) -> Result<()> {
         "captain is reserved for the person"
     );
     let plugins = plugins_dir()?;
-    let harness = match flags.values.get("harness") {
-        Some(id) => id.clone(),
-        None => HARNESSES
-            .iter()
-            .find(|(binary, id)| {
-                on_path(binary) && plugins.join(id).join("manifest.json").is_file()
-            })
-            .map(|(_, id)| (*id).to_owned())
-            .context(
-                "no supported AI harness found on PATH (claude, codex, pi, …); pass --harness ID",
-            )?,
-    };
+    let harness = detect_harness(&plugins, flags.values.get("harness"))?;
     let manifest = plugins.join(&harness).join("manifest.json");
     ensure!(
         manifest.is_file(),
@@ -334,6 +341,13 @@ fn init(home: &Path, args: &[String]) -> Result<()> {
     claude_settings(&folder, &binary.display().to_string())?;
     ensure_lines(&folder.join(".gitignore"), &[".privateer/", "projects/"])?;
 
+    if quiet {
+        println!(
+            "Aye. {} is now the ship {ship}, crewed by {harness}.",
+            folder.display()
+        );
+        return Ok(());
+    }
     println!("Aye. {} is now the ship {ship}.", folder.display());
     println!("  first mate harness: {harness} (change with: privateer init --harness ID)");
     if !ours {
@@ -454,6 +468,55 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Bare `privateer`: get aboard. Inside a ship, make sure its dispatcher is
+/// running and talk to its first mate. Elsewhere, offer to make this folder a
+/// ship first; without a terminal to ask in (or `--yes`), print help.
+pub fn board(home: Option<PathBuf>, yes: bool) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    let home = match home {
+        Some(home) => home,
+        None => {
+            let folder = std::env::current_dir()?;
+            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            if !yes && !interactive {
+                println!(
+                    "Privateer: autonomous ships under a charter.\n\nIn a folder for a ship:  privateer          make it a ship (asks first) and talk to its first mate\n                         privateer --yes    the same, without asking\nMore commands:           privateer --help"
+                );
+                return Ok(());
+            }
+            let user_home = std::env::var_os("HOME").map(PathBuf::from);
+            ensure!(
+                folder.parent().is_some() && Some(&folder) != user_home.as_ref(),
+                "make a dedicated folder for a ship first, for example: mkdir -p ~/ships/infra && cd ~/ships/infra"
+            );
+            let ship = ship_name(&folder)?;
+            let harness = detect_harness(&plugins_dir()?, None)?;
+            if !yes {
+                print!(
+                    "{} is not a ship yet. Make it the ship \"{ship}\" with {harness} as its first mate? [Y/n] ",
+                    folder.display()
+                );
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes") {
+                    println!("Left as it is.");
+                    return Ok(());
+                }
+            }
+            let home = folder.join(STATE_DIR);
+            init(&home, &[], true)?;
+            home
+        }
+    };
+    let store = Store::open(&home)?;
+    let ship = crate::presence::folder_ship(&store)
+        .context("this folder's ship is unknown; run `privateer init` here")?;
+    drop(store);
+    println!("Dispatcher: {}", crate::service::ensure(&home, &ship)?);
+    start(&home, &[])
+}
+
 /// Run a human command. `home` is the discovered or given ship home.
 pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
     if verb == "init" {
@@ -461,13 +524,27 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
             Some(home) => home,
             None => std::env::current_dir()?.join(STATE_DIR),
         };
-        return init(&home, args);
+        return init(&home, args, false);
     }
     let home = home.context(
         "not inside a ship folder (no .privateer found here or above); run `privateer init` to make this folder a ship",
     )?;
     if verb == "start" {
         return start(&home, args);
+    }
+    if verb == "service" {
+        let store = Store::open(&home)?;
+        let ship = crate::presence::folder_ship(&store)
+            .context("this folder's ship is unknown; run `privateer init` here")?;
+        drop(store);
+        let report = match args.first().map(String::as_str) {
+            Some("status") | None => crate::service::status(&home, &ship)?,
+            Some("stop") => crate::service::stop(&home, &ship)?,
+            Some("start") => format!("Dispatcher: {}", crate::service::ensure(&home, &ship)?),
+            Some(other) => bail!("usage: privateer service [status|start|stop], not {other}"),
+        };
+        println!("{report}");
+        return Ok(());
     }
     let mut store = Store::open(&home)?;
     let flags = flags(args, &[])?;
