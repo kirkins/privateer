@@ -1,10 +1,10 @@
 # Design: conversation and activation
 
-Status: **agreed design, not yet implemented.** Written 14 October 2026 from a design discussion with the project owner. It describes where Privateer is going; [architecture](../architecture.md) describes what exists today. Work in related areas, including the in-progress Herdr integration, should align with this document rather than treat earlier work as final.
+Status: **partly implemented; remaining policy is agreed design.** Written 14 October 2026 from a design discussion with the project owner. Typed mailboxes, resident first-mate activation, focus-scoped context and crew outcome/decision paths now exist. Selected attended harness paths and the local fleet dashboard also exist. Channels, standing grants, complete request schemas, loop limits, quiet hours and a general captain front door remain proposed. [Architecture](../architecture.md) describes current behavior; the [recovery pilot](../recovery-pilot.md) distinguishes deterministic runtime evidence from pending native qualification. The design below includes future policy and is not a claim that every described capability has shipped.
 
 ## Why this document exists
 
-Privateer can already record charters, task ownership, targeted messages, grouped events and supervised jobs. What it cannot do is hold a conversation with a person or wake an agent when something needs its attention: agents run only when someone calls `agent.start`, and a message to a ship waits until something happens to look.
+Privateer began with charters, task ownership, targeted messages, grouped events and supervised jobs. It now also records typed conversations and wakes configured first mates for actionable mail and crew outcomes. This document explains that direction and the remaining captain policy and authorization layers; implemented machinery still needs profile-specific native qualification and broader recovery evidence.
 
 Two questions decide much of the project's future shape:
 
@@ -219,13 +219,15 @@ A flotilla is a group of ships commanded by one ship: the commanding ship can as
 
 ## Build order
 
-1. **Mailbox v1:** typed messages, correlated requests with reply routing and overdue flags, and the ship directory.
-2. **Resident service and first-mate activation:** `privateer serve`, wake requests, grouping and guards, focus-scoped sessions with handoff notes and the ship summary, the resume-or-fresh policy through harness plugins, and per-wake usage recording.
-3. **Crew outcomes wake the first mate:** runtime-recorded crew outcomes become wakes.
-4. **Channels and standing grants:** channel and grant records, request evaluation, auto-minted approvals, notices and veto windows.
-5. **The captain as a participant:** front door, delivery policy, status/ask/message handling and a liaison charter, followed by plugins (mobile, voice, chat) and an inject wake mode for terminal backends such as Herdr.
+| Stage | Current status | Remaining qualification or design |
+|---|---|---|
+| Mailbox v1 | Implemented: ship directory, typed message kinds, correlated replies, deadlines and durable local-peer delivery. | Full request-kind payload schemas and sustained cross-host qualification. |
+| Resident service and first-mate activation | Implemented: per-home `privateer serve`, batching, wake budgets, focus notes/bearings, warm resume/fresh rotation and reported usage. | Selected native-profile trials, broad interrupted/load scenarios, loop limits and quiet hours. |
+| Crew outcomes and decisions | Implemented: runtime outcome mail, crew decision requests and first-mate replies. | Representative model-driven delegation and recovery; the current integration pilot uses scripted choices. |
+| Channels and standing grants | Proposed. Exact-artifact one-time approval records already exist separately. | Channel/grant records and evaluation, grant-derived approvals, notices and optional veto policy. |
+| Captain participation | Partly implemented: CLI/dashboard fleet views, captain inbox/replies, explicit ship actions and selected attended native mail paths. | General front door, complete delivery policy, external messaging plugins and broader terminal/harness qualification. |
 
-Each step ships with tests at real process boundaries and an isolated pilot, as earlier milestones did.
+Existing behavior has tests at real process boundaries and isolated pilots. A passing scripted pilot establishes those runtime mechanics; it does not establish full native fleet autonomy, cross-home task transfer or production readiness.
 
 ## Open questions
 
