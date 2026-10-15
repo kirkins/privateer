@@ -445,6 +445,82 @@ with open(os.environ['OC_TEST_RECORD'],'w') as f:
 }
 
 #[test]
+fn claude_start_loads_the_optional_mod_and_clears_foreign_mail_health() {
+    let ship = Ship::new();
+    let native = ship.root.join("bin/claude");
+    let record = ship.root.join("claude.json");
+    fs::write(&native, r#"#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['CLAUDE_TEST_RECORD'],'w') as f:
+    json.dump({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('ANTHROPIC_BASE_URL'),'health':os.getenv('PRIVATEER_CLAUDE_MAIL_UNTIL'),'foreign':os.getenv('CLAUDECODE')},f)
+"#).unwrap();
+    fs::set_permissions(&native, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = ship
+        .command(&["start", "claude", "--", "--model", "native-choice"])
+        .env("CLAUDE_TEST_RECORD", &record)
+        .env("ANTHROPIC_BASE_URL", "https://provider.example.invalid")
+        .env("PRIVATEER_CLAUDE_MAIL_UNTIL", "9999999999999")
+        .env("CLAUDECODE", "foreign")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen: Value = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+    assert_eq!(seen["argv"][0], "--plugin-dir");
+    assert!(
+        seen["argv"][1]
+            .as_str()
+            .unwrap()
+            .ends_with("plugins/attended-claude")
+    );
+    assert_eq!(seen["argv"][2], "--model");
+    assert_eq!(seen["argv"][3], "native-choice");
+    assert_eq!(seen["role"], "agent");
+    assert_eq!(seen["actor"], "infra");
+    assert_eq!(seen["route"], "https://provider.example.invalid");
+    assert!(seen["health"].is_null());
+    assert!(seen["foreign"].is_null());
+    assert_eq!(ship.presence()["attended"], false);
+}
+
+#[test]
+fn crew_claude_hooks_never_take_the_captains_presence_or_mail() {
+    let ship = Ship::new();
+    ship.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"captain","ttl_secs":90}),
+    );
+    ship.json("mail.send", json!({"id":"pending-for-captain","from":"captain","to":"infra","kind":"request","body":"handle aboard"}));
+    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+        let output = ship.hook_with(
+            event,
+            "crew-session",
+            &[
+                ("PRIVATEER_JOB", "crew-job"),
+                ("PRIVATEER_PRESENCE_HOLDER", "captain"),
+            ],
+        );
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+    assert_eq!(ship.presence()["lease"]["holder"], "captain");
+    assert_eq!(
+        ship.json("mail.pending", json!({"address":"infra"}))["count"],
+        1
+    );
+    let normal = ship.hook_with(
+        "UserPromptSubmit",
+        "captain-session",
+        &[("PRIVATEER_PRESENCE_HOLDER", "captain")],
+    );
+    assert!(String::from_utf8_lossy(&normal.stdout).contains("pending-for-captain"));
+}
+
+#[test]
 fn failed_start_releases_presence() {
     let ship = Ship::new();
     assert!(
@@ -466,6 +542,22 @@ fn attended_mail_extension_uses_real_mail_and_native_lifecycle_contracts() {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("Node 24 is required to validate the optional Pi/OMP adapter");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn claude_mail_mod_uses_real_mail_and_native_lifecycle_contracts() {
+    let output = Command::new("node")
+        .arg("tests/claude-attended.mjs")
+        .arg(BIN)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Node is required to validate the optional Claude mail mod");
     assert!(
         output.status.success(),
         "{}\n{}",

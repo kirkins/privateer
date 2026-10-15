@@ -466,7 +466,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .to_owned()
     };
     let folder = home.parent().context("ship folder")?;
-    let holder = format!("start:{}", std::process::id());
+    let holder = format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4());
     let control = std::env::current_exe()?;
     let mut command = std::process::Command::new(&binary);
     if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
@@ -484,6 +484,20 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .arg(&binary)
             .arg("-e")
             .arg(extension);
+    } else if harness == "claude" {
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        let plugin = plugins.join("attended-claude");
+        ensure!(
+            plugin.join("hooks/hooks.json").is_file(),
+            "Claude attended mail plugin missing"
+        );
+        command = std::process::Command::new("python3");
+        command
+            .arg(plugins.join("native_launch.py"))
+            .arg(&harness)
+            .arg(&binary)
+            .arg("--plugin-dir")
+            .arg(plugin);
     } else if harness == "opencode-v2" {
         let plugins = fs::canonicalize(plugins_dir()?)?;
         command = std::process::Command::new("python3");

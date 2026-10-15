@@ -231,6 +231,11 @@ pub fn claude_hook(home: Option<&Path>, event: &str) -> i32 {
 }
 
 fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
+    // A supervised crew job may inherit this project's Claude settings and
+    // the captain's environment. It has a brief, not an attended mailbox.
+    if std::env::var_os("PRIVATEER_JOB").is_some() {
+        return Ok(0);
+    }
     let mut store = Store::open(home)?;
     store.set_caller(crate::store::Caller::resolve(
         std::env::var("PRIVATEER_ROLE").ok().as_deref(),
@@ -255,6 +260,15 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
     if wrapped.is_some() && !refresh(&store, &ship, &holder, 90)? {
         return Ok(0);
     }
+    // The native mod sets this only after it has loaded and verified this
+    // session's lease. A refused/disabled mod never disables the old hooks;
+    // a crashed or unloaded mod's heartbeat expires without a config rewrite.
+    let now = Store::now_ms();
+    let native_mail = wrapped.is_some()
+        && std::env::var("PRIVATEER_CLAUDE_MAIL_UNTIL")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .is_some_and(|until| until > now && until <= now + 15_000);
     match event {
         "SessionStart" => {
             if wrapped.is_none() {
@@ -265,13 +279,20 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
                 "You are the first mate of the ship {ship}; the captain is aboard.\n{}",
                 bearings["text"].as_str().unwrap_or("")
             );
-            let mail = present(&store, &ship)?;
+            let mail = if native_mail {
+                vec![]
+            } else {
+                present(&store, &ship)?
+            };
             if !mail.is_empty() {
                 print!("{}", render(&ship, &mail));
             }
             Ok(0)
         }
         "UserPromptSubmit" => {
+            if native_mail {
+                return Ok(0);
+            }
             if wrapped.is_none() {
                 attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
             }
@@ -282,6 +303,9 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
             Ok(0)
         }
         "Stop" => {
+            if native_mail {
+                return Ok(0);
+            }
             if wrapped.is_none() {
                 attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
             }
