@@ -103,7 +103,18 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
     if wake_job(store, job_id)? {
         return Ok(());
     }
+    // Crew follow the jobs they start. While that crew still runs, the outcome
+    // waits for the first mate's next real wake instead of causing one.
+    let crew_watching = match job["started_by"].as_str() {
+        Some(parent) => {
+            !wake_job(store, parent)?
+                && crate::jobs::record(store, parent)
+                    .is_ok_and(|p| matches!(p["status"].as_str(), Some("launching" | "running")))
+        }
+        None => false,
+    };
     let urgency = match status {
+        _ if crew_watching => "low",
         "succeeded" => "normal",
         // The ship stopped it itself; it can wait for the next real wake.
         "cancelled" if job["cancelled_by"] == ship.as_str() => "low",

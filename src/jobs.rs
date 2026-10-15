@@ -97,6 +97,9 @@ struct Job {
     /// Who asked to cancel: the agent's name, or "operator".
     #[serde(default)]
     cancelled_by: Option<String>,
+    /// The supervised job whose agent started this one, when an agent did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_by: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -862,6 +865,16 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         }
         Caller::Operator => requested_actor.map(str::to_owned),
     };
+    // An agent inside a supervised job (crew, or a first mate's wake) is named
+    // by PRIVATEER_JOB; remember which of its jobs started this one.
+    let started_by = match (store.caller(), &agent_actor) {
+        (Caller::Agent { .. }, Some(actor)) => {
+            std::env::var("PRIVATEER_JOB").ok().filter(|parent| {
+                load(store, parent).is_ok_and(|p| p.agent_actor.as_deref() == Some(actor))
+            })
+        }
+        _ => None,
+    };
     let expected_workspace = args
         .get("workspace_lease_id")
         .map(|v| v.as_str().context("workspace_lease_id must be a string"))
@@ -983,6 +996,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         max_wait_secs,
         leader_result: None,
         cancelled_by: None,
+        started_by,
     };
     let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
