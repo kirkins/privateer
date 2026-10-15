@@ -183,7 +183,6 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
                     ship = config.clone();
                 }
                 ship.description = scope;
-                ship.liaison |= live.liaison;
                 ship.live = Some(live);
                 if observed_homes.insert(home) {
                     out.truncated |= local.truncated;
@@ -228,6 +227,17 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     out.jobs.truncate(ROW_LIMIT);
     out.custody.truncate(ROW_LIMIT);
     out.include_observed_ships();
+    if !out.ships.iter().any(|ship| ship.liaison) {
+        let mut candidates = out
+            .ships
+            .iter_mut()
+            .filter(|ship| ship.live.as_ref().is_some_and(|live| live.liaison));
+        if let Some(candidate) = candidates.next()
+            && candidates.next().is_none()
+        {
+            candidate.liaison = true;
+        }
+    }
     if let Err(error) = validate_navigation(&out.ships) {
         out.presentation_error = Some(error.to_string());
     }

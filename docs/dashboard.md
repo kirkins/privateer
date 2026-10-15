@@ -195,9 +195,14 @@ entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
 
-One optional `liaison: true` ship supplies the contact badge and shortcut. This
-is presentation configuration, not a grant of authority or an implementation of
-the captain's runtime delivery policy.
+One optional `liaison: true` ship in `dashboard.json` explicitly selects the
+contact badge and shortcut. If no explicit contact is configured, exactly one
+ship with the `init --liaison` preset supplies that contact. Multiple preset
+ships remain ordinary boardable fleet entries until an explicit contact is
+selected; the dashboard does not choose a preferred ship. Explicit contact
+claims still must agree across homes. Contact selection is presentation
+configuration, not a grant of authority or an implementation of the captain's
+runtime delivery policy.
 
 See [the example registry](../examples/dashboard.json). Its `id` must match the
 runtime's exact task-owner identity. Names, descriptions and terminal bindings

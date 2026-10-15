@@ -34,6 +34,7 @@ class Herdr:
         self.stopped = False
         self.panes, self.children, self.errors = [], [], []
         self.creates = self.focuses = 0
+        self.focused = []
         self.delay_next = False
         self.fail_next = False
         self.protocol = 20
@@ -109,6 +110,7 @@ class Herdr:
         if method == "agent.focus":
             assert any(p["pane_id"] == params["target"] and p["agent"] == "codex" for p in self.panes)
             self.focuses += 1
+            self.focused.append(params["target"])
             return {"type": "agent_focused"}
         raise AssertionError(f"unexpected Herdr method: {method}")
 
@@ -447,6 +449,62 @@ def onboarding(binary, runtime):
             if tui:
                 tui.close()
             server.close()
+        multi_root = root / "multiple-presets"
+        multi_root.mkdir()
+        multi_env = dict(env, HOME=str(multi_root), XDG_CONFIG_HOME=str(multi_root / "config"),
+                         PRIVATEER_FLEET=str(multi_root / "fleet.sqlite"), PRIVATEER_RESOURCE_HOME=str(multi_root / "ledger"))
+        def multi_command(name, *arguments):
+            home = multi_root / name / ".privateer"
+            return subprocess.run([str(runtime), "--home", str(home), *arguments], cwd=multi_root,
+                                  env=multi_env, capture_output=True, check=True, timeout=10).stdout
+        for name in ["alpha", "beta", "gamma"]:
+            arguments = ["init", "--ship", name, "--harness", "codex"]
+            if name != "gamma":
+                arguments.append("--liaison")
+            multi_command(name, *arguments)
+        multi_server = Herdr(multi_root, multi_env)
+        multi = None
+        try:
+            multi = Tui(binary, multi_env, ["--herdr-socket", str(multi_server.path)])
+            multi.until(lambda: "gamma" in multi.screen(), "multiple preset fleet did not load")
+            multi.keys(b"l")
+            assert "No liaison configured" in multi.screen()
+            assert "PRESENTATION UNAVAILABLE" not in multi.screen()
+            for index, name in enumerate(["alpha", "beta", "gamma"]):
+                multi.keys(b"0" + b"j" * (index + 2) + b"\rb")
+                multi.until(lambda: json.loads(multi_command(name, "ship.presence", "--json", json.dumps({"ship":name})))["attended"],
+                            f"multiple presets blocked Board for {name}")
+                assert multi_server.creates == index + 1
+            multi.drain(2.5)
+            alpha_config = multi_root / "alpha/.privateer/dashboard.json"
+            beta_config = multi_root / "beta/.privateer/dashboard.json"
+            gamma = {"id":"gamma", "name":"gamma", "liaison":True}
+            alpha_config.write_text(json.dumps({"ships":[gamma]}))
+            multi.until(lambda: "Liaison · your default contact" in multi.screen(), "explicit contact did not override preset candidates")
+            multi.keys(b"lb")
+            multi.until(lambda: multi_server.focused == ["w1:p3"], "explicit contact did not focus the chosen ordinary ship")
+            beta_config.write_text(json.dumps({"ships":[{"id":"beta", "name":"beta", "liaison":True}]}))
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" in multi.screen(), "conflicting explicit contacts did not fail safely")
+            multi.keys(b"0jj\rbflf")
+            multi.drain(2.2)
+            assert (multi_server.creates, multi_server.focuses) == (3, 1)
+            beta_config.unlink()
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" not in multi.screen(), "explicit contact conflict did not recover")
+            bound = {key: multi_server.panes[0][key] for key in ("pane_id", "terminal_id")}
+            alpha_config.write_text(json.dumps({"ships":[dict(gamma, terminals=[bound])]}))
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" in multi.screen(), "manual claim against another preset's live pane was accepted")
+            multi.keys(b"bflf")
+            multi.drain(2.2)
+            assert (multi_server.creates, multi_server.focuses) == (3, 1)
+            alpha_config.unlink()
+            multi.until(lambda: "PRESENTATION UNAVAILABLE" not in multi.screen(), "pane conflict did not recover")
+            multi.keys(b"l")
+            assert "No liaison configured" in multi.screen()
+            assert not multi_server.errors, multi_server.errors
+        finally:
+            if multi:
+                multi.close()
+            multi_server.close()
         replacement_root = root / "replacement"
         replacement_root.mkdir()
         replacement_env = dict(env, HOME=str(replacement_root), XDG_CONFIG_HOME=str(replacement_root / "config"),
@@ -554,4 +612,4 @@ def onboarding(binary, runtime):
                 assert not (plain_root / "escaped").exists()
             finally:
                 plain.close()
-        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
+        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
