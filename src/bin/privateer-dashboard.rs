@@ -57,7 +57,7 @@ fn options() -> Result<Option<Options>> {
             "--board-liaison" => out.board_liaison = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--board-liaison    Open/focus the liaison on entry (used by bare privateer)\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: open/focus liaison conversation; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nFleet observations are read-only. b: Board; n: New ship; x: Retire; d: Dispatcher.\nMail and management use Privateer commands. Board launches the harness; no input to existing agents."
+                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--board-liaison    Open/focus the liaison on entry (used by bare privateer)\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: open/focus liaison conversation; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nFleet observations are read-only. b: Board; w: Watch; n: New ship; x: Retire; d: Dispatcher.\nMail and management use Privateer commands. Board launches the harness; no input to existing agents."
                 );
                 return Ok(None);
             }
@@ -90,6 +90,11 @@ struct Sample<T> {
 enum HerdrAction {
     Focus(Focus),
     Board {
+        home: PathBuf,
+        name: String,
+        observed: View,
+    },
+    Watch {
         home: PathBuf,
         name: String,
         observed: View,
@@ -285,6 +290,16 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrActio
                             client.board(&observed, folder, &name, &binary, &home)?;
                             Ok(())
                         })(),
+                        HerdrAction::Watch {
+                            home,
+                            name,
+                            observed,
+                        } => (|| -> Result<()> {
+                            privateer::dashboard::command::existing_home(&home)?;
+                            let folder = home.parent().context("ship folder")?;
+                            client.watch(&observed, folder, &name, &binary, &home)?;
+                            Ok(())
+                        })(),
                     };
                     notice = Some(match result {
                         Ok(()) => "Boarding in Herdr; use Herdr navigation to return.".into(),
@@ -395,6 +410,57 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) -> boo
         "Board action unavailable or already pending.".into()
     };
     submitted
+}
+
+/// Open (or focus) a pane following the selected ship's first mate.
+fn request_watch(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
+    if app.demo {
+        app.notice = "Demo only; nothing to watch.".into();
+        return;
+    }
+    let Some(target) = app
+        .snapshot
+        .ships
+        .iter()
+        .find(|s| Some(&s.id) == app.ship.as_ref())
+        .and_then(BoardTarget::from_ship)
+    else {
+        app.notice = "Select a ship to watch.".into();
+        return;
+    };
+    let Some(sender) = sender else {
+        app.notice = format!(
+            "No Herdr connection configured; in any terminal run: privateer --home '{}' watch {}",
+            target.home.to_string_lossy().replace('\'', "'\"'\"'"),
+            target.ship
+        );
+        return;
+    };
+    let Some(view) = &app.herdr else {
+        app.notice = "Waiting for the configured Herdr connection…".into();
+        return;
+    };
+    let title = format!("{} first mate", target.ship);
+    let action = match view
+        .panes
+        .iter()
+        .find(|p| p.agent.is_some() && p.title.as_deref() == Some(title.as_str()))
+    {
+        Some(pane) => HerdrAction::Focus(Focus {
+            observed: view.clone(),
+            pane: pane.clone(),
+        }),
+        None => HerdrAction::Watch {
+            home: target.home,
+            name: target.ship,
+            observed: view.clone(),
+        },
+    };
+    app.notice = if sender.try_send(action).is_ok() {
+        "Opening the watch pane…".into()
+    } else {
+        "Watch unavailable or already pending.".into()
+    };
 }
 
 fn run(opts: Options) -> Result<()> {
@@ -587,6 +653,10 @@ fn run(opts: Options) -> Result<()> {
                     }
                 }
             }
+            if app.watch_requested {
+                app.watch_requested = false;
+                request_watch(&mut app, herdr.as_ref().map(|(_, sender)| sender));
+            }
             if app.board_requested {
                 app.board_requested = false;
                 if request_board(&mut app, herdr.as_ref().map(|(_, sender)| sender))
@@ -694,6 +764,7 @@ fn run(opts: Options) -> Result<()> {
                     KeyCode::Char('l') => app.talk_to_liaison(),
                     KeyCode::Char('m') => app.compose(),
                     KeyCode::Char('b') if app.ship.is_some() => app.board_requested = true,
+                    KeyCode::Char('w') if app.ship.is_some() => app.watch_requested = true,
                     KeyCode::Char('n') => app.manage(privateer::dashboard::forms::Kind::New),
                     KeyCode::Char('x') if app.ship.is_some() => {
                         app.manage(privateer::dashboard::forms::Kind::Retire)

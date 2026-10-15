@@ -30,6 +30,7 @@ pub const VERBS: &[&str] = &[
     "ship",
     "door",
     "permissions",
+    "watch",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -863,7 +864,7 @@ pub fn board(home: Option<PathBuf>, yes: bool, caller: Caller) -> Result<()> {
 
 /// Run a human command. `home` is the discovered or given ship home.
 pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -> Result<()> {
-    if matches!(verb, "init" | "start" | "service") {
+    if matches!(verb, "init" | "start" | "service" | "watch") {
         caller.require_operator(verb)?;
     }
     if verb == "init" {
@@ -936,6 +937,14 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             added["project"].as_str().unwrap_or("")
         );
         return Ok(());
+    }
+    if verb == "watch" {
+        let ship = match args.first() {
+            Some(ship) => ship.clone(),
+            None => crate::presence::folder_ship(&store)
+                .context("usage: privateer watch [SHIP], from a ship folder")?,
+        };
+        return crate::watch::run(&mut store, &ship);
     }
     if verb == "service" {
         let ship = crate::presence::folder_ship(&store)

@@ -261,6 +261,37 @@ impl Client {
         binary: &Path,
         home: &Path,
     ) -> Result<Pane> {
+        self.launch(observed, folder, name, binary, home, &["start"])
+    }
+
+    /// Open a tab following the ship's first mate (`privateer watch`).
+    pub fn watch(
+        &mut self,
+        observed: &View,
+        folder: &Path,
+        name: &str,
+        binary: &Path,
+        home: &Path,
+    ) -> Result<Pane> {
+        self.launch(
+            observed,
+            folder,
+            &format!("{name} watch"),
+            binary,
+            home,
+            &["watch", name],
+        )
+    }
+
+    fn launch(
+        &mut self,
+        observed: &View,
+        folder: &Path,
+        name: &str,
+        binary: &Path,
+        home: &Path,
+        command: &[&str],
+    ) -> Result<Pane> {
         ensure!(
             observed.socket_identity == self.identity,
             "Herdr server socket changed; refresh"
@@ -314,7 +345,23 @@ impl Client {
             ensure!(!path.chars().any(char::is_control), "invalid launch path");
             Ok(format!("'{}'", path.replace('\'', "'\"'\"'")))
         }
-        let text = format!("exec {} --home {} start", quote(binary)?, quote(home)?);
+        let words = command
+            .iter()
+            .map(|word| {
+                ensure!(
+                    word.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)),
+                    "invalid launch argument"
+                );
+                Ok(*word)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let text = format!(
+            "exec {} --home {} {}",
+            quote(binary)?,
+            quote(home)?,
+            words.join(" ")
+        );
         self.request(
             "pane.send_input",
             json!({"pane_id":pane.pane_id,"text":text,"keys":["Enter"]}),
@@ -324,6 +371,35 @@ impl Client {
 
     /// Navigation only. A second snapshot and socket incarnation check reject a
     /// stale selection; these checks do not authorize input or process control.
+    /// Report a pane as an agent Privateer supervises: `agent` is its
+    /// harness, `display` the label Herdr lists it under.
+    pub fn report_agent(
+        &mut self,
+        pane: &str,
+        agent: &str,
+        display: &str,
+        state: &str,
+        message: &str,
+    ) -> Result<()> {
+        self.request(
+            "pane.report_agent",
+            json!({"pane_id":pane,"source":"privateer","agent":agent,"state":state,"message":message}),
+        )?;
+        self.request(
+            "pane.report_metadata",
+            json!({"pane_id":pane,"source":"privateer","agent":agent,"display_agent":display,"title":format!("{display} first mate")}),
+        )?;
+        Ok(())
+    }
+
+    pub fn release_agent(&mut self, pane: &str, agent: &str) -> Result<()> {
+        self.request(
+            "pane.release_agent",
+            json!({"pane_id":pane,"source":"privateer","agent":agent}),
+        )?;
+        Ok(())
+    }
+
     pub fn focus(&mut self, observed: &View, pane: &Pane) -> Result<()> {
         ensure!(
             observed.socket_identity == self.identity,

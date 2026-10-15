@@ -133,6 +133,7 @@ pub struct App {
     pub composer: Option<Composer>,
     pub form: Option<super::forms::Form>,
     pub board_requested: bool,
+    pub watch_requested: bool,
     pub pending_board: Option<PendingBoard>,
     pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
@@ -461,6 +462,7 @@ impl App {
                         'l' => self.talk_to_liaison(),
                         'm' => self.compose(),
                         'b' => self.board_requested = true,
+                        'w' => self.watch_requested = true,
                         'n' => self.manage(super::forms::Kind::New),
                         'x' => self.manage(super::forms::Kind::Retire),
                         'd' => self.manage(super::forms::Kind::Dispatcher),
@@ -675,7 +677,8 @@ impl App {
                 } else if let Some(start) = direct_start(ship).filter(|_| !self.herdr_configured) {
                     format!("Board needs Herdr. Talk to its first mate directly: {start}")
                 } else if self.scoped_panes().is_empty() {
-                    "b: Board · launch its first mate in a new Herdr tab".into()
+                    "b: Board · launch its first mate in a new Herdr tab · w: Watch its wakes live"
+                        .into()
                 } else {
                     "b or f: open its first mate's terminal · 3: Terminals for its crew".into()
                 }));
@@ -839,6 +842,7 @@ impl App {
                     ("b", "board"),
                     ("m", "message"),
                     ("f", "open terminal"),
+                    ("w", "watch"),
                     ("1–4", "views"),
                     ("d", "dispatcher"),
                     ("x", "retire"),
