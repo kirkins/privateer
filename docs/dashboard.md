@@ -95,7 +95,9 @@ statuses may be stale because this UI deliberately does not reconcile processes.
 Select a ship and press `b` (or click Board). A live exact binding focuses its
 Herdr terminal. Otherwise Board creates a tab in the ship folder and launches
 `privateer start` using the installed protocol 20 `tab.create` and
-`pane.send_input` contracts. Shell tokens are quoted; captain text is never
+`pane.send_input` contracts. The installed 0.8.2 CLI was also checked against
+a private protocol recorder: `pane run` emits `pane.send_input` with text and
+`keys: ["Enter"]`. Shell tokens are quoted; captain text is never
 shell input. Only the pane returned by creation is eligible for this launch,
 after a fresh identity/protocol check. Repeat launches in that pane are blocked
 while it exists, and a live presence lease blocks a competing attended session. A transactional
