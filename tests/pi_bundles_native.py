@@ -119,9 +119,11 @@ class Native(unittest.TestCase):
             'ambient-stdio': {'command': 'python3', 'args': [str(server)]},
             'ambient-http': {'url': self.url + '/mcp', 'headers': {'Authorization': SENTINEL}}}}))
 
-    def run_inventory(self, selection, attended=False):
+    def run_inventory(self, selection, attended=False, hosted_crew=False):
         plan = bundles.plan(self.registry, selection, 'first_mate' if attended else 'crew')
         env = dict(self.env)
+        if hosted_crew:
+            env['PRIVATEER_HOSTED_CREW'] = '1'
         if selection:
             env['PRIVATEER_FIXTURE_CLIENT'] = str(Path(self.selected['root']) / 'client.py')
         args = [sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(plan)]
@@ -130,6 +132,8 @@ class Native(unittest.TestCase):
         args += ['pi', 'pi']
         if attended:
             args += ['-e', str(ROOT / 'plugins/attended/mail.ts')]
+        if hosted_crew:
+            args += ['-e', str(ROOT / 'plugins/attended/crew.ts')]
         # --print executes the extension command, not a user/model prompt.
         # No JSON-mode completion wrapper: an inventory command has no model turn.
         args += ['--offline', '--no-session', '--print', '--', '/bundle-inventory']
@@ -162,12 +166,17 @@ class Native(unittest.TestCase):
         self.assertTrue(attended['selected'])
         self.assertEqual(selected['tools'], attended['tools'])
         self.assertEqual(selected['commands'], attended['commands'])
+        hosted = self.run_inventory(['selected@1'], hosted_crew=True)
+        self.assertTrue(hosted['selected'])
+        self.assertEqual(selected['tools'], hosted['tools'])
+        self.assertEqual(selected['commands'], hosted['commands'])
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             a = pool.submit(self.run_inventory, ['selected@1'])
             b = pool.submit(self.run_inventory, [])
             self.assertTrue(a.result()['selected'])
             self.assertFalse(b.result()['selected'])
-        print(json.dumps({'native_pi': '1.2.0', 'inventory': 'selected/empty/attended/concurrent',
+        self.assertEqual(self.server.requests.count('/lookup'), 4)
+        print(json.dumps({'native_pi': '1.2.0', 'inventory': 'selected/empty/attended/hosted-crew/concurrent',
                           'ambient_mcp_connections': 0, 'api_calls': self.server.requests.count('/lookup')}))
 
     def test_required_extension_factory_failure_refuses_without_agent_turn(self):

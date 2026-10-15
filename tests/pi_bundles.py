@@ -161,13 +161,30 @@ class Bundles(unittest.TestCase):
         self.registry['integrations']['extensions'] = [{'path': str(ext), 'sha256': hashlib.sha256(ext.read_bytes()).hexdigest()}]
         mail = ROOT / 'plugins/attended/mail.ts'
         with self.probe():
-            argv = self.preflight(args=['pi', '-e', str(mail), '--', 'brief'], mail_extension=mail)
+            argv = self.preflight(args=['pi', '-e', str(mail), '--', 'brief'], runtime_extensions=[mail])
         self.assertEqual(argv.count('-e'), 2)
         self.assertIn(str(ext), argv)
         self.assertIn(str(mail), argv)
         ext.write_text('throw new Error("changed")')
         with self.assertRaises(ValueError):
             self.plan()
+
+    def test_effective_hosted_crew_adapter_is_retained_but_not_inherited(self):
+        import native_launch
+        crew = str(ROOT / 'plugins/attended/crew.ts')
+        env = dict(self.env, PRIVATEER_HOSTED_CREW='1')
+        with patch.dict(os.environ, env, clear=True), self.probe(), patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '-e', crew, '--', 'brief'], bundles=self.plan([]))
+            argv = execute.call_args.args[1]
+            self.assertIn(crew, argv)
+            self.assertEqual(argv.count('-e'), 1)
+            self.assertIn('--no-mcp', argv)
+            execute.reset_mock()
+            native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan([]))
+            self.assertNotIn(crew, execute.call_args.args[1], 'a stale hosted marker cannot add resources')
+        with patch.dict(os.environ, self.env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
+            native_launch.launch('pi', ['pi', '-e', crew, '--', 'brief'], bundles=self.plan([]))
+        probe.assert_not_called()
 
     def test_ambient_packages_and_prompt_files_refuse_before_native_probe(self):
         for directory in (self.agent, self.repo / '.pi'):

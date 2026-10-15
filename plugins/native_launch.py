@@ -31,8 +31,18 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         if harness != "pi":
             raise ValueError("bounded resources support only Pi")
         from pi_bundles import preflight
-        mail = Path(__file__).resolve().parent / "attended/mail.ts" if attended else None
-        argv = preflight(bundles, argv, env=native_environment(), mail_extension=mail)
+        directory = Path(__file__).resolve().parent
+        extensions = [directory / "attended/mail.ts"] if attended else []
+        crew = str(directory / "attended/crew.ts")
+        # #96 injects the lifecycle adapter after plugin planning for hosted
+        # crew. Recognize that exact runtime-owned seam, never an inherited
+        # first-mate selection or arbitrary -e override. Stale hosted markers
+        # alone cannot add the extension to a nested/headless run.
+        flags = argv[:argv.index("--")] if "--" in argv else argv
+        if os.environ.get("PRIVATEER_HOSTED_CREW") == "1" and any(
+                flags[i:i+2] == ["-e", crew] for i in range(len(flags))):
+            extensions.append(crew)
+        argv = preflight(bundles, argv, env=native_environment(), runtime_extensions=extensions)
     if harness == "opencode-v2":
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),
                                   *argv], native_environment())

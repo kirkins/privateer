@@ -124,7 +124,10 @@ Both `plugin.command`/headless jobs and `privateer start`/hosted first-mate
 launches pass the same selected-only pinned plan to `native_launch.py`. The
 loader leaves the original native auth, models, settings, provider/model argv,
 Privateer brief/actor/control and permission policy intact. Attended runs retain
-the explicit bundled Privateer mail adapter. No bundle plan or selection is
+the explicit bundled Privateer mail adapter. Hosted crew retain #96's explicitly
+injected bundled `attended/crew.ts` lifecycle adapter: it is recognized only with
+the runtime hosted-crew marker and exact injected path. A stale inherited marker
+alone never adds it or a first-mate selection. No bundle plan or selection is
 exported as an inherited environment variable.
 
 The loader uses Pi's supported flags:
@@ -181,14 +184,16 @@ The deterministic suite checks registry validation, path safety/pins, malformed
 settings, source-qualified preflight refusal before native probes, redacted
 protocol errors, operator boundaries and legacy/empty separation. Runtime tests
 use fake native subprocesses to exercise ordinary/nested crew and job replay;
-those are not actual Pi inventory evidence.
+mocked-host tests retain hosted custody/lifecycle injection and refuse an
+unsupported binary without silently running it. Those are not actual Pi
+inventory evidence.
 
 The opt-in native fixture uses **installed Pi 1.2.0**, a disposable auth-less
 `PI_CODING_AGENT_DIR` and project, a clean credential-free environment allowlist,
 unchanged `HOME`, offline/no-session controls, and a recognized inspection slash
 command. Its inspector exits if an agent turn starts: no inference or real
-service is needed. It checks actual selected/empty inventories, the attended
-injection path, concurrent launches, lazy skill instructions, required-extension
+service is needed. It checks actual selected/empty inventories, the attended and
+hosted-crew adapter injection paths, concurrent launches, lazy skill instructions, required-extension
 load failure, and zero starts/connections from seeded ambient global/project
 stdio/HTTP MCP servers and extensions. The selected supporting API script really
 calls a loopback fake HTTP server; response projection, redirects, server errors,

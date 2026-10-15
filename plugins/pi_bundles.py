@@ -200,7 +200,7 @@ def validate_plan(value):
     require(len({s['name'] for s in skills}) == len(skills))
 
 
-def preflight(value, argv, cwd=None, env=None, mail_extension=None):
+def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
     """Recheck pins immediately before native execution. No native probe until
     package/settings checks pass. Auth/models files are never read here.
     """
@@ -242,13 +242,19 @@ def preflight(value, argv, cwd=None, env=None, mail_extension=None):
     forbidden = ('--continue', '-c', '--resume', '-r', '--session', '--session-id', '--fork',
                  '--extension', '-e', '--skill', '--prompt-template', '--theme', '--system-prompt',
                  '--append-system-prompt', '--approve', '-a')
+    runtime_paths = [str(path) for path in runtime_extensions]
+    require(len(runtime_paths) <= 2 and len(set(runtime_paths)) == len(runtime_paths))
+    seen_runtime = set()
     clean = []
     i = 0
     while i < len(flags):
         arg = flags[i]
-        # Privateer owns this explicit mail adapter; it is not an ambient or
-        # registry-selected integration. Permit exactly this injected path.
-        if arg == '-e' and i + 1 < len(flags) and mail_extension and flags[i+1] == str(mail_extension):
+        # Privateer owns these explicit mail/crew-lifecycle adapters, not
+        # ambient or registry-selected integrations. Permit only exact paths
+        # chosen by the native launcher for this effective execution mode.
+        if arg == '-e' and i + 1 < len(flags) and flags[i+1] in runtime_paths:
+            require(flags[i+1] not in seen_runtime)
+            seen_runtime.add(flags[i+1])
             i += 2
             continue
         require(not any(arg == f or arg.startswith(f + '=') for f in forbidden))
@@ -263,8 +269,8 @@ def preflight(value, argv, cwd=None, env=None, mail_extension=None):
     loaded = [argv[0], *FLAGS]
     for item in value['integrations']['extensions']:
         loaded.extend(['-e', item['path']])
-    if mail_extension:
-        loaded.extend(['-e', str(mail_extension)])
+    for path in runtime_paths:
+        loaded.extend(['-e', path])
     for item in value['skills']:
         loaded.extend(['--skill', str(Path(item['root']) / 'SKILL.md')])
     return [*loaded, *clean, *args[len(flags):]]
