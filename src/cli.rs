@@ -86,7 +86,7 @@ pub fn installed_harnesses() -> Result<Vec<String>> {
 /// Release images use only their own immutable bundle. Legacy/source builds
 /// retain the explicit override and checkout discovery for development.
 pub(crate) fn plugins_dir() -> Result<PathBuf> {
-    let executable = std::env::current_exe()?;
+    let executable = crate::releases::running_image()?;
     if let Some(release) = crate::releases::Release::from_executable(&executable) {
         let plugins = release.plugins();
         ensure!(
@@ -828,7 +828,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
 
 fn dashboard_binary() -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let image = std::env::current_exe().ok()?;
+    let image = crate::releases::running_image().ok()?;
     if let Some(release) = crate::releases::Release::from_executable(&image) {
         let dashboard = release.entrypoint("privateer-dashboard").ok()?;
         return (dashboard.is_file()

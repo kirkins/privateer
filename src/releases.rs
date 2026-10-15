@@ -32,6 +32,29 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(data.join("privateer"))
 }
 
+/// The running image's real path. Linux reports it already resolved; macOS
+/// reports the invoked path (often through `current`), so it is resolved once,
+/// before an upgrade can move `current`. Entry points call this at startup.
+pub fn running_image() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(std::env::current_exe()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        static IMAGE: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+            std::sync::OnceLock::new();
+        IMAGE
+            .get_or_init(|| {
+                std::env::current_exe()
+                    .and_then(fs::canonicalize)
+                    .map_err(|e| e.to_string())
+            })
+            .clone()
+            .map_err(|e| anyhow::anyhow!("cannot locate the running Privateer image: {e}"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub root: PathBuf,
@@ -159,7 +182,7 @@ pub fn record_upgrade(conn: &Connection, record: &UpgradeRecord) -> Result<()> {
 /// Read-only status works outside a ship and never creates a fleet registry.
 /// `current_commit` is the selected release; `running_commit` may be older.
 pub fn status() -> Result<Value> {
-    let executable = std::env::current_exe()?;
+    let executable = running_image()?;
     let running = Release::from_executable(&executable);
     let data = match &running {
         Some(release) => release

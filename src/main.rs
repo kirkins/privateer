@@ -189,6 +189,8 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // Pin this image before an upgrade can move `current`.
+    let _ = privateer::releases::running_image();
     if let Err(error) = run() {
         eprintln!("{}", json!({"ok":false,"error":error.to_string()}));
         std::process::exit(1);
