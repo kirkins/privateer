@@ -49,7 +49,11 @@ selects its native minimal launch mode for an isolated pilot. Pi and signed Pi
 also accept `bare: true`: disable extensions, MCP, skills, templates, context
 files and themes for this invocation, keeping native provider/authentication
 configuration. Cursor accepts
-native `sandbox` (`enabled`/`disabled`) and boolean `trust`. Gemini's boolean
+native `sandbox` (`enabled`/`disabled`), boolean `trust` and boolean `force`.
+`force: true` maps to native `--force`: allow commands unless the native policy
+explicitly denies them. It is omitted by default. Explicit `sandbox: enabled`
+adds only the current Privateer operational home through `--add-dir`, allowing
+durable task/mail writes alongside repository work. Gemini's boolean
 `trust` selects per-run `--skip-trust`, without modifying the trust store. Devin
 accepts native `permission_mode`, boolean `sandbox` and boolean `trust`; its
 `autonomous` permission mode requires its sandbox. Devin headless output is

@@ -100,7 +100,9 @@ def main():
         result = subprocess.run([sys.executable, "-m", "unittest", "-q"], cwd=repo, capture_output=True, text=True)
         assert result.returncode == 0, "Independent tests did not pass"
         inbox = call("mail.inbox", {"address": "reviewer"})
-        assert any(m["id"] == "native-result" for m in inbox["messages"]), "Native agent did not record its task-linked result"
+        expected = {"id": "native-result", "from": "applications", "to": "reviewer",
+                    "kind": "notice", "task_id": "repair"}
+        assert any(all(m.get(key) == value for key, value in expected.items()) for m in inbox["messages"]), "Native agent did not record its task-linked result"
         log = home / "jobs" / job["id"] / job["incarnation"] / "stdout.log"
         session_id = read_session(harness, log)
         evidence["native_session_id_observed"] = session_id is not None

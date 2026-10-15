@@ -84,7 +84,7 @@ def build(harness, request):
     if harness == "devin":
         allowed |= {"permission_mode", "sandbox", "trust"}
     if harness == "cursor":
-        allowed |= {"sandbox", "trust"}
+        allowed |= {"sandbox", "trust", "force"}
     if not isinstance(options, dict) or set(options) - allowed:
         raise ValueError("unknown native option")
     mode = selector(options, "mode", ["headless", "interactive"]) or "headless"
@@ -210,6 +210,13 @@ def build(harness, request):
         sandbox = selector(options, "sandbox", ["enabled", "disabled"])
         if sandbox:
             argv += ["--sandbox", sandbox]
+            if sandbox == "enabled":
+                home = Path(request["context"]["control"]["cli_argv"][2]).resolve(strict=True)
+                if not home.is_dir():
+                    raise ValueError("operational home missing")
+                argv += ["--add-dir", str(home)]
+        if boolean(options, "force"):
+            argv += ["--force"]
         if boolean(options, "trust"):
             argv += ["--trust"]
         if model:
