@@ -22,8 +22,9 @@ cargo run --features dashboard --bin privateer-dashboard -- --demo
 ```
 
 Run without `--demo` to use the registered fleet and captain inbox. Click a ship,
-then its workspace tabs; `0` returns to Fleet overview. See
-[dashboard setup, live mail controls and Herdr boundaries](docs/dashboard.md).
+then its workspace tabs; `0` returns to Fleet overview. See the
+[dashboard guide](docs/dashboard.md) for boarding, ship management, live mail
+and Herdr boundaries.
 
 ## Quick start
 

@@ -180,7 +180,7 @@ impl App {
         let Some(view) = &self.herdr else {
             return Vec::new();
         };
-        // Registry order makes the first binding the ship's primary terminal.
+        // Live presence is primary; manual bindings retain registry order.
         let automatic = ship
             .live
             .as_ref()
