@@ -618,7 +618,7 @@ fn a_created_ship_keeps_its_creators_model_route_on_the_same_harness() {
 }
 
 #[test]
-fn running_init_again_keeps_the_first_mates_model_for_the_same_harness() {
+fn running_init_again_keeps_the_first_mates_harness_and_model() {
     let machine = Machine::new();
     let apps = machine.ship("apps");
     let mut profile = machine.json(&apps, "ship.show", json!({"name":"apps"}))["first_mate"].take();
@@ -637,4 +637,19 @@ fn running_init_again_keeps_the_first_mates_model_for_the_same_harness() {
     assert_eq!(options(), chosen);
     machine.ok(&apps, &["init", "--harness", "pi"]);
     assert_eq!(options(), json!({}));
+
+    // Without --harness, init keeps the ship's harness even when another one
+    // would be detected first on PATH.
+    let mut profile = machine.json(&apps, "ship.show", json!({"name":"apps"}))["first_mate"].take();
+    let pi = json!({"provider":"openai","model":"chosen"});
+    profile["options"] = pi.clone();
+    machine.json(
+        &apps,
+        "ship.put",
+        json!({"name":"apps","first_mate":profile}),
+    );
+    machine.ok(&apps, &["init"]);
+    let kept = machine.json(&apps, "ship.show", json!({"name":"apps"}))["first_mate"].take();
+    assert_eq!(kept["manifest"], "bundled:pi");
+    assert_eq!(kept["options"], pi);
 }

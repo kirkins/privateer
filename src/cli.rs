@@ -442,13 +442,32 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     identifier(&ship)?;
     crate::mail::unreserved(&ship)?;
     let plugins = plugins_dir()?;
-    let harness = detect_harness(&plugins, setup.harness.as_ref())?;
-    let manifest = plugins.join(&harness).join("manifest.json");
-    ensure!(
-        manifest.is_file(),
-        "no bundled adapter for harness {harness} in {}",
-        plugins.display()
-    );
+    // Running init again keeps the ship's harness unless one is named; the
+    // first harness found on PATH is only a default for a new ship.
+    let kept_manifest = match (&existing, &setup.harness) {
+        (Some(_), None) => {
+            crate::dispatch(&mut Store::open(home)?, "ship.show", json!({"name": ship}))
+                .ok()
+                .and_then(|s| s["first_mate"]["manifest"].as_str().map(str::to_owned))
+        }
+        _ => None,
+    };
+    let (harness, manifest) = match kept_manifest {
+        Some(manifest) => (
+            crate::bundled::harness(&manifest).context("cannot name the ship's harness")?,
+            manifest,
+        ),
+        None => {
+            let harness = detect_harness(&plugins, setup.harness.as_ref())?;
+            let manifest = plugins.join(&harness).join("manifest.json");
+            ensure!(
+                manifest.is_file(),
+                "no bundled adapter for harness {harness} in {}",
+                plugins.display()
+            );
+            (harness, manifest.display().to_string())
+        }
+    };
     fs::create_dir_all(folder.join("projects"))?;
     let mut store = Store::open(home)?;
     let binary = crate::executable::installed()?;
