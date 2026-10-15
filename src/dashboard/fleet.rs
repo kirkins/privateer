@@ -60,13 +60,8 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
         "SELECT json_extract(record,'$.first_mate.manifest') FROM ships WHERE name=?1 AND json_extract(record,'$.location')='here'",
         [name], |r| r.get(0)).context("registered ship is not hosted here")?;
     let harness = description
-        .and_then(|p| {
-            Path::new(&p)
-                .parent()?
-                .file_name()?
-                .to_str()
-                .map(str::to_owned)
-        })
+        .as_deref()
+        .and_then(crate::bundled::harness)
         .unwrap_or_default();
     let attended = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM presence WHERE ship=?1 AND expires_ms>?2)",

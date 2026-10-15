@@ -324,6 +324,50 @@ fn fleet_uses_each_home_and_never_resurrects_a_missing_ship() {
 }
 
 #[test]
+fn fleet_harness_labels_support_bundled_legacy_and_custom_references_without_writes() {
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let conn = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    let raw: String = conn
+        .query_row("SELECT record FROM ships WHERE name='apps'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut record: Value = serde_json::from_str(&raw).unwrap();
+    for (reference, expected) in [
+        (json!("bundled:codex"), "codex"),
+        (json!("bundled:pi-signed"), "pi-signed"),
+        (
+            json!(m.root.join("deleted-checkout/plugins/claude/manifest.json")),
+            "claude",
+        ),
+        (
+            json!(m.root.join("custom/my-harness/manifest.json")),
+            "my-harness",
+        ),
+        (Value::Null, ""),
+    ] {
+        record["first_mate"]["manifest"] = reference;
+        let stored = record.to_string();
+        conn.execute("UPDATE ships SET record=?1 WHERE name='apps'", [&stored])
+            .unwrap();
+        let view = m.dashboard();
+        let ship = &view["snapshot"]["ships"][0];
+        assert_eq!(ship["live"]["error"], Value::Null, "{view}");
+        assert_eq!(ship["live"]["harness"], expected, "{view}");
+        let after: String = conn
+            .query_row("SELECT record FROM ships WHERE name='apps'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            after, stored,
+            "dashboard must not migrate manifest references"
+        );
+    }
+}
+
+#[test]
 fn captain_mail_keeps_home_identity_replies_and_acknowledges_only_read_prefix() {
     use privateer::dashboard::{command, fleet, mailbox::Mailbox};
     let m = Machine::new();

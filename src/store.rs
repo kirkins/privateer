@@ -161,6 +161,7 @@ impl Store {
         crate::workspace::init(&store)?;
         crate::peers::init(&store)?;
         crate::mail::init(&store)?;
+        crate::bundled::migrate(&store)?;
         crate::activation::init(&store)?;
         crate::context::init(&store)?;
         crate::presence::init(&store)?;

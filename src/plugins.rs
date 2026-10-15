@@ -202,7 +202,8 @@ fn selected_paths(charter: &Value, args: &Value) -> Result<(PathBuf, Option<Path
         }
         Ok((manifest, config))
     } else {
-        let manifest = absolute_file(field(args, "manifest")?)?;
+        let manifest = crate::bundled::resolve(field(args, "manifest")?)?;
+        let manifest = absolute_file(manifest.to_str().context("manifest path must be UTF-8")?)?;
         let config = args
             .get("config")
             .filter(|v| !v.is_null())

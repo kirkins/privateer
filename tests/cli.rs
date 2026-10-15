@@ -683,12 +683,7 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
 
     let ship = folder.json("ship.show", json!({"name":"infra-ship"}));
     assert_eq!(ship["scope"], "Deploys and build servers");
-    assert!(
-        ship["first_mate"]["manifest"]
-            .as_str()
-            .unwrap()
-            .ends_with("plugins/codex/manifest.json")
-    );
+    assert_eq!(ship["first_mate"]["manifest"], "bundled:codex");
     assert_eq!(ship["first_mate"]["options"]["sandbox"], "workspace-write");
     assert_eq!(ship["first_mate"]["duty_task"], "infra-ship-duty");
     let charter = folder.json("charter.show", json!({"id":"infra-ship"}));
@@ -714,12 +709,7 @@ fn init_again_keeps_the_captains_edits() {
     );
     let ship = folder.json("ship.show", json!({"name":"infra"}));
     assert_eq!(ship["scope"], "Deploys");
-    assert!(
-        ship["first_mate"]["manifest"]
-            .as_str()
-            .unwrap()
-            .ends_with("plugins/claude/manifest.json")
-    );
+    assert_eq!(ship["first_mate"]["manifest"], "bundled:claude");
     assert_eq!(
         ship["first_mate"]["options"]["permission_mode"],
         "acceptEdits"

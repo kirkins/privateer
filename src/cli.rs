@@ -31,6 +31,7 @@ pub const VERBS: &[&str] = &[
     "door",
     "permissions",
     "watch",
+    "upgrade",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -82,14 +83,22 @@ pub fn installed_harnesses() -> Result<Vec<String>> {
         .collect())
 }
 
-/// The bundled adapters: `PRIVATEER_PLUGINS`, a `plugins/` directory beside
-/// or above the executable (a source checkout's target/ build), or the
-/// checkout the binary was built from.
+/// Release images use only their own immutable bundle. Legacy/source builds
+/// retain the explicit override and checkout discovery for development.
 pub(crate) fn plugins_dir() -> Result<PathBuf> {
+    let executable = crate::releases::running_image()?;
+    if let Some(release) = crate::releases::Release::from_executable(&executable) {
+        let plugins = release.plugins();
+        ensure!(
+            plugins.join("native.py").is_file(),
+            "release {} is missing its bundled plugins",
+            release.commit
+        );
+        return Ok(plugins);
+    }
     if let Some(dir) = std::env::var_os("PRIVATEER_PLUGINS") {
         return Ok(PathBuf::from(dir));
     }
-    let executable = std::env::current_exe()?;
     for dir in executable.ancestors().skip(1) {
         for candidate in [dir.join("plugins"), dir.join("share/privateer/plugins")] {
             if candidate.join("native.py").is_file() {
@@ -513,7 +522,8 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
         .filter(|mate| {
             mate["manifest"]
                 .as_str()
-                .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+                .and_then(crate::bundled::harness)
+                .as_deref()
                 == Some(harness.as_str())
         })
         .map(|mate| mate["options"].clone())
@@ -676,13 +686,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         Some(name) => name.clone(),
         None => profile["first_mate"]["manifest"]
             .as_str()
-            .and_then(|m| {
-                Path::new(m)
-                    .parent()?
-                    .file_name()?
-                    .to_str()
-                    .map(str::to_owned)
-            })
+            .and_then(crate::bundled::harness)
             .context("no first-mate harness configured; pass one: privateer start claude")?,
     };
     // The captain's model and provider for this ship's harness, unless the
@@ -690,7 +694,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let options = &profile["first_mate"]["options"];
     let own_harness = profile["first_mate"]["manifest"]
         .as_str()
-        .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+        .and_then(crate::bundled::harness)
+        .as_deref()
         == Some(harness.as_str());
     let chooses = |flag: &str| {
         passthrough
@@ -823,9 +828,16 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
 
 fn dashboard_binary() -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let beside = std::env::current_exe()
-        .ok()?
-        .with_file_name("privateer-dashboard");
+    let image = crate::releases::running_image().ok()?;
+    if let Some(release) = crate::releases::Release::from_executable(&image) {
+        let dashboard = release.entrypoint("privateer-dashboard").ok()?;
+        return (dashboard.is_file()
+            && dashboard
+                .metadata()
+                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0))
+        .then_some(dashboard);
+    }
+    let beside = image.with_file_name("privateer-dashboard");
     let candidates =
         std::iter::once(beside).chain(std::env::var_os("PATH").into_iter().flat_map(|paths| {
             std::env::split_paths(&paths)
@@ -1083,7 +1095,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                 };
                 let mate = ship["first_mate"]["manifest"]
                     .as_str()
-                    .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+                    .and_then(crate::bundled::harness)
                     .map(|h| format!(", first mate: {h}"))
                     .unwrap_or_default();
                 println!(

@@ -66,7 +66,7 @@ fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path COMMAND --file args.yaml   YAML/YML/JSON object (64 KiB)\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nprivateer          open the dashboard when installed (ordinary terminals or Herdr)\nprivateer start    talk to the current ship's first mate directly\nIf the dashboard is missing: get aboard the current ship, offering to initialize a new folder first (or --yes).\nIn a ship folder, --home is found automatically:\nprivateer init [--ship NAME] [--harness ID] [--liaison]\nprivateer start | status | ships | ask SHIP TEXT | tell SHIP TEXT | inbox | reply ID TEXT | wakes |\n          project add URL [NAME] [--ship SHIP] | service [status|start|stop]\nprivateer permissions [show|standard|yolo|allow TOOL_RULE]   fleet-wide launch permissions\nprivateer door add NAME [--config PATH] [--to SHIP] | start | stop | status | list | remove   the captain's front doors (e.g. telegram)\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, ship.create/actions/retire, project.add, wake.list,\nnote.put/get/list, focus.digest, permissions.show/set/blocked,\nmail.send/inbox/outbox/pending/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\nworkspace.acquire/status/list/recover/release, crew.report/answer, resource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
+                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path COMMAND --file args.yaml   YAML/YML/JSON object (64 KiB)\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nprivateer          open the dashboard when installed (ordinary terminals or Herdr)\nprivateer start    talk to the current ship's first mate directly\nIf the dashboard is missing: get aboard the current ship, offering to initialize a new folder first (or --yes).\nIn a ship folder, --home is found automatically:\nprivateer init [--ship NAME] [--harness ID] [--liaison]\nprivateer start | status | ships | ask SHIP TEXT | tell SHIP TEXT | inbox | reply ID TEXT | wakes |\n          project add URL [NAME] [--ship SHIP] | service [status|start|stop]\nprivateer upgrade status   read-only release identity and upgrade history (no upgrade execution yet)\nprivateer permissions [show|standard|yolo|allow TOOL_RULE]   fleet-wide launch permissions\nprivateer door add NAME [--config PATH] [--to SHIP] | start | stop | status | list | remove   the captain's front doors (e.g. telegram)\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, ship.create/actions/retire, project.add, wake.list,\nnote.put/get/list, focus.digest, upgrade.status, permissions.show/set/blocked,\nmail.send/inbox/outbox/pending/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\nworkspace.acquire/status/list/recover/release, crew.report/answer, resource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
                 );
                 return Ok(());
             }
@@ -116,6 +116,14 @@ fn run() -> Result<()> {
     let Some(command) = command else {
         return privateer::cli::board(home, yes, caller);
     };
+    // Release status belongs to the installation, not to a ship home.
+    if command == "upgrade" && !json_given && !file_given {
+        return privateer::releases::cli(&positional);
+    }
+    if command == "upgrade.status" {
+        println!("{}", privateer::releases::status()?);
+        return Ok(());
+    }
     // Front doors belong to the captain's whole fleet, not to one ship home.
     if command == "door" && !json_given && !file_given {
         caller.require_operator("door")?;
@@ -181,6 +189,8 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // Pin this image before an upgrade can move `current`.
+    let _ = privateer::releases::running_image();
     if let Err(error) = run() {
         eprintln!("{}", json!({"ok":false,"error":error.to_string()}));
         std::process::exit(1);

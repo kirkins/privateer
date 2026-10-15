@@ -10,7 +10,6 @@ use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
-use std::path::Path;
 use std::time::Duration;
 
 /// Defaults for a first mate's activation settings, in seconds or counts.
@@ -95,6 +94,7 @@ fn read_session(harness: &str, log: &str) -> Option<String> {
 fn harness_id(profile: &Value) -> String {
     profile["manifest"]
         .as_str()
+        .and_then(|reference| crate::bundled::resolve(reference).ok())
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
         .and_then(|manifest| manifest["id"].as_str().map(str::to_owned))
@@ -114,11 +114,21 @@ pub fn profile(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
             let path = path
                 .as_str()
                 .with_context(|| format!("first_mate.{key} must be a path"))?;
+            let reference = if key == "manifest" {
+                crate::bundled::normalize(path)?
+            } else {
+                path.to_owned()
+            };
+            let resolved = if key == "manifest" {
+                crate::bundled::resolve(&reference)?
+            } else {
+                reference.clone().into()
+            };
             ensure!(
-                Path::new(path).is_absolute() && Path::new(path).is_file(),
-                "first_mate.{key} must be an existing absolute file"
+                resolved.is_absolute() && resolved.is_file(),
+                "first_mate.{key} must be an existing absolute file or bundled manifest"
             );
-            out.insert(key.into(), json!(path));
+            out.insert(key.into(), json!(reference));
         }
     }
     ensure!(

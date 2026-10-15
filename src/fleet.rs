@@ -48,6 +48,7 @@ pub(crate) fn registry() -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
            created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
     )?;
+    crate::releases::init(&conn)?;
     Ok(conn)
 }
 
@@ -215,13 +216,9 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         let profile =
             crate::mail::dispatch(store, "ship.show", json!({"name": c})).ok()?["first_mate"]
                 .take();
-        let harness = profile["manifest"].as_str().and_then(|m| {
-            Path::new(m)
-                .parent()?
-                .file_name()?
-                .to_str()
-                .map(str::to_owned)
-        })?;
+        let harness = profile["manifest"]
+            .as_str()
+            .and_then(crate::bundled::harness)?;
         Some((harness, profile["options"].clone()))
     });
     let harness = args
