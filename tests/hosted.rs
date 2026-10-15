@@ -115,11 +115,12 @@ struct Herdr {
 }
 
 impl Herdr {
-    fn start(socket: &Path, path: &str) -> Self {
+    /// `base` is the environment a pane starts with, as Herdr's own would be.
+    fn start(socket: &Path, base: Vec<(String, String)>) -> Self {
         let listener = UnixListener::bind(socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let seen = requests.clone();
-        let (socket, path) = (socket.to_owned(), path.to_owned());
+        let socket = socket.to_owned();
         std::thread::spawn(move || {
             let pane = json!({"pane_id":"w9:p1","terminal_id":"t9","workspace_id":"w9",
                 "tab_id":"w9:t1","agent":null,"agent_status":"unknown"});
@@ -153,7 +154,8 @@ impl Herdr {
                         let mut shell = Command::new("sh");
                         shell
                             .args(["-c", request["params"]["text"].as_str().unwrap()])
-                            .env("PATH", &path)
+                            .env_clear()
+                            .envs(base.iter().cloned())
                             .env("HERDR_ENV", "1")
                             .env("HERDR_SOCKET_PATH", &socket)
                             .env("HERDR_PANE_ID", "w9:p1")
@@ -193,7 +195,17 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     let place = Place::new();
     let socket = place.root.join("config/herdr/herdr.sock");
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    let herdr = Herdr::start(&socket, &place.path);
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
     place.json(
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"check CI"}),
