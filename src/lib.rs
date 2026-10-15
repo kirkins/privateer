@@ -12,6 +12,7 @@ pub mod door;
 mod executable;
 pub mod fleet;
 pub mod herdr;
+mod host;
 pub mod input;
 pub mod jobs;
 pub mod mail;

@@ -5,6 +5,8 @@ import { isAbsolute } from "node:path";
 
 const execute = promisify(execFile);
 const TYPE = "privateer-mail";
+// A hosted first mate has no captain to type /privateer-mail resume.
+const HOSTED_RETRY_MS = 60_000;
 const SLOT = Symbol.for("privateer.attended.mail");
 
 export class AttendedMail {
@@ -13,6 +15,7 @@ export class AttendedMail {
     this.config = config;
     this.every = dependencies.every ?? setInterval;
     this.cancel = dependencies.cancel ?? clearInterval;
+    this.now = dependencies.now ?? Date.now;
     this.call = dependencies.call ?? (async (command, args) => {
       this.abort = new AbortController();
       const result = await execute(config.cli, ["--home", config.home, command, "--json", JSON.stringify(args)], {
@@ -50,6 +53,7 @@ export class AttendedMail {
     this.running = true;
     this.seen = 0;
     this.paused = false;
+    this.resumeAt = undefined;
     this.pending = false;
     this.busy = !ctx.isIdle();
     this.lastStop = undefined;
@@ -117,6 +121,10 @@ export class AttendedMail {
       throw new Error("invalid mailbox snapshot");
     }
     this.seen = Math.max(this.seen, snapshot.acknowledged_through);
+    if (this.paused && this.resumeAt !== undefined && this.now() >= this.resumeAt) {
+      this.paused = false;
+      this.resumeAt = undefined;
+    }
     if (snapshot.count === 0) {
       this.status(this.paused ? "⚓ mail paused; /privateer-mail resume" : "⚓ no new mail");
       return;
@@ -148,7 +156,12 @@ export class AttendedMail {
     this.pending = false;
     if (event.aborted === true || ["aborted", "error"].includes(this.lastStop)) {
       this.paused = true;
-      this.status("⚓ mail paused after native stop; /privateer-mail resume");
+      if (this.config.hosted) {
+        this.resumeAt = this.now() + HOSTED_RETRY_MS;
+        this.status("⚓ mail paused after native stop; retrying in a minute");
+      } else {
+        this.status("⚓ mail paused after native stop; /privateer-mail resume");
+      }
     }
   }
   ompEnded(event) {
@@ -163,7 +176,8 @@ export class AttendedMail {
 export default function attended(api) {
   const env = process.env;
   const config = { home: env.PRIVATEER_HOME, cli: env.PRIVATEER_CONTROL_CLI,
-    ship: env.PRIVATEER_ACTOR, holder: env.PRIVATEER_PRESENCE_HOLDER, harness: env.PRIVATEER_ATTENDED_HARNESS };
+    ship: env.PRIVATEER_ACTOR, holder: env.PRIVATEER_PRESENCE_HOLDER, harness: env.PRIVATEER_ATTENDED_HARNESS,
+    hosted: env.PRIVATEER_HOSTED === "1" };
   if (env.PRIVATEER_ROLE !== "agent" || !["pi", "pi-signed", "omp"].includes(config.harness)
       || !config.home || !isAbsolute(config.home) || !config.cli || !isAbsolute(config.cli)
       || !config.ship || !config.holder) return;

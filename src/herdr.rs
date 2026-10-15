@@ -264,6 +264,30 @@ impl Client {
         self.launch(observed, folder, name, binary, home, &["start"])
     }
 
+    /// Open a background space for a ship's hosted first mate and run
+    /// `privateer start --hosted` there under the dispatcher's lease `holder`.
+    pub fn host(
+        &mut self,
+        folder: &Path,
+        name: &str,
+        binary: &Path,
+        home: &Path,
+        holder: &str,
+    ) -> Result<Pane> {
+        let observed = self.snapshot()?;
+        self.spawn(
+            &observed,
+            "workspace.create",
+            folder,
+            name,
+            false,
+            &[("PRIVATEER_HOSTED_HOLDER", holder)],
+            binary,
+            home,
+            &["start", "--hosted"],
+        )
+    }
+
     /// Open a tab following the ship's first mate (`privateer watch`).
     pub fn watch(
         &mut self,
@@ -288,6 +312,33 @@ impl Client {
         observed: &View,
         folder: &Path,
         name: &str,
+        binary: &Path,
+        home: &Path,
+        command: &[&str],
+    ) -> Result<Pane> {
+        self.spawn(
+            observed,
+            "tab.create",
+            folder,
+            name,
+            true,
+            &[],
+            binary,
+            home,
+            command,
+        )
+    }
+
+    /// Create a tab or space and launch only in its returned new shell pane.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        &mut self,
+        observed: &View,
+        method: &str,
+        folder: &Path,
+        name: &str,
+        focus: bool,
+        extra_env: &[(&str, &str)],
         binary: &Path,
         home: &Path,
         command: &[&str],
@@ -320,12 +371,15 @@ impl Client {
             }
         }
         env.insert("PRIVATEER_HOME".into(), json!(home));
+        for (key, value) in extra_env {
+            env.insert((*key).into(), json!(value));
+        }
         let made = self.request(
-            "tab.create",
-            json!({"cwd":folder,"label":name,"focus":true,"env":env}),
+            method,
+            json!({"cwd":folder,"label":name,"focus":focus,"env":env}),
         )?;
         let pane: Pane = serde_json::from_value(made["root_pane"].clone())
-            .context("tab create did not return an exact root pane")?;
+            .with_context(|| format!("{method} did not return an exact root pane"))?;
         ensure!(
             !pane.pane_id.is_empty() && !pane.terminal_id.is_empty(),
             "incomplete new pane identity"
