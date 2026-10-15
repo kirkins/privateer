@@ -188,11 +188,7 @@ fn mail_worker(
                                     },
                                 );
                             }
-                            format!(
-                                "{}: {}",
-                                a.verb,
-                                privateer::dashboard::model::clean(&value.to_string(), 1000)
-                            )
+                            privateer::dashboard::command::summary(&a.verb, &value)
                         }
                         Err(e) => format!("{} failed: {e}; form/draft retained", a.verb),
                     }
@@ -434,6 +430,7 @@ fn run(opts: Options) -> Result<()> {
         ascii: opts.ascii,
         demo: opts.demo,
         mail: if opts.demo { sample_mail() } else { Vec::new() },
+        herdr_configured: herdr.is_some(),
         home_age: Some(0),
         ..App::default()
     };
@@ -525,11 +522,7 @@ fn run(opts: Options) -> Result<()> {
                     app.board_requested = true;
                 } else {
                     app.select_ship(Some(pending.ship.clone()));
-                    app.notice = format!(
-                        "Created {}. No Herdr connection configured; run: privateer --home '{}' start",
-                        pending.ship,
-                        pending.home.to_string_lossy().replace('\'', "'\"'\"'")
-                    );
+                    app.notice = format!("Created {}.", pending.ship);
                     app.pending_board = None;
                 }
             }
@@ -560,6 +553,9 @@ fn run(opts: Options) -> Result<()> {
                 }
             }
             app.selected = app.selected.min(app.selection_len().saturating_sub(1));
+            if app.tick_notice(Instant::now()) {
+                redraw = true;
+            }
             if redraw || last_draw.elapsed() >= Duration::from_secs(1) {
                 terminal.draw(|frame| app.draw(frame))?;
                 last_draw = Instant::now();

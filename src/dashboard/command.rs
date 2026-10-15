@@ -43,6 +43,35 @@ pub fn json(binary: &Path, home: &Path, verb: &str, args: &Value) -> Result<Valu
     serde_json::from_slice(&run(cmd)?).context("invalid Privateer JSON response")
 }
 
+/// One plain sentence describing a completed operator command.
+pub fn summary(verb: &str, value: &Value) -> String {
+    let text = |key: &str| {
+        let words = value[key].as_str().unwrap_or("").split_whitespace();
+        crate::dashboard::model::clean(&words.collect::<Vec<_>>().join(" "), 512)
+    };
+    match verb {
+        "init" => format!("Created {}.", text("ship")),
+        "ship.create" => format!(
+            "Created {} in {} · dispatcher {}.",
+            text("ship"),
+            text("folder"),
+            text("dispatcher").trim_end_matches('.')
+        ),
+        "ship.retire" => format!("Retired {}; its folder is kept.", text("ship")),
+        "mail.send" => format!(
+            "{} sent to {}.",
+            match value["kind"].as_str() {
+                Some("reply") => "Reply",
+                Some("request") => "Question",
+                _ => "Message",
+            },
+            text("to")
+        ),
+        "service" => text("report"),
+        _ => format!("{verb} completed."),
+    }
+}
+
 pub fn initialize(
     binary: &Path,
     folder: &Path,
@@ -181,4 +210,42 @@ pub fn run(mut cmd: Command) -> Result<Vec<u8>> {
         let _ = child.wait();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summary;
+    use serde_json::json;
+
+    #[test]
+    fn command_results_read_as_sentences() {
+        let created = json!({"ship":"builds","folder":"/ships/builds","dispatcher":"not started (PRIVATEER_SERVICE=none)","actions":["inspect"]});
+        assert_eq!(
+            summary("ship.create", &created),
+            "Created builds in /ships/builds · dispatcher not started (PRIVATEER_SERVICE=none)."
+        );
+        assert_eq!(
+            summary(
+                "mail.send",
+                &json!({"kind":"reply","to":"builds","body":"x"})
+            ),
+            "Reply sent to builds."
+        );
+        assert_eq!(
+            summary("mail.send", &json!({"kind":"request","to":"apps"})),
+            "Question sent to apps."
+        );
+        assert_eq!(
+            summary(
+                "service",
+                &json!({"report":"Dispatcher for harbor: not running\n(no user service).\n"})
+            ),
+            "Dispatcher for harbor: not running (no user service)."
+        );
+        assert_eq!(
+            summary("ship.retire", &json!({"ship":"old","retired":true})),
+            "Retired old; its folder is kept."
+        );
+        assert_eq!(summary("init", &json!({"ship":"apps"})), "Created apps.");
+    }
 }

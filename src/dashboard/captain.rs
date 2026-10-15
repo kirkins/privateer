@@ -188,6 +188,7 @@ impl App {
             self.notice = "Ship home is unavailable. No message sent.".into();
             return;
         }
+        self.notice.clear();
         self.composer = Some(Composer {
             recipient: ship,
             home,
@@ -240,6 +241,7 @@ impl App {
             self.notice = "Select an open request or decision.".into();
             return;
         }
+        self.notice.clear();
         self.composer = Some(Composer {
             recipient: mail.from.clone(),
             home: mail.home.clone(),
@@ -422,16 +424,21 @@ impl App {
             .wrap(Wrap { trim: false }),
             rows[2],
         );
+        // Command outcomes (pending, failed and retained) belong beside the draft.
         frame.render_widget(
-            Paragraph::new(format!(
-                "{} / 1024 chars · {}",
-                draft.body.chars().count(),
-                if self.demo {
-                    "local sample only"
-                } else {
-                    "captain mailbox"
-                }
-            )),
+            Paragraph::new(if self.notice.is_empty() {
+                format!(
+                    "{} / 1024 chars · {}",
+                    draft.body.chars().count(),
+                    if self.demo {
+                        "local sample only"
+                    } else {
+                        "captain mailbox"
+                    }
+                )
+            } else {
+                clean(&self.notice, 512)
+            }),
             rows[3],
         );
         frame.render_widget(
