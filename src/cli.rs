@@ -694,7 +694,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let options = &profile["first_mate"]["options"];
     let own_harness = profile["first_mate"]["manifest"]
         .as_str()
-        .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+        .and_then(crate::bundled::harness)
+        .as_deref()
         == Some(harness.as_str());
     let chooses = |flag: &str| {
         passthrough
