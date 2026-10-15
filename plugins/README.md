@@ -96,8 +96,8 @@ with `completion_source: "native-session-projection"`; native output is unchange
 Usage counts completed steps once, including the verified missing final step.
 Provider errors, interrupted/truncated output and incomplete tool loops cannot
 produce successful jobs. These checks confirm a native turn, not task acceptance
-or delivery. Live headless qualification is recorded below; attended idle-mail
-integration remains separate work.
+or delivery. Live headless and attended evidence is recorded separately below;
+neither qualifies every model or profile.
 
 Unattended Pi/signed Pi JSON runs use an event-checking bridge in that same
 job group. Pi may exit zero after exhausted provider retries, so process status
@@ -299,7 +299,7 @@ are from the last attempted native trial, not continuous account monitoring):
 | AGY | Guarded repair, unchanged tests, recorded light test job, mail, exact resume and recall | Other models/profiles remain separate |
 | Gemini | Installed 0.63.0 parser; subprocess completion/failure, focused mail and exact-identity resume fixtures | Existing Google quota exhausted; live repair/recall pending |
 | OpenCode V1 | Installed parser and command plans | Live worker qualification pending |
-| OpenCode V2 | Live 2.0.29 repair, unchanged independent tests, recorded light test job, mail, exact session resume and conversation recall through OpenCode Go (`opencode-go/deepseek-v4.1-flash`); final completion verified against the native saved projection | Other models/profiles and attended idle mail remain separate; earlier Copilot/Google/OpenAI account blockers were not retried |
+| OpenCode V2 | Live 2.0.29 repair, unchanged independent tests, recorded light test job, mail, exact session resume and conversation recall through OpenCode Go (`opencode-go/deepseek-v4.1-flash`); final completion verified against the native saved projection | Other models/profiles remain separate; earlier Copilot/Google/OpenAI account blockers were not retried; attended evidence is below |
 | OMP | Native RPC initialization, exact resume and cross-repository refusal; subprocess lifecycle fixtures | Last live attempt lacked account credits |
 | Grok | Owned native ACP initialization, exact load and model/effort confirmation; subprocess lifecycle fixtures | Last live attempt returned HTTP 429 |
 | Muse | Native echo session/resume and writer-lease refusal; MSP lifecycle fixtures | Meta account billing verification returned HTTP 402; echo is not model/tool autonomy |
@@ -411,6 +411,48 @@ starts, cancelled admission, failure recovery and native receipt provenance.
 This qualifies this attended path and native profile, not arbitrary accounts,
 custom hooks, disabled transcripts or overnight fleet production behavior.
 
+`privateer start opencode-v2` installs a guarded TUI-only entrypoint under the
+ship's `.opencode/plugins/privateer-attended-v2/`. Rust validates the generated
+files, refuses symlinks and custom collisions, and writes atomic private files;
+other plugins and native settings are preserved. The optional adapter remains
+inert outside an explicit V2 attended launch or inside a crew job. It uses V2's
+public TUI API, separately from the V1 plugin contract.
+
+The adapter polls the existing Rust mailbox every five seconds, holds one
+pending native input and combines a burst into at most six headers. It checks
+the current root conversation's workspace and the wrapper's exact presence
+holder, defers while busy or behind queued captain input, and admits with native
+`delivery: "queue"`. Low notices alone do not start inference. V2's public API
+does not expose the composer draft: direct queueing preserves it while the mail
+turn runs, rather than waiting for a blank composer. A native text footer and
+`/privateer-mail pause|resume|status` show and control delivery without a model.
+Pausing prevents future offers; it does not cancel a native input already admitted.
+
+Admission is not presentation or acknowledgment. Only a promoted native user
+receipt, its exact delivered event, or explicit mailbox acknowledgment advances
+the presentation watermark. State is scoped to home, ship and native session,
+with a bounded native storage index and recent-message recovery. A pending
+receipt outside the TUI page can be fetched by its exact native message ID.
+Errors, interruption and uncertain/cancelled admission pause automatic delivery;
+only the explicit local resume command can retry an uncertain offer. It reuses
+the same native input ID and watermark so a lost response or stale TUI cache
+cannot create a second wake. Peer arrivals cannot clear the pause. Losing both
+the native storage cache and old receipts outside the bounded message window
+can re-present mail, but never silently acknowledge it. Cleanup invalidates old
+generations, aborts API requests and stops owned mailbox probes.
+
+OpenCode V2 2.0.29 passed an isolated native TUI pilot through the existing Go
+login and `opencode-go/deepseek-v4.1-flash`, with native `--auto` in the isolated
+ship (2026-10-15, America/Lima): idle
+file/reply/ack, explicit local resume, another mail turn with a typed draft
+preserved, and exact session restart without replaying two delivered but
+unacknowledged requests. Native records independently confirmed the selected
+provider/model and receipt sequences. Graceful exit released presence and left
+the payload group empty. This qualifies that TUI/profile, not arbitrary versions,
+providers or unattended overnight fleet operation. Rust-backed fixtures cover
+burst coalescing, receipt/ack separation, reloads, stale owners, queue failures,
+idempotent retries, evicted receipts, native pauses and cleanup generations.
+
 Real CLI/extension fixtures cover a thousand-message burst, busy/idle delivery,
 resume receipts, failed queues, native error boundaries, holder replacement and
 shutdown. Pi 1.1.0 has also passed a live isolated interactive file/reply/ack
@@ -427,9 +469,10 @@ Attended support is separate from the worker checkpoint above:
 | Pi | Native extension; live file/reply/ack and resume verified |
 | Claude | Native mod; live file/reply/ack and resume verified |
 | Cursor | Rust native stop-hook park; live file/reply/ack, captain input, draft preservation and resume verified |
+| OpenCode V2 | Native TUI plugin; live idle file/reply/ack, typed draft preservation and exact-session restart without replay verified |
 | Pi signed | Shared Pi extension; installed signed wrapper still required |
 | OMP | Native extension loaded; live model/tool trial blocked by account credits |
-| Codex / Grok / OpenCode V1 / OpenCode V2 | Presence wrapper and manual inbox available; automatic attended idle-mail integration still pending |
+| Codex / Grok / OpenCode V1 | Presence wrapper and manual inbox available; automatic attended idle-mail integration still pending |
 
 Headless first-mate activation, worker completion, terminal command planning and
 attended native mail are different capabilities. A passing worker trial or
