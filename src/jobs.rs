@@ -76,6 +76,9 @@ struct Job {
     /// are gone. Absent when the supervisor vanished before recording one.
     #[serde(default)]
     leader_result: Option<LeaderResult>,
+    /// Who asked to cancel: the agent's name, or "operator".
+    #[serde(default)]
+    cancelled_by: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -132,16 +135,23 @@ fn load(store: &Store, id: &str) -> Result<Job> {
         .with_context(|| format!("unknown job {id}"))?;
     Ok(serde_json::from_str(&raw)?)
 }
+/// Change a job record. Every path that ends a job comes through here, so
+/// the first change to a reported status also writes the crew outcome, in
+/// the same transaction: the status and its outcome commit together.
 fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
     let conn = store.connection();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
         let mut job = load(store, id)?;
+        let before = job.status.clone();
         f(&mut job);
         conn.execute(
             "UPDATE jobs SET record=?2 WHERE id=?1",
             params![id, serde_json::to_string(&job)?],
         )?;
+        if reported(&job.status) && !reported(&before) {
+            crate::crew::outcome(store, &public_job(&job))?;
+        }
         Ok(job)
     })();
     if result.is_ok() {
@@ -382,7 +392,13 @@ fn release(store: &Store, job: &Job) -> Result<()> {
 fn identity(pid: u32) -> Result<Option<Process>> {
     let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A process reaped between open and read reports ESRCH: it is gone too.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error).context("inspect process identity"),
     };
     // The executable comm may contain spaces/parentheses. Fields after its
@@ -590,6 +606,12 @@ fn free_bytes(path: &Path) -> Result<u64> {
 fn terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out")
 }
+/// Statuses a crew outcome reports. An orphan is no longer supervised (its
+/// deadline is not enforced), so its first mate hears about it then; the
+/// settlement that may follow is not reported again.
+fn reported(status: &str) -> bool {
+    terminal(status) || status == "orphaned"
+}
 fn public_job(job: &Job) -> Value {
     let mut v = serde_json::to_value(job).unwrap_or(Value::Null);
     v["log_limit_bytes"] = json!(LOG_LIMIT);
@@ -787,6 +809,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
         wait_for_capacity,
         max_wait_secs,
         leader_result: None,
+        cancelled_by: None,
     };
     let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -1540,6 +1563,42 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
     }
     Ok(job)
 }
+/// Reconcile unfinished jobs whose supervisor is gone, so their outcome is
+/// recorded without anyone asking for their status. A live supervisor is
+/// checked cheaply and left to finish its own job.
+pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
+    let mut statement = store.connection().prepare(
+        "SELECT record FROM jobs WHERE json_extract(record, '$.status')
+         IN ('starting', 'queued', 'launching', 'running')",
+    )?;
+    let jobs: Vec<Job> = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .map(|raw| Ok(serde_json::from_str(&raw?)?))
+        .collect::<Result<_>>()?;
+    let mut reserved = Reserved::default();
+    let mut settled = vec![];
+    for job in jobs {
+        // One job that cannot be inspected must not stop the dispatcher; it
+        // is reported and tried again on the next pass.
+        let id = job.id.clone();
+        let before = job.status.clone();
+        let result = (|| -> Result<Option<Job>> {
+            if job.supervisor.as_ref().map(same_process).transpose()? == Some(true) {
+                return Ok(None);
+            }
+            Ok(Some(reconcile(store, job, &mut reserved)?))
+        })();
+        match result {
+            Ok(Some(job)) if job.status != before => {
+                settled.push(json!({"job_id": id, "status": job.status}));
+            }
+            Ok(_) => {}
+            Err(error) => settled.push(json!({"job_id": id, "error": format!("{error:#}")})),
+        }
+    }
+    Ok(settled)
+}
+
 fn cancel(store: &Store, id: &str) -> Result<Value> {
     let initial = load(store, id)?;
     // Stopping already-owned work never grants new execution authority and
@@ -1547,9 +1606,14 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
     if terminal(&initial.status) {
         return Ok(public_job(&initial));
     }
+    let by = match store.caller() {
+        Caller::Agent { actor } => actor.clone(),
+        Caller::Operator => "operator".into(),
+    };
     let mut job = alter(store, id, |j| {
-        if !terminal(&j.status) {
+        if !terminal(&j.status) && !j.cancel_requested {
             j.cancel_requested = true;
+            j.cancelled_by = Some(by);
         }
     })?;
     if terminal(&job.status) {

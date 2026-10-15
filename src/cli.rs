@@ -163,12 +163,16 @@ Run Privateer as `{cli} COMMAND --json '{{...}}'`.
 ## Working
 
 - Mail as yourself: `mail.send {{"from":"{ship}","to":"<ship or captain>","kind":"request|notice|reply","body":"...","task_id":"<optional>"}}`; a reply sets `correlation` to the request id. `ship.list {{}}` shows who handles what.
-- Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`, then `job.status {{"id":"..."}}`.
+- Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`. You need not poll it: when it ends you get its outcome.
 - Delegate with `task.create {{"id":"...","owner":"<ship>","title":"...","charter_id":"{ship}"}}`; hand off with `task.handoff`, which takes effect when the recipient runs `task.accept`.
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
 - Before you stop, replace the handoff note for each focus you worked on: `note.put {{"ship":"{ship}","focus":"task:<id>|thread:<id>|captain|ship","body":"..."}}`. Keep it under 2 KB and to judgement: what you are doing and why, what you are waiting on, what comes next. Facts are already recorded. Put lasting preferences and conventions in the `ship` note.
 - Repositories live in `projects/`; the captain adds them with `privateer project add <git url>`.
 - New area of work? Create a ship for it: `ship.create {{"name":"...","scope":"...","objective":"..."}}` (beside this folder; its charter can only have actions yours has). Retire ships you created with `ship.retire {{"name":"..."}}`. `fleet.list {{}}` shows every ship on this machine.
+
+## Crew
+
+Crew are the jobs you start (`job.start`, or `agent.start` for another harness) on your tasks. When one finishes, fails, times out or is orphaned, the runtime mails you its outcome from `crew`, under the task's focus: status, exit code, reason, duration and the end of its logs, taken from the job's record. An exit status is not proof: check the result yourself (`job.status`, the logs, the work) before relying on it or reporting it, and record your judgement in the task's note.
 
 ## Rules
 
@@ -279,10 +283,7 @@ pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)
         }
         None => ship_name(&folder)?,
     };
-    ensure!(
-        ship != crate::mail::CAPTAIN,
-        "captain is reserved for the person"
-    );
+    crate::mail::unreserved(&ship)?;
     let plugins = plugins_dir()?;
     let harness = detect_harness(&plugins, setup.harness.as_ref())?;
     let manifest = plugins.join(&harness).join("manifest.json");
