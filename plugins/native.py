@@ -258,6 +258,12 @@ def build(harness, request):
             argv += ["--effort", effort]
         if resume:
             argv += ["--resume", resume]
+        # Claude ignores a project's permissions.allow until someone accepts
+        # its trust dialog, which a new ship's folder never had. Grant the
+        # Privateer CLI on the command line so the agent can reach its home.
+        control = request["context"].get("control")
+        if control:
+            argv += ["--allowedTools", f"Bash({control['cli_argv'][0]}:*)"]
         argv += ["--", prompt]
     elif harness == "opencode-v2":
         # V2 uses a different CLI/server/plugin contract. A private server
