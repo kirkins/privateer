@@ -504,9 +504,23 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     }
     // Headless first mates must be able to act: Codex writes inside its
     // sandbox, Claude may edit files.
+    // Running init again keeps the captain's model and provider for the same
+    // harness; a different harness starts from its own defaults.
+    let kept = previous
+        .as_ref()
+        .map(|ship| &ship["first_mate"])
+        .filter(|mate| {
+            mate["manifest"]
+                .as_str()
+                .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+                == Some(harness.as_str())
+        })
+        .map(|mate| mate["options"].clone())
+        .filter(Value::is_object);
     let options = setup
         .options
         .clone()
+        .or(kept)
         .unwrap_or_else(|| match harness.as_str() {
             "codex" => json!({"sandbox": "workspace-write"}),
             "claude" => json!({"permission_mode": "acceptEdits"}),
