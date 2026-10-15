@@ -39,6 +39,7 @@ impl Mailbox {
         let mut messages = Vec::new();
         let mut errors = Vec::new();
         self.unread.retain(|home, _| homes.contains_key(home));
+        self.read.retain(|(home, _)| homes.contains_key(home));
         for (home, error) in homes {
             let result = (|| -> Result<_> {
                 anyhow::ensure!(error.is_none(), "{}", error.unwrap_or_default());
@@ -98,6 +99,9 @@ impl Mailbox {
                         },
                     );
                 }
+                self.read
+                    .retain(|(read_home, seq)| read_home != &home || *seq > cursor);
+                self.ack_read(binary, &home)?;
                 Ok(rows.into_values().collect::<Vec<_>>())
             })();
             match result {
@@ -138,18 +142,16 @@ impl Mailbox {
         });
         self.messages = messages;
         self.errors = errors;
-        self.read.retain(|(home, seq)| {
-            self.unread
-                .get(home)
-                .is_some_and(|unread| unread.contains(seq))
-        });
     }
     pub fn mark_read(&mut self, binary: &Path, mail: &Mail) -> Result<()> {
         let home = mail.home.as_ref().context("sample message has no home")?;
         self.read.insert((home.clone(), mail.seq));
+        self.ack_read(binary, home)
+    }
+    fn ack_read(&self, binary: &Path, home: &Path) -> Result<()> {
         let mut through = None;
         for seq in self.unread.get(home).into_iter().flatten() {
-            if !self.read.contains(&(home.clone(), *seq)) {
+            if !self.read.contains(&(home.to_path_buf(), *seq)) {
                 break;
             }
             through = Some(*seq);

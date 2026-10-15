@@ -442,9 +442,11 @@ impl App {
                 } else {
                     "Open the primary terminal with f, or choose Terminals to inspect its crew."
                 }));
-                lines.push(Line::from(
-                    "Conversation and agent launch are not connected in this preview.",
-                ));
+                if self.demo {
+                    lines.push(Line::from(
+                        "Conversation and agent launch are not connected in this preview.",
+                    ));
+                }
                 lines.push(Line::styled(
                     if self.demo {
                         "m: Try Status / Ask / Message · local demo only"
@@ -619,7 +621,7 @@ impl App {
                     Span::raw(if self.demo {
                         " DEMO / sample data"
                     } else {
-                        " READ-ONLY / local home"
+                        " LIVE / fleet · captain mail"
                     }),
                 ]),
                 Line::from(format!(" {scope}")),
@@ -633,9 +635,15 @@ impl App {
             ListItem::new(vec![
                 Line::from("Captain's inbox"),
                 Line::from(if self.demo {
-                    "Sample decisions / replies"
+                    "Sample decisions / replies".into()
+                } else if self.mail_errors.is_empty() {
+                    format!("{} messages", self.mail.len())
                 } else {
-                    "Not connected"
+                    format!(
+                        "{} messages · errors: {}",
+                        self.mail.len(),
+                        self.mail_errors.len()
+                    )
                 }),
             ]),
         ];
@@ -841,6 +849,11 @@ impl App {
                 self.herdr_error
                     .as_ref()
                     .map(|e| format!("HERDR UNAVAILABLE: {}", clean(e, 180)))
+            })
+            .or_else(|| {
+                self.mail_errors
+                    .first()
+                    .map(|e| format!("MAILBOX UNAVAILABLE: {}", clean(e, 180)))
             });
         let status = error.unwrap_or_else(|| {
             format!(
@@ -850,7 +863,7 @@ impl App {
                 clean(&self.notice, 160)
             )
         });
-        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.home_error.is_some()||self.herdr_error.is_some(){Color::Red}else{Color::Gray}))]),rows[2]);
+        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.home_error.is_some()||self.herdr_error.is_some()||!self.mail_errors.is_empty(){Color::Red}else{Color::Gray}))]),rows[2]);
         self.draw_composer(frame);
     }
 }

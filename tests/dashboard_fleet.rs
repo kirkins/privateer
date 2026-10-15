@@ -851,3 +851,180 @@ fn demo_work_origins_stay_sample_only_without_creating_state() {
     }
     assert_eq!(fs::read_dir(&m.root).unwrap().count(), 0);
 }
+
+#[test]
+fn read_requests_beyond_the_inbox_page_survive_refresh_and_ack_when_reachable() {
+    use privateer::dashboard::{command, fleet, mailbox::Mailbox};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    let proxy = m.proxy();
+    m.send_batch(&apps, (0..command::MAIL_PAGE_LIMIT).map(|i| {
+        json!({"id":format!("notice-{i}"),"from":"apps","to":"captain","kind":"notice","body":"Earlier unseen notice"})
+    }).collect());
+    let request = m.json(&apps, "mail.send", json!({"id":"later-request","from":"apps","to":"captain","kind":"request","body":"Read beyond the inbox page"}));
+    let gap = m.json(&apps, "mail.send", json!({"id":"unseen-gap","from":"apps","to":"captain","kind":"notice","body":"Read this before the later decision can be acknowledged"}));
+    let last_read = m.json(&apps, "mail.send", json!({"id":"later-decision","from":"apps","to":"captain","kind":"decision","body":"Read beyond an unseen gap"}));
+    m.json(&infra, "mail.send", json!({"id":"later-request","from":"infra","to":"captain","kind":"request","body":"Independent unread request"}));
+    let unseen = m.json(&apps, "mail.send", json!({"id":"last-unseen","from":"apps","to":"captain","kind":"notice","body":"Leave this unread"}));
+    let snapshot = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
+    let home = apps.join(".privateer");
+    let page = m.json(
+        &apps,
+        "mail.inbox",
+        json!({"address":"captain","limit":command::MAIL_PAGE_LIMIT}),
+    );
+    assert_eq!(
+        page["messages"].as_array().unwrap().len(),
+        command::MAIL_PAGE_LIMIT
+    );
+    assert!(
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|mail| mail["kind"] == "notice")
+    );
+    let mut mailbox = Mailbox::default();
+    mailbox.refresh(&proxy, &snapshot, None);
+    assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
+    for kind in ["request", "decision"] {
+        let mail = mailbox
+            .messages
+            .iter()
+            .find(|mail| mail.id == format!("later-{kind}") && mail.home.as_ref() == Some(&home))
+            .unwrap()
+            .clone();
+        mailbox.mark_read(&proxy, &mail).unwrap();
+        mailbox.refresh(&proxy, &snapshot, None);
+        assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
+        assert_eq!(
+            m.json(&apps, "mail.inbox", json!({"address":"captain"}))["acknowledged_through"],
+            0
+        );
+    }
+    mailbox.refresh(&m.root.join("missing-binary"), &snapshot, None);
+    assert_eq!(mailbox.errors.len(), 2);
+    mailbox.refresh(&proxy, &snapshot, None);
+    assert!(mailbox.errors.is_empty());
+    for i in 0..command::MAIL_PAGE_LIMIT {
+        let notice = mailbox
+            .messages
+            .iter()
+            .find(|mail| mail.id == format!("notice-{i}"))
+            .unwrap()
+            .clone();
+        mailbox.mark_read(&proxy, &notice).unwrap();
+        mailbox.refresh(&proxy, &snapshot, None);
+        assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
+    }
+    let inbox = m.json(&apps, "mail.inbox", json!({"address":"captain"}));
+    assert_eq!(inbox["acknowledged_through"], request["seq"]);
+    assert_eq!(inbox["messages"][0]["id"], gap["id"]);
+    let gap = mailbox
+        .messages
+        .iter()
+        .find(|mail| mail.id == "unseen-gap")
+        .unwrap()
+        .clone();
+    mailbox.mark_read(&proxy, &gap).unwrap();
+    mailbox.refresh(&proxy, &snapshot, None);
+    assert!(mailbox.errors.is_empty());
+    let inbox = m.json(&apps, "mail.inbox", json!({"address":"captain"}));
+    assert_eq!(inbox["acknowledged_through"], last_read["seq"]);
+    assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox["messages"][0]["id"], unseen["id"]);
+    assert_eq!(
+        m.json(&infra, "mail.inbox", json!({"address":"captain"}))["acknowledged_through"],
+        0
+    );
+    mailbox.refresh(&proxy, &snapshot, None);
+    for kind in ["request", "decision"] {
+        assert!(
+            mailbox
+                .messages
+                .iter()
+                .any(|mail| mail.id == format!("later-{kind}")
+                    && mail.home.as_ref() == Some(&home)
+                    && mail.acknowledged)
+        );
+        assert_eq!(
+            m.json(&apps, "mail.show", json!({"id":format!("later-{kind}")}))["state"],
+            "open"
+        );
+    }
+}
+
+#[test]
+fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
+    use privateer::dashboard::{fleet, mailbox::Mailbox, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    let proxy = m.proxy();
+    let registry = m.root.join("fleet.sqlite");
+    let mut mailbox = Mailbox::default();
+    let mut app = App {
+        snapshot: fleet::read(&registry, None).unwrap(),
+        ..App::default()
+    };
+    mailbox.refresh(&proxy, &app.snapshot, None);
+    assert!(mailbox.errors.is_empty());
+    let empty = screen(&mut app);
+    assert!(empty.contains("LIVE / fleet · captain mail"));
+    assert!(empty.contains("0 messages"));
+    assert!(!empty.contains("READ-ONLY / local home"));
+    assert!(!empty.contains("Not connected"));
+    for (folder, from) in [(&apps, "apps"), (&infra, "infra")] {
+        m.json(
+            folder,
+            "mail.send",
+            json!({"from":from,"to":"captain","kind":"notice","body":format!("Mail from {from}")}),
+        );
+    }
+    mailbox.refresh(&proxy, &app.snapshot, None);
+    app.mail = mailbox.messages.clone();
+    let populated = screen(&mut app);
+    assert!(populated.contains("2 messages"));
+    assert!(!populated.contains("Not connected"));
+    fs::rename(infra.join(".privateer"), infra.join("saved-home")).unwrap();
+    app.update_snapshot(fleet::read(&registry, None).unwrap());
+    mailbox.refresh(&proxy, &app.snapshot, None);
+    app.mail = mailbox.messages.clone();
+    app.mail_errors = mailbox.errors.clone();
+    assert_eq!(app.mail.len(), 2);
+    assert_eq!(app.mail_errors.len(), 1);
+    for view in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+        match view {
+            None => app.select_ship(None),
+            Some(4) => app.open_inbox(),
+            Some(tab) => {
+                app.select_ship(Some("apps".into()));
+                app.select_tab(tab);
+            }
+        }
+        let failed = screen(&mut app);
+        assert!(failed.contains("LIVE / fleet · captain mail"));
+        assert!(failed.contains("2 messages · errors: 1"));
+        assert!(failed.contains("MAILBOX UNAVAILABLE"));
+        assert!(!failed.contains("READ-ONLY / local home"));
+        assert!(!failed.contains("Not connected"));
+        assert!(!failed.contains("Conversation and agent launch are not connected"));
+    }
+    fs::rename(apps.join(".privateer"), apps.join("saved-home")).unwrap();
+    app.update_snapshot(fleet::read(&registry, None).unwrap());
+    mailbox.refresh(&proxy, &app.snapshot, None);
+    app.mail_errors = mailbox.errors.clone();
+    assert!(screen(&mut app).contains("2 messages · errors: 2"));
+    for folder in [&apps, &infra] {
+        fs::rename(folder.join("saved-home"), folder.join(".privateer")).unwrap();
+    }
+    app.update_snapshot(fleet::read(&registry, None).unwrap());
+    mailbox.refresh(&proxy, &app.snapshot, None);
+    app.mail = mailbox.messages;
+    app.mail_errors = mailbox.errors;
+    let recovered = screen(&mut app);
+    assert!(recovered.contains("2 messages"));
+    assert!(!recovered.contains("MAILBOX UNAVAILABLE"));
+    assert!(app.mail_errors.is_empty());
+}

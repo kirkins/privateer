@@ -36,13 +36,17 @@ and notices. `i` opens it; Enter marks the selected message read and `r` replies
 to a request or decision in its originating home. Acknowledgment advances only
 through messages explicitly marked read, so a decision read out of sequence
 cannot clear earlier unseen notices. Read markers waiting on an earlier message
-are session-local. Acknowledged open requests remain visible until answered.
+are session-local and survive refreshes beyond the current inbox page until
+acknowledged. Refreshing a newly reachable page acknowledges only its contiguous
+prefix of explicitly marked messages. Acknowledged open requests remain visible
+until answered.
 Each refresh reads at most 200 unread messages and 200 open requests per home,
 with at most 1,000 displayed items overall. Mark items read to reach later mail;
-no hidden row is acknowledged. Failed homes show an error and retain their last
+no unseen row is acknowledged. Failed homes show an error and retain their last
 mail observation. The UI uses bounded worker queues; commands have 15-second
-deadlines and 1 MiB output limits. Failed sends retain their draft and id for an
-idempotent retry; a deadline means the action's outcome needs checking.
+deadlines and bounded output sized for a full mail page. Failed sends retain
+their draft and id for an idempotent retry; a deadline means the action's outcome
+needs checking.
 
 Select any ship and press `m`: Status summarizes recorded state without a model
 call; Ask sends a request and Message a notice from `captain`. Replies use the
