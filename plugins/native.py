@@ -19,7 +19,7 @@ PROFILES = {
     "cursor": {"binary": "cursor-agent", "resume": "uuid", "effort": []},
     "grok": {"binary": "grok", "resume": "uuid", "effort": None},
     "agy": {"binary": "agy", "resume": "id", "effort": ["low", "medium", "high", "xhigh", "max"]},
-    "muse": {"binary": "muse", "resume": None, "effort": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]},
+    "muse": {"binary": "muse", "resume": "uuid", "effort": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]},
     "devin": {"binary": "devin", "resume": "id", "effort": []},
     "kimi": {"binary": "kimi", "resume": "id", "effort": []},
     "rovo": {"binary": "rovo", "resume": "id", "effort": []},
@@ -85,6 +85,9 @@ def build(harness, request):
         allowed |= {"permission_mode", "sandbox", "trust"}
     if harness == "cursor":
         allowed |= {"sandbox", "trust", "force"}
+    if harness == "muse":
+        allowed |= {"transport", "provider", "trust", "disable_sandbox", "sandbox_network",
+                    "permission_mode", "bare", "msp_permissions", "msp_approval_mode"}
     if not isinstance(options, dict) or set(options) - allowed:
         raise ValueError("unknown native option")
     mode = selector(options, "mode", ["headless", "interactive"]) or "headless"
@@ -93,6 +96,40 @@ def build(harness, request):
     resume = session(option(options, "resume"), profile)
     headless = mode == "headless"
     argv = [profile["binary"]]
+    if harness == "muse":
+        transport = selector(options, "transport", ["native", "msp"]) or "native"
+        if transport == "msp":
+            if not headless or "permission_mode" in options or "bare" in options:
+                raise ValueError("unsupported MSP options")
+            provider = selector(options, "provider", ["echo", "meta", "local"])
+            argv += ["serve"]
+            if provider:
+                argv += ["--provider", provider]
+            if model:
+                argv += ["--model", model]
+            if boolean(options, "trust"):
+                argv += ["--trust-workspace"]
+            if boolean(options, "disable_sandbox"):
+                argv += ["--disable-sandbox"]
+            network = selector(options, "sandbox_network", ["restricted", "enabled", "proxy-only"])
+            if network:
+                argv += ["--sandbox-network", network]
+            roots = [repo]
+            control = request["context"]["control"]
+            home = Path(control["cli_argv"][2]).resolve(strict=True)
+            if not home.is_dir():
+                raise ValueError("MSP operational home missing")
+            for path in [home, *control.get("writable", [])]:
+                path = Path(path).resolve()
+                if path.is_dir() and str(path) not in roots:
+                    roots.append(str(path))
+            payload = {"argv": argv, "cwd": repo, "roots": roots, "prompt": prompt,
+                       "model": model, "provider": provider, "resume": resume, "effort": effort,
+                       "permissions": selector(options, "msp_permissions", ["deny", "allow_once"]) or "deny",
+                       "approval_mode": selector(options, "msp_approval_mode", ["allowAll", "promptUnmatched", "onRequest", "denyUnmatched"])}
+            return repo, [sys.executable, str(Path(__file__).with_name("msp.py")), "--request", json.dumps(payload)]
+        if resume or "msp_permissions" in options or "msp_approval_mode" in options:
+            raise ValueError("MSP transport required for unattended resume")
     if harness in ("rovo", "kimi", "devin"):
         transport = selector(options, "transport", ["native", "acp"]) or ("acp" if harness == "rovo" else "native")
         if transport == "acp":
@@ -252,6 +289,23 @@ def build(harness, request):
     elif harness == "muse":
         if headless:
             argv += ["exec", "--json"]
+        provider = selector(options, "provider", ["echo", "meta"])
+        if provider:
+            argv += ["--provider", provider]
+        permissions = selector(options, "permission_mode", ["untrusted", "on-request", "never"])
+        if permissions:
+            argv += ["--approval-mode", permissions]
+        if boolean(options, "trust"):
+            argv += ["--trust-workspace"]
+        if boolean(options, "disable_sandbox"):
+            argv += ["--disable-sandbox"]
+        network = selector(options, "sandbox_network", ["restricted", "enabled", "proxy-only"])
+        if network:
+            argv += ["--sandbox-network", network]
+        if boolean(options, "bare"):
+            if not headless:
+                raise ValueError("Muse bare options require exec mode")
+            argv += ["--no-foreign-personal-context", "--disable-reminders", "--disable-web-tools"]
         if model:
             argv += ["--model", model]
         if effort:
@@ -291,7 +345,7 @@ def build(harness, request):
 def handle(harness, request):
     repo, argv = build(harness, request)
     return {"valid": True} if request["method"] == "validate" else {
-        "argv": argv if argv[:2] == [sys.executable, str(Path(__file__).with_name("acp.py"))] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), harness, *argv],
+        "argv": argv if len(argv) > 1 and argv[0] == sys.executable and argv[1] in [str(Path(__file__).with_name(name)) for name in ("acp.py", "msp.py")] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), harness, *argv],
         "cwd": repo, "env_names": []}
 
 
@@ -302,6 +356,7 @@ if __name__ == "__main__":
                                 "effort": p["effort"], "live_injection": False,
                                 "structured_headless_output": name != "devin",
                                 "acp_transport": name in ("rovo", "kimi", "devin"),
+                                "msp_transport": name == "muse",
                                 "qualification": "command-plan; native pilots required"}
                           for name, p in PROFILES.items()}, indent=2))
     elif len(sys.argv) == 2 and sys.argv[1] in PROFILES:

@@ -64,7 +64,7 @@ def select_model(client, session, model):
 
 
 class Client:
-    def __init__(self, binary, cwd, timeout, permissions):
+    def __init__(self, binary, cwd, timeout, permissions, *, argv=None):
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
             raise ProtocolError("invalid-deadline")
         self.end = time.monotonic() + timeout
@@ -72,7 +72,7 @@ class Client:
         self.outgoing = queue.Queue(1)
         # Inherit the owning job's process group. The runtime remains the sole
         # deadline/cancellation owner, including any native tool descendants.
-        self.child = subprocess.Popen([binary, "acp"], cwd=cwd, env=native_environment(),
+        self.child = subprocess.Popen(argv if argv is not None else [binary, "acp"], cwd=cwd, env=native_environment(),
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, bufsize=0)
         self.permissions = permissions

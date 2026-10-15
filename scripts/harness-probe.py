@@ -58,6 +58,10 @@ def main():
                 if profile["resume"]:
                     cases.append(("headless", "ses_0123456789abc" if name == "opencode" else "46a81234-1234-4567-8123-123456789abc"))
                 for mode, resume in cases:
+                    if name == "muse" and resume:
+                        passed, reason = check([profile["binary"], "serve", "--help"])
+                        result["cases"].append({"mode": "msp-entry", "resume": False, "passed": passed, "reason": reason})
+                        continue
                     if name == "rovo":
                         if resume or mode != "headless":
                             continue

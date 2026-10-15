@@ -26,7 +26,7 @@ stdin-detached `agent.start` job path.
 | `cursor` | `cursor-agent` | Full chat UUID | Yes |
 | `grok` | `grok` | Full session UUID | Yes |
 | `agy` | `agy` | Native conversation ID | Yes |
-| `muse` | `muse` | Headless resume not qualified | Yes, fresh |
+| `muse` | `muse` | Full session UUID with `transport: msp` | Yes, fresh |
 | `devin` | `devin` | Native session ID | Yes |
 | `kimi` | `kimi` (current Kimi Code 2.x) | Native session ID | Readiness-gated initial delivery still needed |
 | `rovo` | `rovo acp` | Native ACP session ID, requires advertised load support | No |
@@ -96,6 +96,39 @@ changes must be confirmed. Unsupported choices fail before the prompt.
 Usage remains absent when the server does not report it; no token counts are
 estimated. The core remains responsible for cancellation and descendant cleanup.
 
+Muse optionally accepts `transport: msp` for its native MSP v1 stdio host
+(`muse serve`). The native exec interface remains the default. MSP requires
+durable sessions, exact UUID resume, an idle session in the same repository,
+and no pending interaction. A refused resume never creates a replacement.
+The bridge waits for the accepted turn's `turn/completed` with terminal
+`completed`, then confirms a clean host exit. An acceptance reply, foreground
+completion, or a different turn cannot report success. Messages, startup
+events, approval queues and deadlines are bounded; the host shares the owning
+job's process group. The runtime's existing focus routing can bind the reported
+Muse identity without changing its orchestration policy.
+
+MSP options include native `provider` (`echo`, `meta`, `local`), `model`,
+per-turn `effort`, boolean `trust`, boolean `disable_sandbox` and native
+`sandbox_network` (`restricted`, `enabled`, `proxy-only`). Existing repository,
+operational home and shared-ledger directories become explicit workspace
+roots; these roots do not themselves grant project trust. Explicit model,
+provider and approval-mode choices must be confirmed before submitting input.
+`msp_approval_mode` selects a native preconfigured mode (`allowAll`,
+`promptUnmatched`, `onRequest`, `denyUnmatched`) for this session. It is omitted
+by default. Tool requests default to denial; `msp_permissions: allow_once`
+selects only an offered one-time approval and sends its exact requirement
+reference. The presentation receipt never grants permission. Persistent grants,
+stale decisions and unsupported client tool requests do not become fallbacks.
+Only terminal aggregate usage is counted, when present; cumulative snapshots
+remain nested native events.
+
+Muse's native exec/interactive plans accept `provider` (`echo`, `meta`),
+`permission_mode` (`untrusted`, `on-request`, `never`), `trust`,
+`disable_sandbox` and `sandbox_network`. Exec-only `bare: true` disables
+foreign personal context, reminders and web tools for that run. These exec
+controls are not reinterpreted as MSP approval options. No global settings,
+provider endpoints or credentials are changed by either transport.
+
 Inspect supported command options and check installed parsers without inference:
 
 ```sh
@@ -122,7 +155,7 @@ recorded light job under the same task. It checks the job's argv, cwd and result
 this does not exercise admission of a heavy build. The canary creates its own
 ledger before planning sandbox grants, and rejects changed acceptance tests.
 Session-start decoding is currently implemented for Codex, Claude, Pi-family,
-OpenCode, Gemini, Cursor, AGY and the Rovo/Kimi/Devin ACP transport; an unknown
+OpenCode, Gemini, Cursor, AGY, Muse MSP and the Rovo/Kimi/Devin ACP transport; an unknown
 format stays unqualified.
 
 This is progress toward the harness set in
@@ -131,6 +164,12 @@ not full lifecycle parity. The ACP adapter has real pipe/process fixtures for
 session identity, permissions, deadlines, cancellation and the existing
 activation/mail contract. Native Kimi and Devin initialization has been checked;
 live authenticated ACP turns, including Rovo, still require qualification.
+Muse 1.4.4 has passed real native echo creation, exact resume and writer-lease
+refusal without a replacement session, plus protocol
+fixtures for focused activation, mail, role enforcement and descendant
+cancellation. Echo does not prove model/tool autonomy. The authenticated Meta
+repair canary currently fails with HTTP 402 billing verification; live Muse
+repair, task mail, recorded jobs and conversation recall remain unqualified.
 Interactive attachment/injection and per-harness supervision remain separate
 qualification work; command plans and scripted protocol fixtures do not claim
 a harness can already coordinate a ship autonomously. Provider routes remain
