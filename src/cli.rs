@@ -392,13 +392,18 @@ pub(crate) fn setup_unlinked(home: &Path, setup: &Setup) -> Result<(String, Stri
 
 fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, String, bool)> {
     let folder = home.parent().context("ship folder")?.to_path_buf();
-    let ship = match &setup.ship {
-        Some(name) => {
-            identifier(name)?;
-            name.clone()
-        }
+    let existing = fs::read(home.join("config.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
+    let ship = match setup.ship.clone().or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|c| c["ship"].as_str().map(str::to_owned))
+    }) {
+        Some(name) => name,
         None => ship_name(&folder)?,
     };
+    identifier(&ship)?;
     crate::mail::unreserved(&ship)?;
     let plugins = plugins_dir()?;
     let harness = detect_harness(&plugins, setup.harness.as_ref())?;
@@ -417,11 +422,7 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
         shell_token(&store.home().to_string_lossy())
     );
 
-    let liaison = setup.liaison
-        || fs::read(home.join("config.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-            .is_some_and(|c| c["preset"] == "liaison");
+    let liaison = setup.liaison || existing.as_ref().is_some_and(|c| c["preset"] == "liaison");
     let mut config = json!({"ship":ship});
     if liaison {
         config["preset"] = json!("liaison");

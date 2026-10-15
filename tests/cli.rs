@@ -39,6 +39,11 @@ impl Folder {
             .args(args)
             .current_dir(dir)
             .env("PATH", &self.path)
+            .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("PRIVATEER_SERVICE", "none")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH")
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env_remove("PRIVATEER_HOME")
@@ -104,8 +109,8 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
 
 #[test]
 fn init_again_keeps_the_captains_edits() {
-    let folder = Folder::new("infra");
-    folder.ok(&["init", "--scope", "Deploys"]);
+    let folder = Folder::new("desk");
+    folder.ok(&["init", "--ship", "infra", "--scope", "Deploys"]);
     fs::write(folder.ship.join("AGENTS.md"), "# My own instructions\n").unwrap();
     folder.json(
         "charter.put",
@@ -131,6 +136,13 @@ fn init_again_keeps_the_captains_edits() {
     );
     let charter = folder.json("charter.show", json!({"id":"infra"}));
     assert_eq!(charter["objective"], "Edited by the captain");
+    assert_eq!(
+        folder.json("fleet.list", json!({}))["ships"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let settings: Value =
         serde_json::from_slice(&fs::read(folder.ship.join(".claude/settings.json")).unwrap())
             .unwrap();
@@ -258,8 +270,17 @@ fn init_needs_a_harness_or_says_how_to_choose_one() {
 
 #[test]
 fn liaison_preset_is_read_message_delegate_and_keeps_captain_edits() {
-    let folder = Folder::new("contact");
-    folder.ok(&["init", "--liaison", "--harness", "codex"]);
+    let folder = Folder::new("desk");
+    folder.ok(&[
+        "init",
+        "--ship",
+        "contact",
+        "--liaison",
+        "--harness",
+        "codex",
+        "--scope",
+        "Captain contact",
+    ]);
     let charter = folder.json("charter.show", json!({"id":"contact"}));
     assert_eq!(charter["actions"], json!(["inspect", "spawn", "message"]));
     let emitted = fs::read_to_string(folder.ship.join("AGENTS.md")).unwrap();
@@ -277,15 +298,36 @@ fn liaison_preset_is_read_message_delegate_and_keeps_captain_edits() {
         "charter.put",
         json!({"id":"contact","actions":["inspect","message"]}),
     );
-    folder.ok(&["init", "--liaison"]);
-    assert_eq!(
-        folder.json("charter.show", json!({"id":"contact"}))["actions"],
-        json!(["inspect", "message"])
-    );
+    let charter = folder.json("charter.show", json!({"id":"contact"}));
+    let ship = folder.json("ship.show", json!({"name":"contact"}));
+    let task = folder.json("task.show", json!({"id":"contact-duty"}));
+    for _ in 0..2 {
+        folder.ok(&["init"]);
+        assert_eq!(
+            folder.json("charter.show", json!({"id":"contact"})),
+            charter
+        );
+        assert_eq!(folder.json("ship.show", json!({"name":"contact"})), ship);
+        assert_eq!(folder.json("task.show", json!({"id":"contact-duty"})), task);
+        let fleet = folder.json("fleet.list", json!({}));
+        let members = fleet["ships"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["name"], "contact");
+        assert_eq!(members[0]["home"], json!(folder.ship.join(".privateer")));
+        let local = folder.json("ship.list", json!({}));
+        assert_eq!(local["ships"].as_array().unwrap().len(), 1);
+        assert_eq!(local["ships"][0]["name"], "contact");
+        assert!(
+            fs::read_to_string(folder.ship.join("AGENTS.md"))
+                .unwrap()
+                .contains("first mate of the Privateer ship **contact**")
+        );
+    }
     let config: Value =
         serde_json::from_slice(&fs::read(folder.ship.join(".privateer/config.json")).unwrap())
             .unwrap();
     assert_eq!(config["preset"], "liaison");
+    assert_eq!(config["ship"], "contact");
 }
 
 #[test]

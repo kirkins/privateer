@@ -399,6 +399,7 @@ def onboarding(binary, runtime):
                            "Path(os.environ['HOME'],'harness-started').touch()\n"
                            "while not Path(os.environ['HOME'],'release').exists(): time.sleep(.05)\n")
         harness.chmod(0o755)
+        (bins / "privateer").symlink_to(runtime)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("PRIVATEER_") and k not in {"HERDR_ENV", "HERDR_SOCKET_PATH"}}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
@@ -437,23 +438,37 @@ def onboarding(binary, runtime):
             if tui:
                 tui.close()
             server.close()
-        # A person may choose an ordinary ship first. No Herdr means it is
-        # created and the explicit Board limitation is shown, not a hidden launch.
-        plain_root = root / "plain"
-        plain_root.mkdir()
-        plain_env = dict(env, HOME=str(plain_root), XDG_CONFIG_HOME=str(plain_root / "config"), PRIVATEER_FLEET=str(plain_root / "fleet.sqlite"),
-                         PRIVATEER_RESOURCE_HOME=str(plain_root / "ledger"))
-        plain = Tui(binary, plain_env, ["--no-herdr"])
-        try:
-            plain.keys(b"\x15apps\t\t\t\x15ship\r")
-            plain_home = plain_root / "ships/apps/.privateer"
-            plain.until(lambda: (plain_home / "privateer.sqlite").is_file(), "ordinary first ship was not created")
-            plain.until(lambda: "Board needs" in plain.screen(), "missing Herdr was not explained")
-            config = json.loads((plain_home / "config.json").read_text())
-            assert "preset" not in config
-            out = subprocess.run([str(runtime), "--home", str(plain_home), "charter.show", "--json", '{"id":"apps"}'],
-                                 env=plain_env, capture_output=True, check=True)
-            assert "implement" in json.loads(out.stdout)["actions"]
-        finally:
-            plain.close()
-        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness/automatic Board, ordinary first ship opt-out; no model calls.")
+        for role, args in [("liaison", []), ("ship", ["--no-herdr"])]:
+            plain_root = root / f"offline {role}'s $(touch escaped)"
+            plain_root.mkdir()
+            plain_env = dict(env, HOME=str(plain_root), XDG_CONFIG_HOME=str(plain_root / "config"), PRIVATEER_FLEET=str(plain_root / "fleet.sqlite"),
+                             PRIVATEER_RESOURCE_HOME=str(plain_root / "ledger"))
+            plain = Tui(binary, plain_env, args)
+            try:
+                plain.keys(b"\x15apps\t\t\t\x15" + role.encode() + b"\r")
+                plain_home = plain_root / "ships/apps/.privateer"
+                plain.until(lambda: (plain_home / "privateer.sqlite").is_file(), f"{role} first ship was not created")
+                command = "privateer --home " + shlex.quote(str(plain_home)) + " start"
+                def details():
+                    return " ".join(" ".join(line.split("│")[-2] for line in plain.screen().splitlines()
+                                             if line.count("│") >= 2).split())
+                plain.until(lambda: "Created apps. No Herdr connection configured; run: " + command
+                            in details(), "creation success and direct start command were not shown")
+                plain.drain(2.2)
+                screen = details()
+                displayed = screen.split("run: ", 1)[1].split(" start", 1)[0] + " start"
+                assert shlex.split(displayed) == ["privateer", "--home", str(plain_home), "start"]
+                assert not (plain_root / "harness-started").exists(), "no-socket creation launched a session"
+                config = json.loads((plain_home / "config.json").read_text())
+                assert (config.get("preset") == "liaison") == (role == "liaison")
+                out = subprocess.run([str(runtime), "--home", str(plain_home), "charter.show", "--json", '{"id":"apps"}'],
+                                     env=plain_env, capture_output=True, check=True, timeout=10)
+                assert ("implement" in json.loads(out.stdout)["actions"]) == (role == "ship")
+                (plain_root / "release").touch()
+                subprocess.run(["sh", "-c", displayed], cwd=plain_root, env=plain_env,
+                               capture_output=True, check=True, timeout=10)
+                assert (plain_root / "harness-started").exists()
+                assert not (plain_root / "escaped").exists()
+            finally:
+                plain.close()
+        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness/automatic Board, both offline roles with executable quoted start guidance; no model calls.")

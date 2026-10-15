@@ -493,8 +493,22 @@ fn run(opts: Options) -> Result<()> {
                 .cloned()
             {
                 app.pending_board = None;
-                app.select_ship(Some(ship));
-                app.board_requested = true;
+                app.select_ship(Some(ship.clone()));
+                if herdr.is_some() {
+                    app.board_requested = true;
+                } else if let Some(home) = app
+                    .snapshot
+                    .ships
+                    .iter()
+                    .find(|s| s.id == ship)
+                    .and_then(|s| s.live.as_ref())
+                    .map(|l| &l.home)
+                {
+                    app.notice = format!(
+                        "Created {ship}. No Herdr connection configured; run: privateer --home '{}' start",
+                        home.to_string_lossy().replace('\'', "'\"'\"'")
+                    );
+                }
             }
             if app.board_requested {
                 app.board_requested = false;

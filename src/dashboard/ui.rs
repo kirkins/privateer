@@ -950,6 +950,10 @@ impl App {
             body = parts[1];
         }
         let mut lines = self.details();
+        if !self.notice.is_empty() {
+            lines.insert(0, Line::from(clean(&self.notice, 8192)));
+            lines.insert(1, Line::from(""));
+        }
         if self.snapshot.truncated {
             lines.push(Line::styled(
                 "Bounded snapshot; older records remain in the runtime.",
