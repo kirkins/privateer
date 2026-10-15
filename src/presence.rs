@@ -24,6 +24,16 @@ pub fn init(store: &Store) -> Result<()> {
            harness TEXT, started_ms INTEGER NOT NULL, expires_ms INTEGER NOT NULL,
            presented_through INTEGER NOT NULL DEFAULT 0);",
     )?;
+    let tx = store.write_transaction()?;
+    let has_binding: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('presence') WHERE name='binding')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_binding {
+        tx.execute_batch("ALTER TABLE presence ADD COLUMN binding TEXT;")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -56,14 +66,20 @@ pub fn attend(
         (1..=MAX_TTL_SECS).contains(&ttl_secs),
         "ttl_secs must be 1..{MAX_TTL_SECS}"
     );
+    let binding = crate::herdr::Binding::capture()
+        .ok()
+        .flatten()
+        .map(|b| serde_json::to_string(&b))
+        .transpose()?;
     let now = Store::now_ms();
     store.connection().execute(
-        "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms) VALUES(?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms, binding) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(ship) DO UPDATE SET
            started_ms = CASE WHEN holder = excluded.holder THEN started_ms ELSE excluded.started_ms END,
            holder = excluded.holder, harness = COALESCE(excluded.harness, harness),
-           expires_ms = excluded.expires_ms",
-        params![ship, holder, harness, now, now + ttl_secs as i64 * 1000],
+           expires_ms = excluded.expires_ms,
+           binding = CASE WHEN holder=excluded.holder THEN binding ELSE excluded.binding END",
+        params![ship, holder, harness, now, now + ttl_secs as i64 * 1000,binding],
     )?;
     presence(store, ship)
 }
@@ -103,11 +119,11 @@ fn presence(store: &Store, ship: &str) -> Result<Value> {
     let lease = store
         .connection()
         .query_row(
-            "SELECT holder, harness, started_ms, expires_ms FROM presence WHERE ship=?1",
+            "SELECT holder, harness, started_ms, expires_ms, binding FROM presence WHERE ship=?1",
             [ship],
             |r| {
                 Ok(json!({"holder": r.get::<_, String>(0)?, "harness": r.get::<_, Option<String>>(1)?,
-                    "started_ms": r.get::<_, i64>(2)?, "expires_ms": r.get::<_, i64>(3)?}))
+                    "started_ms": r.get::<_, i64>(2)?, "expires_ms": r.get::<_, i64>(3)?, "binding":r.get::<_,Option<String>>(4)?.and_then(|s|serde_json::from_str::<Value>(&s).ok())}))
             },
         )
         .optional()?;

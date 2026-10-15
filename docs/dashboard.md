@@ -101,6 +101,40 @@ There is no inferred binding based on similar labels or matching owners. A
 Herdr `done` state does not mark a task done or prove a passing PR. Stored job
 statuses may be stale because this UI deliberately does not reconcile processes.
 
+## Boarding and management
+
+Select a ship and press `b` (or click Board). A live exact binding focuses its
+Herdr terminal. Otherwise Board creates a tab in the ship folder and launches
+`privateer start` using the installed protocol 20 `tab.create` and
+`pane.send_input` contracts. Shell tokens are quoted; captain text is never
+shell input. Only the pane returned by creation is eligible for this launch,
+after a fresh identity/protocol check. Repeat launches in that pane are blocked
+while it exists, and a live presence lease blocks a competing attended session.
+An unbound attended session must be reached directly or its binding refreshed;
+the dashboard does not open a second first mate.
+
+`privateer start` and attended hooks record their verified inherited Herdr pane
+in the presence lease. The lease pins the socket incarnation and terminal and
+location ids, plus a native session identity when available; a new lease holder
+captures its own binding. Missing/invalid Herdr context leaves attendance usable
+without a binding. No label matching or guessed socket is used. Dashboard
+observations also support homes made before the binding column was introduced,
+without migrating them. Board needs an explicit/inherited Herdr socket; a
+regular terminal still shows state and supports mail and management.
+
+`n` opens New ship (name, scope, optional sibling folder, harness). `x` opens
+Retire: type the exact selected ship name to confirm; its folder is kept.
+Retirement refuses if the fleet name now belongs to a different home. `d` opens
+Dispatcher: status, start or stop. The forms call `ship.create`, `ship.retire`
+and `privateer service` through argv, in a worker; errors retain the form and
+commands never write SQLite directly. Retirement uses the runtime's existing
+behavior: it revokes/unlinks and stops the dispatcher, without taking ownership
+of an attended agent process.
+
+The [attended injection proposal](design/herdr-inject.md) explains the lease,
+presentation cursor and headless-wake rules. Injection remains disabled because
+the installed prompt contract has no atomic expected-occupant guard.
+
 ## Ships, ownership and terminal bindings
 
 Ships are equal peer identities, not ranks. `Navigator` is a familiar point of
@@ -130,8 +164,8 @@ homes. Conflicting presentation configuration produces a visible source error
 and disables terminal bindings and liaison shortcuts until corrected; recorded
 work, originating homes and custody history remain visible.
 
-A terminal belongs to a ship only through an exact `pane_id` + `terminal_id`
-binding in this registry. The first binding is its primary terminal. Similar
+A terminal belongs to a ship through its live verified presence binding, or an
+exact `pane_id` + `terminal_id` binding in this presentation registry. The live presence binding is primary, otherwise the first configured binding is primary. Similar
 labels, process kinds and task titles never establish ownership. Stale bindings
 show no connected terminal until the configuration is updated. The existing
 focus action still revalidates the actual server and observed agent/session.
@@ -215,10 +249,10 @@ function. No animation timer or motion controls run in the dashboard.
 - Socket JSON responses have correlation checks, a 1 MiB cap and an 800 ms
   response deadline. At most 1,000 panes are accepted. Repeated failures replace
   the source error in the UI instead of appending transcript notifications.
-- Nothing in the dashboard owns, cancels, restarts or recovers agent processes.
-  Closing the dashboard never sends worker shutdown signals. Interactive
-  launch/admission/recovery must be added through an explicit backend lifecycle
-  contract before it can replace headless job ownership.
+- The dashboard opens an attended session through `privateer start`; that
+  runtime holds its presence and waits for its harness. It does not own, cancel,
+  restart or recover agents.
+  Closing the dashboard never sends worker shutdown signals. Boarding does not replace headless job ownership or admission.
 - Only the explicitly selected/inherited Herdr socket is inspected. Provider
   routes and machine topology remain private configuration. Read-only viewing
   does not narrow the OS account's other credentials.
@@ -247,12 +281,15 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 cargo check --locked --no-default-features --bin privateer
 python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
+python3 scripts/pilot.py --binary target/debug/privateer
 ```
 
 Dashboard tests use isolated databases, temporary Unix sockets and Ratatui's
 in-memory terminal backend. They cover non-mutating observation, bounded views,
 terminal replacement, socket replacement, malformed replies, timeouts, demo
 isolation, ship scoping, custody transfers, idle ship registration, mouse input,
-resize and the reserved boat module. They do not connect to a live fleet or
-prove model-driven execution. Use a real isolated Herdr session to qualify
+resize and the reserved boat module. The PTY smoke also drives real isolated runtime binaries for mail, boarding,
+presence binding, repeated focus and management against a simulated Herdr socket
+and a fake harness. It does not contact a real Herdr session or provider and
+does not prove model-driven execution. Use a real isolated Herdr session to qualify
 interactive navigation on the installed server version before fleet adoption.

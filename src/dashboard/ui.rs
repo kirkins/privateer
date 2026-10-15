@@ -40,6 +40,8 @@ pub struct App {
     pub action: Option<super::mailbox::Action>,
     pub mail_pending: bool,
     pub composer: Option<Composer>,
+    pub form: Option<super::forms::Form>,
+    pub board_requested: bool,
     pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
     pub herdr: Option<herdr::View>,
@@ -116,7 +118,57 @@ impl App {
             .get(self.selected)
             .map(|&i| &self.snapshot.tasks[i])
     }
+    fn claims_pane(ship: &super::model::Ship, view: &herdr::View, pane: &herdr::Pane) -> bool {
+        ship.terminals.iter().any(|b| b.pane_id == pane.pane_id)
+            || ship
+                .live
+                .as_ref()
+                .and_then(|l| l.binding.as_ref())
+                .is_some_and(|b| b.matches(view, pane))
+    }
+    fn binds(ship: &super::model::Ship, view: &herdr::View, pane: &herdr::Pane) -> bool {
+        if let Some(binding) = ship
+            .live
+            .as_ref()
+            .and_then(|live| live.binding.as_ref())
+            .filter(|binding| {
+                binding.pane.pane_id == pane.pane_id || binding.pane.terminal_id == pane.terminal_id
+            })
+        {
+            return binding.matches(view, pane);
+        }
+        ship.terminals.iter().any(|binding| {
+            binding.pane_id == pane.pane_id && binding.terminal_id == pane.terminal_id
+        })
+    }
+    pub fn binding_ambiguous(&self) -> bool {
+        if self.snapshot.presentation_error.is_some() {
+            return true;
+        }
+        let Some(view) = &self.herdr else {
+            return false;
+        };
+        let Some(ship) = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == self.ship.as_ref())
+        else {
+            return false;
+        };
+        view.panes.iter().any(|p| {
+            Self::claims_pane(ship, view, p)
+                && self
+                    .snapshot
+                    .ships
+                    .iter()
+                    .any(|other| other.id != ship.id && Self::claims_pane(other, view, p))
+        })
+    }
     pub fn scoped_panes(&self) -> Vec<&herdr::Pane> {
+        if self.snapshot.presentation_error.is_some() {
+            return Vec::new();
+        }
         let Some(ship) = self
             .snapshot
             .ships
@@ -129,15 +181,34 @@ impl App {
             return Vec::new();
         };
         // Registry order makes the first binding the ship's primary terminal.
-        ship.terminals
-            .iter()
-            .filter_map(|b| {
-                view.panes
+        let automatic = ship
+            .live
+            .as_ref()
+            .and_then(|l| l.binding.as_ref())
+            .and_then(|b| view.panes.iter().find(|p| b.matches(view, p)));
+        automatic
+            .into_iter()
+            .chain(
+                ship.terminals
                     .iter()
-                    .find(|p| p.pane_id == b.pane_id && p.terminal_id == b.terminal_id)
+                    .filter_map(|b| {
+                        view.panes
+                            .iter()
+                            .find(|p| p.pane_id == b.pane_id && p.terminal_id == b.terminal_id)
+                    })
+                    .filter(|p| automatic.is_none_or(|a| a.pane_id != p.pane_id)),
+            )
+            .filter(|p| {
+                Self::binds(ship, view, p)
+                    && !self
+                        .snapshot
+                        .ships
+                        .iter()
+                        .any(|other| other.id != ship.id && Self::claims_pane(other, view, p))
             })
             .collect()
     }
+
     pub fn selected_pane(&self) -> Option<&herdr::Pane> {
         if !matches!(self.tab, 0 | 2) {
             return None;
@@ -263,6 +334,10 @@ impl App {
                         'i' => self.open_inbox(),
                         'l' => self.open_liaison(),
                         'm' => self.compose(),
+                        'b' => self.board_requested = true,
+                        'n' => self.manage(super::forms::Kind::New),
+                        'x' => self.manage(super::forms::Kind::Retire),
+                        'd' => self.manage(super::forms::Kind::Dispatcher),
                         _ => {}
                     }
                 } else if self.mouse.ships.contains(point) {
@@ -453,16 +528,23 @@ impl App {
                     "{owned} owned assignments · {incoming} incoming handoffs"
                 )));
                 lines.push(Line::from(""));
+                if self.binding_ambiguous() {
+                    lines.push(Line::styled(
+                        "Ambiguous pane ownership; Board/focus disabled. Inspect exact bindings.",
+                        Style::default().fg(Color::Red),
+                    ));
+                }
                 lines.push(Line::from(if self.scoped_panes().is_empty() {
-                    "Primary terminal is not connected. Configure an exact ship binding."
+                    "b: Board this ship in Herdr."
                 } else {
                     "Open the primary terminal with f, or choose Terminals to inspect its crew."
                 }));
-                if self.demo {
-                    lines.push(Line::from(
-                        "Conversation and agent launch are not connected in this preview.",
-                    ));
-                }
+                lines.push(Line::from(if self.demo {
+                    "Conversation and agent launch are not connected in this preview."
+                } else {
+                    "b: Board or focus the first mate · f: focus a selected terminal"
+                }));
+
                 lines.push(Line::styled(
                     if self.demo {
                         "m: Try Status / Ask / Message · local demo only"
@@ -698,9 +780,34 @@ impl App {
         self.mouse.ship_offset = state.offset();
         let mut body = cols[1];
         let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
-        let mut actions = vec![("[i Inbox]", 'i'), ("[l Talk to liaison]", 'l')];
+        let mut actions = vec![
+            ("[i Inbox]", 'i'),
+            (
+                if self.demo {
+                    "[l Talk to liaison]"
+                } else {
+                    "[l Liaison]"
+                },
+                'l',
+            ),
+        ];
+        if !self.demo {
+            actions.push(("[n New ship]", 'n'));
+        }
         if self.ship.is_some() {
-            actions.push(("[m Message ship]", 'm'));
+            actions.push(("[b Board]", 'b'));
+            actions.push((
+                if self.demo {
+                    "[m Message ship]"
+                } else {
+                    "[m Message]"
+                },
+                'm',
+            ));
+            if !self.demo {
+                actions.push(("[x Retire]", 'x'));
+                actions.push(("[d Dispatcher]", 'd'));
+            }
         }
         let mut x = sections[0].x;
         let mut spans = Vec::new();
@@ -887,6 +994,7 @@ impl App {
         });
         frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.snapshot.presentation_error.is_some()||self.home_error.is_some()||self.herdr_error.is_some()||!self.mail_errors.is_empty(){Color::Red}else{Color::Gray}))]),rows[2]);
         self.draw_composer(frame);
+        self.draw_form(frame);
     }
 }
 fn age(value: Option<u64>) -> String {

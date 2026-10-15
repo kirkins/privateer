@@ -13,6 +13,7 @@ use std::{
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ShipState {
     pub home: PathBuf,
+    pub binding: Option<crate::herdr::Binding>,
     pub harness: String,
     pub attended: bool,
     pub dispatcher: bool,
@@ -59,6 +60,23 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
         params![name, crate::store::Store::now_ms()],
         |r| r.get(0),
     )?;
+    let has_binding: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('presence') WHERE name='binding')",
+        [],
+        |r| r.get(0),
+    )?;
+    let binding = if has_binding {
+        conn.query_row(
+            "SELECT binding FROM presence WHERE ship=?1 AND expires_ms>?2",
+            params![name, crate::store::Store::now_ms()],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
     let requests = conn.query_row(
         "SELECT count(*) FROM mail WHERE (sender=?1 OR recipient=?1) AND state='open'",
         [name],
@@ -69,6 +87,7 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
     Ok(ShipState {
         home: home.into(),
         harness,
+        binding,
         attended,
         dispatcher: crate::service::running(home)?,
         requests,

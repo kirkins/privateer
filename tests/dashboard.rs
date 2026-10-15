@@ -796,3 +796,74 @@ fn ship_registry_keeps_idle_peers_and_rejects_ambiguous_terminal_ownership() {
     fs::write(&path, "x".repeat(65537)).unwrap();
     assert!(Snapshot::read(store.home()).is_err());
 }
+
+#[test]
+fn boarding_never_sends_launch_input_after_the_new_pane_changes() {
+    let (root, store) = fixture();
+    let socket = root.path().join("launch.sock");
+    let shell = json!({"pane_id":"w1:p9","terminal_id":"new-terminal","workspace_id":"w1","tab_id":"w1:t9","agent":null,"agent_status":"unknown"});
+    let empty = json!({"snapshot":{"version":"test","protocol":20,"panes":[]}});
+    let mut changed = shell.clone();
+    changed["terminal_id"] = json!("replaced-terminal");
+    let worker = server(
+        &socket,
+        vec![
+            empty.clone(),
+            empty,
+            json!({"root_pane":shell}),
+            json!({"snapshot":{"version":"test","protocol":20,"panes":[changed]}}),
+        ],
+    );
+    let mut client = Client::connect(&socket).unwrap();
+    let observed = client.snapshot().unwrap();
+    assert!(
+        client
+            .board(
+                &observed,
+                store.home().parent().unwrap(),
+                "apps",
+                Path::new(env!("CARGO_BIN_EXE_privateer")),
+                store.home()
+            )
+            .is_err()
+    );
+    let requests = worker.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "session.snapshot",
+            "session.snapshot",
+            "tab.create",
+            "session.snapshot"
+        ]
+    );
+}
+
+#[test]
+fn automatic_bindings_require_socket_terminal_location_and_pinned_session() {
+    use privateer::herdr::{Binding, View};
+    let view = View::demo();
+    let pane = view.panes[0].clone();
+    let mut binding = Binding {
+        socket: "/isolated/socket".into(),
+        socket_identity: view.socket_identity,
+        pane: pane.clone(),
+    };
+    assert!(binding.matches(&view, &pane));
+    let mut changed = pane.clone();
+    changed.terminal_id = "replacement".into();
+    assert!(!binding.matches(&view, &changed));
+    changed = pane.clone();
+    changed.tab_id = "different-tab".into();
+    assert!(!binding.matches(&view, &changed));
+    let mut other = view.clone();
+    other.socket_identity = (9, 9);
+    assert!(!binding.matches(&other, &pane));
+    binding.pane.agent_session = Some(json!({"value":"original"}));
+    changed = pane;
+    changed.agent_session = Some(json!({"value":"replacement"}));
+    assert!(!binding.matches(&view, &changed));
+}

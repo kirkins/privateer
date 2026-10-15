@@ -1,5 +1,5 @@
 //! Explicit socket only: never discovers a focused session, creates a server,
-//! starts a harness, sends keystrokes, or kills processes.
+//! or kills processes. Launch input is restricted to a freshly created pane.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +62,60 @@ impl View {
             .collect(),
             ..Self::default()
         }
+    }
+}
+
+/// A navigation binding recorded by a live presence holder. The socket
+/// incarnation and terminal identity are part of the binding, never a label.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Binding {
+    pub socket: PathBuf,
+    pub socket_identity: (u64, u64),
+    pub pane: Pane,
+}
+impl Binding {
+    pub fn capture() -> Result<Option<Self>> {
+        if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
+            return Ok(None);
+        }
+        let Some(socket) = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from) else {
+            return Ok(None);
+        };
+        let Some(id) = std::env::var("HERDR_PANE_ID").ok() else {
+            return Ok(None);
+        };
+        let mut client = Client::connect(&socket)?;
+        let view = client.snapshot()?;
+        let pane = view
+            .panes
+            .into_iter()
+            .find(|p| p.pane_id == id)
+            .context("caller pane missing from Herdr snapshot")?;
+        for (key, observed) in [
+            ("HERDR_WORKSPACE_ID", &pane.workspace_id),
+            ("HERDR_TAB_ID", &pane.tab_id),
+        ] {
+            if let Ok(inherited) = std::env::var(key) {
+                ensure!(&inherited == observed, "Herdr caller context changed");
+            }
+        }
+        Ok(Some(Self {
+            socket,
+            socket_identity: view.socket_identity,
+            pane,
+        }))
+    }
+    pub fn matches(&self, view: &View, pane: &Pane) -> bool {
+        self.socket_identity == view.socket_identity
+            && self.pane.pane_id == pane.pane_id
+            && self.pane.terminal_id == pane.terminal_id
+            && self.pane.workspace_id == pane.workspace_id
+            && self.pane.tab_id == pane.tab_id
+            && self
+                .pane
+                .agent_session
+                .as_ref()
+                .is_none_or(|s| pane.agent_session.as_ref() == Some(s))
     }
 }
 
@@ -183,6 +237,77 @@ impl Client {
             panes,
             socket_identity: self.identity,
         })
+    }
+
+    /// Create and launch only in the returned new shell pane. Every path is
+    /// quoted as a POSIX shell token because pane.send_input runs shell text.
+    pub fn board(
+        &mut self,
+        observed: &View,
+        folder: &Path,
+        name: &str,
+        binary: &Path,
+        home: &Path,
+    ) -> Result<Pane> {
+        ensure!(
+            observed.socket_identity == self.identity,
+            "Herdr server socket changed; refresh"
+        );
+        ensure!(
+            folder.is_dir() && home.join("privateer.sqlite").is_file(),
+            "ship folder is missing"
+        );
+        let metadata = std::fs::metadata(&self.path)?;
+        ensure!(
+            (metadata.dev(), metadata.ino()) == self.identity,
+            "Herdr socket changed before tab creation"
+        );
+        self.snapshot()?; // protocol gate before the first mutation
+        let mut env = serde_json::Map::new();
+        for key in [
+            "PRIVATEER_FLEET",
+            "PRIVATEER_SERVICE",
+            "PRIVATEER_RESOURCE_HOME",
+            "PRIVATEER_PLUGINS",
+            "PRIVATEER_ROLE",
+            "PRIVATEER_ACTOR",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                env.insert(key.into(), json!(value));
+            }
+        }
+        env.insert("PRIVATEER_HOME".into(), json!(home));
+        let made = self.request(
+            "tab.create",
+            json!({"cwd":folder,"label":name,"focus":true,"env":env}),
+        )?;
+        let pane: Pane = serde_json::from_value(made["root_pane"].clone())
+            .context("tab create did not return an exact root pane")?;
+        ensure!(
+            !pane.pane_id.is_empty() && !pane.terminal_id.is_empty(),
+            "incomplete new pane identity"
+        );
+        let fresh = self.snapshot()?;
+        ensure!(
+            fresh.panes.iter().any(|p| p == &pane && p.agent.is_none()),
+            "new shell pane changed before launch; no command sent"
+        );
+        let metadata = std::fs::metadata(&self.path)?;
+        ensure!(
+            (metadata.dev(), metadata.ino()) == self.identity,
+            "Herdr socket changed before launch"
+        );
+        fn quote(path: &Path) -> Result<String> {
+            let path = path.to_str().context("launch path must be UTF-8")?;
+            ensure!(!path.chars().any(char::is_control), "invalid launch path");
+            Ok(format!("'{}'", path.replace('\'', "'\"'\"'")))
+        }
+        let text = format!("exec {} --home {} start", quote(binary)?, quote(home)?);
+        self.request(
+            "pane.send_input",
+            json!({"pane_id":pane.pane_id,"text":text,"keys":["enter"]}),
+        )?;
+        Ok(pane)
     }
 
     /// Navigation only. A second snapshot and socket incarnation check reject a
