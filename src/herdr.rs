@@ -264,27 +264,28 @@ impl Client {
         self.launch(observed, folder, name, binary, home, &["start"])
     }
 
-    /// Open a background space for a ship's hosted first mate and run
-    /// `privateer start --hosted` there under the dispatcher's lease `holder`.
-    pub fn host(
+    /// Open a background space running `privateer --home HOME COMMAND...`:
+    /// a hosted first mate or a crew member's supervisor.
+    pub fn space(
         &mut self,
         folder: &Path,
-        name: &str,
+        label: &str,
         binary: &Path,
         home: &Path,
-        holder: &str,
+        env: &[(&str, &str)],
+        command: &[&str],
     ) -> Result<Pane> {
         let observed = self.snapshot()?;
         self.spawn(
             &observed,
             "workspace.create",
             folder,
-            name,
+            label,
             false,
-            &[("PRIVATEER_HOSTED_HOLDER", holder)],
+            env,
             binary,
             home,
-            &["start", "--hosted"],
+            command,
         )
     }
 
@@ -442,6 +443,71 @@ impl Client {
         self.request(
             "pane.report_metadata",
             json!({"pane_id":pane,"source":"privateer","agent":agent,"display_agent":display,"title":format!("{display} first mate")}),
+        )?;
+        Ok(())
+    }
+
+    /// Mark a space as Privateer's: `role` is `bridge`, `mate` or `crew`,
+    /// and `ship` the ship it belongs to.
+    pub fn tag(&mut self, workspace: &str, role: &str, ship: &str) -> Result<()> {
+        self.request(
+            "workspace.report_metadata",
+            json!({"workspace_id":workspace,"source":"privateer",
+                "tokens":{"privateer":role,"ship":ship}}),
+        )?;
+        Ok(())
+    }
+
+    /// Keep Privateer's spaces together at the top of the sidebar: the bridge
+    /// first, then each ship's first mate followed by its crew. Ships keep
+    /// their current order; other spaces are left alone below.
+    pub fn arrange(&mut self) -> Result<()> {
+        let listed = self.request("workspace.list", json!({}))?;
+        let spaces: Vec<(String, String, String)> = listed["workspaces"]
+            .as_array()
+            .context("workspace list missing")?
+            .iter()
+            .filter_map(|w| {
+                Some((
+                    w["workspace_id"].as_str()?.to_owned(),
+                    w["tokens"]["privateer"].as_str().unwrap_or("").to_owned(),
+                    w["tokens"]["ship"].as_str().unwrap_or("").to_owned(),
+                ))
+            })
+            .collect();
+        let mut ships: Vec<&str> = vec![];
+        for (_, role, ship) in &spaces {
+            if matches!(role.as_str(), "mate" | "crew") && !ships.contains(&ship.as_str()) {
+                ships.push(ship);
+            }
+        }
+        let of = |role: &str, ship: Option<&str>| -> Vec<String> {
+            spaces
+                .iter()
+                .filter(|(_, r, s)| r == role && ship.is_none_or(|ship| s == ship))
+                .map(|(id, _, _)| id.clone())
+                .collect()
+        };
+        let mut wanted: Vec<String> = of("bridge", None);
+        for ship in &ships {
+            wanted.extend(of("mate", Some(ship)));
+            wanted.extend(of("crew", Some(ship)));
+        }
+        let current: Vec<&String> = spaces
+            .iter()
+            .map(|(id, _, _)| id)
+            .take(wanted.len())
+            .collect();
+        if wanted.is_empty() || current.iter().copied().eq(wanted.iter()) {
+            return Ok(());
+        }
+        let before = spaces
+            .iter()
+            .map(|(id, _, _)| id)
+            .find(|id| !wanted.contains(id));
+        self.request(
+            "workspace.move_block",
+            json!({"workspace_ids":wanted,"before_workspace_id":before}),
         )?;
         Ok(())
     }

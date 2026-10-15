@@ -32,7 +32,8 @@ struct Place {
 
 impl Place {
     /// The Pi ship "infra" with `first_mate.host = "herdr"`. Its `pi` records
-    /// how it was started and stays up until `release` exists.
+    /// how it was started; a first mate stays up until `release` exists, and
+    /// a hosted crew member ends at once.
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -43,7 +44,8 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
+                "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
                  printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
                  while [ ! -e '{root}/release' ]; do sleep 0.05; done\n",
                 root = root.display()
@@ -92,6 +94,21 @@ impl Place {
         );
         String::from_utf8(output.stdout).unwrap()
     }
+    /// A command as the ship's agent, as its first mate runs them.
+    fn agent(&self, command: &str, args: Value) -> Value {
+        let output = self
+            .command(&[command, "--json", &args.to_string()])
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "infra")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
     fn json(&self, command: &str, args: Value) -> Value {
         serde_json::from_str(&self.ok(&[command, "--json", &args.to_string()])).unwrap()
     }
@@ -108,10 +125,12 @@ impl Place {
     }
 }
 
-/// A Herdr that answers one request per connection and runs the text sent to
-/// the space it creates, with that pane's Herdr environment.
+/// A Herdr that answers one request per connection, keeps its spaces in
+/// sidebar order (starting with one of the captain's own), and runs the text
+/// sent to a space it created with that pane's Herdr environment.
 struct Herdr {
     requests: Arc<Mutex<Vec<Value>>>,
+    spaces: Arc<Mutex<Vec<(String, Value)>>>,
 }
 
 impl Herdr {
@@ -119,12 +138,16 @@ impl Herdr {
     fn start(socket: &Path, base: Vec<(String, String)>) -> Self {
         let listener = UnixListener::bind(socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let seen = requests.clone();
+        let spaces = Arc::new(Mutex::new(vec![("w1".to_owned(), json!({}))]));
+        let (seen, order) = (requests.clone(), spaces.clone());
         let socket = socket.to_owned();
         std::thread::spawn(move || {
-            let pane = json!({"pane_id":"w9:p1","terminal_id":"t9","workspace_id":"w9",
-                "tab_id":"w9:t1","agent":null,"agent_status":"unknown"});
-            let mut created: Option<Value> = None;
+            let pane = |n: usize| {
+                json!({"pane_id":format!("w{n}:p1"),"terminal_id":format!("t{n}"),
+                    "workspace_id":format!("w{n}"),"tab_id":format!("w{n}:t1"),
+                    "agent":null,"agent_status":"unknown"})
+            };
+            let mut created: Vec<Value> = vec![];
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let mut line = String::new();
@@ -137,34 +160,69 @@ impl Herdr {
                 let Ok(request) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                let params = &request["params"];
                 let result = match request["method"].as_str().unwrap_or("") {
                     "session.snapshot" => {
-                        let panes = if created.is_some() {
-                            vec![pane.clone()]
-                        } else {
-                            vec![]
-                        };
+                        let panes: Vec<Value> = (0..created.len()).map(|i| pane(i + 2)).collect();
                         json!({"snapshot":{"version":"test","protocol":20,"panes":panes}})
                     }
                     "workspace.create" => {
-                        created = Some(request["params"]["env"].clone());
-                        json!({"type":"workspace_created","root_pane":pane})
+                        created.push(params["env"].clone());
+                        let n = created.len() + 1;
+                        order.lock().unwrap().push((format!("w{n}"), json!({})));
+                        json!({"type":"workspace_created","root_pane":pane(n)})
+                    }
+                    "workspace.report_metadata" => {
+                        let mut order = order.lock().unwrap();
+                        if let Some(space) = order
+                            .iter_mut()
+                            .find(|(id, _)| *id == params["workspace_id"])
+                        {
+                            space.1 = params["tokens"].clone();
+                        }
+                        json!({"type":"ok"})
+                    }
+                    "workspace.list" => {
+                        let order = order.lock().unwrap();
+                        let spaces: Vec<Value> = order
+                            .iter()
+                            .map(|(id, tokens)| json!({"workspace_id":id,"tokens":tokens}))
+                            .collect();
+                        json!({"type":"workspace_list","workspaces":spaces})
+                    }
+                    "workspace.move_block" => {
+                        let mut order = order.lock().unwrap();
+                        let moved: Vec<String> =
+                            serde_json::from_value(params["workspace_ids"].clone()).unwrap();
+                        let block: Vec<(String, Value)> = moved
+                            .iter()
+                            .map(|id| order.iter().find(|(w, _)| w == id).unwrap().clone())
+                            .collect();
+                        order.retain(|(id, _)| !moved.contains(id));
+                        let at = params["before_workspace_id"]
+                            .as_str()
+                            .and_then(|before| order.iter().position(|(id, _)| id == before))
+                            .unwrap_or(order.len());
+                        order.splice(at..at, block);
+                        json!({"type":"ok"})
                     }
                     "pane.send_input" => {
+                        let id = params["pane_id"].as_str().unwrap();
+                        let n: usize = id[1..id.find(':').unwrap()].parse().unwrap();
                         let mut shell = Command::new("sh");
                         shell
-                            .args(["-c", request["params"]["text"].as_str().unwrap()])
+                            .args(["-c", params["text"].as_str().unwrap()])
                             .env_clear()
                             .envs(base.iter().cloned())
                             .env("HERDR_ENV", "1")
                             .env("HERDR_SOCKET_PATH", &socket)
-                            .env("HERDR_PANE_ID", "w9:p1")
-                            .env("HERDR_WORKSPACE_ID", "w9")
-                            .env("HERDR_TAB_ID", "w9:t1")
+                            .env("HERDR_PANE_ID", id)
+                            .env("HERDR_WORKSPACE_ID", format!("w{n}"))
+                            .env("HERDR_TAB_ID", format!("w{n}:t1"))
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .stderr(Stdio::null());
-                        for (key, value) in created.as_ref().unwrap().as_object().unwrap() {
+                        for (key, value) in created[n - 2].as_object().unwrap() {
                             shell.env(key, value.as_str().unwrap());
                         }
                         let mut child = shell.spawn().unwrap();
@@ -177,7 +235,7 @@ impl Herdr {
                 seen.lock().unwrap().push(request);
             }
         });
-        Self { requests }
+        Self { requests, spaces }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
         self.requests
@@ -186,6 +244,15 @@ impl Herdr {
             .iter()
             .filter(|r| r["method"] == method)
             .cloned()
+            .collect()
+    }
+    /// The sidebar, top to bottom.
+    fn order(&self) -> Vec<String> {
+        self.spaces
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
             .collect()
     }
 }
@@ -213,7 +280,7 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
 
     // Mail launches the first mate in a background space, not a headless wake.
     let report = place.tick();
-    assert_eq!(report["hosted"]["pane"], "w9:p1", "{report}");
+    assert_eq!(report["hosted"]["pane"], "w2:p1", "{report}");
     assert_eq!(place.wakes(), 0);
     let create = &herdr.calls("workspace.create")[0]["params"];
     assert_eq!(create["label"], "infra");
@@ -240,7 +307,7 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert!(holder.starts_with("host:"), "{env}");
     let lease = place.json("ship.presence", json!({"ship":"infra"}));
     assert_eq!(lease["lease"]["holder"], holder);
-    assert_eq!(lease["lease"]["binding"]["pane"]["pane_id"], "w9:p1");
+    assert_eq!(lease["lease"]["binding"]["pane"]["pane_id"], "w2:p1");
 
     // While it lives, more mail goes to it: no second space, no wake.
     place.json(
@@ -266,4 +333,103 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert!(report["wake"].is_string(), "{report}");
     assert!(report["host_error"].is_string(), "{report}");
     assert_eq!(place.wakes(), 1);
+}
+
+#[test]
+fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "task.create",
+        json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
+    );
+    let started = place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
+    assert_eq!(started["hosted"], true, "{started}");
+
+    // The supervisor runs in a background space under the task, and gives an
+    // interactive harness, with the crew extension, the pane's terminal.
+    let create = &herdr.calls("workspace.create")[0]["params"];
+    assert_eq!(create["label"], "└ infra-fix");
+    assert_eq!(create["focus"], false);
+    let mut job = Value::Null;
+    until("the crew to finish", || {
+        job = place.json("job.status", json!({"id":"crew-1"}));
+        job["status"] == "succeeded"
+    });
+    let argv = fs::read_to_string(place.root.join("crew-argv")).unwrap();
+    let argv: Vec<&str> = argv.lines().collect();
+    assert!(!argv.contains(&"--print"), "{argv:?}");
+    let extension = argv.iter().position(|a| *a == "-e").unwrap();
+    assert!(argv[extension + 1].ends_with("attended/crew.ts"));
+    assert!(extension < argv.iter().rposition(|a| *a == "--").unwrap());
+
+    // Custody is unchanged: the outcome reaches the first mate as crew mail.
+    let inbox = place.json("mail.inbox", json!({"address":"infra","all":true}));
+    let outcome = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["from"] == "crew" && m["payload"]["job_id"] == "crew-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(outcome["payload"]["status"], "succeeded");
+}
+
+#[test]
+fn a_hosted_crew_session_ends_when_its_work_settles() {
+    let output = support::command("node")
+        .arg("tests/hosted-crew.mjs")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Node is required to check the hosted crew extension");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_ships_spaces_lead_the_sidebar_with_its_crew_under_its_first_mate() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    // The captain's own space (w1) is first until Privateer opens its own.
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"check CI"}),
+    );
+    assert_eq!(place.tick()["hosted"]["workspace"], "w2");
+    assert_eq!(herdr.order(), ["w2", "w1"]);
+    place.json(
+        "task.create",
+        json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
+    );
+    place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
+    assert_eq!(herdr.order(), ["w2", "w3", "w1"]);
+    fs::write(place.root.join("release"), "").unwrap();
 }

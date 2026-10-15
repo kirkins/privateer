@@ -510,6 +510,19 @@ fn run(opts: Options) -> Result<()> {
     } else {
         Some(state_worker(privateer::fleet::registry_path()?, opts.home))
     };
+    // Inside Herdr, the bridge's own space leads Privateer's spaces.
+    if let (false, Some(socket), Ok("1"), Ok(workspace)) = (
+        opts.demo,
+        &opts.socket,
+        std::env::var("HERDR_ENV").as_deref(),
+        std::env::var("HERDR_WORKSPACE_ID"),
+    ) && std::env::var_os("HERDR_SOCKET_PATH").is_some_and(|path| path == socket.as_os_str())
+        && let Ok(mut client) = Client::connect(socket)
+    {
+        let _ = client
+            .tag(&workspace, "bridge", "")
+            .and_then(|()| client.arrange());
+    }
     let herdr = opts.socket.map(herdr_worker);
     let mut app = App {
         snapshot,
