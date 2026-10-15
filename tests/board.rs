@@ -54,6 +54,8 @@ impl Place {
             .env_remove("PRIVATEER_HOME")
             .env_remove("PRIVATEER_ROLE")
             .env_remove("PRIVATEER_ACTOR")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH")
             .output()
             .unwrap()
     }
