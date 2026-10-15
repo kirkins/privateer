@@ -138,12 +138,12 @@ def main():
         )
         job = invoke(homes["applications"], "job.start", {
             "id": "repair-job", "task_id": "repair", "command": [python, "-c", worker_code],
-            "cwd": str(repo), "heavy": True,
+            "cwd": str(repo), "heavy": True, "estimate": {"cpus": 1, "memory_bytes": 64 * 1024 * 1024},
         })
         assert job["id"] == "repair-job"
         refusal = invoke(homes["infrastructure"], "job.start", {
             "id": "competing-job", "task_id": "diagnosis", "command": [python, "-c", "print('diagnosis')"],
-            "cwd": str(repo), "heavy": True,
+            "cwd": str(repo), "heavy": True, "estimate": {"cpus": 1, "memory_bytes": 64 * 1024 * 1024},
         }, expect=False)
         assert refusal.returncode != 0, "Second heavy job must be refused across homes"
         evidence["shared_capacity_enforced"] = True

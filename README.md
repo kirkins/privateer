@@ -50,6 +50,30 @@ Harnesses and provider routes are optional executable plugins. A private gateway
 
 The default charter allows implementation, testing, opening PRs, merging passing work, routine recovery, cleanup, delegation, and messaging. Production requires approval of the exact artifact and environment. The current delivery check records workflow evidence; forge merge and production deployment adapters are future integrations.
 
+For human-authored command arguments, use a YAML or JSON file:
+
+```sh
+privateer --home /absolute/private/home charter.put --file examples/charter.yaml
+```
+
+Edit the [example charter](examples/charter.yaml) for your repository first.
+`--file` accepts regular UTF-8 `.yaml`, `.yml` and `.json` files, containing one
+object with unique string keys and JSON-compatible values. Plain YAML integers
+must fit `i64` or `u64`; floating-point numbers must fit finite `f64` values.
+Quote numeric-looking text or use `!!str` to keep it as a string, including in
+mapping keys. For `--file`, raw input and normalized JSON arguments are each
+limited to 64 KiB, with at most 64 nesting levels, 10,000 nodes (including keys),
+and 1 MiB of expanded scalar/key data. Nonrecursive YAML aliases are supported
+within these budgets. Parsing finishes before a home is opened.
+YAML supplies data: it does not read includes, run constructors or expand
+environment variables. Local custom tags are rejected; standard core tags and
+inert global annotations may be accepted or ignored as ordinary data. Existing
+command validation still applies. Use `--file` once, separately from `--json`;
+it supplies command arguments, not runtime configuration. RPC, hooks and internal
+supervisors do not accept `--file`. Inline `--json` and all machine protocols and
+outputs continue to use JSON. To pass `--file` to a native harness, put it after
+the separator in `privateer start HARNESS -- --file PATH`.
+
 ## Build and try the isolated pilot
 
 Rust 1.85 or newer and Cargo are required. Unix systems are supported for process-group supervision. Python 3 is used by optional native adapters and process fixtures; Git is used by the pilot. Node 24 is required for the Pi/OMP extension tests. The extension runs inside the chosen harness in normal use.
