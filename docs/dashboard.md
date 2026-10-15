@@ -110,8 +110,10 @@ Herdr terminal. Otherwise Board creates a tab in the ship folder and launches
 a private protocol recorder: `pane run` emits `pane.send_input` with text and
 `keys: ["Enter"]`. Shell tokens are quoted; captain text is never
 shell input. Only the pane returned by creation is eligible for this launch,
-after a fresh identity/protocol check. Repeat launches in that pane are blocked
-while it exists, and a live presence lease blocks a competing attended session. A transactional
+after a fresh identity/protocol check. A pending launch blocks retries for up to
+15 seconds, and confirmed live presence clears that pending guard. A completed
+or failed session can be boarded again even when its old tab remains. Every new
+launch checks fresh presence; a live lease blocks a competing attended session. A transactional
 `privateer start` lease claim also prevents concurrent Board actions from
 launching two harnesses when both dashboards observed an absent lease.
 An unbound attended session must be reached directly or its binding refreshed;
