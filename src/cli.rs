@@ -522,7 +522,8 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
         .filter(|mate| {
             mate["manifest"]
                 .as_str()
-                .and_then(|m| Path::new(m).parent()?.file_name()?.to_str())
+                .and_then(crate::bundled::harness)
+                .as_deref()
                 == Some(harness.as_str())
         })
         .map(|mate| mate["options"].clone())
