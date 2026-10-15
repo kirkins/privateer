@@ -70,9 +70,9 @@ def demo(binary):
             drain(0.3)
             return output[start:]
         assert b"Bridge" in click(5,10), "ship click did not open its workspace"
-        assert b"awaiting" in click(55,5), "Assignments click did not show handoff details"
-        assert b"codex" in click(71,5), "Terminals click did not show this ship's agent"
-        assert b"Custody" in click(85,5), "Logbook click did not show ship history"
+        assert b"awaiting" in click(55,4), "Assignments click did not show handoff details"
+        assert b"codex" in click(71,4), "Terminals click did not show this ship's agent"
+        assert b"Custody" in click(80,4), "Logbook click did not show ship history"
         os.write(terminal, b"i")
         drain(0.2)
         os.write(terminal, b"l")

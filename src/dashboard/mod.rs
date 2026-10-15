@@ -6,6 +6,7 @@ pub mod captain;
 pub mod fleet;
 pub use crate::herdr;
 pub mod model;
+pub mod overview;
 pub mod ui;
 
 pub mod command;

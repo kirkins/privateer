@@ -2,6 +2,7 @@ use super::{
     captain::{Composer, Exchange, Mail},
     herdr,
     model::{Snapshot, Task, clean, count},
+    overview,
 };
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -9,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, List, ListItem, ListState, Paragraph, Table, TableState, Tabs, Wrap},
 };
 use std::{
     path::{Path, PathBuf},
@@ -26,6 +27,46 @@ fn origin(home: Option<&Path>) -> String {
     })
 }
 
+fn border(focused: bool) -> Style {
+    Style::default().fg(if focused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    })
+}
+
+fn selected_row() -> Style {
+    Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Keeps the last hint (quit) and drops optional hints from the end until the line fits.
+fn hint_line(hints: &[(&'static str, &'static str)], width: usize) -> Line<'static> {
+    let Some((quit, optional)) = hints.split_last() else {
+        return Line::default();
+    };
+    let mut count = optional.len();
+    loop {
+        let mut spans = vec![Span::raw(" ")];
+        for (i, (key, label)) in optional[..count].iter().chain([quit]).enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" · "));
+            }
+            spans.push(Span::styled(
+                *key,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(format!(" {label}")));
+        }
+        let line = Line::from(spans);
+        if line.width() <= width || count == 0 {
+            return line;
+        }
+        count -= 1;
+    }
+}
+
 #[derive(Default)]
 pub struct MouseMap {
     actions: Vec<(Rect, char)>,
@@ -34,6 +75,8 @@ pub struct MouseMap {
     ship_offset: usize,
     list: Rect,
     list_offset: usize,
+    fleet: Rect,
+    fleet_offset: usize,
     details: Rect,
 }
 
@@ -401,6 +444,12 @@ impl App {
                     if index <= self.snapshot.ships.len() + 1 {
                         self.select_navigation(index);
                     }
+                } else if self.mouse.fleet.contains(point) {
+                    let index =
+                        self.mouse.fleet_offset + usize::from(event.row - self.mouse.fleet.y);
+                    if index < self.snapshot.ships.len() {
+                        self.select_navigation(index + 2);
+                    }
                 } else if let Some((_, tab)) =
                     self.mouse.tabs.iter().find(|(r, _)| r.contains(point))
                 {
@@ -490,8 +539,12 @@ impl App {
                 )),
                 Line::from(if self.snapshot.ships.is_empty() && !self.demo {
                     "No ships yet · n: create your first ship (a liaison is suggested)"
+                } else if !overview::observed(&self.snapshot) {
+                    "Select a ship to enter its workspace."
+                } else if self.ascii {
+                    "Select a ship to enter its workspace; * aboard · o not aboard · x unavailable"
                 } else {
-                    "Select a ship to enter its workspace. i: Inbox · l: Talk to liaison"
+                    "Select a ship to enter its workspace; ● aboard · ○ not aboard · ✕ unavailable"
                 }),
                 Line::from(""),
             ];
@@ -522,40 +575,15 @@ impl App {
             }
             lines.push(Line::from(""));
             for ship in &self.snapshot.ships {
-                let owned = self
-                    .snapshot
-                    .tasks
-                    .iter()
-                    .filter(|t| t.owner == ship.id)
-                    .count();
-                let incoming = self
-                    .snapshot
-                    .tasks
-                    .iter()
-                    .filter(|t| t.handoff_to.as_ref() == Some(&ship.id))
-                    .count();
-                let pending = self
-                    .snapshot
-                    .pending
-                    .iter()
-                    .filter(|n| n.owner == ship.id)
-                    .count();
-                lines.push(Line::styled(
-                    format!(
-                        "{}{}",
-                        clean(&ship.name, 160),
-                        if ship.liaison { " · Liaison" } else { "" }
-                    ),
-                    Style::default().fg(Color::Yellow),
-                ));
-                lines.push(Line::from(format!(
-                    "{owned} owned · {} · {}",
-                    count(incoming, "incoming handoff", "incoming handoffs"),
-                    count(pending, "pending issue", "pending issues")
-                )));
-                lines.push(Line::from(clean(&ship.description, 512)));
-                if let Some(live) = &ship.live {
-                    lines.extend(super::fleet::lines(live));
+                if let Some(error) = ship.live.as_ref().and_then(|l| l.error.as_ref()) {
+                    lines.push(Line::styled(
+                        format!(
+                            "{} unavailable: {}",
+                            clean(&ship.name, 160),
+                            clean(error, 512)
+                        ),
+                        Style::default().fg(Color::Red),
+                    ));
                 }
             }
             lines.extend(self.pending_lines());
@@ -752,6 +780,73 @@ impl App {
         }
         lines
     }
+    /// Priority order; the final hint (quit) is always kept.
+    fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
+        let mut hints = if self.inbox_open {
+            vec![
+                ("Enter", "mark read"),
+                ("r", "reply"),
+                ("↑↓", "select"),
+                ("PgUp/PgDn", "scroll"),
+                ("0", "home"),
+            ]
+        } else if self.ship.is_none() {
+            let mut hints = vec![("↑↓", "select ship"), ("i", "inbox")];
+            if !self.demo {
+                hints.push(("n", "new ship"));
+            }
+            if self.snapshot.ships.iter().any(|s| s.liaison) {
+                hints.push(("l", "liaison"));
+            }
+            hints
+        } else {
+            match self.tab {
+                0 => vec![
+                    ("b", "board"),
+                    ("m", "message"),
+                    ("f", "open terminal"),
+                    ("1–4", "views"),
+                    ("d", "dispatcher"),
+                    ("x", "retire"),
+                    ("c", "details"),
+                    ("0", "home"),
+                ],
+                1 => vec![
+                    ("↑↓", "select"),
+                    ("1–4", "views"),
+                    ("m", "message"),
+                    ("b", "board"),
+                    ("0", "home"),
+                ],
+                2 => vec![
+                    ("Enter", "open terminal"),
+                    ("↑↓", "select"),
+                    ("1–4", "views"),
+                    ("b", "board"),
+                    ("0", "home"),
+                ],
+                _ => vec![
+                    ("PgUp/PgDn", "scroll"),
+                    ("1–4", "views"),
+                    ("m", "message"),
+                    ("0", "home"),
+                ],
+            }
+        };
+        if self.demo {
+            hints.retain(|(key, _)| !matches!(*key, "n" | "x" | "d"));
+        }
+        hints.push(("q", "quit"));
+        hints
+    }
+    /// Observation health only; outcome notices render in the details pane.
+    fn status_text(&self) -> String {
+        format!(
+            "State {} · Herdr {}",
+            age(self.home_age),
+            age(self.herdr_age)
+        )
+    }
     pub fn draw(&mut self, frame: &mut Frame) {
         self.mouse = MouseMap::default();
         let area = frame.area();
@@ -803,43 +898,28 @@ impl App {
         let cols = Layout::horizontal([Constraint::Percentage(27), Constraint::Percentage(73)])
             .split(rows[1]);
         let mut items = vec![
-            ListItem::new(vec![Line::from("Fleet overview"), Line::from("All ships")]),
+            ListItem::new(vec![
+                Line::from("Fleet overview"),
+                Line::from(count(self.snapshot.ships.len(), "ship", "ships")),
+            ]),
             ListItem::new(vec![
                 Line::from("Captain's inbox"),
-                Line::from(if self.demo {
-                    "Sample decisions / replies".into()
-                } else if self.mail_errors.is_empty() {
-                    format!("{} messages", self.mail.len())
-                } else {
-                    format!(
-                        "{} messages · errors: {}",
-                        self.mail.len(),
-                        self.mail_errors.len()
-                    )
-                }),
+                Line::from(overview::inbox(&self.mail, self.mail_errors.len())),
             ]),
         ];
         for s in &self.snapshot.ships {
-            let assignments = self
-                .snapshot
-                .tasks
-                .iter()
-                .filter(|t| t.owner == s.id)
-                .count();
             items.push(ListItem::new(vec![
-                Line::from(clean(&s.name, 160)),
-                Line::from(format!(
-                    "{} · {}",
-                    if s.liaison { "Liaison" } else { "Peer ship" },
-                    count(assignments, "assignment", "assignments")
-                )),
+                Line::from(vec![
+                    overview::presence(s, self.ascii),
+                    Span::raw(" "),
+                    Span::raw(clean(&s.name, 160)),
+                ]),
+                Line::from(format!("  {}", overview::summary(s, &self.snapshot))),
             ]));
         }
-        let block = Block::bordered().title(if self.focus_content {
-            "Navigation · ←"
-        } else {
-            "Navigation"
-        });
+        let block = Block::bordered()
+            .title("Navigation")
+            .border_style(border(!self.focus_content));
         self.mouse.ships = block.inner(cols[0]);
         self.mouse.ships.height -= self.mouse.ships.height % 2;
         let mut state = ListState::default().with_selected(Some(self.ship_index()));
@@ -847,7 +927,7 @@ impl App {
             List::new(items)
                 .block(block)
                 .highlight_symbol("> ")
-                .highlight_style(Style::default().bg(Color::DarkGray)),
+                .highlight_style(selected_row()),
             cols[0],
             &mut state,
         );
@@ -901,19 +981,16 @@ impl App {
         body = sections[1];
         if self.ship.is_some() {
             let sections =
-                Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(body);
-            let block = Block::bordered();
-            let inner = block.inner(sections[0]);
-            let mut x = inner.x;
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
+            let row = sections[0];
+            let mut x = row.x;
             for (i, label) in TABS.iter().enumerate() {
                 let width =
-                    (Line::from(*label).width() as u16 + 2).min(inner.right().saturating_sub(x));
+                    (Line::from(*label).width() as u16 + 2).min(row.right().saturating_sub(x));
                 if width == 0 {
                     break;
                 }
-                self.mouse
-                    .tabs
-                    .push((Rect::new(x, inner.y, width, inner.height), i));
+                self.mouse.tabs.push((Rect::new(x, row.y, width, 1), i));
                 x = x.saturating_add(width + 1);
             }
             frame.render_widget(
@@ -921,9 +998,12 @@ impl App {
                     .padding(" ", " ")
                     .divider("│")
                     .select(self.tab)
-                    .highlight_style(Style::default().fg(Color::Yellow))
-                    .block(block),
-                sections[0],
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                    ),
+                row,
             );
             body = sections[1];
         }
@@ -939,7 +1019,33 @@ impl App {
                 _ => "Ship logbook",
             }
         };
-        if self.inbox_open || (self.ship.is_some() && matches!(self.tab, 1 | 2)) {
+        let has_list = self.inbox_open || (self.ship.is_some() && matches!(self.tab, 1 | 2));
+        if !self.inbox_open && self.ship.is_none() && !self.snapshot.ships.is_empty() {
+            let rows = self.snapshot.ships.len() as u16;
+            let parts = Layout::vertical([
+                Constraint::Length((rows + 3).min((body.height / 2).max(5))),
+                Constraint::Min(1),
+            ])
+            .split(body);
+            let block = Block::bordered().title("Ships").border_style(border(false));
+            let inner = block.inner(parts[0]);
+            let (header, rows, widths) = overview::table(&self.snapshot, inner.width, self.ascii);
+            let mut state = TableState::default();
+            frame.render_stateful_widget(
+                Table::new(rows, widths).header(header).block(block),
+                parts[0],
+                &mut state,
+            );
+            self.mouse.fleet = Rect::new(
+                inner.x,
+                inner.y.saturating_add(1),
+                inner.width,
+                inner.height.saturating_sub(1),
+            );
+            self.mouse.fleet_offset = state.offset();
+            body = parts[1];
+        }
+        if has_list {
             let parts = Layout::vertical([
                 Constraint::Length((body.height / 2).max(4)),
                 Constraint::Min(1),
@@ -1000,13 +1106,15 @@ impl App {
                     })
                     .collect::<Vec<_>>()
             };
-            let block = Block::bordered().title(if self.inbox_open {
-                "For the captain · decisions / replies / notices"
-            } else if self.tab == 1 {
-                "This ship's assignments / incoming handoffs"
-            } else {
-                "This ship's terminals"
-            });
+            let block = Block::bordered()
+                .title(if self.inbox_open {
+                    "For the captain · decisions / replies / notices"
+                } else if self.tab == 1 {
+                    "This ship's assignments / incoming handoffs"
+                } else {
+                    "This ship's terminals"
+                })
+                .border_style(border(self.focus_content));
             self.mouse.list = block.inner(parts[0]);
             self.mouse.list.height -= self.mouse.list.height % 2;
             let mut state =
@@ -1015,7 +1123,7 @@ impl App {
                 List::new(entries)
                     .block(block)
                     .highlight_symbol("> ")
-                    .highlight_style(Style::default().bg(Color::DarkGray)),
+                    .highlight_style(selected_row()),
                 parts[0],
                 &mut state,
             );
@@ -1041,7 +1149,9 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ));
         }
-        let block = Block::bordered().title(title);
+        let block = Block::bordered()
+            .title(title)
+            .border_style(border(self.focus_content && !has_list));
         self.mouse.details = block.inner(body);
         frame.render_widget(
             Paragraph::new(lines)
@@ -1070,18 +1180,84 @@ impl App {
                     .first()
                     .map(|e| format!("MAILBOX UNAVAILABLE: {}", clean(e, 180)))
             });
-        let status = error.unwrap_or_else(|| {
-            format!(
-                "State {} · Herdr {}",
-                age(self.home_age),
-                age(self.herdr_age)
-            )
-        });
-        frame.render_widget(Paragraph::new(vec![Line::from(" i inbox · l liaison · m message · ↑↓ select · ← ships / → content · 0 home · 1–4 views · q quit"),Line::styled(status,Style::default().fg(if self.snapshot.presentation_error.is_some()||self.home_error.is_some()||self.herdr_error.is_some()||!self.mail_errors.is_empty(){Color::Red}else{Color::Gray}))]),rows[2]);
+        let failed = self.snapshot.presentation_error.is_some()
+            || self.home_error.is_some()
+            || self.herdr_error.is_some()
+            || !self.mail_errors.is_empty();
+        let status = error.unwrap_or_else(|| self.status_text());
+        frame.render_widget(
+            Paragraph::new(vec![
+                hint_line(&self.footer_hints(), usize::from(rows[2].width)),
+                Line::styled(
+                    status,
+                    Style::default().fg(if failed { Color::Red } else { Color::Gray }),
+                ),
+            ]),
+            rows[2],
+        );
         self.draw_composer(frame);
         self.draw_form(frame);
     }
 }
 fn age(value: Option<u64>) -> String {
     value.map_or("not connected".into(), |s| format!("{s}s ago"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn footer_hints_drop_trailing_hints_but_keep_quit() {
+        let app = App {
+            ship: Some("apps".into()),
+            tab: 0,
+            ..App::default()
+        };
+        let line = hint_line(&app.footer_hints(), 50);
+        let shown = text(&line);
+        assert!(line.width() <= 50, "{shown:?}");
+        assert!(shown.ends_with("q quit"), "{shown:?}");
+        assert!(shown.contains("b board") && shown.contains("m message"));
+        assert!(!shown.contains("0 home"), "{shown:?}");
+        assert!(!shown.contains("1–4 views"), "{shown:?}");
+        assert!(shown.contains("f open terminal"), "{shown:?}");
+        let wide = text(&hint_line(&app.footer_hints(), 200));
+        assert!(
+            wide.contains("0 home") && wide.ends_with("q quit"),
+            "{wide:?}"
+        );
+    }
+
+    #[test]
+    fn demo_footer_omits_disabled_management_keys() {
+        let app = App {
+            ship: Some("apps".into()),
+            tab: 0,
+            demo: true,
+            ..App::default()
+        };
+        let keys: Vec<_> = app.footer_hints().iter().map(|(k, _)| *k).collect();
+        assert!(
+            !keys.iter().any(|k| matches!(*k, "n" | "x" | "d")),
+            "{keys:?}"
+        );
+        assert_eq!(keys.last(), Some(&"q"));
+    }
+
+    #[test]
+    fn status_line_reports_health_without_a_trailing_separator() {
+        let app = App {
+            notice: "Recording read…".into(),
+            ..App::default()
+        };
+        assert_eq!(
+            app.status_text(),
+            "State not connected · Herdr not connected"
+        );
+    }
 }

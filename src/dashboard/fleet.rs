@@ -244,6 +244,8 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
             ship.liaison = false;
         }
     }
+    // The captain's contact leads the list; the rest keep registry order.
+    out.ships.sort_by_key(|ship| !ship.liaison);
     out.truncated |= out.ships.len() > ROW_LIMIT;
     out.ships.truncate(ROW_LIMIT);
     Ok(out)
