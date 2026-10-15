@@ -252,7 +252,7 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
 }
 
 pub fn lines(live: &ShipState) -> Vec<ratatui::text::Line<'static>> {
-    use super::model::clean;
+    use super::model::{clean, count};
     use ratatui::text::Line;
     if let Some(error) = &live.error {
         return vec![Line::from(format!("Unavailable: {}", clean(error, 512)))];
@@ -273,8 +273,9 @@ pub fn lines(live: &ShipState) -> Vec<ratatui::text::Line<'static>> {
             }
         )),
         Line::from(format!(
-            "{} open requests · {} unread mail",
-            live.requests, live.unread
+            "{} · {} unread mail",
+            count(live.requests, "open request", "open requests"),
+            live.unread
         )),
     ];
     for wake in &live.wakes {

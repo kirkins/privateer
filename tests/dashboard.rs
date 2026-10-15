@@ -1007,3 +1007,20 @@ fn automatic_presence_bindings_cannot_give_one_live_pane_to_two_ships() {
     app.select_ship(Some("infra".into()));
     assert!(app.scoped_panes().is_empty());
 }
+
+#[test]
+fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
+    let mut app = App::default();
+    let screen = render(&mut app, 120, 34);
+    assert!(screen.contains("No ships yet · n: create your first ship"));
+    assert!(screen.contains("0 ships · 0 assignments · 0 pending issues"));
+    assert!(!screen.contains("[l Liaison]"));
+    let mut demo = App {
+        snapshot: Snapshot::demo(),
+        demo: true,
+        ..App::default()
+    };
+    let screen = render(&mut demo, 120, 34);
+    assert!(screen.contains("[l Talk to liaison]"));
+    assert!(screen.contains("1 pending issue\n") || screen.contains("· 1 pending issue "));
+}
