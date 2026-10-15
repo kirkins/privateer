@@ -475,6 +475,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 reject_symlinks(path)?;
                 data["resource_home"] = json!(path);
             }
+            // The ship this folder is, for commands and hooks run inside it.
+            if let Some(ship) = args.get("ship") {
+                let ship = ship
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("ship must be a name"))?;
+                identifier(ship)?;
+                data["ship"] = json!(ship);
+            }
             let temp = store
                 .home()
                 .join(format!("config-{}.tmp", uuid::Uuid::new_v4()));

@@ -130,6 +130,7 @@ impl Store {
         crate::mail::init(&store)?;
         crate::activation::init(&store)?;
         crate::context::init(&store)?;
+        crate::presence::init(&store)?;
         Ok(store)
     }
 
