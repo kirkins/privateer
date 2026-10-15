@@ -2,6 +2,8 @@
 
 Run `python3 scripts/pilot.py --binary target/debug/privateer` after building. It uses the actual CLI and supervisor binary, temporary SQLite homes, actual subprocesses, and an actual temporary Git repository. It retains its evidence directory so the result can be inspected.
 
+The scripted pilot pins the repository's Treehouse protocol fixture, which creates real Git worktrees, into its temporary homes. No installed Treehouse binary or user pool is used. The repair runs and is independently tested in the task's leased worktree; the source checkout retains the failing fixture. External Treehouse CLI compatibility is covered by the separate opt-in contract test.
+
 The navigator owns the overall outcome. An application department owns the repair task and an infrastructure department owns a diagnostic task. Each home receives an explicit local charter for the same temporary fixture; this is not a test of distributed charter inheritance. Departments communicate through direct peer RPC and task-linked messages.
 
 The pilot emits many facts for one issue and verifies one pending notification with the facts retained. The application job deliberately remains alive after the `job.start` launcher exits. A separate heavy job is refused while that shared host slot is occupied. The repair changes the fixture, runs a meaningful regression test, commits the result locally, and records durable completion. Fresh CLI invocations inspect the resulting state.
