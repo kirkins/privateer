@@ -241,6 +241,49 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
 }
 
 #[test]
+fn muse_msp_plans_exact_resume_and_runtime_roots_without_changing_native_defaults() {
+    let mut f = Fixture::new();
+    let mut args = f.args(&example("muse"));
+    args["options"] = json!({"transport":"msp","provider":"meta","model":"fixture-model","effort":"low","resume":"46a81234-1234-4567-8123-123456789abc","msp_permissions":"allow_once","msp_approval_mode":"onRequest","trust":true,"sandbox_network":"restricted"});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+    assert!(plan["argv"][1].as_str().unwrap().ends_with("msp.py"));
+    let request: Value = serde_json::from_str(plan["argv"][3].as_str().unwrap()).unwrap();
+    assert_eq!(request["resume"], args["options"]["resume"]);
+    assert_eq!(request["roots"][0], json!(f.repo));
+    assert!(
+        request["roots"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(f.store.home()))
+    );
+    assert_eq!(request["permissions"], "allow_once");
+    assert_eq!(request["approval_mode"], "onRequest");
+    let argv = request["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|v| v == "--trust-workspace"));
+    assert!(!argv.iter().any(|v| v == "--disable-sandbox"));
+    args["options"] = json!({"provider":"meta","permission_mode":"never","bare":true});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+    let argv = plan["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|v| v == "exec"));
+    assert!(argv.iter().any(|v| v == "--no-foreign-personal-context"));
+    assert!(!argv.iter().any(|v| v == "--disable-sandbox"));
+    for invalid in [
+        json!({"transport":"msp","mode":"interactive"}),
+        json!({"transport":"msp","bare":true}),
+        json!({"transport":"msp","permission_mode":"never"}),
+        json!({"msp_permissions":"allow_once"}),
+        json!({"transport":"msp","msp_permissions":"allow_always"}),
+        json!({"transport":"msp","trust":"true"}),
+        json!({"transport":"msp","sandbox_network":"unrestricted"}),
+        json!({"bare":true,"mode":"interactive"}),
+        json!({"permission_mode":"allowAll"}),
+    ] {
+        args["options"] = invalid;
+        assert!(plugins::dispatch(&mut f.store, "plugin.command", args.clone()).is_err());
+    }
+}
+
+#[test]
 fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_identity() {
     let mut f = Fixture::new();
     let fakebin = f.base().join("bin");
@@ -322,7 +365,7 @@ assert read_session('claude',log) is None
 log.write_text('x'*65537+'\n'+json.dumps({'type':'thread.started','thread_id':identity})+'\n')
 assert read_session('codex',log) is None
 assert session_started('codex',{'type':'thread.started','thread_id':'bad\nidentity'}) is None
-for harness in ('rovo','kimi','devin'):
+for harness in ('rovo','kimi','devin','muse'):
     assert session_started(harness,{'type':'session.started','harness':harness,'session_id':identity})==identity
     assert session_started(harness,{'type':'session.started','harness':'unrelated','session_id':identity}) is None
 "#;
@@ -341,7 +384,11 @@ for harness in ('rovo','kimi','devin'):
 
 #[test]
 fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
-    for script in ["tests/acp_bridge.py", "tests/pi_turn.py"] {
+    for script in [
+        "tests/acp_bridge.py",
+        "tests/pi_turn.py",
+        "tests/msp_bridge.py",
+    ] {
         let output = Command::new("python3")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
             .output()
@@ -433,82 +480,112 @@ for event in [
 }
 
 #[test]
-fn an_acp_first_mate_uses_the_existing_activation_mail_and_agent_role_contract() {
-    let mut f = Fixture::new();
-    fs::write(
-        f.store.home().join("config.json"),
-        json!({"resource_home":f.base().join("ledger")}).to_string(),
-    )
-    .unwrap();
-    let fakebin = f.base().join("bin");
-    fs::create_dir(&fakebin).unwrap();
-    let server = fakebin.join("rovo");
-    fs::write(&server,r#"#!/usr/bin/env python3
+fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contract() {
+    for harness in ["rovo", "muse"] {
+        let mut f = Fixture::new();
+        fs::write(
+            f.store.home().join("config.json"),
+            json!({"resource_home":f.base().join("ledger")}).to_string(),
+        )
+        .unwrap();
+        let fakebin = f.base().join("bin");
+        fs::create_dir(&fakebin).unwrap();
+        let server = fakebin.join(harness);
+        fs::write(&server,r#"#!/usr/bin/env python3
 import json,os,subprocess,sys
+harness=os.path.basename(sys.argv[0])
+sid='46a81234-1234-4567-8123-123456789abc'
+turn='46a81234-1234-4567-8123-123456789abd'
 def call(command,args):
-    output=subprocess.run([os.environ['ACP_TEST_CLI'],'--home',os.environ['ACP_TEST_HOME'],command,'--json',json.dumps(args)],capture_output=True,text=True)
+    output=subprocess.run([os.environ['STDIO_TEST_CLI'],'--home',os.environ['STDIO_TEST_HOME'],command,'--json',json.dumps(args)],capture_output=True,text=True)
     assert output.returncode==0,command
     return json.loads(output.stdout)
 for line in sys.stdin:
     request=json.loads(line)
     method=request['method']
-    if method=='initialize':result={'protocolVersion':1,'agentCapabilities':{'loadSession':True}}
-    elif method=='session/new':result={'sessionId':'actual-protocol-fixture-session'}
-    elif method=='session/prompt':
+    if method=='initialize':
+        result={'schema':{'version':1},'sessionDurability':'durable'} if harness=='muse' else {'protocolVersion':1,'agentCapabilities':{'loadSession':True}}
+    elif method=='initialized':continue
+    elif method in ('session/new','session/load'):result={'sessionId':sid}
+    elif method in ('session/start','session/resume'):
+        if method=='session/resume':assert request['params']['sessionId']==sid
+        result={'session':{'sessionId':sid,'workspaceRoot':os.getcwd(),'status':'idle','activeTurnId':None},'pendingRequests':[]}
+    elif method in ('session/prompt','turn/start'):
         assert os.environ['PRIVATEER_ROLE']=='agent' and os.environ['PRIVATEER_ACTOR']=='department'
-        assert 'New mail through seq' in request['params']['prompt'][0]['text']
+        prompt=request['params']['input' if harness=='muse' else 'prompt'][0]['text']
+        assert 'New mail through seq' in prompt
         inbox=call('mail.inbox',{'address':'department'})
         for mail in inbox['messages']:
-            if mail['kind']=='request':
-                call('mail.send',{'id':'reply-'+mail['id'],'from':'department','to':mail['from'],'kind':'reply','correlation':mail['id'],'body':'handled through ACP protocol fixture'})
+            if mail['kind']=='request' and mail['state']=='open':
+                call('mail.send',{'id':'reply-'+mail['id'],'from':'department','to':mail['from'],'kind':'reply','correlation':mail['id'],'body':'handled through stdio protocol fixture'})
         call('mail.ack',{'address':'department','through_seq':max(m['seq'] for m in inbox['messages'])})
-        result={'stopReason':'end_turn'}
+        result={'commandId':request['params']['commandId'],'status':'accepted','turnId':turn,'disposition':'started','startedNewTurn':True} if harness=='muse' else {'stopReason':'end_turn'}
     else:raise RuntimeError('unexpected method')
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+    if method=='turn/start':print(json.dumps({'jsonrpc':'2.0','method':'turn/completed','params':{'sessionId':sid,'turnId':turn,'terminal':'completed'}}),flush=True)
 "#).unwrap();
-    fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
-    privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"ACP protocol fixture","first_mate":{"manifest":example("rovo"),"duty_task":"task","batch_secs":0,"max_delay_secs":0}})).unwrap();
-    privateer::dispatch(&mut f.store,"mail.send",json!({"id":"acp-work","from":"captain","to":"department","kind":"request","body":"Handle the isolated protocol test"})).unwrap();
-    let tick = Command::new(env!("CARGO_BIN_EXE_privateer"))
-        .args([
-            "--home",
-            f.store.home().to_str().unwrap(),
-            "serve",
-            "--json",
-            "{\"once\":true}",
-        ])
-        .env(
-            "PATH",
-            format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
-        )
-        .env("ACP_TEST_CLI", env!("CARGO_BIN_EXE_privateer"))
-        .env("ACP_TEST_HOME", f.store.home())
-        .output()
-        .unwrap();
-    assert!(
-        tick.status.success(),
-        "{}",
-        String::from_utf8_lossy(&tick.stderr)
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let wake = loop {
-        privateer::activation::tick(&mut f.store).unwrap();
-        let wakes =
-            privateer::dispatch(&mut f.store, "wake.list", json!({"ship":"department"})).unwrap();
-        let wake = &wakes["wakes"][0];
-        if wake["status"] != "running" {
-            break wake.clone();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
+        let options = if harness == "muse" {
+            json!({"transport":"msp"})
+        } else {
+            json!({})
+        };
+        privateer::dispatch(&mut f.store,"ship.put",json!({"name":"department","scope":"stdio protocol fixture","first_mate":{"manifest":example(harness),"options":options,"duty_task":"task","batch_secs":0,"max_delay_secs":0}})).unwrap();
+        for (index, id) in ["stdio-work", "stdio-more"].into_iter().enumerate() {
+            privateer::dispatch(&mut f.store,"mail.send",json!({"id":id,"from":"captain","to":"department","kind":"request","task_id":"task","body":"Handle the isolated protocol test"})).unwrap();
+            let tick = Command::new(env!("CARGO_BIN_EXE_privateer"))
+                .args([
+                    "--home",
+                    f.store.home().to_str().unwrap(),
+                    "serve",
+                    "--json",
+                    "{\"once\":true}",
+                ])
+                .env(
+                    "PATH",
+                    format!("{}:{}", fakebin.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("STDIO_TEST_CLI", env!("CARGO_BIN_EXE_privateer"))
+                .env("STDIO_TEST_HOME", f.store.home())
+                .output()
+                .unwrap();
+            assert!(
+                tick.status.success(),
+                "{}",
+                String::from_utf8_lossy(&tick.stderr)
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let wake = loop {
+                privateer::activation::tick(&mut f.store).unwrap();
+                let wakes =
+                    privateer::dispatch(&mut f.store, "wake.list", json!({"ship":"department"}))
+                        .unwrap();
+                assert_eq!(wakes["wakes"].as_array().unwrap().len(), index + 1);
+                let wake = &wakes["wakes"][0];
+                if wake["status"] != "running" {
+                    break wake.clone();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{harness} fixture wake did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(wake["status"], "succeeded", "{harness}: {wake}");
+            assert_eq!(
+                wake["mode"],
+                if index == 0 { "fresh" } else { "resume" },
+                "{wake}"
+            );
+            assert_eq!(wake["session_id"], "46a81234-1234-4567-8123-123456789abc");
+            assert!(
+                wake["usage"].is_null(),
+                "unreported native usage must remain absent"
+            );
+            let request = privateer::dispatch(&mut f.store, "mail.show", json!({"id":id})).unwrap();
+            assert_eq!(request["state"], "answered");
         }
-        assert!(Instant::now() < deadline, "ACP fixture wake did not finish");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(wake["status"], "succeeded", "{wake}");
-    assert!(
-        wake["usage"].is_null(),
-        "unreported native usage must not become invented token counts"
-    );
-    let request = privateer::dispatch(&mut f.store, "mail.show", json!({"id":"acp-work"})).unwrap();
-    assert_eq!(request["state"], "answered");
+    }
 }
 
 #[test]
@@ -762,7 +839,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
 
 #[test]
 fn cancellation_reaches_the_execed_harness_and_its_descendants() {
-    for harness in ["codex", "rovo", "pi"] {
+    for harness in ["codex", "rovo", "pi", "muse"] {
         let mut f = Fixture::new();
         fs::write(
             f.store.home().join("config.json"),
@@ -800,7 +877,7 @@ else:
                 f.store.home().to_str().unwrap(),
                 "agent.start",
                 "--json",
-                &json!({"id":"native-cancel","task_id":"task","manifest":example(harness)})
+                &json!({"id":"native-cancel","task_id":"task","manifest":example(harness),"options":if harness == "muse" {json!({"transport":"msp"})} else {json!({})}})
                     .to_string(),
             ])
             .env(
