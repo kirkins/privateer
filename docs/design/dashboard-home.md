@@ -62,6 +62,6 @@ The same actions without Herdr: a tmux window per ship running `privateer start`
 - With several ships made by `init` and `ship.create`, the fleet home lists all of them with live presence, dispatcher and mail counts.
 - A request from a ship to the captain appears in the dashboard inbox; replying closes it (`mail.show` reports `answered`).
 - Board on a ship with no pane opens a Herdr tab in its folder running `privateer start`, and the ship shows as aboard; Board again focuses that pane.
-- First run with an empty fleet walks through creating a liaison and boards it.
+- First run with an empty fleet walks through creating a liaison, following the documented [creation and Board conditions](../dashboard.md#first-run-and-everyday-entry).
 - Inside Herdr with the dashboard installed, bare `privateer` opens the dashboard; elsewhere it starts the harness as today.
 - Tests drive real binaries against temporary homes with a private `PRIVATEER_FLEET` and `PRIVATEER_SERVICE=none`; Herdr interactions are covered by the existing smoke-test approach.

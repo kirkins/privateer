@@ -5,7 +5,7 @@
 //! folder is its charter's repository root, with the projects it works on
 //! cloned into `projects/`. `init` turns a folder into a ship with sensible
 //! defaults and writes the instructions that make any harness launched there
-//! its first mate. JSON commands for agents and RPC are unchanged.
+//! its first mate.
 use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
