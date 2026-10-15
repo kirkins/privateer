@@ -11,6 +11,7 @@ struct Place {
     _temp: tempfile::TempDir,
     root: PathBuf,
     folder: PathBuf,
+    binary: PathBuf,
     path: String,
     probe: PathBuf,
 }
@@ -25,6 +26,9 @@ impl Place {
         fs::create_dir(&folder).unwrap();
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
+        // The legacy entry tests must have no installed sibling/PATH dashboard.
+        let binary = bin.join("privateer");
+        fs::copy(BIN, &binary).unwrap();
         let probe = root.join("probe.txt");
         fs::write(
             bin.join("codex"),
@@ -40,11 +44,12 @@ impl Place {
             path: format!("{}:/usr/bin:/bin", bin.display()),
             root,
             folder,
+            binary,
             probe,
         }
     }
     fn run(&self, dir: &PathBuf, args: &[&str], service: &str) -> Output {
-        support::command(BIN)
+        support::command(&self.binary)
             .args(args)
             .current_dir(dir)
             .env("PATH", &self.path)
@@ -175,7 +180,7 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let run = |args: &[&str]| {
-        support::command(BIN)
+        support::command(&place.binary)
             .args(args)
             .current_dir(&place.folder)
             .env("PATH", &place.path)
@@ -201,7 +206,8 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
     let unit = fs::read_to_string(&units[0]).unwrap();
     assert!(
         unit.contains(&format!(
-            "ExecStart=\"{BIN}\" --home \"{}\" serve",
+            "ExecStart=\"{}\" --home \"{}\" serve",
+            place.binary.display(),
             place.folder.join(".privateer").display()
         )),
         "{unit}"
@@ -218,10 +224,11 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
 }
 
 #[test]
-fn herdr_dashboard_entry_uses_installed_sibling_and_preserves_direct_start_and_fallback() {
+fn dashboard_entry_uses_installed_sibling_or_path_in_both_environments() {
     let place = Place::new();
-    let binary = place.root.join("bin/privateer");
-    fs::copy(BIN, &binary).unwrap();
+    let path_binary = place.root.join("runtime/privateer");
+    fs::create_dir(path_binary.parent().unwrap()).unwrap();
+    fs::copy(BIN, &path_binary).unwrap();
     let dashboard = place.root.join("bin/privateer-dashboard");
     let probe = place.root.join("dashboard-argv");
     fs::write(
@@ -230,8 +237,8 @@ fn herdr_dashboard_entry_uses_installed_sibling_and_preserves_direct_start_and_f
     )
     .unwrap();
     fs::set_permissions(&dashboard, fs::Permissions::from_mode(0o755)).unwrap();
-    let run = |args: &[&str], herdr: bool| {
-        let mut command = support::command(&binary);
+    let run = |binary: &PathBuf, args: &[&str], herdr: bool| {
+        let mut command = support::command(binary);
         command
             .args(args)
             .current_dir(&place.folder)
@@ -243,31 +250,54 @@ fn herdr_dashboard_entry_uses_installed_sibling_and_preserves_direct_start_and_f
             .env("PRIVATEER_RESOURCE_HOME", place.root.join("ledger"))
             .env_remove("PRIVATEER_HOME")
             .env_remove("PRIVATEER_ROLE")
-            .env_remove("PRIVATEER_ACTOR")
-            .env_remove("HERDR_ENV")
-            .env_remove("HERDR_SOCKET_PATH");
+            .env_remove("PRIVATEER_ACTOR");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("HERDR_") {
+                command.env_remove(key);
+            }
+        }
         if herdr {
             command.env("HERDR_ENV", "1");
         }
         command.output().unwrap()
     };
-    let fresh = run(&[], true);
-    assert!(fresh.status.success(), "{}", text(&fresh));
-    assert!(!place.folder.join(".privateer").exists());
-    assert!(place.probes().is_empty());
-    assert_eq!(fs::read_to_string(&probe).unwrap(), "\n");
-    assert!(run(&["init", "--harness", "codex"], false).status.success());
-    assert!(run(&[], true).status.success());
-    let args = fs::read_to_string(&probe).unwrap();
-    assert_eq!(
-        args.lines().collect::<Vec<_>>(),
-        ["--home", place.folder.join(".privateer").to_str().unwrap()]
+    // The first runtime finds a sibling; the second finds the same probe on PATH.
+    for binary in [&place.binary, &path_binary] {
+        for herdr in [false, true] {
+            let fresh = run(binary, &[], herdr);
+            assert!(fresh.status.success(), "{}", text(&fresh));
+            assert!(!place.folder.join(".privateer").exists());
+            assert!(!place.root.join("fleet.sqlite").exists());
+            assert!(place.probes().is_empty());
+            assert_eq!(fs::read_to_string(&probe).unwrap(), "\n");
+        }
+    }
+    assert!(
+        run(&place.binary, &["init", "--harness", "codex"], false)
+            .status
+            .success()
     );
-    assert!(run(&["start"], true).status.success());
-    assert_eq!(place.probes().len(), 1);
-    assert!(run(&[], false).status.success());
-    assert_eq!(place.probes().len(), 2);
+    let mut launches = 0;
+    for binary in [&place.binary, &path_binary] {
+        for herdr in [false, true] {
+            assert!(run(binary, &[], herdr).status.success());
+            let args = fs::read_to_string(&probe).unwrap();
+            assert_eq!(
+                args.lines().collect::<Vec<_>>(),
+                ["--home", place.folder.join(".privateer").to_str().unwrap()]
+            );
+            assert_eq!(place.probes().len(), launches);
+            assert!(run(binary, &["start"], herdr).status.success());
+            launches += 1;
+            assert_eq!(place.probes().len(), launches);
+        }
+    }
     fs::remove_file(&dashboard).unwrap();
-    assert!(run(&[], true).status.success());
-    assert_eq!(place.probes().len(), 3);
+    for binary in [&place.binary, &path_binary] {
+        for herdr in [false, true] {
+            assert!(run(binary, &[], herdr).status.success());
+            launches += 1;
+            assert_eq!(place.probes().len(), launches);
+        }
+    }
 }

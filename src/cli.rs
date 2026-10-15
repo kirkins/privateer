@@ -746,9 +746,6 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
 
 fn dashboard_binary() -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
-        return None;
-    }
     let beside = std::env::current_exe()
         .ok()?
         .with_file_name("privateer-dashboard");
@@ -773,7 +770,7 @@ fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
     Err(command.exec()).context("open the Privateer dashboard")
 }
 
-/// Bare `privateer` opens the installed dashboard inside Herdr. Otherwise,
+/// Bare `privateer` opens the installed dashboard. If it is unavailable,
 /// ensure this ship's dispatcher and talk to its first mate, offering to create
 /// the ship first when needed; without a terminal or `--yes`, print help.
 pub fn board(home: Option<PathBuf>, yes: bool, caller: Caller) -> Result<()> {

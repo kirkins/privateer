@@ -4,7 +4,7 @@ Status: **steps 1–6 implemented; step 7 pending**. See [dashboard setup and bo
 
 ## Goal
 
-A person should be able to install Privateer, type `privateer`, and land somewhere they can see every ship, read and answer their mail, and jump into any ship's first mate, without visiting folders one by one or writing commands. Inside Herdr that place is the dashboard (`privateer-dashboard`); a tmux variant can follow for people without Herdr. A first-time user is walked through creating their first ship, suggested as a liaison, which then helps them create the rest.
+A person should be able to install Privateer, type `privateer`, and land somewhere they can see every ship, read and answer their mail, and jump into any ship's first mate, without visiting folders one by one or writing commands. That place is the installed dashboard (`privateer-dashboard`) in ordinary terminals and Herdr. Observation, inbox and onboarding are standalone; Board uses only a configured Herdr socket. A first-time user is walked through creating their first ship, suggested as a liaison, which then helps them create the rest.
 
 ## What exists today
 
@@ -63,5 +63,5 @@ The same actions without Herdr: a tmux window per ship running `privateer start`
 - A request from a ship to the captain appears in the dashboard inbox; replying closes it (`mail.show` reports `answered`).
 - Board on a ship with no pane opens a Herdr tab in its folder running `privateer start`, and the ship shows as aboard; Board again focuses that pane.
 - First run with an empty fleet walks through creating a liaison, following the documented [creation and Board conditions](../dashboard.md#first-run-and-everyday-entry).
-- Inside Herdr with the dashboard installed, bare `privateer` opens the dashboard; elsewhere it starts the harness as today.
+- With an executable dashboard installed beside the runtime or on PATH, bare `privateer` opens it in ordinary terminals and Herdr. `privateer start` is the direct harness command. Only a missing dashboard retains the legacy harness/initialization flow.
 - Tests drive real binaries against temporary homes with a private `PRIVATEER_FLEET` and `PRIVATEER_SERVICE=none`; Herdr interactions are covered by the existing smoke-test approach.

@@ -131,7 +131,7 @@ class Herdr:
 
 
 class Tui:
-    def __init__(self, binary, env, args, columns=132):
+    def __init__(self, binary, env, args, columns=132, cwd=None):
         self.columns = columns
         gate_read, gate_write = os.pipe()
         self.pid, self.fd = pty.fork()
@@ -139,7 +139,7 @@ class Tui:
             os.close(gate_write)
             os.read(gate_read, 1)
             os.close(gate_read)
-            os.chdir(env["HOME"])
+            os.chdir(cwd or env["HOME"])
             os.execve(str(binary), [str(binary), *args], env)
         os.close(gate_read)
         self.reaped = False
@@ -244,7 +244,7 @@ def run(binary, runtime):
                            "while not (root/'release').exists() and not (root/f'release-{pane}').exists(): time.sleep(.05)\n")
         harness.chmod(0o755)
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("PRIVATEER_") and k not in {"HERDR_ENV", "HERDR_SOCKET_PATH"}}
+               if not k.startswith("PRIVATEER_") and not k.startswith("HERDR_")}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
                    PATH=os.pathsep.join([str(bins), str(Path(sys.executable).parent), os.environ.get("PATH", "/usr/bin:/bin")]))
@@ -405,18 +405,39 @@ def onboarding(binary, runtime):
         harness.chmod(0o755)
         (bins / "privateer").symlink_to(runtime)
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("PRIVATEER_") and k not in {"HERDR_ENV", "HERDR_SOCKET_PATH"}}
+               if not k.startswith("PRIVATEER_") and not k.startswith("HERDR_")}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color", PATH=str(bins)+":/usr/bin:/bin")
-        # Skipping first-run setup creates neither a home nor a registry.
-        skipped = Tui(runtime, dict(env, HERDR_ENV="1"), [])
-        try:
-            assert "Welcome" in skipped.screen()
-            skipped.keys(b"\x1b")
-            assert not (root / "fleet.sqlite").exists()
-            assert not (root / "ships").exists()
-        finally:
-            skipped.close()
+        # Real bare-runtime entry works with every HERDR_* variable absent,
+        # as well as inside Herdr, before initializing the current folder.
+        for inside_herdr in [False, True]:
+            entry_root = root / ("herdr-entry" if inside_herdr else "ordinary-entry")
+            fresh = entry_root / "fresh"
+            user = entry_root / "user"
+            fresh.mkdir(parents=True)
+            user.mkdir()
+            entry_env = dict(env, HOME=str(user), XDG_CONFIG_HOME=str(entry_root / "config"),
+                             PRIVATEER_FLEET=str(entry_root / "fleet.sqlite"),
+                             PRIVATEER_RESOURCE_HOME=str(entry_root / "ledger"))
+            assert not any(key.startswith("HERDR_") for key in entry_env)
+            if inside_herdr:
+                entry_env["HERDR_ENV"] = "1"
+            skipped = Tui(runtime, entry_env, [], cwd=fresh)
+            try:
+                skipped.until(lambda: "Welcome" in skipped.screen(), "bare privateer did not open real welcome")
+                assert not list(fresh.iterdir()), "welcome initialized the current folder"
+                assert not (user / ".privateer").exists()
+                assert not (entry_root / "fleet.sqlite").exists()
+                assert not (user / "ships").exists()
+                assert not (user / "harness-started").exists()
+                skipped.keys(b"\x1b")
+            finally:
+                skipped.close()
+            assert not list(fresh.iterdir()), "skip initialized the current folder"
+            assert not (user / ".privateer").exists()
+            assert not (entry_root / "fleet.sqlite").exists()
+            assert not (user / "ships").exists()
+            assert not (user / "harness-started").exists()
         server = Herdr(root, env)
         server.protocol = 19
         tui = None
@@ -612,4 +633,4 @@ def onboarding(binary, runtime):
                 assert not (plain_root / "escaped").exists()
             finally:
                 plain.close()
-        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
+        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")

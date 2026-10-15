@@ -244,15 +244,19 @@ fn ergonomic_agent_delegation_retains_identity_and_child_action_limits() {
 fn agent_operator_entry_is_rejected_before_fresh_state_or_launches() {
     let folder = Folder::new("desk");
     let fresh = folder.ship.join(".privateer");
-    let output = folder
-        .command_in(&folder.ship, &[])
-        .env("HERDR_ENV", "1")
-        .env("PRIVATEER_ROLE", "agent")
-        .env("PRIVATEER_ACTOR", "liaison")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+    for herdr in [false, true] {
+        let mut command = folder.command_in(&folder.ship, &[]);
+        if herdr {
+            command.env("HERDR_ENV", "1");
+        }
+        let output = command
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "liaison")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+    }
     for args in [
         vec!["--yes"],
         vec!["init", "--liaison", "--harness", "codex"],
@@ -264,29 +268,33 @@ fn agent_operator_entry_is_rejected_before_fresh_state_or_launches() {
         vec!["project", "add", "unused"],
         vec!["serve"],
     ] {
-        for via_flags in [false, true] {
-            let mut argv = vec!["--home", fresh.to_str().unwrap()];
-            argv.extend_from_slice(&args);
-            let mut command = folder.command_in(&folder.ship, &argv);
-            command.env("HERDR_ENV", "1");
-            if via_flags {
-                command.args(["--role", "agent", "--actor", "liaison"]);
-            } else {
-                command
-                    .env("PRIVATEER_ROLE", "agent")
-                    .env("PRIVATEER_ACTOR", "liaison")
-                    .args(["--role", "operator"]);
+        for herdr in [false, true] {
+            for via_flags in [false, true] {
+                let mut argv = vec!["--home", fresh.to_str().unwrap()];
+                argv.extend_from_slice(&args);
+                let mut command = folder.command_in(&folder.ship, &argv);
+                if herdr {
+                    command.env("HERDR_ENV", "1");
+                }
+                if via_flags {
+                    command.args(["--role", "agent", "--actor", "liaison"]);
+                } else {
+                    command
+                        .env("PRIVATEER_ROLE", "agent")
+                        .env("PRIVATEER_ACTOR", "liaison")
+                        .args(["--role", "operator"]);
+                }
+                let output = command.output().unwrap();
+                assert!(!output.status.success(), "{args:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("operator command"),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
+                assert!(!folder.root.join("fleet.sqlite").exists());
+                assert!(!folder.root.join("config").exists());
             }
-            let output = command.output().unwrap();
-            assert!(!output.status.success(), "{args:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("operator command"),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(fs::read_dir(&folder.ship).unwrap().count(), 0);
-            assert!(!folder.root.join("fleet.sqlite").exists());
-            assert!(!folder.root.join("config").exists());
         }
     }
     for flags in [

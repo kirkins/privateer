@@ -34,19 +34,24 @@ See [dashboard setup and boundaries](docs/dashboard.md).
 
 ## Quick start
 
-Inside Herdr, bare `privateer` opens the fleet dashboard and first-run setup.
-Outside Herdr, use a dedicated ship folder:
+Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
+Herdr. With no current ship, first-run setup offers a dedicated ship folder.
 
 ```sh
 cargo install --locked --path . --features dashboard  # installs privateer + privateer-dashboard
-mkdir -p ~/ships/infra && cd ~/ships/infra
-privateer                           # outside Herdr: asks, makes this folder a ship, ensures its
-                                    # dispatcher, and opens its first mate; inside Herdr: dashboard
-privateer                           # inside Herdr: fleet dashboard; elsewhere: first mate
-privateer start                     # always talk to this ship directly
+privateer                           # fleet dashboard and first-run setup
+cd ~/ships/liaison                   # after creating this ship in setup
+privateer start                     # talk to this ship's first mate directly
 ```
 
-The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. Scripts can use `privateer --yes` to skip the question.
+The dashboard uses an executable installed beside the runtime or on PATH.
+If it is missing, bare `privateer` keeps the legacy flow: in a ship folder it
+ensures the dispatcher and opens the harness; elsewhere it offers to initialize
+the current folder first (`--yes` skips that question). Without a configured
+Herdr socket, dashboard observation, inbox and setup remain available; creation
+shows a quoted `privateer --home HOME start` command for direct access.
+
+The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. In the legacy flow, scripts can use `privateer --yes` to skip the initialization question.
 
 For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable).
 

@@ -106,6 +106,13 @@ statuses may be stale because this UI deliberately does not reconcile processes.
 
 ## First run and everyday entry
 
+Bare `privateer` opens an executable `privateer-dashboard` installed beside it
+or on PATH, in ordinary terminals as well as Herdr. With a current ship, its
+dispatcher is ensured first. `privateer start` always opens the harness directly.
+Only a missing dashboard retains the legacy harness/initialization flow.
+Standalone observation, inbox and onboarding need no Herdr socket; Board still
+requires an explicitly selected or inherited socket and validated bindings.
+
 With an empty fleet, the interactive dashboard welcomes the captain and suggests
 `liaison` at `~/ships/liaison`. Name and folder are editable; the suggested folder
 tracks the name until changed explicitly. Choose among supported installed

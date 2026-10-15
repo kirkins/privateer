@@ -240,7 +240,7 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
     let marker = fleet.root.join("slow-started.json");
     let script = fleet.root.join("slow-peer.py");
     fs::write(&script, format!(
-        "#!/usr/bin/env python3\nimport json, os, pathlib, sqlite3, time\nwith sqlite3.connect({:?}) as db:\n    wakes = db.execute(\"SELECT COUNT(*) FROM wakes\").fetchone()[0]\npathlib.Path({:?}).write_text(json.dumps({{\"pid\":os.getpid(),\"wakes\":wakes}}))\ntime.sleep(5)\n",
+        "#!/usr/bin/env python3\nimport json, os, pathlib, sqlite3, time\ntime.sleep(0.25)  # exercise cold interpreter startup\nwith sqlite3.connect({:?}) as db:\n    wakes = db.execute(\"SELECT COUNT(*) FROM wakes\").fetchone()[0]\npathlib.Path({:?}).write_text(json.dumps({{\"pid\":os.getpid(),\"wakes\":wakes}}))\ntime.sleep(5)\n",
         fleet.home.join("privateer.sqlite").to_string_lossy(), marker.to_string_lossy(),
     )).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -281,8 +281,11 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
     let started = Instant::now();
-    let first = tick(100);
-    assert!(started.elapsed() < Duration::from_secs(2), "{first}");
+    // Budget for cold Python startup (including the injected delay), while
+    // remaining well below the fixture's five-second blocked call and the
+    // configured peer timeout. Production timeouts are unchanged.
+    let first = tick(1000);
+    assert!(started.elapsed() < Duration::from_secs(3), "{first}");
     assert_eq!(Fleet::infra(&first)["status"], "running", "{first}");
     assert_eq!(first["delivered"]["attempted"], 1);
     let observed: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
