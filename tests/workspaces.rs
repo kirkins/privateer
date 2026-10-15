@@ -546,7 +546,7 @@ fn queued_jobs_hold_their_own_workspace_until_cancelled() {
         "job.start",
         json!({"task_id":"one","id":"heavy","command":["/bin/sleep","3"],"heavy":true}),
     );
-    let queued = f.ok("job.start", json!({"task_id":"two","id":"queued","command":["/bin/true"],"heavy":true,"wait_for_capacity":true}));
+    let queued = f.ok("job.start", json!({"task_id":"two","id":"queued","command":["/bin/sh","-c","true"],"heavy":true,"wait_for_capacity":true}));
     assert_eq!(queued["status"], "queued");
     assert_ne!(queued["cwd"], first["cwd"]);
     let w = f.acquire("two");
@@ -570,7 +570,7 @@ fn only_a_recorded_agent_wake_keeps_the_ship_repository() {
     let store = Store::open(&f.home).unwrap();
     store.connection().execute("INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms) VALUES('wake','ship','ship',0,'wake','fresh','running',0),('ordinary','ship','ship',0,'ordinary','fresh','running',0)", []).unwrap();
     let adapter = f.root.join("wake-adapter.py");
-    fs::write(&adapter, "import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'version':1,'ok':True,'result':{'argv':['/bin/true'],'cwd':r['context']['repo'],'env_names':[]}}))\n").unwrap();
+    fs::write(&adapter, "import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'version':1,'ok':True,'result':{'argv':['/bin/sh','-c','true'],'cwd':r['context']['repo'],'env_names':[]}}))\n").unwrap();
     let manifest = f.root.join("wake-manifest.json");
     fs::write(
         &manifest,
@@ -693,7 +693,7 @@ fn a_charter_subdirectory_stays_scoped_inside_its_task_worktree() {
     let w = f.acquire("one");
     assert_eq!(job["cwd"], json!(path(&w).join("component")));
     assert!(!f.repo.join("component/output").exists());
-    assert!(!f.run("job.start",json!({"task_id":"one","id":"escape","cwd":path(&w),"command":["/bin/true"],"heavy":false})).status.success());
+    assert!(!f.run("job.start",json!({"task_id":"one","id":"escape","cwd":path(&w),"command":["/bin/sh","-c","true"],"heavy":false})).status.success());
 }
 
 #[test]
@@ -846,7 +846,7 @@ fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
     assert!(
         !f.run(
             "job.start",
-            json!({"task_id":"one","command":["/bin/true"],"heavy":false})
+            json!({"task_id":"one","command":["/bin/sh","-c","true"],"heavy":false})
         )
         .status
         .success()
@@ -865,7 +865,7 @@ fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
     assert!(
         !f.run(
             "job.start",
-            json!({"task_id":"one","cwd":f.root,"command":["/bin/true"],"heavy":false})
+            json!({"task_id":"one","cwd":f.root,"command":["/bin/sh","-c","true"],"heavy":false})
         )
         .status
         .success()
@@ -980,7 +980,7 @@ fn a_project_selector_routes_agent_planning_but_cannot_escape_or_retarget() {
     assert!(
         !f.run(
             "job.start",
-            json!({"task_id":"one","cwd":other,"command":["/bin/true"],"heavy":false})
+            json!({"task_id":"one","cwd":other,"command":["/bin/sh","-c","true"],"heavy":false})
         )
         .status
         .success()
