@@ -129,7 +129,8 @@ class Herdr:
 
 
 class Tui:
-    def __init__(self, binary, env, args):
+    def __init__(self, binary, env, args, columns=132):
+        self.columns = columns
         gate_read, gate_write = os.pipe()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
@@ -141,7 +142,7 @@ class Tui:
         os.close(gate_read)
         self.reaped = False
         self.output = bytearray()
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 38, 132, 0, 0))
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 38, columns, 0, 0))
         os.write(gate_write, b"1")
         os.close(gate_write)
         self.drain(0.4)
@@ -176,7 +177,7 @@ class Tui:
     def screen(self):
         # Interpret cursor placement in Ratatui's incremental ANSI output.
         # Substrings in raw bytes miss text reused from the preceding frame.
-        rows, cols = 38, 132
+        rows, cols = 38, self.columns
         cells = [[" " for _ in range(cols)] for _ in range(rows)]
         row = col = 0
         def text(value):
@@ -486,7 +487,9 @@ def onboarding(binary, runtime):
             plain_root.mkdir()
             plain_env = dict(env, HOME=str(plain_root), XDG_CONFIG_HOME=str(plain_root / "config"), PRIVATEER_FLEET=str(plain_root / "fleet.sqlite"),
                              PRIVATEER_RESOURCE_HOME=str(plain_root / "ledger"))
-            plain = Tui(binary, plain_env, args)
+            # Keep path components unbroken so reading back the displayed shell
+            # command does not insert spaces at hard wraps in long worktrees.
+            plain = Tui(binary, plain_env, args, columns=max(132, 2 * len(str(plain_root)) + 80))
             try:
                 plain.keys(b"\x15apps\t\t\t\x15" + role.encode() + b"\r")
                 plain_home = plain_root / "ships/apps/.privateer"

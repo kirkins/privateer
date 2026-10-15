@@ -115,30 +115,21 @@ without creating a home or fleet registry. `n` reopens setup in an empty fleet.
 A missing harness keeps setup open with guidance, without initializing anything.
 
 Creation uses `privateer init --ship NAME --harness ID [--liaison]` in the chosen
-folder, then `privateer service start` and Board. The chosen dedicated folder must
-be empty. If initialization succeeds before service startup fails, the ship
-remains available through existing ship and dispatcher management; onboarding
+folder, then `privateer service start`. With a configured Herdr connection,
+Board waits for the registered ship and fresh, valid home and Herdr observations;
+temporary observation failures retain the request until the action queue accepts it.
+The chosen dedicated folder must be empty. If initialization succeeds before
+service startup fails, the ship remains available through existing ship and dispatcher management; onboarding
 does not reinitialize it or change its role.
-Without Herdr, creation succeeds and the Board limitation is shown; use
-`privateer start` in that folder to talk to its first mate.
+Without a configured Herdr socket, creation succeeds and displays a shell-quoted
+`privateer --home HOME start` command to talk to its first mate directly.
 
-`privateer init --liaison` creates a default charter with `inspect`, `message`
-and `spawn` (read, communicate, delegate), without implementation authority. Its
-generated `AGENTS.md` asks about work and preferences, proposes peer ships and
-charters, helps create them and add projects, and explains direct dashboard
-access. New agent-created ships remain bounded by the creator's charter; the
-captain grants implementation rights explicitly when needed. The preset and
-checklist survive a later ordinary init; captain-edited charters and instruction
-files are preserved. It is a suggested agent interface, not evidence of an
-actual autonomous onboarding conversation.
+See [Getting aboard](architecture.md#getting-aboard) for the liaison preset,
+generated onboarding checklist and initialization refresh policy, and
+[The fleet](architecture.md#the-fleet) for agent-created ship authority.
 
-Inside Herdr (`HERDR_ENV=1`), bare `privateer` opens an executable
-`privateer-dashboard` beside the runtime or on PATH. An empty-fleet entry opens
-the dashboard before offering to initialize the current directory. An existing
-ship still gets its dispatcher ensured before the dashboard opens. Outside
-Herdr, or without an installed dashboard, existing behavior is preserved.
-`privateer start` always launches the harness directly. Install both binaries
-with `cargo install --locked --path . --features dashboard`.
+The same runtime guide covers bare `privateer` and direct `privateer start`
+entry. Installation is covered under [Build and preview](#build-and-preview).
 
 ## Boarding and management
 

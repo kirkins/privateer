@@ -1,6 +1,6 @@
 # Handoff: the dashboard as home, and onboarding
 
-Status: **steps 1–4 implemented; steps 5–7 pending**, written 14 October 2026. See [dashboard setup and boundaries](../dashboard.md) for current behavior. Read [conversation and activation](conversation-and-activation.md) for the overall design and [architecture](../architecture.md) for what exists. This document is self-contained enough to start from; where it names a command, that command exists today unless marked *new*.
+Status: **steps 1–6 implemented; step 7 pending**. See [dashboard setup and boundaries](../dashboard.md) for current behavior. Read [conversation and activation](conversation-and-activation.md) for the overall design and [architecture](../architecture.md) for what exists.
 
 ## Goal
 
@@ -8,7 +8,7 @@ A person should be able to install Privateer, type `privateer`, and land somewhe
 
 ## What exists today
 
-- **Ships are folders.** `privateer init` (or bare `privateer`, which asks first) makes the current folder a ship: state in `<folder>/.privateer`, the folder is the charter's repository root, projects go in `projects/`. It writes `AGENTS.md`, `CLAUDE.md`, Claude permissions and hooks, starts the ship's dispatcher (`privateer service status|start|stop`; a systemd user service where available, otherwise detached), and registers the ship in the fleet.
+- **Ships are folders.** State lives in `<folder>/.privateer`, the folder is the charter's repository root, and projects go in `projects/`. Setup generates harness instructions (`AGENTS.md`, `CLAUDE.md`) and Claude permissions and hooks. See [Getting aboard](../architecture.md#getting-aboard) for initialization, dashboard entry, refresh policy and dispatcher behavior.
 - **The fleet.** A per-user registry lists every ship on the machine: `fleet.list` returns `{registry, ships:[{name, home, created_by, created_ms, retired_ms}]}`. Ships are linked both ways automatically, so they can mail each other. `ship.create {name, scope?, objective?, folder?, harness?}` makes a sibling ship from inside a ship (`privateer ship new NAME`); `ship.retire {name}` retires one, keeping its folder. An agent's new ship gets at most its own charter's actions.
 - **Talking to a ship.** `privateer start [HARNESS]` launches the ship's harness in its folder as its first mate, holding the ship's presence lease (`ship.presence {ship}` shows it) so the dispatcher leaves mail to the live session. Claude Code sessions also get mail at each prompt and turn end through hooks.
 - **The captain's mail.** `captain` is a mailbox in each home. Ships send it requests, notices and decisions; `privateer inbox` reads and acknowledges it, `privateer reply ID TEXT` answers, `privateer ask SHIP TEXT` / `tell` send. JSON equivalents: `mail.inbox {"address":"captain"}`, `mail.ack`, `mail.send {"from":"captain",...}`, `mail.show`.
@@ -37,17 +37,14 @@ Implemented; the forms and confirmation rules are documented under
 
 ### 5. Onboarding
 
-On first run with an empty fleet:
-
-1. Welcome, then suggest creating a first ship, named `liaison` by default, in `~/ships/liaison`; let the person rename it, pick the folder, and choose a harness from those installed.
-2. Run `privateer init --ship <name> --harness <id>` in that folder (create it first), then Board it.
-3. The liaison's first session onboards the captain: it asks what they work on, proposes ships with scopes and charters, creates them with `ship.create`, adds projects (`privateer project add`), and explains how to reach any ship. Nothing forces a liaison: a person can make any ship first, or skip onboarding.
-
-**Small runtime piece (new):** a liaison preset, for example `privateer init --liaison`, that writes a liaison charter (read, message and delegate by default, without implementation, per the design) and an `AGENTS.md` variant with the onboarding checklist above. Coordinate it with whoever owns `src/cli.rs` (the `setup` function and `instructions`), or add it in the same work.
+Implemented; see [First run and everyday entry](../dashboard.md#first-run-and-everyday-entry)
+for the form and creation flow, and [Getting aboard](../architecture.md#getting-aboard)
+for the liaison preset and generated instructions.
 
 ### 6. Opening into the dashboard
 
-Last step, once Board works: bare `privateer` should open the dashboard when running inside Herdr (`HERDR_ENV=1`) and `privateer-dashboard` is installed (on `PATH` or beside the `privateer` binary), and otherwise keep today's behaviour of starting the ship's harness. The change belongs at the end of `board` in `src/cli.rs`, which currently calls `start(&home, &[])` after making sure the dispatcher runs. Keep `privateer start` as the direct path. Installation should cover both binaries: `cargo install --locked --path . --features dashboard`.
+Implemented; see [Getting aboard](../architecture.md#getting-aboard) for entry
+behavior and [Build and preview](../dashboard.md#build-and-preview) for installation.
 
 ### 7. tmux fallback (later)
 
