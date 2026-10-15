@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the real demo TUI in an isolated PTY; no Herdr/fleet access."""
+"""Exercise demo and live TUIs in isolated PTYs with private fake Herdr/fleet state."""
 import argparse
 import errno
 import fcntl
