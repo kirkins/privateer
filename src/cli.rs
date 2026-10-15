@@ -764,6 +764,7 @@ fn dashboard_binary() -> Option<PathBuf> {
 fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let mut command = std::process::Command::new(binary);
+    command.arg("--board-liaison");
     if let Some(home) = home {
         command.arg("--home").arg(home);
     }

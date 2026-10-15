@@ -245,7 +245,9 @@ def run(binary, runtime):
         harness.chmod(0o755)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("PRIVATEER_") and not k.startswith("HERDR_")}
-        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
+        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"),
+                   XDG_STATE_HOME=str(root / "state"), XDG_DATA_HOME=str(root / "data"), XDG_CACHE_HOME=str(root / "cache"),
+                   PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color",
                    PATH=os.pathsep.join([str(bins), str(Path(sys.executable).parent), os.environ.get("PATH", "/usr/bin:/bin")]))
 
@@ -407,7 +409,9 @@ def onboarding(binary, runtime):
         (bins / "privateer").symlink_to(runtime)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("PRIVATEER_") and not k.startswith("HERDR_")}
-        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
+        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"),
+                   XDG_STATE_HOME=str(root / "state"), XDG_DATA_HOME=str(root / "data"), XDG_CACHE_HOME=str(root / "cache"),
+                   PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
                    PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color", PATH=str(bins)+":/usr/bin:/bin")
         # Real bare-runtime entry works with every HERDR_* variable absent,
         # as well as inside Herdr, before initializing the current folder.
@@ -467,10 +471,164 @@ def onboarding(binary, runtime):
             tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
             tui.drain(2.5)
             assert server.creates == 1 and server.focuses == 0 and not server.errors, server.errors
+            # Everyday entry must reach the native conversation, leaving this
+            # dashboard alive as the observability tab. Reopening must reuse
+            # the exact presence binding rather than start another first mate.
+            tui.close()
+            tui = None
+            tui = Tui(binary, env, ["--herdr-socket", str(server.path)])
+            tui.drain(2.5)
+            assert server.creates == 1 and server.focuses == 0, "direct dashboard entry launched or focused an agent"
+            tui.close()
+            tui = None
+            once = subprocess.run([str(binary), "--once", "--board-liaison", "--herdr-socket", str(server.path)],
+                                  env=env, capture_output=True, check=True, timeout=10)
+            assert json.loads(once.stdout)["read_only"] is True
+            assert server.creates == 1 and server.focuses == 0, "--once performed a startup action"
+            tui = Tui(runtime, env, [], cwd=root)
+            tui.until(lambda: "to talk directly, run:" in tui.screen(), "ordinary entry did not explain how to reach the liaison")
+            tui.keys(b"l")
+            assert server.creates == 1 and server.focuses == 0, "ordinary entry discovered an unconfigured socket"
+            tui.close()
+            tui = None
+            entry_env = dict(env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(server.path))
+            tui = Tui(runtime, entry_env, [], cwd=root)
+            tui.until(lambda: server.focuses == 1, "bare privateer did not automatically focus the liaison")
+            tui.drain(2.5)
+            assert server.creates == 1 and server.focuses == 1
+            tui.keys(b"0l")
+            tui.until(lambda: server.focuses == 2, "Talk to liaison needed another Board action")
+            screen = tui.screen().splitlines()
+            row, line = next((row, line) for row, line in enumerate(screen) if "[l Liaison]" in line)
+            column = line.index("[l Liaison]")
+            tui.keys(f"\x1b[<0;{column+1};{row+1}M\x1b[<0;{column+1};{row+1}m".encode())
+            tui.until(lambda: server.focuses == 3, "Talk to liaison click did not focus the conversation")
+            tui.close()
+            tui = None
+            # End the attended session while retaining its old Herdr pane.
+            # Next entry must create a fresh conversation automatically.
+            (root / "release").touch()
+            for child in server.children:
+                _, error = child.communicate(timeout=5)
+                assert child.returncode == 0, error.decode()
+            (root / "release").unlink()
+            (root / "harness-started").unlink()
+            tui = Tui(runtime, entry_env, [], cwd=root)
+            tui.until(lambda: (root / "harness-started").exists(), "bare privateer did not open an offline liaison")
+            tui.until(lambda: query("ship.presence", {"ship":"contact"})["attended"], "automatic liaison launch did not claim presence")
+            assert query("ship.presence", {"ship":"contact"})["lease"]["binding"]["pane"]["pane_id"] == "w1:p2"
+            tui.drain(2.5)
+            assert server.creates == 2 and server.focuses == 3 and not server.errors, server.errors
         finally:
             if tui:
                 tui.close()
             server.close()
+        for change in ["ambiguous", "removed", "contact", "home", "navigation"]:
+            for attended in [False, True]:
+                startup_root = root / f"startup-{change}-{attended}"
+                startup_root.mkdir()
+                startup_env = dict(env, HOME=str(startup_root), XDG_CONFIG_HOME=str(startup_root / "config"),
+                                   PRIVATEER_FLEET=str(startup_root / "fleet.sqlite"),
+                                   PRIVATEER_RESOURCE_HOME=str(startup_root / "ledger"))
+                def startup_command(name, *arguments):
+                    return subprocess.run([str(runtime), "--home", str(startup_root / name / ".privateer"), *arguments],
+                                          cwd=startup_root, env=startup_env, capture_output=True, check=True, timeout=10).stdout
+                startup_command("contact", "init", "--ship", "contact", "--harness", "codex", "--liaison")
+                if change == "navigation":
+                    startup_command("other", "init", "--ship", "other", "--harness", "codex")
+                startup_server = Herdr(startup_root, startup_env)
+                startup_entry = dict(startup_env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(startup_server.path))
+                startup = None
+                try:
+                    if attended:
+                        startup = Tui(runtime, startup_entry, [])
+                        startup.until(lambda: json.loads(startup_command("contact", "ship.presence", "--json", '{"ship":"contact"}'))["attended"],
+                                      "startup fixture did not establish attended presence")
+                        startup.close()
+                        startup = None
+                    counts = (startup_server.creates, startup_server.focuses)
+                    startup_server.protocol = 19
+                    startup = Tui(runtime, startup_entry, [])
+                    startup.until(lambda: "HERDR UNAVAILABLE" in startup.screen(), "startup did not observe the Herdr outage")
+                    assert "No Herdr connection configured" not in startup.screen(), "configured outage was reported as missing context"
+                    assert "Liaison · your default contact" in startup.screen()
+                    if change == "navigation":
+                        for tab in ["2 Assignments", "3 Terminals", "4 Logbook"]:
+                            startup.keys(tab[0].encode())
+                            startup.drain(1.2)
+                            for direction in [b"\x1b[B", b"\x1b[A"]:
+                                startup.keys(direction)
+                                assert f"contact / {tab}" in startup.screen().splitlines()[1], "pending startup stole workspace focus"
+                                assert "automatic Board cancelled" not in startup.screen(), "workspace navigation cancelled startup Board"
+                        startup.keys(b"0")
+                    elif change in ["ambiguous", "contact"]:
+                        arguments = ["init", "--ship", "other", "--harness", "codex"]
+                        if change == "ambiguous":
+                            arguments.append("--liaison")
+                        startup_command("other", *arguments)
+                        if change == "contact":
+                            (startup_root / "contact/.privateer/dashboard.json").write_text(
+                                json.dumps({"ships":[{"id":"other", "name":"other", "liaison":True}]}))
+                    else:
+                        startup_command("contact", "ship", "retire", "contact")
+                        if change == "home":
+                            startup_command("replacement", "init", "--ship", "contact", "--harness", "codex", "--liaison")
+                    startup.until(lambda: "automatic Board cancelled" in startup.screen(),
+                                  f"{change} liaison did not cancel startup Board")
+                    if change == "navigation":
+                        assert " / 1 Bridge" not in startup.screen().splitlines()[1], "startup stole fleet navigation"
+                        startup.keys(b"i")
+                        startup.until(lambda: "Captain's inbox · message details" in startup.screen(), "startup prevented inbox navigation")
+                    startup_server.protocol = 20
+                    startup.until(lambda: "HERDR UNAVAILABLE" not in startup.screen(), "startup did not observe Herdr recovery", timeout=25)
+                    startup.drain(2.5)
+                    assert (startup_server.creates, startup_server.focuses) == counts, (change, attended)
+                    if change == "navigation":
+                        assert "Captain's inbox · message details" in startup.screen(), "Herdr recovery stole inbox navigation"
+                        startup.keys(b"l")
+                        expected = (counts[0], counts[1] + 1) if attended else (1, 0)
+                        startup.until(lambda: (startup_server.creates, startup_server.focuses) == expected,
+                                      "explicit Talk did not work after cancelling automatic startup")
+                        startup.until(lambda: (startup_root / "harness-started").exists(), "explicit Talk did not reach the harness")
+                    if change == "ambiguous":
+                        startup_command("other", "ship", "retire", "other")
+                        startup.until(lambda: "Liaison · your default contact" in startup.screen(), "unique contact did not recover")
+                        startup.drain(2.5)
+                        assert (startup_server.creates, startup_server.focuses) == counts, "cancelled startup intent resumed"
+                    assert (startup_root / "harness-started").exists() == (attended or change == "navigation")
+                    assert not startup_server.errors, startup_server.errors
+                finally:
+                    if startup:
+                        startup.close()
+                    startup_server.close()
+        ordinary_root = root / "ordinary-onboarding"
+        ordinary_root.mkdir()
+        ordinary_env = dict(env, HOME=str(ordinary_root), XDG_CONFIG_HOME=str(ordinary_root / "config"),
+                            PRIVATEER_FLEET=str(ordinary_root / "fleet.sqlite"),
+                            PRIVATEER_RESOURCE_HOME=str(ordinary_root / "ledger"))
+        ordinary_server = Herdr(ordinary_root, ordinary_env)
+        ordinary_server.protocol = 19
+        ordinary = None
+        ordinary_home = ordinary_root / "chosen/.privateer"
+        try:
+            ordinary = Tui(binary, ordinary_env, ["--herdr-socket", str(ordinary_server.path)])
+            ordinary.until(lambda: "HERDR UNAVAILABLE" in ordinary.screen(), "ordinary onboarding did not observe Herdr outage")
+            ordinary.keys(b"\x15chosen\t\x15" + str(ordinary_home.parent).encode() + b"\t\t\x15ship\r")
+            ordinary.until(lambda: "Bridge" in ordinary.screen(), "ordinary ship was not created and selected")
+            assert json.loads((ordinary_home / "config.json").read_text()).get("preset") != "liaison"
+            assert ordinary_server.creates == 0
+            ordinary_server.protocol = 20
+            ordinary.until(lambda: (ordinary_root / "harness-started").exists(), "ordinary onboarding did not Board after recovery", timeout=25)
+            presence = subprocess.run([str(runtime), "--home", str(ordinary_home), "ship.presence", "--json", '{"ship":"chosen"}'],
+                                      env=ordinary_env, capture_output=True, check=True, timeout=10)
+            assert json.loads(presence.stdout)["attended"]
+            ordinary.drain(2.5)
+            assert ordinary_server.creates == 1 and ordinary_server.focuses == 0
+            assert not ordinary_server.errors, ordinary_server.errors
+        finally:
+            if ordinary:
+                ordinary.close()
+            ordinary_server.close()
         multi_root = root / "multiple-presets"
         multi_root.mkdir()
         multi_env = dict(env, HOME=str(multi_root), XDG_CONFIG_HOME=str(multi_root / "config"),
@@ -503,7 +661,7 @@ def onboarding(binary, runtime):
             gamma = {"id":"gamma", "name":"gamma", "liaison":True}
             alpha_config.write_text(json.dumps({"ships":[gamma]}))
             multi.until(lambda: "Liaison · your default contact" in multi.screen(), "explicit contact did not override preset candidates")
-            multi.keys(b"lb")
+            multi.keys(b"l")
             multi.until(lambda: multi_server.focused == ["w1:p3"], "explicit contact did not focus the chosen ordinary ship")
             beta_config.write_text(json.dumps({"ships":[{"id":"beta", "name":"beta", "liaison":True}]}))
             multi.until(lambda: "PRESENTATION UNAVAILABLE" in multi.screen(), "conflicting explicit contacts did not fail safely")
@@ -634,4 +792,4 @@ def onboarding(binary, runtime):
                 assert not (plain_root / "escaped").exists()
             finally:
                 plain.close()
-        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")
+        print("Onboarding PTY passed: ordinary/Herdr bare-runtime welcome and skip without state or harness launch, renamed liaison/custom folder/installed harness, ordinary and liaison onboarding Board after Herdr recovery, bare entry opens/focuses the liaison with keyboard/mouse return and no duplicate launch, startup cancels ambiguous/removed/changed contacts and homes for idle and attended ships without resuming or retargeting, multiple presets remain boardable with explicit contact preference and conflict rejection, replacement home never boarded automatically, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")

@@ -640,6 +640,10 @@ fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh
     click_text(&mut app, &screen, "[l Talk to liaison]");
     assert_eq!(app.ship.as_deref(), Some("navigator"));
     assert!(!app.inbox_open);
+    assert!(
+        app.board_requested,
+        "Talk must open the conversation, not just its dashboard view"
+    );
     assert!(render(&mut app, 120, 34).contains("Liaison · your default contact"));
     assert_eq!(serde_json::to_value(&app.snapshot).unwrap(), before);
     app.select_ship(None);
