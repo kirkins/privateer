@@ -255,6 +255,35 @@ def run(binary, runtime):
             tui.keys(b"b")
             tui.until(lambda: server.focuses == 1, "Board again did not focus the bound pane")
             assert server.creates == 1
+            presentation = folder / ".privateer" / "dashboard.json"
+            terminal = {key: lease["binding"]["pane"][key] for key in ("pane_id", "terminal_id")}
+            own = {"id": "apps", "name": "Apps", "liaison": True}
+            foreign = {"id": "crew", "name": "Crew", "terminals": [terminal]}
+            valid = dict(own, terminals=[terminal])
+            for configuration in [json.dumps({"ships": [own, foreign]}),
+                                  json.dumps({"ships": [valid, foreign]}), "invalid JSON"]:
+                presentation.write_text(configuration)
+                tui.until(lambda: "PRESENTATION UNAVAILABLE" in tui.screen(), "presentation conflict was not surfaced")
+                tui.keys(b"bflf")
+                assert (server.creates, server.focuses) == (1, 1), "invalid claims allowed Board/focus navigation"
+                presentation.write_text(json.dumps({"ships": [valid]}))
+                tui.until(lambda: "PRESENTATION UNAVAILABLE" not in tui.screen(), "presentation did not recover")
+            original_session = lease["binding"]["pane"]["agent_session"]
+            assert original_session is not None, "fake native session was not pinned"
+            with server.lock:
+                server.panes[0]["agent_session"] = {"kind": "id", "value": "replacement"}
+            tui.keys(b"3")
+            tui.until(lambda: "No connected terminals bound" in tui.screen(), "manual binding bypassed the pinned native session")
+            tui.keys(b"bflf")
+            tui.drain(2.2)
+            assert (server.creates, server.focuses) == (1, 1), "replaced native session allowed Board/focus navigation"
+            with server.lock:
+                server.panes[0]["agent_session"] = original_session
+            tui.keys(b"3")
+            tui.until(lambda: "No connected terminals bound" not in tui.screen(), "native binding did not recover")
+            tui.keys(b"b")
+            tui.until(lambda: server.focuses == 2, "Board did not focus after identity recovery")
+            tui.keys(b"1")
             tui.keys(b"d\r")
             tui.until(lambda: "service:" in tui.screen(), "dispatcher completion did not reach the UI")
             tui.keys(b"nnewworker\tScope of worker\r")
@@ -271,4 +300,4 @@ def run(binary, runtime):
                 tui.close()
             server.close()
         assert not command("ship.presence", {"ship": "apps"})["attended"]
-        print("Live dashboard PTY passed: captain reply, Board/start/presence/binding, focus, dispatcher status, new/retire; isolated fake Herdr only.")
+        print("Live dashboard PTY passed: captain reply, Board/start/presence/binding, conflict and session rejection/recovery, focus, dispatcher status, new/retire; isolated fake Herdr only.")
