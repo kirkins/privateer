@@ -7,6 +7,24 @@ use std::process::Output;
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 
+// Concurrent forks can briefly inherit a fixture copy's writable descriptor
+// until exec closes it. Match the executable-replacement fixtures: retry only
+// ETXTBSY, before any product process has started, for at most two seconds.
+fn fixture_output(command: &mut std::process::Command) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match command.output() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result.unwrap(),
+        }
+    }
+}
+
 struct Place {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -49,7 +67,8 @@ impl Place {
         }
     }
     fn run(&self, dir: &PathBuf, args: &[&str], service: &str) -> Output {
-        support::command(&self.binary)
+        let mut command = support::command(&self.binary);
+        command
             .args(args)
             .current_dir(dir)
             .env("PATH", &self.path)
@@ -62,9 +81,8 @@ impl Place {
             .env_remove("PRIVATEER_ROLE")
             .env_remove("PRIVATEER_ACTOR")
             .env_remove("HERDR_ENV")
-            .env_remove("HERDR_SOCKET_PATH")
-            .output()
-            .unwrap()
+            .env_remove("HERDR_SOCKET_PATH");
+        fixture_output(&mut command)
     }
     fn probes(&self) -> Vec<String> {
         fs::read_to_string(&self.probe)
@@ -259,7 +277,7 @@ fn dashboard_entry_uses_installed_sibling_or_path_in_both_environments() {
         if herdr {
             command.env("HERDR_ENV", "1");
         }
-        command.output().unwrap()
+        fixture_output(&mut command)
     };
     // The first runtime finds a sibling; the second finds the same probe on PATH.
     for binary in [&place.binary, &path_binary] {
