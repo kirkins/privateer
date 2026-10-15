@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from protocol import context, option, serve
+from tool_permissions import options_for, claude_rules, policy
 
 
 PROFILES = {
@@ -71,7 +72,9 @@ def build(harness, request):
     if harness in ("rovo", "kimi", "devin", "grok"):
         allowed |= {"transport", "acp_permissions"}
     if harness == "codex":
-        allowed |= {"sandbox", "ephemeral"}
+        allowed |= {"sandbox", "ephemeral", "yolo"}
+    if harness == "opencode-v2":
+        allowed |= {"auto"}
     if harness in ("pi", "pi-signed", "omp"):
         allowed |= {"provider", "ephemeral"}
     if harness in ("pi", "pi-signed", "omp"):
@@ -95,6 +98,8 @@ def build(harness, request):
                     "permission_mode", "bare", "msp_permissions", "msp_approval_mode"}
     if not isinstance(options, dict) or set(options) - allowed:
         raise ValueError("unknown native option")
+    tool_policy = policy(request["context"].get("tool_permissions"))
+    options = options_for(harness, options, tool_policy)
     mode = selector(options, "mode", ["headless", "interactive"]) or "headless"
     model = option(options, "model")
     effort = selector(options, "effort", profile["effort"])
@@ -162,6 +167,8 @@ def build(harness, request):
         elif resume:
             argv += ["resume"]
         argv += ["-C", repo]
+        if boolean(options, "yolo"):
+            argv += ["--dangerously-bypass-approvals-and-sandbox"]
         sandbox = selector(options, "sandbox", ["read-only", "workspace-write", "danger-full-access"])
         if sandbox:
             argv += ["--sandbox", sandbox]
@@ -262,10 +269,11 @@ def build(harness, request):
         # its trust dialog, which a new ship's folder never had. Grant the
         # Privateer CLI on the command line so the agent can reach its home.
         control = request["context"].get("control")
-        if control:
-            argv += ["--allowedTools", f"Bash({control['cli_argv'][0]}:*)"]
+        argv += ["--allowedTools", *claude_rules(tool_policy, control)]
         argv += ["--", prompt]
     elif harness == "opencode-v2":
+        if boolean(options, "auto"):
+            argv += ["--auto"]
         # V2 uses a different CLI/server/plugin contract. A private server
         # keeps tools in this job's actor environment, outside a shared daemon.
         if not headless and (model or effort):
@@ -433,8 +441,11 @@ def build(harness, request):
 
 def handle(harness, request):
     repo, argv = build(harness, request)
+    prefix = (["--control", json.dumps(request["context"].get("control"))] if harness == "claude" else [])
+    if harness == "opencode" and policy(request["context"].get("tool_permissions"))["mode"] == "yolo":
+        prefix = ["--opencode-yolo"]
     return {"valid": True} if request["method"] == "validate" else {
-        "argv": argv if len(argv) > 1 and argv[0] == sys.executable and argv[1] in [str(Path(__file__).with_name(name)) for name in ("acp.py", "msp.py", "omp_rpc.py")] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), harness, *argv],
+        "argv": argv if len(argv) > 1 and argv[0] == sys.executable and argv[1] in [str(Path(__file__).with_name(name)) for name in ("acp.py", "msp.py", "omp_rpc.py")] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), *prefix, harness, *argv],
         "cwd": repo, "env_names": []}
 
 

@@ -63,6 +63,8 @@ shows a quoted `privateer --home HOME start` command for direct access.
 
 The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. In the legacy flow, scripts can use `privateer --yes` to skip the initialization question.
 
+Claude ships can run Git and GitHub CLI commands without per-folder permission edits. Use `privateer permissions yolo` (Telegram: `/yolo on`) to select YOLO for every first mate's next launch, or `privateer permissions standard` to restore normal profile behavior. Additional tools use captain-managed fleet rules. See [Tool permissions](docs/tool-permissions.md).
+
 To talk to your liaison from your phone, add the Telegram front door: `privateer door add telegram --config ~/.config/privateer/telegram.toml && privateer door start telegram` (see [the Telegram door](plugins/telegram/README.md)). Front doors are fleet-wide adapters that carry the captain's mail; see [architecture](docs/architecture.md#front-doors).
 
 For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable).

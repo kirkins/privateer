@@ -76,6 +76,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "validate"
             };
             let mut request = json!({"id": id, "version": 1, "method": method, "context": context, "options": options});
+            request["context"]["tool_permissions"] = crate::permissions::for_store(store)?;
             if let Some(path) = config {
                 request["config_path"] = json!(path);
             }
@@ -90,6 +91,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 response["version"] == 1 && response["id"] == id,
                 "plugin response identity or version mismatch"
             );
+            if response["error_code"] == "unsupported-tool-policy" {
+                bail!(
+                    "fleet YOLO is unavailable for this harness transport; select a supported transport or standard mode"
+                );
+            }
             ensure!(
                 response["ok"] == true,
                 "plugin refused request (diagnostics withheld to avoid exposing credentials)"

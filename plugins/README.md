@@ -1,5 +1,13 @@
 # Optional trusted adapters
 
+Native launches receive the captain's fleet `context.tool_permissions` policy.
+Standard Claude launches pre-approve Privateer, Git and GitHub CLI commands;
+YOLO is translated into native flags without editing harness settings or provider
+configuration. Attended launches use the same policy. Custom adapters must honor
+this policy explicitly; unsupported bundled transports refuse YOLO rather than
+silently falling back. See [Fleet tool permissions](../docs/tool-permissions.md)
+for the CLI, Telegram controls, mappings and Claude permission-block reporting.
+
 Privateer core knows tasks, charters, jobs and events. Harnesses and personal provider routes live here, outside the core. Installing an adapter does not enable it: select its manifest explicitly when planning or starting an agent. A charter's optional `provider_plugin` pins `{"manifest":"/absolute/manifest.json","config":"/optional/private/config.json"}`. Omitted call arguments use those paths; different supplied paths are refused. Manifest and private config contents remain trusted operator-controlled files; this is not a cryptographic or network boundary.
 
 Plugin manifests remain JSON; harness discovery looks for `manifest.json`.

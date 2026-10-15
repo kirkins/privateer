@@ -155,6 +155,12 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
                         "acp.py"
                     })
             );
+        } else if name == "claude" {
+            assert_eq!(planned["argv"][2], "--control");
+            let control: Value =
+                serde_json::from_str(planned["argv"][3].as_str().unwrap()).unwrap();
+            assert_eq!(control["cli_argv"][2], json!(f.store.home()));
+            assert_eq!(planned["argv"][4], "claude");
         } else {
             assert_eq!(planned["argv"][2], name);
         }
@@ -540,6 +546,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/omp_rpc.py",
         "tests/agy_turn.py",
         "tests/result_turn.py",
+        "tests/tool_permissions.py",
         "tests/opencode_v2.py",
     ] {
         let output = support::command("python3")
