@@ -162,7 +162,11 @@ fn call(peer: &Peer, id: &str, command: &str, args: Value, caller: &Caller) -> R
     remote_argv.push("rpc");
     let mut child_command = if peer.transport == "local" {
         let mut cmd = Command::new(&peer.executable);
-        cmd.args(&remote_argv[1..]);
+        // As over SSH, the identity is the flags above, never this
+        // process's inherited environment.
+        cmd.args(&remote_argv[1..])
+            .env_remove("PRIVATEER_ROLE")
+            .env_remove("PRIVATEER_ACTOR");
         cmd
     } else {
         let ssh = std::env::var_os("PRIVATEER_SSH_EXECUTABLE").unwrap_or_else(|| "ssh".into());

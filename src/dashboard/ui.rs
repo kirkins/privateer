@@ -119,17 +119,33 @@ impl App {
             .get(self.selected)
             .map(|&i| &self.snapshot.tasks[i])
     }
-    fn binds(ship: &super::model::Ship, view: &herdr::View, pane: &herdr::Pane) -> bool {
-        ship.terminals
-            .iter()
-            .any(|b| b.pane_id == pane.pane_id && b.terminal_id == pane.terminal_id)
+    fn claims_pane(ship: &super::model::Ship, view: &herdr::View, pane: &herdr::Pane) -> bool {
+        ship.terminals.iter().any(|b| b.pane_id == pane.pane_id)
             || ship
                 .live
                 .as_ref()
                 .and_then(|l| l.binding.as_ref())
                 .is_some_and(|b| b.matches(view, pane))
     }
+    fn binds(ship: &super::model::Ship, view: &herdr::View, pane: &herdr::Pane) -> bool {
+        if let Some(binding) = ship
+            .live
+            .as_ref()
+            .and_then(|live| live.binding.as_ref())
+            .filter(|binding| {
+                binding.pane.pane_id == pane.pane_id || binding.pane.terminal_id == pane.terminal_id
+            })
+        {
+            return binding.matches(view, pane);
+        }
+        ship.terminals.iter().any(|binding| {
+            binding.pane_id == pane.pane_id && binding.terminal_id == pane.terminal_id
+        })
+    }
     pub fn binding_ambiguous(&self) -> bool {
+        if self.snapshot.presentation_error.is_some() {
+            return true;
+        }
         let Some(view) = &self.herdr else {
             return false;
         };
@@ -142,15 +158,18 @@ impl App {
             return false;
         };
         view.panes.iter().any(|p| {
-            Self::binds(ship, view, p)
+            Self::claims_pane(ship, view, p)
                 && self
                     .snapshot
                     .ships
                     .iter()
-                    .any(|other| other.id != ship.id && Self::binds(other, view, p))
+                    .any(|other| other.id != ship.id && Self::claims_pane(other, view, p))
         })
     }
     pub fn scoped_panes(&self) -> Vec<&herdr::Pane> {
+        if self.snapshot.presentation_error.is_some() {
+            return Vec::new();
+        }
         let Some(ship) = self
             .snapshot
             .ships
@@ -181,11 +200,12 @@ impl App {
                     .filter(|p| automatic.is_none_or(|a| a.pane_id != p.pane_id)),
             )
             .filter(|p| {
-                !self
-                    .snapshot
-                    .ships
-                    .iter()
-                    .any(|other| other.id != ship.id && Self::binds(other, view, p))
+                Self::binds(ship, view, p)
+                    && !self
+                        .snapshot
+                        .ships
+                        .iter()
+                        .any(|other| other.id != ship.id && Self::claims_pane(other, view, p))
             })
             .collect()
     }

@@ -46,6 +46,68 @@ fn err(result: anyhow::Result<Value>) -> String {
 }
 
 #[test]
+fn pending_coalesces_a_burst_without_reading_or_acknowledging_bodies() {
+    let (_temp, mut s) = fleet();
+    let mut through = json!(0);
+    for n in 0..1000 {
+        through = send(
+            &mut s,
+            json!({"id":format!("burst-{n}"),"from":"apps","to":"infra",
+            "kind":"notice","urgency":"low","body":"durable body, never in notification"}),
+        )
+        .unwrap()["seq"]
+            .clone();
+    }
+    let snapshot = dispatch(&mut s, "mail.pending", json!({"address":"infra"})).unwrap();
+    assert_eq!(snapshot["count"], 1000);
+    assert_eq!(snapshot["actionable"], 0);
+    assert_eq!(snapshot["through_seq"], through);
+    assert_eq!(snapshot["headers"].as_array().unwrap().len(), 6);
+    assert_eq!(snapshot["headers"][0]["id"], "burst-999");
+    assert!(!snapshot.to_string().contains("durable body"));
+    assert!(snapshot.to_string().len() < 2048);
+    assert_eq!(snapshot["acknowledged_through"], 0);
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"burst-0"})).unwrap()["body"],
+        "durable body, never in notification"
+    );
+    let request = send(
+        &mut s,
+        json!({"id":"fresh","from":"apps","to":"infra",
+        "kind":"request","urgency":"low","body":"Act on this"}),
+    )
+    .unwrap();
+    let next = dispatch(
+        &mut s,
+        "mail.pending",
+        json!({"address":"infra","after_seq":through}),
+    )
+    .unwrap();
+    assert_eq!(next["count"], 1);
+    assert_eq!(next["actionable"], 1);
+    assert_eq!(next["through_seq"], request["seq"]);
+    assert_eq!(next["acknowledged_through"], 0);
+    dispatch(
+        &mut s,
+        "mail.ack",
+        json!({"address":"infra","through_seq":through}),
+    )
+    .unwrap();
+    let acknowledged = dispatch(
+        &mut s,
+        "mail.pending",
+        json!({"address":"infra","after_seq":0}),
+    )
+    .unwrap();
+    assert_eq!(acknowledged["after_seq"], through);
+    assert_eq!(acknowledged["count"], 1);
+    s.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    assert!(dispatch(&mut s, "mail.pending", json!({"address":"infra"})).is_err());
+}
+
+#[test]
 fn directory_records_ships_and_reserves_the_captain() {
     let (_temp, mut s) = fleet();
     let ships = dispatch(&mut s, "ship.list", json!({})).unwrap();

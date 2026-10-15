@@ -15,7 +15,8 @@ use std::io::Read;
 use std::path::Path;
 
 const MAX_TTL_SECS: u64 = 86_400;
-const BODY_CHARS: usize = 1_500;
+// As much of a message as a wake shows, so crew log tails survive.
+const BODY_CHARS: usize = 2_000;
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -74,10 +75,10 @@ pub fn attend(
     store.connection().execute(
         "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms, binding) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(ship) DO UPDATE SET
-           started_ms = CASE WHEN holder = excluded.holder THEN started_ms ELSE excluded.started_ms END,
+           started_ms = CASE WHEN holder = excluded.holder AND expires_ms > excluded.started_ms THEN started_ms ELSE excluded.started_ms END,
            holder = excluded.holder, harness = COALESCE(excluded.harness, harness),
            expires_ms = excluded.expires_ms,
-           binding = CASE WHEN holder=excluded.holder THEN binding ELSE excluded.binding END",
+           binding = CASE WHEN holder=excluded.holder AND expires_ms > excluded.started_ms THEN binding ELSE excluded.binding END",
         params![ship, holder, harness, now, now + ttl_secs as i64 * 1000,binding],
     )?;
     presence(store, ship)
@@ -108,6 +109,20 @@ pub fn leave(store: &Store, ship: &str, holder: &str) -> Result<bool> {
     Ok(store.connection().execute(
         "DELETE FROM presence WHERE ship=?1 AND holder=?2",
         params![ship, holder],
+    )? == 1)
+}
+
+/// A heartbeat may extend its own lease, never reclaim a replacement.
+pub fn refresh(store: &Store, ship: &str, holder: &str, ttl_secs: u64) -> Result<bool> {
+    local_ship(store, ship)?;
+    ensure!(
+        (1..=MAX_TTL_SECS).contains(&ttl_secs),
+        "ttl_secs must be 1..{MAX_TTL_SECS}"
+    );
+    let now = Store::now_ms();
+    Ok(store.connection().execute(
+        "UPDATE presence SET expires_ms=?3 WHERE ship=?1 AND holder=?2 AND expires_ms>?4",
+        params![ship, holder, now + ttl_secs as i64 * 1000, now],
     )? == 1)
 }
 
@@ -252,6 +267,11 @@ pub fn claude_hook(home: Option<&Path>, event: &str) -> i32 {
 }
 
 fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
+    // A supervised crew job may inherit this project's Claude settings and
+    // the captain's environment. It has a brief, not an attended mailbox.
+    if std::env::var_os("PRIVATEER_JOB").is_some() {
+        return Ok(0);
+    }
     let mut store = Store::open(home)?;
     store.set_caller(crate::store::Caller::resolve(
         std::env::var("PRIVATEER_ROLE").ok().as_deref(),
@@ -262,27 +282,56 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
     let Some(ship) = folder_ship(&store) else {
         return Ok(0);
     };
+    if let crate::store::Caller::Agent { actor } = store.caller() {
+        ensure!(actor == &ship, "hook actor must be this folder's ship");
+    }
     let input: Value = serde_json::from_str(payload).unwrap_or(json!({}));
-    let holder = format!(
-        "claude:{}",
-        input["session_id"].as_str().unwrap_or("unknown")
-    );
+    let wrapped = std::env::var("PRIVATEER_PRESENCE_HOLDER").ok();
+    let holder = wrapped.clone().unwrap_or_else(|| {
+        format!(
+            "claude:{}",
+            input["session_id"].as_str().unwrap_or("unknown")
+        )
+    });
+    if wrapped.is_some() && !refresh(&store, &ship, &holder, 90)? {
+        return Ok(0);
+    }
+    // The native mod sets this only after it has loaded and verified this
+    // session's lease. A refused/disabled mod never disables the old hooks;
+    // a crashed or unloaded mod's heartbeat expires without a config rewrite.
+    let now = Store::now_ms();
+    let native_mail = wrapped.is_some()
+        && std::env::var("PRIVATEER_CLAUDE_MAIL_UNTIL")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .is_some_and(|until| until > now && until <= now + 15_000);
     match event {
         "SessionStart" => {
-            attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            if wrapped.is_none() {
+                attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            }
             let bearings = crate::context::bearings(&store, &ship)?;
             print!(
                 "You are the first mate of the ship {ship}; the captain is aboard.\n{}",
                 bearings["text"].as_str().unwrap_or("")
             );
-            let mail = present(&store, &ship)?;
+            let mail = if native_mail {
+                vec![]
+            } else {
+                present(&store, &ship)?
+            };
             if !mail.is_empty() {
                 print!("{}", render(&ship, &mail));
             }
             Ok(0)
         }
         "UserPromptSubmit" => {
-            attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            if native_mail {
+                return Ok(0);
+            }
+            if wrapped.is_none() {
+                attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            }
             let mail = present(&store, &ship)?;
             if !mail.is_empty() {
                 print!("{}", render(&ship, &mail));
@@ -290,7 +339,12 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
             Ok(0)
         }
         "Stop" => {
-            attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            if native_mail {
+                return Ok(0);
+            }
+            if wrapped.is_none() {
+                attend(&store, &ship, &holder, HOOK_TTL_SECS, Some("claude"))?;
+            }
             let mail = present(&store, &ship)?;
             if mail.is_empty() {
                 return Ok(0);
@@ -300,7 +354,9 @@ fn claude_hook_inner(home: &Path, event: &str, payload: &str) -> Result<i32> {
             Ok(2)
         }
         "SessionEnd" => {
-            leave(&store, &ship, &holder)?;
+            if wrapped.is_none() {
+                leave(&store, &ship, &holder)?;
+            }
             Ok(0)
         }
         _ => Ok(0),

@@ -17,7 +17,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/privateer-dashboard")
     args = parser.parse_args()
-    binary = str(Path(args.binary).resolve())
+    binary = Path(args.binary).resolve()
+    demo(str(binary))
+    from dashboard_live_smoke import run, onboarding
+    run(binary, binary.with_name("privateer"))
+    onboarding(binary, binary.with_name("privateer"))
+
+
+def demo(binary):
     gate_read, gate_write = os.pipe()
     pid, terminal = pty.fork()
     if pid == 0:
@@ -112,10 +119,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Keep the live path in the same CI entry point as the existing demo smoke.
-if __name__ == "__main__":
-    from dashboard_live_smoke import run, onboarding
-    import sys
-    live_binary = Path(sys.argv[sys.argv.index("--binary") + 1] if "--binary" in sys.argv else "target/debug/privateer-dashboard").resolve()
-    run(live_binary, live_binary.with_name("privateer"))
-    onboarding(live_binary, live_binary.with_name("privateer"))

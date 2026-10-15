@@ -1,7 +1,9 @@
+mod support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 
@@ -42,7 +44,7 @@ impl Place {
         }
     }
     fn run(&self, dir: &PathBuf, args: &[&str], service: &str) -> Output {
-        Command::new(BIN)
+        support::command(BIN)
             .args(args)
             .current_dir(dir)
             .env("PATH", &self.path)
@@ -173,7 +175,7 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let run = |args: &[&str]| {
-        Command::new(BIN)
+        support::command(BIN)
             .args(args)
             .current_dir(&place.folder)
             .env("PATH", &place.path)
@@ -229,7 +231,7 @@ fn herdr_dashboard_entry_uses_installed_sibling_and_preserves_direct_start_and_f
     .unwrap();
     fs::set_permissions(&dashboard, fs::Permissions::from_mode(0o755)).unwrap();
     let run = |args: &[&str], herdr: bool| {
-        let mut command = Command::new(&binary);
+        let mut command = support::command(&binary);
         command
             .args(args)
             .current_dir(&place.folder)

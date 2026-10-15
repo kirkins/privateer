@@ -22,6 +22,7 @@ stdin-detached `agent.start` job path.
 | `pi-signed` | `pi-signed` | Same as Pi; requires the selected wrapper | Yes |
 | `omp` | `omp` | Full session UUID or existing absolute session file, verified through RPC | Yes, fresh |
 | `opencode` | `opencode` | Native `ses_…` ID | Yes |
+| `opencode-v2` | `opencode` 2.x | Existing `ses_…` ID with matching saved directory | Yes, native model picker |
 | `gemini` | `gemini` | Full session UUID | Yes |
 | `cursor` | `cursor-agent` | Full chat UUID | Yes |
 | `grok` | `grok agent --no-leader stdio` (ACP for headless) | Full session UUID | Yes, native TUI plan |
@@ -66,6 +67,28 @@ The direct native launcher replaces itself with the selected CLI in the same pro
 It clears inherited foreign harness identity markers while preserving
 `PRIVATEER_ROLE`, `PRIVATEER_ACTOR`, authentication and provider configuration.
 A missing CLI fails without substituting another harness or model.
+
+The dogfooding focus is Claude, Codex, Pi and OpenCode V2. Other adapters remain
+available, but are outside the current qualification work. `opencode` keeps the
+V1 command contract; choose `opencode-v2` explicitly for V2. Its launch preflight
+checks the installed major version and uses `--standalone` so tool processes
+inherit this job's actor environment. Before an exact resume, the native API
+must confirm both the existing session ID and its saved directory. V2 otherwise
+creates a missing `--session` ID, which would silently lose conversation history.
+Shared servers, continuation pickers, forks and abbreviated resume flags are
+refused on this adapter path. It never edits authentication or provider routes.
+
+V2 headless variants use `model: "provider/model"` plus `effort: "variant"`,
+encoded as `provider/model#variant`. The full V2 TUI has no `--model` flag;
+interactive plans retain its native model picker and reject explicit model or
+effort options instead of silently dropping them. V2 JSON runs require matching
+session/message frames, a final `step_finish` with reason `stop`, complete JSONL
+and native exit zero. Provider errors, interrupted/truncated output and incomplete
+tool loops cannot produce successful jobs. Usage comes only from completed step
+records. These checks confirm a native turn, not task acceptance or delivery.
+V2 live repair, attended idle mail and exact-resume recall remain unqualified
+until their native pilots pass; command plans and subprocess fixtures alone do
+not establish those capabilities.
 
 Unattended Pi/signed Pi JSON runs use an event-checking bridge in that same
 job group. Pi may exit zero after exhausted provider retries, so process status
@@ -242,6 +265,73 @@ a harness can already coordinate a ship autonomously. Provider routes remain
 private configuration.
 
 Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `danger-full-access`) and boolean `ephemeral`. They are omitted by default, preserving native user configuration. Choosing `workspace-write` adds only the local Privateer operational home with `--add-dir`, so the agent can write its durable task and message records as well as work in the repository. `ephemeral:true` suppresses native Codex session persistence while Privateer retains its job records. This does not change global harness preferences.
+
+## Attended native sessions
+
+`privateer start pi`, `privateer start pi-signed` and `privateer start omp`
+explicitly load the optional `attended/mail.ts` extension. Bare `privateer`
+does the same when that ship selects one of these harnesses. Native options
+follow `--`, for example `privateer start pi -- --model provider/model`.
+The selected CLI must be installed; signed Pi never falls back to ordinary Pi.
+Native credentials, provider routes and extension configuration stay unchanged.
+Starting the native CLI directly does not install this integration.
+
+One compact notification covers a mailbox arrival burst, with at most six
+headers and no bodies. Full mail stays in the durable inbox. Polls are bounded
+and single flight; busy sessions show a footer count instead of queuing turns.
+New actionable mail can wake an idle session; low-priority notices wait for
+the next normal prompt. Native custom-message receipts suppress duplicate
+notifications on resume. Notification is never acknowledgement: the mate must
+read, handle and acknowledge the mail itself. `/privateer-mail pause`, `resume`
+and `status` control automatic delivery. A native error or interruption pauses
+automatic wakes until an explicit resume or the next normal prompt.
+
+The launching wrapper registers presence before starting the CLI and refreshes
+only its own holder. A replacement session cannot be reclaimed by an old
+heartbeat. Claude hooks share the wrapper's holder when launched this way;
+raw Claude hooks retain their existing lifecycle. While presence is live,
+`serve` leaves work with the attended session.
+
+`privateer start claude` loads the optional `attended-claude` native mod for
+Claude Code 2.1.287 or later (live checks used 2.1.300). It uses the native
+prompt API, never terminal keystrokes: idle actionable mail starts one turn;
+busy turns and unfinished drafts retain a single footer count. Low notices
+join the captain's next normal prompt. Native turn-start receipts and bounded
+transcript recovery preserve notification progress across resume; queue
+admission alone does not advance the delivery watermark. Busy and queued state
+also survive a mod reload within the same wrapper lifetime. Notification never
+acknowledges a message or claims task completion.
+
+`/privateer-mail pause|resume|status` works without a model turn. Errors,
+interruptions, refusals and declined native prompt admission pause automatic
+wakes. Only an explicit resume or a captain prompt permits recovery; background
+peer and scheduled events do not clear the pause. Native model and permission
+settings still apply; options follow `--`, for example
+`privateer start claude -- --permission-mode auto`. No permission bypass,
+provider selection, credential copy or global plugin installation is added.
+
+The loaded mod renews a short process-local heartbeat after checking its exact
+presence holder. Existing Claude settings hooks retain startup bearings and
+stand down for mail only while that heartbeat is fresh. Disabled/refused mods
+leave the legacy prompt/turn-end hooks available; an expired heartbeat restores
+them. Legacy hooks alone do not provide idle wakeups. An organization may
+restrict mods or classic-event hooks; native policy is respected.
+
+Claude 2.1.300 passed a live isolated idle-wake/file/reply/ack pilot, a draft-held
+request, and exact native resume without replaying a deliberately unacknowledged
+request. The native mod validator and real-mailbox fixtures cover burst
+coalescing, busy/reload boundaries, pause recovery, stale holders, failed
+admission and legacy fallback. These checks establish attended mail integration,
+not unattended fleet production readiness.
+
+Real CLI/extension fixtures cover a thousand-message burst, busy/idle delivery,
+resume receipts, failed queues, native error boundaries, holder replacement and
+shutdown. Pi 1.1.0 has also passed a live isolated interactive file/reply/ack
+canary using existing OpenAI OAuth. These checks do not establish live OMP
+model availability or signed-Pi qualification on a machine without that wrapper.
+OMP 18.8.9 has loaded the extension and displayed a low-priority notice in its
+native terminal without a model turn. Its live model/tool path remains
+unqualified under the account limitation noted above.
 
 ## Gateway Pi adapter
 

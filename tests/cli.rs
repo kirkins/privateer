@@ -1,8 +1,10 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 
@@ -33,7 +35,7 @@ impl Folder {
         }
     }
     fn run_in(&self, dir: &Path, args: &[&str]) -> Output {
-        Command::new(BIN)
+        support::command(BIN)
             .args(args)
             .current_dir(dir)
             .env("PATH", &self.path)
@@ -307,12 +309,14 @@ fn generated_first_mate_commands_work_from_a_folder_with_shell_metacharacters() 
         .0;
     // Execute the generated public shell interface, rather than merely asserting
     // that its source contains quoting tokens.
-    let output = Command::new("sh")
+    let output = support::command("sh")
         .arg("-c")
         .arg(format!(
             "{prefix} ship.bearings --json '{{\"ship\":\"contact\"}}'"
         ))
         .current_dir(&folder.ship)
+        .env("HOME", &folder.root)
+        .env("XDG_CONFIG_HOME", folder.root.join("config"))
         .env("PRIVATEER_FLEET", folder.root.join("fleet.sqlite"))
         .env("PRIVATEER_RESOURCE_HOME", folder.root.join("ledger"))
         .env("PRIVATEER_SERVICE", "none")

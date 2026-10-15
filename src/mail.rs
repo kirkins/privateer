@@ -11,6 +11,9 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Value, json};
 
 pub const CAPTAIN: &str = "captain";
+/// The runtime's voice for a ship's crew: job outcomes and crew reports.
+/// Only the runtime writes as it (see `crew`); nobody can send as it.
+pub const CREW: &str = "crew";
 const KINDS: &[&str] = &["request", "reply", "notice", "decision"];
 const URGENCIES: &[&str] = &["low", "normal", "high"];
 const MAX_MESSAGE_BYTES: usize = 65_536;
@@ -75,6 +78,10 @@ fn ship(store: &Store, name: &str) -> Result<Option<Value>> {
 
 /// A mailbox this home holds: the captain's, or a ship hosted here.
 fn local_address(store: &Store, address: &str) -> Result<()> {
+    ensure!(
+        address != CREW,
+        "{CREW} has no mailbox; crew read answers with crew.answer"
+    );
     if address == CAPTAIN {
         return Ok(());
     }
@@ -85,10 +92,20 @@ fn local_address(store: &Store, address: &str) -> Result<()> {
     }
 }
 
+/// Refuse names no ship may take: the person's and the runtime's crew.
+pub fn unreserved(name: &str) -> Result<()> {
+    ensure!(name != CAPTAIN, "{CAPTAIN} is reserved for the person");
+    ensure!(
+        name != CREW,
+        "{CREW} is reserved for the runtime's crew mail"
+    );
+    Ok(())
+}
+
 fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
-    ensure!(name != CAPTAIN, "{CAPTAIN} is reserved for the person");
+    unreserved(name)?;
     let scope = args.get("scope").and_then(Value::as_str).unwrap_or("");
     ensure!(
         scope.chars().count() <= MAX_SCOPE_CHARS,
@@ -128,6 +145,42 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     )?;
     store.audit("ship.put", &json!({"name": name}))?;
     Ok(record)
+}
+
+/// Write a message from `crew` to a ship hosted here, inside the caller's
+/// transaction so it commits with the fact it reports. `message` holds id,
+/// to, kind (notice or request), task_id, body, payload and urgency. The id
+/// is the idempotency key: an existing message under it is left as it is,
+/// and false is returned.
+pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Result<bool> {
+    let text = |key: &str| message[key].as_str().context("invalid crew message");
+    let (kind, urgency) = (text("kind")?, text("urgency")?);
+    ensure!(
+        matches!(kind, "notice" | "request") && URGENCIES.contains(&urgency),
+        "invalid crew message"
+    );
+    let written = conn.execute(
+        "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO NOTHING",
+        params![
+            text("id")?,
+            CREW,
+            text("to")?,
+            kind,
+            text("task_id")?,
+            text("body")?,
+            message["payload"].to_string(),
+            urgency,
+            Store::now_ms(),
+            (kind == "request").then_some("open")
+        ],
+    )?;
+    Ok(written == 1)
+}
+
+/// A message by id, for runtime modules that check it against the caller.
+pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
+    Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
 }
 
 const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms";
@@ -196,14 +249,21 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             "only the operator speaks as the captain"
         );
     }
+    ensure!(from != CREW, "only the runtime speaks as {CREW}");
+    // Crew have no mailbox: a first mate reaches them by answering their
+    // requests, which they read with crew.answer.
+    ensure!(
+        to != CREW || kind == "reply",
+        "{CREW} is answered only by replying to its requests"
+    );
     local_address(store, from)?;
-    let recipient = if to == CAPTAIN {
+    let recipient = if to == CAPTAIN || to == CREW {
         None
     } else {
         ship(store, to)?
     };
     ensure!(
-        to == CAPTAIN || recipient.is_some(),
+        to == CAPTAIN || to == CREW || recipient.is_some(),
         "unknown ship {to}; add it with ship.put"
     );
     ensure!(from != to, "a mailbox cannot write to itself");
@@ -453,6 +513,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         kind != "decision" && from != CAPTAIN && to != CAPTAIN,
         "the captain's mail stays in its own home for now"
     );
+    ensure!(
+        from != CREW && to != CREW,
+        "crew reports stay in their own home"
+    );
     let sender = ship(store, from)?.with_context(|| format!("unknown ship {from}"))?;
     ensure!(
         remote_peer(&sender).is_some(),
@@ -559,6 +623,36 @@ fn inbox(store: &Store, args: &Value) -> Result<Value> {
     Ok(json!({"address": address, "acknowledged_through": acknowledged, "messages": messages}))
 }
 
+/// A bounded notification snapshot, not a read/acknowledgement of message
+/// bodies. One native wake can point at an entire arrival burst.
+fn pending(store: &Store, args: &Value) -> Result<Value> {
+    let address = required(args, "address")?;
+    local_address(store, address)?;
+    let acknowledged = cursor(store, address)?;
+    let after = args
+        .get("after_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(acknowledged)
+        .max(0);
+    let (count, through, actionable): (i64,i64,i64) = store.connection().query_row(
+        "SELECT COUNT(*), COALESCE(MAX(seq), ?2), COALESCE(SUM(CASE WHEN kind <> 'notice' OR urgency <> 'low' THEN 1 ELSE 0 END),0)
+         FROM mail WHERE recipient=?1 AND seq>?2 AND COALESCE(delivery,'received')='received'",
+        params![address,after], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let mut statement=store.connection().prepare(
+        "SELECT seq,id,sender,kind,urgency,task_id FROM mail WHERE recipient=?1 AND seq>?2 AND seq<=?3
+         AND COALESCE(delivery,'received')='received'
+         ORDER BY seq DESC LIMIT 6")?;
+    let headers=statement.query_map(params![address,after,through], |r| Ok(json!({
+        "seq":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,"from":r.get::<_,String>(2)?,
+        "kind":r.get::<_,String>(3)?,"urgency":r.get::<_,String>(4)?,"task_id":r.get::<_,Option<String>>(5)?
+    })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(
+        json!({"address":address,"after_seq":after,"acknowledged_through":acknowledged,
+        "count":count,"through_seq":through,"actionable":actionable,"headers":headers}),
+    )
+}
+
 fn ack(store: &Store, args: &Value) -> Result<Value> {
     let address = required(args, "address")?;
     local_address(store, address)?;
@@ -630,7 +724,8 @@ fn requests(store: &Store, args: &Value) -> Result<Value> {
 pub fn summary(store: &Store) -> Result<Value> {
     let unread: i64 = store.connection().query_row(
         "SELECT COUNT(*) FROM mail m LEFT JOIN mail_cursor c ON c.address=m.recipient
-         WHERE COALESCE(m.delivery, 'received')='received' AND m.seq > COALESCE(c.through_seq, 0)",
+         WHERE COALESCE(m.delivery, 'received')='received' AND m.seq > COALESCE(c.through_seq, 0)
+           AND m.recipient <> 'crew'",
         [],
         |r| r.get(0),
     )?;
@@ -654,7 +749,9 @@ pub fn summary(store: &Store) -> Result<Value> {
 /// never unread mail or a request still owed its reply.
 pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
     // Mail held here counts once acknowledged; an outgoing copy once delivered.
+    // Replies to crew have no mailbox to acknowledge them.
     let stale = "created_ms < ?1 AND COALESCE(state, '') <> 'open' AND (delivery='delivered'
+        OR recipient='crew'
         OR (COALESCE(delivery, 'received')='received'
             AND seq <= COALESCE((SELECT through_seq FROM mail_cursor WHERE address=mail.recipient), 0)))";
     let count: i64 = store.connection().query_row(
@@ -689,6 +786,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "mail.send" => send(store, &args),
         "mail.inbox" => inbox(store, &args),
+        "mail.pending" => pending(store, &args),
         "mail.ack" => ack(store, &args),
         "mail.show" => show(store, &args),
         "mail.requests" => requests(store, &args),

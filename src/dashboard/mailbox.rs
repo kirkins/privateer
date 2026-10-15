@@ -38,6 +38,12 @@ impl Mailbox {
         }
         let mut messages = Vec::new();
         let mut errors = Vec::new();
+        let priority = |m: &Mail| match m.kind.as_str() {
+            "decision" => 0,
+            "request" => 1,
+            "reply" => 2,
+            _ => 3,
+        };
         self.unread.retain(|home, _| homes.contains_key(home));
         self.read.retain(|(home, _)| homes.contains_key(home));
         for (home, error) in homes {
@@ -124,24 +130,14 @@ impl Mailbox {
                         || m.home
                             .as_ref()
                             .is_some_and(|home| self.read.contains(&(home.clone(), m.seq))),
+                    priority(m),
                     m.home.clone(),
                     m.seq,
                 )
             });
             messages.truncate(1000);
         }
-        messages.sort_by_key(|m| {
-            (
-                match m.kind.as_str() {
-                    "decision" => 0,
-                    "request" => 1,
-                    "reply" => 2,
-                    _ => 3,
-                },
-                m.home.clone(),
-                m.seq,
-            )
-        });
+        messages.sort_by_key(|m| (priority(m), m.home.clone(), m.seq));
         self.messages = messages;
         self.errors = errors;
     }

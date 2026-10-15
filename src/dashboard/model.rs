@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -66,7 +66,7 @@ pub struct Custody {
     pub owner: String,
 }
 
-fn read_registry(home: &Path) -> Result<Vec<Ship>> {
+pub(super) fn read_registry(home: &Path) -> Result<Vec<Ship>> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Registry {
@@ -87,12 +87,13 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
     ensure!(bytes.len() <= 65536, "dashboard registry exceeds 64 KiB");
     let registry: Registry =
         serde_json::from_slice(&bytes).context("invalid dashboard.json ship registry")?;
-    ensure!(
-        registry.ships.len() <= 200,
-        "dashboard registry exceeds 200 ships"
-    );
+    Ok(registry.ships)
+}
+
+pub(super) fn validate_registry(ships: &[Ship]) -> Result<()> {
+    ensure!(ships.len() <= 200, "dashboard registry exceeds 200 ships");
     let mut ids = BTreeSet::new();
-    for ship in &registry.ships {
+    for ship in ships {
         crate::store::identifier(&ship.id)?;
         ensure!(ids.insert(ship.id.clone()), "duplicate ship identity");
         ensure!(
@@ -113,8 +114,7 @@ fn read_registry(home: &Path) -> Result<Vec<Ship>> {
             );
         }
     }
-    validate_navigation(&registry.ships)?;
-    Ok(registry.ships)
+    validate_navigation(ships)
 }
 
 pub(super) fn validate_navigation(ships: &[Ship]) -> Result<()> {
@@ -122,12 +122,33 @@ pub(super) fn validate_navigation(ships: &[Ship]) -> Result<()> {
         ships.iter().filter(|s| s.liaison).count() <= 1,
         "only one ship may be the liaison"
     );
-    let mut terminals = BTreeSet::new();
-    for terminal in ships.iter().flat_map(|ship| &ship.terminals) {
-        ensure!(
-            terminals.insert(terminal.pane_id.clone()),
-            "a pane can belong to only one ship"
-        );
+    let mut terminals = BTreeMap::new();
+    for ship in ships {
+        for terminal in &ship.terminals {
+            ensure!(
+                terminals
+                    .insert(terminal.pane_id.as_str(), ship.id.as_str())
+                    .is_none(),
+                "a pane can belong to only one ship"
+            );
+        }
+    }
+    let mut automatic = BTreeMap::new();
+    for ship in ships {
+        if let Some(binding) = ship.live.as_ref().and_then(|live| live.binding.as_ref()) {
+            ensure!(
+                terminals
+                    .get(binding.pane.pane_id.as_str())
+                    .is_none_or(|owner| *owner == ship.id)
+                    && automatic
+                        .insert(
+                            (binding.socket_identity, binding.pane.pane_id.as_str()),
+                            ship.id.as_str()
+                        )
+                        .is_none_or(|owner| owner == ship.id),
+                "a pane can belong to only one ship"
+            );
+        }
     }
     Ok(())
 }
@@ -223,6 +244,14 @@ impl Snapshot {
     /// Open an existing home with SQLite READ_ONLY, avoiding Store::open's
     /// migrations/chmod and job.list's recovery side effects. No resource ledger.
     pub fn read(home: &Path) -> Result<Self> {
+        let mut snapshot = Self::read_work(home)?;
+        snapshot.ships = read_registry(home)?;
+        validate_registry(&snapshot.ships)?;
+        snapshot.include_observed_ships();
+        Ok(snapshot)
+    }
+
+    pub(super) fn read_work(home: &Path) -> Result<Self> {
         ensure!(home.is_absolute(), "dashboard home must be absolute");
         let db = home.join("privateer.sqlite");
         reject_symlinks(&db)?;
@@ -295,8 +324,6 @@ impl Snapshot {
         snapshot.activity.truncate(ROW_LIMIT);
         snapshot.jobs.truncate(ROW_LIMIT);
         snapshot.custody.truncate(ROW_LIMIT);
-        snapshot.ships = read_registry(home)?;
-        snapshot.include_observed_ships();
         Ok(snapshot)
     }
 

@@ -1,5 +1,7 @@
 #![cfg(feature = "dashboard")]
 
+mod support;
+
 use privateer::{
     dashboard::{
         boat::Boat,
@@ -420,7 +422,7 @@ fn demo_cli_never_opens_an_inherited_herdr_socket() {
     let path = root.path().join("api.sock");
     let listener = UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_privateer-dashboard"))
+    let output = support::command(env!("CARGO_BIN_EXE_privateer-dashboard"))
         .args(["--demo", "--once"])
         .env("HERDR_ENV", "1")
         .env("HERDR_SOCKET_PATH", &path)
@@ -864,6 +866,104 @@ fn automatic_bindings_require_socket_terminal_location_and_pinned_session() {
     changed = pane;
     changed.agent_session = Some(json!({"value":"replacement"}));
     assert!(!binding.matches(&view, &changed));
+}
+
+#[test]
+fn manual_selection_cannot_bypass_known_automatic_pane_identity() {
+    use privateer::dashboard::{
+        fleet::ShipState,
+        herdr::{Binding, View},
+        model::{Ship, TerminalBinding},
+    };
+    let mut original = View::demo();
+    original.panes[0].agent_session = Some(json!({"kind":"id","value":"original"}));
+    let bound = original.panes[0].clone();
+    let unrelated = original.panes[1].clone();
+    let ship = Ship {
+        id: "owner".into(),
+        name: "Owner".into(),
+        liaison: true,
+        terminals: [&bound, &unrelated]
+            .into_iter()
+            .map(|pane| TerminalBinding {
+                pane_id: pane.pane_id.clone(),
+                terminal_id: pane.terminal_id.clone(),
+            })
+            .chain(std::iter::once(TerminalBinding {
+                pane_id: "moved".into(),
+                terminal_id: bound.terminal_id.clone(),
+            }))
+            .collect(),
+        live: Some(ShipState {
+            binding: Some(Binding {
+                socket: "/isolated/socket".into(),
+                socket_identity: original.socket_identity,
+                pane: bound.clone(),
+            }),
+            ..ShipState::default()
+        }),
+        ..Ship::default()
+    };
+    let mut app = App {
+        snapshot: Snapshot {
+            ships: vec![ship],
+            ..Snapshot::default()
+        },
+        herdr: Some(original.clone()),
+        ..App::default()
+    };
+    for dimension in [
+        "socket",
+        "pane",
+        "terminal",
+        "workspace",
+        "tab",
+        "session",
+        "missing-session",
+    ] {
+        let mut changed = original.clone();
+        match dimension {
+            "socket" => changed.socket_identity = (9, 9),
+            "pane" => changed.panes[0].pane_id = "moved".into(),
+            "terminal" => changed.panes[0].terminal_id = "replacement".into(),
+            "workspace" => changed.panes[0].workspace_id = "replacement".into(),
+            "tab" => changed.panes[0].tab_id = "replacement".into(),
+            "session" => {
+                changed.panes[0].agent_session = Some(json!({"kind":"id","value":"replacement"}))
+            }
+            "missing-session" => changed.panes[0].agent_session = None,
+            _ => unreachable!(),
+        }
+        app.herdr = Some(changed);
+        app.select_ship(None);
+        app.open_liaison();
+        assert_eq!(app.ship.as_deref(), Some("owner"));
+        assert_eq!(app.scoped_panes(), vec![&unrelated], "{dimension}");
+        for tab in [0, 2] {
+            app.select_tab(tab);
+            assert_eq!(app.selected_pane(), Some(&unrelated), "{dimension}");
+        }
+        app.herdr = Some(original.clone());
+        app.select_ship(None);
+        app.open_liaison();
+        assert_eq!(app.selected_pane(), Some(&bound), "{dimension}");
+        assert_eq!(app.scoped_panes().len(), 2);
+    }
+    app.snapshot.ships.push(Ship {
+        id: "other".into(),
+        name: "Other".into(),
+        terminals: vec![TerminalBinding {
+            pane_id: bound.pane_id.clone(),
+            terminal_id: bound.terminal_id.clone(),
+        }],
+        ..Ship::default()
+    });
+    app.herdr.as_mut().unwrap().panes[0].agent_session =
+        Some(json!({"kind":"id","value":"replacement"}));
+    app.select_ship(Some("other".into()));
+    assert!(app.binding_ambiguous());
+    assert!(app.scoped_panes().is_empty());
+    assert!(app.selected_pane().is_none());
 }
 
 #[test]
