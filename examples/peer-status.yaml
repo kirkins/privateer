@@ -1,0 +1,4 @@
+# Use the name registered by peer.put.
+name: department
+command: status
+args: {}

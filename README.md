@@ -63,7 +63,8 @@ Harnesses and provider routes are optional executable plugins. A private gateway
 
 The default charter allows implementation, testing, opening PRs, merging passing work, routine recovery, cleanup, delegation, and messaging. Production requires approval of the exact artifact and environment. The current delivery check records workflow evidence; forge merge and production deployment adapters are future integrations.
 
-For human-authored command arguments, use a YAML or JSON file:
+For human-authored command arguments, the examples use YAML; JSON files are also
+supported:
 
 ```sh
 privateer --home /absolute/private/home charter.put --file examples/charter.yaml
@@ -83,9 +84,9 @@ environment variables. Local custom tags are rejected; standard core tags and
 inert global annotations may be accepted or ignored as ordinary data. Existing
 command validation still applies. Use `--file` once, separately from `--json`;
 it supplies command arguments, not runtime configuration. RPC, hooks and internal
-supervisors do not accept `--file`. Inline `--json` and all machine protocols and
-outputs continue to use JSON. To pass `--file` to a native harness, put it after
-the separator in `privateer start HARNESS -- --file PATH`.
+supervisors do not accept `--file`. Inline `--json`, machine protocols, outputs
+and native plugin manifests keep their JSON formats. To pass `--file` to a native
+harness, put it after the separator in `privateer start HARNESS -- --file PATH`.
 
 ## Build and try the isolated pilot
 
@@ -106,11 +107,13 @@ privateer --home /absolute/private/home init --json '{}'
 privateer --home /absolute/private/home status --json '{}'
 ```
 
-Register an SSH peer after installing the same binary on that host:
+Register an SSH peer after installing the same binary on that host. Edit the
+[example peer](examples/peer.yaml) with its SSH host and absolute paths first;
+the [status request](examples/peer-status.yaml) uses the same peer name:
 
 ```sh
-privateer --home /absolute/private/home peer.put --json '{"name":"infrastructure","host":"department-host","executable":"/absolute/bin/privateer","home":"/absolute/privateer/home"}'
-privateer --home /absolute/private/home peer.call --json '{"name":"infrastructure","command":"status","args":{}}'
+privateer --home /absolute/private/home peer.put --file examples/peer.yaml
+privateer --home /absolute/private/home peer.call --file examples/peer-status.yaml
 ```
 
 Native SSH handles authentication and host verification. The remote executable and home must be absolute paths; an SSH host is an alias or `user@host`. The caller receives the remote JSON envelope, including its correlation ID and success/error result. Remote state remains remote. The current peer address is a transport configuration, not a proof that another host inherited a charter.
