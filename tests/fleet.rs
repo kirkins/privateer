@@ -567,3 +567,57 @@ fn reinit_upgrades_only_an_unedited_contact_only_liaison() {
     let kept = machine.json(&liaison, "charter.show", json!({"id":"liaison"}));
     assert_eq!(kept["actions"], json!(["inspect", "spawn", "message"]));
 }
+
+#[test]
+fn a_created_ship_keeps_its_creators_model_route_on_the_same_harness() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let mut profile =
+        machine.json(&liaison, "ship.show", json!({"name":"liaison"}))["first_mate"].take();
+    let options = json!({"sandbox":"workspace-write","provider":"openai","model":"gpt-test"});
+    profile["options"] = options.clone();
+    machine.json(
+        &liaison,
+        "ship.put",
+        json!({"name":"liaison","first_mate":profile}),
+    );
+    let first_mate = |name: &str| {
+        machine.json(&machine.ships.join(name), "ship.show", json!({"name":name}))["first_mate"]
+            .take()
+    };
+
+    let same = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.create",
+        json!({"name":"tooling"}),
+    );
+    assert!(same.status.success(), "{}", stderr(&same));
+    assert_eq!(first_mate("tooling")["options"], options);
+
+    let named = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.create",
+        json!({"name":"named","harness":"codex"}),
+    );
+    assert!(named.status.success(), "{}", stderr(&named));
+    assert_eq!(first_mate("named")["options"], options);
+
+    // Another harness cannot use the creator's options; it gets its defaults.
+    let other = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.create",
+        json!({"name":"other","harness":"pi"}),
+    );
+    assert!(other.status.success(), "{}", stderr(&other));
+    let other = first_mate("other");
+    assert!(
+        other["manifest"]
+            .as_str()
+            .unwrap()
+            .ends_with("pi/manifest.json")
+    );
+    assert_eq!(other["options"], json!({}));
+}

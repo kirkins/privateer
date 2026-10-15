@@ -394,6 +394,8 @@ pub(crate) struct Setup {
     /// Who made it, recorded in the fleet list.
     pub created_by: String,
     pub liaison: bool,
+    /// First-mate harness options; None means the harness's defaults.
+    pub options: Option<Value>,
 }
 
 /// Make (or update) the ship whose state lives in `home`, returning its name,
@@ -499,11 +501,14 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     }
     // Headless first mates must be able to act: Codex writes inside its
     // sandbox, Claude may edit files.
-    let options = match harness.as_str() {
-        "codex" => json!({"sandbox": "workspace-write"}),
-        "claude" => json!({"permission_mode": "acceptEdits"}),
-        _ => json!({}),
-    };
+    let options = setup
+        .options
+        .clone()
+        .unwrap_or_else(|| match harness.as_str() {
+            "codex" => json!({"sandbox": "workspace-write"}),
+            "claude" => json!({"permission_mode": "acceptEdits"}),
+            _ => json!({}),
+        });
     crate::dispatch(
         &mut store,
         "ship.put",
