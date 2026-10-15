@@ -22,6 +22,7 @@ pub mod presence;
 pub mod project;
 pub mod service;
 pub mod store;
+pub mod watch;
 pub mod workspace;
 
 use anyhow::{Result, bail};
