@@ -30,6 +30,10 @@ def launch(harness, argv):
             flags[i:i+2] == ["--mode", "json"] for i in range(len(flags))):
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("native_turn.py")),
                                   harness, *argv], native_environment())
+    if harness == "agy" and "--print" in flags and any(
+            flags[i:i+2] == ["--output-format", "stream-json"] for i in range(len(flags))):
+        os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("native_turn.py")),
+                                  harness, *argv], native_environment())
     # Keep PRIVATEER_ROLE/ACTOR and all native auth/provider configuration.
     # exec preserves the job's process identity, group and cancellation path.
     os.execvpe(argv[0], argv, native_environment())

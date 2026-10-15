@@ -25,13 +25,13 @@ def emit(kind, **fields):
     print(json.dumps({"type": kind, **fields}, separators=(",", ":")), flush=True)
 
 
-def select_model(client, session, model):
+def select_config(client, session, model, category="model"):
     """Use advertised v1 configuration; never silently keep a default model."""
     configs = session.get("configOptions", [])
     if not isinstance(configs, list):
         raise ProtocolError("invalid-model-options")
     selected = next((option for option in configs if isinstance(option, dict)
-                     and (option.get("category") == "model" or option.get("id") == "model")
+                     and (option.get("category") == category or option.get("id") == ("model" if category == "model" else "reasoning_effort"))
                      and option.get("type") == "select"), None)
     if selected is not None:
         values = selected.get("options", [])
@@ -54,6 +54,8 @@ def select_model(client, session, model):
                                                     and o.get("currentValue") == model for o in returned):
             raise ProtocolError("model-unconfirmed")
         return
+    if category != "model":
+        raise ProtocolError("effort-unavailable")
     # Older ACP v1 servers expose the unstable models field instead. Only
     # invoke its setter when that exact requested model was advertised.
     models = session.get("models", {})
@@ -72,7 +74,8 @@ class Client:
         self.outgoing = queue.Queue(1)
         # Inherit the owning job's process group. The runtime remains the sole
         # deadline/cancellation owner, including any native tool descendants.
-        self.child = subprocess.Popen(argv if argv is not None else [binary, "acp"], cwd=cwd, env=native_environment(),
+        command = ["grok", "agent", "--no-leader", "stdio"] if binary == "grok" else [binary, "acp"]
+        self.child = subprocess.Popen(argv if argv is not None else command, cwd=cwd, env=native_environment(),
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, bufsize=0)
         self.permissions = permissions
@@ -217,12 +220,18 @@ class Client:
         try:
             self.child.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            self.child.kill()
-            self.child.wait(timeout=2)
+            # Some owned servers keep stdin EOF open as a transport event.
+            # Give their normal signal teardown a chance to flush sessions.
+            self.child.terminate()
+            try:
+                self.child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.child.kill()
+                self.child.wait(timeout=2)
 
 
 def run(request):
-    if not isinstance(request, dict) or request.get("binary") not in ("rovo", "kimi", "devin") or request.get("permissions") not in ("ask", "auto"):
+    if not isinstance(request, dict) or request.get("binary") not in ("rovo", "kimi", "devin", "grok") or request.get("permissions") not in ("ask", "auto"):
         raise ProtocolError("invalid-launch")
     if not isinstance(request.get("prompt"), str) or not 0 < len(request["prompt"]) <= 32768:
         raise ProtocolError("invalid-prompt")
@@ -253,12 +262,21 @@ def run(request):
             client.creating = False
         if not isinstance(client.session, str) or not 0 < len(client.session) <= 512 or any(c.isspace() or ord(c) < 32 for c in client.session):
             raise ProtocolError("invalid-session")
+        if request["binary"] == "grok":
+            selected = result.get("_meta", {}).get("currentWorkingDirectory")
+            if (not isinstance(selected, str) or not Path(selected).is_absolute()
+                    or Path(selected).resolve() != cwd.resolve()):
+                raise ProtocolError("native-workspace-unconfirmed")
         for update in client.pending_updates:
             client.inbound(update, min(client.end, time.monotonic() + 5))
         client.pending_updates.clear()
         emit("session.started", harness=request["binary"], session_id=client.session, source="acp.load" if resume else "acp.new")
         if request.get("model"):
-            select_model(client, result, request["model"])
+            select_config(client, result, request["model"])
+        if request.get("effort"):
+            if request["binary"] != "grok":
+                raise ProtocolError("effort-unavailable")
+            select_config(client, result, request["effort"], "thought_level")
         completed = client.request("session/prompt", {"sessionId": client.session,
                                                       "prompt": [{"type": "text", "text": request["prompt"]}]}, seconds=request.get("timeout", 900))
         if completed.get("stopReason") != "end_turn" or client.denied:

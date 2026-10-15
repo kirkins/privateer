@@ -5,18 +5,20 @@ import json
 def session_started(harness, event):
     if not isinstance(event, dict):
         return None
-    kind = event.get("type")
+    kind = event.get("event") if harness == "agy" else event.get("type")
     value = None
     if harness == "codex" and kind == "thread.started":
         value = event.get("thread_id")
-    elif harness in ("rovo", "kimi", "devin", "muse") and kind == "session.started" and event.get("harness") == harness:
+    elif harness in ("rovo", "kimi", "devin", "grok", "muse") and kind == "session.started" and event.get("harness") == harness:
         value = event.get("session_id")
     elif harness in ("pi", "pi-signed", "gateway-pi", "omp") and kind == "session":
         value = event.get("id")
     elif harness in ("claude", "cursor") and kind == "system" and event.get("subtype") == "init":
         value = event.get("session_id")
-    elif harness in ("gemini", "agy") and kind == "init":
+    elif harness == "gemini" and kind == "init":
         value = event.get("session_id")
+    elif harness == "agy" and kind == "init":
+        value = event.get("conversation_id")
     elif harness == "opencode" and kind == "step_start":
         value = event.get("sessionID")
     if isinstance(value, str) and 0 < len(value) <= 512 and not any(c.isspace() or ord(c) < 32 for c in value):

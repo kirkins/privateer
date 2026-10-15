@@ -141,15 +141,15 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
         let mut args = f.args(&example(name));
         let planned = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
         assert_eq!(planned["cwd"], json!(f.repo));
-        if matches!(name, "rovo" | "omp") {
+        if matches!(name, "rovo" | "grok" | "omp") {
             assert!(
                 planned["argv"][1]
                     .as_str()
                     .unwrap()
-                    .ends_with(if name == "rovo" {
-                        "acp.py"
-                    } else {
+                    .ends_with(if name == "omp" {
                         "omp_rpc.py"
+                    } else {
+                        "acp.py"
                     })
             );
         } else {
@@ -170,7 +170,7 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
             );
         } else {
             let resumed = resumed.unwrap();
-            if matches!(name, "rovo" | "omp") {
+            if matches!(name, "rovo" | "grok" | "omp") {
                 let payload: Value =
                     serde_json::from_str(resumed["argv"][3].as_str().unwrap()).unwrap();
                 assert_eq!(payload["resume"], resume);
@@ -246,6 +246,59 @@ fn native_profiles_plan_explicit_resume_and_interactive_commands_without_core_ch
             args["options"] = invalid;
             assert!(plugins::dispatch(&mut f.store, "plugin.command", args.clone()).is_err());
         }
+    }
+}
+
+#[test]
+fn grok_and_agy_use_explicit_owned_native_controls_without_global_configuration() {
+    let mut f = Fixture::new();
+    let mut args = f.args(&example("grok"));
+    args["options"] =
+        json!({"model":"fixture-model","effort":"low","acp_permissions":"allow_once"});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+    assert!(plan["argv"][1].as_str().unwrap().ends_with("acp.py"));
+    let payload: Value = serde_json::from_str(plan["argv"][3].as_str().unwrap()).unwrap();
+    assert_eq!(payload["binary"], "grok");
+    assert_eq!(payload["permissions"], "auto");
+    assert_eq!(payload["effort"], "low");
+    for invalid in [
+        json!({"transport":"native"}),
+        json!({"permission_mode":"bypassPermissions"}),
+        json!({"transport":"acp","mode":"interactive"}),
+    ] {
+        args["options"] = invalid;
+        assert!(plugins::dispatch(&mut f.store, "plugin.command", args.clone()).is_err());
+    }
+    let mut args = f.args(&example("agy"));
+    args["options"] = json!({"skip_permissions":true,"permission_mode":"accept-edits","sandbox":true,"disable_slash_commands":true});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+    let argv = plan["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|v| v == "--dangerously-skip-permissions"));
+    assert!(argv.iter().any(|v| v == "--sandbox"));
+    assert!(argv.iter().any(|v| v == "--disable-slash-commands"));
+    assert_eq!(
+        argv.windows(2)
+            .filter(|v| v[0] == "--add-dir" && v[1] == json!(f.store.home()))
+            .count(),
+        1
+    );
+    args["options"] = json!({});
+    let plan = plugins::dispatch(&mut f.store, "plugin.command", args.clone()).unwrap();
+    assert!(
+        !plan["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--dangerously-skip-permissions" || v == "--sandbox")
+    );
+    for invalid in [
+        json!({"skip_permissions":"true"}),
+        json!({"permission_mode":"bypassPermissions"}),
+        json!({"sandbox":"true"}),
+        json!({"disable_slash_commands":true,"mode":"interactive"}),
+    ] {
+        args["options"] = invalid;
+        assert!(plugins::dispatch(&mut f.store, "plugin.command", args.clone()).is_err());
     }
 }
 
@@ -433,9 +486,12 @@ assert read_session('claude',log) is None
 log.write_text('x'*65537+'\n'+json.dumps({'type':'thread.started','thread_id':identity})+'\n')
 assert read_session('codex',log) is None
 assert session_started('codex',{'type':'thread.started','thread_id':'bad\nidentity'}) is None
-for harness in ('rovo','kimi','devin','muse'):
+for harness in ('rovo','kimi','devin','grok','muse'):
     assert session_started(harness,{'type':'session.started','harness':harness,'session_id':identity})==identity
     assert session_started(harness,{'type':'session.started','harness':'unrelated','session_id':identity}) is None
+assert session_started('agy',{'event':'init','conversation_id':identity,'init':{'cwd':str(root)}})==identity
+assert session_started('agy',{'event':'step_update','step_update':{'event':'init','conversation_id':identity}}) is None
+assert session_started('agy',{'type':'init','session_id':identity}) is None
 "#;
     let output = Command::new("python3")
         .args(["-c", script])
@@ -457,6 +513,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/pi_turn.py",
         "tests/msp_bridge.py",
         "tests/omp_rpc.py",
+        "tests/agy_turn.py",
     ] {
         let output = Command::new("python3")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
@@ -550,7 +607,7 @@ for event in [
 
 #[test]
 fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contract() {
-    for harness in ["rovo", "muse", "omp"] {
+    for harness in ["rovo", "grok", "muse", "omp", "agy"] {
         let mut f = Fixture::new();
         fs::write(
             f.store.home().join("config.json"),
@@ -560,13 +617,18 @@ fn stdio_first_mates_resume_focused_wakes_under_the_existing_mail_and_role_contr
         let fakebin = f.base().join("bin");
         fs::create_dir(&fakebin).unwrap();
         let server = fakebin.join(harness);
-        let script = if harness == "omp" {
+        let script = if matches!(harness, "omp" | "agy") {
             format!(
-                "#!/usr/bin/env python3\nimport sys\nsys.path.insert(0,{:?})\nfrom omp_rpc import SERVER\nexec(SERVER)\n",
+                "#!/usr/bin/env python3\nimport sys\nsys.path.insert(0,{:?})\nfrom {} import SERVER\nexec(SERVER)\n",
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("tests")
                     .display()
-                    .to_string()
+                    .to_string(),
+                if harness == "omp" {
+                    "omp_rpc"
+                } else {
+                    "agy_turn"
+                }
             )
         } else {
             r#"#!/usr/bin/env python3
@@ -584,7 +646,7 @@ for line in sys.stdin:
     if method=='initialize':
         result={'schema':{'version':1},'sessionDurability':'durable'} if harness=='muse' else {'protocolVersion':1,'agentCapabilities':{'loadSession':True}}
     elif method=='initialized':continue
-    elif method in ('session/new','session/load'):result={'sessionId':sid}
+    elif method in ('session/new','session/load'):result={'sessionId':sid,'_meta':{'currentWorkingDirectory':os.getcwd()}}
     elif method in ('session/start','session/resume'):
         if method=='session/resume':assert request['params']['sessionId']==sid
         result={'session':{'sessionId':sid,'workspaceRoot':os.getcwd(),'status':'idle','activeTurnId':None},'pendingRequests':[]}
@@ -660,7 +722,7 @@ for line in sys.stdin:
                 "{wake}"
             );
             assert_eq!(wake["session_id"], "46a81234-1234-4567-8123-123456789abc");
-            if harness == "omp" {
+            if matches!(harness, "omp" | "agy") {
                 assert_eq!(wake["usage"], json!({"input":4,"output":2}));
             } else {
                 assert!(
@@ -925,7 +987,7 @@ fn gateway_plans_and_launches_only_exact_native_route_without_exposing_credentia
 
 #[test]
 fn cancellation_reaches_the_execed_harness_and_its_descendants() {
-    for harness in ["codex", "rovo", "pi", "muse", "omp"] {
+    for harness in ["codex", "rovo", "grok", "pi", "muse", "omp", "agy"] {
         let mut f = Fixture::new();
         fs::write(
             f.store.home().join("config.json"),
