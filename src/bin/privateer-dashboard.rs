@@ -568,13 +568,16 @@ fn run(opts: Options) -> Result<()> {
                     if observed != target {
                         app.pending_board = None;
                         app.notice = "Ship home changed; automatic Board cancelled.".into();
-                    } else if herdr.is_some() {
-                        app.select_ship(Some(target.ship.clone()));
-                        app.board_requested = true;
                     } else {
-                        app.select_ship(Some(target.ship.clone()));
-                        app.notice = format!("Created {}.", target.ship);
-                        app.pending_board = None;
+                        if matches!(pending, PendingBoard::Onboarding(_)) {
+                            app.select_ship(Some(target.ship.clone()));
+                        }
+                        if herdr.is_some() {
+                            app.board_requested = true;
+                        } else {
+                            app.notice = format!("Created {}.", target.ship);
+                            app.pending_board = None;
+                        }
                     }
                 }
             }

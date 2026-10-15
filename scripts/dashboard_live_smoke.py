@@ -534,6 +534,8 @@ def onboarding(binary, runtime):
                     return subprocess.run([str(runtime), "--home", str(startup_root / name / ".privateer"), *arguments],
                                           cwd=startup_root, env=startup_env, capture_output=True, check=True, timeout=10).stdout
                 startup_command("contact", "init", "--ship", "contact", "--harness", "codex", "--liaison")
+                if change == "navigation":
+                    startup_command("other", "init", "--ship", "other", "--harness", "codex")
                 startup_server = Herdr(startup_root, startup_env)
                 startup_entry = dict(startup_env, HERDR_ENV="1", HERDR_SOCKET_PATH=str(startup_server.path))
                 startup = None
@@ -551,6 +553,13 @@ def onboarding(binary, runtime):
                     assert "No Herdr connection configured" not in startup.screen(), "configured outage was reported as missing context"
                     assert "Liaison · your default contact" in startup.screen()
                     if change == "navigation":
+                        for tab in ["2 Assignments", "3 Terminals", "4 Logbook"]:
+                            startup.keys(tab[0].encode())
+                            startup.drain(1.2)
+                            for direction in [b"\x1b[B", b"\x1b[A"]:
+                                startup.keys(direction)
+                                assert f"contact / {tab}" in startup.screen().splitlines()[1], "pending startup stole workspace focus"
+                                assert "automatic Board cancelled" not in startup.screen(), "workspace navigation cancelled startup Board"
                         startup.keys(b"0")
                     elif change in ["ambiguous", "contact"]:
                         arguments = ["init", "--ship", "other", "--harness", "codex"]
