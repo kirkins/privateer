@@ -1,6 +1,6 @@
 # Handoff: crew outcomes wake the first mate
 
-Status: **outcomes implemented**; crew reports in progress (see [architecture](../architecture.md#crew-outcomes)); handoff written 14 October 2026. Where the implementation differs from this handoff is listed under [Implementation notes](#implementation-notes). This is step 3 of the build order in [conversation and activation](conversation-and-activation.md). Read [architecture](../architecture.md) ("Waking first mates", "Attended mode") for what exists.
+Status: **implemented** (see [architecture](../architecture.md#crew-outcomes)); handoff written 14 October 2026. Where the implementation differs from this handoff is listed under [Implementation notes](#implementation-notes). This is step 3 of the build order in [conversation and activation](conversation-and-activation.md). Read [architecture](../architecture.md) ("Waking first mates", "Attended mode") for what exists.
 
 ## Goal
 
@@ -63,4 +63,4 @@ Extend the wake text and the generated `AGENTS.md` (`instructions` in `src/cli.r
 - **`serve` reconciles unsupervised jobs.** Otherwise a vanished supervisor's outcome waited until someone asked for the job's status. Live supervisors are checked with a cheap process identity read and skipped; a job that cannot be inspected is reported in the pass instead of stopping the dispatcher.
 - **Bounds.** The whole outcome body, header and log tails, is at most 2,000 characters (the tail gets what the header leaves, up to 1,400 bytes, stderr first), so it fits a wake's and a hook's per-message limit; the hook limit was raised from 1,500 to 2,000 characters to match the wake. The payload is not repeated in the wake text.
 - **Cancellation records who asked** (`cancelled_by`), which decides `low` (the ship itself) or `normal` (the operator, or authority ending).
-- **Crew asking their first mate** (`crew.report`) follows separately, on top of outcomes.
+- **`crew.answer {id, wait_secs}`** reads a decision's state and reply; `crew.report` accepts an optional `id` so a retried report is not duplicated.

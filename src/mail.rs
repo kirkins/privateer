@@ -11,7 +11,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Value, json};
 
 pub const CAPTAIN: &str = "captain";
-/// The runtime's voice for a ship's crew: the outcomes of its jobs.
+/// The runtime's voice for a ship's crew: job outcomes and crew reports.
 /// Only the runtime writes as it (see `crew`); nobody can send as it.
 pub const CREW: &str = "crew";
 const KINDS: &[&str] = &["request", "reply", "notice", "decision"];
@@ -78,7 +78,10 @@ fn ship(store: &Store, name: &str) -> Result<Option<Value>> {
 
 /// A mailbox this home holds: the captain's, or a ship hosted here.
 fn local_address(store: &Store, address: &str) -> Result<()> {
-    ensure!(address != CREW, "{CREW} has no mailbox");
+    ensure!(
+        address != CREW,
+        "{CREW} has no mailbox; crew read answers with crew.answer"
+    );
     if address == CAPTAIN {
         return Ok(());
     }
@@ -175,6 +178,11 @@ pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Resul
     Ok(written == 1)
 }
 
+/// A message by id, for runtime modules that check it against the caller.
+pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
+    Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
+}
+
 const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms";
 
 fn message(r: &Row) -> rusqlite::Result<Value> {
@@ -242,15 +250,20 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         );
     }
     ensure!(from != CREW, "only the runtime speaks as {CREW}");
-    ensure!(to != CREW, "{CREW} has no mailbox");
+    // Crew have no mailbox: a first mate reaches them by answering their
+    // requests, which they read with crew.answer.
+    ensure!(
+        to != CREW || kind == "reply",
+        "{CREW} is answered only by replying to its requests"
+    );
     local_address(store, from)?;
-    let recipient = if to == CAPTAIN {
+    let recipient = if to == CAPTAIN || to == CREW {
         None
     } else {
         ship(store, to)?
     };
     ensure!(
-        to == CAPTAIN || recipient.is_some(),
+        to == CAPTAIN || to == CREW || recipient.is_some(),
         "unknown ship {to}; add it with ship.put"
     );
     ensure!(from != to, "a mailbox cannot write to itself");
@@ -711,7 +724,8 @@ fn requests(store: &Store, args: &Value) -> Result<Value> {
 pub fn summary(store: &Store) -> Result<Value> {
     let unread: i64 = store.connection().query_row(
         "SELECT COUNT(*) FROM mail m LEFT JOIN mail_cursor c ON c.address=m.recipient
-         WHERE COALESCE(m.delivery, 'received')='received' AND m.seq > COALESCE(c.through_seq, 0)",
+         WHERE COALESCE(m.delivery, 'received')='received' AND m.seq > COALESCE(c.through_seq, 0)
+           AND m.recipient <> 'crew'",
         [],
         |r| r.get(0),
     )?;
@@ -735,7 +749,9 @@ pub fn summary(store: &Store) -> Result<Value> {
 /// never unread mail or a request still owed its reply.
 pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
     // Mail held here counts once acknowledged; an outgoing copy once delivered.
+    // Replies to crew have no mailbox to acknowledge them.
     let stale = "created_ms < ?1 AND COALESCE(state, '') <> 'open' AND (delivery='delivered'
+        OR recipient='crew'
         OR (COALESCE(delivery, 'received')='received'
             AND seq <= COALESCE((SELECT through_seq FROM mail_cursor WHERE address=mail.recipient), 0)))";
     let count: i64 = store.connection().query_row(

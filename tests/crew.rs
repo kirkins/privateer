@@ -332,6 +332,93 @@ fn jobs_that_end_in_the_capacity_queue_report_too() {
     assert_eq!(outcomes_of(&mut fleet, "holder").len(), 1);
 }
 
+const CREW_SCRIPT: &str = r#"import json, subprocess, sys
+binary, home = sys.argv[1], sys.argv[2]
+def call(command, args):
+    out = subprocess.run([binary, "--home", home, command, "--json", json.dumps(args)], capture_output=True, text=True)
+    if out.returncode:
+        sys.exit("%s failed: %s" % (command, out.stderr))
+    return json.loads(out.stdout)
+call("crew.report", {"kind": "progress", "body": "halfway there"})
+asked = call("crew.report", {"kind": "decision", "id": "which-plan", "body": "Plan A or plan B?"})
+again = call("crew.report", {"kind": "decision", "id": "which-plan", "body": "Plan A or plan B?"})
+assert again["id"] == asked["id"] and again["duplicate"], again
+answer = call("crew.answer", {"id": asked["id"], "wait_secs": 60})
+print("answer:", answer["reply"]["body"])
+"#;
+
+#[test]
+fn a_crew_decision_reaches_the_first_mate_and_the_crew_reads_its_reply() {
+    let mut fleet = Fleet::new(now_settings());
+    let script = fleet.root.join("crew.py");
+    fs::write(&script, CREW_SCRIPT).unwrap();
+    let job = fleet.ok(
+        "job.start",
+        json!({"id": "asker", "task_id": "infra-repair", "heavy": false,
+            "command": ["python3", script, support::BIN, fleet.home]}),
+        Some("infra"),
+    );
+    // The dispatcher wakes the first mate for the decision; the scripted
+    // first mate answers open requests, so the crew gets its reply and ends.
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        fleet.tick();
+        let status = fleet.ok("job.status", json!({"id": "asker"}), None);
+        if status["status"] != "running" && status["status"] != "launching" {
+            assert_eq!(status["status"], "succeeded", "{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "crew never got its answer: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log = fleet
+        .home
+        .join("jobs/asker")
+        .join(job["incarnation"].as_str().unwrap())
+        .join("stdout.log");
+    assert_eq!(
+        fs::read_to_string(log).unwrap().trim(),
+        "answer: handled by infra"
+    );
+    let reports = from_crew(&mut fleet, "infra");
+    let progress = reports
+        .iter()
+        .find(|m| m["payload"]["report"] == "progress")
+        .unwrap();
+    assert_eq!(progress["kind"], "notice");
+    assert_eq!(progress["urgency"], "low");
+    assert_eq!(progress["task_id"], "infra-repair");
+    let decisions: Vec<_> = reports
+        .iter()
+        .filter(|m| m["payload"]["report"] == "decision")
+        .collect();
+    assert_eq!(decisions.len(), 1, "an id makes a report idempotent");
+    let decision = decisions[0];
+    assert_eq!(decision["kind"], "request");
+    assert_eq!(decision["urgency"], "high");
+    assert_eq!(decision["state"], "answered");
+    assert!(
+        decision["body"]
+            .as_str()
+            .unwrap()
+            .ends_with("Plan A or plan B?")
+    );
+    // The answer is a recorded reply, readable later by the crew's ship.
+    let answer = fleet.ok("crew.answer", json!({"id": decision["id"]}), Some("infra"));
+    assert_eq!(answer["state"], "answered");
+    assert_eq!(answer["reply"]["from"], "infra");
+    assert_eq!(answer["reply"]["to"], "crew");
+    // Replies to crew are not anyone's unread mail.
+    fleet.settle();
+    let status = dispatch(&mut fleet.store, "status", json!({})).unwrap();
+    assert_eq!(status["unacknowledged_mail"], 0, "{status}");
+    assert_eq!(status["open_requests"], 0);
+    assert_eq!(outcomes_of(&mut fleet, "asker").len(), 1);
+}
+
 #[test]
 fn only_the_runtime_speaks_as_crew() {
     let mut fleet = Fleet::new(now_settings());
@@ -368,19 +455,69 @@ fn only_the_runtime_speaks_as_crew() {
                 json!({"from": "infra", "to": "crew", "kind": "notice", "body": "hello"}),
                 Some("infra")
             )
-            .contains("crew has no mailbox")
+            .contains("answered only by replying")
     );
     assert!(
         fleet
             .refused("mail.inbox", json!({"address": "crew"}), None)
             .contains("crew has no mailbox")
     );
-    // Every message from crew was written by the runtime.
+    // A reply to crew must answer a crew request.
+    let request = fleet.send(
+        json!({"id": "ask-infra", "from": "apps", "to": "infra", "kind": "request", "body": "?"}),
+    );
+    assert!(
+        fleet
+            .refused(
+                "mail.send",
+                json!({"from": "infra", "to": "crew", "kind": "reply", "correlation": request["id"], "body": "x"}),
+                Some("infra")
+            )
+            .contains("only the recipient")
+    );
+    // crew.report needs an agent inside its own running job.
+    let report = json!({"kind": "progress", "body": "forged"});
+    assert!(
+        fleet
+            .refused("crew.report", report.clone(), None)
+            .contains("is for crew")
+    );
+    assert!(
+        fleet
+            .refused("crew.report", report.clone(), Some("infra"))
+            .contains("PRIVATEER_JOB is not set")
+    );
+    crew(&fleet, "busy", "infra-repair", "sleep 60");
+    wait(&fleet, "busy", &["running"]);
+    let as_job = |job: &str, agent: &str| {
+        let output = fleet
+            .command()
+            .args(["crew.report", "--json", &report.to_string()])
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", agent)
+            .env("PRIVATEER_JOB", job)
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (ok, error) = as_job("busy", "apps");
+    assert!(!ok && error.contains("is not crew of apps"), "{error}");
     crew(&fleet, "done", "infra-repair", "true");
     wait(&fleet, "done", &["succeeded"]);
-    let written = from_crew(&mut fleet, "infra");
-    assert_eq!(written.len(), 1);
-    assert!(written.iter().all(|m| m["body"] != "all good"));
+    let (ok, error) = as_job("done", "infra");
+    assert!(!ok && error.contains("is not running"), "{error}");
+    let (ok, error) = as_job("busy", "infra");
+    assert!(ok, "{error}");
+    fleet.ok("job.cancel", json!({"id": "busy"}), Some("infra"));
+    // Every message from crew was written by the runtime.
+    assert!(
+        from_crew(&mut fleet, "infra")
+            .iter()
+            .all(|m| m["body"] != "all good")
+    );
 }
 
 #[test]
