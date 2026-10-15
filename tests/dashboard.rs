@@ -661,7 +661,7 @@ fn live_captain_view_does_not_infer_mail_or_allow_demo_sends() {
     };
     app.open_inbox();
     assert_eq!(app.selection_len(), 0);
-    assert!(render(&mut app, 120, 34).contains("not connected to a runtime mailbox"));
+    assert!(render(&mut app, 120, 34).contains("No messages for the captain"));
     app.select_ship(Some("navigator".into()));
     app.compose();
     assert!(app.composer.is_none());

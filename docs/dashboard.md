@@ -1,13 +1,15 @@
 # Privateer's terminal bridge
 
-The first dashboard slice is a Rust TUI that runs inside Herdr or an ordinary
-terminal. It supplies a nautical overview of **one existing local Privateer
-home**, organized as equal peer ships. Fleet overview is the home destination;
+The dashboard is a Rust TUI that runs inside Herdr or an ordinary terminal.
+Its home lists active ships from the per-user fleet registry (`fleet.list`),
+reading each existing home read-only. Missing homes stay visible as unavailable
+and are never recreated. It shows scope, harness, attended presence, dispatcher
+lock status, open requests, unread ship mail and the three latest wakes. Fleet overview is the home destination;
 the sidebar always shows ships. Each ship has Bridge, Assignments, Terminals
-and Logbook views. It does not aggregate other homes or remote peers.
+and Logbook views. Remote peers are not discovered.
 
-This is an observation and navigation tool. It is not yet a conversational
-navigator, scheduler or interactive agent launcher. Installing it does not
+This is an observation and navigation tool. It is not yet a model-driven conversational navigator, scheduler or interactive
+agent launcher. Installing it does not
 replace an existing fleet. The current headless harness/job interfaces continue
 to work independently.
 
@@ -19,6 +21,8 @@ cargo build --locked --features dashboard --bin privateer-dashboard
 ./target/debug/privateer-dashboard --demo --once
 ```
 
+Install both binaries with `cargo install --locked --path . --features dashboard`.
+
 The dashboard dependencies are optional. Ordinary `cargo build --bin privateer`
 does not enable them. Ratatui 0.29/Crossterm 0.28 preserve the project's Rust 1.85
 floor; this does not require adopting a newer compiler for the runtime.
@@ -26,14 +30,28 @@ floor; this does not require adopting a newer compiler for the runtime.
 Demo mode uses clearly labeled sample data, never opens an inherited Herdr
 socket and does not create a runtime home, jobs, events or model calls.
 
-Fleet home now previews a separate captain's inbox. Press `i` to inspect its
-sample decisions, replies and grouped notices, or `l` to open the liaison's
-Bridge. The liaison is an optional contact role among peer ships. In the demo,
-`m` opens a local Status/Ask/Message composer: Tab changes mode, Enter previews
-the interaction, and Escape cancels. Preview exchanges stay in memory and are
-discarded on exit. They do not call a model or deliver a live message. In live
-mode, the captain's inbox and messaging remain unavailable until the runtime's
-front door is connected; task alerts are not treated as captain mail.
+Fleet home includes the live captain inbox aggregated across fleet homes through
+`mail.inbox` and `mail.requests`, with decisions first, then requests, replies
+and notices. `i` opens it; Enter marks the selected message read and `r` replies
+to a request or decision in its originating home. Acknowledgment advances only
+through messages explicitly marked read, so a decision read out of sequence
+cannot clear earlier unseen notices. Read markers waiting on an earlier message
+are session-local. Acknowledged open requests remain visible until answered.
+Each refresh reads at most 200 unread messages and 200 open requests per home,
+with at most 1,000 displayed items overall. Mark items read to reach later mail;
+no hidden row is acknowledged. Failed homes show an error and retain their last
+mail observation. The UI uses bounded worker queues; commands have 15-second
+deadlines and 1 MiB output limits. Failed sends retain their draft and id for an
+idempotent retry; a deadline means the action's outcome needs checking.
+
+Select any ship and press `m`: Status summarizes recorded state without a model
+call; Ask sends a request and Message a notice from `captain`. Replies use the
+original message id as correlation. All mail changes go through Privateer's
+commands, never direct SQL writes. Mailbox commands use the runtime's normal
+Store open/migration behavior; fleet/task observations remain read-only.
+
+Demo mode keeps sample mail and its Status/Ask/Message composer entirely in
+memory. No live mailbox commands, acknowledgments or sends run in demo mode.
 
 ## Existing state and Herdr
 
@@ -43,7 +61,10 @@ In a Herdr pane, run:
 /path/to/privateer-dashboard --home /absolute/privateer/home
 ```
 
-`PRIVATEER_HOME` may supply the home. When `HERDR_ENV=1`, the dashboard can use the
+No home argument is needed for fleet discovery. `PRIVATEER_FLEET` selects a
+private registry; otherwise the runtime's usual per-user path is used. A missing
+registry means an empty fleet and creates no state. `--home` / `PRIVATEER_HOME`
+provide a legacy single-home fallback when the fleet is empty. When `HERDR_ENV=1`, the dashboard can use the
 injected `HERDR_SOCKET_PATH`. It never guesses a global socket, discovers a
 focused session or starts a Herdr server. An explicit `--herdr-socket
 /absolute/path` selects a socket; `--no-herdr` disables the integration. Herdr
@@ -75,8 +96,10 @@ Ships are equal peer identities, not ranks. `Navigator` is a familiar point of
 contact in the demo and has no special authority. The demo also includes Apps,
 Infrastructure and an idle Research ship.
 
-Live ships come from the optional private `<home>/dashboard.json` registry plus
-owner/handoff identities observed in the bounded local snapshot. A registry
+Live fleet ships come from active registry entries, with scope and status read
+from their own homes. The optional private `<home>/dashboard.json` supplies
+presentation names and exact terminal bindings. The single-home fallback also
+includes observed owner/handoff identities. A registry
 entry keeps an idle ship visible between sessions; an unregistered identity may
 fall out of a later bounded snapshot. This is a dashboard registry, not a new
 runtime authority table or remote-host discovery mechanism.
@@ -110,7 +133,7 @@ does not invent historical target information the runtime did not record.
 
 Fleet overview summarizes all observed ships and pending issues. Ship-level
 alerts, jobs, assignment history and terminal lists are filtered to that ship.
-The preview remains one local database plus one explicitly chosen Herdr socket;
+The preview reads bounded local fleet homes plus one explicitly chosen Herdr socket;
 listing a ship does not establish remote access or task-to-native-session
 continuity. Demo terminals are labeled sample data and never connect to a socket.
 

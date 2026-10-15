@@ -32,6 +32,8 @@ pub struct Ship {
     pub liaison: bool,
     #[serde(default)]
     pub terminals: Vec<TerminalBinding>,
+    #[serde(default)]
+    pub live: Option<super::fleet::ShipState>,
 }
 
 impl Ship {
@@ -41,6 +43,7 @@ impl Ship {
             name: name.into(),
             description: description.into(),
             liaison: id == "navigator",
+            live: None,
             terminals: agent
                 .map(|_| TerminalBinding {
                     pane_id: format!("demo:{id}"),

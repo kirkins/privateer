@@ -19,11 +19,18 @@ pub struct Mail {
     pub subject: String,
     pub body: String,
     pub status: String,
+    #[serde(default)]
+    pub home: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub seq: i64,
+    #[serde(default)]
+    pub acknowledged: bool,
 }
 
 pub fn sample_mail() -> Vec<Mail> {
     vec![
         Mail {
+            home: None, seq: 0, acknowledged: false,
             id: "demo-decision".into(),
             kind: "Decision".into(),
             from: "Research".into(),
@@ -32,6 +39,7 @@ pub fn sample_mail() -> Vec<Mail> {
             status: "Awaiting captain".into(),
         },
         Mail {
+            home: None, seq: 0, acknowledged: false,
             id: "demo-reply".into(),
             kind: "Reply".into(),
             from: "Apps".into(),
@@ -40,6 +48,7 @@ pub fn sample_mail() -> Vec<Mail> {
             status: "Reply to your request".into(),
         },
         Mail {
+            home: None, seq: 0, acknowledged: false,
             id: "demo-notice".into(),
             kind: "Notice".into(),
             from: "Infrastructure".into(),
@@ -79,6 +88,9 @@ pub struct Composer {
     pub recipient: String,
     pub mode: InputMode,
     pub body: String,
+    pub home: Option<std::path::PathBuf>,
+    pub correlation: Option<String>,
+    pub id: String,
 }
 
 #[derive(Clone)]
@@ -91,8 +103,13 @@ pub struct Exchange {
 
 impl App {
     pub fn edit_composer(&mut self, key: KeyCode) {
+        if self.mail_pending {
+            self.notice = "Mailbox command pending…".into();
+            return;
+        }
         match key {
             KeyCode::Esc => self.composer = None,
+            KeyCode::Enter if !self.demo => self.submit_live(),
             KeyCode::Enter => self.submit_preview(),
             _ => {
                 if let Some(draft) = &mut self.composer {
@@ -135,6 +152,9 @@ impl App {
         }
     }
     pub fn compose(&mut self) {
+        if self.mail_pending {
+            return;
+        }
         let Some(ship) = self.ship.clone() else {
             self.open_liaison();
             if self.ship.is_none() {
@@ -142,14 +162,22 @@ impl App {
             }
             return self.compose();
         };
-        if !self.demo {
-            self.notice =
-                "Messaging unavailable: captain's front door is not connected. No message sent."
-                    .into();
+        let home = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| s.id == ship)
+            .and_then(|s| s.live.as_ref())
+            .filter(|l| l.error.is_none())
+            .map(|l| l.home.clone());
+        if !self.demo && home.is_none() {
+            self.notice = "Ship home is unavailable. No message sent.".into();
             return;
         }
         self.composer = Some(Composer {
             recipient: ship,
+            home,
+            id: uuid::Uuid::new_v4().to_string(),
             ..Composer::default()
         });
     }
@@ -183,16 +211,74 @@ impl App {
         });
         self.notice = "Demo interaction only · discarded on exit · no inference".into();
     }
-    pub fn inbox_lines(&self) -> Vec<Line<'static>> {
-        if !self.demo {
-            return vec![
-                Line::from("Captain's inbox is not connected to a runtime mailbox yet."),
-                Line::from("Ship operational alerts remain in their own workspaces."),
-                Line::from("No captain decisions or replies are inferred from task events."),
-            ];
+    pub fn reply(&mut self) {
+        if self.mail_pending {
+            return;
         }
         let Some(mail) = self.mail.get(self.selected) else {
-            return vec![Line::from("No messages for the captain.")];
+            return;
+        };
+        if self.demo {
+            self.notice = "Demo replies are sample-only.".into();
+            return;
+        }
+        if !matches!(mail.kind.as_str(), "request" | "decision") || mail.status == "answered" {
+            self.notice = "Select an open request or decision.".into();
+            return;
+        }
+        self.composer = Some(Composer {
+            recipient: mail.from.clone(),
+            home: mail.home.clone(),
+            correlation: Some(mail.id.clone()),
+            id: uuid::Uuid::new_v4().to_string(),
+            ..Composer::default()
+        });
+    }
+    pub fn submit_live(&mut self) {
+        use serde_json::json;
+        let Some(draft) = self.composer.as_ref() else {
+            return;
+        };
+        if draft.body.trim().is_empty() || self.action.is_some() {
+            return;
+        }
+        let Some(home) = draft.home.clone() else {
+            return;
+        };
+        if draft.mode == InputMode::Status && draft.correlation.is_none() {
+            self.notice = self
+                .snapshot
+                .ships
+                .iter()
+                .find(|s| s.id == draft.recipient)
+                .and_then(|s| s.live.as_ref())
+                .map(|l| {
+                    format!(
+                        "{} open requests · {} unread mail · {}",
+                        l.requests,
+                        l.unread,
+                        if l.attended { "aboard" } else { "not aboard" }
+                    )
+                })
+                .unwrap_or_else(|| "Ship state unavailable".into());
+            self.composer = None;
+            return;
+        }
+        self.action = Some(super::mailbox::Action {
+            home,
+            verb: "mail.send".into(),
+            args: json!({"id":draft.id,"from":"captain","to":draft.recipient,"kind":if draft.correlation.is_some() {"reply"} else if draft.mode==InputMode::Ask {"request"} else {"notice"},"correlation":draft.correlation,"body":draft.body}),
+        });
+    }
+    pub fn inbox_lines(&self) -> Vec<Line<'static>> {
+        let Some(mail) = self.mail.get(self.selected) else {
+            return std::iter::once(Line::from("No messages for the captain."))
+                .chain(
+                    self.mail_errors
+                        .iter()
+                        .map(|e| Line::from(format!("Mailbox unavailable: {}", clean(e, 512)))),
+                )
+                .collect();
         };
         vec![
             Line::styled(
@@ -208,8 +294,11 @@ impl App {
             Line::from(""),
             Line::from(clean(&mail.body, 2048)),
             Line::from(""),
-            Line::from("Sample mailbox · viewing does not acknowledge or answer this item."),
-            Line::from("Live replies and decisions await the captain's front door."),
+            Line::from(if self.demo {
+                "Sample mailbox · viewing does not acknowledge or answer this item."
+            } else {
+                "Enter: mark read · r: reply. A read acknowledges only the contiguous read prefix."
+            }),
         ]
     }
     pub fn draw_composer(&self, frame: &mut Frame) {
@@ -232,7 +321,11 @@ impl App {
             .iter()
             .find(|s| s.id == draft.recipient)
             .map_or(draft.recipient.as_str(), |s| s.name.as_str());
-        let block = Block::bordered().title(format!("DEMO · To {}", clean(name, 80)));
+        let block = Block::bordered().title(format!(
+            "{}To {}",
+            if self.demo { "DEMO · " } else { "" },
+            clean(name, 80)
+        ));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         let rows = Layout::vertical([
@@ -294,13 +387,22 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(format!(
-                "{} / 1024 chars · local sample only",
-                draft.body.chars().count()
+                "{} / 1024 chars · {}",
+                draft.body.chars().count(),
+                if self.demo {
+                    "local sample only"
+                } else {
+                    "captain mailbox"
+                }
             )),
             rows[3],
         );
         frame.render_widget(
-            Paragraph::new("Tab: mode · Enter: preview · Esc: cancel"),
+            Paragraph::new(if self.demo {
+                "Tab: mode · Enter: preview · Esc: cancel"
+            } else {
+                "Tab: mode · Enter: send · Esc: cancel"
+            }),
             rows[4],
         );
     }

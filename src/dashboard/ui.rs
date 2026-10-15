@@ -29,6 +29,9 @@ pub struct MouseMap {
 pub struct App {
     pub inbox_open: bool,
     pub mail: Vec<Mail>,
+    pub mail_errors: Vec<String>,
+    pub action: Option<super::mailbox::Action>,
+    pub mail_pending: bool,
     pub composer: Option<Composer>,
     pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
@@ -138,7 +141,7 @@ impl App {
     }
     pub fn selection_len(&self) -> usize {
         if self.inbox_open {
-            return if self.demo { self.mail.len() } else { 0 };
+            return self.mail.len();
         }
         match self.tab {
             1 => self.assignment_indices().len(),
@@ -184,19 +187,16 @@ impl App {
             }
         }
     }
-    pub fn update_snapshot(&mut self, mut snapshot: Snapshot) {
+    pub fn update_snapshot(&mut self, snapshot: Snapshot) {
         let task_id = self.selected_task().map(|t| t.id.clone());
-        if let Some(ship) = self
-            .snapshot
-            .ships
-            .iter()
-            .find(|s| Some(&s.id) == self.ship.as_ref())
-        {
-            if !snapshot.ships.iter().any(|s| s.id == ship.id) {
-                snapshot.ships.push(ship.clone());
-            }
-        }
         self.snapshot = snapshot;
+        if self
+            .ship
+            .as_ref()
+            .is_some_and(|id| !self.snapshot.ships.iter().any(|s| &s.id == id))
+        {
+            self.select_ship(None);
+        }
         if self.tab == 1 {
             self.selected = task_id
                 .and_then(|id| {
@@ -337,7 +337,7 @@ impl App {
                 "Captain's inbox",
                 Style::default().fg(Color::Cyan),
             ));
-            if self.demo {
+            {
                 for mail in self.mail.iter().take(3) {
                     lines.push(Line::from(format!(
                         "{} · {} · {}",
@@ -346,13 +346,17 @@ impl App {
                         clean(&mail.subject, 160)
                     )));
                 }
-                lines.push(Line::from(
-                    "Sample messages · i to inspect; no live mailbox connected",
-                ));
-            } else {
-                lines.push(Line::from(
-                    "Mailbox not connected. Ship alerts below are operational state.",
-                ));
+                lines.push(Line::from(if self.demo {
+                    "Sample messages · i to inspect; no live mailbox connected"
+                } else {
+                    "i: inspect mail · Enter: mark read · r: reply"
+                }));
+                for error in &self.mail_errors {
+                    lines.push(Line::from(format!(
+                        "Mailbox unavailable: {}",
+                        clean(error, 256)
+                    )));
+                }
             }
             lines.push(Line::from(""));
             for ship in &self.snapshot.ships {
@@ -385,6 +389,10 @@ impl App {
                 lines.push(Line::from(format!(
                     "{owned} owned · {incoming} incoming handoffs · {pending} pending issues"
                 )));
+                lines.push(Line::from(clean(&ship.description, 512)));
+                if let Some(live) = &ship.live {
+                    lines.extend(super::fleet::lines(live));
+                }
             }
             lines.extend(self.pending_lines());
             return lines;
@@ -397,6 +405,9 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 ));
                 lines.push(Line::from(clean(&ship.description, 512)));
+                if let Some(live) = &ship.live {
+                    lines.extend(super::fleet::lines(live));
+                }
                 lines.push(Line::from(if ship.liaison {
                     "Liaison · your default contact; a peer ship, not a commander."
                 } else {
@@ -430,7 +441,7 @@ impl App {
                     if self.demo {
                         "m: Try Status / Ask / Message · local demo only"
                     } else {
-                        "Messaging unavailable until the captain's front door is connected."
+                        "m: Status / Ask / Message · delivered through the ship's mailbox"
                     },
                     Style::default().fg(Color::Cyan),
                 ));
@@ -712,7 +723,7 @@ impl App {
             ])
             .split(body);
             let entries = if self.inbox_open {
-                if self.demo {
+                {
                     self.mail
                         .iter()
                         .map(|m| {
@@ -730,8 +741,6 @@ impl App {
                             ])
                         })
                         .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
                 }
             } else if self.tab == 1 {
                 self.assignment_indices()
