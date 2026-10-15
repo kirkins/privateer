@@ -4,6 +4,7 @@ pub mod cli;
 pub mod context;
 pub mod core;
 pub mod crew;
+pub mod cursor_mail;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod fleet;

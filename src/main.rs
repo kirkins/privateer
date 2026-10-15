@@ -68,12 +68,13 @@ fn run() -> Result<()> {
     // Harness hooks must never fail the harness: they exit with the code
     // the harness expects and log their own errors.
     if command == "hook" {
-        ensure!(
-            positional.first().map(String::as_str) == Some("claude"),
-            "usage: privateer hook claude EVENT"
-        );
         let event = positional.get(1).map(String::as_str).unwrap_or("");
-        std::process::exit(privateer::presence::claude_hook(home.as_deref(), event));
+        let code = match positional.first().map(String::as_str) {
+            Some("claude") => privateer::presence::claude_hook(home.as_deref(), event),
+            Some("cursor") => privateer::cursor_mail::hook(home.as_deref(), event),
+            _ => bail!("usage: privateer hook claude|cursor EVENT"),
+        };
+        std::process::exit(code);
     }
     if !json_given && privateer::cli::VERBS.contains(&command.as_str()) {
         return privateer::cli::run(home, &command, &positional);

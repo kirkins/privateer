@@ -22,8 +22,8 @@ cargo build --locked --features dashboard --bins
 ```
 
 Install both binaries with `cargo install --locked --path . --features dashboard`.
-Live mailbox commands use `privateer` beside the dashboard binary, falling back
-to `privateer` on `PATH`.
+Live mail, management and Board launches use `privateer` beside the dashboard
+binary, falling back to `privateer` on `PATH`.
 
 The dashboard dependencies are optional. Ordinary `cargo build --bin privateer`
 does not enable them. Ratatui 0.29/Crossterm 0.28 preserve the project's Rust 1.85
@@ -170,10 +170,12 @@ the binding column was introduced, without migrating them. Board needs an
 explicit/inherited Herdr socket; a
 regular terminal still shows state and supports mail and management.
 
-`n` opens New ship (name, scope, optional sibling folder, harness), using an
+`n` opens New ship (name, scope, optional absolute folder, harness), using an
 existing available ship as its creator. For an empty fleet, create the first
 ship through the [quick start](../README.md#quick-start); dashboard onboarding
-is a later step. `x` opens Retire: type the exact selected ship name to confirm;
+is a later step. Leaving the folder empty creates a sibling of the creator's
+folder. Use Tab or Up/Down to select a field, Enter to submit and Escape to cancel.
+`x` opens Retire: type the exact selected ship name to confirm;
 its folder is kept.
 Retirement refuses if the fleet name now belongs to a different home. `d` opens
 Dispatcher: status, start or stop. The forms call `ship.create`, `ship.retire`
@@ -262,7 +264,7 @@ continuity. Demo terminals are labeled sample data and never connect to a socket
 | Enter/`f` on a ship's terminal; `f` on Bridge | Open the selected/primary live terminal |
 | Wheel / Page Up/Down | Navigate the pointed list / scroll details |
 | `c` | Hide/show additional stored jobs on Bridge |
-| Escape | Return home from a ship; exit when already home |
+| Escape | Cancel a form or draft; otherwise return home from a ship, or exit when already home |
 | `q`, Ctrl-C | Exit; workers continue |
 
 Mouse support works when the terminal forwards mouse events, including inside
@@ -308,8 +310,8 @@ function. No animation timer or motion controls run in the dashboard.
   response deadline. At most 1,000 panes are accepted. Repeated failures replace
   the source error in the UI instead of appending transcript notifications.
 - The dashboard opens an attended session through `privateer start`; that
-  runtime holds its presence and waits for its harness. It does not own, cancel,
-  restart or recover agents.
+  runtime holds its presence and waits for its harness. The dashboard does not
+  own, cancel, restart or recover agents.
   Closing the dashboard never sends worker shutdown signals. Boarding does not replace headless job ownership or admission.
 - Only the explicitly selected/inherited Herdr socket is inspected. Provider
   routes and machine topology remain private configuration. Read-only viewing

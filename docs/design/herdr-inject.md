@@ -50,7 +50,9 @@ The installed Herdr protocol 20 schema, inspected with `herdr api schema`, has
 `herdr agent prompt <pane> <text>` command. It has no expected terminal/session
 or socket-incarnation precondition. An agent can exit and be replaced between
 verification and the prompt. Existing dashboard safety explicitly allows this
-non-atomic check only for focus, never input. Therefore this proposal does not
+non-atomic check for focus; the separate
+[boarding boundary](../dashboard.md#boarding-and-management) does not authorize
+input to an existing agent. Therefore this proposal does not
 enable injection on that API. It needs a conditional prompt operation or an
 equivalent server-enforced occupant lock, plus confirmation of the native
 session qualification contract, before implementation.

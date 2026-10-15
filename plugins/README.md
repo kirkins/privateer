@@ -362,6 +362,42 @@ coalescing, busy/reload boundaries, pause recovery, stale holders, failed
 admission and legacy fallback. These checks establish attended mail integration,
 not unattended fleet production readiness.
 
+`privateer start cursor -- --trust` adds the optional native hooks beside the
+ship's existing `.cursor/hooks.json` handlers and starts Cursor through the
+identity-clearing launcher. Native model, sandbox and permission options follow
+`--`; project hooks need native trust. The first completed captain turn arms
+the Rust stop-hook watcher, including after an exact native `--resume UUID`.
+It parks without model inference for up to just under eight hours per completed
+turn, then needs another captain turn to re-arm. The hook uses native
+`followup_message` for actionable mail, coalesces a burst into one bounded
+notification with at most six headers, and leaves bodies and acknowledgements
+in the durable mailbox. Routine notices wait in the inbox. A new captain
+prompt, changed presence owner, ended session or vanished parent supersedes
+the old watcher. Supervised crew do not attach to this mailbox.
+
+Cursor automatic follow-ups bypass `beforeSubmitPrompt`; their native user
+transcript records, rather than queue admission, confirm delivery. Rust keeps
+128 native-session watermarks and can recover them from the last 128 records
+within a 1 MiB native transcript tail. A recorded inbox acknowledgement can
+also settle an outstanding notification after a long turn. Missing/disabled,
+foreign or symlinked transcripts pause automatic delivery while captain prompts
+remain usable. Native error/abort pauses also persist until a new captain
+prompt. That prompt permits retry of an unconfirmed/cancelled notification;
+confirmed notifications do not replay. Losing both the cache and an older
+receipt outside the bounded tail can cause a notification to be presented again,
+never silently acknowledged. Cursor's native follow-up preserves an unfinished
+draft while it runs; unlike Pi's adapter it does not wait for a blank composer.
+See the [native hook contract](https://cursor.com/docs/hooks).
+
+Cursor 2026.10.14-941492e passed an isolated interactive idle wake, file/reply/ack,
+captain input during a parked hook, another mail turn with the draft preserved,
+and exact UUID resume without replaying a delivered unacknowledged request.
+Exit released presence and left the pilot process group empty. Rust process
+fixtures cover concurrent callbacks, stale generations/owners, late session
+starts, cancelled admission, failure recovery and native receipt provenance.
+This qualifies this attended path and native profile, not arbitrary accounts,
+custom hooks, disabled transcripts or overnight fleet production behavior.
+
 Real CLI/extension fixtures cover a thousand-message burst, busy/idle delivery,
 resume receipts, failed queues, native error boundaries, holder replacement and
 shutdown. Pi 1.1.0 has also passed a live isolated interactive file/reply/ack
@@ -370,6 +406,21 @@ model availability or signed-Pi qualification on a machine without that wrapper.
 OMP 18.8.9 has loaded the extension and displayed a low-priority notice in its
 native terminal without a model turn. Its live model/tool path remains
 unqualified under the account limitation noted above.
+
+Attended support is separate from the worker checkpoint above:
+
+| Harness | Privateer attended-mail path |
+|---|---|
+| Pi | Native extension; live file/reply/ack and resume verified |
+| Claude | Native mod; live file/reply/ack and resume verified |
+| Cursor | Rust native stop-hook park; live file/reply/ack, captain input, draft preservation and resume verified |
+| Pi signed | Shared Pi extension; installed signed wrapper still required |
+| OMP | Native extension loaded; live model/tool trial blocked by account credits |
+| Codex / Grok / OpenCode V1 / OpenCode V2 | Presence wrapper and manual inbox available; automatic attended idle-mail integration still pending |
+
+Headless first-mate activation, worker completion, terminal command planning and
+attended native mail are different capabilities. A passing worker trial or
+protocol fixture does not qualify an attended adapter.
 
 ## Gateway Pi adapter
 

@@ -322,7 +322,7 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
         return;
     };
     if app.herdr_error.is_some()
-        || !app.herdr_age.is_some_and(|age| age < 10)
+        || app.herdr_age.is_none_or(|age| age >= 10)
         || app.selection_invalidated
     {
         app.notice = "Refresh Herdr and select the ship again.".into();
