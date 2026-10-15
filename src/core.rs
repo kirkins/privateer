@@ -19,7 +19,8 @@ const ACTIONS: &[&str] = &[
     "cleanup",
     "deploy_production",
 ];
-const DEFAULT_ACTIONS: &[&str] = &[
+/// A new charter's actions: everything but production deployment.
+pub const DEFAULT_ACTIONS: &[&str] = &[
     "inspect",
     "spawn",
     "implement",

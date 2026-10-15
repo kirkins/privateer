@@ -8,8 +8,9 @@
 //! local-transport peer for every other active ship and a directory entry
 //! behind it. A ship may create another ship, but only with a charter whose
 //! actions its own charter already has: delegation never widens authority.
-//! It may retire only ships it created. Retiring revokes the ship's charter,
-//! stops its dispatcher and unlinks it, and keeps its folder.
+//! It may retire only ships it created, and change the actions of ships it
+//! created within its own. Retiring revokes the ship's charter, stops its
+//! dispatcher and unlinks it, and keeps its folder.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -53,7 +54,7 @@ pub(crate) fn registry() -> Result<Connection> {
 pub(crate) struct Member {
     pub name: String,
     pub home: PathBuf,
-    created_by: String,
+    pub created_by: String,
 }
 
 pub(crate) fn members(conn: &Connection) -> Result<Vec<Member>> {
@@ -151,11 +152,54 @@ pub fn link(store: &Store, ship: &str) -> Result<usize> {
     Ok(linked)
 }
 
-fn caller_ship(store: &Store) -> Option<String> {
+pub(crate) fn caller_ship(store: &Store) -> Option<String> {
     match store.caller() {
         Caller::Agent { actor } => Some(actor.clone()),
         Caller::Operator => crate::presence::folder_ship(store),
     }
+}
+
+/// An active fleet ship the caller may manage: any ship for the captain, only
+/// ships it created for an agent. `verb` completes "can VERB only ships it created".
+pub(crate) fn managed(store: &Store, name: &str, verb: &str) -> Result<Member> {
+    let member = members(&registry()?)?
+        .into_iter()
+        .find(|m| m.name == name)
+        .with_context(|| format!("no active ship named {name} in the fleet"))?;
+    if let Caller::Agent { actor } = store.caller() {
+        ensure!(
+            &member.created_by == actor,
+            "{actor} can {verb} only ships it created; {name} was created by {}",
+            member.created_by
+        );
+    }
+    Ok(member)
+}
+
+/// The actions of an agent's own active charter. Callers deciding on another
+/// ship's authority hold this home's write lock around the read.
+pub(crate) fn own_actions(store: &Store, actor: &str) -> Result<Vec<String>> {
+    let charter = store.charter(actor)?;
+    ensure!(charter["active"] == true, "{actor}'s charter was revoked");
+    Ok(charter["actions"]
+        .as_array()
+        .with_context(|| format!("{actor}'s charter has no actions"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Every requested action must be one the granting agent holds.
+fn within(own: &[String], actor: &str, requested: &Value) -> Result<()> {
+    for action in requested.as_array().context("actions must be a list")? {
+        let action = action.as_str().context("actions are names")?;
+        ensure!(
+            own.iter().any(|a| a == action),
+            "{actor} cannot give a ship the {action} action its own charter lacks"
+        );
+    }
+    Ok(())
 }
 
 /// Create a ship from inside a ship. An agent's new ship gets at most its
@@ -184,33 +228,13 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         Caller::Operator => None,
     };
     if let Caller::Agent { actor } = store.caller() {
-        let charter = store.charter(actor)?;
+        let own = own_actions(store, actor)?;
         ensure!(
-            charter["active"] == true,
-            "creating ship's charter was revoked"
-        );
-        let own = &charter["actions"];
-        let own: Vec<&str> = own
-            .as_array()
-            .context("creating ship's charter has no actions")?
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        ensure!(
-            own.contains(&"spawn"),
+            own.iter().any(|a| a == "spawn"),
             "ship.create requires spawn in the creating ship's charter"
         );
         match &actions {
-            Some(requested) => {
-                let requested = requested.as_array().context("actions must be a list")?;
-                for action in requested {
-                    let action = action.as_str().context("actions are names")?;
-                    ensure!(
-                        own.contains(&action),
-                        "{actor} cannot give a new ship the {action} action its own charter lacks"
-                    );
-                }
-            }
+            Some(requested) => within(&own, actor, requested)?,
             None => actions = Some(json!(own)),
         }
     }
@@ -275,21 +299,11 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
 fn retire(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     let conn = registry()?;
-    let member = members(&conn)?
-        .into_iter()
-        .find(|m| m.name == name)
-        .with_context(|| format!("no active ship named {name} in the fleet"))?;
+    let member = managed(store, name, "retire")?;
     if let Some(expected) = args.get("expected_home").and_then(Value::as_str) {
         ensure!(
             member.home == Path::new(expected),
             "ship home changed since selection; refresh before retiring"
-        );
-    }
-    if let Caller::Agent { actor } = store.caller() {
-        ensure!(
-            &member.created_by == actor,
-            "{actor} can retire only ships it created; {name} was created by {}",
-            member.created_by
         );
     }
     let dispatcher = if member.home.is_dir() {
@@ -329,6 +343,44 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
     )
 }
 
+/// Set the actions of a ship's charter. An agent may change only ships it
+/// created, and only to actions its own charter has: granting never widens
+/// authority beyond the granter's. The captain may change any ship.
+fn set_actions(store: &mut Store, args: &Value) -> Result<Value> {
+    let name = required(args, "name")?;
+    let requested = args.get("actions").context("actions is required")?;
+    let member = managed(store, name, "change the actions of")?;
+    // Hold this home's write lock through the grant: a revoke committed
+    // first wins, and one committed later cannot interleave with the check.
+    let authority = match store.caller() {
+        Caller::Agent { .. } => Some(store.write_transaction()?),
+        Caller::Operator => None,
+    };
+    if let Caller::Agent { actor } = store.caller() {
+        within(&own_actions(store, actor)?, actor, requested)?;
+    }
+    ensure!(member.home.is_dir(), "{name}'s folder is gone");
+    let mut target = Store::open(&member.home)?;
+    ensure!(
+        target.charter(name)?["active"] == true,
+        "{name}'s charter was revoked"
+    );
+    let charter = crate::core::dispatch(
+        &mut target,
+        "charter.put",
+        json!({"id": name, "actions": requested}),
+    )?;
+    let by = caller_ship(store).unwrap_or_else(|| "captain".into());
+    store.audit(
+        "ship.actions",
+        &json!({"ship": name, "actions": charter["actions"], "by": by}),
+    )?;
+    if let Some(authority) = authority {
+        authority.commit()?;
+    }
+    Ok(json!({"ship": name, "actions": charter["actions"], "by": by}))
+}
+
 fn list() -> Result<Value> {
     let conn = registry()?;
     let mut statement = conn.prepare(
@@ -356,6 +408,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "ship.create" => create(store, &args),
         "ship.retire" => retire(store, &args),
+        "ship.actions" => set_actions(store, &args),
         _ => bail!("unknown fleet command {command}"),
     }
 }

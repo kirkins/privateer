@@ -468,7 +468,7 @@ def onboarding(binary, runtime):
                 assert out.returncode == 0, out.stderr.decode()
                 return json.loads(out.stdout)
             tui.until(lambda: query("ship.presence", {"ship":"contact"})["attended"], "onboarded ship has no presence")
-            assert query("charter.show", {"id":"contact"})["actions"] == ["inspect", "spawn", "message"]
+            assert query("charter.show", {"id":"contact"})["actions"] == ["inspect", "spawn", "implement", "test", "publish_pr", "merge_green", "message", "recovery", "cleanup"]
             assert json.loads((home / "config.json").read_text())["preset"] == "liaison"
             assert "Onboarding the captain" in (folder / "AGENTS.md").read_text()
             tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
@@ -811,7 +811,9 @@ def onboarding(binary, runtime):
                 assert (config.get("preset") == "liaison") == (role == "liaison")
                 out = subprocess.run([str(runtime), "--home", str(plain_home), "charter.show", "--json", '{"id":"apps"}'],
                                      env=plain_env, capture_output=True, check=True, timeout=10)
-                assert ("implement" in json.loads(out.stdout)["actions"]) == (role == "ship")
+                # Liaison or not, a captain-made ship can work but not deploy.
+                actions = json.loads(out.stdout)["actions"]
+                assert "implement" in actions and "deploy_production" not in actions
                 (plain_root / "release").touch()
                 subprocess.run(["sh", "-c", displayed], cwd=plain_root, env=plain_env,
                                capture_output=True, check=True, timeout=10)

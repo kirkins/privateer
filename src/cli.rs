@@ -186,8 +186,8 @@ You are the first mate of the Privateer ship **{ship}**.{scope} The captain, the
 Run Privateer as `{cli} COMMAND --json '{{...}}'`.
 
 Use your agent identity for mail and delegation through these JSON commands or
-`privateer ship new|retire`. Bare `privateer`, `init`, `start`, `service`, the
-dashboard and `project add` are captain commands; ask the captain to run them.
+`privateer ship new|retire` and `privateer project add`. Bare `privateer`,
+`init`, `start`, `service`, the dashboard and charter edits are captain commands.
 
 ## At the start of every session
 
@@ -202,8 +202,8 @@ dashboard and `project add` are captain commands; ask the captain to run them.
 - Delegate with `task.create {{"id":"...","owner":"<ship>","title":"...","charter_id":"{ship}"}}`; hand off with `task.handoff`, which takes effect when the recipient runs `task.accept`.
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
 - Before you stop, replace the handoff note for each focus you worked on: `note.put {{"ship":"{ship}","focus":"task:<id>|thread:<id>|captain|ship","body":"..."}}`. Keep it under 2 KB and to judgement: what you are doing and why, what you are waiting on, what comes next. Facts are already recorded. Put lasting preferences and conventions in the `ship` note.
-- Repositories live in `projects/`; the captain adds them with `privateer project add <git url>`.
-- New area of work? Create a ship for it: `ship.create {{"name":"...","scope":"...","objective":"..."}}` (beside this folder; its charter can only have actions yours has). Retire ships you created with `ship.retire {{"name":"..."}}`. `fleet.list {{}}` shows every ship on this machine.
+- Repositories live in `projects/`. Add one with `project.add {{"url":"<git url>","name":"<optional>"}}`, or to a ship you created with `"target":"<ship>"`.
+- New area of work? Create a ship for it: `ship.create {{"name":"...","scope":"...","objective":"..."}}` (beside this folder; it gets your charter's actions, or the subset you pass as `"actions"`). Change a ship you created with `ship.actions {{"name":"...","actions":[...]}}`, within your own actions, and retire it with `ship.retire {{"name":"..."}}`. `fleet.list {{}}` shows every ship on this machine.
 
 ## Crew
 
@@ -437,13 +437,23 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     // The shared ledger must exist before a sandboxed first mate is planned.
     crate::jobs::ensure_ledger(&store)?;
     // Created once; later edits to the charter are the captain's to keep.
+    // A liaison still holding the original contact-only preset, never edited,
+    // gets the liaison's current authority.
+    if liaison
+        && store.charter(&ship).is_ok_and(|c| {
+            c["revision"] == 1 && c["actions"] == json!(["inspect", "spawn", "message"])
+        })
+    {
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id": ship, "actions": crate::core::DEFAULT_ACTIONS}),
+        )?;
+    }
     if store.charter(&ship).is_err() {
         let mut charter = json!({"id": ship,
-            "objective": setup.objective.clone().unwrap_or_else(|| if liaison {"Help the captain onboard, read fleet state, relay mail and delegate work to peers".into()} else {format!("Work as the ship {ship}")}),
+            "objective": setup.objective.clone().unwrap_or_else(|| if liaison {"Act for the captain: onboard them, set up and staff ships, relay mail and delegate work to peers".into()} else {format!("Work as the ship {ship}")}),
             "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600});
-        if liaison {
-            charter["actions"] = json!(["inspect", "spawn", "message"]);
-        }
         if let Some(actions) = &setup.actions {
             charter["actions"] = actions.clone();
         }
@@ -550,25 +560,30 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
 fn liaison_instructions(ship: &str) -> String {
     format!(
         r#"
-## Liaison: the captain's optional contact
+## Liaison: the captain's contact
 
-You are an ordinary peer, with read (`inspect`), message and delegate (`spawn`)
-actions by default. Keep turns short and stay responsive. Route implementation
-to a ship that accepts ownership; do not implement, build, merge or deploy under
-this charter. A contact role grants no command over another ship.
+You act for the captain, who reaches you from the dashboard, a terminal or a
+front door such as their phone. Do on their behalf what they ask: create and
+retire ships, give them working authority, add repositories and route work.
+Do not send the captain to the command line for something you can do.
+
+Your charter holds a ship's ordinary actions; ships you create inherit them, or
+the subset you choose. Production deployment stays with the captain, bound to
+an exact artifact and environment. Keep turns short and stay responsive: route
+lasting work to the ship that owns it, so each outcome keeps one owner. A
+contact role grants no command over ships you did not create.
 
 ## Onboarding the captain
 
 1. Ask what the captain works on, their projects, priorities and preferences.
-2. Inspect `fleet.list` and propose useful ships with scopes and charters. Ask
-   which proposals they want before creating those ships with `ship.create`.
-3. New ships created by you inherit only your charter's actions. Explain any
-   implementation authority they need and have the captain grant it explicitly;
-   never widen your own charter or claim a child has rights you do not hold.
-4. Ask the captain to add the chosen repositories with `privateer project add <git url>`.
-5. Explain the dashboard's inbox, direct messages and Board action, and the
+2. Inspect `fleet.list` and propose useful ships with scopes and actions. Ask
+   which proposals they want, then create those ships with `ship.create`.
+3. Add each ship's repositories with `project.add` and its `target`. A ship you
+   created earlier with too few actions gets more with `ship.actions`; never
+   claim a ship holds actions its charter lacks.
+4. Explain the dashboard's inbox, direct messages and Board action, and the
    direct `privateer start` path. The captain can talk to any ship directly.
-6. Keep the captain's lasting preferences in {ship}'s `ship` note, and the
+5. Keep the captain's lasting preferences in {ship}'s `ship` note, and the
    onboarding progress in its `captain` note. Resume from those records.
 
 The captain may use a different ship first or skip this checklist. Do not claim
@@ -834,7 +849,7 @@ pub fn board(home: Option<PathBuf>, yes: bool, caller: Caller) -> Result<()> {
 
 /// Run a human command. `home` is the discovered or given ship home.
 pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -> Result<()> {
-    if matches!(verb, "init" | "start" | "service" | "project") {
+    if matches!(verb, "init" | "start" | "service") {
         caller.require_operator(verb)?;
     }
     if verb == "init" {
@@ -882,6 +897,30 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             }
             _ => bail!(usage),
         }
+        return Ok(());
+    }
+    if verb == "project" {
+        let flags = flags(args, &["ship"])?;
+        let usage = "usage: privateer project add GIT_URL [NAME] [--ship SHIP]";
+        ensure!(
+            flags.positional.first().map(String::as_str) == Some("add"),
+            usage
+        );
+        let url = flags.positional.get(1).context(usage)?;
+        let mut request = json!({"url": url});
+        if let Some(name) = flags.positional.get(2) {
+            request["name"] = json!(name);
+        }
+        if let Some(ship) = flags.values.get("ship") {
+            request["target"] = json!(ship);
+        }
+        let added = crate::dispatch(&mut store, "project.add", request)?;
+        println!(
+            "Cloned {} into {}'s projects/{}.",
+            added["url"].as_str().unwrap_or(""),
+            added["ship"].as_str().unwrap_or(""),
+            added["project"].as_str().unwrap_or("")
+        );
         return Ok(());
     }
     if verb == "service" {
@@ -1083,36 +1122,6 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     println!("    {error}");
                 }
             }
-        }
-        "project" => {
-            ensure!(
-                p.first().map(String::as_str) == Some("add"),
-                "usage: privateer project add GIT_URL [NAME]"
-            );
-            let url = p
-                .get(1)
-                .context("usage: privateer project add GIT_URL [NAME]")?;
-            let name = match p.get(2) {
-                Some(name) => name.clone(),
-                None => url
-                    .trim_end_matches('/')
-                    .rsplit(['/', ':'])
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(".git")
-                    .to_owned(),
-            };
-            identifier(&name).context("pass a project NAME")?;
-            let folder = home.parent().context("ship folder")?;
-            let target = folder.join("projects").join(&name);
-            ensure!(!target.exists(), "{} already exists", target.display());
-            let status = std::process::Command::new("git")
-                .args(["clone", "--", url])
-                .arg(&target)
-                .status()
-                .context("run git clone")?;
-            ensure!(status.success(), "git clone failed");
-            println!("Cloned {url} into projects/{name}.");
         }
         _ => bail!("unknown command {verb}"),
     }
