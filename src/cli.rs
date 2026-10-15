@@ -348,6 +348,17 @@ pub(crate) struct Setup {
 /// the captain's charter edits, scope and accepted kinds, and rewrites only
 /// files it generated.
 pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)> {
+    setup_inner(home, setup, true)
+}
+
+/// Bootstrap a ship without publishing it. Fleet creation holds the creating
+/// home's authority lock until setup completes, so linking must wait: it writes
+/// that home through a separate connection.
+pub(crate) fn setup_unlinked(home: &Path, setup: &Setup) -> Result<(String, String, bool)> {
+    setup_inner(home, setup, false)
+}
+
+fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, String, bool)> {
     let folder = home.parent().context("ship folder")?.to_path_buf();
     let ship = match &setup.ship {
         Some(name) => {
@@ -431,9 +442,11 @@ pub(crate) fn setup(home: &Path, setup: &Setup) -> Result<(String, String, bool)
     }
     claude_settings(&folder, &binary.display().to_string())?;
     ensure_lines(&folder.join(".gitignore"), &[".privateer/", "projects/"])?;
-    // Join the fleet: ships on this machine find and mail each other.
-    crate::fleet::register(&ship, store.home(), &setup.created_by)?;
-    crate::fleet::link(&store, &ship)?;
+    if join_fleet {
+        // Join the fleet: ships on this machine find and mail each other.
+        crate::fleet::register(&ship, store.home(), &setup.created_by)?;
+        crate::fleet::link(&store, &ship)?;
+    }
     Ok((ship, harness, ours))
 }
 
