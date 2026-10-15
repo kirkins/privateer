@@ -25,6 +25,17 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
+      # A ship working on Privateer runs its tests as crew. Nothing the
+      # crew environment sets may leak into the tests' own processes.
+      - name: cargo test as crew
+        if: runner.os == 'Linux'
+        run: cargo test --locked --all-features
+        env:
+          PRIVATEER_ROLE: agent
+          PRIVATEER_ACTOR: crew-check
+          PRIVATEER_JOB: crew-check
+          PRIVATEER_HOME: /nonexistent/privateer-home
+          PRIVATEER_PRESENCE_HOLDER: crew-check
       - run: cargo check --locked --no-default-features --bin privateer
       - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
       - run: python3 scripts/pilot.py --binary target/debug/privateer

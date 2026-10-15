@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -33,7 +35,7 @@ impl Folder {
         }
     }
     fn run_in(&self, dir: &Path, args: &[&str]) -> Output {
-        Command::new(BIN)
+        support::command(BIN)
             .args(args)
             .current_dir(dir)
             .env("PATH", &self.path)

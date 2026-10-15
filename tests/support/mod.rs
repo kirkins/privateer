@@ -4,12 +4,27 @@
 #![allow(dead_code)]
 use privateer::{dispatch, store::Store};
 use serde_json::{Value, json};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_privateer");
+
+/// A command that inherits no Privateer settings from whoever runs the
+/// tests. A crew job running `cargo test` has PRIVATEER_ROLE, _ACTOR and
+/// _JOB set, which would otherwise make every test's subprocess its agent.
+/// Tests that need a setting set it explicitly afterwards.
+pub fn command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("PRIVATEER_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
 
 const ADAPTER: &str = r#"import json, sys
 r = json.loads(sys.stdin.readline())
@@ -131,7 +146,7 @@ impl Fleet {
     pub fn command(&self) -> Command {
         let user = self.root.join("user");
         fs::create_dir_all(&user).unwrap();
-        let mut command = Command::new(BIN);
+        let mut command = command(BIN);
         command
             .arg("--home")
             .arg(&self.home)
@@ -139,11 +154,7 @@ impl Fleet {
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env("PRIVATEER_SERVICE", "none")
-            .env_remove("XDG_STATE_HOME")
-            .env_remove("PRIVATEER_HOME")
-            .env_remove("PRIVATEER_ROLE")
-            .env_remove("PRIVATEER_ACTOR")
-            .env_remove("PRIVATEER_JOB");
+            .env_remove("XDG_STATE_HOME");
         command
     }
     /// Run a JSON command, as the agent `as_agent` when given.
