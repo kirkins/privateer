@@ -330,6 +330,18 @@ def run(binary, runtime):
                 presence = command("ship.presence", {"ship": "apps"})
                 return presence["attended"] and presence["lease"]["binding"]["pane"]["pane_id"] == f"w1:p{pane_number}"
 
+            def pending_guard(message):
+                def blocked():
+                    # A stale fleet observation can still route the first key
+                    # to the completed pane. Retry while the fresh observation
+                    # arrives, within the 15-second startup guard window.
+                    tui.keys(b"0jj\rb")
+                    # Let the worker result render before another key replaces
+                    # its notice with "Checking ship and terminal".
+                    tui.drain(1.0)
+                    return "launch already submitted" in tui.screen()
+                tui.until(blocked, message, timeout=8)
+
             finish(1)
             board_until(2, "Board could not restart after a completed harness left its pane")
             tui.until(lambda: bound_to(2), "restart did not claim a fresh bound lease")
@@ -343,15 +355,13 @@ def run(binary, runtime):
             server.expected_failures.add(failed.pid)
             assert failed.wait(timeout=5) == 1
             assert not command("ship.presence", {"ship": "apps"})["attended"]
-            tui.keys(b"0jj\rbbb")
-            tui.until(lambda: "launch already submitted" in tui.screen(), "failed startup lost its uncertainty guard")
+            pending_guard("failed startup lost its uncertainty guard")
             assert server.creates == 3
             harness.write_text(harness_script)
             server.delay_next = True
             board_until(4, "failed startup permanently blocked Board")
             assert not command("ship.presence", {"ship": "apps"})["attended"]
-            tui.keys(b"0jj\rbbb")
-            tui.until(lambda: "launch already submitted" in tui.screen(), "delayed startup did not retain its pending guard")
+            pending_guard("delayed startup did not retain its pending guard")
             assert server.creates == 4
             assert not (root / "harness-started-w1:p4").exists()
             (root / "allow-start").touch()
