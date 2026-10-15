@@ -1,0 +1,73 @@
+# Telegram front door for Privateer. Copy this OUTSIDE any repository, edit it,
+# and keep it private (Privateer refuses a config others can read):
+#
+#   install -m 600 plugins/telegram/config.example.toml ~/.config/privateer/telegram.toml
+#   privateer door add telegram --config ~/.config/privateer/telegram.toml
+#   privateer door start telegram
+
+# From @BotFather. Or leave it unset and name a Secret Service entry instead,
+# fetched with `secret-tool lookup` at startup so it never sits in a file:
+#   printf %s 'TOKEN' | secret-tool store --label='privateer telegram' \
+#       service privateer-telegram account bot_token
+bot_token = "REPLACE_ME:token"
+# bot_token_secret = { service = "privateer-telegram", account = "bot_token" }
+
+# Your numeric chat id (message the bot, then read it from getUpdates, or ask
+# @userinfobot). Only this chat is heard; everything else is logged and dropped.
+chat_id = "REPLACE_ME"
+
+# Narrow it further to these Telegram user ids (recommended in group chats).
+# allowed_user_ids = [123456789]
+
+# How a plain message reaches its ship: "request" (default) opens a thread the
+# ship answers, threaded under your message here; "notice" just tells it.
+# send_kind = "request"
+
+# Render mail bodies as Telegram-flavoured markdown. false sends plain text.
+# markdown = true
+
+# Confirm a sent message with a 👍 reaction; false (or a reaction failure)
+# replies "➡️ ship" instead.
+# confirm_with_reaction = true
+
+# Keep a bare "Captain, shipshape." all-clear out of the chat.
+# suppress_noop_ack = false
+
+# Photos and files are saved under the door's state directory and the ship is
+# handed the path. Files older than inbox_days are swept.
+# accept_files = true
+# max_file_mb = 20
+# inbox_days = 7
+
+# Reach Telegram through something else.
+# proxy = "socks5h://127.0.0.1:1080"
+# api_base = "https://api.telegram.org"
+
+# --- voice notes in (speech to text) -----------------------------------------
+# Any OpenAI-compatible transcription endpoint: "groq" (default) or "openai",
+# or either with base_url pointed elsewhere. The key rides to curl in a 0600
+# header file, never argv, and is redacted from every log line.
+# [stt]
+# enabled = true
+# provider = "groq"
+# api_key = "REPLACE_ME"
+# model = "whisper-large-v3-turbo"
+# base_url = "https://api.groq.com/openai/v1"
+# language = ""
+# echo_transcript = true
+
+# --- voice notes out (text to speech) ----------------------------------------
+# /voice on speaks each message as a voice note after its text. "openai"
+# (default) is the OpenAI speech shape; "cloudflare" is Workers AI's native
+# shape (needs account_id, and ffmpeg for formats other than Ogg/Opus).
+# [tts]
+# enabled = true
+# provider = "openai"
+# api_key = "REPLACE_ME"
+# api_key_secret = { service = "privateer-telegram", account = "tts_api_key" }
+# account_id = ""
+# voice = "alloy"
+# model = "gpt-4o-mini-tts"
+# response_format = "opus"
+# Notices stay text-only; requests, decisions and replies are still spoken.
+# speak_final_only = false
