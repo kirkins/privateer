@@ -571,6 +571,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .arg(plugin);
     } else if harness == "opencode-v2" {
         let plugins = fs::canonicalize(plugins_dir()?)?;
+        crate::opencode_mail::install(folder, &plugins)?;
         command = std::process::Command::new("python3");
         command
             .arg(plugins.join("native_launch.py"))
