@@ -92,6 +92,64 @@ def preflight(argv):
     return False
 
 
+def reconcile_final(session, message):
+    """Read one exact final step when V2's JSON projection drops its finish.
+
+    The native CLI can reconcile final text from storage without projecting the
+    corresponding step_finish. Require both that same assistant message and a
+    subsequent successful idle marker, never just a zero exit or response text.
+    All inspections are bounded and read-only; this never resubmits a prompt.
+    """
+    result = json.loads(inspect([
+        "opencode", "api", "--standalone", "session.message.list",
+        "--param", "sessionID=" + session, "--param", "limit=2", "--param", "order=desc",
+    ]))
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, list) or len(data) != 2:
+        raise ValueError("missing-final-projection")
+    idle, final = data
+    if (not isinstance(idle, dict) or idle.get("type") != "idle"
+            or idle.get("outcome") != "succeeded" or idle.get("error") is not None
+            or not isinstance(final, dict) or final.get("type") != "assistant"
+            or final.get("id") != message or final.get("finish") != "stop"
+            or final.get("error") is not None or final.get("retry") is not None):
+        raise ValueError("unconfirmed-final-projection")
+    final_time, idle_time = final.get("time"), idle.get("time")
+    if not isinstance(final_time, dict) or not isinstance(idle_time, dict):
+        raise ValueError("missing-final-time")
+    times = [final_time.get("created"), final_time.get("completed"), idle_time.get("created")]
+    if (any(type(t) is not int or t <= 0 for t in times)
+            or not times[0] <= times[1] <= times[2]):
+        raise ValueError("unsettled-final-projection")
+    content = final.get("content")
+    if not isinstance(content, list) or any(
+        not isinstance(item, dict) or item.get("type") not in ("text", "reasoning", "tool")
+        or (item.get("type") == "tool" and (
+            not isinstance(item.get("state"), dict)
+            or item["state"].get("status") not in ("completed", "error")))
+        for item in content
+    ):
+        raise ValueError("unsettled-final-content")
+    result = json.loads(inspect([
+        "opencode", "api", "--standalone", "session.get", "--param", "sessionID=" + session,
+    ]))
+    metadata = result.get("data") if isinstance(result, dict) else None
+    location = metadata.get("location") if isinstance(metadata, dict) else None
+    directory = location.get("directory") if isinstance(location, dict) else None
+    native_time = metadata.get("time") if isinstance(metadata, dict) else None
+    if (not isinstance(metadata, dict) or metadata.get("id") != session
+            or metadata.get("outcome") != "succeeded"
+            or not isinstance(directory, str) or not Path(directory).is_absolute()
+            or Path(directory).resolve() != Path.cwd().resolve()
+            or not isinstance(native_time, dict) or type(native_time.get("idle")) is not int
+            or native_time.get("idle") != times[2]):
+        raise ValueError("final-session-workspace-or-idle-mismatch")
+    return {"type": "step_finish", "sessionID": session, "part": {
+        "type": "step-finish", "sessionID": session, "messageID": message,
+        "reason": "stop", "tokens": final.get("tokens"),
+    }}
+
+
 def main():
     try:
         argv = sys.argv[1:]

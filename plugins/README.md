@@ -66,10 +66,12 @@ unattended mode; no conflicting `--auto` flag is appended.
 The direct native launcher replaces itself with the selected CLI in the same process group.
 It clears inherited foreign harness identity markers while preserving
 `PRIVATEER_ROLE`, `PRIVATEER_ACTOR`, authentication and provider configuration.
+A native launch sets `PWD` to its actual working directory, so CLIs that prefer
+the shell variable cannot inherit the launcher's different workspace.
 A missing CLI fails without substituting another harness or model.
 
-The dogfooding focus is Claude, Codex, Pi and OpenCode V2. Other adapters remain
-available, but are outside the current qualification work. `opencode` keeps the
+The dogfooding priority is Claude, Codex, Pi and OpenCode V2, with other adapters
+qualified incrementally as native CLIs and accounts become available. `opencode` keeps the
 V1 command contract; choose `opencode-v2` explicitly for V2. Its launch preflight
 checks the installed major version and uses `--standalone` so tool processes
 inherit this job's actor environment. Before an exact resume, the native API
@@ -83,12 +85,19 @@ encoded as `provider/model#variant`. The full V2 TUI has no `--model` flag;
 interactive plans retain its native model picker and reject explicit model or
 effort options instead of silently dropping them. V2 JSON runs require matching
 session/message frames, a final `step_finish` with reason `stop`, complete JSONL
-and native exit zero. Provider errors, interrupted/truncated output and incomplete
-tool loops cannot produce successful jobs. Usage comes only from completed step
-records. These checks confirm a native turn, not task acceptance or delivery.
-V2 live repair, attended idle mail and exact-resume recall remain unqualified
-until their native pilots pass; command plans and subprocess fixtures alone do
-not establish those capabilities.
+and native exit zero. V2 2.0.29 can omit the final finish while reconciling text
+from its saved messages. Only for an unfinished final step with an otherwise
+valid, zero-exit stream, the adapter may make two bounded read-only API calls:
+the newest messages must be that exact completed assistant step followed by a
+successful idle marker, and the session must still match this workspace and
+idle time. A running tool, error, retry, stale/mismatched record or unavailable
+projection fails closed. No prompt is resubmitted. The summary marks this path
+with `completion_source: "native-session-projection"`; native output is unchanged.
+Usage counts completed steps once, including the verified missing final step.
+Provider errors, interrupted/truncated output and incomplete tool loops cannot
+produce successful jobs. These checks confirm a native turn, not task acceptance
+or delivery. Live headless qualification is recorded below; attended idle-mail
+integration remains separate work.
 
 Unattended Pi/signed Pi JSON runs use an event-checking bridge in that same
 job group. Pi may exit zero after exhausted provider retries, so process status
@@ -290,7 +299,7 @@ are from the last attempted native trial, not continuous account monitoring):
 | AGY | Guarded repair, unchanged tests, recorded light test job, mail, exact resume and recall | Other models/profiles remain separate |
 | Gemini | Installed 0.63.0 parser; subprocess completion/failure, focused mail and exact-identity resume fixtures | Existing Google quota exhausted; live repair/recall pending |
 | OpenCode V1 | Installed parser and command plans | Live worker qualification pending |
-| OpenCode V2 | Explicit 2.x preflight, saved-workspace resume checks and completion fixtures | Copilot login expired, Google quota exhausted, OpenAI API key rejected; no new attempts on those accounts |
+| OpenCode V2 | Live 2.0.29 repair, unchanged independent tests, recorded light test job, mail, exact session resume and conversation recall through OpenCode Go (`opencode-go/deepseek-v4.1-flash`); final completion verified against the native saved projection | Other models/profiles and attended idle mail remain separate; earlier Copilot/Google/OpenAI account blockers were not retried |
 | OMP | Native RPC initialization, exact resume and cross-repository refusal; subprocess lifecycle fixtures | Last live attempt lacked account credits |
 | Grok | Owned native ACP initialization, exact load and model/effort confirmation; subprocess lifecycle fixtures | Last live attempt returned HTTP 429 |
 | Muse | Native echo session/resume and writer-lease refusal; MSP lifecycle fixtures | Meta account billing verification returned HTTP 402; echo is not model/tool autonomy |
@@ -301,6 +310,10 @@ Account-blocked rows do not block work on other adapters and are not advertised
 as live-qualified. Standard help probes do not send prompts or check accounts.
 The OpenCode V2 probe includes its launch-time major-version check: finding the
 V1 `opencode` executable does not qualify V2, even when V1 accepts `--help`.
+The V2 Go canary's saved session independently confirmed both the selected model
+and the isolated repository. Its resumed tool trace used conversation recall,
+without searching prior task or job records. The Go login remained in native
+storage; credentials and personal provider configuration were not copied or edited.
 
 Codex options may explicitly choose `sandbox` (`read-only`, `workspace-write`, `danger-full-access`) and boolean `ephemeral`. They are omitted by default, preserving native user configuration. Choosing `workspace-write` adds only the local Privateer operational home with `--add-dir`, so the agent can write its durable task and message records as well as work in the repository. `ephemeral:true` suppresses native Codex session persistence while Privateer retains its job records. This does not change global harness preferences.
 

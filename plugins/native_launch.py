@@ -15,6 +15,9 @@ IDENTITY_MARKERS = (
 
 def native_environment():
     env = os.environ.copy()
+    # subprocess cwd does not update the inherited shell variable. Some native
+    # CLIs (including OpenCode V2) prefer PWD over getcwd to select a workspace.
+    env["PWD"] = os.getcwd()
     for name in IDENTITY_MARKERS:
         env.pop(name, None)
     return env
