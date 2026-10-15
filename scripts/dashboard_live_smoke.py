@@ -36,6 +36,7 @@ class Herdr:
         self.creates = self.focuses = 0
         self.delay_next = False
         self.fail_next = False
+        self.protocol = 20
         self.expected_failures = set()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.accept, daemon=True)
@@ -67,7 +68,7 @@ class Herdr:
     def respond(self, request):
         method, params = request["method"], request["params"]
         if method == "session.snapshot":
-            return {"snapshot": {"version": "isolated-test", "protocol": 20, "panes": self.panes}}
+            return {"snapshot": {"version": "isolated-test", "protocol": self.protocol, "panes": self.panes}}
         if method == "tab.create":
             self.creates += 1
             n = self.creates
@@ -414,15 +415,21 @@ def onboarding(binary, runtime):
         finally:
             skipped.close()
         server = Herdr(root, env)
+        server.protocol = 19
         tui = None
         folder = root / "custom contact ' folder"
         home = folder / ".privateer"
         try:
             tui = Tui(binary, env, ["--herdr-socket", str(server.path)])
             assert "liaison" in tui.screen() and "codex" in tui.screen()
+            tui.until(lambda: "HERDR UNAVAILABLE" in tui.screen(), "initial Herdr observation did not fail")
             tui.keys(b"\x15contact\t\x15" + str(folder).encode() + b"\t\x1b[C\r")
             tui.until(lambda: (home / "privateer.sqlite").is_file(), "onboarding did not initialize the chosen folder")
-            tui.until(lambda: (root / "harness-started").exists(), "onboarding did not automatically Board")
+            tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
+            tui.drain(2.2)
+            assert server.creates == 0 and not (root / "harness-started").exists()
+            server.protocol = 20
+            tui.until(lambda: (root / "harness-started").exists(), "onboarding did not automatically Board after Herdr recovery", timeout=25)
             def query(verb, args):
                 out = subprocess.run([str(runtime), "--home", str(home), verb, "--json", json.dumps(args)],
                                      env=env, capture_output=True, timeout=10)
@@ -433,11 +440,47 @@ def onboarding(binary, runtime):
             assert json.loads((home / "config.json").read_text())["preset"] == "liaison"
             assert "Onboarding the captain" in (folder / "AGENTS.md").read_text()
             tui.until(lambda: "Bridge" in tui.screen(), "created first ship did not become selected")
-            assert server.creates == 1 and not server.errors, server.errors
+            tui.drain(2.5)
+            assert server.creates == 1 and server.focuses == 0 and not server.errors, server.errors
         finally:
             if tui:
                 tui.close()
             server.close()
+        for original_role in ["ship", "liaison"]:
+            occupied_root = root / f"occupied-{original_role}"
+            occupied_root.mkdir()
+            occupied_env = dict(env, HOME=str(occupied_root), XDG_CONFIG_HOME=str(occupied_root / "config"),
+                                PRIVATEER_FLEET=str(occupied_root / "fleet.sqlite"), PRIVATEER_RESOURCE_HOME=str(occupied_root / "ledger"))
+            occupied = Tui(binary, occupied_env, ["--no-herdr"])
+            try:
+                occupied_folder = occupied_root / "desk"
+                occupied_folder.mkdir()
+                occupied_home = occupied_folder / ".privateer"
+                def invoke(arguments):
+                    return subprocess.run([str(runtime), "--home", str(occupied_home), *arguments],
+                                          env=occupied_env, cwd=occupied_root, capture_output=True, check=True, timeout=10).stdout
+                init = ["init", "--ship", "existing", "--harness", "codex"]
+                if original_role == "liaison":
+                    init.append("--liaison")
+                invoke(init)
+                invoke(["charter.put", "--json", json.dumps({"id":"existing", "actions":["inspect", "message"], "objective":"Captain edited"})])
+                config = (occupied_home / "config.json").read_bytes()
+                instructions = (occupied_folder / "AGENTS.md").read_bytes()
+                charter = json.loads(invoke(["charter.show", "--json", '{"id":"existing"}']))
+                registry = json.loads(invoke(["fleet.list", "--json", '{}']))
+                for index, requested_role in enumerate(["liaison" if original_role == "ship" else "ship", original_role]):
+                    if index:
+                        occupied.keys(b"\t")
+                    occupied.keys(b"\x15existing\t\x15" + str(occupied_folder).encode() + b"\t\t\x15" + requested_role.encode() + b"\r")
+                    occupied.drain(1.2)
+                    occupied.until(lambda: "choose an empty ship folder" in occupied.screen(), "onboarding accepted an initialized folder")
+                    assert (occupied_home / "config.json").read_bytes() == config
+                    assert (occupied_folder / "AGENTS.md").read_bytes() == instructions
+                    assert json.loads(invoke(["charter.show", "--json", '{"id":"existing"}'])) == charter
+                    assert json.loads(invoke(["fleet.list", "--json", '{}'])) == registry
+            finally:
+                occupied.keys(b"\x1b")
+                occupied.close()
         for role, args in [("liaison", []), ("ship", ["--no-herdr"])]:
             plain_root = root / f"offline {role}'s $(touch escaped)"
             plain_root.mkdir()
@@ -471,4 +514,4 @@ def onboarding(binary, runtime):
                 assert not (plain_root / "escaped").exists()
             finally:
                 plain.close()
-        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness/automatic Board, both offline roles with executable quoted start guidance; no model calls.")
+        print("Onboarding PTY passed: skip without state, renamed liaison/custom folder/installed harness, exactly one automatic Board after Herdr recovery, existing ordinary/liaison homes preserved on rejection, both offline roles with executable quoted start guidance; no model calls.")

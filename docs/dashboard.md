@@ -115,8 +115,10 @@ without creating a home or fleet registry. `n` reopens setup in an empty fleet.
 A missing harness keeps setup open with guidance, without initializing anything.
 
 Creation uses `privateer init --ship NAME --harness ID [--liaison]` in the chosen
-folder, then `privateer service start` and Board. Existing nonempty folders are
-refused unless they hold that same initialized ship (safe command retry).
+folder, then `privateer service start` and Board. The chosen dedicated folder must
+be empty. If initialization succeeds before service startup fails, the ship
+remains available through existing ship and dispatcher management; onboarding
+does not reinitialize it or change its role.
 Without Herdr, creation succeeds and the Board limitation is shown; use
 `privateer start` in that folder to talk to its first mate.
 

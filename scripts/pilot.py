@@ -80,6 +80,7 @@ def main():
         # deterministic; live load and memory limits are left generous here.
         invoke(homes["navigator"], "resource.configure", {
             "max_heavy_jobs": 1, "max_load_per_cpu": 64, "min_available_memory_bytes": 0,
+            "heavy_estimate": {"memory_bytes": 0},
         })
         for source, targets in (
             ("navigator", ("applications", "infrastructure")),

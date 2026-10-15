@@ -66,16 +66,10 @@ pub fn initialize(
     );
     crate::store::reject_symlinks(folder)?;
     let home = folder.join(crate::cli::STATE_DIR);
-    if folder.exists() && std::fs::read_dir(folder)?.next().is_some() {
-        let existing = std::fs::read(home.join("config.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok());
-        ensure!(
-            home.join("privateer.sqlite").is_file()
-                && existing.as_ref().is_some_and(|c| c["ship"] == name),
-            "choose an empty ship folder"
-        );
-    }
+    ensure!(
+        !folder.exists() || std::fs::read_dir(folder)?.next().is_none(),
+        "choose an empty ship folder"
+    );
     std::fs::create_dir_all(folder)?;
     let mut cmd = Command::new(binary);
     cmd.current_dir(folder)

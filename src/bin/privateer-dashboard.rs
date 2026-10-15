@@ -312,27 +312,31 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrActio
     (receive, focus)
 }
 
-fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
+fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) -> bool {
     if app.demo {
         app.notice = "Demo only; no ship launched.".into();
-        return;
+        return false;
+    }
+    if app.home_error.is_some() || app.home_age.is_none_or(|age| age >= 10) {
+        app.notice = "Refresh Privateer state before boarding.".into();
+        return false;
     }
     let (Some(view), Some(sender)) = (&app.herdr, sender) else {
         app.notice = "Board needs an explicitly configured Herdr connection.".into();
-        return;
+        return false;
     };
     if app.herdr_error.is_some()
         || app.herdr_age.is_none_or(|age| age >= 10)
         || app.selection_invalidated
     {
         app.notice = "Refresh Herdr and select the ship again.".into();
-        return;
+        return false;
     }
     if app.binding_ambiguous() {
         app.notice =
             "Pane is bound to more than one ship; resolve the exact bindings before boarding."
                 .into();
-        return;
+        return false;
     }
     let action = if let Some(pane) = app.scoped_panes().first() {
         Some(HerdrAction::Focus(Focus {
@@ -355,11 +359,13 @@ fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
                     })
             })
     };
-    app.notice = if action.is_some_and(|a| sender.try_send(a).is_ok()) {
+    let submitted = action.is_some_and(|a| sender.try_send(a).is_ok());
+    app.notice = if submitted {
         "Checking ship and terminal before boarding…".into()
     } else {
         "Board action unavailable or already pending.".into()
     };
+    submitted
 }
 
 fn run(opts: Options) -> Result<()> {
@@ -493,7 +499,6 @@ fn run(opts: Options) -> Result<()> {
                 .filter(|id| app.snapshot.ships.iter().any(|s| &s.id == *id))
                 .cloned()
             {
-                app.pending_board = None;
                 app.select_ship(Some(ship.clone()));
                 if herdr.is_some() {
                     app.board_requested = true;
@@ -509,11 +514,16 @@ fn run(opts: Options) -> Result<()> {
                         "Created {ship}. No Herdr connection configured; run: privateer --home '{}' start",
                         home.to_string_lossy().replace('\'', "'\"'\"'")
                     );
+                    app.pending_board = None;
                 }
             }
             if app.board_requested {
                 app.board_requested = false;
-                request_board(&mut app, herdr.as_ref().map(|(_, sender)| sender));
+                if request_board(&mut app, herdr.as_ref().map(|(_, sender)| sender))
+                    && app.pending_board.as_ref() == app.ship.as_ref()
+                {
+                    app.pending_board = None;
+                }
             }
             if let Some(action) = app.action.take() {
                 if let Some((_, sender)) = &mailbox {
@@ -683,5 +693,72 @@ fn main() {
     if let Err(error) = options().and_then(|o| o.map_or(Ok(()), run)) {
         eprintln!("privateer-dashboard: {error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_app() -> App {
+        let mut app = App {
+            snapshot: Snapshot::demo(),
+            herdr: Some(View::demo()),
+            home_age: Some(0),
+            herdr_age: Some(0),
+            ..App::default()
+        };
+        app.select_ship(Some("apps".into()));
+        app
+    }
+
+    #[test]
+    fn board_reports_acceptance_only_after_the_bounded_queue_accepts_it() {
+        let mut app = ready_app();
+        let (sender, receive) = mpsc::sync_channel(1);
+        assert!(request_board(&mut app, Some(&sender)));
+        assert!(!request_board(&mut app, Some(&sender)));
+        let HerdrAction::Focus(focus) = receive.try_recv().unwrap() else {
+            panic!("expected focus of the explicitly bound pane");
+        };
+        assert_eq!(focus.pane.pane_id, "demo:apps");
+        assert!(request_board(&mut app, Some(&sender)));
+        assert!(receive.try_recv().is_ok());
+        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(!request_board(&mut app, None));
+    }
+
+    #[test]
+    fn board_refuses_missing_failed_stale_or_invalid_observations() {
+        for condition in [
+            "home-error",
+            "home-stale",
+            "home-unknown",
+            "herdr-missing",
+            "herdr-error",
+            "herdr-stale",
+            "herdr-unknown",
+            "invalid-selection",
+            "ambiguous",
+            "demo",
+        ] {
+            let mut app = ready_app();
+            match condition {
+                "home-error" => app.home_error = Some("unavailable".into()),
+                "home-stale" => app.home_age = Some(10),
+                "home-unknown" => app.home_age = None,
+                "herdr-missing" => app.herdr = None,
+                "herdr-error" => app.herdr_error = Some("unavailable".into()),
+                "herdr-stale" => app.herdr_age = Some(10),
+                "herdr-unknown" => app.herdr_age = None,
+                "invalid-selection" => app.selection_invalidated = true,
+                "ambiguous" => app.snapshot.presentation_error = Some("ambiguous".into()),
+                "demo" => app.demo = true,
+                _ => unreachable!(),
+            }
+            let (sender, receive) = mpsc::sync_channel(1);
+            assert!(!request_board(&mut app, Some(&sender)), "{condition}");
+            assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
     }
 }
