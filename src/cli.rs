@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 pub const STATE_DIR: &str = ".privateer";
 /// Commands that mean the human form when given without `--json`.
 pub const VERBS: &[&str] = &[
-    "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project",
+    "init", "status", "ships", "ask", "tell", "inbox", "reply", "wakes", "project", "start", "hook",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -183,6 +183,32 @@ fn claude_settings(folder: &Path, binary: &str) -> Result<()> {
     if !allow.iter().any(|r| r == &json!(rule)) {
         allow.push(json!(rule));
     }
+    // Attended mode: the session registers presence, sees new mail at each
+    // prompt and turn end, and releases presence when it ends.
+    let hooks = settings
+        .as_object_mut()
+        .context(".claude/settings.json must hold an object")?
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("hooks must be an object")?;
+    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+        let command = format!("{binary} hook claude {event}");
+        let entries = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .with_context(|| format!("hooks.{event} must be a list"))?;
+        let present = entries.iter().any(|entry| {
+            entry["hooks"]
+                .as_array()
+                .is_some_and(|hs| hs.iter().any(|h| h["command"] == json!(command)))
+        });
+        if !present {
+            entries
+                .push(json!({"hooks": [{"type": "command", "command": command, "timeout": 30}]}));
+        }
+    }
     fs::create_dir_all(folder.join(".claude"))?;
     fs::write(&path, serde_json::to_vec_pretty(&settings)?)?;
     Ok(())
@@ -246,7 +272,7 @@ fn init(home: &Path, args: &[String]) -> Result<()> {
     let binary = std::env::current_exe()?;
     let cli = format!("{} --home {}", binary.display(), store.home().display());
 
-    crate::dispatch(&mut store, "init", json!({}))?;
+    crate::dispatch(&mut store, "init", json!({"ship": ship}))?;
     // The shared ledger must exist before a sandboxed first mate is planned.
     crate::jobs::ensure_ledger(&store)?;
     // Created once; later edits to the charter are the captain's to keep.
@@ -318,7 +344,7 @@ fn init(home: &Path, args: &[String]) -> Result<()> {
     println!(
         "  privateer serve                     answer mail while you are away (keep it running)"
     );
-    println!("  {harness}                              talk to {ship}'s first mate here");
+    println!("  privateer start                     talk to {ship}'s first mate ({harness}) here");
     println!(
         "  privateer ask {ship} \"...\"           or send it a request from anywhere in this folder"
     );
@@ -349,6 +375,85 @@ fn text(positional: &[String], from: usize, usage: &str) -> Result<String> {
     Ok(body)
 }
 
+/// `privateer start [HARNESS] [-- ARGS]`: talk to the ship's first mate.
+/// Launches the harness in the ship folder as the ship (agent role) and holds
+/// the ship's presence lease while it runs, so `serve` leaves the mail to
+/// this session. Works with any harness; Claude Code also gets mail at each
+/// prompt and turn end through the hooks `init` installs.
+fn start(home: &Path, args: &[String]) -> Result<()> {
+    let (ours, passthrough) = match args.iter().position(|a| a == "--") {
+        Some(at) => (&args[..at], &args[at + 1..]),
+        None => (args, &args[args.len()..]),
+    };
+    let mut store = Store::open(home)?;
+    let ship = crate::presence::folder_ship(&store)
+        .context("this folder's ship is unknown; run `privateer init` here")?;
+    let profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
+    let harness = match ours.first() {
+        Some(name) => name.clone(),
+        None => profile["first_mate"]["manifest"]
+            .as_str()
+            .and_then(|m| {
+                Path::new(m)
+                    .parent()?
+                    .file_name()?
+                    .to_str()
+                    .map(str::to_owned)
+            })
+            .context("no first-mate harness configured; pass one: privateer start claude")?,
+    };
+    let binary = HARNESSES
+        .iter()
+        .find(|(_, id)| *id == harness)
+        .map_or(harness.as_str(), |(binary, _)| binary)
+        .to_owned();
+    let folder = home.parent().context("ship folder")?;
+    let mut child = std::process::Command::new(&binary)
+        .args(passthrough)
+        .current_dir(folder)
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", &ship)
+        .spawn()
+        .with_context(|| format!("cannot start {binary}; is it installed?"))?;
+    // Ctrl-C belongs to the harness; this process must live to release
+    // presence afterwards.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+    }
+    let holder = format!("start:{}", std::process::id());
+    crate::presence::attend(&store, &ship, &holder, 90, Some(&harness))?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let heartbeat = {
+        let (stop, home, ship, holder, harness) = (
+            stop.clone(),
+            home.to_path_buf(),
+            ship.clone(),
+            holder.clone(),
+            harness.clone(),
+        );
+        std::thread::spawn(move || {
+            let Ok(store) = Store::open(&home) else {
+                return;
+            };
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for _ in 0..30 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                let _ = crate::presence::attend(&store, &ship, &holder, 90, Some(&harness));
+            }
+        })
+    };
+    let status = child.wait()?;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = heartbeat.join();
+    crate::presence::leave(&store, &ship, &holder)?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 /// Run a human command. `home` is the discovered or given ship home.
 pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
     if verb == "init" {
@@ -361,6 +466,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
     let home = home.context(
         "not inside a ship folder (no .privateer found here or above); run `privateer init` to make this folder a ship",
     )?;
+    if verb == "start" {
+        return start(&home, args);
+    }
     let mut store = Store::open(&home)?;
     let flags = flags(args, &[])?;
     let p = &flags.positional;
@@ -374,6 +482,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String]) -> Result<()> {
                 if ship["location"] == "here" {
                     let bearings = crate::context::bearings(&store, name)?;
                     print!("{}", bearings["text"].as_str().unwrap_or(""));
+                    if crate::presence::attended(&store, name)? {
+                        println!("The captain's session is aboard {name}.");
+                    }
                 } else {
                     println!("Ship {name}: behind peer {}", ship["location"]["peer"]);
                 }

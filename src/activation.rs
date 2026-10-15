@@ -482,6 +482,11 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     if running {
         return Ok(json!({"ship": name, "skipped": "first mate already awake"}));
     }
+    // The captain's interactive session is the first mate while it is
+    // aboard; its hooks or inbox reads deliver the mail instead.
+    if crate::presence::attended(store, &name)? {
+        return Ok(json!({"ship": name, "skipped": "captain's session is aboard"}));
+    }
     // A wake covers mail through its sequence whether or not the first mate
     // acknowledged it, so an agent that forgets to ack is not woken forever.
     let woken_through: i64 = store.connection().query_row(

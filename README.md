@@ -39,7 +39,7 @@ mkdir -p ~/ships/infra && cd ~/ships/infra
 privateer init                      # names the ship after the folder, detects your harness
 privateer project add <git url>     # repositories the ship works on go in projects/
 privateer serve                     # keep running: answers mail while you are away
-claude                              # or codex, pi, …: this session is infra's first mate
+privateer start                     # talk to infra's first mate (or run claude, codex, … here directly)
 privateer ask infra "..."           # or ask from anywhere in the folder; read answers with: privateer inbox
 ```
 

@@ -36,7 +36,7 @@ fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, wake.list,\nnote.put/get/list, focus.digest,\nmail.send/inbox/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\nresource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
+                    "Privateer — autonomous peers under a charter\n\nprivateer --home /absolute/path COMMAND --json '{{...}}'\nprivateer --home /absolute/path rpc\nprivateer --home /absolute/path serve [--json '{{\"once\":true}}']   wake first mates when mail arrives\n\nIn a ship folder (made with `privateer init`), --home is found automatically:\nprivateer init | start | status | ships | ask SHIP TEXT | tell SHIP TEXT | inbox | reply ID TEXT | wakes | project add URL\n\nCommands: init, status, charter.put/show/revoke, task.create/list/show/update/handoff/accept,\nevent.emit/pending/history/ack, ship.put/list/show/bearings, wake.list,\nnote.put/get/list, focus.digest,\nmail.send/inbox/ack/show/requests/flush/deliver, message.send/inbox, job.start/status/list/cancel/retry,\nresource.status/configure/recover, peer.put/list/call, plugin.validate/command, agent.brief/start,\ndelivery.check, approval.grant/consume, audit.list, history.prune\n\nRPC accepts one JSON object per line: {{\"id\":\"1\",\"command\":\"status\",\"args\":{{}}}}\n\nAgents run with PRIVATEER_ROLE=agent and PRIVATEER_ACTOR (or --role agent --actor NAME):\noperator commands are refused and actor names are bound to that identity.\nLocal homes contain private state; credentials stay with your chosen harness."
                 );
                 return Ok(());
             }
@@ -60,6 +60,16 @@ fn run() -> Result<()> {
     let home = home
         .or_else(|| std::env::var_os("PRIVATEER_HOME").map(PathBuf::from))
         .or_else(privateer::cli::discover_home);
+    // Harness hooks must never fail the harness: they exit with the code
+    // the harness expects and log their own errors.
+    if command == "hook" {
+        ensure!(
+            positional.first().map(String::as_str) == Some("claude"),
+            "usage: privateer hook claude EVENT"
+        );
+        let event = positional.get(1).map(String::as_str).unwrap_or("");
+        std::process::exit(privateer::presence::claude_hook(home.as_deref(), event));
+    }
     if !json_given && privateer::cli::VERBS.contains(&command.as_str()) {
         return privateer::cli::run(home, &command, &positional);
     }
