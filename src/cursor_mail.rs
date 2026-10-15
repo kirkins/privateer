@@ -409,7 +409,7 @@ fn handle(home: &Path, event: &str, input: &Value) -> Result<Value> {
             save(&tx, &ship, &state)?;
             tx.commit()?;
             let tag = json!({"home":store.home(),"ship":ship,"session":session,"through":through});
-            let cli = std::env::current_exe()?;
+            let cli = crate::executable::installed()?;
             let inbox = json!([
                 cli,
                 "--home",

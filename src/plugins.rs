@@ -201,7 +201,7 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
         .chars()
         .take(512)
         .collect();
-    let executable = std::env::current_exe().context("cannot locate Privateer executable")?;
+    let executable = crate::executable::installed()?;
     // A sandboxed harness must be able to write the home and the shared
     // resource ledger to keep records and start crew jobs.
     let writable = json!([store.home(), crate::jobs::ledger_dir(store)?]);

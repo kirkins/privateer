@@ -15,7 +15,7 @@ pub const MAIL_PAGE_LIMIT: usize = 200;
 const OUTPUT_LIMIT: usize = MAIL_PAGE_LIMIT * (65_536 + 4096) + 1024;
 
 pub fn binary() -> Result<PathBuf> {
-    let sibling = std::env::current_exe()?.with_file_name("privateer");
+    let sibling = crate::executable::installed()?.with_file_name("privateer");
     Ok(if sibling.is_file() {
         sibling
     } else {

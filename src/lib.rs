@@ -7,6 +7,7 @@ pub mod crew;
 pub mod cursor_mail;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+mod executable;
 pub mod fleet;
 pub mod herdr;
 pub mod jobs;

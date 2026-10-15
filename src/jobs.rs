@@ -898,8 +898,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
     if let Some(existing) = admitted? {
         return Ok(public_job(&existing));
     }
-    let executable = std::env::current_exe()?;
-    let mut cmd = Command::new(executable);
+    let executable = crate::executable::supervisor()?;
+    let mut cmd = Command::new(&executable);
     cmd.arg("--home")
         .arg(store.home())
         .arg("_job-supervise")
@@ -936,10 +936,15 @@ fn start(store: &Store, args: Value, retry_of: Option<String>) -> Result<Value> 
             job = alter(store, &id, |j| {
                 j.status = "failed".into();
                 j.finished_ms = Some(Store::now_ms());
-                j.reason = Some(format!("supervisor spawn failed: {error}"));
+                j.reason = Some(format!(
+                    "supervisor spawn failed using {}: {error}",
+                    executable.display()
+                ));
             })?;
             release(store, &job)?;
-            return Err(error.into());
+            return Err(error).with_context(|| {
+                format!("spawn Privateer supervisor using {}", executable.display())
+            });
         }
     }
     store.audit(
