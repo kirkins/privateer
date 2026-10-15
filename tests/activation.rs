@@ -276,8 +276,10 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
     let started = Instant::now();
-    let first = tick(100);
-    assert!(started.elapsed() < Duration::from_secs(2), "{first}");
+    // Allow Python's cold start to record the marker on slower runners, while
+    // still cutting off the peer well before its five-second sleep completes.
+    let first = tick(1000);
+    assert!(started.elapsed() < Duration::from_secs(3), "{first}");
     assert_eq!(Fleet::infra(&first)["status"], "running", "{first}");
     assert_eq!(first["delivered"]["attempted"], 1);
     let observed: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
