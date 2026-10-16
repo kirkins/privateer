@@ -219,12 +219,13 @@ class Bundles(unittest.TestCase):
         mail = str(ROOT / 'plugins/attended/mail.ts')
         crew = str(ROOT / 'plugins/attended/crew.ts')
         calm = str(ROOT / 'plugins/attended/calm.ts')
+        captain = str(ROOT / 'plugins/attended/captain.ts')
         before = dict(self.env, PRIVATEER_ROLE='agent', PRIVATEER_ACTOR='fixture',
                       PRIVATEER_HOME=str(self.base / '.privateer'),
                       PRIVATEER_CONTROL_CLI='/fixture/privateer',
                       PRIVATEER_ATTENDED_HARNESS='pi', PI_CODING_AGENT_DIR=str(self.agent))
         for bounded in (False, True):
-            for mode, adapters in (('headless', []), ('attended', [mail, calm]), ('hosted', [crew, calm])):
+            for mode, adapters in (('headless', []), ('attended', [mail, captain, calm]), ('hosted', [crew, calm])):
                 env = dict(before)
                 if mode == 'hosted':
                     env['PRIVATEER_HOSTED_CREW'] = '1'
@@ -247,7 +248,8 @@ class Bundles(unittest.TestCase):
                 (False, False, ['-e', calm]), (False, True, ['-e', calm]),
                 (True, False, ['-e', calm + '.spoof']), (True, False, ['--extension', calm]),
                 (True, False, ['-e' + calm]), (True, False, ['-e', calm, '-e', calm]),
-                (False, True, ['-e', crew, '-e', calm + '.spoof'])):
+                (False, True, ['-e', crew, '-e', calm + '.spoof']),
+                (False, False, ['-e', captain]), (False, True, ['-e', crew, '-e', captain])):
             env = dict(before, PRIVATEER_HOSTED_CREW='1' if hosted else '0')
             with self.subTest(flags=flags, attended=attended, hosted=hosted), \
                     patch.dict(os.environ, env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
