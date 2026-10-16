@@ -377,8 +377,48 @@ class SimulatedMode {
     this.updatePendingMessagesDisplay();if(options?.abort)this.session.abort();return all.length;
   }
 }
+// Calm hides the Working row Herdr reads, so it reports the pane's state
+// itself while on, and hands it back when off or when the session ends.
+export async function herdrStateBehavior() {
+  const home=mkdtempSync(join(tmpdir(),"privateer-calm-herdr-"));
+  try {
+    writePreference(home,true);
+    const calls=[],handlers=new Map(),commands=new Map();
+    const api={on:(e,fn)=>{handlers.set(e,fn);return()=>handlers.delete(e);},registerCommand:(n,c)=>commands.set(n,c)};
+    const deps={every:()=>({}),cancel(){},warn(){},herdr:args=>{calls.push(args);return Promise.resolve();}};
+    const ctx={mode:"tui",hasUI:true,isIdle:()=>true,ui:{setWorkingVisible(){},setWidget(){},notify(){}}};
+    const env={PRIVATEER_ROLE:"agent",PRIVATEER_HOME:home,PRIVATEER_ATTENDED_HARNESS:"pi",
+      HERDR_BIN_PATH:"/fixture/herdr",HERDR_PANE_ID:"w1:p1"};
+    const said=()=>calls.map(a=>a[1]==="release-agent"?"released":a[a.indexOf("--state")+1]);
+    const controller=registerCalm(api,{},env,deps);
+    handlers.get("session_start")({},ctx);
+    handlers.get("agent_start")({},ctx);
+    handlers.get("agent_start")({},ctx);
+    handlers.get("agent_settled")({},ctx);
+    await commands.get("calm").handler("",ctx);
+    handlers.get("agent_start")({},ctx);
+    await commands.get("calm").handler("",ctx);
+    handlers.get("session_shutdown")();
+    assert.deepEqual(said(),["idle","working","idle","released","working","released"]);
+    const reports=calls.filter(a=>a[1]==="report-agent");
+    assert.deepEqual(reports.map(a=>a.at(-1)),reports.map(()=>"w1:p1"));
+    assert(reports.every(a=>a.includes("privateer-calm")&&a[a.indexOf("--agent")+1]==="pi"));
+    assert.deepEqual(reports.map(a=>Number(a[a.indexOf("--seq")+1])),[1,2,3,4]);
+    for(const release of calls.filter(a=>a[1]==="release-agent")) assert.deepEqual(release,["pane","release-agent","w1:p1","--source","privateer-calm","--agent","pi"]);
+    controller.dispose();
+    // Outside Herdr nothing is reported.
+    calls.length=0;
+    const outside={...env};delete outside.HERDR_PANE_ID;
+    registerCalm(api,{},outside,deps).state;
+    handlers.get("session_start")({},ctx);handlers.get("agent_start")({},ctx);
+    assert.deepEqual(calls,[]);
+    console.log("ok - calm reports the pane's working state to Herdr while it hides the Working row");
+  } finally {rmSync(home,{recursive:true,force:true});}
+}
+
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   await policyAndClock();
+  await herdrStateBehavior();
   queueCapabilityBehavior();
   await queueBehavior({InteractiveMode:SimulatedMode},simulatedQueueSession());
 }
