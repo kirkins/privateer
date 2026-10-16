@@ -52,8 +52,38 @@ proof; this fixture uses actual installed exports and native runtime code.
 Capacity-admit through the active charter's `job.start`; run serially:
 
 ```sh
+python3 tests/pi_offline_netns_test.py
 python3 tests/pi_mcp_native.py /absolute/installed/native/pi
+# Keep the stage-one native regression suite under the same boundary:
+python3 tests/pi_offline_netns.py -- python3 tests/pi_bundles_native.py /absolute/installed/native/pi
 ```
+
+The MCP entry point reexecutes the **entire suite, fake listeners and native
+children**, including the version probe, through `unshare --user
+--map-root-user --net`. The standard-library helper `tests/pi_offline_netns.py`
+checks that both namespaces differ from the parent, refuses any interface other
+than loopback and any route other than exact kernel local-loopback routes, then
+brings up only that namespace's `lo`. There are no external interfaces, default
+routes, veths, proxies or host network/configuration changes. Missing Linux
+namespace support, `unshare` or `ip`, unexpected topology, or a failed guard
+check **refuses without a host fallback**. No installs, privilege escalation or
+host permission/limit changes are needed.
+
+Before native exec, the guard records the namespace identities and topology and
+requires immediate kernel `ENETUNREACH` for IPv4 `192.0.2.1` and IPv6
+`2001:db8::1`, for both TCP and UDP. These are documentation-only addresses;
+no DNS or real service is contacted. The topology is checked **before** those
+socket probes. The native suite rechecks the guard before `--version` and every
+invocation; namespace inheritance applies to Pi and its stdio payloads without
+replacing or patching Pi's connector. This independent kernel boundary does not
+rely on Pi's offline switches, extension events or a Python/JS socket shim.
+
+Loopback remains reachable inside the namespace, including the ambient HTTP
+traps: every selected and ambient listener first accepts a positive-control TCP
+connection. Its completed control is excluded from the subsequent native traffic
+count. Thus zero ambient TCP counts cannot be explained by containment blocking
+the ambient traps. Only disposable fake listeners are started there; host
+loopback listeners are not reachable in this fresh network namespace.
 
 Without an explicit binary the suite skips; a skip is **not evidence**. A binary
 other than native Pi reporting exactly `1.2.0` refuses. No packages are installed
@@ -121,7 +151,11 @@ markers:
 - Concurrent selected/empty sessions use distinct temporary inputs and identities;
   cleanup is idempotent and no selection is inherited through environment state.
 
-### Recorded native evidence
+### Historical native evidence (before independent containment)
+
+The original run below predates the namespace guard. It demonstrated native
+behavior and ambient-listener non-use, **not external containment**, and must not
+be reproduced unguarded. Guarded review-fix evidence is recorded separately below.
 
 Admitted serial job `87665241-7122-4216-90f0-a0cdf2bb11a0`, incarnation
 `15d61332-3478-44db-93c7-79e3653395a7`, **succeeded, exit 0**: five unittest
@@ -211,6 +245,11 @@ A future loader needs its own direct CLI adapter, fail-closed startup/readiness,
 registered-server exclusion, registry/role/replay tests, and attended/hosted native
 qualification before implementation can be called production-ready. This fixture
 does not qualify credentials, live inference, a complete personal profile, a
-Herdr terminal, hostile same-user extensions, resume/fork or an OS/network sandbox.
-Pi's trusted code and built-in tools retain the user's OS access. Offline controls
-and fixed local fixtures are exposure hygiene, not a general transport firewall.
+Herdr terminal, hostile same-user extensions, resume/fork or a production sandbox.
+The qualification now independently contains ordinary IPv4/IPv6 transport in a
+verified disposable network namespace. It is **not filesystem/process isolation**:
+real HOME is retained, host files and pathname Unix sockets remain accessible to
+trusted code, and this is not protection against hostile code deliberately using
+those paths. No real credentials are read by the fixtures. No production launcher
+or policy inherits this guard. Offline controls and inference refusal are retained
+as defense in depth, not cited as the transport boundary.

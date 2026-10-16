@@ -4,6 +4,8 @@
 python3 tests/pi_mcp_native.py /absolute/installed/native/pi
 No provider/model options, model prompts, installs, real config or credentials.
 HOME stays unchanged; only a disposable PI_CODING_AGENT_DIR/project is used.
+Reexecs the entire suite/listeners into a verified Linux user/network namespace
+BEFORE any native exec. Missing boundary support REFUSES, never falls back.
 """
 import concurrent.futures
 import hashlib
@@ -12,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,12 +22,14 @@ import threading
 import time
 import unittest
 
+import pi_offline_netns as boundary
+
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / 'tests/fixtures/pi-mcp'
 sys.path.insert(0, str(FIXTURE))
 import server as fake
 
-NATIVE = Path(sys.argv.pop(1)).resolve(strict=True) if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
+NATIVE = None  # Parsed only after the independent transport boundary is active.
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -74,6 +79,15 @@ class Server(http.server.ThreadingHTTPServer):
         super().__init__(('127.0.0.1', 0), Handler)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
+        # Positive control on EVERY listener, including ambient leakage traps:
+        # network containment must not make an ambient zero-count vacuous.
+        with socket.create_connection(('127.0.0.1', self.server_port), timeout=1):
+            pass
+        deadline = time.monotonic() + 1
+        while self.connections == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert self.connections == 1, 'loopback trap unreachable inside boundary'
+        self.connections = 0  # Exclude only this completed pre-native control.
 
     def get_request(self):
         connection = super().get_request()
@@ -104,12 +118,23 @@ class Native(unittest.TestCase):
     def setUpClass(cls):
         if NATIVE is None:
             raise unittest.SkipTest('explicit installed native Pi required; skip is not evidence')
+        boundary.require_boundary()  # Includes --version, not just MCP execution.
         with NATIVE.open('rb') as stream:
             wrapper = stream.read(2) == b'#!'
         if NATIVE.name != 'pi' or wrapper:
             raise RuntimeError('exact native Pi, not an activation wrapper, required')
-        probe = subprocess.run([str(NATIVE), '--version'], text=True, capture_output=True,
-                               env={'PATH': '/usr/bin:/bin', 'PI_OFFLINE': '1', 'PI_TELEMETRY': '0'}, timeout=5)
+        with tempfile.TemporaryDirectory(prefix='privateer-pi-version-') as tmp:
+            base = Path(tmp)
+            agent, repo = base / 'agent', base / 'repo'
+            agent.mkdir()
+            repo.mkdir()
+            for name in ('auth.json', 'models.json'):
+                (agent / name).write_text('{}')
+            (agent / 'settings.json').write_text('{"packages": []}')
+            probe = subprocess.run([str(NATIVE), '--version'], cwd=repo, text=True, capture_output=True,
+                                   env={'HOME': os.environ['HOME'], 'PATH': '/usr/bin:/bin',
+                                        'PI_CODING_AGENT_DIR': str(agent), 'PI_OFFLINE': '1',
+                                        'PI_SKIP_VERSION_CHECK': '1', 'PI_TELEMETRY': '0'}, timeout=5)
         if probe.returncode or probe.stdout.strip() != '1.2.0':
             raise RuntimeError('qualification requires exactly Pi1.2.0')
         with NATIVE.open('rb') as stream:
@@ -176,6 +201,7 @@ class Native(unittest.TestCase):
                     broken.write_text('export default function() { throw new Error("fixture-factory-failed"); }')
                     args += ['-e', str(broken)]
                 args += ['--print', '--', '/mcp-qualify']
+                boundary.require_boundary()
                 before = time.monotonic()
                 run = subprocess.run(args, cwd=repo, env=env, text=True,
                                      capture_output=True, timeout=20)
@@ -229,6 +255,8 @@ class Native(unittest.TestCase):
                 print(json.dumps({'case': operation, 'transport': transport, 'identity': identity,
                                   'seconds': round(duration, 3), 'ambient_tcp': ambient.connections,
                                   'selected_tcp': selected.connections, 'stdio_starts': len(starts),
+                                  'loopback_positive_controls': ['selected', 'ambient'],
+                                  'netns': boundary.identity('net'),
                                   'methods': [r.get('method') for r in (selected.requests if transport == 'http' else requests)],
                                   'payloads_remaining': 0, 'result': result}), flush=True)
                 return result
@@ -280,4 +308,6 @@ class Native(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    boundary.enter()
+    NATIVE = Path(sys.argv.pop(1)).resolve(strict=True) if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
     unittest.main()
