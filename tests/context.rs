@@ -438,6 +438,69 @@ fn bearings_name_running_tasks_that_nothing_is_moving() {
 }
 
 #[test]
+fn bearings_turn_attention_reports_into_pressure() {
+    let (_temp, mut s) = fleet();
+    let report = |s: &mut Store, kind: &str, tokens: i64| {
+        dispatch(
+            s,
+            "attention.report",
+            json!({"ship":"infra","kind":kind,"tokens":tokens,"window":272_000,"summary_chars":1000}),
+        )
+        .unwrap()
+    };
+    // Nothing reported yet: the bearings stay as they were.
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert!(bearings["attention"].is_null());
+    assert!(!bearings["text"].as_str().unwrap().contains("Attention"));
+
+    for tokens in [60_000, 90_000, 120_000] {
+        report(&mut s, "turn", tokens);
+    }
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    let attention = &bearings["attention"];
+    assert_eq!(attention["pressure"], "normal", "{attention}");
+    assert_eq!(attention["added_hour"], 60_000);
+    assert_eq!(attention["percent"], 44.0);
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("Attention: normal (context 44% of 272k, 60k added"),
+        "{text}"
+    );
+
+    // A compaction resets the baseline and makes the pressure high.
+    report(&mut s, "compaction", 258_000);
+    report(&mut s, "turn", 40_000);
+    report(&mut s, "turn", 50_000);
+    let attention = dispatch(&mut s, "attention.show", json!({"ship":"infra"})).unwrap();
+    assert_eq!(attention["pressure"], "high");
+    assert_eq!(attention["added_hour"], 70_000);
+    assert_eq!(attention["compactions_hour"], 1);
+    let text = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(text.contains("Start no new task"), "{text}");
+
+    // Unread crew reports also count, as does a nearly full context.
+    let (_temp, mut s) = fleet();
+    report(&mut s, "turn", 210_000);
+    let attention = dispatch(&mut s, "attention.show", json!({"ship":"infra"})).unwrap();
+    assert_eq!(attention["reasons"], json!(["context 77% full"]));
+    // Another ship cannot report for this one.
+    s.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    assert!(
+        dispatch(
+            &mut s,
+            "attention.report",
+            json!({"ship":"infra","kind":"turn","tokens":1,"window":2})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn a_backlog_starts_ranked_tasks_first_and_holds_only_unstarted_work() {
     let (_temp, mut s) = fleet();
     for id in ["docs", "audit"] {
