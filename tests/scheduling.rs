@@ -38,6 +38,12 @@ fn an_idle_hosted_session_claims_prepared_work_without_new_mail() {
     assert_eq!(first["offer"]["task_id"], "infra-repair", "{first}");
     assert!(first["offer"]["id"].is_string());
     assert!(
+        first["offer"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Attention: normal")
+    );
+    assert!(
         poll(&mut fleet, true)["offer"].is_null(),
         "another poll must not duplicate an outstanding offer"
     );
@@ -257,6 +263,63 @@ fn stale_or_replaced_attention_never_silently_becomes_healthy() {
         call(&mut fleet, "attention.show", json!({"ship":"infra"}))["pressure"],
         "unknown"
     );
+}
+
+#[test]
+fn attention_wait_requires_a_fresh_normal_reading_to_resume() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    call(
+        &mut fleet,
+        "attention.report",
+        json!({"ship":"infra","holder":"host:scheduler-test","kind":"sample","tokens":90000,"window":100000}),
+    );
+    let deferred = call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"attention","reason":"Wait for context to ease","until_ms":privateer::store::Store::now_ms()+100000}}),
+    );
+    assert_eq!(deferred["state"], "waiting");
+
+    // A fresh high reading at the deadline is still not an all-clear.
+    fleet.store.connection().execute("UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0) WHERE task_id='infra-repair'", []).unwrap();
+    fleet.tick();
+    assert_eq!(
+        call(&mut fleet, "work.status", json!({"ship":"infra"}))["tasks"][0]["state"],
+        "waiting"
+    );
+
+    call(
+        &mut fleet,
+        "attention.report",
+        json!({"ship":"infra","holder":"host:scheduler-test","kind":"sample","tokens":1000,"window":100000}),
+    );
+    fleet.tick();
+    assert_eq!(
+        call(&mut fleet, "work.status", json!({"ship":"infra"}))["tasks"][0]["state"],
+        "ready"
+    );
+}
+
+#[test]
+fn attention_wait_is_refused_when_the_fresh_reading_is_normal() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    call(
+        &mut fleet,
+        "attention.report",
+        json!({"ship":"infra","holder":"host:scheduler-test","kind":"sample","tokens":1000,"window":100000}),
+    );
+    let result = dispatch(
+        &mut fleet.store,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"attention","reason":"Wait for context to ease","until_ms":privateer::store::Store::now_ms()+100000}}),
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("attention wait refused"), "{error}");
+    assert!(error.contains("Attention: normal"), "{error}");
 }
 
 #[test]

@@ -87,6 +87,14 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
                 .as_i64()
                 .context("wait.until_ms is required")?;
             ensure!(at > Store::now_ms(), "wait deadline must be in the future");
+            if kind == "attention" {
+                let reading = crate::attention::summary_for(store, &work.owner)?;
+                ensure!(
+                    !(reading["fresh"] == true && reading["pressure"] == "normal"),
+                    "attention wait refused: current reading is {}",
+                    crate::attention::line(&reading).unwrap_or_else(|| "Attention: unknown".into())
+                );
+            }
         }
         "task" => {
             let dependency = required(wait, "ref")?;

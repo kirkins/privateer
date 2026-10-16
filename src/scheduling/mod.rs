@@ -165,7 +165,11 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
             .clone()
             .context("waiting schedule has no condition")?;
         let ready = match wait["kind"].as_str() {
-            Some("time" | "attention") => now >= work.not_before_ms,
+            Some("time") => now >= work.not_before_ms,
+            Some("attention") => {
+                let reading = crate::attention::summary_for(store, &work.owner)?;
+                reading["fresh"] == true && reading["pressure"] == "normal"
+            }
             Some("task") => {
                 let dependency = store.task(required(&wait, "ref")?)?;
                 if dependency["status"] == "cancelled" {
