@@ -152,7 +152,10 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
                retry_ms=excluded.retry_ms, error=excluded.error",
             params![ship, holder, failures, now + delay(failures)])?;
         // Under the same lock as the attended check; no nested claim transaction.
-        crate::presence::attend(store, ship, &holder, LAUNCH_TTL_SECS, None)?;
+        let harness = profile["manifest"]
+            .as_str()
+            .and_then(crate::bundled::harness);
+        crate::presence::attend(store, ship, &holder, LAUNCH_TTL_SECS, harness.as_deref())?;
         tx.commit()?;
     }
     let result = (|| -> Result<Value> {

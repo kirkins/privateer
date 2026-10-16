@@ -649,8 +649,10 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
     });
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     assert_eq!(place.wakes(), 0);
-    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let lease = place.json("ship.presence", json!({"ship":"infra"}))["lease"].clone();
+    let holder = lease["holder"].clone();
     assert!(holder.as_str().unwrap().starts_with("host:"));
+    assert_eq!(lease["harness"], "pi");
     assert_eq!(place.tick()["skipped"], "its live first mate has the mail");
     assert_eq!(herdr.order(), ["w2", "w1"]);
     place.stop_native("infra");
