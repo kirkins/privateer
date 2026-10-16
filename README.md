@@ -70,6 +70,14 @@ To talk to your liaison from your phone, add the Telegram front door: `privateer
 
 For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable). Versioned release identities, durable bundled-adapter references, and read-only `privateer upgrade status` are described in [releases](docs/releases.md); fleet upgrade execution is not implemented yet.
 
+## Automatic prepared work
+
+Prepared tasks can run without new mail or a captain nudge. Write their assignment
+and call `task.enqueue`; the existing dispatcher records a bounded work offer,
+with hosted or fresh task-focused delivery and explicit resumption conditions.
+Legacy open/ranked tasks remain unscheduled. See [work scheduling](docs/scheduling.md)
+for enqueueing, typed waits, native adapter scope and recovery guarantees.
+
 ## General runtime and optional integrations
 
 The core owns charters, tasks, custody, targeted messages, coalesced notifications, durable jobs, resource admission, and SSH transport. It contains no personal provider account, model, gateway address, machine name, or user path.

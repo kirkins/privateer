@@ -100,6 +100,8 @@ struct Job {
     /// The supervised job whose agent started this one, when an agent did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started_by: Option<String>,
+    #[serde(default)]
+    work_offer: Option<String>,
     /// Crew hosted in the terminal host: the supervisor runs in its own
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1044,6 +1046,10 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         leader_result: None,
         cancelled_by: None,
         started_by,
+        work_offer: args
+            .get("work_offer")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
         model_route: args
             .get("model_route")
@@ -1073,6 +1079,13 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             fs::canonicalize(current["repo"].as_str().context("charter repo missing")?)? == repo,
             "charter repository changed during workspace allocation"
         );
+        crate::scheduling::admit_job(
+            store,
+            task_id,
+            &id,
+            job.started_by.as_deref(),
+            job.work_offer.as_deref(),
+        )?;
         check_plugin_binding(&job, &current)?;
         check_workspace_owner(store, &job)?;
         let existing: Option<String> = conn
@@ -1094,7 +1107,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                     && existing.agent_actor == job.agent_actor
                     && existing.estimate == job.estimate
                     && existing.wait_for_capacity == job.wait_for_capacity
-                    && existing.hosted == job.hosted,
+                    && existing.hosted == job.hosted
+                    && existing.work_offer == job.work_offer,
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));

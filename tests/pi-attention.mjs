@@ -37,8 +37,8 @@ else:
   await fire("agent_settled", {}, ctx);
   await fire("session_compact", { compactionEntry: { tokensBefore: 258_000, summary: "s".repeat(5_000) } }, ctx);
   assert.deepEqual(reports(), [
-    { ship: "privateer", kind: "turn", tokens: 150_000, window: 272_000 },
-    { ship: "privateer", kind: "compaction", tokens: 258_000, window: 272_000, summary_chars: 5_000 },
+    { ship: "privateer", kind: "turn", tokens: 150_000, window: 272_000, holder: "this-session" },
+    { ship: "privateer", kind: "compaction", tokens: 258_000, window: 272_000, holder: "this-session", summary_chars: 5_000 },
   ]);
 
   // A session that does not hold the ship's lease reports nothing.

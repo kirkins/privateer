@@ -342,6 +342,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     )?;
     let idle = idle_tasks(store, ship)?;
     let attention = crate::attention::summary_for(store, ship)?;
+    let scheduling = crate::scheduling::snapshot(store, ship)?;
     let knowledge = current_note(store, ship, "ship")?;
     let mut text = format!("Bearings for {ship}: {unacknowledged} unacknowledged messages.\n");
     if let Some(line) = crate::away::bearings_line() {
@@ -396,6 +397,18 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             ));
         }
     }
+    if !scheduling.is_empty() {
+        text.push_str("Task scheduling (unscheduled tasks require explicit task.enqueue):\n");
+        for work in scheduling.iter().take(20) {
+            text.push_str(&format!(
+                "- {}: {} · {} · next check {}\n",
+                work["task_id"].as_str().unwrap_or("?"),
+                work["state"].as_str().unwrap_or("unknown"),
+                clip(work["reason"].as_str().unwrap_or(""), 120),
+                work["next_check_ms"]
+            ));
+        }
+    }
     if let Some(note) = &knowledge {
         text.push_str(&format!(
             "Ship knowledge (note v{}):\n{}\n",
@@ -407,7 +420,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
-        "idle_tasks": idle, "attention": attention, "text": text,
+        "idle_tasks": idle, "attention": attention, "scheduling": scheduling, "text": text,
     }))
 }
 

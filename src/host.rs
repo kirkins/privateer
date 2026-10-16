@@ -129,7 +129,7 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
     {
         let tx = store.write_transaction()?;
         let running: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status='running')",
+            "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status IN ('offered','running'))",
             [ship],
             |r| r.get(0),
         )?;
