@@ -572,3 +572,162 @@ fn the_telegram_door_works_end_to_end_against_a_fake_bot_api() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// Plays the captain's phone through an away period: acknowledges mail,
+// peeks while away, then comes back with an ordinary message.
+const AWAY_ADAPTER: &str = r#"import json, os, sys
+log = open(os.environ["FAKE_DOOR_LOG"], "a")
+def note(entry):
+    log.write(json.dumps(entry) + "\n"); log.flush()
+note({"hello": json.loads(sys.stdin.readline())})
+def ask(ident, command, args):
+    print(json.dumps({"type": "request", "id": ident, "command": command, "args": args}), flush=True)
+mails = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    note(message)
+    if message["type"] == "mail":
+        print(json.dumps({"type": "delivered", "ref": message["ref"]}), flush=True)
+        mails += 1
+        if mails == 3:
+            ask("held", "held", {}); ask("peek", "status", {}); ask("still", "away", {"action": "status"})
+            ask("morning", "send", {"body": "good morning"})
+    elif message["type"] == "response" and message["id"] == "morning":
+        ask("again", "away", {"action": "start", "words": ""})
+        ask("back", "away", {"action": "back"})
+"#;
+
+#[test]
+fn away_holds_mail_lets_three_emergencies_through_and_summarizes_on_return() {
+    let fleet = Fleet::new();
+    fs::write(fleet.root.join("adapter/door.py"), AWAY_ADAPTER).unwrap();
+    fleet.add();
+    let out = fleet.ok(&["afk", "until", "8am", "merge #9 if CI is green"]);
+    assert!(
+        out.contains("only high-urgency messages reach you"),
+        "{out}"
+    );
+    let bearings = fleet.call("ops", "ship.bearings", json!({"ship":"ops"}));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("Captain away since")
+    );
+    let mail = |body: &str, kind: &str, urgency: &str| {
+        fleet.call(
+            "ops",
+            "mail.send",
+            json!({"from":"ops","to":"captain","kind":kind,"urgency":urgency,"body":body}),
+        )
+    };
+    mail("routine progress", "notice", "normal");
+    for n in 1..=4 {
+        mail(&format!("fire {n}"), "notice", "high");
+    }
+    let decide = mail("decide the region", "request", "normal");
+
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("the return and the second away period", |e| {
+        response(e, "back").is_some().then(|| e.to_vec())
+    });
+    // Three emergencies reached the phone, marked; the fourth and the rest waited.
+    let pushed: Vec<(&str, bool)> = entries
+        .iter()
+        .filter(|e| e["type"] == "mail")
+        .map(|e| {
+            (
+                e["mail"]["body"].as_str().unwrap(),
+                e["breakthrough"] == true,
+            )
+        })
+        .collect();
+    assert_eq!(
+        pushed,
+        [("fire 1", true), ("fire 2", true), ("fire 3", true)]
+    );
+    // Peeking left the captain away.
+    let held: Vec<&str> = response(&entries, "held").unwrap()["result"]["held"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(held, ["routine progress", "fire 4", "decide the region"]);
+    assert_eq!(response(&entries, "peek").unwrap()["ok"], true);
+    assert!(response(&entries, "still").unwrap()["result"]["away"].is_object());
+
+    // The first ordinary message is the return: a digest from records at once.
+    let morning = &response(&entries, "morning").unwrap()["result"];
+    assert_eq!(morning["ship"], "liaison");
+    let digest = morning["returned"]["digest"].as_str().unwrap();
+    assert!(
+        digest.contains(": 3 messages from 1 ship, 1 waiting on you, 3 emergencies sent. 1 urgent message was held over the hourly limit."),
+        "{digest}"
+    );
+    // The liaison got the away words, then the summary request, then the message.
+    let inbox = fleet.call("liaison", "mail.inbox", json!({"address":"liaison"}));
+    let bodies: Vec<&str> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    // Then the second, empty away period: its notice and a reminder of what waits.
+    assert_eq!(bodies.len(), 5, "{bodies:#?}");
+    assert!(bodies[3].contains("They left no instructions"));
+    assert!(
+        bodies[4].contains("Nothing new reached my mailbox, but 1 request still waits on me"),
+        "{}",
+        bodies[4]
+    );
+    assert!(
+        bodies[0].contains("(back about 8am)") && bodies[0].contains("\"merge #9 if CI is green\"")
+    );
+    assert!(bodies[1].starts_with("I'm back after"));
+    for line in [
+        "ops notice",
+        "routine progress",
+        "fire 4",
+        "decide the region",
+        "still open",
+    ] {
+        assert!(
+            bodies[1].contains(line),
+            "{line} missing from {}",
+            bodies[1]
+        );
+    }
+    assert!(!bodies[1].contains("fire 1"));
+    assert_eq!(bodies[2], "good morning");
+    let request = fleet.call(
+        "liaison",
+        "mail.show",
+        json!({"id": inbox["messages"][1]["id"]}),
+    );
+    assert_eq!(request["kind"], "request");
+    assert_eq!(request["from"], "captain");
+    let _ = decide;
+
+    // A second, empty away period ends with an empty digest; held mail from
+    // the first is never replayed, and new mail flows normally again.
+    let again = &response(&entries, "back").unwrap()["result"]["returned"]["digest"];
+    assert!(
+        again
+            .as_str()
+            .unwrap()
+            .contains(": 0 messages from 0 ships"),
+        "{again}"
+    );
+    mail("after you returned", "notice", "normal");
+    let later = fleet.wait("mail after the return", |e| {
+        let bodies: Vec<String> = e
+            .iter()
+            .filter(|e| e["type"] == "mail")
+            .map(|e| e["mail"]["body"].as_str().unwrap().to_owned())
+            .collect();
+        (bodies.len() > 3).then_some(bodies)
+    });
+    assert_eq!(later[3..], ["after you returned"]);
+    stop(supervisor);
+}

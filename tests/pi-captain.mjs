@@ -8,7 +8,7 @@ const api = { registerCommand: (name, spec) => commands.set(name, spec) };
 assert.deepEqual(registerCaptain(api, { ...process.env, PRIVATEER_ROLE: "operator" }), []);
 assert.deepEqual(registerCaptain(api, { ...process.env, PRIVATEER_ATTENDED_HARNESS: "codex" }), []);
 assert.equal(commands.size, 0);
-assert.deepEqual(registerCaptain(api, process.env).sort(), ["ships", "stow", "yolo"]);
+assert.deepEqual(registerCaptain(api, process.env).sort(), ["afk", "back", "ships", "stow", "yolo"]);
 
 const run = async (name, args) => {
   const seen = [];

@@ -34,6 +34,10 @@ pub const VERBS: &[&str] = &[
     "upgrade",
     "stow",
     "backlog",
+    // Fleet-wide, handled before a home is needed.
+    "afk",
+    "back",
+    "away",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -250,7 +254,7 @@ Use your agent identity for mail and delegation through these JSON commands or
 - Mail as yourself: `mail.send {{"from":"{ship}","to":"<ship or captain>","kind":"request|notice|reply","body":"...","task_id":"<optional>"}}`; a reply sets `correlation` to the request id. Task ids are this ship's own: name only your tasks in `task_id`, and link another ship's work through its request thread (`correlation`). `ship.list {{}}` shows who handles what; another ship's home is the peer `fleet-<ship>`.
 - Write to another ship when it must act or decide. A fact it may want but need not act on, such as a heads-up that your work touches its area, is a notice with `"urgency":"low"`: it waits for that ship's next wake instead of waking it.
 - A request you sent that no longer needs an answer, because the work happened another way or the question went stale, is withdrawn with `mail.withdraw {{"id":"<request id>","reason":"..."}}` (optional `actor` must be yourself), so it stops waiting on the captain or another ship. Acknowledging mail is not resolution; linked requests close when their task ends.
-- Writing to `captain`: they read it on a phone, between other things. Start with what happened and what you need from them, in plain words, in one to four short sentences. Name PRs and issues by number; leave out job ids, commit hashes, memory figures and internal task ids unless they ask. Write only when something they care about changes: a result, a decision you need, or a blocker. Progress details go to the ship that asked, not the captain.
+- Writing to `captain`: they read it on a phone, between other things. Use `"urgency":"high"` for the captain only when production or data is at risk, there is a security problem, money is being spent unexpectedly, or a deadline is hours away: high urgency reaches them even while they are away, so everything else is normal. Start with what happened and what you need from them, in plain words, in one to four short sentences. Name PRs and issues by number; leave out job ids, commit hashes, memory figures and internal task ids unless they ask. Write only when something they care about changes: a result, a decision you need, or a blocker. Progress details go to the ship that asked, not the captain.
 - Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`. You need not poll it: when it ends you get its outcome. While a change is in progress, run the tests that cover it, not the whole suite at every review round; the pull request's CI runs the full suite on every platform, so run it locally once, if at all, on the commit you open the PR from. A queued job keeps its place in line: cancel it only when the commit it tests is wrong, never to re-queue the same check.
 - Delegate with `task.create {{"id":"...","owner":"<ship>","title":"...","charter_id":"{ship}"}}`; hand off with `task.handoff`, which takes effect when the recipient runs `task.accept`.
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.

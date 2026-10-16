@@ -345,6 +345,10 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     let scheduling = crate::scheduling::snapshot(store, ship)?;
     let knowledge = current_note(store, ship, "ship")?;
     let mut text = format!("Bearings for {ship}: {unacknowledged} unacknowledged messages.\n");
+    if let Some(line) = crate::away::bearings_line() {
+        text.push_str(&line);
+        text.push('\n');
+    }
     if let Some(line) = crate::attention::line(&attention) {
         text.push_str(&line);
         text.push('\n');
