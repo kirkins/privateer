@@ -1380,6 +1380,29 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+fn persist_reply(line: &[u8], path: &Path) -> Result<()> {
+    if let Ok(event) = serde_json::from_slice::<Value>(line)
+        && let Some(reply) = crate::reply::text(&event)
+    {
+        let bounded: String = reply.chars().take(16_000).collect();
+        let temporary = path.with_extension("reply.tmp");
+        let mut saved = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        saved.write_all(bounded.as_bytes())?;
+        saved.sync_all()?;
+        fs::rename(&temporary, path)?;
+        OpenOptions::new()
+            .read(true)
+            .open(path.parent().context("reply has no parent")?)?
+            .sync_all()?;
+    }
+    Ok(())
+}
+
 /// Copy a pipe into `path`, bounded to about `LOG_LIMIT`: the head goes
 /// straight to the file, later bytes to two rotating tail segments that are
 /// appended after a truncation marker when the pipe ends. Returns the number
@@ -1387,6 +1410,7 @@ fn is_zero(n: &u64) -> bool {
 fn capture(
     mut pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
     path: PathBuf,
+    reply_path: Option<PathBuf>,
     stop: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<Result<u64>>> {
     let fd = pipe.as_raw_fd();
@@ -1420,6 +1444,8 @@ fn capture(
         let mut dropped = 0u64;
         let mut buf = [0u8; 8192];
         let mut stopping_bytes = 0usize;
+        let mut event_line = Vec::new();
+        let mut dropping_line = false;
         loop {
             if stop.load(Ordering::Relaxed) && stopping_bytes >= 65536 {
                 break;
@@ -1427,6 +1453,24 @@ fn capture(
             match pipe.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(reply_path) = &reply_path {
+                        for byte in &buf[..n] {
+                            if *byte == b'\n' {
+                                if !dropping_line {
+                                    persist_reply(&event_line, reply_path)?;
+                                }
+                                event_line.clear();
+                                dropping_line = false;
+                            } else if !dropping_line {
+                                if event_line.len() < 1_048_576 {
+                                    event_line.push(*byte);
+                                } else {
+                                    event_line.clear();
+                                    dropping_line = true;
+                                }
+                            }
+                        }
+                    }
                     let take = n.min(LOG_HEAD - head);
                     file.write_all(&buf[..take])?;
                     head += take;
@@ -1460,6 +1504,12 @@ fn capture(
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
             }
+        }
+        if let Some(reply_path) = &reply_path
+            && !dropping_line
+            && !event_line.is_empty()
+        {
+            persist_reply(&event_line, reply_path)?;
         }
         drop(segment);
         if segments > 0 {
@@ -1545,6 +1595,36 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod reply_capture_tests {
+    use super::*;
+
+    #[test]
+    fn rotated_pi_log_needs_the_reply_captured_from_the_intact_stream() {
+        let rotated = include_str!("../tests/fixtures/errand-rotated-pi.log");
+        // The old fallback treated the progress turn as the verdict. The
+        // shared extractor ignores toolUse, and the final record is cut.
+        assert_eq!(crate::errand::last_reply(rotated), None);
+
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("reply");
+        let progress = br#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"progress"}],"stopReason":"toolUse"}}"#;
+        persist_reply(progress, &sidecar).unwrap();
+        assert!(!sidecar.exists());
+        let final_reply = br#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"final verdict"}],"stopReason":"stop"}}"#;
+        persist_reply(final_reply, &sidecar).unwrap();
+        assert_eq!(fs::read_to_string(sidecar).unwrap(), "final verdict");
+    }
+
+    #[test]
+    fn stream_without_a_completed_reply_does_not_create_a_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("reply");
+        persist_reply(br#"{"type":"agent_settled","aborted":false}"#, &sidecar).unwrap();
+        assert!(!sidecar.exists());
+    }
 }
 
 fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
@@ -1715,11 +1795,13 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             Some(capture(
                 child.stdout.take().context("stdout missing")?,
                 dir.join("stdout.log"),
+                Some(dir.join("reply")),
                 stop.clone(),
             )?),
             Some(capture(
                 child.stderr.take().context("stderr missing")?,
                 dir.join("stderr.log"),
+                None,
                 stop.clone(),
             )?),
         )

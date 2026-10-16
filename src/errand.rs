@@ -192,29 +192,9 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
 /// `message_end`, Codex `agent_message` items and Claude's `result`.
 pub(crate) fn last_reply(log: &str) -> Option<String> {
     let mut reply = None;
-    for line in log.lines() {
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if event["type"] == "item.completed" && event["item"]["type"] == "agent_message" {
-            if let Some(text) = event["item"]["text"].as_str().filter(|t| !t.is_empty()) {
-                reply = Some(text.to_owned());
-            }
-        } else if event["type"] == "result" {
-            if let Some(text) = event["result"].as_str().filter(|t| !t.is_empty()) {
-                reply = Some(text.to_owned());
-            }
-        } else if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
-            let text: Vec<&str> = event["message"]["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|c| c["type"] == "text")
-                .filter_map(|c| c["text"].as_str())
-                .collect();
-            if !text.is_empty() {
-                reply = Some(text.join("\n"));
-            }
+    for event in crate::reply::events(log) {
+        if let Some(text) = crate::reply::text(&event) {
+            reply = Some(text);
         }
     }
     reply
@@ -257,7 +237,10 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         let log = std::fs::read(logs.join("stdout.log"))
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
-        let reply = last_reply(&log);
+        let reply = std::fs::read_to_string(logs.join("reply"))
+            .ok()
+            .filter(|reply| !reply.is_empty())
+            .or_else(|| last_reply(&log));
         let outcome = if status == "succeeded" && reply.is_some() {
             "succeeded"
         } else {

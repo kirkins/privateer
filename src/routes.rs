@@ -183,10 +183,7 @@ fn iso_timestamp_ms(value: &str) -> Option<i64> {
 fn classify(log: &str) -> Option<RouteFailure> {
     let mut last = None;
     let mut native_error = None;
-    for line in log.lines() {
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    for event in crate::reply::events(log) {
         if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
             last = Some(event["message"].clone());
         } else if event["type"] == "error" {

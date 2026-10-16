@@ -335,7 +335,7 @@ fn hash(line: &str) -> u64 {
 /// One readable line for a harness event worth showing, from Pi, Claude or
 /// Codex JSON; streaming deltas and bookkeeping are skipped.
 pub(crate) fn render(line: &str) -> Option<String> {
-    let event: Value = serde_json::from_str(line).ok()?;
+    let event: Value = crate::reply::parse_event(line)?;
     match event["type"].as_str()? {
         // Pi
         "message_end" if event["message"]["role"] == "assistant" => {
