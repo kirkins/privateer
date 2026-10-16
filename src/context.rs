@@ -341,8 +341,13 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         |r| r.get(0),
     )?;
     let idle = idle_tasks(store, ship)?;
+    let attention = crate::attention::summary_for(store, ship)?;
     let knowledge = current_note(store, ship, "ship")?;
     let mut text = format!("Bearings for {ship}: {unacknowledged} unacknowledged messages.\n");
+    if let Some(line) = crate::attention::line(&attention) {
+        text.push_str(&line);
+        text.push('\n');
+    }
     for (title, items) in [
         ("Open tasks", &tasks),
         ("Requests you owe a reply", &owed),
@@ -387,7 +392,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
-        "idle_tasks": idle, "text": text,
+        "idle_tasks": idle, "attention": attention, "text": text,
     }))
 }
 

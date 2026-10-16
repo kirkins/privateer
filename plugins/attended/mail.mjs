@@ -214,6 +214,21 @@ export default function attended(api) {
     api.on("session_branch", rebase);
   }
   api.on("session_shutdown", () => { mail.stop(); quiet.stop(); });
+  // The ship's attention: its live context after each run and each
+  // compaction, reported by the session that holds the lease.
+  const attention = async (kind, ctx, tokens, extra = {}) => {
+    try {
+      const window = ctx?.getContextUsage?.()?.contextWindow ?? ctx?.model?.contextWindow;
+      if (!mail.running || !Number.isFinite(tokens) || !(window > 0)) return;
+      if (!await mail.owned(mail.generation)) return;
+      await mail.call("attention.report", { ship: config.ship, kind, tokens: Math.round(tokens), window, ...extra });
+    } catch { /* attention reports are best effort */ }
+  };
+  if (config.harness !== "omp") {
+    api.on("agent_settled", (_event, ctx) => attention("turn", ctx, ctx?.getContextUsage?.()?.tokens));
+    api.on("session_compact", (event, ctx) => attention("compaction", ctx, event?.compactionEntry?.tokensBefore,
+      { summary_chars: event?.compactionEntry?.summary?.length ?? 0 }));
+  }
   api.on("agent_start", () => { mail.began(); quiet.began(); });
   api.on("message_end", event => mail.messageEnded(event));
   api.on(config.harness === "omp" ? "agent_end" : "agent_settled", event => {

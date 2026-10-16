@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod admission;
+pub mod attention;
 mod bundled;
 pub mod captain;
 pub mod cli;
@@ -103,6 +104,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship" | "mail" => mail::dispatch(store, command, args),
         "wake" => activation::dispatch(store, command, args),
         "errand" => errand::dispatch(store, command, args),
+        "attention" => attention::dispatch(store, command, args),
         "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let mut args = args;
