@@ -37,7 +37,9 @@ pub fn init(store: &Store) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS wakes(id TEXT PRIMARY KEY, ship TEXT NOT NULL, focus TEXT NOT NULL,
            through_seq INTEGER NOT NULL, job_id TEXT, mode TEXT NOT NULL, status TEXT NOT NULL,
            created_ms INTEGER NOT NULL, finished_ms INTEGER, error TEXT, usage TEXT);
-         CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);",
+         CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);
+         CREATE TABLE IF NOT EXISTS host_launches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
+           failures INTEGER NOT NULL, retry_ms INTEGER NOT NULL, error TEXT);",
     )?;
     for column in ["focuses", "harness", "session_id", "dispatcher_generation"] {
         let present: bool = tx.query_row(
@@ -572,6 +574,23 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         };
         return Ok(json!({"ship": name, "skipped": skipped}));
     }
+    // Maintaining an interactive first mate is independent of mail batching,
+    // wake budgets and prompt construction. Idle and mail-driven launches use
+    // one durable admission path, before the headless fallback below.
+    let mut host_error = None;
+    let mut host_backoff_until_ms = None;
+    if crate::host::hosted(&profile) {
+        match crate::host::launch(store, &name, &profile) {
+            Ok(crate::host::Attempt::Launched(hosted)) => {
+                return Ok(json!({"ship": name, "hosted": hosted}));
+            }
+            Ok(crate::host::Attempt::Backoff(until)) => host_backoff_until_ms = Some(until),
+            Ok(crate::host::Attempt::Busy) => {
+                return Ok(json!({"ship": name, "skipped": "first mate already aboard or awake"}));
+            }
+            Err(error) => host_error = Some(format!("{error:#}")),
+        }
+    }
     // A wake covers mail through its sequence whether or not the first mate
     // acknowledged it, so an agent that forgets to ack is not woken forever.
     let woken_through: i64 = store.connection().query_row(
@@ -600,7 +619,8 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let (Some(oldest), Some(newest)) = (oldest, newest) else {
-        return Ok(json!({"ship": name, "skipped": "nothing wake-worthy"}));
+        return Ok(json!({"ship": name, "skipped": "nothing wake-worthy",
+            "host_error": host_error, "host_backoff_until_ms": host_backoff_until_ms}));
     };
     let mail = new_mail(store, &name, after)?;
     if mail.is_empty() {
@@ -611,15 +631,6 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let overdue = now - oldest >= setting(&profile, "max_delay_secs") * 1000;
     if !quiet && !overdue {
         return Ok(json!({"ship": name, "skipped": "batching"}));
-    }
-    // A hosted first mate gets the mail in its live session; without the
-    // host, the headless wake below still runs.
-    let mut host_error = None;
-    if crate::host::hosted(&profile) {
-        match crate::host::launch(store, &name, &harness_id(&profile)) {
-            Ok(hosted) => return Ok(json!({"ship": name, "hosted": hosted})),
-            Err(error) => host_error = Some(format!("{error:#}")),
-        }
     }
     let last: Option<(String, Option<i64>)> = store
         .connection()
@@ -732,40 +743,8 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     Ok(
         json!({"ship": name, "wake": wake, "status": status, "through_seq": through,
         "focus": primary, "task_id": task, "focuses": foci, "mode": mode, "error": error,
-        "host_error": host_error}),
+        "host_error": host_error, "host_backoff_until_ms": host_backoff_until_ms}),
     )
-}
-
-/// When the dispatcher starts, give each hosted ship its live first mate so
-/// it is visible before any mail arrives.
-fn host_idle(store: &mut Store) -> Vec<Value> {
-    let mut launched = vec![];
-    for ship in ships(store).unwrap_or_default() {
-        let name = ship["name"].as_str().unwrap_or_default().to_owned();
-        if !crate::host::hosted(&ship["first_mate"])
-            || crate::presence::attended(store, &name).unwrap_or(true)
-        {
-            continue;
-        }
-        let running: bool = store
-            .connection()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status='running')",
-                [&name],
-                |r| r.get(0),
-            )
-            .unwrap_or(true);
-        if running {
-            continue;
-        }
-        launched.push(
-            match crate::host::launch(store, &name, &harness_id(&ship["first_mate"])) {
-                Ok(hosted) => json!({"ship": name, "hosted": hosted}),
-                Err(error) => json!({"ship": name, "host_error": format!("{error:#}")}),
-            },
-        );
-    }
-    launched
 }
 
 /// Local reconciliation and wakes run before bounded remote delivery, so a
@@ -836,12 +815,6 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
             [uuid::Uuid::new_v4().to_string()],
         )?;
         tx.commit()?;
-    }
-    if !once {
-        let hosted = host_idle(store);
-        if !hosted.is_empty() {
-            println!("{}", json!({"hosted": hosted}));
-        }
     }
     loop {
         let report = tick_with_delivery_budget(store, Duration::from_millis(delivery_budget))?;

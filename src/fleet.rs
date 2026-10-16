@@ -219,7 +219,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         let harness = profile["manifest"]
             .as_str()
             .and_then(crate::bundled::harness)?;
-        Some((harness, profile["options"].clone()))
+        Some((harness, profile))
     });
     let harness = args
         .get("harness")
@@ -228,10 +228,22 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         .or_else(|| parent.as_ref().map(|(h, _)| h.clone()));
     // A child crewed like its creator keeps the creator's model and provider
     // route: the captain chose it, and the creator cannot change it.
-    let options = parent
+    let inherited = parent
+        .as_ref()
         .filter(|(h, _)| Some(h) == harness.as_ref())
-        .map(|(_, options)| options)
+        .map(|(_, profile)| profile);
+    let options = inherited
+        .map(|profile| profile["options"].clone())
         .filter(Value::is_object);
+    // Hosting follows exactly the same harness eligibility as the native
+    // route. An explicit null opts out; no bundles, other settings or authority
+    // are copied. Validate before creating any child state.
+    let host = args
+        .get("host")
+        .or_else(|| inherited.and_then(|profile| profile.get("host")))
+        .filter(|host| !host.is_null())
+        .map(crate::host::validate)
+        .transpose()?;
     // Keep authority stable through local setup, before the child is published
     // or a dispatcher can run it. A previously committed revoke wins this lock
     // and leaves no child folder, registry entry or service behind.
@@ -289,6 +301,18 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
             options,
         },
     )?;
+    if let Some(host) = host {
+        let mut child = Store::open(&home)?;
+        let mut profile =
+            crate::mail::dispatch(&mut child, "ship.show", json!({"name": ship}))?["first_mate"]
+                .take();
+        profile["host"] = host;
+        crate::mail::dispatch(
+            &mut child,
+            "ship.put",
+            json!({"name": ship, "first_mate": profile}),
+        )?;
+    }
     store.audit(
         "ship.created",
         &json!({"ship": ship, "folder": folder, "by": created_by}),

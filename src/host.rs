@@ -4,9 +4,11 @@
 //! ship's presence lease (a `host:` holder the runtime owns, not the
 //! captain's) and its attended mail adapter starts turns as mail arrives. If
 //! the host is unreachable, the headless wake runs as before; if the session
-//! dies, its lease lapses and the next mail launches another.
+//! dies, its lease lapses and a later ordinary tick launches another. Failed
+//! launches back off durably, including a pane that never adopts its lease.
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -50,42 +52,185 @@ pub(crate) fn repair(store: &Store) {
     }
 }
 
-/// Launch the ship's first mate in its own background Herdr space. The lease
-/// is claimed first, so a racing launch or captain's session is refused, and
-/// released again if the host refuses.
-pub(crate) fn launch(store: &Store, ship: &str, harness: &str) -> Result<Value> {
+pub(crate) enum Attempt {
+    Launched(Value),
+    Backoff(i64),
+    Busy,
+}
+
+/// Retry at most once a minute, exponentially up to an hour. This bound is
+/// independent of headless wake retry settings (which may legitimately be 0).
+fn delay(failures: i64) -> i64 {
+    (60_000_i64 << failures.saturating_sub(1).clamp(0, 6)).min(3_600_000)
+}
+
+/// No inference: check the same charter/provider adapter and option validation
+/// as a headless launch. Native auth and provider environments remain untouched.
+/// Interactive starts cannot silently substitute a custom adapter or its config.
+/// Rechecked by `start --hosted`, since revocation may win after pane creation.
+pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> Result<()> {
+    ensure!(hosted(profile), "ship is no longer hosted");
+    let harness = profile["manifest"]
+        .as_str()
+        .and_then(crate::bundled::harness)
+        .context("hosting requires a bundled native harness")?;
     ensure!(
-        LIVE_HARNESSES.contains(&harness),
+        LIVE_HARNESSES.contains(&harness.as_str()),
         "{harness} cannot be hosted: its attended adapter does not start turns on mail"
     );
-    let socket = socket().context("no Herdr socket configured")?;
-    let mut client = crate::herdr::Client::connect(&socket)?;
+    ensure!(
+        crate::presence::folder_ship(store).as_deref() == Some(ship),
+        "hosted start must use this folder's ship"
+    );
+    ensure!(
+        !crate::permissions::paused(store, ship)?,
+        "tool permission question awaits captain or a policy change"
+    );
+    let duty = profile["duty_task"]
+        .as_str()
+        .context("first mate duty task")?;
+    ensure!(
+        store.task(duty)?["owner"] == ship,
+        "first mate duty owner changed"
+    );
+    let charter = store.authorize(duty, "spawn")?;
+    let folder = store
+        .home()
+        .parent()
+        .context("ship folder")?
+        .canonicalize()?;
+    let repo = Path::new(charter["repo"].as_str().context("charter repo")?).canonicalize()?;
+    ensure!(
+        folder.is_dir() && folder.starts_with(repo),
+        "hosted cwd escapes charter repository"
+    );
+    ensure!(
+        profile.get("config").is_none(),
+        "hosted native start cannot apply plugin config"
+    );
+    crate::plugins::dispatch(
+        store,
+        "plugin.validate",
+        json!({
+            "task_id": duty, "manifest": profile["manifest"], "options": profile["options"]
+        }),
+    )?;
+    Ok(())
+}
+
+/// Reserve both the launch lease and its next retry BEFORE any host I/O.
+/// A crash, missing binary, rejected pane or unadopted lease therefore cannot
+/// turn an ordinary tick (or dispatcher restart) into an unbounded retry loop.
+/// The one row per ship and bounded error also bound persistent state.
+pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<Attempt> {
     let holder = format!("{}{}", crate::presence::HOSTED, uuid::Uuid::new_v4());
-    crate::presence::claim(store, ship, &holder, LAUNCH_TTL_SECS, Some(harness))?;
-    let folder = store.home().parent().context("ship folder")?;
-    let binary = crate::executable::installed()?;
-    match client.space(
-        folder,
-        ship,
-        &binary,
-        store.home(),
-        &[("PRIVATEER_HOSTED_HOLDER", &holder)],
-        &["start", "--hosted"],
-    ) {
-        Ok(pane) => {
-            settle(store, &mut client, &pane.workspace_id, "mate", ship);
-            let launched = json!({"holder": holder, "pane": pane.pane_id,
-                "workspace": pane.workspace_id});
-            store.audit(
-                "host.launched",
-                &json!({"ship": ship, "launched": launched}),
-            )?;
-            Ok(launched)
+    {
+        let tx = store.write_transaction()?;
+        let running: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status='running')",
+            [ship],
+            |r| r.get(0),
+        )?;
+        if running || crate::presence::attended(store, ship)? {
+            return Ok(Attempt::Busy);
         }
+        let previous: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT failures, retry_ms FROM host_launches WHERE ship=?1",
+                [ship],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let now = Store::now_ms();
+        if let Some((_, until)) = previous.filter(|(_, until)| *until > now) {
+            return Ok(Attempt::Backoff(until));
+        }
+        let failures = previous.map_or(1, |(n, _)| n.saturating_add(1).clamp(1, 7));
+        tx.execute(
+            "INSERT INTO host_launches(ship,holder,failures,retry_ms,error) VALUES(?1,?2,?3,?4,'awaiting hosted startup')
+             ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, failures=excluded.failures,
+               retry_ms=excluded.retry_ms, error=excluded.error",
+            params![ship, holder, failures, now + delay(failures)])?;
+        // Under the same lock as the attended check; no nested claim transaction.
+        let harness = profile["manifest"]
+            .as_str()
+            .and_then(crate::bundled::harness);
+        crate::presence::attend(store, ship, &holder, LAUNCH_TTL_SECS, harness.as_deref())?;
+        tx.commit()?;
+    }
+    let result = (|| -> Result<Value> {
+        validate_start(store, ship, profile)?;
+        let socket = socket().context("no Herdr socket configured")?;
+        let mut client = crate::herdr::Client::connect(&socket)?;
+        let folder = store.home().parent().context("ship folder")?;
+        let binary = crate::executable::installed()?;
+        let pane = client.space(
+            folder,
+            ship,
+            &binary,
+            store.home(),
+            &[("PRIVATEER_HOSTED_HOLDER", &holder)],
+            &["start", "--hosted"],
+        )?;
+        settle(store, &mut client, &pane.workspace_id, "mate", ship);
+        let launched =
+            json!({"holder": holder, "pane": pane.pane_id, "workspace": pane.workspace_id});
+        store.audit(
+            "host.launched",
+            &json!({"ship": ship, "launched": launched}),
+        )?;
+        Ok(launched)
+    })();
+    match result {
+        Ok(pane) => Ok(Attempt::Launched(pane)),
         Err(error) => {
+            failed(store, ship, &holder, &format!("{error:#}"))?;
             crate::presence::leave(store, ship, &holder)?;
             Err(error)
         }
+    }
+}
+
+/// Only this attempt may settle its state; a stale pane cannot reset a newer
+/// launch's backoff. Keep the reserved deadline even after adoption, so a
+/// harness that immediately exits cannot be relaunched on every tick.
+pub(crate) fn started(store: &Store, ship: &str, holder: &str) -> Result<()> {
+    store.connection().execute(
+        "UPDATE host_launches SET failures=0,error=NULL WHERE ship=?1 AND holder=?2",
+        params![ship, holder],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn failed(store: &Store, ship: &str, holder: &str, error: &str) -> Result<()> {
+    let tx = store.write_transaction()?;
+    let failures: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(failures,1) FROM host_launches WHERE ship=?1 AND holder=?2",
+            params![ship, holder],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(failures) = failures {
+        tx.execute(
+            "UPDATE host_launches SET failures=?3,retry_ms=MAX(retry_ms,?4),error=?5 WHERE ship=?1 AND holder=?2",
+            params![ship, holder, failures, Store::now_ms() + delay(failures),
+                error.chars().take(2_000).collect::<String>()])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Release even when hosted startup fails before spawning its native process.
+/// Successful starts still explicitly release before exiting the wrapper.
+pub(crate) struct Lease<'a> {
+    pub store: &'a Store,
+    pub ship: &'a str,
+    pub holder: &'a str,
+}
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let _ = crate::presence::leave(self.store, self.ship, self.holder);
     }
 }
 
