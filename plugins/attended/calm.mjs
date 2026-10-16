@@ -1,9 +1,35 @@
+import { execFile } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { readPreference, writePreference } from "./calm-policy.mjs";
 import { WorkingBoat } from "./calm-boat.mjs";
 import { installLayouts } from "./calm-layout.mjs";
 
 const SLOT = Symbol.for("privateer.pi.calm");
+const SOURCE = "privateer-calm";
+
+/// Herdr reads a Pi pane's working state from Pi's stock Working row, which
+/// Calm hides. While Calm is on, it tells Herdr the state itself; when Calm is
+/// off or the session ends, it releases that authority and Herdr reads the
+/// screen again. Outside Herdr there is nothing to report.
+function herdrState(env, dependencies) {
+  const bin = env.HERDR_BIN_PATH, pane = env.HERDR_PANE_ID;
+  if (!bin || !isAbsolute(bin) || !pane) return { set() {} };
+  const run = dependencies.herdr ?? (args => new Promise(resolve => {
+    execFile(bin, args, { timeout: 3000 }, () => resolve());
+  }));
+  let current = "released", seq = 0;
+  return {
+    set(next) {
+      if (next === current) return;
+      current = next;
+      void (next === "released"
+        // Herdr 0.9.5 parses release-agent's pane id only before its options.
+        ? run(["pane", "release-agent", pane, "--source", SOURCE, "--agent", "pi"])
+        : run(["pane", "report-agent", "--source", SOURCE, "--agent", "pi", "--state", next,
+          "--seq", String(++seq), pane]));
+    },
+  };
+}
 
 export function registerCalm(api, host, env = process.env, dependencies = {}) {
   if (env.PRIVATEER_ROLE !== "agent" || !isAbsolute(env.PRIVATEER_HOME ?? "")
@@ -22,12 +48,15 @@ export function registerCalm(api, host, env = process.env, dependencies = {}) {
   catch { state.warn("preference read"); }
   let layouts = installLayouts(host, state);
   let boat = new WorkingBoat(dependencies), running = false, disposed = false;
+  const herdr = herdrState(env, dependencies);
   const subscriptions = [];
   const on = (event, handler) => subscriptions.push(api.on(event, handler));
   const apply = () => {
-    if (!state.disposed && state.enabled && running && state.ctx?.mode === "tui") {
+    const calm = !state.disposed && state.enabled && state.ctx?.mode === "tui";
+    if (calm && running) {
       if (boat.start(state.ctx) === false) state.warn("working boat");
     } else boat.stop();
+    herdr.set(calm ? (running ? "working" : "idle") : "released");
   };
   const controller = {
     state,
@@ -37,6 +66,7 @@ export function registerCalm(api, host, env = process.env, dependencies = {}) {
       state.epoch++;
       running = false;
       boat.stop();
+      herdr.set("released");
       layouts.dispose();
       for (const unsubscribe of subscriptions) unsubscribe?.();
     },
@@ -62,6 +92,7 @@ export function registerCalm(api, host, env = process.env, dependencies = {}) {
     state.epoch++;
     running = false;
     boat.stop();
+    herdr.set("released");
     layouts.dispose();
   });
   api.registerCommand("calm", { description: "Toggle the home-local conversation-only Pi view",

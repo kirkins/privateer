@@ -28,6 +28,14 @@ the same direction, and resets for a new session or extension lifetime. Settle,
 abort, error, shutdown, replacement and reload release its scheduler/widget.
 Retry and compaction indicators remain stock.
 
+Herdr reads a Pi pane's working state from that stock Working row, so hiding it
+would make a working first mate look idle in Herdr's sidebar. In a Herdr pane
+(`HERDR_BIN_PATH` and `HERDR_PANE_ID` set), Calm therefore reports the state
+itself while on: `herdr pane report-agent --source privateer-calm --agent pi
+--state working|idle` as runs start and settle, numbered with `--seq`. Turning
+Calm off, shutdown and disposal run `release-agent`, returning the pane to
+Herdr's own detection. Outside Herdr nothing is reported.
+
 Calm hides:
 
 - Collapsed thinking, without hiding explicitly expanded reasoning.
