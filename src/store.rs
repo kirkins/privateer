@@ -6,6 +6,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Only these known lifecycle refusals may be omitted from an observation.
+// Parse, SQL, missing-record and invalid-ancestry errors must remain unavailable.
+#[derive(Debug)]
+struct InactiveAuthority(&'static str);
+
+impl std::fmt::Display for InactiveAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for InactiveAuthority {}
+
 pub struct Store {
     home: PathBuf,
     connection: Connection,
@@ -79,6 +91,61 @@ impl Caller {
 }
 
 impl Store {
+    /// Observation-only commands must not initialize or migrate a home.
+    pub fn open_readonly(home: &Path, caller: Caller) -> Result<Self> {
+        caller.require_operator("read-only captain observation")?;
+        if !home.is_absolute() {
+            bail!("home must be an absolute path");
+        }
+        reject_symlinks(home)?;
+        let home = fs::canonicalize(home).context("existing Privateer home required")?;
+        let database = home.join("privateer.sqlite");
+        reject_symlinks(&database)?;
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .context("existing Privateer database required")?;
+        // Observation-only open must not inherit ordinary writers' ten-second
+        // lock wait. The query installs its own scoped VM/deadline budget.
+        connection.busy_timeout(Duration::from_millis(25))?;
+        connection.execute_batch("PRAGMA query_only=ON;")?;
+        Ok(Self {
+            home,
+            connection,
+            caller,
+        })
+    }
+
+    /// Explicit local operator intent only. Unlike normal startup, never create,
+    /// migrate, chmod, repair, or change journal mode. Callers pin and revalidate
+    /// filesystem identity and origin around this open and before dispatch.
+    pub(crate) fn open_existing_action(home: &Path, caller: Caller) -> Result<Self> {
+        caller.require_operator("existing-home captain action")?;
+        if !home.is_absolute() {
+            bail!("home must be absolute");
+        }
+        reject_symlinks(home)?;
+        let home = fs::canonicalize(home)?;
+        let database = home.join("privateer.sqlite");
+        reject_symlinks(&database)?;
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_millis(250))?;
+        let schema: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM metadata WHERE key='schema' AND value='1') AND EXISTS(SELECT 1 FROM metadata WHERE key='runtime_origin' AND length(value) BETWEEN 1 AND 160) AND (SELECT COUNT(*) FROM pragma_table_info('mail') WHERE name IN ('ended_by','ended_ms','end_reason'))=3 AND EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='approver')", [], |r| r.get(0))?;
+        if !schema {
+            bail!("incompatible existing action schema; use normal upgrade workflow");
+        }
+        let mode: String = connection.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if mode != "wal" {
+            bail!("existing action requires the normal WAL schema; no repair performed");
+        }
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+        Ok(Self {
+            home,
+            connection,
+            caller,
+        })
+    }
+
     pub fn open_as(home: &Path, caller: Caller) -> Result<Self> {
         if matches!(caller, Caller::Agent { .. }) && !home.join("privateer.sqlite").is_file() {
             bail!("agents require an existing ship home");
@@ -145,6 +212,10 @@ impl Store {
         )?;
         migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;
+        connection.execute(
+            "INSERT OR IGNORE INTO metadata VALUES('runtime_origin',?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
         let schema: String =
             connection.query_row("SELECT value FROM metadata WHERE key='schema'", [], |r| {
                 r.get(0)
@@ -226,26 +297,54 @@ impl Store {
     pub fn active_charter(&self, task_id: &str) -> Result<Value> {
         self.authorize_inner(task_id, None, false)
     }
+    /// Use exactly the grant's authority/hash semantics, with observation-only
+    /// checkpoints across short SQL statements and Rust ancestry work. Only
+    /// explicit lifecycle refusals are stale; all invalid source errors survive.
+    pub(crate) fn observe_active_charter(
+        &self,
+        task_id: &str,
+        mut checkpoint: impl FnMut(&str) -> Result<()>,
+    ) -> Result<Option<Value>> {
+        match self.authorize_checked(task_id, None, false, &mut checkpoint) {
+            Ok(charter) => Ok(Some(charter)),
+            Err(error) if error.is::<InactiveAuthority>() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     /// Completion prevents admission of new work. A job already running may
     /// finish recording its result; cancellation and revocation still stop it.
     pub fn authorize_running(&self, task_id: &str, action: &str) -> Result<Value> {
         self.authorize_inner(task_id, Some(action), true)
     }
     fn authorize_inner(&self, task_id: &str, action: Option<&str>, running: bool) -> Result<Value> {
+        self.authorize_checked(task_id, action, running, &mut |_| Ok(()))
+    }
+    fn authorize_checked(
+        &self,
+        task_id: &str,
+        action: Option<&str>,
+        running: bool,
+        checkpoint: &mut impl FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        checkpoint(task_id)?;
         let task = self.task(task_id)?;
         if task["status"] == "cancelled" || (!running && task["status"] == "done") {
-            bail!("task is terminal");
+            return Err(InactiveAuthority("task is terminal").into());
         }
         let mut current = task.clone();
         while let Some(parent) = current["parent"].as_str() {
+            checkpoint(parent)?;
             current = self.task(parent)?;
             if current["status"] == "cancelled" {
-                bail!("parent task was cancelled");
+                return Err(InactiveAuthority("parent task was cancelled").into());
             }
         }
         let charter = self.charter(task["charter_id"].as_str().unwrap())?;
-        if charter["active"] != true {
-            bail!("charter was revoked");
+        let active = charter["active"]
+            .as_bool()
+            .context("invalid charter active flag")?;
+        if !active {
+            return Err(InactiveAuthority("charter was revoked").into());
         }
         if let Some(action) = action {
             if !charter["actions"]

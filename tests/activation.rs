@@ -766,7 +766,14 @@ fn liaison_wakes_keep_duty_fallback_for_ineligible_or_foreign_tasks() {
             }
             _ => {}
         }
-        fleet.send(json!({"id":"question","from":"apps","to":"infra","kind":"request","task_id":"focus","body":"Can you relay this?"}));
+        // Terminal tasks cannot acquire new open questions. A notice still
+        // carries historical task context and must take the same duty fallback.
+        let kind = if matches!(ineligible, "cancelled" | "done") {
+            "notice"
+        } else {
+            "request"
+        };
+        fleet.send(json!({"id":"question","from":"apps","to":"infra","kind":kind,"task_id":"focus","body":"Can you relay this?"}));
         let woke = Fleet::infra(&fleet.tick());
         let wake = fleet.settle();
         assert_eq!(woke["task_id"], "infra-duty", "{ineligible}: {woke}");

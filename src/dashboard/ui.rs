@@ -1,106 +1,37 @@
 use super::{
-    captain::{Composer, Exchange, Mail},
+    bridge::{Answer, Attention, Binding, FRESH_MS, RECENT_MS},
+    captain::{Composer, Exchange, HistoryBinding, Mail},
     herdr,
-    model::{Snapshot, Task, clean, count},
-    overview,
+    model::{Snapshot, Task, clean},
 };
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Table, TableState, Tabs, Wrap},
+    text::Line,
+    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
-const TABS: [&str; 4] = ["1 Bridge", "2 Assignments", "3 Terminals", "4 Logbook"];
-/// How long an outcome notice stays visible once nothing is waiting on it.
 pub const NOTICE_TTL: Duration = Duration::from_secs(8);
-
-fn origin(home: Option<&Path>) -> String {
-    home.map_or_else(String::new, |home| {
-        format!(" · Home: {}", clean(&home.display().to_string(), 512))
-    })
-}
-
-/// The shell-quoted command that reaches a ship's first mate without Herdr.
-fn direct_start(ship: &super::model::Ship) -> Option<String> {
-    let home = ship
-        .live
-        .as_ref()
-        .filter(|live| live.error.is_none())?
-        .home
-        .clone();
-    let home = std::fs::canonicalize(&home).unwrap_or(home);
-    Some(format!(
-        "privateer --home '{}' start",
-        clean(&home.to_string_lossy(), 4096).replace('\'', "'\"'\"'")
-    ))
-}
-
-fn border(focused: bool) -> Style {
-    Style::default().fg(if focused {
-        Color::Yellow
-    } else {
-        Color::DarkGray
-    })
-}
-
-fn selected_row() -> Style {
-    Style::default()
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Keeps the last hint (quit) and drops optional hints from the end until the line fits.
-fn hint_line(hints: &[(&'static str, &'static str)], width: usize) -> Line<'static> {
-    let Some((quit, optional)) = hints.split_last() else {
-        return Line::default();
-    };
-    let mut count = optional.len();
-    loop {
-        let mut spans = vec![Span::raw(" ")];
-        for (i, (key, label)) in optional[..count].iter().chain([quit]).enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" · "));
-            }
-            spans.push(Span::styled(
-                *key,
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(format!(" {label}")));
-        }
-        let line = Line::from(spans);
-        if line.width() <= width || count == 0 {
-            return line;
-        }
-        count -= 1;
-    }
-}
 
 #[derive(Default)]
 pub struct MouseMap {
-    actions: Vec<(Rect, char)>,
-    tabs: Vec<(Rect, usize)>,
-    ships: Rect,
-    ship_offset: usize,
-    list: Rect,
-    list_offset: usize,
     fleet: Rect,
     fleet_offset: usize,
+    list: Rect,
+    list_offset: usize,
     details: Rect,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoardTarget {
     pub ship: String,
     pub home: PathBuf,
 }
-
 impl BoardTarget {
     pub fn from_ship(ship: &super::model::Ship) -> Option<Self> {
         Some(Self {
@@ -109,22 +40,27 @@ impl BoardTarget {
         })
     }
 }
-
 pub enum PendingBoard {
     Onboarding(BoardTarget),
     Liaison(BoardTarget),
 }
-
 impl PendingBoard {
     pub fn target(&self) -> &BoardTarget {
         match self {
-            Self::Onboarding(target) | Self::Liaison(target) => target,
+            Self::Onboarding(t) | Self::Liaison(t) => t,
         }
     }
 }
 
 #[derive(Default)]
 pub struct App {
+    pub attention: Attention,
+    pub need_id: Option<Binding>,
+    pub mail_id: Option<HistoryBinding>,
+    pub history_read: Option<Mail>,
+    pub answer: Option<Answer>,
+    pub answer_action: Option<Answer>,
+    pub needs_focus: bool,
     pub inbox_open: bool,
     pub mail: Vec<Mail>,
     pub mail_errors: Vec<String>,
@@ -132,6 +68,7 @@ pub struct App {
     pub mail_pending: bool,
     pub composer: Option<Composer>,
     pub form: Option<super::forms::Form>,
+    // Retained library management helpers; the bridge has no launch/watch controls.
     pub board_requested: bool,
     pub watch_requested: bool,
     pub pending_board: Option<PendingBoard>,
@@ -157,7 +94,6 @@ pub struct App {
     pub selection_invalidated: bool,
     pub mouse: MouseMap,
 }
-
 impl App {
     pub fn select_ship(&mut self, id: Option<String>) {
         if id
@@ -166,42 +102,36 @@ impl App {
         {
             return;
         }
-        if self.ship != id || self.inbox_open {
-            if self.ship.is_none() || id.is_none() {
-                self.tab = 0;
-            }
-            self.notice.clear();
-            self.ship = id;
-            self.selected = 0;
-            self.scroll = 0;
-            self.selection_invalidated = false;
-        }
+        self.ship = id;
         self.inbox_open = false;
+        self.needs_focus = false;
+        self.selected = 0;
+        self.scroll = 0;
+        self.tab = 0;
+        self.notice.clear();
+        self.selection_invalidated = false;
         self.focus_content = false;
     }
+    /// Compatibility for library selection helpers; no per-ship tabs are rendered or keyed.
     pub fn select_tab(&mut self, tab: usize) {
-        if self.ship.is_none() {
-            self.notice = "Choose a ship to open its workspace.".into();
-            return;
-        }
-        if tab < TABS.len() && self.tab != tab {
+        if self.ship.is_some() && tab < 4 {
             self.tab = tab;
-            self.notice.clear();
             self.selected = 0;
             self.scroll = 0;
             self.selection_invalidated = false;
+            self.focus_content = true;
         }
-        self.focus_content = true;
     }
-    /// Expire an outcome notice after `NOTICE_TTL`, unless a form, draft or
-    /// command still depends on it. Returns whether the notice was cleared.
     pub fn tick_notice(&mut self, now: Instant) -> bool {
         if self.notice != self.notice_shown {
             self.notice_shown = self.notice.clone();
             self.notice_at = Some(now);
             return false;
         }
-        let waiting = self.form.is_some() || self.composer.is_some() || self.mail_pending;
+        let waiting = self.form.is_some()
+            || self.composer.is_some()
+            || self.answer.is_some()
+            || self.mail_pending;
         if self.notice.is_empty()
             || waiting
             || self
@@ -221,7 +151,7 @@ impl App {
         self.ship
             .as_ref()
             .and_then(|id| self.snapshot.ships.iter().position(|s| &s.id == id))
-            .map_or(usize::from(self.inbox_open), |i| i + 2)
+            .unwrap_or(0)
     }
     pub fn assignment_indices(&self) -> Vec<usize> {
         let Some(ship) = self.ship.as_deref() else {
@@ -252,30 +182,26 @@ impl App {
         if let Some(binding) = ship
             .live
             .as_ref()
-            .and_then(|live| live.binding.as_ref())
-            .filter(|binding| {
-                binding.pane.pane_id == pane.pane_id || binding.pane.terminal_id == pane.terminal_id
-            })
+            .and_then(|l| l.binding.as_ref())
+            .filter(|b| b.pane.pane_id == pane.pane_id || b.pane.terminal_id == pane.terminal_id)
         {
             return binding.matches(view, pane);
         }
-        ship.terminals.iter().any(|binding| {
-            binding.pane_id == pane.pane_id && binding.terminal_id == pane.terminal_id
-        })
+        ship.terminals
+            .iter()
+            .any(|b| b.pane_id == pane.pane_id && b.terminal_id == pane.terminal_id)
     }
     pub fn binding_ambiguous(&self) -> bool {
         if self.snapshot.presentation_error.is_some() {
             return true;
         }
-        let Some(view) = &self.herdr else {
-            return false;
-        };
-        let Some(ship) = self
-            .snapshot
-            .ships
-            .iter()
-            .find(|s| Some(&s.id) == self.ship.as_ref())
-        else {
+        let (Some(view), Some(ship)) = (
+            &self.herdr,
+            self.snapshot
+                .ships
+                .iter()
+                .find(|s| Some(&s.id) == self.ship.as_ref()),
+        ) else {
             return false;
         };
         view.panes.iter().any(|p| {
@@ -291,18 +217,15 @@ impl App {
         if self.snapshot.presentation_error.is_some() {
             return Vec::new();
         }
-        let Some(ship) = self
-            .snapshot
-            .ships
-            .iter()
-            .find(|s| Some(&s.id) == self.ship.as_ref())
-        else {
+        let (Some(view), Some(ship)) = (
+            &self.herdr,
+            self.snapshot
+                .ships
+                .iter()
+                .find(|s| Some(&s.id) == self.ship.as_ref()),
+        ) else {
             return Vec::new();
         };
-        let Some(view) = &self.herdr else {
-            return Vec::new();
-        };
-        // Live presence is primary; manual bindings retain registry order.
         let automatic = ship
             .live
             .as_ref()
@@ -330,7 +253,6 @@ impl App {
             })
             .collect()
     }
-
     pub fn selected_pane(&self) -> Option<&herdr::Pane> {
         if !matches!(self.tab, 0 | 2) {
             return None;
@@ -339,73 +261,165 @@ impl App {
             .get(if self.tab == 0 { 0 } else { self.selected })
             .copied()
     }
+    /// Snapshot + full Herdr identity must both be fresh. Does not create or reorder panes.
+    pub fn focus_target(&self) -> anyhow::Result<(herdr::View, herdr::Pane)> {
+        anyhow::ensure!(!self.demo, "Demo only; no live focus");
+        anyhow::ensure!(
+            self.home_error.is_none() && self.home_age.is_some_and(|a| a < 10),
+            "Privateer observation unavailable/stale"
+        );
+        anyhow::ensure!(
+            self.snapshot.scope_complete(),
+            "Fleet discovery incomplete/unknown; focus refused"
+        );
+        anyhow::ensure!(
+            self.herdr_error.is_none()
+                && self.herdr_age.is_some_and(|a| a < 10)
+                && !self.selection_invalidated
+                && !self.binding_ambiguous(),
+            "Herdr observation/selection changed; refresh and reselect"
+        );
+        let ship = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == self.ship.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Select a ship"))?;
+        anyhow::ensure!(
+            ship.live.as_ref().is_none_or(|l| l.error.is_none()),
+            "Ship home unavailable"
+        );
+        Ok((
+            self.herdr
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("No Herdr connection"))?,
+            (*self
+                .scoped_panes()
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No existing validated mate space; use Herdr"))?)
+            .clone(),
+        ))
+    }
     pub fn selection_len(&self) -> usize {
         if self.inbox_open {
-            return self.mail.len();
-        }
-        match self.tab {
-            1 => self.assignment_indices().len(),
-            2 => self.scoped_panes().len(),
-            _ => 0,
+            self.mail.len()
+        } else if self.needs_focus {
+            self.attention.items().len()
+        } else {
+            self.snapshot.ships.len()
         }
     }
     pub fn move_selection(&mut self, down: bool) {
-        if !self.focus_content {
+        if self.inbox_open || self.needs_focus {
+            self.selected = if down {
+                self.selected
+                    .saturating_add(1)
+                    .min(self.selection_len().saturating_sub(1))
+            } else {
+                self.selected
+                    .saturating_sub(1)
+                    .min(self.selection_len().saturating_sub(1))
+            };
+            if self.needs_focus {
+                self.need_id = self
+                    .attention
+                    .items()
+                    .get(self.selected)
+                    .map(|n| n.binding());
+            } else {
+                self.mail_id = self.mail.get(self.selected).map(Mail::binding);
+            }
+        } else if !self.snapshot.ships.is_empty() {
             let current = self.ship_index();
-            let max = self.snapshot.ships.len() + 1;
-            let next = if down {
-                (current + 1).min(max)
+            let next = if down && self.ship.is_some() {
+                (current + 1).min(self.snapshot.ships.len() - 1)
+            } else if down {
+                0
             } else {
                 current.saturating_sub(1)
             };
-            self.select_navigation(next);
-            self.focus_content = false;
-        } else if self.selection_len() > 0 {
-            self.selected = if down {
-                (self.selected + 1).min(self.selection_len() - 1)
-            } else {
-                self.selected.saturating_sub(1)
-            };
-            self.selection_invalidated = false;
-            self.scroll = 0;
-        } else {
-            self.scroll = if down {
-                self.scroll.saturating_add(1)
-            } else {
-                self.scroll.saturating_sub(1)
-            };
+            self.select_ship(Some(self.snapshot.ships[next].id.clone()));
         }
+        self.scroll = 0;
     }
-    fn select_navigation(&mut self, index: usize) {
-        match index {
-            0 => self.select_ship(None),
-            1 => self.open_inbox(),
-            _ => {
-                if let Some(ship) = self.snapshot.ships.get(index - 2) {
-                    self.select_ship(Some(ship.id.clone()));
-                }
-            }
-        }
+    /// Only an explicitly selected, still-bound history row can become read intent.
+    pub fn selected_history(&self) -> Option<&Mail> {
+        self.mail
+            .get(self.selected)
+            .filter(|m| self.inbox_open && self.mail_id.as_ref() == Some(&m.binding()))
     }
     pub fn update_mail(&mut self, messages: Vec<Mail>, errors: Vec<String>) {
-        let selected = self
-            .mail
-            .get(self.selected)
-            .map(|m| (m.home.clone(), m.id.clone()));
         self.mail = messages;
         self.mail_errors = errors;
         if self.inbox_open {
-            let index = selected
-                .and_then(|(home, id)| self.mail.iter().position(|m| m.home == home && m.id == id));
-            // A message that left the inbox (read or answered) yields to the
-            // one that took its place, not to the top of the list.
-            self.selected = index.unwrap_or(self.selected.min(self.mail.len().saturating_sub(1)));
+            let index = self.mail_id.as_ref().and_then(|binding| {
+                let selected = self.mail.iter().find(|m| &m.binding() == binding)?;
+                if selected.origin.is_some()
+                    && self.mail.iter().any(|m| {
+                        m.origin == selected.origin
+                            && (m.home != selected.home || m.identity != selected.identity)
+                    })
+                {
+                    return None;
+                }
+                let mut matches = self
+                    .mail
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| &m.binding() == binding);
+                let first = matches.next().map(|(i, _)| i);
+                first.filter(|_| matches.next().is_none())
+            });
+            self.selected = index.unwrap_or(usize::MAX);
             if index.is_none() {
+                self.mail_id = None;
                 self.scroll = 0;
             }
         }
     }
+    pub fn update_attention(&mut self, attention: Attention) {
+        self.attention = attention;
+        if self.needs_focus {
+            // Never silently select the replacement when an actionable row disappears.
+            let index = self.need_id.as_ref().and_then(|binding| {
+                if self
+                    .attention
+                    .sources
+                    .iter()
+                    .filter(|s| s.origin.as_ref() == Some(&binding.origin))
+                    .count()
+                    != 1
+                {
+                    return None;
+                }
+                let items = self.attention.items();
+                let mut matches = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| &n.binding() == binding);
+                let first = matches.next().map(|(i, _)| i);
+                first.filter(|_| matches.next().is_none())
+            });
+            self.selected = index.unwrap_or(usize::MAX);
+            if index.is_none() {
+                self.need_id = None;
+            }
+        }
+    }
     pub fn update_snapshot(&mut self, snapshot: Snapshot) {
+        let old_home = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == self.ship.as_ref())
+            .and_then(BoardTarget::from_ship);
+        let old_identity = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == self.ship.as_ref())
+            .and_then(|s| s.live.as_ref())
+            .and_then(|l| l.identity.clone());
         let task_id = self.selected_task().map(|t| (t.home.clone(), t.id.clone()));
         self.snapshot = snapshot;
         if self
@@ -413,11 +427,25 @@ impl App {
             .as_ref()
             .is_some_and(|id| !self.snapshot.ships.iter().any(|s| &s.id == id))
         {
-            // A refresh is not navigation: keep the outcome that removed the ship.
             let notice = std::mem::take(&mut self.notice);
             self.select_ship(None);
             self.notice = notice;
         }
+        let new_home = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == self.ship.as_ref())
+            .and_then(BoardTarget::from_ship);
+        let new_identity = self
+            .snapshot
+            .ships
+            .iter()
+            .find(|s| Some(&s.id) == self.ship.as_ref())
+            .and_then(|s| s.live.as_ref())
+            .and_then(|l| l.identity.clone());
+        let identity_changed = old_home != new_home || old_identity != new_identity;
+        self.selection_invalidated |= identity_changed;
         if self.tab == 1 {
             self.selected = task_id
                 .and_then(|(home, id)| {
@@ -440,789 +468,571 @@ impl App {
                     || panes[i].agent != old.agent
                     || panes[i].agent_session != old.agent_session
             }) || old_socket != self.herdr.as_ref().map(|v| v.socket_identity);
-            self.selected = index.unwrap_or(0);
+            if self.tab == 2 {
+                self.selected = index.unwrap_or(0);
+            }
             self.selection_invalidated |= changed;
             if changed {
                 self.notice = "Terminal changed; select it again before opening.".into();
             }
         }
     }
+    pub fn begin_answer(&mut self) {
+        if self.mail_pending || self.demo {
+            self.notice = "No live answer available.".into();
+            return;
+        }
+        let Some(need) = self
+            .attention
+            .items()
+            .get(self.selected)
+            .copied()
+            .filter(|n| {
+                self.need_id
+                    .as_ref()
+                    .is_some_and(|binding| binding == &n.binding())
+            })
+        else {
+            self.notice = "Select an attention item again.".into();
+            return;
+        };
+        if !self.attention.actionable(need) {
+            self.notice = "Attention unavailable/stale; refresh before answering.".into();
+            return;
+        }
+        if need.item["kind"] == "blocker" {
+            self.notice = "Recorded evidence only; no generic unblock/cancel action.".into();
+            return;
+        }
+        self.answer = Some(Answer::new(need.clone()));
+    }
+    /// Actual bridge input path, also exercised by disposable-store behavior tests.
+    /// Returns true only for an explicit focus request (the worker validates again).
+    pub fn bridge_key(&mut self, key: KeyCode) -> bool {
+        if self.answer.is_some() {
+            if self.mail_pending {
+                return false;
+            }
+            let answer = self.answer.as_mut().unwrap();
+            let choices = answer.need.item["choices"].as_array().map_or(0, Vec::len);
+            match key {
+                KeyCode::Esc => self.answer = None,
+                KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
+                KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
+                KeyCode::Left | KeyCode::Up => answer.choice = answer.choice.saturating_sub(1),
+                KeyCode::Right | KeyCode::Down => {
+                    answer.choice = (answer.choice + 1).min(choices.saturating_sub(1))
+                }
+                KeyCode::Char('a') if answer.need.item["kind"] == "approval" => answer.deny = false,
+                KeyCode::Char('d') if answer.need.item["kind"] == "approval" => answer.deny = true,
+                KeyCode::Enter => match answer.command() {
+                    Ok(_) => self.answer_action = Some(answer.clone()),
+                    Err(e) => self.notice = e.to_string(),
+                },
+                KeyCode::Backspace if choices == 0 => {
+                    answer.body.pop();
+                }
+                KeyCode::Char(c)
+                    if choices == 0
+                        && answer.need.item["kind"] == "decision"
+                        && answer.body.chars().count() < 2000
+                        && clean(&c.to_string(), 1) == c.to_string() =>
+                {
+                    answer.body.push(c)
+                }
+                _ => {}
+            }
+            return false;
+        }
+        match key {
+            KeyCode::Char('i') => self.open_inbox(),
+            KeyCode::Esc | KeyCode::Home => self.select_ship(None),
+            KeyCode::Tab if !self.inbox_open => {
+                self.needs_focus = !self.needs_focus;
+                self.selected = 0;
+                self.scroll = 0;
+                if self.needs_focus {
+                    self.need_id = self.attention.items().first().map(|n| n.binding());
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
+            KeyCode::Enter if self.inbox_open && !self.mail_pending => {
+                self.history_read = self.selected_history().cloned();
+                if self.history_read.is_none() {
+                    self.notice = "Select a history item again.".into();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('r') if self.needs_focus => self.begin_answer(),
+            KeyCode::Enter if !self.inbox_open => return true,
+            _ => {}
+        }
+        false
+    }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        if self.composer.is_some() {
+        if self.composer.is_some() || self.answer.is_some() {
             return;
         }
         let point = Position::new(event.column, event.row);
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, action)) =
-                    self.mouse.actions.iter().find(|(r, _)| r.contains(point))
-                {
-                    match action {
-                        'i' => self.open_inbox(),
-                        'l' => self.talk_to_liaison(),
-                        'm' => self.compose(),
-                        'b' => self.board_requested = true,
-                        'w' => self.watch_requested = true,
-                        'n' => self.manage(super::forms::Kind::New),
-                        'x' => self.manage(super::forms::Kind::Retire),
-                        'd' => self.manage(super::forms::Kind::Dispatcher),
-                        _ => {}
-                    }
-                } else if self.mouse.ships.contains(point) {
-                    let index =
-                        self.mouse.ship_offset + usize::from((event.row - self.mouse.ships.y) / 2);
-                    if index <= self.snapshot.ships.len() + 1 {
-                        self.select_navigation(index);
-                    }
-                } else if self.mouse.fleet.contains(point) {
-                    let index =
-                        self.mouse.fleet_offset + usize::from(event.row - self.mouse.fleet.y);
-                    if index < self.snapshot.ships.len() {
-                        self.select_navigation(index + 2);
-                    }
-                } else if let Some((_, tab)) =
-                    self.mouse.tabs.iter().find(|(r, _)| r.contains(point))
-                {
-                    self.select_tab(*tab);
-                } else if self.mouse.list.contains(point) {
-                    let index =
-                        self.mouse.list_offset + usize::from((event.row - self.mouse.list.y) / 2);
-                    if index < self.selection_len() {
-                        self.selected = index;
-                        self.focus_content = true;
-                        self.scroll = 0;
-                        self.selection_invalidated = false;
+            MouseEventKind::Down(MouseButton::Left) if self.mouse.fleet.contains(point) => {
+                let index = self.mouse.fleet_offset + usize::from(event.row - self.mouse.fleet.y);
+                if let Some(ship) = self.snapshot.ships.get(index) {
+                    self.select_ship(Some(ship.id.clone()));
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.mouse.list.contains(point) => {
+                let index = self.mouse.list_offset + usize::from(event.row - self.mouse.list.y);
+                if index < self.selection_len() || !self.inbox_open {
+                    self.selected = index;
+                    self.scroll = 0;
+                    if !self.inbox_open {
+                        self.needs_focus = true;
+                        self.need_id = self.attention.items().get(index).map(|n| n.binding());
+                    } else {
+                        self.mail_id = self.mail.get(index).map(Mail::binding);
                     }
                 }
             }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let down = event.kind == MouseEventKind::ScrollDown;
-                if self.mouse.ships.contains(point) {
-                    self.focus_content = false;
-                    self.move_selection(down);
-                } else if self.mouse.list.contains(point) {
-                    self.focus_content = true;
-                    self.move_selection(down);
-                } else if self.mouse.details.contains(point) {
-                    self.scroll = if down {
-                        self.scroll.saturating_add(3)
-                    } else {
-                        self.scroll.saturating_sub(3)
-                    };
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                if self.mouse.details.contains(point) =>
+            {
+                self.scroll = if event.kind == MouseEventKind::ScrollDown {
+                    self.scroll.saturating_add(3)
+                } else {
+                    self.scroll.saturating_sub(3)
                 }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                self.move_selection(event.kind == MouseEventKind::ScrollDown)
             }
             _ => {}
         }
     }
-    fn pending_lines(&self) -> Vec<Line<'static>> {
-        let notices = self
-            .snapshot
-            .pending
-            .iter()
-            .filter(|n| self.ship.as_ref().is_none_or(|id| &n.owner == id))
-            .collect::<Vec<_>>();
-        let mut lines = vec![Line::styled(
-            format!(
-                "{} {}",
-                if self.ascii { "!" } else { "⚓" },
-                count(notices.len(), "pending issue", "pending issues")
-            ),
-            Style::default().fg(Color::Yellow),
-        )];
-        for n in notices {
-            lines.push(Line::from(format!(
-                "{}{} / {} [#{}]{}",
-                if self.ship.is_none() {
-                    format!("{} / ", clean(&n.owner, 160))
-                } else {
-                    String::new()
-                },
-                clean(&n.task_id, 160),
-                clean(&n.issue_key, 160),
-                n.seq,
-                origin(n.home.as_deref())
-            )));
-            lines.push(Line::from(clean(&n.summary, 2048)));
-        }
-        lines
-    }
-    fn details(&self) -> Vec<Line<'static>> {
-        if self.inbox_open {
-            return self.inbox_lines();
-        }
-        let Some(ship) = self
-            .snapshot
+    fn fleet_rows(&self) -> Vec<ListItem<'static>> {
+        self.snapshot
             .ships
             .iter()
-            .find(|s| Some(&s.id) == self.ship.as_ref())
-        else {
-            let mut lines = vec![
-                Line::from(format!(
-                    "{} · {} · {}",
-                    count(self.snapshot.ships.len(), "ship", "ships"),
-                    count(self.snapshot.tasks.len(), "assignment", "assignments"),
-                    count(
-                        self.snapshot.pending.len(),
-                        "pending issue",
-                        "pending issues"
-                    )
-                )),
-                Line::from(if self.snapshot.ships.is_empty() && !self.demo {
-                    "No ships yet · n: create your first ship (a liaison is suggested)"
-                } else if !overview::observed(&self.snapshot) {
-                    "Select a ship to enter its workspace."
-                } else if self.ascii {
-                    "Select a ship to enter its workspace; * aboard · o not aboard · x unavailable"
-                } else {
-                    "Select a ship to enter its workspace; ● aboard · ○ not aboard · ✕ unavailable"
-                }),
-            ];
-            if let Some(liaison) = self.snapshot.ships.iter().find(|s| s.liaison) {
-                let name = clean(&liaison.name, 160);
-                lines.push(Line::styled(
-                    if self.demo {
-                        format!("l: talk to {name} · launch is not connected in this preview")
-                    } else if let Some(start) = direct_start(liaison).filter(|_| !self.herdr_configured) {
-                        format!("Talk to {name} directly: {start}")
-                    } else {
-                        format!("l: talk to {name} · opens its first mate in a Herdr tab; b boards any ship")
-                    },
-                    Style::default().fg(Color::Cyan),
-                ));
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                "Captain's inbox",
-                Style::default().fg(Color::Cyan),
-            ));
-            {
-                for mail in self.mail.iter().take(3) {
-                    lines.push(Line::from(format!(
-                        "{} · {} · {}",
-                        clean(&mail.kind, 40),
-                        clean(&mail.from, 80),
-                        clean(&mail.subject, 160)
-                    )));
-                }
-                lines.push(Line::from(if self.demo {
-                    "Sample messages · i to inspect; no live mailbox connected"
-                } else {
-                    "i: inspect mail · Enter: mark read · r: reply"
-                }));
-                for error in &self.mail_errors {
-                    lines.push(Line::from(format!(
-                        "Mailbox unavailable: {}",
-                        clean(error, 256)
-                    )));
-                }
-            }
-            lines.push(Line::from(""));
-            for ship in &self.snapshot.ships {
-                if let Some(error) = ship.live.as_ref().and_then(|l| l.error.as_ref()) {
-                    lines.push(Line::styled(
-                        format!(
-                            "{} unavailable: {}",
-                            clean(&ship.name, 160),
-                            clean(error, 512)
-                        ),
-                        Style::default().fg(Color::Red),
-                    ));
-                }
-            }
-            lines.extend(self.pending_lines());
-            return lines;
-        };
-        let mut lines = Vec::new();
-        match self.tab {
-            0 => {
-                lines.push(Line::styled(
-                    clean(&ship.name, 160),
-                    Style::default().fg(Color::Yellow),
-                ));
-                lines.push(Line::from(clean(&ship.description, 512)));
-                if let Some(live) = &ship.live {
-                    lines.extend(super::fleet::lines(live));
-                }
-                lines.push(Line::from(if ship.liaison {
-                    "Liaison · your default contact; a peer ship, not a commander."
-                } else {
-                    "Independent peer · first mate and crew work within this ship."
-                }));
-                let owned = self
+            .map(|s| {
+                let home = s.live.as_ref().map(|l| &l.home);
+                let tasks: Vec<_> = self
                     .snapshot
                     .tasks
                     .iter()
-                    .filter(|t| t.owner == ship.id)
-                    .count();
-                let incoming = self
-                    .snapshot
-                    .tasks
+                    .filter(|t| {
+                        (t.owner == s.id || t.handoff_to.as_ref() == Some(&s.id))
+                            && !matches!(t.status.as_str(), "done" | "cancelled")
+                    })
+                    .collect();
+                let work = tasks
                     .iter()
-                    .filter(|t| t.handoff_to.as_ref() == Some(&ship.id))
-                    .count();
-                lines.push(Line::from(format!(
-                    "{} · {}",
-                    count(owned, "owned assignment", "owned assignments"),
-                    count(incoming, "incoming handoff", "incoming handoffs")
-                )));
-                lines.push(Line::from(""));
-                if self.binding_ambiguous() {
-                    lines.push(Line::styled(
-                        "Ambiguous pane ownership; Board/focus disabled. Inspect exact bindings.",
-                        Style::default().fg(Color::Red),
-                    ));
-                }
-                lines.push(Line::from(if self.demo {
-                    "Conversation and agent launch are not connected in this preview.".into()
-                } else if let Some(start) = direct_start(ship).filter(|_| !self.herdr_configured) {
-                    format!("Board needs Herdr. Talk to its first mate directly: {start}")
-                } else if self.scoped_panes().is_empty() {
-                    "b: Board · launch its first mate in a new Herdr tab · w: Watch its wakes live"
-                        .into()
-                } else {
-                    "b or f: open its first mate's terminal · 3: Terminals for its crew".into()
-                }));
-
-                lines.push(Line::styled(
-                    if self.demo {
-                        "m: Try Status / Ask / Message · local demo only"
-                    } else {
-                        "m: Status / Ask / Message · delivered through the ship's mailbox"
-                    },
-                    Style::default().fg(Color::Cyan),
-                ));
-                for exchange in self.exchanges.iter().filter(|e| e.ship == ship.id) {
-                    lines.push(Line::from(format!(
-                        "Captain [{}]: {}",
-                        exchange.mode.label(),
-                        clean(&exchange.body, 1024)
-                    )));
-                    lines.push(Line::from(clean(&exchange.response, 1024)));
-                }
-                lines.push(Line::from(""));
-                lines.extend(self.pending_lines());
-                if !self.compact {
-                    for job in self.snapshot.jobs.iter().filter(|j| j.owner == ship.id) {
-                        lines.push(Line::from(format!(
-                            "Job {} · {}{}",
-                            clean(&job.id, 160),
-                            clean(&job.status, 40),
-                            origin(job.home.as_deref())
-                        )));
-                    }
-                }
-            }
-            1 => {
-                if let Some(task) = self.selected_task() {
-                    lines.push(Line::styled(
-                        clean(&task.title, 512),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                    lines.push(Line::from(format!(
-                        "Task: {} · Owner: {} · {}{}",
-                        clean(&task.id, 160),
-                        clean(&task.owner, 160),
-                        clean(&task.status, 40),
-                        origin(task.home.as_deref())
-                    )));
-                    if let Some(target) = &task.handoff_to {
-                        lines.push(Line::from(format!(
-                            "Offered to {} · awaiting acceptance; {} still owns it",
-                            clean(target, 160),
-                            clean(&task.owner, 160)
-                        )));
-                    }
-                    for job in self
-                        .snapshot
-                        .jobs
-                        .iter()
-                        .filter(|j| j.home == task.home && j.task_id == task.id)
-                    {
-                        lines.push(Line::from(format!(
-                            "Job {} · {}{}",
-                            clean(&job.id, 160),
-                            clean(&job.status, 40),
-                            origin(job.home.as_deref())
-                        )));
-                    }
-                } else {
-                    lines.push(Line::from(
-                        "No assignments or incoming handoffs for this ship.",
-                    ));
-                }
-            }
-            2 => {
-                if let Some(p) = self.selected_pane() {
-                    lines.push(Line::from(format!(
-                        "{} · {}",
-                        clean(p.agent.as_deref().unwrap_or("shell"), 80),
-                        clean(&p.agent_status, 40)
-                    )));
-                    lines.push(Line::from(format!(
-                        "Pane: {} · Terminal: {}",
-                        clean(&p.pane_id, 160),
-                        clean(&p.terminal_id, 160)
-                    )));
-                    lines.push(Line::from(clean(p.title.as_deref().unwrap_or(""), 256)));
-                    lines.push(Line::from(if self.demo {
-                        "Sample terminal only; no live agent is running."
-                    } else {
-                        "Enter/f: open this agent in Herdr. Use Herdr navigation to return."
-                    }));
-                } else {
-                    lines.push(Line::from("No connected terminals bound to this ship."));
-                }
-                lines.push(Line::from(
-                    "Terminal state does not verify assignment completion.",
-                ));
-            }
-            _ => {
-                lines.push(Line::from("Assignment events (newest first):"));
-                for n in self.snapshot.activity.iter().filter(|n| n.owner == ship.id) {
-                    lines.push(Line::styled(
+                    .take(3)
+                    .map(|t| {
                         format!(
-                            "#{} {} · {}{}",
-                            n.seq,
-                            clean(&n.task_id, 160),
-                            clean(&n.kind, 80),
-                            origin(n.home.as_deref())
-                        ),
-                        Style::default().fg(Color::Cyan),
-                    ));
-                    lines.push(Line::from(clean(&n.summary, 2048)));
-                }
-                lines.push(Line::from(""));
-                lines.push(Line::from("Custody history:"));
-                for c in self
-                    .snapshot
-                    .custody
-                    .iter()
-                    .filter(|c| c.actor == ship.id || c.owner == ship.id)
-                {
-                    lines.push(Line::from(format!(
-                        "{} · {} {} · current owner {}{}",
-                        clean(&c.task_id, 160),
-                        clean(&c.actor, 160),
-                        if c.kind == "task.accept" {
-                            "accepted responsibility"
+                            "{} {} [{}; owner {}{}; origin/home {}]",
+                            clean(&t.id, 160),
+                            clean(&t.title, 512),
+                            clean(&t.status, 40),
+                            clean(&t.owner, 160),
+                            t.handoff_to.as_ref().map_or(String::new(), |to| format!(
+                                "; offered to {} (not accepted)",
+                                clean(to, 160)
+                            )),
+                            clean(
+                                &t.home
+                                    .as_ref()
+                                    .map_or("sample".into(), |h| h.display().to_string()),
+                                512
+                            )
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let location = home.map_or("origin/home unobserved".into(), |h| {
+                    format!("origin/home {}", clean(&h.display().to_string(), 512))
+                });
+                let state = s.live.as_ref().and_then(|l| l.error.as_ref()).map_or_else(
+                    || {
+                        if tasks.is_empty() {
+                            "no active work in bounded record".into()
                         } else {
-                            "offered a handoff"
-                        },
-                        clean(&c.owner, 160),
-                        origin(c.home.as_deref())
-                    )));
+                            work
+                        }
+                    },
+                    |e| format!("UNAVAILABLE {}", clean(e, 256)),
+                );
+                ListItem::new(format!("{} · {} · {}", clean(&s.id, 160), location, state))
+            })
+            .collect()
+    }
+    fn need_details(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if !self.notice.is_empty() {
+            lines.push(Line::from(clean(&self.notice, 8192)));
+        }
+        if let Some(answer) = &self.answer {
+            let item = &answer.need.item;
+            lines.push(Line::from(if item["kind"] == "approval" {
+                format!(
+                    "a approve / d deny: {} · Enter commits exact binding · Esc cancel",
+                    if answer.deny { "DENY" } else { "APPROVE" }
+                )
+            } else {
+                "←/→ choice or type text · Enter reply · Esc cancel · PgUp/PgDn scroll".into()
+            }));
+            if let Some(choices) = item["choices"].as_array().filter(|c| !c.is_empty()) {
+                lines.push(Line::from(format!(
+                    "Choices: {}",
+                    choices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!(
+                            "{}{}",
+                            if i == answer.choice { "> " } else { "" },
+                            clean(c.as_str().unwrap_or(""), 200)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                )));
+            } else if item["kind"] == "decision" {
+                lines.push(Line::from(format!("> {}", clean(&answer.body, 2000))));
+            }
+            lines.push(Line::from(format!(
+                "{} · home {} · ship {} · version {}",
+                clean(answer.need.id(), 512),
+                clean(&answer.need.home.display().to_string(), 512),
+                clean(item["ship"].as_str().unwrap_or("?"), 160),
+                clean(item["version"].as_str().unwrap_or("?"), 160)
+            )));
+            if item["kind"] == "approval" {
+                lines.push(Line::from(format!(
+                    "Artifact: {} · Environment: {}",
+                    clean(item["artifact"].as_str().unwrap_or(""), 1024),
+                    clean(item["environment"].as_str().unwrap_or(""), 1024)
+                )));
+            }
+            lines.push(Line::from(clean(
+                item["question"].as_str().unwrap_or(""),
+                2000,
+            )));
+            lines.push(Line::from(
+                "Revalidated before mutation; unknown live/external evidence is not health.",
+            ));
+            return lines;
+        }
+        if let Some(ship) = self
+            .ship
+            .as_ref()
+            .and_then(|id| self.snapshot.ships.iter().find(|ship| &ship.id == id))
+        {
+            lines.push(Line::from(format!(
+                "Selected ship: {} · {}",
+                clean(&ship.name, 160),
+                clean(&ship.id, 160)
+            )));
+            lines.push(Line::from(format!(
+                "{} scope: {}",
+                if self.demo { "Sample" } else { "Recorded" },
+                if ship.description.is_empty() {
+                    "not observed".into()
+                } else {
+                    clean(&ship.description, 512)
                 }
+            )));
+        }
+        if let Some(error) = &self.attention.error {
+            lines.push(Line::from(format!("UNAVAILABLE: {}", clean(error, 512))));
+        }
+        if self.binding_ambiguous() {
+            lines.push(Line::from(
+                "Ambiguous pane ownership; focus disabled. Inspect exact bindings.",
+            ));
+        }
+        if self.attention.sources.is_empty() {
+            lines.push(Line::from(
+                "Runtime needs not observed; external evidence unknown (not an all-clear).",
+            ));
+        }
+        for source in &self.attention.sources {
+            let fresh =
+                source.available && crate::store::Store::now_ms() - source.checked_ms < FRESH_MS;
+            lines.push(Line::from(format!(
+                "{} · origin {} · {}",
+                clean(&source.home.display().to_string(), 512),
+                clean(source.origin.as_deref().unwrap_or("unknown"), 160),
+                if fresh {
+                    "recorded observation"
+                } else {
+                    "UNAVAILABLE / stale; retained history"
+                }
+            )));
+            if let Some(error) = &source.error {
+                lines.push(Line::from(clean(error, 512)));
+            }
+            lines.push(Line::from(format!(
+                "Unknown: {}",
+                source
+                    .unknown
+                    .iter()
+                    .map(|s| clean(s, 80))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if let Some(n) = self
+            .attention
+            .items()
+            .get(self.selected)
+            .filter(|_| self.needs_focus)
+        {
+            lines.push(Line::from(format!(
+                "{} · ship {} · task {} · version {}",
+                clean(n.id(), 512),
+                clean(n.item["ship"].as_str().unwrap_or("?"), 160),
+                clean(n.item["task_id"].as_str().unwrap_or("none"), 160),
+                clean(n.item["version"].as_str().unwrap_or("?"), 160)
+            )));
+            lines.push(Line::from(clean(
+                n.item["question"]
+                    .as_str()
+                    .or(n.item["summary"].as_str())
+                    .unwrap_or(""),
+                2000,
+            )));
+            if n.item["kind"] == "blocker" {
+                lines.push(Line::from(format!("Recorded {} · status {} · incarnation {}. No live process proof; no inline mutation.",n.item["evidence"],n.item["status"],n.item["incarnation"])));
+            }
+            if n.item["kind"] == "approval" {
+                lines.push(Line::from(format!(
+                    "Exact artifact: {} · environment: {}",
+                    clean(n.item["artifact"].as_str().unwrap_or(""), 1024),
+                    clean(n.item["environment"].as_str().unwrap_or(""), 1024)
+                )));
             }
         }
         lines
-    }
-    /// Priority order; the final hint (quit) is always kept.
-    fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
-        let mut hints = if self.inbox_open {
-            vec![
-                ("Enter", "mark read"),
-                ("r", "reply"),
-                ("↑↓", "select"),
-                ("PgUp/PgDn", "scroll"),
-                ("0", "home"),
-            ]
-        } else if self.ship.is_none() {
-            let mut hints = Vec::new();
-            if self.snapshot.ships.iter().any(|s| s.liaison) {
-                hints.push(("l", "talk to liaison"));
-            }
-            hints.extend([("↑↓", "select ship"), ("i", "inbox")]);
-            if !self.demo {
-                hints.push(("n", "new ship"));
-            }
-            hints
-        } else {
-            match self.tab {
-                0 => vec![
-                    ("b", "board"),
-                    ("m", "message"),
-                    ("f", "open terminal"),
-                    ("w", "watch"),
-                    ("1–4", "views"),
-                    ("d", "dispatcher"),
-                    ("x", "retire"),
-                    ("c", "details"),
-                    ("0", "home"),
-                ],
-                1 => vec![
-                    ("↑↓", "select"),
-                    ("1–4", "views"),
-                    ("m", "message"),
-                    ("b", "board"),
-                    ("0", "home"),
-                ],
-                2 => vec![
-                    ("Enter", "open terminal"),
-                    ("↑↓", "select"),
-                    ("1–4", "views"),
-                    ("b", "board"),
-                    ("0", "home"),
-                ],
-                _ => vec![
-                    ("PgUp/PgDn", "scroll"),
-                    ("1–4", "views"),
-                    ("m", "message"),
-                    ("0", "home"),
-                ],
-            }
-        };
-        if self.demo {
-            hints.retain(|(key, _)| !matches!(*key, "n" | "x" | "d"));
-        }
-        hints.push(("q", "quit"));
-        hints
-    }
-    /// Observation health only; outcome notices render in the details pane.
-    fn status_text(&self) -> String {
-        format!(
-            "State {} · Herdr {}",
-            age(self.home_age),
-            age(self.herdr_age)
-        )
     }
     pub fn draw(&mut self, frame: &mut Frame) {
         self.mouse = MouseMap::default();
         let area = frame.area();
-        if area.width < 50 || area.height < 14 {
+        if area.width < 40 || area.height < 14 {
             frame.render_widget(
-                Paragraph::new("PRIVATEER\nResize to at least 50 x 14.\nq: quit"),
+                Paragraph::new("PRIVATEER · bridge\nResize to at least 40 x 14.\nq: quit"),
                 area,
             );
             return;
         }
         let rows = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
         ])
         .split(area);
-        let scope = self
-            .ship
-            .as_ref()
-            .and_then(|id| self.snapshot.ships.iter().find(|s| &s.id == id))
-            .map_or(
-                if self.inbox_open {
-                    "Captain / Inbox"
-                } else {
-                    "Fleet overview"
-                }
-                .into(),
-                |s| format!("{} / {}", clean(&s.name, 160), TABS[self.tab]),
-            );
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        " PRIVATEER ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(if self.demo {
-                        " DEMO / sample data"
-                    } else {
-                        " LIVE / fleet · captain mail"
-                    }),
-                ]),
-                Line::from(format!(" {scope}")),
-            ]),
+            Paragraph::new(if self.demo {
+                " PRIVATEER · bridge · DEMO / sample only"
+            } else {
+                " PRIVATEER · bridge · recorded facts, not live health"
+            })
+            .style(Style::default().fg(Color::Yellow)),
             rows[0],
         );
-        let cols = Layout::horizontal([Constraint::Percentage(27), Constraint::Percentage(73)])
+        let list_style = Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD);
+        if self.inbox_open {
+            let parts = Layout::vertical([
+                Constraint::Length((rows[1].height / 3).max(3)),
+                Constraint::Min(1),
+            ])
             .split(rows[1]);
-        let mut items = vec![
-            ListItem::new(vec![
-                Line::from("Fleet overview"),
-                Line::from(count(self.snapshot.ships.len(), "ship", "ships")),
-            ]),
-            ListItem::new(vec![
-                Line::from("Captain's inbox"),
-                Line::from(overview::inbox(&self.mail, self.mail_errors.len())),
-            ]),
-        ];
-        for s in &self.snapshot.ships {
-            items.push(ListItem::new(vec![
-                Line::from(vec![
-                    overview::presence(s, self.ascii),
-                    Span::raw(" "),
-                    Span::raw(clean(&s.name, 160)),
-                ]),
-                Line::from(format!("  {}", overview::summary(s, &self.snapshot))),
-            ]));
-        }
-        let block = Block::bordered()
-            .title("Navigation")
-            .border_style(border(!self.focus_content));
-        self.mouse.ships = block.inner(cols[0]);
-        self.mouse.ships.height -= self.mouse.ships.height % 2;
-        let mut state = ListState::default().with_selected(Some(self.ship_index()));
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(block)
-                .highlight_symbol("> ")
-                .highlight_style(selected_row()),
-            cols[0],
-            &mut state,
-        );
-        self.mouse.ship_offset = state.offset();
-        let mut body = cols[1];
-        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
-        let mut actions = vec![("[i Inbox]", 'i')];
-        if self.snapshot.ships.iter().any(|s| s.liaison) {
-            actions.push(("[l Talk to liaison]", 'l'));
-        }
-        if !self.demo {
-            actions.push(("[n New ship]", 'n'));
-        }
-        if self.ship.is_some() {
-            actions.push(("[b Board]", 'b'));
-            actions.push((
-                if self.demo {
-                    "[m Message ship]"
-                } else {
-                    "[m Message]"
-                },
-                'm',
-            ));
-            if !self.demo {
-                actions.push(("[x Retire]", 'x'));
-                actions.push(("[d Dispatcher]", 'd'));
-            }
-        }
-        let mut x = sections[0].x;
-        let mut spans = Vec::new();
-        for (label, action) in actions {
-            let width = (label.len() as u16).min(sections[0].right().saturating_sub(x));
-            if width == 0 {
-                break;
-            }
-            self.mouse
-                .actions
-                .push((Rect::new(x, sections[0].y, width, 1), action));
-            spans.push(Span::styled(label, Style::default().fg(Color::Cyan)));
-            spans.push(Span::raw(" "));
-            x = x.saturating_add(width + 1);
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), sections[0]);
-        body = sections[1];
-        if self.ship.is_some() {
-            let sections =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
-            let row = sections[0];
-            let mut x = row.x;
-            for (i, label) in TABS.iter().enumerate() {
-                let width =
-                    (Line::from(*label).width() as u16 + 2).min(row.right().saturating_sub(x));
-                if width == 0 {
-                    break;
-                }
-                self.mouse.tabs.push((Rect::new(x, row.y, width, 1), i));
-                x = x.saturating_add(width + 1);
-            }
-            frame.render_widget(
-                Tabs::new(TABS)
-                    .padding(" ", " ")
-                    .divider("│")
-                    .select(self.tab)
-                    .highlight_style(
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                    ),
-                row,
-            );
-            body = sections[1];
-        }
-        let title = if self.inbox_open {
-            "Captain's inbox · message details"
-        } else if self.ship.is_none() {
-            "Fleet overview"
-        } else {
-            match self.tab {
-                0 => "Bridge",
-                1 => "Assignment details",
-                2 => "Terminal details",
-                _ => "Ship logbook",
-            }
-        };
-        let has_list = self.inbox_open || (self.ship.is_some() && matches!(self.tab, 1 | 2));
-        if !self.inbox_open && self.ship.is_none() && !self.snapshot.ships.is_empty() {
-            let rows = self.snapshot.ships.len() as u16;
-            let parts = Layout::vertical([
-                Constraint::Length((rows + 3).min((body.height / 2).max(5))),
-                Constraint::Min(1),
-            ])
-            .split(body);
-            let block = Block::bordered().title("Ships").border_style(border(false));
-            let inner = block.inner(parts[0]);
-            let (header, rows, widths) = overview::table(&self.snapshot, inner.width, self.ascii);
-            let mut state = TableState::default();
-            frame.render_stateful_widget(
-                Table::new(rows, widths).header(header).block(block),
-                parts[0],
-                &mut state,
-            );
-            self.mouse.fleet = Rect::new(
-                inner.x,
-                inner.y.saturating_add(1),
-                inner.width,
-                inner.height.saturating_sub(1),
-            );
-            self.mouse.fleet_offset = state.offset();
-            body = parts[1];
-        }
-        if has_list {
-            let parts = Layout::vertical([
-                Constraint::Length((body.height / 2).max(4)),
-                Constraint::Min(1),
-            ])
-            .split(body);
-            let entries = if self.inbox_open {
-                {
-                    self.mail
-                        .iter()
-                        .map(|m| {
-                            ListItem::new(vec![
-                                Line::from(format!(
-                                    "{} · {}",
-                                    clean(&m.kind, 40),
-                                    clean(&m.subject, 160)
-                                )),
-                                Line::from(format!(
-                                    "{} · {}",
-                                    clean(&m.from, 80),
-                                    clean(&m.status, 80)
-                                )),
-                            ])
-                        })
-                        .collect::<Vec<_>>()
-                }
-            } else if self.tab == 1 {
-                self.assignment_indices()
-                    .iter()
-                    .map(|&i| {
-                        let t = &self.snapshot.tasks[i];
-                        let role = if Some(&t.owner) == self.ship.as_ref() {
-                            "Owned"
-                        } else {
-                            "Incoming"
-                        };
-                        ListItem::new(vec![
-                            Line::from(clean(&t.title, 160)),
-                            Line::from(format!(
-                                "{role} · {}{}",
-                                clean(&t.status, 40),
-                                origin(t.home.as_deref())
-                            )),
-                        ])
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                self.scoped_panes()
-                    .iter()
-                    .map(|p| {
-                        ListItem::new(vec![
-                            Line::from(clean(p.title.as_deref().unwrap_or(&p.pane_id), 160)),
-                            Line::from(format!(
-                                "{} · {}",
-                                clean(p.agent.as_deref().unwrap_or("shell"), 80),
-                                clean(&p.agent_status, 40)
-                            )),
-                        ])
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let block = Block::bordered()
-                .title(if self.inbox_open {
-                    "For the captain · decisions / replies / notices"
-                } else if self.tab == 1 {
-                    "This ship's assignments / incoming handoffs"
-                } else {
-                    "This ship's terminals"
-                })
-                .border_style(border(self.focus_content));
+            let block = Block::bordered().title("Mail history · separate from Needs you");
             self.mouse.list = block.inner(parts[0]);
-            self.mouse.list.height -= self.mouse.list.height % 2;
-            let mut state =
-                ListState::default().with_selected((!entries.is_empty()).then_some(self.selected));
+            let items: Vec<_> = self
+                .mail
+                .iter()
+                .map(|m| {
+                    ListItem::new(format!(
+                        "{} · {} · {} · {}",
+                        clean(&m.from, 160),
+                        clean(&m.status, 80),
+                        clean(
+                            &m.home
+                                .as_ref()
+                                .map_or("sample".into(), |h| h.display().to_string()),
+                            512
+                        ),
+                        clean(&m.subject, 160)
+                    ))
+                })
+                .collect();
+            let mut state = ListState::default()
+                .with_selected((self.selected < items.len()).then_some(self.selected));
             frame.render_stateful_widget(
-                List::new(entries)
-                    .block(block)
-                    .highlight_symbol("> ")
-                    .highlight_style(selected_row()),
+                List::new(items).block(block).highlight_style(list_style),
                 parts[0],
                 &mut state,
             );
             self.mouse.list_offset = state.offset();
-            body = parts[1];
-        }
-        let mut lines = self.details();
-        if !self.notice.is_empty() {
-            lines.insert(
-                0,
-                Line::styled(
-                    clean(&self.notice, 8192),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+            self.mouse.details = parts[1];
+            let mut lines = self.inbox_lines();
+            if !self.notice.is_empty() {
+                lines.insert(0, Line::from(clean(&self.notice, 8192)));
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll, 0)),
+                parts[1],
             );
-            lines.insert(1, Line::from(""));
-        }
-        if self.snapshot.truncated {
-            lines.push(Line::styled(
-                "Bounded snapshot; older records remain in the runtime.",
-                Style::default().fg(Color::Yellow),
+        } else {
+            let parts = Layout::vertical([
+                Constraint::Length(
+                    (self.snapshot.ships.len() as u16 + 2).min((rows[1].height / 3).max(3)),
+                ),
+                Constraint::Length(4),
+                Constraint::Min(3),
+                Constraint::Length((rows[1].height / 5).max(2)),
+            ])
+            .split(rows[1]);
+            let block =
+                Block::bordered().title("Fleet · recorded work · Enter: focus existing mate space");
+            self.mouse.fleet = block.inner(parts[0]);
+            let mut state =
+                ListState::default().with_selected(self.ship.as_ref().map(|_| self.ship_index()));
+            frame.render_stateful_widget(
+                List::new(self.fleet_rows())
+                    .block(block)
+                    .highlight_style(list_style),
+                parts[0],
+                &mut state,
+            );
+            self.mouse.fleet_offset = state.offset();
+            let needs = self.attention.items();
+            let items: Vec<_> = needs
+                .iter()
+                .map(|n| {
+                    ListItem::new(format!(
+                        "{}{} · {} · {}",
+                        if n.stale { "STALE " } else { "" },
+                        clean(n.item["kind"].as_str().unwrap_or("unknown"), 40),
+                        clean(n.item["ship"].as_str().unwrap_or("?"), 160),
+                        clean(
+                            n.item["question"]
+                                .as_str()
+                                .or(n.item["summary"].as_str())
+                                .unwrap_or(""),
+                            2000
+                        )
+                    ))
+                })
+                .collect();
+            let block = Block::bordered().title(format!(
+                "Needs you ({}) · Tab: select · Enter: answer",
+                needs.len()
             ));
+            self.mouse.list = block.inner(parts[1]);
+            let mut state = ListState::default().with_selected(
+                (self.needs_focus && self.selected < items.len()).then_some(self.selected),
+            );
+            frame.render_stateful_widget(
+                List::new(items).block(block).highlight_style(list_style),
+                parts[1],
+                &mut state,
+            );
+            self.mouse.list_offset = state.offset();
+            self.mouse.details = parts[2];
+            frame.render_widget(
+                Paragraph::new(self.need_details())
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll, 0)),
+                parts[2],
+            );
+            let now = crate::store::Store::now_ms();
+            let recent: Vec<_> = self
+                .snapshot
+                .recent
+                .iter()
+                .filter(|r| now >= r.completed_ms && now - r.completed_ms < RECENT_MS)
+                .map(|r| {
+                    Line::styled(
+                        format!(
+                            "{} · {} · {} · {} · recorded task completion {}ms",
+                            clean(&r.owner, 160),
+                            clean(&r.task_id, 160),
+                            clean(&r.title, 512),
+                            clean(&r.home.display().to_string(), 512),
+                            r.completed_ms
+                        ),
+                        Style::default().fg(if now - r.completed_ms > RECENT_MS / 2 {
+                            Color::DarkGray
+                        } else {
+                            Color::Gray
+                        }),
+                    )
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(if recent.is_empty() {
+                    vec![Line::from(
+                        "No timestamped completions in the last three hours (bounded evidence).",
+                    )]
+                } else {
+                    recent
+                })
+                .block(
+                    Block::bordered()
+                        .title("Recently done · evidenced finished tasks, not inferred merges"),
+                )
+                .wrap(Wrap { trim: false }),
+                parts[3],
+            );
         }
-        let block = Block::bordered()
-            .title(title)
-            .border_style(border(self.focus_content && !has_list));
-        self.mouse.details = block.inner(body);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0))
-                .block(block),
-            body,
-        );
-        let error = self
-            .snapshot
-            .presentation_error
-            .as_ref()
-            .map(|e| format!("PRESENTATION UNAVAILABLE: {}", clean(e, 180)))
-            .or_else(|| {
-                self.home_error
-                    .as_ref()
-                    .map(|e| format!("STATE UNAVAILABLE: {}", clean(e, 180)))
-            })
-            .or_else(|| {
-                self.herdr_error
-                    .as_ref()
-                    .map(|e| format!("HERDR UNAVAILABLE: {}", clean(e, 180)))
-            })
-            .or_else(|| {
-                self.mail_errors
-                    .first()
-                    .map(|e| format!("MAILBOX UNAVAILABLE: {}", clean(e, 180)))
-            });
-        let failed = self.snapshot.presentation_error.is_some()
-            || self.home_error.is_some()
-            || self.herdr_error.is_some()
-            || !self.mail_errors.is_empty();
-        let status = error.unwrap_or_else(|| self.status_text());
+        let errors: Vec<_> = [
+            (
+                "PRESENTATION UNAVAILABLE",
+                self.snapshot.presentation_error.as_ref(),
+            ),
+            ("STATE UNAVAILABLE", self.home_error.as_ref()),
+            ("HERDR UNAVAILABLE", self.herdr_error.as_ref()),
+            ("MAILBOX UNAVAILABLE", self.mail_errors.first()),
+        ]
+        .into_iter()
+        .filter_map(|(label, e)| e.map(|e| format!("{label}: {}", clean(e, 256))))
+        .collect();
         frame.render_widget(
             Paragraph::new(vec![
-                hint_line(&self.footer_hints(), usize::from(rows[2].width)),
+                Line::from(if self.inbox_open {
+                    "i history · Enter mark read · PgUp/PgDn scroll · Esc bridge · q quit"
+                } else {
+                    "↑↓ select · Tab Fleet/Needs · Enter focus/answer · i history · q quit"
+                }),
                 Line::styled(
-                    status,
-                    Style::default().fg(if failed { Color::Red } else { Color::Gray }),
+                    if self.mail_pending {
+                        "Command pending; no resolution inferred."
+                    } else {
+                        "Observation only; unknown is never an all-clear."
+                    },
+                    Style::default().fg(Color::Cyan),
                 ),
+                Line::from(format!(
+                    "{} · State {} · Herdr {}{}{}",
+                    errors.join(" · "),
+                    age(self.home_age),
+                    age(self.herdr_age),
+                    if self.snapshot.truncated {
+                        " · recorded history clipped"
+                    } else {
+                        ""
+                    },
+                    if !self.snapshot.scope_complete() {
+                        " · fleet discovery incomplete/unknown"
+                    } else {
+                        ""
+                    }
+                )),
             ]),
             rows[2],
         );
@@ -1232,63 +1042,4 @@ impl App {
 }
 fn age(value: Option<u64>) -> String {
     value.map_or("not connected".into(), |s| format!("{s}s ago"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    #[test]
-    fn footer_hints_drop_trailing_hints_but_keep_quit() {
-        let app = App {
-            ship: Some("apps".into()),
-            tab: 0,
-            ..App::default()
-        };
-        let line = hint_line(&app.footer_hints(), 50);
-        let shown = text(&line);
-        assert!(line.width() <= 50, "{shown:?}");
-        assert!(shown.ends_with("q quit"), "{shown:?}");
-        assert!(shown.contains("b board") && shown.contains("m message"));
-        assert!(!shown.contains("0 home"), "{shown:?}");
-        assert!(!shown.contains("1–4 views"), "{shown:?}");
-        assert!(shown.contains("f open terminal"), "{shown:?}");
-        let wide = text(&hint_line(&app.footer_hints(), 200));
-        assert!(
-            wide.contains("0 home") && wide.ends_with("q quit"),
-            "{wide:?}"
-        );
-    }
-
-    #[test]
-    fn demo_footer_omits_disabled_management_keys() {
-        let app = App {
-            ship: Some("apps".into()),
-            tab: 0,
-            demo: true,
-            ..App::default()
-        };
-        let keys: Vec<_> = app.footer_hints().iter().map(|(k, _)| *k).collect();
-        assert!(
-            !keys.iter().any(|k| matches!(*k, "n" | "x" | "d")),
-            "{keys:?}"
-        );
-        assert_eq!(keys.last(), Some(&"q"));
-    }
-
-    #[test]
-    fn status_line_reports_health_without_a_trailing_separator() {
-        let app = App {
-            notice: "Recording read…".into(),
-            ..App::default()
-        };
-        assert_eq!(
-            app.status_text(),
-            "State not connected · Herdr not connected"
-        );
-    }
 }

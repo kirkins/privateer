@@ -1,23 +1,10 @@
 # Privateer's terminal bridge
 
-The dashboard is a Rust TUI that runs inside Herdr or an ordinary terminal.
-Its home lists active ships from the per-user fleet registry (`fleet.list`),
-reading each existing home read-only. Missing homes stay visible as unavailable
-and are never recreated. Its table shows each ship's attended presence, open
-requests, unread ship mail, pending issues, assignments (`+n` incoming),
-dispatcher status and latest wake, dropping the last columns on narrow
-terminals; each Bridge adds scope, harness and the three latest wakes. Fleet
-overview is the home destination; the sidebar always shows ships, marked
-● aboard, ○ not aboard or ✕ unavailable with a few words on what needs
-attention, and lists the liaison first. Each ship has Bridge, Assignments, Terminals
-and Logbook views. Remote peers are not discovered.
-
-The dashboard supports observation, navigation, captain mail, attended boarding
-and ship management. A model-driven conversational navigator and scheduler remain
-future work. Installing it does not replace an existing fleet. The current
-headless harness/job interfaces continue to work independently.
-
-## Build and preview
+The optional Rust TUI is one column: **Fleet**, **Needs you**, **Recently done**.
+Herdr owns terminals and navigation. There is no sidebar, per-ship view, Board,
+Watch, ship-management control, automatic focus, pane creation or pane reorder.
+Existing safe Herdr and management library helpers remain available to other
+consumers; they are not bridge controls. Nothing here installs or deploys.
 
 ```sh
 cargo build --locked --features dashboard --bins
@@ -25,376 +12,202 @@ cargo build --locked --features dashboard --bins
 ./target/debug/privateer-dashboard --demo --once
 ```
 
-Install both binaries with `cargo install --locked --path . --features dashboard`.
-Live mail, management and Board launches use `privateer` beside the dashboard
-binary, falling back to `privateer` on `PATH`.
+The dashboard dependencies remain optional. Ordinary builds of `privateer`
+need no TUI. Demo mode opens no runtime home, registry or socket, even with
+inherited Herdr variables; its mail and work are explicitly samples.
 
-The dashboard dependencies are optional. Ordinary `cargo build --bin privateer`
-does not enable them. Ratatui 0.29/Crossterm 0.28 preserve the project's Rust 1.85
-floor; this does not require adopting a newer compiler for the runtime.
+## Fleet and focus
 
-Demo mode uses clearly labeled sample data, never opens an inherited Herdr
-socket and does not create a runtime home, jobs, events or model calls.
+Fleet discovery uses the existing per-user registry (`PRIVATEER_FLEET` can select
+an isolated registry). An absent registry is not initialized. `--home` or
+`PRIVATEER_HOME` supplies a legacy fallback when the registry is empty. Each
+row identifies a ship, its home, and current recorded tasks/titles/status,
+including delegated work's originating home and owner. Offered handoffs do not
+transfer custody. Rows describe bounded recorded facts, never live process health.
+Unregistered observed owners remain distinguishable from registered homes.
+Missing or conflicting presentation stays visible and disables focus.
 
-Fleet home includes the live captain inbox aggregated across fleet homes through
-`mail.inbox` and `mail.requests`, with decisions first, then requests, replies
-and notices. `i` opens it; Enter marks the selected message read and `r` replies
-to a request or decision in its originating home. Acknowledgment advances only
-through messages explicitly marked read, so a decision read out of sequence
-cannot clear earlier unseen notices. Read markers waiting on an earlier message
-are session-local and survive refreshes beyond the current inbox page until
-acknowledged. Refreshing a newly reachable page acknowledges only its contiguous
-prefix of explicitly marked messages. Acknowledged open requests remain visible
-until answered.
-Each refresh reads at most 200 unread messages and 200 open requests per home,
-with at most 1,000 displayed items overall. Admission prefers unread items,
-then decisions, requests, replies and notices within each read state. Mark items
-read to reach later mail; list previews are bounded to 100 characters, while
-details retain the supported body and JSON payload. Scroll with Page Up/Down or
-the wheel to read long mail;
-payload-only messages include a JSON preview and readable payload details.
-Refresh preserves scroll only while the same message in the same home remains
-selected; selecting another message starts its details at the top.
-No unseen row is acknowledged. Failed homes show an error and retain their last
-mail observation. The UI uses bounded worker queues; commands have 15-second
-deadlines and bounded output sized for a full mail page. Failed sends retain
-their draft and id for an idempotent retry; a deadline means the action's outcome
-needs checking.
+Up/Down or j/k selects a ship. Enter requests focus of its **existing** validated
+mate space. It cannot launch or create anything. Only an explicit
+`--herdr-socket /absolute/socket` or Herdr's injected socket when `HERDR_ENV=1`
+is used; `--no-herdr` disables it. It never guesses a global socket or provider.
+The primary binding is the current unexpired presence binding, otherwise the
+first exact manual pane/terminal binding. Similar labels never establish ownership.
+The existing socket/pane/terminal/workspace/tab/agent/native-session checks
+still run immediately before `agent.focus`. Fresh fleet binding and home identity
+are also checked in the worker. Stale/reused/replaced/ambiguous selections refuse;
+refresh and explicitly reselect. Truncated fleet scope also refuses focus, answers
+and history read intent. Refresh never focuses anything. Herdr snapshot
+and focus are separate server operations, **not** an atomic occupant lock.
 
-Select any ship and press `m`: Status summarizes recorded state without a model
-call; Ask sends a request and Message a notice from `captain`. Replies use the
-original message id as correlation. All mail changes go through Privateer's
-commands, never direct SQL writes. Mailbox commands use the runtime's normal
-Store open/migration behavior; fleet/task observations remain read-only.
+Optional `<home>/dashboard.yaml`, `.yml` or `.json` presentation retains the
+existing strict input/duplicate/alias limits and cross-home conflict checks.
+Keep only one file. [Example](../examples/dashboard.yaml). No presentation entry
+creates a home, custody, remote access or authority. Local registered homes are
+supported; remote observation/action adapters remain explicitly unknown.
 
-Demo mode keeps sample mail and its Status/Ask/Message composer entirely in
-memory. No live mailbox commands, acknowledgments or sends run in demo mode.
+## Needs you
 
-## Existing state and Herdr
+Attention consumes ONLY the reviewed [runtime.needs v1 contract](runtime-needs.md).
+Unread mail, prose, task titles and generic blocked tasks do not classify needs.
+Every source's origin, unknown categories, unavailability and retained history
+remain explicit. Empty items are not an all-clear. Copied origins are ambiguous,
+not independent ships. Last recorded capacity waits/orphans are evidence, not
+proof of a live/stopped process; there is no generic cancel/ok/unblock button.
 
-In a Herdr pane, run:
+Tab switches Fleet/Needs selection. Enter opens an inline answer. The actual
+question is shown with its source ship, local task and version. Left/Right picks
+from supplied choices; without choices, type free text. Enter submits; Escape
+cancels. A reply is `mail.send` from captain to the original sender with the
+original request ID as correlation and a stable client-generated outcome ID.
+Acknowledgment never resolves a request. Withdrawal, authoritative reply and
+terminal-task closure clear items only through fresh runtime observations.
 
-```sh
-/path/to/privateer-dashboard --home /absolute/privateer/home
-```
+Typed production approvals show the **exact artifact, environment and charter
+version**. `a` selects approve, `d` deny, Enter records the selected outcome via
+existing `approval.grant` / `approval.deny`, with request_id + expected_version
+and a stable explicit grant ID. Plain replies or prose never create a grant.
+This is not deployment: artifact/environment consumption and production
+authorization remain the runtime's existing gates.
 
-No home argument is needed for fleet discovery. `PRIVATEER_FLEET` selects a
-private registry; otherwise the runtime's usual per-user path is used. A missing
-registry means an empty fleet and creates no state. `--home` / `PRIVATEER_HOME`
-provide a legacy single-home fallback when the fleet is empty. When `HERDR_ENV=1`, the dashboard can use the
-injected `HERDR_SOCKET_PATH`. It never guesses a global socket, discovers a
-focused session or starts a Herdr server. An explicit `--herdr-socket
-/absolute/path` selects a socket; `--no-herdr` disables the integration. Herdr
-is optional: without it, tasks, jobs and events remain visible.
+An explicit answer uses a narrow crate-private existing-home action open,
+approved for this local bridge: READ_WRITE without CREATE, mkdir, chmod,
+migration, repair or journal-mode rewrite; incompatible schemas refuse. It uses
+the already-resolved operator caller, foreign keys and FULL synchronous writes.
+Selection pins normalized home, directory/database device+inode and durable
+origin. The worker validates current configured scope, duplicate origins,
+identity around open and immediately before dispatch, and requeries semantic
+item/version/binding on that **same connection**. It invokes only reply/grant/deny;
+existing core/mail transactions retain atomic open-request/recipient/charter/
+consumption checks. There is no new outer transaction or authorization bypass.
+This guards ordinary workflow replacement races, not a hostile-same-user
+filesystem sandbox or an impossible atomic path/SQLite guarantee. Nonlocal
+homes without equivalent reviewed guards cannot mutate through this surface.
 
-The adapter uses the versioned `session.snapshot` and `agent.focus` socket
-contracts. Protocol 20 or newer is required for this initial implementation;
-older/malformed responses produce a visible connection error. This minimum is
-based on the installed 0.8.2 protocol schema inspected during development, not
-a claim that all future protocol revisions are qualified.
+Errors retain the draft and stable ID, not an automatic retry with a new ID.
+Only a proved identical committed outcome reaches the runtime's idempotent retry
+path after closure. Refresh removes only genuinely closed items. Stale selection
+never silently moves an action onto the row that replaced it. Selection pins
+physical directory/database identity, durable origin and source ID, not just home
+and ID. A same-origin copy with identical IDs requires explicit reselection after
+a complete fresh scan. Ordinary observed-time changes do not invalidate a draft;
+an already-open draft keeps its immutable original binding and refuses replacement.
 
-Select a ship and its **Terminals** view, choose a bound agent and press Enter or `f` to focus
-its native Herdr terminal. Return through Herdr's own tab/workspace navigation.
-The dashboard does not embed a second terminal emulator. The operation checks
-the selected socket incarnation and re-reads the pane's terminal, workspace,
-tab, agent and native session identity before focusing. Focus is navigation
-only; it does not authorize input, confirm delivery or verify a task outcome.
-The check and focus are separate server operations, so they are not an atomic
-occupant lock. Input to existing agents remains disabled; the separate
-[Board action](#boarding-and-management) sends launch text only to a new shell pane.
+Attention queries one local home/page per worker pass (250 ms cadence), at most
+100 items/page, four pages/scan, 200 retained sources and 400 retained items.
+Partial scans do not replace a completed observation. Bounds/unavailable sources
+retain old items as stale with explicit errors. Empty continuation pages count.
+Each scan pins physical identity and origin independently of items, including an
+empty first continuation page. Every page rechecks identity after the query;
+replacement discards the pending scan/cursor and restarts at the beginning, never
+combining generations or publishing partial all-clear results.
+Per-home successful scans wait two seconds; failures back off up to sixteen
+seconds rather than retrying each input tick. Action rechecks have the same
+four-page bound; observations older than ten
+seconds cannot act. Large fleets may therefore require later fresh observation;
+unsupported or over-budget data is never healthy/quiet. The query's cooperative
+250 ms budget cannot preempt OS/filesystem I/O. No remote inference or live
+CI/provider/dispatcher/wake-health adapter is introduced.
 
-Herdr pane observations are deliberately separate from Privateer task records.
-There is no inferred binding based on similar labels or matching owners. A
-Herdr `done` state does not mark a task done or prove a passing PR. Stored job
-statuses may be stale because this UI deliberately does not reconcile processes.
+## Recently done
 
-## First run and everyday entry
+This shows **finished tasks**, not inferred merges. Completion requires a done
+task and its last `task.update` audit timestamp. Missing/pruned audit time does
+not become newly recent. Rows retain home and current recorded owner, dim after
+90 minutes and expire after three hours (including while the UI stays open).
+Arbitrary event prose, titles and exit status cannot establish a merge. Reads and
+retention are bounded to 200 rows, with source truncation visible.
 
-Bare `privateer` opens an executable `privateer-dashboard` installed beside it
-or on PATH, in ordinary terminals as well as Herdr. With a current ship, its
-dispatcher is ensured first. `privateer start` always opens the harness directly.
-Only a missing dashboard retains the legacy harness/initialization flow.
-Bare entry opens the bridge only and never boards a first mate: a boarded ship
-is attended, and its mail waits for that session instead of headless wakes.
-Press `l` to talk to the liaison. Passed explicitly, `--board-liaison` does that
-on entry: with a configured Herdr connection and one
-selected liaison, it opens the liaison's first mate in a new tab
-or focuses its verified live pane. The dashboard remains available in its
-original tab through Herdr navigation. Startup waits for fresh observations and
-pins the selected ship's canonical home; it never chooses between conflicting
-contacts. A pending startup attempt is cancelled if fresh fleet observations
-remove, change or make that contact ambiguous, even during a Herdr outage.
-A queued attempt runs once; after a launch failure, use `l` to retry.
-An unavailable configured Herdr connection leaves the attempt pending.
-Input waits up to 2 seconds for the first Herdr observation, so a keystroke or
-scroll during startup cannot cancel the handoff before its first attempt.
-Navigation to the fleet, inbox or another ship cancels a delayed startup handoff.
-Changing views or scrolling within the liaison's workspace preserves navigation
-and leaves the attempt pending.
-Running `privateer-dashboard` directly keeps the observational entry behavior;
-`--once` stays read-only even with `--board-liaison`.
-Standalone observation, inbox and onboarding need no Herdr socket; Board still
-requires an explicitly selected or inherited socket and validated bindings.
-Privateer does not launch Herdr from an ordinary terminal. If a liaison is
-selected but no socket is configured, bare entry displays a shell-quoted
-`privateer --home HOME start` command to talk directly.
+`Snapshot.truncated` means recorded display/history rows were clipped, not that
+runtime homes went undiscovered. This remains visible as “recorded history
+clipped”; it does not suppress authoritative typed needs, answers, explicit history
+reads or validated existing-pane focus. The separate `discovery` state is complete
+only after successful bounded fleet/home mapping (or a successfully read explicit
+local fallback). Default/older serialized snapshots are unknown, never implicitly
+complete. More than 200 discovered identities, unavailable homes or invalid mapping
+remain incomplete; unknown/incomplete scope refuses actions even with retained
+facts. An empty registered fleet cannot resurrect a retired fallback home. Failed
+refreshes retain evidence, not permission to act or an all-clear.
 
-With an empty fleet, the interactive dashboard welcomes the captain and suggests
-`liaison` at `~/ships/liaison`. Name and folder are editable; the suggested folder
-tracks the name until changed explicitly. Choose among supported installed
-harnesses (←/→ cycles Harness), and choose `liaison` or an ordinary `ship` role.
-Tab moves fields, Delete/Ctrl-U clears a field, Enter creates, and Escape skips
-without creating a home or fleet registry. `n` reopens setup in an empty fleet.
-A missing harness keeps setup open with guidance, without initializing anything.
+## Mail history and controls
 
-Creation uses `privateer init --ship NAME --harness ID [--liaison]` in the chosen
-folder, then `privateer service start`. With a configured Herdr connection,
-Board waits for the created ship's name and canonical home to appear in the
-registry, with fresh, valid home and Herdr observations. Temporary observation
-failures retain the request until the action queue accepts it. If the name now
-maps to a different home, automatic Board is cancelled.
-The chosen dedicated folder must be empty. If initialization succeeds before
-service startup fails, the ship remains available through existing ship and dispatcher management; onboarding
-does not reinitialize it or change its role.
-Without a configured Herdr socket, creation succeeds and displays a shell-quoted
-`privateer --home HOME start` command to talk to its first mate directly.
+`i` opens separate captain history through existing `mail.inbox` / `mail.requests`
+commands. Enter marks read using the existing contiguous read-prefix guard;
+opening/refreshing alone cannot acknowledge unseen mail or resolve a request.
+Needs-you answers are separate. Origin/home, full supported body and payload,
+scroll preservation, bounded queues and failure retention are retained. Bridge
+history queries use an existing READ_ONLY Store and existing mail query dispatch,
+never CLI initialization/migration. Explicit Enter uses the same origin and
+filesystem-identity-pinned existing-home action open, allowlisting mail.ack only.
+Read/unread markers are generation-bound to that identity and origin, invalidated
+on replacement, retirement, ambiguity or failed observation. History selection
+also pins physical generation, origin and message ID: disappearance or replacement
+clears selection rather than selecting an adjacent row. Enter cannot mark another
+row until explicit navigation/reselection. Incomplete/unknown/unavailable fleet scope refuses
+history write intent; retained rows may remain visible read-only. Before acknowledgement
+the pinned connection rechecks the selected message and actual unread mailbox
+prefix against the observed page. Requests merged from later pages cannot skip
+unseen earlier mail. Operator privacy is checked before loading captain bodies,
+not merely at the standalone binary boundary. No refresh acknowledges mail.
+Legacy library command-backed helpers remain for other consumers; the bridge
+never calls them. History is loaded only on explicit entry (or compatibility
+JSON `--once` output), not used as attention.
 
-See [Getting aboard](architecture.md#getting-aboard) for the liaison preset,
-generated onboarding checklist and initialization refresh policy, and
-[The fleet](architecture.md#the-fleet) for agent-created ship authority.
-
-The same runtime guide covers bare `privateer` and direct `privateer start`
-entry. Installation is covered under [Build and preview](#build-and-preview).
-
-## Boarding and management
-
-Press `l` or click **Liaison** to open or focus its native conversation
-in one action. This uses the same verified Board path as any ship; `m` remains
-the dashboard's separate mailbox composer. Herdr discovers the harness after
-it starts in the created pane; fleet registration alone does not create a live
-Herdr agent.
-
-Select a ship and press `b` (or click Board). A live exact binding focuses its
-Herdr terminal. Otherwise Board creates a tab in the ship folder and launches
-`privateer start` using the installed protocol 20 `tab.create` and
-`pane.send_input` contracts. The installed 0.8.2 CLI was also checked against
-a private protocol recorder: `pane run` emits `pane.send_input` with text and
-`keys: ["Enter"]`. Shell tokens are quoted; captain text is never
-shell input. Only the pane returned by creation is eligible for this launch,
-after a fresh identity/protocol check. A pending launch blocks retries for up to
-15 seconds, and confirmed live presence clears that pending guard. A completed
-or failed session can be boarded again even when its old tab remains. Every new
-launch checks fresh presence; a live lease blocks a competing attended session.
-The runtime's [transactional lease claim](architecture.md#attended-mode) also
-protects against simultaneous launches from separate dashboards.
-An unbound attended session must be reached directly or its binding refreshed;
-the dashboard does not open a second first mate.
-
-`privateer start` and attended hooks record an optional `binding` in the presence
-lease, captured from the explicit inherited socket path and caller pane. It pins
-the socket's device/inode incarnation, pane, terminal, workspace and tab ids,
-plus a native session identity when available. Only a refresh by the same holder
-while its lease is still live preserves the binding and start time. Reclaiming
-an expired lease captures a new binding and start time even
-when the holder string is reused; a replacement holder also captures its own
-context. Missing/invalid Herdr context leaves attendance usable without a binding.
-The dashboard ignores bindings after lease expiry or release. No label matching
-or guessed socket is used. Dashboard observations also support homes made before
-the binding column was introduced, without migrating them. Board needs an
-explicit/inherited Herdr socket; a
-regular terminal still shows state and supports mail and management.
-
-`n` opens New ship (name, scope, optional absolute folder, harness), using an
-existing available ship as its creator. In an empty fleet, it opens
-[first-run setup](#first-run-and-everyday-entry). Leaving the New ship folder
-empty creates a sibling of the creator's folder. Use Tab or Up/Down to select a
-field, Enter to submit and Escape to cancel.
-`x` opens Retire: type the exact selected ship name to confirm;
-its folder is kept.
-Retirement refuses if the fleet name now belongs to a different home. `d` opens
-Dispatcher: status, start or stop. The forms call `ship.create`, `ship.retire`
-and `privateer service` through argv, in a worker; errors retain the form and
-commands never write SQLite directly. Retirement uses the runtime's existing
-behavior: it revokes/unlinks and stops the dispatcher, without taking ownership
-of an attended agent process.
-
-The [attended injection proposal](design/herdr-inject.md) explains the lease,
-presentation cursor and headless-wake rules. Injection remains disabled because
-the installed prompt contract has no atomic expected-occupant guard.
-
-## Ships, ownership and terminal bindings
-
-Ships are equal peer identities, not ranks. `Navigator` is a familiar point of
-contact in the demo and has no special authority. The demo also includes Apps,
-Infrastructure and an idle Research ship.
-
-Live fleet ships come from active registry entries, with scope and status read
-from their own homes. The optional private `<home>/dashboard.yaml` supplies
-presentation names and exact terminal bindings. Fleet and single-home views also
-include observed owner/handoff identities. A registry
-entry keeps an idle ship visible between sessions; an unregistered identity may
-fall out of a later bounded snapshot. This is a dashboard registry, not a new
-runtime authority table or remote-host discovery mechanism.
-
-One optional `liaison: true` ship in the presentation registry explicitly selects the
-contact badge and shortcut. If no explicit contact is configured, exactly one
-ship with the `init --liaison` preset supplies that contact. Multiple preset
-ships remain ordinary boardable fleet entries until an explicit contact is
-selected; the dashboard does not choose a preferred ship. Explicit contact
-claims still must agree across homes. Contact selection is presentation
-configuration, not a grant of authority or an implementation of the captain's
-runtime delivery policy.
-
-Copy and edit [the example registry](../examples/dashboard.yaml) as
-`<home>/dashboard.yaml`. The `.yml` suffix and existing `dashboard.json` files
-are also supported; keep only one registry file in each home. Multiple files
-are rejected so an old configuration cannot silently shadow another. Each `id`
-must match the runtime's exact task-owner identity. Names, descriptions and
-terminal bindings are presentation configuration. The dashboard reads the file
-without creating or modifying it. All three suffixes use the
-[CLI input reader and limits](../README.md#general-runtime-and-optional-integrations),
-including duplicate-key and alias-expansion checks. The registry must be a
-regular file; symlinks are rejected. It accepts at most 200 configured ships and
-32 terminal bindings per ship. Duplicate identities and a pane bound to multiple ships are
-rejected. Missing configuration falls back to observed owners.
-Pane ownership and liaison uniqueness are also checked across assembled fleet
-homes, including manual claims against automatic presence bindings. Claims from
-every observed configuration remain conflict evidence, including entries for
-another ship and locally invalid presentation. Invalid presentation produces a
-visible source error and disables Board, terminal focus and liaison shortcuts
-until corrected; recorded work, originating homes and custody history remain
-visible.
-
-A terminal belongs to a ship through its live verified presence binding, or an
-exact `pane_id` + `terminal_id` binding in this presentation registry. The live presence binding is primary, otherwise the first configured binding is primary. Similar
-labels, process kinds and task titles never establish ownership. A manual claim
-cannot bypass the known automatic socket, terminal, workspace, tab or native
-session constraints for the same pane or terminal. Stale bindings show no
-connected terminal until their identities match the observed context. The existing
-focus action still revalidates the actual server and observed agent/session.
-Unbound Herdr panes are not presented as another ship's crew.
-
-Assignments appear only in their owning ship's Assignments view. An offered
-handoff also appears under the recipient as **Incoming**, with the current owner
-shown explicitly. Ownership changes only after the runtime records acceptance;
-this dashboard does not initiate or accept transfers. Every task, notice, job,
-activity and custody row retains its originating home, including work delegated
-to an owner registered in another home or absent from the fleet registry. Task
-selection and job joins use the home plus local task ID, so identical IDs from
-different homes remain distinct across refreshes and handoffs. Jobs and pending
-facts follow the current owner. Logbook includes current assignments'
-events and custody audit rows involving the ship, preserving an outgoing ship's
-handoff reference. Audit rows identify actor/action and current owner; the UI
-does not invent historical target information the runtime did not record.
-
-Fleet overview summarizes all observed ships and pending issues. Ship-level
-alerts, jobs, assignment history and terminal lists are filtered to that ship.
-The preview reads bounded local fleet homes plus one explicitly chosen Herdr socket;
-listing a ship does not establish remote access or task-to-native-session
-continuity. Demo terminals are labeled sample data and never connect to a socket.
-
-## Controls and presentation
-
-| Key / action | Result |
+| Key | Result |
 |---|---|
-| Click a ship (sidebar or fleet table row) | Open its workspace |
-| `b` / Board | Focus its bound first mate or launch `privateer start` in a new Herdr tab |
-| `n`, `x`, `d` | New ship, confirmed retirement, dispatcher status/start/stop |
-| Click Fleet overview; `0` or Home | Return to the fleet home |
-| `1`–`4`, Tab after selecting a ship | Bridge, Assignments, Terminals, Logbook |
-| Click an assignment/terminal | Select its details |
-| Up/Down, `j`/`k` | Select a ship, or an entry in the focused content list |
-| Left / Right | Focus ship navigation / workspace content |
-| Enter on ship navigation | Focus workspace content |
-| Enter/`f` on a ship's terminal; `f` on Bridge | Open the selected/primary live terminal |
-| Wheel / Page Up/Down | Navigate the pointed list / scroll details |
-| `c` | Hide/show additional stored jobs on Bridge |
-| Escape | Cancel a form or draft; otherwise return home from a ship, or exit when already home |
-| `q`, Ctrl-C | Exit; workers continue |
+| Up/Down, j/k | Select in Fleet, Needs, or history |
+| Tab | Switch Fleet / Needs |
+| Enter | Existing mate focus, inline answer, or history read |
+| Left/Right in answer | Pick a supplied choice |
+| a / d in approval | Select approve / deny; Enter commits |
+| Page Up/Down, wheel | Scroll details / navigate list |
+| i | Separate mail history |
+| Escape / Home | Return to bridge (or cancel draft) |
+| q / Ctrl-C | Exit (q is literal text while answering) |
 
-Mouse support works when the terminal forwards mouse events, including inside
-Herdr. Clicking a terminal changes selection only; live terminal focus requires
-Enter/`f` or the explicit Board action. Hit targets follow rendered layout and
-list offset; resizing clears stale targets. Mouse capture is released on exit.
+Mouse clicks select, never focus or send; hit targets follow list offsets and
+are cleared on resize. At least 40 columns by 14 rows is required. Terminal
+control and bidi-override characters are removed. Summaries and messages can
+still contain private text; this is not screenshot sanitization.
 
-The compact summary starts on. Grouped pending issues remain visible and routine
-facts stay available in Logbook; viewing never deletes facts or acknowledges an
-alert. State and Herdr worker errors retain the last snapshot with its age;
-an unavailable fleet home remains listed with an error. The details toggle is
-session-local.
+## Reliability and verification
 
-The home screen has no boat or animation/status band: those three rows are
-available to assignments and details. `--ascii` uses a plain ASCII attention
-marker. Terminals narrower than 50 columns or 14 rows get a resize notice rather
-than a broken layout.
+State/action and Herdr workers use bounded one-item channels. Slow source/action
+work stays off the input loop. Herdr refreshes every two seconds with failure
+backoff up to sixteen seconds. Its correlated JSON protocol keeps the existing
+1 MiB/800 ms response and pane limits. Closing the dashboard does not kill agents,
+recover jobs or assume a wrapper's payload stopped. No service/config/provider
+route/model/permission/production change is part of this UI.
 
-The tested Rust boat module is retained for a future Calm experience, where the
-boat can identify that mode and replace an existing working indicator. The
-current dashboard detail toggle is not First Mate's transcript-level Calm
-function. No animation timer or motion controls run in the dashboard.
+`--once` emits bounded read-only JSON with one attention scan step plus explicit
+not-yet-observed sources; it does not imply a complete multi-home attention scan.
+SQLite may use its ordinary WAL/shared-memory sidecars. The boat helper remains
+reserved and tested; the bridge runs no animation timer.
 
-## Reliability boundaries
-
-- Fleet/task observation opens an existing database with `READ_ONLY`; it does
-  not call `Store::open`, run migrations, chmod the home, touch the shared
-  resource ledger, run job reconciliation or alter task/event/approval state.
-  SQLite may use its normal WAL/shared-memory sidecars. A missing home is an error, not an implicit
-  initialization. Mailbox commands use the Store behavior described above.
-- Fleet/task sections are bounded to 200 rows with a truncation notice. Queries
-  bound long fields; SQLite uses a 100 ms busy timeout and a 500 ms progress
-  deadline. Text displayed in the terminal has control and bidi-override
-  characters removed. Task views read selected summary fields; mail details keep
-  the full supported body and JSON payload within the display's row bound.
-  Views omit argv, provider configuration and environment variables. Summaries
-  and messages can contain private text; treat screenshots accordingly.
-- State and Herdr refresh in separate workers, each with a one-item result
-  channel. A stalled source cannot block keyboard handling. Herdr snapshots
-  refresh every two seconds, with failure backoff up to 16 seconds. This first
-  version polls bounded snapshots; it does not yet consume push subscriptions.
-- Socket JSON responses have correlation checks, a 1 MiB cap and an 800 ms
-  response deadline. At most 1,000 panes are accepted. Repeated failures replace
-  the source error in the UI instead of appending transcript notifications.
-- The dashboard opens an attended session through `privateer start`; that
-  runtime holds its presence and waits for its harness. The dashboard does not
-  own, cancel, restart or recover agents.
-  Closing the dashboard never sends worker shutdown signals. Boarding does not replace headless job ownership or admission.
-- Only the explicitly selected/inherited Herdr socket is inspected. Provider
-  routes and machine topology remain private configuration. Read-only viewing
-  does not narrow the OS account's other credentials.
-
-## Reuse and next boundaries
-
-First Mate's Calm behavior and nautical working indicator inform the visual
-direction. The reserved boat is a fresh Rust implementation, without importing the Pi
-renderer or its transcript patches. See [attribution](../THIRD_PARTY_NOTICES.md).
-Its Herdr regression scenarios also informed stale-identity checks and focus
-behavior; its shell backend and policy framework are not imported.
-
-Future work includes persistent navigator conversation, explicit task-to-native
-session bindings, native-session delivery evidence, push events,
-agent recovery and dashboard resource controls. These need meaningful
-qualification; the dashboard does not claim them through its labels or demo.
-
-The broader comparison remains an informational reference in
-[issue #12](https://github.com/kirkins/privateer/issues/12), not a parity checklist.
-
-## Validation
+Validation uses disposable databases, fake Herdr sockets and actual keyboard to
+action/command scenarios, not screen snapshots. Preserve the identity/privacy/
+custody/read-only safety tests; old tab/boarding-layout smoke expectations are
+replaced. The live PTY proof observes incremental current terminal cells, including
+cursor placement, erasure and split UTF-8/escape chunks; it never matches concatenated
+raw frames. Denial requires a newly changed outcome match, not the earlier reply's
+notice. Unsupported terminal controls fail the proof rather than being stripped.
+Run through resource admission on a clean frozen SHA:
 
 ```sh
 cargo fmt --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-features
-cargo check --locked --no-default-features --bin privateer
+cargo clippy --locked --all-targets --all-features -j1 -- -D warnings
+cargo test --locked --all-features -j1 -- --test-threads=1
+cargo check --locked --no-default-features --bin privateer -j1
 python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
-python3 scripts/pilot.py --binary target/debug/privateer
 ```
 
-Dashboard tests use isolated databases, temporary Unix sockets and Ratatui's
-in-memory terminal backend. They cover non-mutating observation, bounded views,
-terminal replacement, socket replacement, malformed replies, timeouts, demo
-isolation, ship scoping, custody transfers, idle ship registration, mouse input,
-resize and the reserved boat module. The PTY smoke also drives real isolated runtime binaries for mail, boarding,
-presence binding, repeated focus and management against a simulated Herdr socket
-and a fake harness. It does not contact a real Herdr session or provider and
-does not prove model-driven execution. Use a real isolated Herdr session to qualify
-interactive navigation on the installed server version before fleet adoption.
+Both PTYs and their local fixture CLI children receive a literal clean environment
+allowlist with disposable HOME, XDG, fleet, resource and temporary roots, a fixed
+system PATH and no inherited credentials, actor/role or Herdr endpoints. Only these
+disposable authless children are isolated from the supervisor's role: the supervising
+agent environment and real operator guards remain unchanged. The actual absolute
+built binaries are used. Exit/reap and terminal/screen/mouse restoration are checked
+before fixture cleanup; forced fallback cleanup is a failure, never a pass.
+
+These are offline/local qualifications, not live Herdr/API canaries or proof of
+native model autonomy. Live fleet adoption/deployment requires separate approval.

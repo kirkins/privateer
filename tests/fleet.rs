@@ -915,4 +915,54 @@ fn the_liaison_sees_what_waits_on_the_captain_and_relays_the_captains_answers() 
     assert_eq!(result["remote"], "withdrawn", "{result}");
     let theirs = machine.json(&apps, "mail.show", json!({"id":question["id"]}));
     assert_eq!(theirs["state"], "withdrawn");
+    assert_eq!(theirs["ended_by"], result["ended_by"]);
+    assert!(theirs["answered_by"].is_null());
+    let again = withdraw(&liaison, "liaison", &question["id"]);
+    assert!(again.status.success(), "{}", stderr(&again));
+    let retried: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(retried["remote"], "withdrawn");
+    assert_eq!(retried["ended_by"], result["ended_by"]);
+
+    // A cited captain message permits normal answers, not production grants
+    // or consumption of the typed approval request. No actor/role clearing.
+    machine.json(
+        &apps,
+        "task.create",
+        json!({"id":"release","charter_id":"apps","owner":"apps","title":"Release"}),
+    );
+    let production = send(
+        &apps,
+        "apps",
+        json!({"from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"release","body":"Release exact build?","payload":{"artifact":"sha256:exact","environment":"production"}}),
+    );
+    let approval_source = machine.json(
+        &liaison,
+        "mail.send",
+        json!({"from":"captain","to":"liaison","kind":"notice","body":"Yes, release that build."}),
+    );
+    let refused = machine.as_agent(&liaison,"liaison","captain.relay",json!({"request":production["id"],"source":approval_source["id"],"body":"Approved for production."}));
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("production approvals"),
+        "{}",
+        stderr(&refused)
+    );
+    let still_open = machine.json(&apps, "mail.show", json!({"id":production["id"]}));
+    assert_eq!(still_open["state"], "open");
+    assert!(still_open["answered_by"].is_null());
+    let needs = machine.json(&apps, "runtime.needs", json!({}));
+    assert_eq!(needs["items"][0]["kind"], "approval");
+    assert_eq!(needs["items"][0]["source_id"], production["id"]);
+    // Specific liaison desk permission does not grant readonly bridge access.
+    assert!(
+        !machine
+            .as_agent(&liaison, "liaison", "runtime.needs", json!({}))
+            .status
+            .success()
+    );
+    let consume = machine.run(&apps,&["approval.consume","--json","{\"id\":\"no-relayed-grant\",\"task_id\":\"release\",\"artifact\":\"sha256:exact\",\"environment\":\"production\"}"]);
+    assert!(!consume.status.success());
+    let waiting = machine.json(&liaison, "captain.waiting", json!({}));
+    assert_eq!(waiting["waiting"].as_array().unwrap().len(), 1);
+    assert_eq!(waiting["waiting"][0]["mail"]["id"], production["id"]);
 }
