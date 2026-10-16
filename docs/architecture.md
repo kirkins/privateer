@@ -149,7 +149,7 @@ Examples can demonstrate a generic native harness or a gateway-constrained Pi ro
 
 SSH runs a remote shell even when invoked through a local argv array. Privateer validates endpoint tokens and POSIX-quotes every remote command argument. Stdin carries JSON; task contents never become shell commands. Request size, output size, diagnostics, and total call duration are bounded. A local transport exercises the identical RPC protocol without SSH credentials.
 
-This milestone does not implement distributed consensus or cryptographic cross-host charter inheritance. Explicitly configured remote homes remain responsible for their own charters. A peer's address is not a superior role or authority credential. Cross-host authorization and custody protocols need further qualification before replacing a fleet.
+This milestone does not implement distributed consensus or cryptographic cross-host charter inheritance. Explicitly configured remote homes remain responsible for their own charters. A peer's address is not a superior role or authority credential. Cross-host authorization and custody protocols need further qualification before replacing a fleet. The [cross-machine fleet proposal](design/cross-machine-fleet.md) describes how machines could join one fleet.
 
 ## Delivery and deployment
 
