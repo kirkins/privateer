@@ -44,7 +44,7 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; exit 0; fi\n\
+                "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
                  printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
                  while [ ! -e '{root}/release' ]; do sleep 0.05; done\n",
@@ -301,6 +301,10 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
         argv.lines().any(|a| a.ends_with("attended/mail.ts")),
         "{argv}"
     );
+    assert!(
+        argv.lines().any(|a| a.ends_with("attended/calm.ts")),
+        "{argv}"
+    );
     let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
     let (flag, holder) = env.trim().split_once(' ').unwrap();
     assert_eq!(flag, "1");
@@ -373,7 +377,14 @@ fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
     assert!(!argv.contains(&"--print"), "{argv:?}");
     let extension = argv.iter().position(|a| *a == "-e").unwrap();
     assert!(argv[extension + 1].ends_with("attended/crew.ts"));
-    assert!(extension < argv.iter().rposition(|a| *a == "--").unwrap());
+    assert_eq!(argv[extension + 2], "-e");
+    assert!(argv[extension + 3].ends_with("attended/calm.ts"));
+    assert!(extension + 3 < argv.iter().rposition(|a| *a == "--").unwrap());
+
+    assert_eq!(
+        fs::read_to_string(place.root.join("crew-home")).unwrap(),
+        place.folder.join(".privateer").to_string_lossy()
+    );
 
     // Custody is unchanged: the outcome reaches the first mate as crew mail.
     let inbox = place.json("mail.inbox", json!({"address":"infra","all":true}));
@@ -449,6 +460,11 @@ fn bounded_hosted_crew_plan_retains_its_lifecycle_adapter_without_inheriting_sel
         command[..at]
             .windows(2)
             .any(|p| p[0] == "-e" && p[1].as_str().unwrap().ends_with("attended/crew.ts"))
+    );
+    assert!(
+        command[..at]
+            .windows(2)
+            .any(|p| p[0] == "-e" && p[1].as_str().unwrap().ends_with("attended/calm.ts"))
     );
     // A deliberately unsupported activation wrapper cannot run a bounded
     // session, even in a real hosted supervisor. The separate native fixture

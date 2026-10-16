@@ -174,7 +174,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let mut plan = plugins::dispatch(store, "plugin.command", args.clone())?;
             if hosted {
                 // The crew extension ends the session when its work settles.
-                let extension = cli::plugins_dir()?.join("attended/crew.ts");
+                let plugins = cli::plugins_dir()?;
+                let extension = plugins.join("attended/crew.ts");
+                let calm = plugins.join("attended/calm.ts");
+                anyhow::ensure!(calm.is_file(), "Pi calm extension missing");
                 let argv = plan["argv"]
                     .as_array_mut()
                     .ok_or_else(|| anyhow::anyhow!("plan without argv"))?;
@@ -184,7 +187,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     .ok_or_else(|| anyhow::anyhow!("interactive plan without a prompt"))?;
                 argv.splice(
                     at..at,
-                    [serde_json::json!("-e"), serde_json::json!(extension)],
+                    [
+                        serde_json::json!("-e"),
+                        serde_json::json!(extension),
+                        serde_json::json!("-e"),
+                        serde_json::json!(calm),
+                    ],
                 );
             }
             // The launched harness acts as the task owner, under the agent role.

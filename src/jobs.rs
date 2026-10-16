@@ -1583,7 +1583,10 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     if job.hosted {
         // The harness keeps the pane's terminal, in its own foreground
         // process group, so group signals still reach exactly its work.
-        cmd.env("PRIVATEER_HOSTED_CREW", "1");
+        cmd.env("PRIVATEER_HOSTED_CREW", "1")
+            // A crew's checkout is not its operational home. Calm preferences
+            // are shared with this home's first mate, never inferred from cwd.
+            .env("PRIVATEER_HOME", store.home());
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setpgid(0, 0) == -1 {
