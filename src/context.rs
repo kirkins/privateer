@@ -348,6 +348,17 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         text.push_str(&line);
         text.push('\n');
     }
+    let throttled = crate::jobs::host_ledger(store)
+        .and_then(|conn| crate::routes::list(&conn))
+        .unwrap_or_default();
+    for route in &throttled {
+        text.push_str(&format!(
+            "Model route {} is backing off for {}s ({}); new crew and errands on it wait.\n",
+            route["route"].as_str().unwrap_or(""),
+            ((route["until_ms"].as_i64().unwrap_or(0) - Store::now_ms()) / 1000).max(1),
+            route["last_error"].as_str().unwrap_or("")
+        ));
+    }
     for (title, items) in [
         ("Open tasks", &tasks),
         ("Requests you owe a reply", &owed),

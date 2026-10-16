@@ -104,6 +104,9 @@ struct Job {
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     hosted: bool,
+    /// A harness job's `harness/provider/model`, for provider backoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_route: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -254,6 +257,7 @@ fn ledger(path: &Path) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);",
     )?;
     admission::init(&conn)?;
+    crate::routes::init(&conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS queue (key TEXT PRIMARY KEY, record TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS stows (id TEXT PRIMARY KEY, started_ms INTEGER NOT NULL,
@@ -1041,6 +1045,11 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         cancelled_by: None,
         started_by,
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
+        model_route: args
+            .get("model_route")
+            .and_then(Value::as_str)
+            .filter(|_| agent)
+            .map(str::to_owned),
     };
     let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -2326,6 +2335,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             status["heavy_reserved"] = json!(values.iter().filter(|v| v["heavy"] == true).count());
             status["reservations"] = json!(values);
             status["queue"] = json!(live_queue(&conn)?);
+            status["model_routes"] = json!(crate::routes::list(&conn)?);
             Ok(status)
         }
         _ => bail!("unknown jobs command {command}"),
