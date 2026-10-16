@@ -245,9 +245,9 @@ fn stale_or_replaced_attention_never_silently_becomes_healthy() {
         .connection()
         .execute("UPDATE attention SET at_ms=at_ms-7200000", [])
         .unwrap();
+    // The same session's full context stays full however long it sits idle.
     let attention = call(&mut fleet, "attention.show", json!({"ship":"infra"}));
-    assert_eq!(attention["pressure"], "unknown");
-    assert_eq!(attention["last_tokens"], 90000);
+    assert_eq!(attention["pressure"], "high", "{attention}");
     call(
         &mut fleet,
         "ship.attend",
@@ -485,6 +485,30 @@ fn request_waits_resume_only_after_the_correlated_answer() {
 }
 
 #[test]
+fn an_unreadable_wait_faults_its_task_without_stopping_the_dispatcher() {
+    let mut fleet = Fleet::new(json!({}));
+    enqueue(&mut fleet);
+    let request = call(
+        &mut fleet,
+        "mail.send",
+        json!({"from":"infra","to":"captain","kind":"request","task_id":"infra-repair","body":"Please confirm the fixture."}),
+    );
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"request","ref":request["id"],"reason":"Waiting for owner acceptance"}}),
+    );
+    // As if history.prune removed the request while the dispatcher was down.
+    fleet
+        .store
+        .connection()
+        .execute("DELETE FROM mail WHERE id=?1", [request["id"].as_str()])
+        .unwrap();
+    fleet.tick();
+    assert_eq!(status(&mut fleet, "infra-repair")["state"], "fault");
+}
+
+#[test]
 fn concurrent_hosted_polls_create_one_claim() {
     let mut fleet = Fleet::new(json!({}));
     attend(&mut fleet);
@@ -530,6 +554,43 @@ fn a_foreign_job_cannot_race_a_scheduled_claim() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     panic!("fixture job did not settle");
+}
+
+#[test]
+fn crew_started_under_a_hosted_claim_can_start_their_own_jobs() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let offer = poll(&mut fleet, true)["offer"]["id"].clone();
+    // Like a test gate a crew starts: it knows nothing of the offer and
+    // inherits the claim from the supervised job that carries it.
+    let gate = json!({"task_id":"infra-repair","command":["true"],"heavy":false});
+    let out = fleet.root.join("gate.out");
+    let crew = fleet.ok(
+        "job.start",
+        json!({"task_id":"infra-repair","heavy":false,"work_offer":offer,"command":[
+            "sh","-c","\"$0\" --home \"$1\" job.start --json \"$2\" >\"$3\" 2>&1",
+            support::BIN, fleet.home, gate.to_string(), out]}),
+        Some("infra"),
+    );
+    let settled = |fleet: &Fleet, id: &Value| {
+        for _ in 0..250 {
+            let job = fleet.ok("job.status", json!({"id":id}), None);
+            if !matches!(
+                job["status"].as_str(),
+                Some("starting" | "queued" | "launching" | "running")
+            ) {
+                return job;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("fixture job did not settle");
+    };
+    let crew = settled(&fleet, &crew["id"]);
+    let output = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(crew["status"], "succeeded", "{output}");
+    let gate: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(settled(&fleet, &gate["id"])["status"], "succeeded");
 }
 
 #[test]

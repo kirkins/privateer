@@ -95,8 +95,10 @@ an already admitted payload; use existing job/task cancellation for that.
 
 Attention reports bind to the current presence holder. The latest measured
 fullness is retained separately from the rolling growth/compaction window.
-A stale sample or a different session reads `unknown`, with the previous
-measurement retained as history. Time passing cannot make a full context healthy.
+A session's own latest sample stays current while it holds the ship, since its
+context changes only through the turns it reports. A sample from a different
+session reads `unknown`, with the previous measurement retained as history.
+Time passing cannot make a full context healthy.
 The idle adapter supplies a fresh sample without a model call before claiming
 hosted work. Compaction's before-size does not become a current fullness sample.
 

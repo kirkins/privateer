@@ -1,8 +1,9 @@
 //! A first mate's attention: how full its live context is and how fast it
 //! fills, measured rather than capped. The attended Pi adapter reports the
 //! context after each run and each compaction. Bearings retain the latest
-//! measured fullness separately from the last hour's growth. Only a fresh
-//! measurement from the current session can qualify hosted work delivery.
+//! measured fullness separately from the last hour's growth. A measurement
+//! counts only for the session that took it; once another session holds the
+//! ship, it reads unknown until that session reports.
 //! The pressure thresholds remain provisional.
 use crate::store::{Store, required};
 use anyhow::{Result, bail, ensure};
@@ -97,7 +98,14 @@ pub fn summary_for(store: &Store, ship: &str) -> Result<Value> {
             Value::Null
         });
     };
-    if now - sample_ms > FRESH_MS || (holder.is_some() && holder != sample_holder.as_deref()) {
+    // A session's context changes only through the turns and compactions it
+    // reports, so its own latest sample stays current however old. Age only
+    // matters when no session holds the ship.
+    let stale = match holder {
+        Some(holder) => sample_holder.as_deref() != Some(holder),
+        None => now - sample_ms > FRESH_MS,
+    };
+    if stale {
         return Ok(
             json!({"pressure":"unknown","fresh":false,"sample_ms":sample_ms,
             "last_tokens":tokens,"last_window":window,"reason":"Fresh context sample required for the current session"}),

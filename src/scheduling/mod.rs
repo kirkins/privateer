@@ -257,6 +257,20 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
     Ok(())
 }
 
+/// One unreadable schedule (say, a wait whose request was pruned) must not
+/// stop the dispatcher for every ship; it becomes that schedule's fault.
+fn check(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
+    if let Err(error) = advance(store, work, now) {
+        fault(
+            store,
+            work,
+            format!("Scheduling check failed: {error:#}"),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 fn reconcile_for(store: &Store, ship: Option<&str>) -> Result<()> {
     let tx = store.write_transaction()?;
     let mut statement = store.connection().prepare(
@@ -268,7 +282,7 @@ fn reconcile_for(store: &Store, ship: Option<&str>) -> Result<()> {
     drop(statement);
     for id in ids {
         let mut work = load(store, &id)?.context("schedule vanished")?;
-        advance(store, &mut work, Store::now_ms())?;
+        check(store, &mut work, Store::now_ms())?;
         save(store, &work)?;
     }
     tx.commit()?;
@@ -289,7 +303,8 @@ fn view(work: &Scheduled) -> Value {
 }
 
 /// Serialize this check with job insertion: an unrelated launcher cannot race
-/// a durable offer. Descendants of the recorded coordinator inherit its claim.
+/// a durable offer. Descendants of the recorded coordinator, or of a job
+/// admitted under the offer (a hosted coordinator's crew), inherit its claim.
 pub(crate) fn admit_job(
     store: &Store,
     task: &str,
@@ -312,8 +327,8 @@ pub(crate) fn admit_job(
         };
         if let Some(work) = load(store, &id)? {
             ensure!(
-                !(work.offer_id.as_deref() == Some(job)
-                    && !matches!(work.state.as_str(), "offered" | "claimed" | "executing")),
+                work.offer_id.as_deref() != Some(job)
+                    || matches!(work.state.as_str(), "offered" | "claimed" | "executing"),
                 "scheduled launch intent was withdrawn before admission"
             );
             ensure!(
@@ -340,10 +355,12 @@ pub(crate) fn admit_job(
                         .connection()
                         .query_row("SELECT record FROM jobs WHERE id=?1", [id], |r| r.get(0))
                         .optional()?;
-                    ancestor = raw
-                        .map(|r| serde_json::from_str::<Value>(&r))
-                        .transpose()?
-                        .and_then(|r| r["started_by"].as_str().map(str::to_owned));
+                    let record = raw.map(|r| serde_json::from_str::<Value>(&r)).transpose()?;
+                    if record.as_ref().is_some_and(|r| r["work_offer"] == expected) {
+                        allowed = true;
+                        break;
+                    }
+                    ancestor = record.and_then(|r| r["started_by"].as_str().map(str::to_owned));
                 }
                 ensure!(
                     allowed,

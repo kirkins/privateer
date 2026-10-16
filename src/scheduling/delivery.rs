@@ -95,7 +95,7 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
     let refusal = blocked(store, ship, &profile, now)?;
     for id in ready_ids(store, ship)? {
         let mut work = load(store, &id)?.context("schedule vanished")?;
-        advance(store, &mut work, now)?;
+        check(store, &mut work, now)?;
         if work.state != "ready" || now < work.not_before_ms || live_jobs(store, &id)? {
             save(store, &work)?;
             continue;
