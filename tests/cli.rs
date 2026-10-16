@@ -1097,12 +1097,12 @@ fn runtime_needs_never_creates_or_migrates_a_home() {
                     .unwrap();
             }
             "two-node-cycle" => {
-                conn.execute_batch("INSERT INTO tasks VALUES('ancestor','project','apps','Fixture','open','main',1,NULL);
+                conn.execute_batch("INSERT INTO tasks(id,charter_id,owner,title,status,parent,depth,handoff_to) VALUES('ancestor','project','apps','Fixture','open','main',1,NULL);
                 UPDATE tasks SET parent='ancestor' WHERE id='main';").unwrap();
             }
             _ => {
                 conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
-                INSERT INTO tasks SELECT 'chain-'||x,'project','apps','Fixture','open',CASE WHEN x<5000 THEN 'chain-'||(x+1) END,1,NULL FROM n;
+                INSERT INTO tasks(id,charter_id,owner,title,status,parent,depth,handoff_to) SELECT 'chain-'||x,'project','apps','Fixture','open',CASE WHEN x<5000 THEN 'chain-'||(x+1) END,1,NULL FROM n;
                 UPDATE tasks SET parent='chain-1' WHERE id='main';").unwrap();
             }
         }
