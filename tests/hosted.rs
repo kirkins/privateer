@@ -239,7 +239,10 @@ impl Place {
     }
     fn stop_wake(&self, phase: &str, report: &Value) {
         println!("{phase}: wake report {report}");
-        assert_eq!(report["status"], "running", "{phase}: planning failed: {report}");
+        assert_eq!(
+            report["status"], "running",
+            "{phase}: planning failed: {report}"
+        );
         let wake = report["wake"].as_str().unwrap();
         self.wait_wake(phase, wake, true);
         let pid = self.native_pid();
