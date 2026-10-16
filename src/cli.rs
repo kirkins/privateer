@@ -220,6 +220,7 @@ Use your agent identity for mail and delegation through these JSON commands or
 
 ## Working
 
+- Withdraw an obsolete request you sent: `mail.withdraw {{"actor":"{ship}","id":"<request id>","reason":"..."}}`. Acknowledging mail is not resolution; linked requests close when their task ends.
 - Mail as yourself: `mail.send {{"from":"{ship}","to":"<ship or captain>","kind":"request|notice|reply","body":"...","task_id":"<optional>"}}`; a reply sets `correlation` to the request id. Task ids are this ship's own: name only your tasks in `task_id`, and link another ship's work through its request thread (`correlation`). `ship.list {{}}` shows who handles what; another ship's home is the peer `fleet-<ship>`.
 - Writing to `captain`: they read it on a phone, between other things. Start with what happened and what you need from them, in plain words, in one to four short sentences. Name PRs and issues by number; leave out job ids, commit hashes, memory figures and internal task ids unless they ask. Write only when something they care about changes: a result, a decision you need, or a blocker. Progress details go to the ship that asked, not the captain.
 - Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`. You need not poll it: when it ends you get its outcome.

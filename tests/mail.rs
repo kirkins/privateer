@@ -1461,3 +1461,335 @@ fn naming_another_ships_task_or_peer_points_to_the_cross_ship_link() {
     assert!(peer.contains("peer infra is not configured"), "{peer}");
     assert!(peer.contains("fleet-<ship>"), "{peer}");
 }
+
+#[test]
+fn withdrawal_is_sender_only_durable_and_not_an_ack_or_reply() {
+    let (temp, mut s) = fleet();
+    let request = send(&mut s, json!({"id":"question","from":"apps","to":"captain","kind":"decision","body":"Choose?","task_id":"main"})).unwrap();
+    dispatch(
+        &mut s,
+        "mail.ack",
+        json!({"address":"captain","through_seq":request["seq"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        dispatch(
+            &mut s,
+            "mail.withdraw",
+            json!({"actor":"infra","id":"question","reason":"obsolete"})
+        )
+        .is_err()
+    );
+    s.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    assert!(dispatch(&mut s, "runtime.needs", json!({})).is_err());
+    assert!(
+        dispatch(
+            &mut s,
+            "mail.withdraw",
+            json!({"actor":"infra","id":"question","reason":"obsolete"})
+        )
+        .is_err()
+    );
+    let args = json!({"actor":"apps","id":"question","reason":"obsolete"});
+    let closed = dispatch(&mut s, "mail.withdraw", args.clone()).unwrap();
+    assert_eq!(closed["state"], "withdrawn");
+    assert!(closed["answered_by"].is_null());
+    assert!(!closed["ended_by"].is_null());
+    assert_eq!(dispatch(&mut s, "mail.withdraw", args).unwrap(), closed);
+    assert!(
+        dispatch(
+            &mut s,
+            "mail.withdraw",
+            json!({"actor":"apps","id":"question","reason":"changed"})
+        )
+        .is_err()
+    );
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"question"})).unwrap()["state"],
+        "withdrawn"
+    );
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(send(&mut s,json!({"from":"captain","to":"apps","kind":"reply","correlation":"question","body":"late"})).is_err());
+}
+
+#[test]
+fn terminal_task_closes_linked_questions_and_preserves_history() {
+    for status in ["done", "cancelled"] {
+        let (_temp, mut s) = fleet();
+        send(&mut s,json!({"id":"linked","from":"apps","to":"captain","kind":"request","body":"question","task_id":"main"})).unwrap();
+        send(&mut s,json!({"id":"unlinked","from":"apps","to":"captain","kind":"request","body":"question"})).unwrap();
+        dispatch(
+            &mut s,
+            "task.update",
+            json!({"actor":"apps","id":"main","status":status}),
+        )
+        .unwrap();
+        let linked = dispatch(&mut s, "mail.show", json!({"id":"linked"})).unwrap();
+        assert_eq!(linked["state"], format!("task_{status}"));
+        assert!(linked["answered_by"].is_null());
+        assert_eq!(
+            dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["source_id"],
+            "unlinked"
+        );
+        assert!(
+            send(
+                &mut s,
+                json!({"from":"apps","to":"captain","kind":"request","body":"new","task_id":"main"})
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn closure_crosses_homes_and_inflight_reply_wins_without_reopening() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    send(
+        &mut a,
+        json!({"id":"withdraw-me","from":"apps","to":"infra","kind":"request","body":"question"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "mail.withdraw",
+        json!({"actor":"apps","id":"withdraw-me","reason":"no longer needed"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
+        "withdrawn"
+    );
+    // An authenticated late delivery models a reply recorded before the remote
+    // withdrawal arrived. A new mail.send after observing it is refused.
+    assert!(send(&mut b,json!({"from":"infra","to":"apps","kind":"reply","correlation":"withdraw-me","body":"late"})).is_err());
+    let wire = json!({"id":"inflight","from":"infra","to":"apps","kind":"reply","correlation":"withdraw-me","body":"already sent"});
+    dispatch(&mut a, "mail.deliver", wire.clone()).unwrap();
+    assert!(
+        dispatch(&mut a, "mail.deliver", wire).unwrap()["duplicate"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        dispatch(&mut a, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
+        "answered"
+    );
+}
+
+#[test]
+fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
+    let (temp, mut s) = fleet();
+    send(&mut s,json!({"id":"decision","from":"apps","to":"captain","kind":"decision","body":"Which?","payload":{"choices":["a","b"]}})).unwrap();
+    send(&mut s,json!({"id":"release","from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"sha256:exact","environment":"production"}})).unwrap();
+    let first = dispatch(&mut s, "runtime.needs", json!({"limit":1})).unwrap();
+    assert_eq!(first["items"][0]["source_id"], "decision");
+    assert_eq!(first["items"][0]["choices"], json!(["a", "b"]));
+    let second = dispatch(
+        &mut s,
+        "runtime.needs",
+        json!({"after":first["next_after"]}),
+    )
+    .unwrap();
+    let item = &second["items"][0];
+    assert_eq!(item["kind"], "approval");
+    let mut approval = json!({"id":"grant-exact","request_id":"release","expected_version":item["version"],"task_id":"main","artifact":"sha256:exact","environment":"production","approver":"captain"});
+    let stable = item["id"].clone();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(
+        dispatch(
+            &mut s,
+            "runtime.needs",
+            json!({"after":first["next_after"]})
+        )
+        .unwrap()["items"][0]["id"],
+        stable
+    );
+    approval["artifact"] = json!("different");
+    assert!(dispatch(&mut s, "approval.grant", approval.clone()).is_err());
+    approval["artifact"] = json!("sha256:exact");
+    s.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    assert!(dispatch(&mut s, "approval.grant", approval.clone()).is_err());
+    s.set_caller(Caller::Operator);
+    dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
+    dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["state"],
+        "approved"
+    );
+    assert!(dispatch(&mut s, "approval.deny", approval.clone()).is_err());
+    dispatch(&mut s, "approval.consume", json!({"id":"grant-exact","task_id":"main","artifact":"sha256:exact","environment":"production"})).unwrap();
+    assert!(dispatch(&mut s, "approval.grant", approval).is_err());
+    assert_eq!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn denial_is_distinct_and_ordinary_reply_never_grants() {
+    let (_temp, mut s) = fleet();
+    for id in ["deny", "plain"] {
+        send(&mut s,json!({"id":id,"from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
+    }
+    let version =
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["version"].clone();
+    let args = json!({"request_id":"deny","expected_version":version,"task_id":"main","artifact":"abc","environment":"production","approver":"captain"});
+    dispatch(&mut s, "approval.deny", args.clone()).unwrap();
+    dispatch(&mut s, "approval.deny", args).unwrap();
+    send(&mut s,json!({"from":"captain","to":"apps","kind":"reply","correlation":"plain","body":"approved"})).unwrap();
+    assert_eq!(
+        s.connection()
+            .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"deny"})).unwrap()["state"],
+        "denied"
+    );
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
+    let (_temp, mut s) = fleet();
+    send(&mut s,json!({"from":"apps","to":"captain","kind":"notice","body":"BLOCKED CI red, production needs approval"})).unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"actor":"apps","id":"main","status":"blocked"}),
+    )
+    .unwrap();
+    let now = Store::now_ms();
+    for (id, status) in [("queued", "queued"), ("orphan", "orphaned")] {
+        s.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",rusqlite::params![id,json!({"id":id,"status":status,"task_id":"main","created_ms":now-61_000,"incarnation":"inc","reason":"typed reason"}).to_string()]).unwrap();
+    }
+    let before: i64 = s
+        .connection()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    let result = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    let after: i64 = s
+        .connection()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(result["items"].as_array().unwrap().len(), 3);
+    assert!(
+        result["unknown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "ci")
+    );
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"actor":"apps","id":"main","status":"done"}),
+    )
+    .unwrap();
+    let result = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["items"][0]["evidence"], "orphaned_job");
+    s.connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.status','succeeded')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn reply_withdraw_and_terminal_update_serialize_without_lost_facts() {
+    for _ in 0..8 {
+        let (temp, mut s) = fleet();
+        send(&mut s,json!({"id":"race","from":"apps","to":"captain","kind":"request","body":"question","task_id":"main"})).unwrap();
+        let home = temp.path().join("home");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = [("mail.withdraw",json!({"actor":"apps","id":"race","reason":"obsolete"})),("mail.send",json!({"id":"race-answer","from":"captain","to":"apps","kind":"reply","correlation":"race","body":"answer"})),("task.update",json!({"actor":"apps","id":"main","status":"done"}))].into_iter().map(|(cmd,args)| {
+            let barrier = barrier.clone(); let home = home.clone();
+            std::thread::spawn(move || { let mut s = Store::open(&home).unwrap(); barrier.wait(); dispatch(&mut s,cmd,args).is_ok() })
+        }).collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let request = dispatch(&mut s, "mail.show", json!({"id":"race"})).unwrap();
+        assert!(matches!(
+            request["state"].as_str(),
+            Some("answered" | "withdrawn" | "task_done")
+        ));
+        let replies: i64 = s
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE kind='reply' AND correlation='race'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replies, if request["state"] == "answered" { 1 } else { 0 });
+        assert!(
+            dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn stale_approval_version_is_not_grantable_and_disappears() {
+    let (_temp, mut s) = fleet();
+    send(&mut s,json!({"id":"stale","from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
+    let version =
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["version"].clone();
+    s.connection()
+        .execute(
+            "UPDATE charters SET data=json_set(data,'$.objective','changed') WHERE id='project'",
+            [],
+        )
+        .unwrap();
+    assert!(dispatch(&mut s,"approval.grant",json!({"id":"stale-grant","request_id":"stale","expected_version":version,"task_id":"main","artifact":"abc","environment":"production","approver":"captain"})).is_err());
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

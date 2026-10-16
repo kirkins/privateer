@@ -16,6 +16,7 @@ mod host;
 pub mod input;
 pub mod jobs;
 pub mod mail;
+pub mod needs;
 pub mod opencode_mail;
 pub mod peers;
 pub mod permissions;
@@ -41,6 +42,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "charter.revoke",
     "approval.grant",
     "approval.consume",
+    "approval.deny",
     "peer.put",
     "resource.recover",
     "history.prune",
@@ -67,6 +69,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
     }
     match command.split('.').next().unwrap_or("") {
+        "runtime" if command == "runtime.needs" => needs::query(store, &args),
         "upgrade" if command == "upgrade.status" => releases::status(),
         "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
         "permissions" => permissions::dispatch(store, command, args),

@@ -145,6 +145,10 @@ impl Store {
         )?;
         migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;
+        connection.execute(
+            "INSERT OR IGNORE INTO metadata VALUES('runtime_origin',?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
         let schema: String =
             connection.query_row("SELECT value FROM metadata WHERE key='schema'", [], |r| {
                 r.get(0)

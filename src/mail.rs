@@ -4,7 +4,7 @@
 //! hosts one or more ships; the directory records where each ship lives.
 //! `captain` is the reserved address of the person. Messages are durable,
 //! idempotent and typed: a `request` or `decision` stays open until its single
-//! `reply`, so the runtime, not an agent's memory, tracks owed answers.
+//! `reply` or explicit closure, so the runtime tracks owed answers.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, Row, params};
@@ -38,6 +38,9 @@ pub fn init(store: &Store) -> Result<()> {
     )?;
     let tx = store.write_transaction()?;
     for (column, declaration) in [
+        ("ended_by", "TEXT"),
+        ("ended_ms", "INTEGER"),
+        ("end_reason", "TEXT"),
         ("delivery", "TEXT"),
         ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("delivery_error", "TEXT"),
@@ -186,7 +189,7 @@ pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
 }
 
-const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms";
+const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms,ended_by,ended_ms,end_reason";
 
 fn message(r: &Row) -> rusqlite::Result<Value> {
     let payload: String = r.get(9)?;
@@ -202,6 +205,8 @@ fn message(r: &Row) -> rusqlite::Result<Value> {
         "answered_by": r.get::<_, Option<String>>(14)?, "answered_ms": r.get::<_, Option<i64>>(15)?,
         "delivery": r.get::<_, Option<String>>(16)?, "delivery_attempts": r.get::<_, i64>(17)?,
         "delivery_error": r.get::<_, Option<String>>(18)?, "delivered_ms": r.get::<_, Option<i64>>(19)?,
+        "ended_by": r.get::<_, Option<String>>(20)?, "ended_ms": r.get::<_, Option<i64>>(21)?,
+        "end_reason": r.get::<_, Option<String>>(22)?,
     }))
 }
 
@@ -234,6 +239,114 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
                 .with_context(|| format!("{key} must be a string"))
         })
         .transpose()
+}
+
+/// Record a sender-authored closure as an ordinary correlated notice. Old
+/// peers can retain the notice without understanding it; new peers apply it.
+/// The caller holds the write transaction. Delivery uses the existing outbox.
+fn end_request(store: &Store, request: &Value, state: &str, reason: &str) -> Result<()> {
+    let id = format!("end-{}", crate::core::hash(&request["id"]));
+    let peer = ship(store, request["to"].as_str().context("request recipient")?)?
+        .as_ref()
+        .and_then(remote_peer)
+        .map(str::to_owned);
+    let payload = json!({"request_end":{"version":1,"state":state,"reason":reason}});
+    let now = Store::now_ms();
+    store.connection().execute(
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms,delivery)
+         VALUES(?1,?2,?3,'notice',?4,?5,?6,?7,'low',?8,?9)",
+        params![id,request["from"].as_str(),request["to"].as_str(),request["id"].as_str(),
+        request["task_id"].as_str(),reason,payload.to_string(),now,peer.map(|_| "pending")])?;
+    store.connection().execute(
+        "UPDATE mail SET state=?2,ended_by=?3,ended_ms=?4,end_reason=?5 WHERE id=?1 AND state='open'",
+        params![request["id"].as_str(),state,id,now,reason])?;
+    Ok(())
+}
+
+fn withdraw(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    let actor = required(args, "actor")?;
+    let reason = required(args, "reason")?;
+    ensure!(reason.len() <= 2000, "withdrawal reason exceeds 2000 bytes");
+    local_address(store, actor)?;
+    ensure!(
+        actor != CAPTAIN || *store.caller() == Caller::Operator,
+        "only operator speaks as captain"
+    );
+    let tx = store.write_transaction()?;
+    let request = by_id(store, id)?.context("unknown request")?;
+    ensure!(
+        request["from"] == actor,
+        "only the sender can withdraw its request"
+    );
+    ensure!(
+        matches!(request["kind"].as_str(), Some("request" | "decision")),
+        "only requests can be withdrawn"
+    );
+    if request["state"] == "withdrawn" {
+        ensure!(
+            request["end_reason"] == reason,
+            "withdrawal already has a different reason"
+        );
+    } else {
+        ensure!(request["state"] == "open", "request is already closed");
+        end_request(store, &request, "withdrawn", reason)?;
+    }
+    tx.commit()?;
+    // Bounded and retryable, like mail.send. Task closure only enqueues.
+    flush_pending(store, 1, false, None, None)?;
+    by_id(store, id)?.context("request vanished")
+}
+
+/// A task's terminal state, not its current owner, ends its linked requests.
+/// Runs in task.update's transaction; never invents a reply or changes custody.
+pub(crate) fn close_task(store: &Store, task: &str, status: &str) -> Result<()> {
+    let mut statement = store.connection().prepare(&format!(
+        "SELECT {COLUMNS} FROM mail WHERE task_id=?1 AND state='open'"
+    ))?;
+    let requests = statement
+        .query_map([task], message)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for request in requests {
+        end_request(
+            store,
+            &request,
+            &format!("task_{status}"),
+            &format!("linked task {task} is {status}"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Complete an exact-artifact approval request in the grant/deny transaction.
+pub(crate) fn approval_answer(
+    store: &Store,
+    request: &Value,
+    state: &str,
+    args: &Value,
+) -> Result<Value> {
+    let id = format!("approval-answer-{}", crate::core::hash(&request["id"]));
+    let payload = json!({"approval_outcome":state,"approval_id":args.get("id"),
+        "artifact":args["artifact"],"environment":args["environment"]});
+    if let Some(existing) = by_id(store, &id)? {
+        ensure!(
+            existing["from"] == CAPTAIN
+                && existing["correlation"] == request["id"]
+                && existing["payload"] == payload,
+            "approval response differs from recorded outcome"
+        );
+        return Ok(existing);
+    }
+    ensure!(request["state"] == "open", "request is closed");
+    let now = Store::now_ms();
+    store.connection().execute(
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms)
+         VALUES(?1,'captain',?2,'reply',?3,?4,?5,?6,'normal',?7)",
+        params![id,request["from"].as_str(),request["id"].as_str(),request["task_id"].as_str(),state,payload.to_string(),now])?;
+    store.connection().execute("UPDATE mail SET state=?2,answered_by=?3,answered_ms=?4,ended_by=?3,ended_ms=?4,end_reason=?2 WHERE id=?1 AND state='open'",
+        params![request["id"].as_str(),state,id,now])?;
+    store.audit("approval.response", &json!({"request_id":request["id"],"state":state,"answer_id":id,"approval_id":args.get("id")}))?;
+    by_id(store, &id)?.context("approval answer vanished")
 }
 
 fn send(store: &Store, args: &Value) -> Result<Value> {
@@ -285,8 +398,36 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     identifier(&id)?;
     let body = args.get("body").and_then(Value::as_str).unwrap_or("");
-    let payload = args.get("payload").cloned().unwrap_or(json!({}));
+    let mut payload = args.get("payload").cloned().unwrap_or(json!({}));
     ensure!(payload.is_object(), "payload must be an object");
+    ensure!(
+        payload.get("request_end").is_none(),
+        "request_end is reserved for runtime closure"
+    );
+    if args["request_kind"] == "production_approval" {
+        ensure!(
+            kind == "request" && to == CAPTAIN,
+            "production approvals are requests to captain"
+        );
+        let task = required(args, "task_id")?;
+        ensure!(
+            required(&payload, "artifact")?.len() <= 1024
+                && required(&payload, "environment")?.len() <= 1024,
+            "approval artifact and environment are limited to 1024 bytes"
+        );
+        let charter = store.active_charter(task)?;
+        payload["charter_hash"] = json!(crate::core::hash(&charter));
+    }
+    if let Some(choices) = payload.get("choices") {
+        let choices = choices.as_array().context("choices must be an array")?;
+        ensure!(
+            choices.len() <= 20
+                && choices
+                    .iter()
+                    .all(|v| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200)),
+            "choices must contain at most 20 bounded strings"
+        );
+    }
     ensure!(
         !body.is_empty() || payload.as_object().is_some_and(|p| !p.is_empty()),
         "a message needs a body or a payload"
@@ -354,6 +495,19 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         let mut existing = annotate(existing, Store::now_ms());
         existing["duplicate"] = json!(true);
         return Ok(existing);
+    }
+    if let Some(task) = task_id {
+        let linked = store.task(task)?;
+        ensure!(
+            !matches!(linked["status"].as_str(), Some("done" | "cancelled")),
+            "task is terminal"
+        );
+        if request_kind == Some("production_approval") {
+            ensure!(
+                payload["charter_hash"] == crate::core::hash(&store.active_charter(task)?),
+                "approval authority changed"
+            );
+        }
     }
     if let Some(correlation) = correlation {
         let thread = by_id(store, correlation)?
@@ -678,7 +832,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             "only the recipient of {correlation} can answer it"
         );
         ensure!(
-            request["state"] == "open",
+            matches!(
+                request["state"].as_str(),
+                Some("open" | "withdrawn" | "task_done" | "task_cancelled")
+            ),
             "{correlation} was already answered"
         );
     }
@@ -706,6 +863,27 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3 WHERE id=?1",
             params![correlation, id, now],
         )?;
+    }
+    if let Some(end) = payload.get("request_end") {
+        ensure!(
+            kind == "notice" && end["version"] == 1,
+            "invalid request closure"
+        );
+        let request_id = correlation.context("closure requires correlation")?;
+        let request = by_id(store, request_id)?.context("unknown closed request")?;
+        ensure!(
+            request["from"] == from
+                && request["to"] == to
+                && matches!(request["kind"].as_str(), Some("request" | "decision")),
+            "only the sender can close its request"
+        );
+        let reason = required(end, "reason")?;
+        let state = required(end, "state")?;
+        ensure!(
+            matches!(state, "withdrawn" | "task_done" | "task_cancelled"),
+            "invalid closure state"
+        );
+        tx.execute("UPDATE mail SET state=?2,ended_by=?3,ended_ms=?4,end_reason=?5 WHERE id=?1 AND state='open'", params![request_id,state,id,now,reason])?;
     }
     tx.commit()?;
     Ok(json!({"id": id, "duplicate": false}))
@@ -878,8 +1056,18 @@ fn requests(store: &Store, args: &Value) -> Result<Value> {
     };
     let state = optional_str(args, "state")?;
     ensure!(
-        state.is_none_or(|s| matches!(s, "open" | "answered" | "overdue")),
-        "state must be open, answered or overdue"
+        state.is_none_or(|s| matches!(
+            s,
+            "open"
+                | "answered"
+                | "overdue"
+                | "withdrawn"
+                | "task_done"
+                | "task_cancelled"
+                | "approved"
+                | "denied"
+        )),
+        "invalid request state"
     );
     let now = Store::now_ms();
     let mut statement = store.connection().prepare(&format!(
@@ -966,6 +1154,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             Ok(json!({"ships": ships}))
         }
         "mail.send" => send(store, &args),
+        "mail.withdraw" => withdraw(store, &args),
         "mail.inbox" => inbox(store, &args),
         "mail.outbox" => outbox(store, &args),
         "mail.pending" => pending(store, &args),
