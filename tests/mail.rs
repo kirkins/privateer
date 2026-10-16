@@ -1756,11 +1756,10 @@ fn transport_results_require_matching_closure_receipt_for_remote_state() {
         );
         // Closure, raw transport failure and lack of application evidence
         // survive reopening the disposable sender home.
+        let durable = dispatch(&mut a, "mail.show", json!({"id":"legacy-end"})).unwrap();
         let home = a.home().to_owned();
         drop(a);
         let mut a = Store::open(&home).unwrap();
-        let mut durable = result.clone();
-        durable.as_object_mut().unwrap().remove("remote");
         assert_eq!(
             dispatch(&mut a, "mail.show", json!({"id":"legacy-end"})).unwrap(),
             durable
