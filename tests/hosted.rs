@@ -54,7 +54,7 @@ impl Place {
                  printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
                  if [ -e '{root}/native-fail' ]; then exit 17; fi\n\
                  while [ ! -e '{root}/release' ]; do sleep 0.05; done\n\
-                 printf '%s\\n' '{{\"type\":\"session\",\"id\":\"fixture-session\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
+                 printf '%s\\n' '{{\"type\":\"session\",\"id\":\"11111111-1111-4111-8111-111111111111\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
                 root = root.display()
             ),
         )
@@ -239,6 +239,7 @@ impl Place {
     }
     fn stop_wake(&self, phase: &str, report: &Value) {
         println!("{phase}: wake report {report}");
+        assert_eq!(report["status"], "running", "{phase}: planning failed: {report}");
         let wake = report["wake"].as_str().unwrap();
         self.wait_wake(phase, wake, true);
         let pid = self.native_pid();
