@@ -147,7 +147,11 @@ peer), and pending delivery reports `"pending"` or its recorded transport error.
 A transport acknowledgement alone never means the remote request was withdrawn.
 Retry/backoff and explicit `mail.flush` retain the same committed closure ID;
 local closure remains committed on remote failure. No direct remote withdrawal
-or acknowledgement/custody/grant side effect is added.
+or acknowledgement/custody/grant side effect is added. If retention removes an
+acknowledged closed request while retaining its unread closure notice, duplicate
+delivery remains a no-op with unknown application evidence, not a peer-FIFO
+blocking transport failure. Receipts describe recorded application, not a fresh
+liveness observation or a promise against a later in-flight answer.
 Task IDs remain local and do not travel. A valid reply already in flight wins
 over closure when eventually delivered, so both homes converge to answered;
 after observing closure a receiver cannot create a new reply. Both facts remain

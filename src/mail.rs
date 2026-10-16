@@ -867,13 +867,18 @@ fn closure_receipt(store: &Store, closure: &Value) -> Result<Value> {
     if !closure["payload"]["request_end"].is_object() {
         return Ok(Value::Null);
     }
-    let request = by_id(
+    let Some(request) = by_id(
         store,
         closure["correlation"]
             .as_str()
             .context("closure correlation")?,
     )?
-    .context("closed request disappeared")?;
+    else {
+        // Retention may remove an acknowledged closed request before its
+        // unread closure notice. A duplicate remains a transport no-op, but
+        // missing history cannot supply application evidence.
+        return Ok(Value::Null);
+    };
     Ok(json!({"id":request["id"],"state":request["state"],"ended_by":request["ended_by"]}))
 }
 

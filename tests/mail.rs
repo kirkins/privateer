@@ -1643,7 +1643,7 @@ fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
     assert_eq!(theirs["ended_by"], closed["ended_by"]);
     let notice = dispatch(&mut a, "mail.show", json!({"id":closed["ended_by"]})).unwrap();
     let wire = json!({"id":notice["id"],"from":"apps","to":"infra","kind":"notice","correlation":"retry-end","body":notice["body"],"payload":notice["payload"]});
-    let duplicate = dispatch(&mut b, "mail.deliver", wire).unwrap();
+    let duplicate = dispatch(&mut b, "mail.deliver", wire.clone()).unwrap();
     assert_eq!(duplicate["duplicate"], true);
     assert_eq!(duplicate["request_end"]["ended_by"], closed["ended_by"]);
     assert_eq!(duplicate["request_end"]["state"], "withdrawn");
@@ -1662,6 +1662,28 @@ fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
     assert_eq!(
         dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap()["acknowledged_through"],
         0
+    );
+    // Ordinary retention can remove the acknowledged closed request while
+    // its unread closure remains. Redelivery must still succeed as a no-op,
+    // with unknown application evidence rather than blocking the peer FIFO.
+    dispatch(
+        &mut b,
+        "mail.ack",
+        json!({"address":"infra","through_seq":theirs["seq"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        privateer::mail::prune(&b, Store::now_ms() + 1, false).unwrap(),
+        1
+    );
+    assert!(dispatch(&mut b, "mail.show", json!({"id":"retry-end"})).is_err());
+    let retained = dispatch(&mut b, "mail.show", json!({"id":closed["ended_by"]})).unwrap();
+    let redelivered = dispatch(&mut b, "mail.deliver", wire).unwrap();
+    assert_eq!(redelivered["duplicate"], true);
+    assert!(redelivered["request_end"].is_null());
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":closed["ended_by"]})).unwrap(),
+        retained
     );
 }
 
