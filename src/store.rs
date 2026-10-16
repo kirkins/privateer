@@ -163,6 +163,7 @@ impl Store {
         crate::mail::init(&store)?;
         crate::bundled::migrate(&store)?;
         crate::activation::init(&store)?;
+        crate::errand::init(&store)?;
         crate::context::init(&store)?;
         crate::presence::init(&store)?;
         Ok(store)
