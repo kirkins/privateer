@@ -1688,12 +1688,20 @@ fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
 }
 
 #[test]
-fn transport_success_without_matching_closure_receipt_is_unknown() {
+fn transport_results_require_matching_closure_receipt_for_remote_state() {
     use std::os::unix::fs::PermissionsExt;
-    for receipt in [
-        "None",
-        "{'id':'wrong-request','state':'withdrawn','ended_by':r['args']['id']}",
-        "{'id':r['args'].get('correlation'),'state':'withdrawn','ended_by':'wrong-closure'}",
+    for (response, error) in [
+        ("{'ok':True,'result':{'request_end':None}}", None),
+        (
+            "{'ok':True,'result':{'request_end':{'id':'wrong-request','state':'withdrawn','ended_by':r['args']['id']}}}",
+            None,
+        ),
+        (
+            "{'ok':True,'result':{'request_end':{'id':r['args'].get('correlation'),'state':'withdrawn','ended_by':'wrong-closure'}}}",
+            None,
+        ),
+        ("{'ok':False,'error':'withdrawn'}", Some("withdrawn")),
+        ("{'ok':False,'error':'answered'}", Some("answered")),
     ] {
         let Pair {
             _temp,
@@ -1706,10 +1714,11 @@ fn transport_success_without_matching_closure_receipt_is_unknown() {
             json!({"id":"legacy-end","from":"apps","to":"infra","kind":"request","body":"Needed?"}),
         )
         .unwrap();
-        // Disposable legacy/incorrect peer: acknowledges transport, without
-        // applying this closure. No real home/role/config is bypassed.
+        // Disposable peer: either acknowledges transport without applying
+        // the closure, or fails with state-like error text. No real home,
+        // role or config is bypassed.
         let peer = _temp.path().join("legacy-peer");
-        fs::write(&peer,format!("#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({{'id':r['id'],'ok':True,'result':{{'request_end':{receipt}}}}}))\n")).unwrap();
+        fs::write(&peer,format!("#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))\n")).unwrap();
         fs::set_permissions(&peer, fs::Permissions::from_mode(0o755)).unwrap();
         dispatch(
             &mut a,
@@ -1723,15 +1732,52 @@ fn transport_success_without_matching_closure_receipt_is_unknown() {
             json!({"id":"legacy-end","reason":"obsolete"}),
         )
         .unwrap();
-        assert_eq!(result["remote"], "unknown", "{result}");
+        let expected_remote = error
+            .map(|e| format!("error: {e}"))
+            .unwrap_or_else(|| "unknown".to_owned());
+        assert_eq!(result["remote"], expected_remote, "{result}");
+        assert_ne!(result["remote"], "withdrawn");
+        assert_eq!(result["state"], "withdrawn");
+        assert!(result["answered_by"].is_null());
+        let notice = dispatch(&mut a, "mail.show", json!({"id":result["ended_by"]})).unwrap();
         assert_eq!(
-            dispatch(&mut a, "mail.show", json!({"id":result["ended_by"]})).unwrap()["delivery"],
-            "delivered"
+            notice["delivery"],
+            if error.is_some() {
+                "pending"
+            } else {
+                "delivered"
+            }
         );
+        assert_eq!(notice["delivery_error"], json!(error));
+        assert_eq!(notice["delivery_attempts"], 1);
         assert_eq!(
             dispatch(&mut b, "mail.show", json!({"id":"legacy-end"})).unwrap()["state"],
             "open"
         );
+        // Closure, raw transport failure and lack of application evidence
+        // survive reopening the disposable sender home.
+        let home = a.home().to_owned();
+        drop(a);
+        let mut a = Store::open(&home).unwrap();
+        let mut durable = result.clone();
+        durable.as_object_mut().unwrap().remove("remote");
+        assert_eq!(
+            dispatch(&mut a, "mail.show", json!({"id":"legacy-end"})).unwrap(),
+            durable
+        );
+        assert_eq!(
+            dispatch(&mut a, "mail.show", json!({"id":result["ended_by"]})).unwrap(),
+            notice
+        );
+        let applied: Option<String> = a
+            .connection()
+            .query_row(
+                "SELECT remote_end_state FROM mail WHERE id=?1",
+                [result["ended_by"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, None);
     }
 }
 

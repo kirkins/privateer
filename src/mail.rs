@@ -337,24 +337,27 @@ fn withdraw(store: &Store, args: &Value) -> Result<Value> {
         flush_pending(store, 1, false, None, Some(peer))?;
     }
     let mut result = by_id(store, id)?.context("request vanished")?;
-    result["remote"] =
-        if peer.is_some() {
-            let (applied, delivery, error): (Option<String>, Option<String>, Option<String>) =
-                store.connection().query_row(
-                    "SELECT remote_end_state,delivery,delivery_error FROM mail WHERE id=?1",
-                    [result["ended_by"].as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?;
-            json!(applied.or(error).unwrap_or_else(
-                || if delivery.as_deref() == Some("delivered") {
+    result["remote"] = if peer.is_some() {
+        let (applied, delivery, error): (Option<String>, Option<String>, Option<String>) =
+            store.connection().query_row(
+                "SELECT remote_end_state,delivery,delivery_error FROM mail WHERE id=?1",
+                [result["ended_by"].as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        // Only a verified application receipt may supply a state token.
+        // Keep the raw error durable, but distinguish it in this result.
+        json!(
+            applied
+                .or_else(|| error.map(|e| format!("error: {e}")))
+                .unwrap_or_else(|| if delivery.as_deref() == Some("delivered") {
                     "unknown".to_owned()
                 } else {
                     "pending".to_owned()
-                }
-            ))
-        } else {
-            Value::Null
-        };
+                })
+        )
+    } else {
+        Value::Null
+    };
     Ok(result)
 }
 
