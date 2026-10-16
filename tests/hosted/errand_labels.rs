@@ -62,6 +62,36 @@ fn finish(place: &Place, id: &str) {
         "actual errand payload exit before fixture cleanup",
         || unsafe { libc::kill(pid, 0) } == -1,
     );
+    let job = place.agent("job.status", json!({"id":id}));
+    println!(
+        "headless payload {pid} exited; job {id} status={} incarnation={}",
+        job["status"], job["incarnation"]
+    );
+    if let Some(evidence) = std::env::var_os("ERRAND_LABELS_EVIDENCE") {
+        let incarnation = job["incarnation"].as_str().unwrap();
+        let dest = PathBuf::from(evidence).join(id).join(incarnation);
+        fs::create_dir_all(&dest).unwrap();
+        let logs = place
+            .folder
+            .join(".privateer/jobs")
+            .join(id)
+            .join(incarnation);
+        for entry in fs::read_dir(logs).unwrap().flatten() {
+            if entry.file_type().unwrap().is_file() {
+                fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
+            }
+        }
+        fs::write(
+            dest.join("job.json"),
+            serde_json::to_vec_pretty(&job).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dest.join("lifecycle.json"),
+            json!({"payload_pid":pid,"payload_exited":true,"job_status":job["status"]}).to_string(),
+        )
+        .unwrap();
+    }
     place.tick();
     let list = place.agent("errand.list", json!({}));
     let errand = list["errands"]
@@ -211,6 +241,78 @@ fn errand_captions_refuse_replaced_ambiguous_expired_and_pinned_foreign_endpoint
         expected += 1;
         assert_eq!(captions(&host).len(), expected);
     }
+    place
+        .database()
+        .execute(
+            "UPDATE presence SET binding='malformed' WHERE ship='infra'",
+            [],
+        )
+        .unwrap();
+    place.tick();
+    assert_eq!(captions(&host).len(), expected, "malformed binding");
+    assert_eq!(cache_count(&place), 0);
+    place
+        .database()
+        .execute(
+            "UPDATE presence SET binding=?1 WHERE ship='infra'",
+            [&binding],
+        )
+        .unwrap();
+    place.tick();
+    expected += 1;
+    let holder: String = place
+        .database()
+        .query_row("SELECT holder FROM presence WHERE ship='infra'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    place.database().execute("UPDATE presence SET holder='host:33333333-3333-4333-8333-333333333333' WHERE ship='infra'", []).unwrap();
+    place.tick();
+    assert_eq!(
+        captions(&host).len(),
+        expected,
+        "replacement holder lacks matching launch custody"
+    );
+    assert_eq!(cache_count(&place), 0);
+    place
+        .database()
+        .execute("UPDATE presence SET holder=?1 WHERE ship='infra'", [holder])
+        .unwrap();
+    place.tick();
+    expected += 1;
+    place.database().execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) SELECT 'ambiguous','other',started_ms,expires_ms,binding FROM presence WHERE ship='infra'", []).unwrap();
+    place.tick();
+    assert_eq!(
+        captions(&host).len(),
+        expected,
+        "second binding claiming endpoint"
+    );
+    assert_eq!(cache_count(&place), 0);
+    place
+        .database()
+        .execute("DELETE FROM presence WHERE ship='ambiguous'", [])
+        .unwrap();
+    place.tick();
+    expected += 1;
+
+    let socket = place.root.join("config/herdr/herdr.sock");
+    let old_socket = place.root.join("original.sock");
+    fs::rename(&socket, &old_socket).unwrap();
+    let replacement_host = Herdr::start(&socket, vec![]);
+    // Direct settlement avoids unrelated sidebar/host reconciliation calls.
+    let mut store = privateer::store::Store::open(&place.folder.join(".privateer")).unwrap();
+    privateer::errand::settle(&mut store).unwrap();
+    assert!(
+        replacement_host.requests.lock().unwrap().is_empty(),
+        "wrong socket incarnation never contacted"
+    );
+    assert_eq!(captions(&host).len(), expected);
+    assert_eq!(cache_count(&place), 0);
+    fs::rename(&socket, place.root.join("replacement.sock")).unwrap();
+    fs::rename(old_socket, &socket).unwrap();
+    place.tick();
+    expected += 1;
+
     host.panes.lock().unwrap().push(original.clone());
     place.tick();
     assert_eq!(captions(&host).len(), expected, "duplicate pane/terminal");
