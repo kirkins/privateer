@@ -41,6 +41,23 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 use store::{Caller, Store};
 
+/// Default a bundled Codex crew's sandbox when the caller chose none. Absent
+/// or malformed options are left for the plugin layer to refuse cleanly rather
+/// than panicking on an index assignment here. Returns whether this is a
+/// bundled Codex launch.
+fn codex_crew_sandbox_default(args: &mut Value) -> bool {
+    if args["manifest"] != "bundled:codex" {
+        return false;
+    }
+    if args["options"].is_null() {
+        args["options"] = serde_json::json!({});
+    }
+    if args["options"].is_object() && args["options"].get("sandbox").is_none() {
+        args["options"]["sandbox"] = serde_json::json!("danger-full-access");
+    }
+    true
+}
+
 /// Commands that change authority, configuration or capacity. Agents
 /// launched by Privateer cannot run them; see `store::Caller`.
 pub const OPERATOR_COMMANDS: &[&str] = &[
@@ -150,6 +167,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     }
                 }
             }
+            // Codex crew need network and supervised nested jobs, like the Pi
+            // crew. Keep an explicit sandbox choice, including read-only.
+            let codex = codex_crew_sandbox_default(&mut args);
+            let codex_read_only = codex
+                && args["options"].get("sandbox").and_then(Value::as_str) == Some("read-only");
             // A provider that is throttling this route only fails another run.
             let model_route = args["manifest"]
                 .as_str()
@@ -242,6 +264,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 // through job.start with heavy and wait_for_capacity.
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))
             });
+            if codex_read_only {
+                job["codex_read_only_crew"] = Value::Bool(true);
+            }
             for key in [
                 "id",
                 "estimate",
@@ -294,5 +319,34 @@ pub fn rpc(store: &mut Store, request: Value) -> Value {
     match result {
         Ok(result) => serde_json::json!({"id":id,"ok":true,"result":result}),
         Err(error) => serde_json::json!({"id":id,"ok":false,"error":error.to_string()}),
+    }
+}
+
+#[cfg(test)]
+mod codex_crew_sandbox_default_tests {
+    use super::codex_crew_sandbox_default;
+    use serde_json::json;
+
+    #[test]
+    fn defaults_only_when_absent_and_never_panics_on_malformed_options() {
+        let mut absent = json!({"manifest":"bundled:codex","options":{}});
+        assert!(codex_crew_sandbox_default(&mut absent));
+        assert_eq!(absent["options"]["sandbox"], json!("danger-full-access"));
+
+        let mut null = json!({"manifest":"bundled:codex","options":null});
+        assert!(codex_crew_sandbox_default(&mut null));
+        assert_eq!(null["options"]["sandbox"], json!("danger-full-access"));
+
+        let mut chosen = json!({"manifest":"bundled:codex","options":{"sandbox":"read-only"}});
+        assert!(codex_crew_sandbox_default(&mut chosen));
+        assert_eq!(chosen["options"]["sandbox"], json!("read-only"));
+
+        let mut malformed = json!({"manifest":"bundled:codex","options":"nope"});
+        assert!(codex_crew_sandbox_default(&mut malformed));
+        assert_eq!(malformed["options"], json!("nope"));
+
+        let mut other = json!({"manifest":"bundled:pi","options":{}});
+        assert!(!codex_crew_sandbox_default(&mut other));
+        assert!(other["options"].get("sandbox").is_none());
     }
 }

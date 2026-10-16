@@ -998,3 +998,85 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
         .unwrap();
     assert_eq!(left, 0);
 }
+
+#[test]
+fn codex_crew_sandbox_defaults_and_flags_read_only() {
+    let fleet = Fleet::new(now_settings());
+    // An isolated bundled:codex manifest so the test never runs real Codex.
+    let plugins = fleet.root.join("plugins");
+    fs::create_dir_all(plugins.join("codex")).unwrap();
+    fs::write(
+        plugins.join("codex/manifest.json"),
+        json!({
+            "schema_version":1,"id":"codex",
+            "executable":["python3", fleet.root.join("codex_adapter.py")],
+            "timeout_ms":2000,"max_output_bytes":65536
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        fleet.root.join("codex_adapter.py"),
+        r#"import json,sys
+r=json.loads(sys.stdin.readline())
+sandbox=r.get("options",{}).get("sandbox","-")
+print(json.dumps({"id":r["id"],"version":1,"ok":True,"result":{"argv":[sys.executable,"-c","import sys;sys.exit(0)","--sandbox",sandbox],"cwd":r["context"]["repo"],"env_names":[]}}))
+"#,
+    )
+    .unwrap();
+    let start = |args: Value| {
+        let mut cmd = fleet.command();
+        cmd.env("PRIVATEER_PLUGINS", &plugins)
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "infra")
+            .args(["agent.start", "--json", &args.to_string()]);
+        cmd.output().unwrap()
+    };
+    let repo = fleet.root.join("repo");
+
+    let default = start(json!({"id":"codex-default","task_id":"infra-repair",
+        "manifest":"bundled:codex","options":{},"cwd":repo}));
+    assert!(
+        default.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let job: Value = serde_json::from_slice(&default.stdout).unwrap();
+    assert!(
+        job["command"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|p| p == ["--sandbox", "danger-full-access"]),
+        "{job}"
+    );
+    assert_ne!(job["codex_read_only_crew"], json!(true), "{job}");
+
+    let read_only = start(json!({"id":"codex-read-only","task_id":"infra-repair",
+        "manifest":"bundled:codex","options":{"sandbox":"read-only"},"cwd":repo}));
+    assert!(
+        read_only.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read_only.stderr)
+    );
+    let job: Value = serde_json::from_slice(&read_only.stdout).unwrap();
+    assert!(
+        job["command"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|p| p == ["--sandbox", "read-only"]),
+        "{job}"
+    );
+    assert_eq!(job["codex_read_only_crew"], json!(true), "{job}");
+
+    // Malformed options must reach the clean typed error, never a panic.
+    let malformed = start(json!({"id":"codex-malformed","task_id":"infra-repair",
+        "manifest":"bundled:codex","options":"nope","cwd":repo}));
+    assert!(!malformed.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("plugin options must be an object"),
+        "{}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+}

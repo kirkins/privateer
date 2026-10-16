@@ -859,6 +859,57 @@ fn vanished_supervisor_with_ended_payload_settles_as_failed() {
 }
 
 #[test]
+fn a_read_only_codex_crew_that_reports_nothing_is_recorded_failed() {
+    let fixture = Fixture::new();
+    let home = fixture.home("home", 0);
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"readonly-noop","command":["sh","-c","exit 0"],
+            "heavy":true,"codex_read_only_crew":true}),
+    );
+    let settled = wait(&home, "readonly-noop", &["failed", "succeeded"]);
+    assert_eq!(settled["status"], "failed", "{settled}");
+    assert!(
+        settled["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("read-only"),
+        "{settled}"
+    );
+}
+
+#[test]
+fn a_read_only_codex_crew_with_a_durable_report_succeeds() {
+    let fixture = Fixture::new();
+    let home = fixture.home("home", 0);
+    let started = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"readonly-reported","command":["sh","-c","sleep 1; exit 0"],
+            "heavy":true,"codex_read_only_crew":true}),
+    );
+    let incarnation = started["incarnation"].as_str().unwrap().to_owned();
+    {
+        let store = Store::open(&home).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+                 VALUES(?1,'crew','peer','notice','task','reported',?2,'normal',0,NULL)",
+                params![
+                    format!("crew-readonly-reported-{incarnation}"),
+                    json!({"job_id":"readonly-reported","incarnation":incarnation.clone(),"report":"did work"})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+    }
+    let settled = wait(&home, "readonly-reported", &["failed", "succeeded"]);
+    assert_eq!(settled["status"], "succeeded", "{settled}");
+}
+
+#[test]
 fn agent_jobs_carry_the_role_into_their_payload() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);

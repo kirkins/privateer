@@ -90,6 +90,16 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
             .any(|p| p[0] == "--add-dir" && p[1] == json!(f.store.home()))
     );
     assert!(argv.iter().any(|v| v == "--ephemeral"));
+    let mut args = f.args(&example("codex"));
+    args["options"] = json!({"sandbox":"read-only"});
+    let command = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+    assert!(
+        command["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair[0] == "--sandbox" && pair[1] == "read-only")
+    );
     for invalid in [
         json!({"sandbox":"unrestricted"}),
         json!({"ephemeral":"true"}),

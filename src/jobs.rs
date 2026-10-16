@@ -109,6 +109,10 @@ struct Job {
     /// A harness job's `harness/provider/model`, for provider backoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_route: Option<String>,
+    /// Bundled Codex read-only crew must leave a durable report; otherwise a
+    /// sandboxed no-op would be indistinguishable from successful work.
+    #[serde(default)]
+    codex_read_only_crew: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -1056,6 +1060,10 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .and_then(Value::as_str)
             .filter(|_| agent)
             .map(str::to_owned),
+        codex_read_only_crew: args
+            .get("codex_read_only_crew")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
     let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -1824,6 +1832,18 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     if outcome == "succeeded" && !status.success() {
         outcome = "failed";
     }
+    if outcome == "succeeded" && job.codex_read_only_crew {
+        let reported: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE json_extract(payload,'$.job_id')=?1
+                AND json_extract(payload,'$.incarnation')=?2 AND json_extract(payload,'$.report') IS NOT NULL)",
+            params![job.id, job.incarnation],
+            |row| row.get(0),
+        )?;
+        if !reported {
+            outcome = "failed";
+            reason = Some("Codex read-only crew exited without a durable crew report".into());
+        }
+    }
     job = alter(store, id, |j| {
         j.status = if group_remains {
             "orphaned".into()
@@ -2294,7 +2314,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
             );
             store.authorize(&old.task_id, "recovery")?;
-            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate, "wait_for_capacity": old.wait_for_capacity, "max_wait_secs": old.max_wait_secs});
+            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate, "wait_for_capacity": old.wait_for_capacity, "max_wait_secs": old.max_wait_secs, "codex_read_only_crew": old.codex_read_only_crew});
             if let Some(id) = args.get("new_id") {
                 next["id"] = id.clone();
             }
