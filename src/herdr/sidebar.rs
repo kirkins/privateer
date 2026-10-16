@@ -4,7 +4,14 @@ use super::Binding;
 use crate::store::Store;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OpenFlags, params};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
+
+// Presentation must not hold up local repair, mail or a launch behind a
+// fleet's worth of slow databases. Registry and homes share this deadline.
+const FLEET_BUDGET: Duration = Duration::from_millis(200);
 
 pub(crate) fn mates(conn: &Connection) -> Result<Vec<(String, Binding)>> {
     let mut query = conn.prepare(
@@ -25,21 +32,26 @@ pub(crate) fn mates(conn: &Connection) -> Result<Vec<(String, Binding)>> {
         .collect())
 }
 
-fn connection(path: &Path) -> Result<Connection> {
+fn connection(path: &Path, deadline: Instant) -> Result<Connection> {
+    ensure!(Instant::now() < deadline, "sidebar fleet budget spent");
     ensure!(path.is_absolute(), "sidebar path must be absolute");
     crate::store::reject_symlinks(path)?;
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.busy_timeout(Duration::from_millis(100))?;
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    conn.progress_handler(10_000, Some(move || std::time::Instant::now() >= deadline));
+    // Skip contention rather than repeatedly spending the remaining budget
+    // on busy retries. This also bounds waits during prepare/schema reads,
+    // where SQLite need not invoke the VM progress callback.
+    conn.busy_timeout(Duration::ZERO)?;
+    conn.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    ensure!(Instant::now() < deadline, "sidebar fleet budget spent");
     Ok(conn)
 }
 
 /// Do not create homes, migrate schemas or let a broken fleet member prevent
 /// recovery for the rest. The dispatcher's own connection is a separate fallback.
 pub(super) fn fleet_mates() -> Vec<(String, Binding)> {
+    let deadline = Instant::now() + FLEET_BUDGET;
     let read = || -> Result<Vec<(String, std::path::PathBuf)>> {
-        let conn = connection(&crate::fleet::registry_path()?)?;
+        let conn = connection(&crate::fleet::registry_path()?, deadline)?;
         Ok(conn
             .prepare(
                 "SELECT name,home FROM ships WHERE retired_ms IS NULL ORDER BY name LIMIT 200",
@@ -49,7 +61,10 @@ pub(super) fn fleet_mates() -> Vec<(String, Binding)> {
     };
     let mut found = vec![];
     for (name, home) in read().unwrap_or_default() {
-        if let Ok(conn) = connection(&home.join("privateer.sqlite")) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(conn) = connection(&home.join("privateer.sqlite"), deadline) {
             found.extend(
                 mates(&conn)
                     .unwrap_or_default()
