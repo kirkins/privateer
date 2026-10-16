@@ -78,6 +78,8 @@ impl Owner {
 #[serde(deny_unknown_fields)]
 struct Claim {
     registry: (u64, u64),
+    guard: (u64, u64),
+    live: (u64, u64),
     owner: Owner,
     token: String,
     binding: Option<Binding>,
@@ -231,13 +233,20 @@ impl Coordination {
         ensure!(raw.len() <= 65_536, "bridge claim exceeds 64 KiB");
         let claim: Claim = serde_json::from_slice(&raw)?;
         ensure!(
-            claim.registry == self.registry && uuid::Uuid::parse_str(&claim.token).is_ok(),
+            claim.registry == self.registry
+                && claim.guard == identity(&self.dir.join("guard"))?
+                && uuid::Uuid::parse_str(&claim.token).is_ok(),
             "bridge claim scope changed"
         );
         Ok(Some(claim))
     }
     fn save(&self, claim: &Claim) -> Result<()> {
         self.validate()?;
+        ensure!(
+            claim.guard == identity(&self.dir.join("guard"))?
+                && claim.live == identity(&self.dir.join("live"))?,
+            "bridge coordination incarnation changed"
+        );
         // One bounded staging file, also after an interrupted durable rename.
         let next = self.dir.join("claim.next");
         let mut f = file(&next, true)?;
@@ -249,8 +258,15 @@ impl Coordination {
         File::open(&self.dir)?.sync_all()?;
         Ok(())
     }
-    fn live(&self) -> Result<(File, bool)> {
-        let f = file(&self.dir.join("live"), true)?;
+    fn live(&self, claim: Option<&Claim>) -> Result<(File, bool)> {
+        // A removed/replaced lease PATH is not proof that a dashboard holding
+        // the old open inode exited. Never recreate it for an existing claim.
+        let f = file(&self.dir.join("live"), claim.is_none())?;
+        let m = f.metadata()?;
+        ensure!(
+            claim.is_none_or(|c| c.live == (m.dev(), m.ino())),
+            "bridge lifetime lease incarnation changed"
+        );
         let free = try_lock(&f)?;
         Ok((f, free))
     }
@@ -279,8 +295,8 @@ pub(crate) fn maintain(store: &Store) -> Result<Value> {
         return Ok(Value::Null);
     };
     let coord = Coordination::open(true)?;
-    let (_live, free) = coord.live()?;
     let mut previous = coord.read()?;
+    let (_live, free) = coord.live(previous.as_ref())?;
     if let Some(claim) = previous.as_ref() {
         if let Some(binding) = &claim.binding {
             let socket = super::socket().context("no Herdr socket configured")?;
@@ -351,6 +367,8 @@ pub(crate) fn maintain(store: &Store) -> Result<Value> {
         .map_or(1, |c| c.failures.saturating_add(1).clamp(1, 7));
     let mut claim = Claim {
         registry: coord.registry,
+        guard: identity(&coord.dir.join("guard"))?,
+        live: identity(&coord.dir.join("live"))?,
         owner: owner_now,
         token: uuid::Uuid::new_v4().to_string(),
         binding: None,
@@ -419,7 +437,7 @@ pub(crate) fn focus(home: Option<&Path>) -> Result<bool> {
     let Some(claim) = coord.read()? else {
         return Ok(false);
     };
-    let (_lease, free) = coord.live()?;
+    let (_lease, free) = coord.live(Some(&claim))?;
     ensure!(!free && claim.adopted, "bridge has no live dashboard lease");
     coord.owner(&claim.owner)?;
     let binding = claim.binding.context("bridge endpoint unknown")?;
@@ -451,7 +469,7 @@ pub fn adopt() -> Result<Option<Lease>> {
         claim.token == token && !claim.adopted,
         "stale bridge launch token"
     );
-    let (lease, free) = coord.live()?;
+    let (lease, free) = coord.live(Some(&claim))?;
     ensure!(free, "another dashboard holds the bridge lease");
     coord.owner(&claim.owner)?;
     let binding = Binding::capture()?.context("bridge requires exact Herdr caller identity")?;

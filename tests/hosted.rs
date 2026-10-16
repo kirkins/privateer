@@ -802,6 +802,30 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
         assert_eq!(herdr.calls("pane.focus").len(), 1);
         assert!(herdr.calls("agent.focus").is_empty());
     };
+    // A removed/replaced lock PATH does not prove its original open inode (or
+    // its actual dashboard) died. Pin both coordination incarnations too.
+    for name in ["live", "guard"] {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = coordination.join(name);
+        let saved_path = coordination.join(format!("{name}.saved"));
+        fs::rename(&path, &saved_path).unwrap();
+        if name == "live" {
+            assert!(tick(&apps)["bridge"]["error"].is_string());
+            assert!(!command(&apps, &[]).output().unwrap().status.success());
+            no_effects();
+        }
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(tick(&apps)["bridge"]["error"].is_string());
+        assert!(!command(&apps, &[]).output().unwrap().status.success());
+        no_effects();
+        fs::remove_file(&path).unwrap();
+        fs::rename(saved_path, path).unwrap();
+    }
     // Same plausible label is never endpoint ownership. Every authoritative
     // identity change, duplicate/malformed snapshot and changed socket refuses
     // BOTH automatic adoption/recreation and manual focus.

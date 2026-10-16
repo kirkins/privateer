@@ -32,7 +32,8 @@ Coordination lives beside the existing fleet registry at `<registry>.bridge/`:
 an owned 0700 directory, no symlinks, private regular single-link files, an atomic
 cross-home `guard` flock, a bounded atomically replaced/fsynced claim and a separate
 `live` flock held by the **direct dashboard process** until exit. The claim pins
-registry and hosting-home identities/origin, a unique launch token, full socket
+registry, guard/live-file incarnations and hosting-home identities/origin, a
+unique launch token, full socket
 device/inode incarnation, pane/workspace/tab/terminal and exact agent/session.
 The operator-only startup handshake validates that token and the new endpoint;
 it does not mutate Herdr. No titles or metadata tokens confer ownership.
@@ -47,7 +48,8 @@ and focus are separate operations, not an atomic occupant lock.
 
 Closing a bridge permits recreation only after a valid same-incarnation snapshot
 shows its entire old location gone **and** its direct dashboard's kernel lease
-has disappeared. A transient missing pane while the dashboard still lives, or an
+has disappeared. A removed or replaced lease/guard path is not lease expiry:
+its recorded device/inode must still match. A transient missing pane while the dashboard still lives, or an
 unadopted launch whose pane still exists, cannot cause another create or input
 replay. A new claim fences delayed old-token adoption. Retries reserve durable
 60-second exponential backoff capped at an hour, independently of wake budgets.
