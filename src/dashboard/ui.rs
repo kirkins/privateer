@@ -268,6 +268,7 @@ impl App {
             self.home_error.is_none() && self.home_age.is_some_and(|a| a < 10),
             "Privateer observation unavailable/stale"
         );
+        anyhow::ensure!(!self.snapshot.truncated, "Fleet scope truncated; focus refused");
         anyhow::ensure!(
             self.herdr_error.is_none()
                 && self.herdr_age.is_some_and(|a| a < 10)

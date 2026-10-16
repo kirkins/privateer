@@ -483,15 +483,17 @@ mod tests {
         assert!(app.bridge_key(KeyCode::Enter));
         request_focus(&mut app, Some(&send));
         assert_eq!(receive.try_recv().unwrap().pane.pane_id, "demo:apps");
-        for case in ["stale", "demo", "ambiguous", "invalid"] {
+        for case in ["stale", "demo", "ambiguous", "truncated", "invalid"] {
             app.herdr_age = Some(0);
             app.demo = false;
             app.snapshot.presentation_error = None;
+            app.snapshot.truncated = false;
             app.selection_invalidated = false;
             match case {
                 "stale" => app.herdr_age = Some(10),
                 "demo" => app.demo = true,
                 "ambiguous" => app.snapshot.presentation_error = Some("conflict".into()),
+                "truncated" => app.snapshot.truncated = true,
                 _ => app.selection_invalidated = true,
             }
             request_focus(&mut app, Some(&send));

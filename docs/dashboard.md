@@ -36,7 +36,8 @@ first exact manual pane/terminal binding. Similar labels never establish ownersh
 The existing socket/pane/terminal/workspace/tab/agent/native-session checks
 still run immediately before `agent.focus`. Fresh fleet binding and home identity
 are also checked in the worker. Stale/reused/replaced/ambiguous selections refuse;
-refresh and explicitly reselect. Refresh never focuses anything. Herdr snapshot
+refresh and explicitly reselect. Truncated fleet scope also refuses focus, answers
+and history read intent. Refresh never focuses anything. Herdr snapshot
 and focus are separate server operations, **not** an atomic occupant lock.
 
 Optional `<home>/dashboard.yaml`, `.yml` or `.json` presentation retains the
