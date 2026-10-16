@@ -371,6 +371,7 @@ pub(crate) fn maintain(store: &Store) -> Result<Value> {
         store.home().parent().context("ship folder")?,
         &binary,
         store.home(),
+        &coord.registry_path,
         &token,
         |pane| {
             claim.binding = pane.map(|pane| Binding {

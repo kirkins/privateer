@@ -613,6 +613,10 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     let apps = place.root.join("apps/.privateer");
     fs::create_dir_all(apps.parent().unwrap()).unwrap();
     let infra = place.folder.join(".privateer");
+    let fleet = place.root.join("state/privateer/fleet.sqlite");
+    fs::create_dir_all(fleet.parent().unwrap()).unwrap();
+    fs::rename(place.root.join("fleet.sqlite"), &fleet).unwrap();
+    let coordination = fleet.with_file_name("fleet.sqlite.bridge");
     let runtime = place.root.join("runtime ' bridge");
     fs::create_dir(&runtime).unwrap();
     let binary = runtime.join("privateer");
@@ -629,7 +633,8 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
             .env("HOME", &place.root)
             .env("XDG_CONFIG_HOME", place.root.join("config"))
             .env("XDG_STATE_HOME", place.root.join("state"))
-            .env("PRIVATEER_FLEET", place.root.join("fleet.sqlite"))
+            // Deliberately no PRIVATEER_FLEET override: host must forward the
+            // resolved default despite Herdr's different XDG environment.
             .env("PRIVATEER_RESOURCE_HOME", place.root.join("ledger"))
             .env("PRIVATEER_SERVICE", "none");
         c
@@ -668,7 +673,7 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
             ),
             (
                 "XDG_STATE_HOME".into(),
-                place.root.join("state").display().to_string(),
+                place.root.join("herdr-state").display().to_string(),
             ),
         ],
     );
@@ -692,10 +697,10 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     configure(&infra, "infra", false);
     assert!(tick(&infra)["bridge"].is_null());
     assert!(tick(&apps)["bridge"].is_null());
-    assert!(!place.root.join("fleet.sqlite.bridge").exists());
+    assert!(!coordination.exists());
     configure(&infra, "infra", true);
     configure(&apps, "apps", true);
-    let claim_path = place.root.join("fleet.sqlite.bridge/claim.json");
+    let claim_path = coordination.join("claim.json");
     let claim = || -> Value { serde_json::from_slice(&fs::read(&claim_path).unwrap()).unwrap() };
     let retry = || {
         let mut c = claim();
@@ -755,6 +760,7 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     let create = &herdr.calls("workspace.create")[0]["params"];
     assert_eq!(create["focus"], false);
     assert_eq!(create["label"], "bridge");
+    assert_eq!(create["env"]["PRIVATEER_FLEET"], fleet.to_str().unwrap());
     let input = herdr.calls("pane.send_input")[0]["params"]["text"]
         .as_str()
         .unwrap()
@@ -892,7 +898,7 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     assert!(herdr.calls("agent.focus").is_empty());
     herdr.dashboards.lock().unwrap()[1].stop();
     use std::os::fd::AsRawFd;
-    let lease = fs::File::open(place.root.join("fleet.sqlite.bridge/live")).unwrap();
+    let lease = fs::File::open(coordination.join("live")).unwrap();
     assert_eq!(
         unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0,

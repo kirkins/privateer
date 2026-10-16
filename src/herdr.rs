@@ -324,6 +324,7 @@ impl Client {
         folder: &Path,
         binary: &Path,
         home: &Path,
+        registry: &Path,
         token: &str,
         record: impl FnMut(Option<&Pane>) -> Result<()>,
     ) -> Result<Pane> {
@@ -334,7 +335,16 @@ impl Client {
             folder,
             "bridge",
             false,
-            &[("PRIVATEER_BRIDGE_TOKEN", token)],
+            &[
+                ("PRIVATEER_BRIDGE_TOKEN", token),
+                // Herdr may have a different HOME/XDG environment from its
+                // dispatchers. Pin the resolved registry even without an
+                // explicit PRIVATEER_FLEET override in the launching service.
+                (
+                    "PRIVATEER_FLEET",
+                    registry.to_str().context("fleet path must be UTF-8")?,
+                ),
+            ],
             binary,
             home,
             &[],
