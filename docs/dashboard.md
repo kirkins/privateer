@@ -118,6 +118,17 @@ not become newly recent. Rows retain home and current recorded owner, dim after
 Arbitrary event prose, titles and exit status cannot establish a merge. Reads and
 retention are bounded to 200 rows, with source truncation visible.
 
+`Snapshot.truncated` means recorded display/history rows were clipped, not that
+runtime homes went undiscovered. This remains visible as “recorded history
+clipped”; it does not suppress authoritative typed needs, answers, explicit history
+reads or validated existing-pane focus. The separate `discovery` state is complete
+only after successful bounded fleet/home mapping (or a successfully read explicit
+local fallback). Default/older serialized snapshots are unknown, never implicitly
+complete. More than 200 discovered identities, unavailable homes or invalid mapping
+remain incomplete; unknown/incomplete scope refuses actions even with retained
+facts. An empty registered fleet cannot resurrect a retired fallback home. Failed
+refreshes retain evidence, not permission to act or an all-clear.
+
 ## Mail history and controls
 
 `i` opens separate captain history through existing `mail.inbox` / `mail.requests`
@@ -132,7 +143,7 @@ Read/unread markers are generation-bound to that identity and origin, invalidate
 on replacement, retirement, ambiguity or failed observation. History selection
 also pins physical generation, origin and message ID: disappearance or replacement
 clears selection rather than selecting an adjacent row. Enter cannot mark another
-row until explicit navigation/reselection. Truncated/unavailable fleet scope refuses
+row until explicit navigation/reselection. Incomplete/unknown/unavailable fleet scope refuses
 history write intent; retained rows may remain visible read-only. Before acknowledgement
 the pinned connection rechecks the selected message and actual unread mailbox
 prefix against the observed page. Requests merged from later pages cannot skip
@@ -176,7 +187,11 @@ reserved and tested; the bridge runs no animation timer.
 Validation uses disposable databases, fake Herdr sockets and actual keyboard to
 action/command scenarios, not screen snapshots. Preserve the identity/privacy/
 custody/read-only safety tests; old tab/boarding-layout smoke expectations are
-replaced. Run through resource admission on a clean frozen SHA:
+replaced. The live PTY proof observes incremental current terminal cells, including
+cursor placement, erasure and split UTF-8/escape chunks; it never matches concatenated
+raw frames. Denial requires a newly changed outcome match, not the earlier reply's
+notice. Unsupported terminal controls fail the proof rather than being stripped.
+Run through resource admission on a clean frozen SHA:
 
 ```sh
 cargo fmt --check

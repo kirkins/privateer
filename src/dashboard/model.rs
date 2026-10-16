@@ -222,6 +222,17 @@ pub struct Recent {
     pub completed_ms: i64,
 }
 
+/// Discovery is independent of clipped recorded work. Defaults/older serialized
+/// snapshots have no evidence of successful home discovery and must fail closed.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Discovery {
+    #[default]
+    Unknown,
+    Complete,
+    Incomplete,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Snapshot {
     #[serde(default)]
@@ -234,10 +245,17 @@ pub struct Snapshot {
     pub pending: Vec<Notice>,
     pub activity: Vec<Notice>,
     pub jobs: Vec<Job>,
+    /// Recorded display rows were clipped; NOT evidence of undiscovered homes.
     pub truncated: bool,
+    #[serde(default)]
+    pub discovery: Discovery,
 }
 
 impl Snapshot {
+    pub fn scope_complete(&self) -> bool {
+        self.discovery == Discovery::Complete
+    }
+
     pub fn include_observed_ships(&mut self) {
         let mut observed = BTreeSet::new();
         for task in &self.tasks {
@@ -463,6 +481,8 @@ impl Snapshot {
                 status: "running".into(),
             }],
             truncated: false,
+            // Synthetic scope only; all live actions still refuse demo mode.
+            discovery: Discovery::Complete,
         };
         sample.include_observed_ships();
         sample

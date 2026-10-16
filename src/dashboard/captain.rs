@@ -370,7 +370,7 @@ impl App {
             Line::from(if self.demo {
                 "Sample mailbox · viewing does not acknowledge or answer this item."
             } else {
-                "Enter: mark read · r: reply. A read acknowledges only the contiguous read prefix."
+                "Enter: mark read · Esc: bridge. A read acknowledges only the contiguous read prefix."
             }),
         ]);
         lines

@@ -139,8 +139,9 @@ impl Attention {
     fn step_as(&mut self, snapshot: &Snapshot, fallback: Option<&Path>, caller: &Caller) {
         let homes = homes(snapshot, fallback);
         self.error = snapshot.presentation_error.clone();
-        if snapshot.truncated {
-            self.error = Some("Fleet is bounded; unobserved homes remain unknown".into());
+        if !snapshot.scope_complete() {
+            self.error =
+                Some("Fleet discovery incomplete/unknown; unobserved homes remain unknown".into());
         }
         for source in &mut self.sources {
             if !homes.contains_key(&source.home) {
@@ -346,8 +347,8 @@ fn execute_as(
     caller.require_operator("bridge answer")?;
     let need = &answer.need;
     ensure!(
-        !snapshot.truncated && snapshot.presentation_error.is_none(),
-        "presentation scope truncated/unavailable"
+        snapshot.scope_complete() && snapshot.presentation_error.is_none(),
+        "discovery/presentation scope incomplete/unknown/unavailable"
     );
     ensure!(
         attention.actionable(need),
@@ -550,7 +551,11 @@ mod tests {
         )
         .unwrap();
         let app = App {
-            snapshot: Snapshot::read(store.home()).unwrap(),
+            snapshot: super::super::fleet::read(
+                &root.path().join("fleet.sqlite"),
+                Some(store.home()),
+            )
+            .unwrap(),
             ..App::default()
         };
         (root, store, app)
@@ -583,6 +588,69 @@ mod tests {
             answer,
             Caller::Operator,
         )
+    }
+
+    #[test]
+    fn clipped_recorded_jobs_do_not_hide_needs_or_block_reply_without_ack() {
+        let (root, mut store, mut app) = fixture();
+        for index in 0..201 {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                    rusqlite::params![
+                        format!("history-{index}"),
+                        json!({"task_id":"main","status":"succeeded"}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        crate::dispatch(&mut store, "mail.send", json!({"id":"question","from":"apps","to":"captain","kind":"request","body":"Please answer"})).unwrap();
+        app.snapshot =
+            super::super::fleet::read(&root.path().join("fleet.sqlite"), Some(store.home()))
+                .unwrap();
+        assert!(app.snapshot.truncated && app.snapshot.scope_complete());
+        assert_eq!(app.snapshot.jobs.len(), 200);
+        observe(&mut app, store.home());
+        assert!(app.attention.error.is_none());
+        assert_eq!(app.attention.items().len(), 1);
+        let answer = intent(&mut app, "explicit reply");
+        // Neither unknown defaults nor older serialized snapshots supply discovery evidence.
+        let mut unknown = app.snapshot.clone();
+        unknown.discovery = super::super::model::Discovery::Unknown;
+        let mut retained = app.attention.clone();
+        retained.step_as(&unknown, Some(store.home()), &Caller::Operator);
+        assert!(retained.error.is_some());
+        assert_eq!(retained.items().len(), 1);
+        assert!(!retained.actionable(&answer.need));
+        assert!(
+            execute_as(
+                &unknown,
+                Some(store.home()),
+                &app.attention,
+                &answer,
+                Caller::Operator
+            )
+            .is_err()
+        );
+        let mut serialized = serde_json::to_value(&app.snapshot).unwrap();
+        serialized.as_object_mut().unwrap().remove("discovery");
+        assert!(
+            !serde_json::from_value::<Snapshot>(serialized)
+                .unwrap()
+                .scope_complete()
+        );
+        assert!(!Snapshot::default().scope_complete());
+        assert_eq!(
+            act(&app, store.home(), &answer).unwrap()["body"],
+            "explicit reply"
+        );
+        assert_eq!(
+            crate::dispatch(&mut store, "mail.inbox", json!({"address":"captain"})).unwrap()["acknowledged_through"],
+            0
+        );
+        observe(&mut app, store.home());
+        assert!(app.attention.items().is_empty());
     }
 
     #[test]
@@ -720,7 +788,7 @@ mod tests {
         assert!(app.attention.actionable(&answer.need));
         assert_eq!(app.answer.as_ref().unwrap().id, answer.id);
         let mut truncated = app.snapshot.clone();
-        truncated.truncated = true;
+        truncated.discovery = super::super::model::Discovery::Incomplete;
         assert!(
             execute_as(
                 &truncated,

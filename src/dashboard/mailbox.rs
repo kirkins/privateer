@@ -258,10 +258,10 @@ impl Mailbox {
             }
         }
         messages.sort_by_key(|m| (priority(m), m.home.clone(), m.seq));
-        if readonly && (snapshot.truncated || snapshot.presentation_error.is_some()) {
+        if readonly && (!snapshot.scope_complete() || snapshot.presentation_error.is_some()) {
             self.valid.clear();
             self.read.clear();
-            errors.push("History scope truncated/unavailable; retained rows are read-only".into());
+            errors.push("History discovery scope incomplete/unknown/unavailable; retained rows are read-only".into());
         }
         self.messages = messages;
         self.errors = errors;
@@ -311,7 +311,7 @@ impl Mailbox {
         let scope = super::bridge::homes(snapshot, fallback);
         anyhow::ensure!(scope.len() <= 200, "history scope exceeds bound");
         anyhow::ensure!(
-            !snapshot.truncated
+            snapshot.scope_complete()
                 && snapshot.presentation_error.is_none()
                 && scope.get(home).is_some_and(Option::is_none),
             "history home retired/unavailable"
@@ -443,7 +443,10 @@ mod tests {
             )
             .unwrap();
         }
-        let snapshot = Snapshot::default();
+        let mut snapshot =
+            super::super::fleet::read(&root.path().join("fleet.sqlite"), Some(&home)).unwrap();
+        // Clipped recorded rows must not prevent explicit generation-bound reads.
+        snapshot.truncated = true;
         let mut denied = Mailbox::default();
         denied.refresh_mode(
             Path::new(""),
@@ -538,13 +541,19 @@ mod tests {
                 .is_err()
         );
         let mut incomplete = snapshot.clone();
-        incomplete.truncated = true;
+        incomplete.discovery = super::super::model::Discovery::Incomplete;
         assert!(
             mailbox
                 .mark_read_existing_as(&incomplete, Some(&home), &second, Caller::Operator)
                 .is_err()
         );
-        incomplete.truncated = false;
+        incomplete.discovery = super::super::model::Discovery::Unknown;
+        assert!(
+            mailbox
+                .mark_read_existing_as(&incomplete, Some(&home), &second, Caller::Operator)
+                .is_err()
+        );
+        incomplete.discovery = super::super::model::Discovery::Complete;
         incomplete.presentation_error = Some("unavailable scope".into());
         assert!(
             mailbox

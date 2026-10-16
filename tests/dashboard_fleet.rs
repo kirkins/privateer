@@ -289,6 +289,8 @@ fn fleet_uses_each_home_and_never_resurrects_a_missing_ship() {
     );
     fs::remove_dir_all(&gone).unwrap();
     let view = m.dashboard();
+    assert_eq!(view["snapshot"]["discovery"], "incomplete");
+    assert!(!view["attention"]["error"].is_null());
     let ships = view["snapshot"]["ships"].as_array().unwrap();
     assert_eq!(ships.len(), 3);
     let app = ships.iter().find(|s| s["id"] == "apps").unwrap();
@@ -321,6 +323,46 @@ fn fleet_uses_each_home_and_never_resurrects_a_missing_ship() {
         2
     );
     assert!(infra.exists());
+}
+
+#[test]
+fn bounded_discovery_and_retired_fallback_are_not_complete_empty_history() {
+    use privateer::dashboard::{fleet, model::Discovery};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let registry = m.root.join("fleet.sqlite");
+    let connection = rusqlite::Connection::open(&registry).unwrap();
+    // A real bounded discovery query, independent of recorded work clipping.
+    for index in 0..200 {
+        connection
+            .execute(
+                "INSERT INTO ships(name,home,created_by,created_ms) VALUES(?1,?2,'fixture',0)",
+                rusqlite::params![
+                    format!("peer-{index:03}"),
+                    m.root.join("absent").to_str().unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    let snapshot = fleet::read(&registry, None).unwrap();
+    assert_eq!(snapshot.discovery, Discovery::Incomplete);
+    assert_eq!(snapshot.ships.len(), 200);
+    assert!(!snapshot.truncated, "no recorded work was clipped");
+    connection
+        .execute("DELETE FROM ships WHERE name<>'apps'", [])
+        .unwrap();
+    assert!(fleet::read(&registry, None).unwrap().scope_complete());
+    connection
+        .execute("UPDATE ships SET retired_ms=1 WHERE name='apps'", [])
+        .unwrap();
+    assert!(
+        fleet::read(&registry, Some(&apps.join(".privateer")))
+            .unwrap_err()
+            .to_string()
+            .contains("retired")
+    );
+    assert!(!fleet::read(&registry, None).unwrap().scope_complete());
+    assert!(apps.join(".privateer/privateer.sqlite").is_file());
 }
 
 #[test]
@@ -1616,7 +1658,7 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
             ..App::default()
         };
         truncated.snapshot.ships.truncate(1);
-        truncated.snapshot.truncated = true;
+        truncated.snapshot.discovery = privateer::dashboard::model::Discovery::Incomplete;
         truncated.select_ship(Some("apps".into()));
         assert!(truncated.binding_ambiguous());
         assert!(truncated.scoped_panes().is_empty());

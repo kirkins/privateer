@@ -483,17 +483,33 @@ mod tests {
         assert!(app.bridge_key(KeyCode::Enter));
         request_focus(&mut app, Some(&send));
         assert_eq!(receive.try_recv().unwrap().pane.pane_id, "demo:apps");
-        for case in ["stale", "demo", "ambiguous", "truncated", "invalid"] {
+        // Display clipping alone does not remove validated existing focus.
+        app.snapshot.truncated = true;
+        request_focus(&mut app, Some(&send));
+        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "demo:apps");
+        for case in [
+            "stale",
+            "demo",
+            "ambiguous",
+            "incomplete",
+            "unknown",
+            "invalid",
+        ] {
             app.herdr_age = Some(0);
             app.demo = false;
             app.snapshot.presentation_error = None;
-            app.snapshot.truncated = false;
+            app.snapshot.discovery = privateer::dashboard::model::Discovery::Complete;
             app.selection_invalidated = false;
             match case {
                 "stale" => app.herdr_age = Some(10),
                 "demo" => app.demo = true,
                 "ambiguous" => app.snapshot.presentation_error = Some("conflict".into()),
-                "truncated" => app.snapshot.truncated = true,
+                "incomplete" => {
+                    app.snapshot.discovery = privateer::dashboard::model::Discovery::Incomplete
+                }
+                "unknown" => {
+                    app.snapshot.discovery = privateer::dashboard::model::Discovery::Unknown
+                }
                 _ => app.selection_invalidated = true,
             }
             request_focus(&mut app, Some(&send));

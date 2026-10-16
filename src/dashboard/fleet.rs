@@ -1,7 +1,7 @@
 //! Bounded fleet observations. Never open a runtime Store: even fleet discovery
 //! must work before the first home exists, without initializing state.
 use super::model::{
-    ROW_LIMIT, Ship, Snapshot, read_registry, validate_navigation, validate_registry,
+    Discovery, ROW_LIMIT, Ship, Snapshot, read_registry, validate_navigation, validate_registry,
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -128,6 +128,16 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     };
     if members.is_empty() {
         return fallback.map_or(Ok(Snapshot::default()), |home| {
+            // An explicit fallback is not permission to resurrect a retired home.
+            if registry.exists() {
+                let conn = connection(registry)?;
+                let retired: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ships WHERE home=?1 AND retired_ms IS NOT NULL)",
+                    [home.to_string_lossy().as_ref()],
+                    |r| r.get(0),
+                )?;
+                ensure!(!retired, "fallback home is retired");
+            }
             let mut snapshot = Snapshot::read(home)?;
             let identity = super::bridge::Identity::read(home)?;
             for ship in &mut snapshot.ships {
@@ -137,11 +147,17 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
                     ..ShipState::default()
                 });
             }
+            // Set only after successful work, presentation and identity reads.
+            snapshot.discovery = Discovery::Complete;
             Ok(snapshot)
         });
     }
     let mut out = Snapshot {
-        truncated: members.len() > ROW_LIMIT,
+        discovery: if members.len() > ROW_LIMIT {
+            Discovery::Incomplete
+        } else {
+            Discovery::Complete
+        },
         ..Snapshot::default()
     };
     let mut observed_homes = BTreeSet::new();
@@ -203,7 +219,10 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
                     out.custody.extend(local.custody);
                 }
             }
-            Err(e) => ship.live.as_mut().unwrap().error = Some(e.to_string()),
+            Err(e) => {
+                out.discovery = Discovery::Incomplete;
+                ship.live.as_mut().unwrap().error = Some(e.to_string());
+            }
         }
         out.ships.push(ship);
         if let Ok(config) = config {
@@ -240,6 +259,11 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     out.activity.truncate(ROW_LIMIT);
     out.jobs.truncate(ROW_LIMIT);
     out.custody.truncate(ROW_LIMIT);
+    // Bound the identity/presentation mapping before adding display-only work
+    // owners: clipped historical owners are not undiscovered runtime homes.
+    if out.ships.len() > ROW_LIMIT {
+        out.discovery = Discovery::Incomplete;
+    }
     out.include_observed_ships();
     if !out.ships.iter().any(|ship| ship.liaison) {
         let mut candidates = out
@@ -254,6 +278,7 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
         out.presentation_error = Some(error.to_string());
     }
     if out.presentation_error.is_some() {
+        out.discovery = Discovery::Incomplete;
         for ship in &mut out.ships {
             ship.liaison = false;
         }

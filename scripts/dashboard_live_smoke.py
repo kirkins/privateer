@@ -12,12 +12,15 @@ import pty
 import select
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import tempfile
 import termios
 import threading
 import time
+
+from terminal_text import TerminalText
 
 
 def fixture_environment(root):
@@ -100,10 +103,10 @@ class Tui:
         self.before = termios.tcgetattr(self.fd)
         self.reaped = False
         self.output = bytearray()
+        self.text = TerminalText(38, 132)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 38, 132, 0, 0))
         os.write(gate_write, b"1")
         os.close(gate_write)
-        self.drain(.5)
 
     def drain(self, seconds):
         end = time.monotonic() + seconds
@@ -118,6 +121,7 @@ class Tui:
                 if not data:
                     return
                 self.output.extend(data)
+                self.text.feed(data)
                 assert len(self.output) < 2097152, "unbounded dashboard output"
 
     def keys(self, data):
@@ -177,16 +181,28 @@ def run(binary, runtime):
             return json.loads(cli(verb, "--json", json.dumps(args)))
 
         cli("init", "--ship", "apps", "--harness", "codex")
-        server = Herdr(root)
         presentation = folder / ".privateer" / "dashboard.json"
         presentation.write_text(json.dumps({"ships": [{"id": "apps", "name": "apps",
             "terminals": [{"pane_id": "w1:p1", "terminal_id": "terminal-1"}]}]}))
         command("mail.send", {"id": "question", "from": "apps", "to": "captain",
                 "kind": "request", "body": "Please answer"})
+        # Harmless clipped recorded jobs must not turn complete discovery unknown.
+        with sqlite3.connect(folder / ".privateer" / "privateer.sqlite") as database:
+            database.executemany("INSERT INTO jobs(id,record) VALUES(?,?)", [
+                (f"history-{i}", json.dumps({"task_id": "apps", "status": "succeeded"}))
+                for i in range(201)])
+        once = json.loads(subprocess.check_output(
+            [str(binary), "--once", "--no-herdr"], cwd=folder, env=env, timeout=15))
+        assert once["snapshot"]["truncated"] is True
+        assert once["snapshot"]["discovery"] == "complete"
+        assert once["attention"]["error"] is None and len(once["attention"]["sources"][0]["items"]) == 1
+        assert command("mail.inbox", {"address": "captain"})["acknowledged_through"] == 0
+        server = Herdr(root)
         tui = None
         try:
             tui = Tui(binary, env, ["--herdr-socket", str(server.path)])
-            tui.until(lambda: b"Please answer" in tui.output, "typed need did not load")
+            tui.drain(.5)
+            tui.until(lambda: tui.text.contains("Please answer"), "typed need did not load")
             tui.keys(b"j\r")  # select Fleet ship and focus ONLY its existing pane
             tui.until(lambda: server.focuses == 1, "Enter did not focus existing mate")
             tui.keys(b"\t\rGo ahead\r")
@@ -196,21 +212,28 @@ def run(binary, runtime):
             reply = command("mail.show", {"id": original["answered_by"]})
             assert reply["from"] == "captain" and reply["correlation"] == "question"
             assert reply["body"] == "Go ahead"
+            assert command("mail.inbox", {"address": "captain"})["acknowledged_through"] == 0
             command("mail.send", {"id": "approval", "from": "apps", "to": "captain",
                 "kind": "request", "request_kind": "production_approval", "task_id": "apps",
                 "body": "Exact release?", "payload": {"artifact": "sha256:fixture", "environment": "offline"}})
             tui.keys(b"\x1b")
-            tui.until(lambda: b"Exact release?" in tui.output, "typed approval did not load")
-            approval_start = len(tui.output)
+            tui.until(lambda: tui.text.contains("Exact release?"), "typed approval did not load")
+            approval_start = tui.text.revision
             tui.keys(b"\t\rd\r")
             tui.until(lambda: command("mail.show", {"id": "approval"})["state"] == "denied",
                       "inline denial did not record exact outcome")
-            tui.until(lambda: b"Recorded answer" in tui.output[approval_start:],
+            tui.until(lambda: tui.text.contains("Recorded answer", since=approval_start),
                       "UI did not consume the denial outcome before opening history")
+            approval = command("mail.show", {"id": "approval"})
+            denial = command("mail.show", {"id": approval["answered_by"]})
+            assert denial["from"] == "captain" and denial["correlation"] == "approval"
+            assert denial["payload"]["approval_outcome"] == "denied"
+            assert denial["payload"]["artifact"] == "sha256:fixture"
+            assert denial["payload"]["environment"] == "offline"
             before_history = command("mail.inbox", {"address": "captain"})["acknowledged_through"]
             tui.keys(b"i")
             tui.drain(2.5)
-            assert b"Mail history" in tui.output, "history did not open"
+            assert tui.text.contains("Mail history"), "history did not open"
             assert command("mail.inbox", {"address": "captain"})["acknowledged_through"] == before_history
             assert command("mail.show", {"id": "question"})["state"] == "answered"
             assert server.focuses == 1, "refresh/history stole focus"

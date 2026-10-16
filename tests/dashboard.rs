@@ -1098,6 +1098,7 @@ fn fleet_overview_says_how_to_talk_to_the_liaison() {
 
 #[test]
 fn a_message_leaving_history_requires_explicit_reselection_not_an_adjacent_row() {
+    use crossterm::event::KeyCode;
     use privateer::dashboard::captain::Mail;
     let mail = |id: &str| Mail {
         identity: None,

@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::Line,
     widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
@@ -268,7 +268,10 @@ impl App {
             self.home_error.is_none() && self.home_age.is_some_and(|a| a < 10),
             "Privateer observation unavailable/stale"
         );
-        anyhow::ensure!(!self.snapshot.truncated, "Fleet scope truncated; focus refused");
+        anyhow::ensure!(
+            self.snapshot.scope_complete(),
+            "Fleet discovery incomplete/unknown; focus refused"
+        );
         anyhow::ensure!(
             self.herdr_error.is_none()
                 && self.herdr_age.is_some_and(|a| a < 10)
@@ -995,12 +998,17 @@ impl App {
                     Style::default().fg(Color::Cyan),
                 ),
                 Line::from(format!(
-                    "{} · State {} · Herdr {}{}",
+                    "{} · State {} · Herdr {}{}{}",
                     errors.join(" · "),
                     age(self.home_age),
                     age(self.herdr_age),
                     if self.snapshot.truncated {
-                        " · bounded snapshot; older evidence unknown"
+                        " · recorded history clipped"
+                    } else {
+                        ""
+                    },
+                    if !self.snapshot.scope_complete() {
+                        " · fleet discovery incomplete/unknown"
                     } else {
                         ""
                     }
