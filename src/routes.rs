@@ -9,6 +9,13 @@
 //! on it are refused and headless wakes on it wait. The record lives in the
 //! host's ledger, so every home sees the same provider state. Live hosted
 //! sessions are the harness's own to retry.
+//!
+//! Native adapters do not all use Pi's `message_end` shape. OpenCode V1
+//! reports a failed turn as a final `type:"error"` event (`error.data.message`)
+//! rather than an assistant `message_end`, so those errors are read too. A
+//! free-allowance exhaustion backs the route off until the reset it states
+//! (or about a day when it says nothing); an ordinary throttle keeps the short
+//! doubling window.
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -111,10 +118,12 @@ fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
                 let end = tail
                     .find(|c: char| !c.is_ascii_digit())
                     .unwrap_or(tail.len());
-                if end > 0 && tail[end..].trim_start().starts_with(unit) {
-                    if let Ok(value) = tail[..end].parse::<i64>() {
-                        return Some(value.saturating_mul(multiplier));
-                    }
+                if end > 0
+                    && tail[end..].trim_start().starts_with(unit)
+                    && let Ok(value) = tail[..end].parse::<i64>()
+                    && value > 0
+                {
+                    return Some(value.saturating_mul(multiplier));
                 }
             }
         }
@@ -173,33 +182,48 @@ fn iso_timestamp_ms(value: &str) -> Option<i64> {
 
 fn classify(log: &str) -> Option<RouteFailure> {
     let mut last = None;
+    let mut native_error = None;
     for line in log.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
             last = Some(event["message"].clone());
+        } else if event["type"] == "error" {
+            // Native adapters (OpenCode V1) report a failed turn as a final
+            // error event instead of Pi's assistant message_end.
+            let text = event["error"]["data"]["message"]
+                .as_str()
+                .or_else(|| event["error"]["message"].as_str())
+                .or_else(|| event["error"].as_str())
+                .map(str::to_owned);
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                native_error = Some(text);
+            }
         }
     }
-    let message = last?;
-    if message["stopReason"] != "error" {
-        return None;
-    }
-    let error = message["errorMessage"].as_str().unwrap_or("");
+    let error = if let Some(native) = native_error {
+        native
+    } else {
+        let message = last?;
+        if message["stopReason"] != "error" {
+            return None;
+        }
+        message["errorMessage"].as_str().unwrap_or("").to_owned()
+    };
     let lower = error.to_ascii_lowercase();
-    let free_allowance = (lower.contains("free")
+    // Only a stated free-allowance message earns the long, reset-aware
+    // backoff; a paid quota or usage error still throttles on the short one.
+    let free_allowance = lower.contains("free")
         && [
             "allowance",
             "usage limit",
             "quota",
-            "credits exhausted",
+            "credits",
             "limit exceeded",
         ]
         .iter()
-        .any(|s| lower.contains(s)))
-        || ["quota exhausted", "quota exceeded", "usage limit exceeded"]
-            .iter()
-            .any(|s| lower.contains(s));
+        .any(|sign| lower.contains(sign));
     let throttled = free_allowance
         || ["429", "503", "529"]
             .iter()
@@ -209,13 +233,14 @@ fn classify(log: &str) -> Option<RouteFailure> {
             "rate_limit",
             "overloaded",
             "upstream_unavailable",
+            "quota",
             "timed out",
         ]
         .iter()
         .any(|sign| lower.contains(sign));
     throttled.then(|| RouteFailure {
         error: error.chars().take(200).collect(),
-        reset_ms: reset_delay_ms(error, Store::now_ms()),
+        reset_ms: reset_delay_ms(&error, Store::now_ms()),
         free_allowance,
     })
 }
@@ -419,9 +444,17 @@ mod tests {
 
     #[test]
     fn quota_exhaustion_is_long_backoff_but_plain_rate_limit_is_short() {
-        let quota = classify(&error_log("HTTP 429 quota exhausted; resets in 2 hours")).unwrap();
-        assert!(quota.free_allowance);
-        assert_eq!(quota.reset_ms, Some(7_200_000));
+        // A stated FREE allowance is the long, reset-aware case.
+        let free = classify(&error_log(
+            "HTTP 429 free quota exhausted; resets in 2 hours",
+        ))
+        .unwrap();
+        assert!(free.free_allowance);
+        assert_eq!(free.reset_ms, Some(7_200_000));
+        // A bare paid quota error still throttles, but on the short schedule.
+        let paid = classify(&error_log("429 quota exhausted")).unwrap();
+        assert!(!paid.free_allowance);
+        assert_eq!(paid.reset_ms, None);
         let rate = classify(&error_log("429 rate limit exceeded")).unwrap();
         assert!(!rate.free_allowance);
         assert_eq!(rate.reset_ms, None);
@@ -437,5 +470,48 @@ mod tests {
             iso_timestamp_ms("2026-10-17T02:00:00+02:00"),
             Some(1_792_195_200_000)
         );
+    }
+
+    fn native_error_log(message: &str) -> String {
+        serde_json::to_string(&json!({
+            "type":"error","timestamp":1,
+            "error":{"name":"UnknownError","data":{"message":message}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn native_error_events_are_classified_and_paid_quota_stays_short() {
+        let free = classify(&native_error_log(
+            "Free usage limit exceeded; resets in 5 hours",
+        ))
+        .unwrap();
+        assert!(free.free_allowance);
+        assert_eq!(free.reset_ms, Some(5 * 3_600_000));
+
+        let paid = classify(&native_error_log("429 quota exceeded")).unwrap();
+        assert!(!paid.free_allowance);
+        assert_eq!(paid.reset_ms, None);
+
+        let rate = classify(&native_error_log("429 rate limit exceeded")).unwrap();
+        assert!(!rate.free_allowance);
+
+        // The route's real, non-throttle upstream failure is not a backoff.
+        assert!(
+            classify(&native_error_log(
+                "Unexpected server error. Check server logs for details."
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn reset_delay_parses_an_iso_deadline_and_ignores_a_zero_window() {
+        let now = 1_792_190_000_000;
+        assert_eq!(
+            reset_delay_ms("retry-after: 2026-10-17T00:00:00Z", now),
+            Some(1_792_195_200_000 - now)
+        );
+        assert_eq!(reset_delay_ms("resets in 0 hours", now), None);
     }
 }
