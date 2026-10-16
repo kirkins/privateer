@@ -73,7 +73,10 @@ class Native(unittest.TestCase):
             raise RuntimeError('exact native Pi required')
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='privateer-pi-inventory-')
+        # Keep the fixture below an owned, non-sticky ancestor. In an unprivileged
+        # user namespace host-root /tmp has an unmapped UID; production safe_path
+        # correctly refuses it. Do not weaken that check for qualification.
+        self.temp = tempfile.TemporaryDirectory(prefix='privateer-pi-inventory-', dir=ROOT)
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
         self.repo = self.base / 'repo'

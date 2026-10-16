@@ -196,6 +196,34 @@ aliases before the fixture removes them ahead of connection. Live-runtime
 cases have zero transport starts/connections. Keep production optional MCP
 unsupported until the additional gates below are implemented and qualified.
 
+### Guarded review-fix evidence
+
+First frozen review-fix attempt: SHA
+`f9c7a2c331c701f77c9bd9720f677a1f156c3b7c`, base `2daef25`, admitted job
+`c851d9a5-61af-43d9-ac7b-64904e62e468`, incarnation
+`7ac895ce-9ad5-4c75-878f-45f567e33b77`. Syntax, eight boundary unit tests,
+twenty stage-one Python tests and all five native MCP methods / thirteen
+invocations passed (native MCP: 16.463 seconds). Full logs are
+`<privateer-home>/jobs/<job>/<incarnation>/{stdout,stderr}.log`.
+
+The guard logged distinct parent/child user and network identities, only `lo`
+with exact local routes, and all four IPv4/IPv6 TCP/UDP probes immediately
+refused with `ENETUNREACH`. All thirteen cases logged selected/ambient loopback
+positive controls, zero ambient native TCP connections, no ambient/unselected
+stdio starts and zero remaining payload identities **before** fallback recovery.
+Selected HTTP accepted five native connections and made one tool call. All six
+selected stdio payload identities disappeared after native shutdown. Native
+binary SHA-256 remains the value recorded above; the native factory, stdio/HTTP
+connector and codemode fixture are unchanged.
+
+That first job nevertheless **failed overall, exit 1**: all three stage-one
+native tests errored before native execution because their fixture paths passed
+through `/tmp`. Host-root's UID is unmapped in this unprivileged user namespace,
+so the production ancestor-ownership check correctly refused the sticky directory.
+The stage-one native test now creates disposable roots below the owned repository
+instead. Production path validation, host permissions, namespace containment and
+provider routes remain unchanged; no unguarded fallback was attempted.
+
 ## Important limits and minimal future design
 
 **This API is useful but is not a turnkey fail-closed policy boundary.** Native
