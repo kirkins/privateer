@@ -499,7 +499,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     if let Some(task) = task_id {
         let linked = store.task(task)?;
         ensure!(
-            !matches!(linked["status"].as_str(), Some("done" | "cancelled")),
+            !opens || !matches!(linked["status"].as_str(), Some("done" | "cancelled")),
             "task is terminal"
         );
         if request_kind == Some("production_approval") {

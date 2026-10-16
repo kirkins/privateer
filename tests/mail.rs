@@ -1580,19 +1580,47 @@ fn closure_crosses_homes_and_inflight_reply_wins_without_reopening() {
         dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
         "withdrawn"
     );
-    // An authenticated late delivery models a reply recorded before the remote
-    // withdrawal arrived. A new mail.send after observing it is refused.
+    // A new reply after observing closure is refused.
     assert!(send(&mut b,json!({"from":"infra","to":"apps","kind":"reply","correlation":"withdraw-me","body":"late"})).is_err());
-    let wire = json!({"id":"inflight","from":"infra","to":"apps","kind":"reply","correlation":"withdraw-me","body":"already sent"});
-    dispatch(&mut a, "mail.deliver", wire.clone()).unwrap();
-    assert!(
-        dispatch(&mut a, "mail.deliver", wire).unwrap()["duplicate"]
-            .as_bool()
-            .unwrap()
+    // Hold only B's fixture outbox, so its real reply is committed before A's
+    // withdrawal but crosses the subprocess boundary afterwards.
+    send(
+        &mut a,
+        json!({"id":"race-wire","from":"apps","to":"infra","kind":"request","body":"question"}),
+    )
+    .unwrap();
+    b.connection()
+        .execute(
+            "INSERT INTO mail_delivery_retry VALUES('home-a',1,?1,0)",
+            [Store::now_ms() + 60_000],
+        )
+        .unwrap();
+    let reply = send(&mut b,json!({"id":"inflight","from":"infra","to":"apps","kind":"reply","correlation":"race-wire","body":"already sent"})).unwrap();
+    assert_eq!(reply["delivery"], "pending");
+    dispatch(
+        &mut a,
+        "mail.withdraw",
+        json!({"actor":"apps","id":"race-wire","reason":"obsolete"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"race-wire"})).unwrap()["state"],
+        "answered"
     );
     assert_eq!(
-        dispatch(&mut a, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
-        "answered"
+        dispatch(&mut b, "mail.flush", json!({})).unwrap()["delivered"],
+        1
+    );
+    for store in [&mut a, &mut b] {
+        assert_eq!(
+            dispatch(store, "mail.show", json!({"id":"race-wire"})).unwrap()["state"],
+            "answered"
+        );
+    }
+    let wire = json!({"id":"inflight","from":"infra","to":"apps","kind":"reply","correlation":"race-wire","body":"already sent"});
+    assert_eq!(
+        dispatch(&mut a, "mail.deliver", wire).unwrap()["duplicate"],
+        true
     );
 }
 
@@ -1792,4 +1820,67 @@ fn stale_approval_version_is_not_grantable_and_disappears() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn terminal_task_closure_recovers_outbox_across_restart_and_redelivery() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    let home = a.home().to_owned();
+    dispatch(
+        &mut a,
+        "charter.put",
+        json!({"id":"project","repo":_temp.path(),"objective":"Fixture","min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "task.create",
+        json!({"id":"main","charter_id":"project","owner":"apps","title":"Fixture"}),
+    )
+    .unwrap();
+    send(&mut a,json!({"id":"linked-remote","from":"apps","to":"infra","kind":"request","body":"question","task_id":"main"})).unwrap();
+    dispatch(
+        &mut a,
+        "task.update",
+        json!({"id":"main","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"linked-remote"})).unwrap()["state"],
+        "open"
+    );
+    let local = dispatch(&mut a, "mail.show", json!({"id":"linked-remote"})).unwrap();
+    let closure_id = local["ended_by"].clone();
+    drop(a);
+    let mut a = Store::open(&home).unwrap();
+    assert_eq!(
+        dispatch(&mut a, "mail.flush", json!({})).unwrap()["delivered"],
+        1
+    );
+    let remote = dispatch(&mut b, "mail.show", json!({"id":"linked-remote"})).unwrap();
+    assert_eq!(remote["state"], "task_done");
+    assert!(remote["task_id"].is_null());
+    assert_eq!(remote["ended_by"], closure_id);
+    let closure = dispatch(&mut b, "mail.show", json!({"id":closure_id})).unwrap();
+    assert_eq!(closure["kind"], "notice");
+    assert_eq!(closure["correlation"], "linked-remote");
+    assert_eq!(
+        dispatch(&mut b, "mail.deliver", closure).unwrap()["duplicate"],
+        true
+    );
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"linked-remote"})).unwrap()["state"],
+        "task_done"
+    );
+    // Historical notices may still reference the terminal task.
+    send(
+        &mut a,
+        json!({"from":"apps","to":"infra","kind":"notice","body":"finished","task_id":"main"}),
+    )
+    .unwrap();
 }
