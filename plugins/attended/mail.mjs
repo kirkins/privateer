@@ -2,6 +2,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isAbsolute } from "node:path";
+import { QuietCompaction, RECORDS_TYPE, renderRecords } from "./quiet.mjs";
 
 const execute = promisify(execFile);
 const TYPE = "privateer-mail";
@@ -184,24 +185,33 @@ export default function attended(api) {
   globalThis[SLOT]?.dispose();
   const mail = new AttendedMail(api, config);
   globalThis[SLOT] = mail;
-  api.on("session_start", (_event, ctx) => mail.start(ctx));
+  const quiet = new QuietCompaction(api, {
+    ship: config.ship,
+    afterMs: setting(env.PRIVATEER_QUIET_COMPACT_SECS, 600) * 1000,
+    minPercent: setting(env.PRIVATEER_QUIET_COMPACT_PERCENT, 40),
+  }, () => mail.owned(mail.generation), (command, args) => mail.call(command, args));
+  const dispose = mail.dispose.bind(mail);
+  mail.dispose = () => { quiet.stop(); dispose(); };
+  api.on("session_start", (_event, ctx) => { mail.start(ctx); quiet.start(ctx); });
   // Pi emits session_start for replacements. OMP has separate switch/branch
   // events; tree navigation in either host can change the active receipts.
   const rebase = (_event, ctx) => {
     const paused = mail.paused;
     mail.start(ctx);
     mail.paused = paused;
+    quiet.start(ctx);
   };
   api.on("session_tree", rebase);
   if (config.harness === "omp") {
     api.on("session_switch", rebase);
     api.on("session_branch", rebase);
   }
-  api.on("session_shutdown", () => mail.stop());
-  api.on("agent_start", () => mail.began());
+  api.on("session_shutdown", () => { mail.stop(); quiet.stop(); });
+  api.on("agent_start", () => { mail.began(); quiet.began(); });
   api.on("message_end", event => mail.messageEnded(event));
   api.on(config.harness === "omp" ? "agent_end" : "agent_settled", event => {
     if (config.harness === "omp") mail.ompEnded(event); else mail.settled(event);
+    if (!mail.busy) quiet.settled();
   });
   api.on("before_agent_start", async () => { mail.paused = false; return mail.poll("context"); });
   api.registerCommand("privateer-mail", { description: "Pause, resume or inspect attended mail delivery",
@@ -210,10 +220,17 @@ export default function attended(api) {
       else if (args.trim() === "resume") { mail.paused = false; await mail.poll(); }
       else mail.status(mail.paused ? "⚓ mail paused; /privateer-mail resume" : "⚓ mail enabled");
     } });
+  api.registerMessageRenderer(RECORDS_TYPE, renderRecords);
   api.registerMessageRenderer(TYPE, message => ({
     render(width) {
       const text = `⚓ ${message.details?.ship ?? "ship"}: ${message.details?.count ?? "new"} new mail`;
       return [Array.from(text).slice(0, Math.max(0, width - 2)).join("")];
     }, invalidate() {},
   }));
+}
+
+/// A whole-number setting from the launch environment, or its default.
+function setting(raw, fallback) {
+  const value = Number(raw);
+  return raw !== undefined && raw !== "" && Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 }
