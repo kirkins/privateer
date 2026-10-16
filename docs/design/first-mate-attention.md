@@ -1,0 +1,141 @@
+# Proposal: a first mate's attention
+
+Status: proposal for review; nothing here is implemented.
+
+## What happened
+
+After the update on 16 October 2026 the privateer ship worked without a break,
+and its live Pi session hit Pi's compaction limit mid-task (258k of a 272k
+window). Raising or lowering when it compacts would treat the symptom. The
+session's own record shows the cause. In the 52 minutes that filled that
+window:
+
+| Into the first mate's context | Calls | Characters |
+|---|---|---|
+| Job status and logs of checks it had queued | 30 | 180k |
+| Source files it read | 29 | 107k |
+| Searches | 16 | 47k |
+| Other tools | 8 | 47k |
+| Its own words | | 3k |
+| Mail | | 3k |
+
+It touched 14 tasks. Crew did the implementing, but the first mate reviewed
+by pulling their raw results into its own thread. Across the thread's eight
+compactions Pi's summary grew every time (21k, 35k, 51k, 62k, 70k, 82k, 83k,
+95k characters), because each compaction folds in the previous summary. A
+thread that never ends can only start each window fuller than the last,
+wherever the trigger sits.
+
+Headless wakes do not have this problem: context follows the focus, so each
+task's work happens in that task's own short session, started from its note
+and pins, rotated after a few wakes. Hosting a live first mate (#95) put every
+focus back into one conversation.
+
+## Three scarce things, regulated by measurement
+
+A fixed cap on active tasks fails the way it failed in First Mate: blocked
+work holds slots, so the cap gets raised until it means nothing, and the right
+number differs by model speed. The fleet has three scarce resources, and each
+needs its own regulator, measured rather than counted:
+
+| Resource | Regulated today | By |
+|---|---|---|
+| The machine: memory, CPU, later simulators and Xcode | Yes | Admission from live readings (#109) |
+| The model: rate limits, latency, spend | No | Back off when the provider throttles or slows |
+| The first mate's attention: its context | No | This proposal |
+
+Blocked work must never hold a place. Privateer already mostly gets this
+right: a blocked crew member ends and records its blocker (a `waiting` pin or
+a blocked task), and the mail that clears the blocker wakes the ship again.
+
+## Proposal
+
+### 1. Errands: the first mate's thinking in a fresh context
+
+An **errand** is a short, headless model session the first mate starts for one
+focus, to think something through away from its own thread: review a crew's
+result, investigate a failed check, catch up on a long request thread, prepare
+a pull request. It is not crew: crew implement in a workspace, while an errand
+runs as the ship under the ship's charter, mostly reads, runs anything heavy
+through `job.start` admission, and returns a verdict.
+
+- `errand.start {focus, brief}` starts one. Its first prompt is the focus's
+  note, pins, assignment and the brief; it does not see the first mate's
+  thread.
+- When it ends, the verdict, a few paragraphs, arrives as mail from `crew` on
+  that focus, and exact facts it found are pinned. The live thread receives
+  only the verdict.
+- A follow-up errand on the same focus resumes its session while the prompt
+  cache is warm (review, fix, review again), and rotates after a few rounds,
+  the rule headless wakes already use (`cache_window_secs`,
+  `session_max_wakes`).
+- It is visible without a pane: the ship's status in Herdr's sidebar and on
+  the dashboard reads "reviewing dashboard-102", and `wake.list` lists it.
+
+The brief changes with it: a first mate does its reviewing through errands,
+and reads raw logs or large diffs in its own thread only for a quick check.
+
+### 2. The live first mate keeps the portfolio
+
+The hosted session becomes the conversation with the captain and the overview
+of the ship's work: what is in flight, what waits, what comes next. Detailed
+work happens in crew and errands, each in its own context, so the live thread
+grows by verdicts, not by logs, and its compactions stop compounding.
+
+When it does compact, the summary should be the portfolio, not a history:
+quiet compaction's instructions (#116) already ask for open captain questions
+and ids. They should also ask it to leave out detail that lives in notes,
+pins and errands.
+
+### 3. Attention pressure decides how much the ship takes on
+
+The ship measures its first mate's attention instead of counting tasks:
+
+- context added per hour of activity in the live session (Pi reports usage
+  after every turn);
+- compactions per hour, and the size of the last summary;
+- errands and crew waiting for review.
+
+While pressure is low, the first mate starts the next task from the backlog
+when something finishes. While it is high, it starts nothing new, delegates
+pending reviews to errands, and the bearings say so ("attention: high; 3
+reviews pending"). A slow model fills its context more slowly and so takes on
+more at once, and a fast one less, without any number to tune per model.
+
+### 4. A backlog the captain can see
+
+"Queue as many as you want" needs a queue: tasks marked `open` and not yet
+started, in an order the captain and the first mate can see and change
+(`task.priority`). The dashboard and `/status` show it next to what is
+running and what waits. The first mate pulls from the top when attention
+allows; a blocked task leaves the running set and records its blocker, so it
+never holds a place.
+
+## What this does not do
+
+- No fixed cap on tasks, crew or errands.
+- No change to admission: errands are light, and their heavy checks are
+  admitted like any job.
+- No new authority: an errand acts as its ship, within its charter.
+
+## Order of work
+
+1. Errands, with their visibility and the brief change. This alone keeps raw
+   output out of the live thread.
+2. Attention pressure in the bearings, and the brief's rule to pause new work
+   while it is high.
+3. The visible, ordered backlog.
+4. Model backoff on throttling and latency, which also protects crew and
+   errands.
+
+## Open questions
+
+- Should an errand run on the ship's model, or a cheaper one chosen for
+  reviews? Recommended: the ship's model by default, with an optional errand
+  profile, since review quality matters.
+- Should the live thread ever start fresh? With errands it should grow slowly;
+  if summaries still compound, a fresh live session seeded from bearings,
+  notes and pins (as headless wakes start) is the next step, at a quiet moment
+  and never mid-conversation with the captain.
+- What pressure thresholds? Start by recording the measures for a week of
+  real use before choosing them.
