@@ -333,6 +333,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         [ship],
         |r| r.get(0),
     )?;
+    let idle = idle_tasks(store, ship)?;
     let knowledge = current_note(store, ship, "ship")?;
     let mut text = format!("Bearings for {ship}: {unacknowledged} unacknowledged messages.\n");
     for (title, items) in [
@@ -349,6 +350,18 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             }
         }
     }
+    if !idle.is_empty() {
+        text.push_str(
+            "Running tasks with nothing moving them (no job, open request or pinned wait):\n",
+        );
+        for task in &idle {
+            text.push_str(&format!(
+                "- task {}: {}\n",
+                task["id"].as_str().unwrap_or(""),
+                task["title"].as_str().unwrap_or("")
+            ));
+        }
+    }
     if let Some(note) = &knowledge {
         text.push_str(&format!(
             "Ship knowledge (note v{}):\n{}\n",
@@ -358,8 +371,36 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     }
     Ok(json!({
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
-        "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge, "text": text,
+        "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
+        "idle_tasks": idle, "text": text,
     }))
+}
+
+/// Tasks the ship marks running that nothing is moving: no live job on the
+/// task or any task beneath it, no open request the ship sent about them, and
+/// no pinned `waiting` fact. A first mate that says it will carry on and then
+/// stops leaves exactly these behind. The duty task is ongoing by design.
+pub fn idle_tasks(store: &Store, ship: &str) -> Result<Vec<Value>> {
+    let mut statement = store.connection().prepare(
+        "WITH RECURSIVE tree(root, id) AS (
+           SELECT id, id FROM tasks WHERE owner=?1 AND status='running'
+           UNION SELECT tree.root, t.id FROM tasks t JOIN tree ON t.parent = tree.id)
+         SELECT t.id, t.title FROM tasks t
+         WHERE t.owner=?1 AND t.status='running' AND t.id <> ?1 || '-duty'
+           AND NOT EXISTS (SELECT 1 FROM tree JOIN jobs j
+             ON json_extract(j.record,'$.task_id') = tree.id
+             WHERE tree.root = t.id AND json_extract(j.record,'$.status')
+               IN ('starting','queued','launching','running','orphaned'))
+           AND NOT EXISTS (SELECT 1 FROM tree JOIN mail m ON m.task_id = tree.id
+             WHERE tree.root = t.id AND m.sender=?1 AND m.state='open')
+           AND NOT EXISTS (SELECT 1 FROM pins p
+             WHERE p.ship=?1 AND p.focus='task:' || t.id AND p.key='waiting')
+         ORDER BY t.id LIMIT 20",
+    )?;
+    let rows = statement.query_map([ship], |r| {
+        Ok(json!({"id": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?}))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// A focus's history, curated and bounded, for a first mate that starts

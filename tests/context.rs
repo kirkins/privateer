@@ -365,3 +365,74 @@ fn an_assignment_reaches_its_crew_and_pins_hold_a_few_exact_facts() {
     assert_eq!(read["pins"]["head"], "86dc091");
     assert!(read["pins"].get("fact1").is_none());
 }
+
+#[test]
+fn bearings_name_running_tasks_that_nothing_is_moving() {
+    let (_temp, mut s) = fleet();
+    let task = |s: &mut Store, id: &str, parent: Option<&str>, status: &str| {
+        let mut args =
+            json!({"id":id,"charter_id":"fleet","owner":"infra","title":format!("Work on {id}")});
+        if let Some(parent) = parent {
+            args["parent"] = json!(parent);
+        }
+        dispatch(s, "task.create", args).unwrap();
+        dispatch(
+            s,
+            "task.update",
+            json!({"id":id,"actor":"infra","status":status}),
+        )
+        .unwrap();
+    };
+    for id in ["announced", "delegated", "asking", "parked", "infra-duty"] {
+        task(&mut s, id, None, "running");
+    }
+    task(&mut s, "stuck", None, "blocked");
+    // A crew job on a child task moves its parent.
+    task(&mut s, "delegated-step", Some("delegated"), "running");
+    s.connection()
+        .execute(
+            "INSERT INTO jobs(id, record) VALUES('crew-1', ?1)",
+            [json!({"id":"crew-1","task_id":"delegated-step","status":"running"}).to_string()],
+        )
+        .unwrap();
+    // An open request waits on someone else.
+    dispatch(
+        &mut s,
+        "mail.send",
+        json!({"from":"infra","to":"apps","kind":"request","task_id":"asking","body":"Which region?"}),
+    )
+    .unwrap();
+    // A pinned wait is a recorded reason.
+    dispatch(
+        &mut s,
+        "note.pin",
+        json!({"ship":"infra","focus":"task:parked","key":"waiting","value":"PR #117 CI"}),
+    )
+    .unwrap();
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert_eq!(
+        bearings["idle_tasks"],
+        json!([{"id":"announced","title":"Work on announced"}])
+    );
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("nothing moving them"), "{text}");
+    assert!(
+        text.contains("- task announced: Work on announced"),
+        "{text}"
+    );
+    // Once the job ends, the parent has nothing moving it either.
+    s.connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.status','succeeded') WHERE id='crew-1'",
+            [],
+        )
+        .unwrap();
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    let idle: Vec<&str> = bearings["idle_tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(idle, ["announced", "delegated", "delegated-step"]);
+}
