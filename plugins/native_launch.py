@@ -43,6 +43,11 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
             flags[i:i+2] == ["-e", crew] for i in range(len(flags)))
         if hosted_crew:
             extensions.append(crew)
+        captain = str(directory / "attended/captain.ts")
+        # The captain's slash commands ride with attended mail only, as the
+        # exact runtime injection; a headless or crew run never carries them.
+        if attended and any(flags[i:i+2] == ["-e", captain] for i in range(len(flags))):
+            extensions.append(captain)
         calm = str(directory / "attended/calm.ts")
         # Calm is a runtime-owned presentation adapter, not an operator
         # integration. Only the exact attended/hosted injection may survive

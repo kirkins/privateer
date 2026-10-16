@@ -923,6 +923,10 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         );
         command = launch();
         command.arg("-e").arg(extension);
+        // The captain's fleet commands, such as /stow, in the live session.
+        let captain = plugins.join("attended/captain.ts");
+        ensure!(captain.is_file(), "Pi captain commands missing");
+        command.arg("-e").arg(captain);
         if matches!(harness.as_str(), "pi" | "pi-signed") {
             let calm = plugins.join("attended/calm.ts");
             ensure!(calm.is_file(), "Pi calm extension missing");

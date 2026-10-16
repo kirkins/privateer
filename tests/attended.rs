@@ -448,6 +448,13 @@ sys.exit(7)
                 .unwrap()
                 .ends_with("plugins/attended/mail.ts")
         );
+        assert_eq!(seen["argv"][2], "-e");
+        assert!(
+            seen["argv"][3]
+                .as_str()
+                .unwrap()
+                .ends_with("plugins/attended/captain.ts")
+        );
         let prompt_at = if harness == "omp" {
             assert!(
                 !seen["argv"]
@@ -456,16 +463,16 @@ sys.exit(7)
                     .iter()
                     .any(|a| { a.as_str().is_some_and(|a| a.ends_with("attended/calm.ts")) })
             );
-            2
+            4
         } else {
-            assert_eq!(seen["argv"][2], "-e");
+            assert_eq!(seen["argv"][4], "-e");
             assert!(
-                seen["argv"][3]
+                seen["argv"][5]
                     .as_str()
                     .unwrap()
                     .ends_with("attended/calm.ts")
             );
-            4
+            6
         };
         assert_eq!(seen["argv"][prompt_at], "literal; $value");
         assert_eq!(seen["env"]["PRIVATEER_ROLE"], "agent");

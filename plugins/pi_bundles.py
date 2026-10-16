@@ -243,7 +243,7 @@ def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
                  '--extension', '-e', '--skill', '--prompt-template', '--theme', '--system-prompt',
                  '--append-system-prompt', '--approve', '-a')
     runtime_paths = [str(path) for path in runtime_extensions]
-    require(len(runtime_paths) <= 2 and len(set(runtime_paths)) == len(runtime_paths))
+    require(len(runtime_paths) <= 3 and len(set(runtime_paths)) == len(runtime_paths))
     seen_runtime = set()
     clean = []
     i = 0
