@@ -808,8 +808,6 @@ fn errand_settled(fleet: &mut Fleet, id: &str) -> Value {
 
 #[test]
 fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
-#[test]
-fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     let mut fleet = Fleet::new(now_settings());
     fleet.ok(
         "charter.put",
@@ -836,57 +834,6 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     );
     assert_eq!(started["mode"], "fresh");
     let id = started["errand"].as_str().unwrap().to_owned();
-    let ledger_path = fleet.root.join("ledger/resources.sqlite");
-    let ledger = || rusqlite::Connection::open(&ledger_path).unwrap();
-    let routes =
-        |fleet: &Fleet| fleet.ok("resource.status", json!({}), None)["model_routes"].clone();
-    let crew = |fleet: &Fleet, id: &str| {
-        fleet.run(
-            "agent.start",
-            json!({"id":id,"task_id":"infra-repair"}),
-            Some("infra"),
-        )
-    };
-    let wait_job = |fleet: &Fleet, id: &str| {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !matches!(
-            fleet.ok("job.status", json!({"id":id}), None)["status"].as_str(),
-            Some("succeeded" | "failed" | "cancelled" | "timed_out")
-        ) {
-            assert!(std::time::Instant::now() < until, "job {id} never ended");
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    };
-
-    // A run that fails for another reason says nothing about the provider.
-    fleet.tick();
-    fleet.mode("fail");
-    assert!(crew(&fleet, "broken").status.success());
-    wait_job(&fleet, "broken");
-    fleet.tick();
-    assert_eq!(routes(&fleet), json!([]));
-
-    // A run the provider throttled backs its route off.
-    fleet.mode("throttle");
-    assert!(crew(&fleet, "first").status.success());
-    wait_job(&fleet, "first");
-    fleet.tick();
-    let backed = routes(&fleet);
-    // A wake on the same route may also have been throttled meanwhile.
-    let first_failures = backed[0]["failures"].as_i64().unwrap();
-    assert!(first_failures >= 1, "{backed}");
-    assert!(backed[0]["last_error"].as_str().unwrap().starts_with("429"));
-    let until = backed[0]["until_ms"].as_i64().unwrap();
-
-    // New crew on that route are refused, and headless wakes wait.
-    let refused = crew(&fleet, "second");
-    assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("backing off"));
-    fleet.send(json!({"id":"q","from":"apps","to":"infra","kind":"request","body":"Ready?"}));
-    assert_eq!(
-        Fleet::infra(&fleet.tick())["skipped"],
-        "model route backing off"
-    );
     let bearings = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
     assert!(
         bearings["text"]
@@ -950,6 +897,72 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
         "{last}"
     );
     assert_eq!(last["urgency"], "high");
+}
+
+#[test]
+fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    let ledger_path = fleet.root.join("ledger/resources.sqlite");
+    let ledger = || rusqlite::Connection::open(&ledger_path).unwrap();
+    let routes =
+        |fleet: &Fleet| fleet.ok("resource.status", json!({}), None)["model_routes"].clone();
+    let crew = |fleet: &Fleet, id: &str| {
+        fleet.run(
+            "agent.start",
+            json!({"id":id,"task_id":"infra-repair"}),
+            Some("infra"),
+        )
+    };
+    let wait_job = |fleet: &Fleet, id: &str| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !matches!(
+            fleet.ok("job.status", json!({"id":id}), None)["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled" | "timed_out")
+        ) {
+            assert!(std::time::Instant::now() < until, "job {id} never ended");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    // A run that fails for another reason says nothing about the provider.
+    fleet.tick();
+    fleet.mode("fail");
+    assert!(crew(&fleet, "broken").status.success());
+    wait_job(&fleet, "broken");
+    fleet.tick();
+    assert_eq!(routes(&fleet), json!([]));
+
+    // A run the provider throttled backs its route off.
+    fleet.mode("throttle");
+    assert!(crew(&fleet, "first").status.success());
+    wait_job(&fleet, "first");
+    fleet.tick();
+    let backed = routes(&fleet);
+    // A wake on the same route may also have been throttled meanwhile.
+    let first_failures = backed[0]["failures"].as_i64().unwrap();
+    assert!(first_failures >= 1, "{backed}");
+    assert!(backed[0]["last_error"].as_str().unwrap().starts_with("429"));
+    let until = backed[0]["until_ms"].as_i64().unwrap();
+
+    // New crew on that route are refused, and headless wakes wait.
+    let refused = crew(&fleet, "second");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("backing off"));
+    fleet.send(json!({"id":"q","from":"apps","to":"infra","kind":"request","body":"Ready?"}));
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "model route backing off"
+    );
+    let bearings = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
             .contains("is backing off")
     );
 
