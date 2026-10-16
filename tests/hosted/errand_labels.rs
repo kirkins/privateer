@@ -173,16 +173,38 @@ fn headless_errand_captions_start_settle_and_survive_fresh_dispatchers_without_s
         place.tick();
     }
     assert_eq!(captions(&host).len(), 2);
+    place
+        .database()
+        .execute(
+            "UPDATE ships SET record=json_remove(record,'$.first_mate.host') WHERE name='infra'",
+            [],
+        )
+        .unwrap();
+    place.tick();
+    assert_eq!(
+        captions(&host).len(),
+        3,
+        "hosting-off clears only the still-bound live source"
+    );
+    assert!(caption(&host, "w2:p1").is_null());
+    assert_eq!(cache_count(&place), 0);
+    place.database().execute("UPDATE ships SET record=json_set(record,'$.first_mate.host','herdr') WHERE name='infra'", []).unwrap();
+    place.tick();
+    assert_eq!(captions(&host).len(), 4);
+    assert_eq!(
+        caption(&host, "w2:p1"),
+        "infra · reviewing dashboard-102 +1"
+    );
     finish(&place, &first);
     assert_eq!(caption(&host, "w2:p1"), "infra · reviewing another-focus");
     finish(&place, &second);
     assert!(caption(&host, "w2:p1").is_null());
-    assert_eq!(captions(&host).len(), 4);
+    assert_eq!(captions(&host).len(), 6);
     assert_eq!(cache_count(&place), 0);
     for _ in 0..2 {
         place.tick();
     }
-    assert_eq!(captions(&host).len(), 4);
+    assert_eq!(captions(&host).len(), 6);
     assert_eq!(
         host.metadata
             .lock()
@@ -416,6 +438,22 @@ fn errand_metadata_refusal_is_bounded_retried_and_never_breaks_lifecycle_or_repl
     let record: Value = serde_json::from_str(&record).unwrap();
     assert_eq!(record["dirty"], true);
     assert!(record["acknowledged"].is_null());
+    let terminal = host.panes.lock().unwrap()[1]["terminal_id"].clone();
+    host.panes.lock().unwrap()[1]["terminal_id"] = json!("reused-during-retry");
+    place.tick();
+    assert_eq!(captions(&host).len(), 1);
+    assert_eq!(
+        cache_count(&place),
+        0,
+        "retry backoff must not retain stale endpoint custody"
+    );
+    host.panes.lock().unwrap()[1]["terminal_id"] = terminal;
+    place.tick();
+    assert_eq!(
+        captions(&host).len(),
+        2,
+        "restored exact endpoint gets fresh presentation intent"
+    );
     host.reject_caption.store(false, Ordering::SeqCst);
     place
         .database()
@@ -425,16 +463,16 @@ fn errand_metadata_refusal_is_bounded_retried_and_never_breaks_lifecycle_or_repl
         )
         .unwrap();
     place.tick();
-    assert_eq!(captions(&host).len(), 2);
+    assert_eq!(captions(&host).len(), 3);
     assert_eq!(caption(&host, "w2:p1"), "infra · reviewing retry");
     // A failed clear is not an acknowledgement, and never retries the older
     // active caption, including after fresh dispatcher processes.
     host.reject_caption.store(true, Ordering::SeqCst);
     finish(&place, &id);
-    assert_eq!(captions(&host).len(), 3);
-    assert_eq!(captions(&host)[2]["params"]["clear_display_agent"], true);
+    assert_eq!(captions(&host).len(), 4);
+    assert_eq!(captions(&host)[3]["params"]["clear_display_agent"], true);
     place.tick();
-    assert_eq!(captions(&host).len(), 3);
+    assert_eq!(captions(&host).len(), 4);
     host.reject_caption.store(false, Ordering::SeqCst);
     place
         .database()
@@ -444,7 +482,7 @@ fn errand_metadata_refusal_is_bounded_retried_and_never_breaks_lifecycle_or_repl
         )
         .unwrap();
     place.tick();
-    assert_eq!(captions(&host).len(), 4);
+    assert_eq!(captions(&host).len(), 5);
     assert!(caption(&host, "w2:p1").is_null());
     assert_eq!(cache_count(&place), 0);
     assert!(host.calls("pane.report_agent").is_empty());

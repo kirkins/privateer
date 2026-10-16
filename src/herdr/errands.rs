@@ -45,6 +45,7 @@ struct Target {
     owner: Owner,
     binding: Binding,
     eligible: bool,
+    expires_ms: i64,
 }
 
 fn target(store: &Store, ship: &str) -> Result<Option<Target>> {
@@ -112,6 +113,7 @@ fn target(store: &Store, ship: &str) -> Result<Option<Target>> {
         owner,
         binding,
         eligible,
+        expires_ms: expires,
     }))
 }
 
@@ -261,6 +263,9 @@ fn reconcile_one(store: &Store, ship: &str) -> Result<()> {
             return Ok(());
         }
         if caption.attempted == want && caption.retry_ms > Store::now_ms() {
+            if matches!(validated_client(store, &current), Err(PublishError::Unsafe)) {
+                discard(store, ship)?;
+            }
             tx.commit()?;
             return Ok(());
         }
@@ -395,6 +400,11 @@ fn publish(
 ) -> std::result::Result<(), PublishError> {
     let binding = &target.binding;
     let mut client = validated_client(store, target)?;
+    // A snapshot may consume most of its deadline. Holding the SQLite lock
+    // pins recorded ownership, not the wall clock: do not publish after expiry.
+    if target.expires_ms <= Store::now_ms() {
+        return Err(PublishError::Unsafe);
+    }
     let params = match caption {
         Some(text) => json!({"pane_id":binding.pane.pane_id,"source":SOURCE,"display_agent":text}),
         None => json!({"pane_id":binding.pane.pane_id,"source":SOURCE,"clear_display_agent":true}),
