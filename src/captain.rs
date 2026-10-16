@@ -90,17 +90,21 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
     );
     for (ship, home) in fleet()? {
         let mut target = Store::open(&home)?;
-        let request: Option<(String, String, Option<String>)> = target
+        let request: Option<(String, String, Option<String>, Option<String>)> = target
             .connection()
             .query_row(
-                "SELECT sender, kind, state FROM mail WHERE id=?1 AND recipient=?2",
+                "SELECT sender, kind, state, request_kind FROM mail WHERE id=?1 AND recipient=?2",
                 params![request_id, crate::mail::CAPTAIN],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .ok();
-        let Some((asker, kind, state)) = request else {
+        let Some((asker, kind, state, request_kind)) = request else {
             continue;
         };
+        ensure!(
+            request_kind.as_deref() != Some("production_approval"),
+            "production approvals require the operator's exact artifact/environment grant or denial; they cannot be relayed"
+        );
         ensure!(
             matches!(kind.as_str(), "request" | "decision"),
             "{request_id} is a {kind}, not a request"

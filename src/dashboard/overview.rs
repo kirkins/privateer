@@ -223,6 +223,8 @@ mod tests {
 
     fn mail(kind: &str, status: &str, acknowledged: bool) -> Mail {
         Mail {
+            identity: None,
+            origin: None,
             id: kind.into(),
             kind: kind.into(),
             from: "apps".into(),

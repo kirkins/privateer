@@ -2,17 +2,20 @@ use anyhow::{Context, Result, bail, ensure};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
     },
     execute,
 };
-use privateer::dashboard::{
-    captain::{Mail, sample_mail},
-    fleet,
-    herdr::{Client, Pane, View},
-    mailbox::{Action, Mailbox},
-    model::Snapshot,
-    ui::{App, BoardTarget, PendingBoard},
+use privateer::{
+    dashboard::{
+        bridge::{self, Answer, Attention},
+        captain::{Mail, sample_mail},
+        fleet,
+        herdr::{Client, Pane, View},
+        mailbox::Mailbox,
+        model::Snapshot,
+        ui::App,
+    },
+    store::Caller,
 };
 use serde_json::json;
 use std::{
@@ -23,9 +26,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Longest wait for the first Herdr observation before startup input is read.
-const STARTUP_INPUT_HOLD: Duration = Duration::from_secs(2);
-
 #[derive(Default)]
 struct Options {
     home: Option<PathBuf>,
@@ -34,9 +34,7 @@ struct Options {
     once: bool,
     ascii: bool,
     no_herdr: bool,
-    board_liaison: bool,
 }
-
 fn options() -> Result<Option<Options>> {
     let mut out = Options::default();
     let mut args = std::env::args().skip(1);
@@ -54,10 +52,9 @@ fn options() -> Result<Option<Options>> {
             "--once" => out.once = true,
             "--ascii" => out.ascii = true,
             "--no-herdr" => out.no_herdr = true,
-            "--board-liaison" => out.board_liaison = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer — the bridge\n\nprivateer-dashboard --demo [--once]\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\n--once             Print a bounded JSON snapshot; no terminal required\n--no-herdr         Observe Privateer only, without connecting to Herdr\n--board-liaison    Open/focus the liaison on entry\n--ascii            Plain ASCII attention markers\n\nStart on Fleet overview; select a ship, then use 1–4 for its views. 0 returns home.\ni: captain's inbox; l: open/focus liaison conversation; m: Status/Ask/Message composer.\nInside Herdr, uses HERDR_SOCKET_PATH when HERDR_ENV=1.\nFleet observations are read-only. b: Board; w: Watch; n: New ship; x: Retire; d: Dispatcher.\nMail and management use Privateer commands. Board launches the harness; no input to existing agents."
+                    "Privateer · bridge\n\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\nprivateer-dashboard --demo [--once]\n\n--once: bounded read-only JSON observation\n--no-herdr: do not connect to Herdr\n--ascii: plain markers\n\nOne column: Fleet, Needs you, Recently done. ↑↓ selects; Tab switches Fleet/Needs;\nEnter focuses an EXISTING validated mate space or answers a typed runtime need.\nChoices are offered when provided; otherwise type a reply. Approvals bind exact\nartifact/environment/version; no deployment. i: separate mail history; q: quit.\nNo launch, Board, Watch, tabs, pane creation/reorder, or automatic focus."
                 );
                 return Ok(None);
             }
@@ -72,7 +69,6 @@ fn options() -> Result<Option<Options>> {
     if !out.demo && out.home.is_none() {
         out.home = std::env::var_os("PRIVATEER_HOME").map(PathBuf::from);
     }
-
     if out.socket.is_none() && std::env::var("HERDR_ENV").as_deref() == Ok("1") {
         out.socket = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from);
     }
@@ -82,143 +78,98 @@ fn options() -> Result<Option<Options>> {
     Ok(Some(out))
 }
 
-struct Sample<T> {
-    value: Result<T>,
-    at: Instant,
-    notice: Option<String>,
-}
-enum HerdrAction {
-    Focus(Focus),
-    Board {
-        home: PathBuf,
-        name: String,
-        observed: View,
-    },
-    Watch {
-        home: PathBuf,
-        name: String,
-        observed: View,
-    },
-}
-struct Focus {
-    observed: View,
-    pane: Pane,
-}
-
-struct MouseCapture;
-impl Drop for MouseCapture {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-    }
-}
-
-fn state_worker(registry: PathBuf, home: Option<PathBuf>) -> Receiver<Sample<Snapshot>> {
-    let (send, receive) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        loop {
-            let value = fleet::read(&registry, home.as_deref());
-            if send
-                .send(Sample {
-                    value,
-                    at: Instant::now(),
-                    notice: None,
-                })
-                .is_err()
-            {
-                break;
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
-    receive
-}
-
-enum MailAction {
-    Send(Action),
-    Read(Mail),
-}
-struct MailUpdate {
-    messages: Vec<Mail>,
+struct Update {
+    snapshot: Result<Snapshot>,
+    attention: Attention,
+    mail: Vec<Mail>,
     errors: Vec<String>,
-    notice: Option<String>,
-    sent: bool,
-    completed_send: bool,
-    board: Option<BoardTarget>,
+    outcome: Option<Result<String>>,
 }
-fn mail_worker(
+enum Action {
+    Answer(Answer),
+    Read(Mail),
+    History,
+}
+/// One bounded page/home per pass. A single action queue; no observation on the input loop.
+fn state_worker(
     registry: PathBuf,
     fallback: Option<PathBuf>,
-    binary: PathBuf,
-) -> (Receiver<MailUpdate>, SyncSender<MailAction>) {
-    let (send, receive) = mpsc::sync_channel(1);
+) -> (Receiver<Update>, SyncSender<Action>) {
+    let (send, updates) = mpsc::sync_channel(1);
     let (actions, commands) = mpsc::sync_channel(1);
     thread::spawn(move || {
+        let mut attention = Attention::default();
         let mut mailbox = Mailbox::default();
+        let mut history = false;
+        let mut snapshot = Snapshot::default();
+        let mut observed = Instant::now() - Duration::from_secs(2);
+        let mut failure = None::<String>;
         loop {
-            let action = match commands.recv_timeout(Duration::from_secs(2)) {
+            let action = match commands.recv_timeout(Duration::from_millis(250)) {
                 Ok(a) => Some(a),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(_) => break,
             };
-            let mut sent = false;
-            let mut board = None;
-            let completed_send = matches!(&action, Some(MailAction::Send(_)));
-            let notice = action.map(|a| match a {
-                MailAction::Read(mail) => match mailbox.mark_read(&binary, &mail) {
-                    Ok(()) => "Marked read; earlier unseen mail remains unread.".into(),
-                    Err(e) => format!("Acknowledgment failed: {e}"),
-                },
-                MailAction::Send(a) => {
-                    let result = if a.verb == "init" {
-                        privateer::dashboard::command::initialize(
-                            &binary,
-                            std::path::Path::new(a.args["folder"].as_str().unwrap_or("")),
-                            a.args["name"].as_str().unwrap_or(""),
-                            a.args["harness"].as_str().unwrap_or(""),
-                            a.args["liaison"] == true,
-                        )
-                    } else if a.verb == "service" {
-                        privateer::dashboard::command::service(
-                            &binary,
-                            &a.home,
-                            a.args["action"].as_str().unwrap_or(""),
-                        )
-                        .map(|v| json!({"report":String::from_utf8_lossy(&v)}))
-                    } else {
-                        privateer::dashboard::command::json(&binary, &a.home, &a.verb, &a.args)
-                    };
-                    match result {
-                        Ok(value) => {
-                            sent = true;
-                            if a.verb == "init" {
-                                board = value["ship"].as_str().zip(value["home"].as_str()).map(
-                                    |(ship, home)| BoardTarget {
-                                        ship: ship.to_owned(),
-                                        home: PathBuf::from(home),
-                                    },
-                                );
-                            }
-                            privateer::dashboard::command::summary(&a.verb, &value)
-                        }
-                        Err(e) => format!("{} failed: {e}; form/draft retained", a.verb),
+            if action.is_some() || observed.elapsed() >= Duration::from_secs(2) {
+                match fleet::read(&registry, fallback.as_deref()) {
+                    Ok(s) => {
+                        snapshot = s;
+                        failure = None;
                     }
+                    Err(e) => failure = Some(e.to_string()),
                 }
-            });
-            let errors = match fleet::read(&registry, fallback.as_deref()) {
-                Ok(snapshot) => {
-                    mailbox.refresh(&binary, &snapshot, fallback.as_deref());
-                    mailbox.errors.clone()
+                observed = Instant::now();
+            }
+            let outcome = match action {
+                Some(Action::Answer(answer)) => {
+                    let result = if failure.is_some() {
+                        Err(anyhow::anyhow!("Fleet unavailable; draft retained"))
+                    } else {
+                        bridge::execute(&snapshot, fallback.as_deref(), &attention, &answer).map(
+                            |_| {
+                                "Recorded answer; only authoritative refresh clears the item."
+                                    .into()
+                            },
+                        )
+                    };
+                    attention.refresh_home(&answer.need.home);
+                    Some(result)
                 }
-                Err(e) => vec![e.to_string()],
+                Some(Action::Read(mail)) => Some(if failure.is_some() {
+                    Err(anyhow::anyhow!("Fleet unavailable; read refused"))
+                } else {
+                    mailbox
+                        .mark_read_existing(&snapshot, fallback.as_deref(), &mail)
+                        .map(|()| {
+                            "Marked contiguous read prefix; acknowledgement is not resolution."
+                                .into()
+                        })
+                }),
+                Some(Action::History) => {
+                    history = true;
+                    None
+                }
+                None => None,
             };
+            if failure.is_none() {
+                attention.step(&snapshot, fallback.as_deref());
+            } else {
+                attention.error = Some(
+                    "Fleet observation unavailable; retained attention is NOT an all-clear".into(),
+                );
+            }
+            if history && (outcome.is_some() || observed.elapsed() < Duration::from_millis(250)) {
+                mailbox.refresh_readonly(&snapshot, fallback.as_deref());
+            }
             if send
-                .send(MailUpdate {
-                    messages: mailbox.messages.clone(),
-                    errors,
-                    notice,
-                    sent,
-                    completed_send,
-                    board,
+                .send(Update {
+                    snapshot: failure
+                        .as_ref()
+                        .map_or_else(|| Ok(snapshot.clone()), |e| Err(anyhow::anyhow!(e.clone()))),
+                    attention: attention.clone(),
+                    mail: mailbox.messages.clone(),
+                    errors: mailbox.errors.clone(),
+                    outcome,
                 })
                 .is_err()
             {
@@ -226,84 +177,76 @@ fn mail_worker(
             }
         }
     });
-    (receive, actions)
+    (updates, actions)
 }
-
-fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrAction>) {
-    let (send, receive) = mpsc::sync_channel(1);
-    let (focus, commands) = mpsc::sync_channel::<HerdrAction>(1);
+#[derive(Clone)]
+struct Focus {
+    observed: View,
+    pane: Pane,
+    app_snapshot: Snapshot,
+    ship: String,
+}
+struct HerdrUpdate {
+    value: Result<View>,
+    notice: Option<String>,
+}
+fn herdr_worker(
+    path: PathBuf,
+    registry: PathBuf,
+    fallback: Option<PathBuf>,
+) -> (Receiver<HerdrUpdate>, SyncSender<Focus>) {
+    let (send, updates) = mpsc::sync_channel(1);
+    let (actions, commands) = mpsc::sync_channel::<Focus>(1);
     thread::spawn(move || {
         let mut delay = Duration::ZERO;
         let mut failures = 0_u32;
-        let mut launching = std::collections::BTreeMap::<PathBuf, (String, Instant)>::new();
         loop {
             let action = match commands.recv_timeout(delay) {
-                Ok(action) => Some(action),
+                Ok(a) => Some(a),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(_) => break,
             };
             let mut notice = None;
-            let value = (|| {
+            let value = (|| -> Result<View> {
                 let mut client = Client::connect(&path)?;
-                let binary = privateer::dashboard::command::binary()?;
-                launching.retain(|home, (name, deadline)| {
-                    Instant::now() < *deadline
-                        && !privateer::dashboard::command::json(
-                            &binary,
-                            home,
-                            "ship.presence",
-                            &json!({"ship":name}),
-                        )
-                        .is_ok_and(|presence| presence["attended"] == true)
-                });
                 if let Some(action) = action {
-                    let result = match action {
-                        HerdrAction::Focus(action) => client.focus(&action.observed, &action.pane),
-                        HerdrAction::Board {
-                            home,
-                            name,
-                            observed,
-                        } => (|| -> Result<()> {
-                            privateer::dashboard::command::existing_home(&home)?;
-                            let presence = privateer::dashboard::command::json(
-                                &binary,
-                                &home,
-                                "ship.presence",
-                                &json!({"ship":name}),
-                            )?;
-                            if presence["attended"] == true {
-                                launching.remove(&home);
-                            }
-                            ensure!(
-                                presence["attended"] != true,
-                                "a session is already aboard; refresh its binding or reach it directly"
-                            );
-                            ensure!(
-                                !launching.contains_key(&home),
-                                "launch already submitted; wait for startup before retrying"
-                            );
-                            let folder = home.parent().context("ship folder")?;
-                            launching.insert(
-                                home.clone(),
-                                (name.clone(), Instant::now() + Duration::from_secs(15)),
-                            );
-                            client.board(&observed, folder, &name, &binary, &home)?;
-                            Ok(())
-                        })(),
-                        HerdrAction::Watch {
-                            home,
-                            name,
-                            observed,
-                        } => (|| -> Result<()> {
-                            privateer::dashboard::command::existing_home(&home)?;
-                            let folder = home.parent().context("ship folder")?;
-                            client.watch(&observed, folder, &name, &binary, &home)?;
-                            Ok(())
-                        })(),
-                    };
+                    let result = (|| -> Result<()> {
+                        // Re-read current home/custody/presentation; never launch on a missing binding.
+                        let current = fleet::read(&registry, fallback.as_deref())?;
+                        let before = action
+                            .app_snapshot
+                            .ships
+                            .iter()
+                            .find(|s| s.id == action.ship)
+                            .context("ship selection missing")?;
+                        let after = current
+                            .ships
+                            .iter()
+                            .find(|s| s.id == action.ship)
+                            .context("ship retired")?;
+                        ensure!(
+                            before.live.as_ref().map(|l| (&l.home, &l.identity))
+                                == after.live.as_ref().map(|l| (&l.home, &l.identity)),
+                            "ship home/identity changed"
+                        );
+                        let mut app = App {
+                            snapshot: current,
+                            herdr: Some(action.observed.clone()),
+                            home_age: Some(0),
+                            herdr_age: Some(0),
+                            ..App::default()
+                        };
+                        app.select_ship(Some(action.ship));
+                        let (_, pane) = app.focus_target()?;
+                        ensure!(
+                            pane == action.pane,
+                            "mate binding changed; refresh and reselect"
+                        );
+                        client.focus(&action.observed, &action.pane)
+                    })();
                     notice = Some(match result {
-                        Ok(()) => "Boarding in Herdr; use Herdr navigation to return.".into(),
-                        Err(e) => format!("Board action failed: {e}"),
+                        Ok(()) => "Focused existing mate space.".into(),
+                        Err(e) => format!("Focus refused: {e}"),
                     });
                 }
                 client.snapshot()
@@ -318,178 +261,72 @@ fn herdr_worker(path: PathBuf) -> (Receiver<Sample<View>>, SyncSender<HerdrActio
             } else {
                 2_u64.pow(failures.min(4))
             });
-            if send
-                .send(Sample {
-                    value,
-                    at: Instant::now(),
-                    notice,
-                })
-                .is_err()
-            {
+            if send.send(HerdrUpdate { value, notice }).is_err() {
                 break;
             }
         }
     });
-    (receive, focus)
+    (updates, actions)
 }
-
-fn request_board(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) -> bool {
-    if app.demo {
-        app.notice = "Demo only; no ship launched.".into();
-        return false;
-    }
-    if app.home_error.is_some() || app.home_age.is_none_or(|age| age >= 10) {
-        app.notice = "Refresh Privateer state before boarding.".into();
-        return false;
-    }
-    let Some(sender) = sender else {
-        app.notice = app
-            .snapshot
-            .ships
-            .iter()
-            .find(|ship| Some(&ship.id) == app.ship.as_ref())
-            .and_then(BoardTarget::from_ship)
-            .map_or_else(
-                || "Board needs an explicitly configured Herdr connection.".into(),
-                |target| format!(
-                    "No Herdr connection configured; to talk directly, run: privateer --home '{}' start",
-                    target.home.to_string_lossy().replace('\'', "'\"'\"'")
-                ),
-            );
-        return false;
-    };
-    let Some(view) = &app.herdr else {
-        app.notice = "Waiting for the configured Herdr connection before boarding…".into();
-        return false;
-    };
-    if app.herdr_error.is_some()
-        || app.herdr_age.is_none_or(|age| age >= 10)
-        || app.selection_invalidated
-    {
-        app.notice = "Refresh Herdr and select the ship again.".into();
-        return false;
-    }
-    if app.binding_ambiguous() {
-        app.notice =
-            "Pane is bound to more than one ship; resolve the exact bindings before boarding."
-                .into();
-        return false;
-    }
-    let selected = app
-        .snapshot
-        .ships
-        .iter()
-        .find(|s| Some(&s.id) == app.ship.as_ref());
-    let target = selected.and_then(BoardTarget::from_ship);
-    if app.pending_board.as_ref().is_some_and(|pending| {
-        let pending = pending.target();
-        Some(&pending.ship) == app.ship.as_ref() && Some(pending) != target.as_ref()
-    }) {
-        app.notice = "Ship home changed or is unavailable; automatic Board withheld.".into();
-        return false;
-    }
-    let action = if let Some(pane) = app.scoped_panes().first() {
-        Some(HerdrAction::Focus(Focus {
-            observed: view.clone(),
-            pane: (*pane).clone(),
-        }))
-    } else {
-        selected
-            .filter(|s| s.live.as_ref().is_some_and(|l| l.error.is_none()))
-            .and(target)
-            .map(|target| HerdrAction::Board {
-                home: target.home,
-                name: target.ship,
-                observed: view.clone(),
-            })
-    };
-    let submitted = action.is_some_and(|a| sender.try_send(a).is_ok());
-    app.notice = if submitted {
-        "Checking ship and terminal before boarding…".into()
-    } else {
-        "Board action unavailable or already pending.".into()
-    };
-    submitted
-}
-
-/// Open (or focus) a pane following the selected ship's first mate.
-fn request_watch(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
-    if app.demo {
-        app.notice = "Demo only; nothing to watch.".into();
-        return;
-    }
-    let Some(target) = app
-        .snapshot
-        .ships
-        .iter()
-        .find(|s| Some(&s.id) == app.ship.as_ref())
-        .and_then(BoardTarget::from_ship)
-    else {
-        app.notice = "Select a ship to watch.".into();
-        return;
-    };
-    let Some(sender) = sender else {
-        app.notice = format!(
-            "No Herdr connection configured; in any terminal run: privateer --home '{}' watch {}",
-            target.home.to_string_lossy().replace('\'', "'\"'\"'"),
-            target.ship
-        );
-        return;
-    };
-    let Some(view) = &app.herdr else {
-        app.notice = "Waiting for the configured Herdr connection…".into();
-        return;
-    };
-    let title = format!("{} first mate", target.ship);
-    let action = match view
-        .panes
-        .iter()
-        .find(|p| p.agent.is_some() && p.title.as_deref() == Some(title.as_str()))
-    {
-        Some(pane) => HerdrAction::Focus(Focus {
-            observed: view.clone(),
-            pane: pane.clone(),
-        }),
-        None => HerdrAction::Watch {
-            home: target.home,
-            name: target.ship,
-            observed: view.clone(),
+fn request_focus(app: &mut App, sender: Option<&SyncSender<Focus>>) {
+    app.notice = match app.focus_target() {
+        Err(e) => format!("Focus refused: {e}"),
+        Ok((observed, pane)) => match sender {
+            Some(sender)
+                if sender
+                    .try_send(Focus {
+                        observed,
+                        pane,
+                        app_snapshot: app.snapshot.clone(),
+                        ship: app.ship.clone().unwrap_or_default(),
+                    })
+                    .is_ok() =>
+            {
+                "Revalidating existing mate identity…".into()
+            }
+            _ => "Focus unavailable/already pending.".into(),
         },
     };
-    app.notice = if sender.try_send(action).is_ok() {
-        "Opening the watch pane…".into()
-    } else {
-        "Watch unavailable or already pending.".into()
-    };
 }
-
+struct MouseCapture;
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+}
 fn run(opts: Options) -> Result<()> {
-    privateer::store::Caller::from_env(None, None)?.require_operator("dashboard")?;
+    Caller::from_env(None, None)?.require_operator("dashboard")?;
+    let registry = if opts.demo {
+        PathBuf::new()
+    } else {
+        privateer::fleet::registry_path()?
+    };
     let snapshot = if opts.demo {
         Snapshot::demo()
     } else {
-        fleet::read(&privateer::fleet::registry_path()?, opts.home.as_deref())
-            .context("read existing fleet homes")?
+        fleet::read(&registry, opts.home.as_deref())?
     };
-    let binary = (!opts.demo)
-        .then(privateer::dashboard::command::binary)
-        .transpose()?;
     if opts.once {
         let (herdr, error) = match opts.socket.as_ref() {
             Some(path) => match Client::connect(path).and_then(|mut c| c.snapshot()) {
-                Ok(view) => (Some(view), None),
+                Ok(v) => (Some(v), None),
                 Err(e) => (None, Some(e.to_string())),
             },
             None => (None, None),
         };
         let mut mailbox = Mailbox::default();
-        if let Some(binary) = &binary {
-            mailbox.refresh(binary, &snapshot, opts.home.as_deref());
+        if !opts.demo {
+            mailbox.refresh_readonly(&snapshot, opts.home.as_deref());
+        }
+        let mut attention = Attention::default();
+        // --once is deliberately ONE page/home step, not an unbounded fleet scan.
+        if !opts.demo {
+            attention.step(&snapshot, opts.home.as_deref());
         }
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"demo":opts.demo,"read_only":true,"snapshot":snapshot,"herdr":herdr,"herdr_error":error,"mail":if opts.demo {sample_mail()} else {mailbox.messages},"mail_errors":mailbox.errors})
+                &json!({"demo":opts.demo,"read_only":true,"snapshot":snapshot,"herdr":herdr,"herdr_error":error,"attention":attention,"mail":if opts.demo {sample_mail()} else {mailbox.messages},"mail_errors":mailbox.errors})
             )?
         );
         return Ok(());
@@ -498,364 +335,123 @@ fn run(opts: Options) -> Result<()> {
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive dashboard requires a terminal; use --once for JSON"
     );
-    let mailbox = binary.map(|binary| {
-        mail_worker(
-            privateer::fleet::registry_path().unwrap(),
-            opts.home.clone(),
-            binary,
-        )
-    });
-    let home_updates = if opts.demo {
-        None
-    } else {
-        Some(state_worker(privateer::fleet::registry_path()?, opts.home))
-    };
-    // Inside Herdr, the bridge's own space leads Privateer's spaces.
-    if let (false, Some(socket), Ok("1"), Ok(workspace)) = (
-        opts.demo,
-        &opts.socket,
-        std::env::var("HERDR_ENV").as_deref(),
-        std::env::var("HERDR_WORKSPACE_ID"),
-    ) && std::env::var_os("HERDR_SOCKET_PATH").is_some_and(|path| path == socket.as_os_str())
-        && let Ok(mut client) = Client::connect(socket)
-    {
-        let _ = client
-            .tag(&workspace, "bridge", "")
-            .and_then(|()| client.arrange());
-    }
-    let herdr = opts.socket.map(herdr_worker);
+    let state = (!opts.demo).then(|| state_worker(registry.clone(), opts.home.clone()));
+    let herdr = opts
+        .socket
+        .map(|path| herdr_worker(path, registry, opts.home));
     let mut app = App {
         snapshot,
         herdr: opts.demo.then(View::demo),
-        compact: true,
-        ascii: opts.ascii,
         demo: opts.demo,
-        mail: if opts.demo { sample_mail() } else { Vec::new() },
-        herdr_configured: herdr.is_some(),
+        ascii: opts.ascii,
         home_age: Some(0),
+        herdr_configured: herdr.is_some(),
+        mail: if opts.demo { sample_mail() } else { Vec::new() },
         ..App::default()
     };
-    if !opts.demo && app.snapshot.ships.is_empty() {
-        app.onboard();
-    } else if opts.board_liaison && !opts.demo {
-        app.open_liaison();
-        if let Some(ship) = app
-            .snapshot
-            .ships
-            .iter()
-            .find(|ship| ship.liaison && Some(&ship.id) == app.ship.as_ref())
-        {
-            if herdr.is_some() {
-                app.pending_board = BoardTarget::from_ship(ship).map(PendingBoard::Liaison);
-            } else {
-                request_board(&mut app, None);
-            }
-        }
-    }
-    let started = Instant::now();
-    let mut home_updated = started;
-    let mut herdr_updated: Option<Instant> = None;
-    let mut herdr_observed = false;
+    let mut home_updated = Instant::now();
+    let mut herdr_updated = None::<Instant>;
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<()> {
-        let _mouse_capture = MouseCapture;
+        let _capture = MouseCapture;
         execute!(io::stdout(), EnableMouseCapture)?;
-        let mut redraw = true;
-        let mut last_draw = Instant::now();
         loop {
-            if let Some(updates) = &home_updates {
+            if let Some((updates, _)) = &state {
                 while let Ok(update) = updates.try_recv() {
-                    redraw = true;
-                    match update.value {
-                        Ok(snapshot) => {
-                            app.update_snapshot(snapshot);
+                    match update.snapshot {
+                        Ok(s) => {
+                            app.update_snapshot(s);
                             app.home_error = None;
-                            home_updated = update.at;
+                            home_updated = Instant::now();
                         }
-                        Err(error) => app.home_error = Some(error.to_string()),
+                        Err(e) => app.home_error = Some(e.to_string()),
                     }
-                }
-            } else {
-                home_updated = Instant::now();
-            }
-            if let Some((updates, _)) = &mailbox {
-                while let Ok(update) = updates.try_recv() {
-                    app.update_mail(update.messages, update.errors);
-                    if let Some(notice) = update.notice {
-                        app.notice = notice;
-                    }
-                    if update.completed_send {
+                    app.update_attention(update.attention);
+                    app.update_mail(update.mail, update.errors);
+                    if let Some(outcome) = update.outcome {
                         app.mail_pending = false;
+                        app.notice = match outcome {
+                            Ok(notice) => {
+                                app.answer = None;
+                                notice
+                            }
+                            Err(e) => format!(
+                                "Action failed: {e}; draft retained. Refresh/reselect if stale."
+                            ),
+                        };
                     }
-                    if let Some(ship) = update.board {
-                        app.pending_board = Some(PendingBoard::Onboarding(ship));
-                    }
-                    if update.sent {
-                        app.composer = None;
-                        app.form = None;
-                    }
-                    redraw = true;
                 }
             }
             if let Some((updates, _)) = &herdr {
                 while let Ok(update) = updates.try_recv() {
-                    redraw = true;
-                    herdr_observed = true;
                     if let Some(notice) = update.notice {
                         app.notice = notice;
                     }
                     match update.value {
-                        Ok(view) => {
-                            app.update_herdr(view);
+                        Ok(v) => {
+                            app.update_herdr(v);
                             app.herdr_error = None;
-                            herdr_updated = Some(update.at);
+                            herdr_updated = Some(Instant::now());
                         }
-                        Err(error) => app.herdr_error = Some(error.to_string()),
+                        Err(e) => app.herdr_error = Some(e.to_string()),
                     }
                 }
             }
             app.home_age = Some(home_updated.elapsed().as_secs());
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
-            if opts.demo {
-                app.herdr_age = Some(0);
-            }
-            if let Some(pending) = app
-                .pending_board
-                .as_ref()
-                .filter(|_| app.home_error.is_none() && app.home_age.is_some_and(|age| age < 10))
-            {
-                let target = pending.target().clone();
-                let observed = app
-                    .snapshot
-                    .ships
-                    .iter()
-                    .find(|s| s.id == target.ship)
-                    .and_then(BoardTarget::from_ship);
-                let liaison_changed = matches!(pending, PendingBoard::Liaison(_))
-                    && (app.snapshot.presentation_error.is_some()
-                        || app.snapshot.ships.iter().filter(|s| s.liaison).count() != 1
-                        || !app
-                            .snapshot
-                            .ships
-                            .iter()
-                            .any(|s| s.liaison && s.id == target.ship)
-                        || observed.as_ref() != Some(&target));
-                if liaison_changed {
-                    app.pending_board = None;
-                    app.notice =
-                        "Liaison changed or unavailable; automatic Board cancelled.".into();
-                } else if matches!(pending, PendingBoard::Liaison(_))
-                    && app.ship.as_ref() != Some(&target.ship)
-                {
-                    app.pending_board = None;
-                    app.notice = "Navigation changed; automatic Board cancelled.".into();
-                } else if let Some(observed) = observed {
-                    if observed != target {
-                        app.pending_board = None;
-                        app.notice = "Ship home changed; automatic Board cancelled.".into();
-                    } else {
-                        if matches!(pending, PendingBoard::Onboarding(_)) {
-                            app.select_ship(Some(target.ship.clone()));
-                        }
-                        if herdr.is_some() {
-                            app.board_requested = true;
-                        } else {
-                            app.notice = format!("Created {}.", target.ship);
-                            app.pending_board = None;
-                        }
-                    }
-                }
-            }
-            if app.watch_requested {
-                app.watch_requested = false;
-                request_watch(&mut app, herdr.as_ref().map(|(_, sender)| sender));
-            }
-            if app.board_requested {
-                app.board_requested = false;
-                if request_board(&mut app, herdr.as_ref().map(|(_, sender)| sender))
-                    && app.pending_board.as_ref().is_some_and(|pending| {
-                        app.snapshot
-                            .ships
-                            .iter()
-                            .find(|s| Some(&s.id) == app.ship.as_ref())
-                            .and_then(BoardTarget::from_ship)
-                            .as_ref()
-                            == Some(pending.target())
-                    })
-                {
-                    app.pending_board = None;
-                }
-            }
-            if let Some(action) = app.action.take() {
-                if let Some((_, sender)) = &mailbox {
-                    if sender.try_send(MailAction::Send(action)).is_ok() {
-                        app.mail_pending = true;
-                        app.notice = "Sending through Privateer…".into();
-                    } else {
-                        app.notice = "Mailbox action already pending; draft retained.".into();
-                    }
-                }
-            }
-            app.selected = app.selected.min(app.selection_len().saturating_sub(1));
-            if app.tick_notice(Instant::now()) {
-                redraw = true;
-            }
-            if redraw || last_draw.elapsed() >= Duration::from_secs(1) {
-                terminal.draw(|frame| app.draw(frame))?;
-                last_draw = Instant::now();
-                redraw = false;
-            }
-            // Leave startup input queued until Herdr is first observed, so a
-            // keystroke or scroll cannot cancel the liaison handoff before
-            // its first attempt. Navigation still cancels a delayed one.
-            if !herdr_observed
-                && matches!(app.pending_board, Some(PendingBoard::Liaison(_)))
-                && started.elapsed() < STARTUP_INPUT_HOLD
-            {
-                thread::sleep(Duration::from_millis(20));
+            app.tick_notice(Instant::now());
+            terminal.draw(|frame| app.draw(frame))?;
+            if !event::poll(Duration::from_millis(200))? {
                 continue;
             }
-            if !event::poll(Duration::from_secs(1))? {
-                continue;
-            }
-            let input = event::read()?;
-            if let Event::Mouse(mouse) = input {
-                if matches!(
-                    mouse.kind,
-                    MouseEventKind::Down(MouseButton::Left)
-                        | MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollDown
-                ) {
-                    app.handle_mouse(mouse);
-                    redraw = true;
-                }
-            } else if let Event::Key(key) = input {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                redraw = true;
-                if app.form.is_some() {
+            match event::read()? {
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         break;
                     }
-                    if key.code == KeyCode::Char('u')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        app.edit_form(KeyCode::Delete);
-                    } else if !key
+                    if key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     {
-                        app.edit_form(key.code);
+                        continue;
                     }
-
-                    continue;
-                }
-                if app.composer.is_some() {
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
+                    if app.answer.is_none() && key.code == KeyCode::Char('q') {
                         break;
                     }
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    if app.bridge_key(key.code) {
+                        request_focus(&mut app, herdr.as_ref().map(|(_, s)| s));
+                    }
+                    if let Some(mail) = app.history_read.take()
+                        && let Some((_, sender)) = &state
                     {
-                        app.edit_composer(key.code);
-                    }
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Esc if app.ship.is_some() || app.inbox_open => app.select_ship(None),
-                    KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char('0') | KeyCode::Home => app.select_ship(None),
-                    KeyCode::Char('i') => app.open_inbox(),
-                    KeyCode::Char('l') => app.talk_to_liaison(),
-                    KeyCode::Char('m') => app.compose(),
-                    KeyCode::Char('b') if app.ship.is_some() => app.board_requested = true,
-                    KeyCode::Char('w') if app.ship.is_some() => app.watch_requested = true,
-                    KeyCode::Char('n') => app.manage(privateer::dashboard::forms::Kind::New),
-                    KeyCode::Char('x') if app.ship.is_some() => {
-                        app.manage(privateer::dashboard::forms::Kind::Retire)
-                    }
-                    KeyCode::Char('d') if app.ship.is_some() => {
-                        app.manage(privateer::dashboard::forms::Kind::Dispatcher)
-                    }
-                    KeyCode::Char('r') if app.inbox_open => app.reply(),
-                    KeyCode::Enter if app.inbox_open => {
-                        if let (Some(mail), Some((_, sender))) =
-                            (app.mail.get(app.selected), &mailbox)
-                        {
-                            app.notice = if sender.try_send(MailAction::Read(mail.clone())).is_ok()
-                            {
-                                "Recording read…".into()
-                            } else {
-                                "Mailbox action already pending.".into()
-                            };
-                        }
-                    }
-                    KeyCode::Left => app.focus_content = false,
-                    KeyCode::Right => app.focus_content = app.ship.is_some() || app.inbox_open,
-                    KeyCode::Char('1'..='4') => {
-                        if let KeyCode::Char(n) = key.code {
-                            app.select_tab(n as usize - '1' as usize);
-                        }
-                    }
-                    KeyCode::Tab => {
-                        app.select_tab((app.tab + 1) % 4);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => app.move_selection(true),
-                    KeyCode::Up | KeyCode::Char('k') => app.move_selection(false),
-                    KeyCode::PageDown => app.scroll = app.scroll.saturating_add(8),
-                    KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(8),
-                    KeyCode::Char('c') => app.compact = !app.compact,
-                    KeyCode::Enter if !app.focus_content => {
-                        app.focus_content = app.ship.is_some() || app.inbox_open
-                    }
-                    KeyCode::Enter | KeyCode::Char('f')
-                        if app.ship.is_some() && matches!(app.tab, 0 | 2) =>
-                    {
-                        if app.selected_pane().is_none() {
-                            app.notice = "No terminal is connected to this ship.".into();
-                            continue;
-                        }
-                        if app.demo {
-                            app.notice = "Demo terminal only; no live agent is running.".into();
-                            continue;
-                        }
-                        if let (Some(view), Some((_, sender))) = (&app.herdr, &herdr) {
-                            if !app.selection_invalidated
-                                && app.herdr_error.is_none()
-                                && app.herdr_age.is_some_and(|age| age < 10)
-                            {
-                                if let Some(pane) = app.selected_pane() {
-                                    app.notice = if sender
-                                        .try_send(HerdrAction::Focus(Focus {
-                                            observed: view.clone(),
-                                            pane: pane.clone(),
-                                        }))
-                                        .is_ok()
-                                    {
-                                        "Checking terminal identity before opening…".into()
-                                    } else {
-                                        "Terminal request already pending.".into()
-                                    };
-                                }
-                            } else {
-                                app.notice = "Herdr observations or selection changed; reconnect and select an agent again.".into();
-                            }
+                        if sender.try_send(Action::Read(mail)).is_ok() {
+                            app.mail_pending = true;
                         } else {
-                            app.notice = "No live Herdr connection configured.".into();
+                            app.notice = "History read queue busy; reselect and retry.".into();
                         }
                     }
-                    _ => {}
+                    if app.inbox_open
+                        && key.code == KeyCode::Char('i')
+                        && let Some((_, sender)) = &state
+                    {
+                        let _ = sender.try_send(Action::History);
+                    }
+                    if let Some(answer) = app.answer_action.take()
+                        && let Some((_, sender)) = &state
+                    {
+                        if sender.try_send(Action::Answer(answer)).is_ok() {
+                            app.mail_pending = true;
+                            app.notice =
+                                "Revalidating exact runtime item and recording answer…".into();
+                        } else {
+                            app.notice = "Action queue busy; draft retained.".into();
+                        }
+                    }
                 }
-            } else if matches!(input, Event::Resize(_, _)) {
-                redraw = true;
+                _ => {}
             }
         }
         Ok(())
@@ -863,10 +459,9 @@ fn run(opts: Options) -> Result<()> {
     ratatui::restore();
     result
 }
-
 fn main() {
-    if let Err(error) = options().and_then(|o| o.map_or(Ok(()), run)) {
-        eprintln!("privateer-dashboard: {error:#}");
+    if let Err(e) = options().and_then(|o| o.map_or(Ok(()), run)) {
+        eprintln!("privateer-dashboard: {e:#}");
         std::process::exit(1);
     }
 }
@@ -874,8 +469,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ready_app() -> App {
+    #[test]
+    fn actual_enter_path_queues_only_existing_focus_and_refuses_stale_or_demo() {
         let mut app = App {
             snapshot: Snapshot::demo(),
             herdr: Some(View::demo()),
@@ -884,106 +479,41 @@ mod tests {
             ..App::default()
         };
         app.select_ship(Some("apps".into()));
-        app
-    }
-
-    #[test]
-    fn board_reports_acceptance_only_after_the_bounded_queue_accepts_it() {
-        let mut app = ready_app();
-        let (sender, receive) = mpsc::sync_channel(1);
-        assert!(request_board(&mut app, Some(&sender)));
-        assert!(!request_board(&mut app, Some(&sender)));
-        let HerdrAction::Focus(focus) = receive.try_recv().unwrap() else {
-            panic!("expected focus of the explicitly bound pane");
-        };
-        assert_eq!(focus.pane.pane_id, "demo:apps");
-        assert!(request_board(&mut app, Some(&sender)));
-        assert!(receive.try_recv().is_ok());
-        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
-        assert!(!request_board(&mut app, None));
-    }
-
-    #[test]
-    fn board_refuses_missing_failed_stale_or_invalid_observations() {
-        for condition in [
-            "home-error",
-            "home-stale",
-            "home-unknown",
-            "herdr-missing",
-            "herdr-error",
-            "herdr-stale",
-            "herdr-unknown",
-            "invalid-selection",
-            "ambiguous",
+        let (send, receive) = mpsc::sync_channel(1);
+        assert!(app.bridge_key(KeyCode::Enter));
+        request_focus(&mut app, Some(&send));
+        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "demo:apps");
+        // Display clipping alone does not remove validated existing focus.
+        app.snapshot.truncated = true;
+        request_focus(&mut app, Some(&send));
+        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "demo:apps");
+        for case in [
+            "stale",
             "demo",
+            "ambiguous",
+            "incomplete",
+            "unknown",
+            "invalid",
         ] {
-            let mut app = ready_app();
-            match condition {
-                "home-error" => app.home_error = Some("unavailable".into()),
-                "home-stale" => app.home_age = Some(10),
-                "home-unknown" => app.home_age = None,
-                "herdr-missing" => app.herdr = None,
-                "herdr-error" => app.herdr_error = Some("unavailable".into()),
-                "herdr-stale" => app.herdr_age = Some(10),
-                "herdr-unknown" => app.herdr_age = None,
-                "invalid-selection" => app.selection_invalidated = true,
-                "ambiguous" => app.snapshot.presentation_error = Some("ambiguous".into()),
+            app.herdr_age = Some(0);
+            app.demo = false;
+            app.snapshot.presentation_error = None;
+            app.snapshot.discovery = privateer::dashboard::model::Discovery::Complete;
+            app.selection_invalidated = false;
+            match case {
+                "stale" => app.herdr_age = Some(10),
                 "demo" => app.demo = true,
-                _ => unreachable!(),
+                "ambiguous" => app.snapshot.presentation_error = Some("conflict".into()),
+                "incomplete" => {
+                    app.snapshot.discovery = privateer::dashboard::model::Discovery::Incomplete
+                }
+                "unknown" => {
+                    app.snapshot.discovery = privateer::dashboard::model::Discovery::Unknown
+                }
+                _ => app.selection_invalidated = true,
             }
-            let (sender, receive) = mpsc::sync_channel(1);
-            assert!(!request_board(&mut app, Some(&sender)), "{condition}");
-            assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            request_focus(&mut app, Some(&send));
+            assert!(receive.try_recv().is_err());
         }
-    }
-
-    #[test]
-    fn pending_board_requires_the_created_home_for_focus_and_launch() {
-        let root = tempfile::tempdir().unwrap();
-        let original = root.path().join("original");
-        let replacement = root.path().join("replacement");
-        std::fs::create_dir_all(&original).unwrap();
-        std::fs::create_dir_all(&replacement).unwrap();
-        let expected = BoardTarget {
-            ship: "apps".into(),
-            home: std::fs::canonicalize(&original).unwrap(),
-        };
-        let mut app = ready_app();
-        app.pending_board = Some(PendingBoard::Onboarding(expected.clone()));
-        let ship = app
-            .snapshot
-            .ships
-            .iter_mut()
-            .find(|s| s.id == "apps")
-            .unwrap();
-        ship.live = Some(fleet::ShipState {
-            home: replacement,
-            ..fleet::ShipState::default()
-        });
-        let (sender, receive) = mpsc::sync_channel(1);
-        assert!(!request_board(&mut app, Some(&sender)));
-        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
-        let ship = app
-            .snapshot
-            .ships
-            .iter_mut()
-            .find(|s| s.id == "apps")
-            .unwrap();
-        ship.live.as_mut().unwrap().home = original.join(".");
-        assert!(request_board(&mut app, Some(&sender)));
-        assert!(matches!(receive.try_recv(), Ok(HerdrAction::Focus(_))));
-        app.snapshot
-            .ships
-            .iter_mut()
-            .find(|s| s.id == "apps")
-            .unwrap()
-            .terminals
-            .clear();
-        assert!(request_board(&mut app, Some(&sender)));
-        let HerdrAction::Board { home, name, .. } = receive.try_recv().unwrap() else {
-            panic!("expected a Board launch");
-        };
-        assert_eq!(home, expected.home);
-        assert_eq!(name, expected.ship);
     }
 }

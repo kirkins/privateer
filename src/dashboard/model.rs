@@ -214,7 +214,29 @@ pub struct Job {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Recent {
+    pub home: PathBuf,
+    pub owner: String,
+    pub task_id: String,
+    pub title: String,
+    pub completed_ms: i64,
+}
+
+/// Discovery is independent of clipped recorded work. Defaults/older serialized
+/// snapshots have no evidence of successful home discovery and must fail closed.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Discovery {
+    #[default]
+    Unknown,
+    Complete,
+    Incomplete,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub recent: Vec<Recent>,
     #[serde(default)]
     pub presentation_error: Option<String>,
     pub ships: Vec<Ship>,
@@ -223,10 +245,17 @@ pub struct Snapshot {
     pub pending: Vec<Notice>,
     pub activity: Vec<Notice>,
     pub jobs: Vec<Job>,
+    /// Recorded display rows were clipped; NOT evidence of undiscovered homes.
     pub truncated: bool,
+    #[serde(default)]
+    pub discovery: Discovery,
 }
 
 impl Snapshot {
+    pub fn scope_complete(&self) -> bool {
+        self.discovery == Discovery::Complete
+    }
+
     pub fn include_observed_ships(&mut self) {
         let mut observed = BTreeSet::new();
         for task in &self.tasks {
@@ -295,6 +324,25 @@ impl Snapshot {
                 snapshot.tasks.push(row?);
             }
         }
+        {
+            // Terminal tasks cannot be updated again: their final task.update audit
+            // timestamp is completion evidence. Missing/pruned audit is NOT recent.
+            let mut q = tx.prepare("SELECT substr(t.id,1,160),substr(t.owner,1,160),substr(t.title,1,512),MAX(a.time_ms) FROM tasks t JOIN audit a ON json_extract(a.payload,'$.id')=t.id WHERE t.status='done' AND a.kind='task.update' GROUP BY t.id HAVING MAX(a.time_ms)>=?1 ORDER BY MAX(a.time_ms) DESC LIMIT 201")?;
+            snapshot.recent = q
+                .query_map(
+                    [crate::store::Store::now_ms() - super::bridge::RECENT_MS],
+                    |r| {
+                        Ok(Recent {
+                            home: home.to_path_buf(),
+                            task_id: r.get(0)?,
+                            owner: r.get(1)?,
+                            title: r.get(2)?,
+                            completed_ms: r.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+        }
         snapshot.pending = read_notices(&tx, home, true)?;
         snapshot.activity = read_notices(&tx, home, false)?;
         {
@@ -328,11 +376,13 @@ impl Snapshot {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
         }
         tx.commit()?;
-        snapshot.truncated = snapshot.tasks.len() > ROW_LIMIT
+        snapshot.truncated = snapshot.recent.len() > ROW_LIMIT
+            || snapshot.tasks.len() > ROW_LIMIT
             || snapshot.pending.len() > ROW_LIMIT
             || snapshot.activity.len() > ROW_LIMIT
             || snapshot.jobs.len() > ROW_LIMIT
             || snapshot.custody.len() > ROW_LIMIT;
+        snapshot.recent.truncate(ROW_LIMIT);
         snapshot.tasks.truncate(ROW_LIMIT);
         snapshot.pending.truncate(ROW_LIMIT);
         snapshot.activity.truncate(ROW_LIMIT);
@@ -343,6 +393,7 @@ impl Snapshot {
 
     pub fn demo() -> Self {
         let mut sample = Self {
+            recent: Vec::new(),
             presentation_error: None,
             ships: vec![
                 Ship::demo(
@@ -430,6 +481,8 @@ impl Snapshot {
                 status: "running".into(),
             }],
             truncated: false,
+            // Synthetic scope only; all live actions still refuse demo mode.
+            discovery: Discovery::Complete,
         };
         sample.include_observed_ships();
         sample

@@ -1,5 +1,5 @@
 use crate::store::{Store, identifier, reject_symlinks, required};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -39,7 +39,7 @@ fn limit(args: &Value, default: u64) -> u64 {
         .clamp(1, 1000)
 }
 
-fn hash(value: &Value) -> String {
+pub(crate) fn hash(value: &Value) -> String {
     format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
 }
 
@@ -232,6 +232,9 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
                 "UPDATE tasks SET status=?2 WHERE id=?1",
                 params![id, status],
             )?;
+            if matches!(status, "done" | "cancelled") {
+                crate::mail::close_task(store, id, status)?;
+            }
         }
     }
     store.audit(command, &json!({"id":id,"actor":actor}))?;
@@ -324,6 +327,24 @@ fn event_list(store: &Store, command: &str, args: Value) -> Result<Value> {
 }
 
 fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
+    // Presence (including null) opts into the complete typed correlation pair.
+    // Validate before any mutation; unsupported commands cannot ignore it.
+    let correlated = args.get("request_id").is_some() || args.get("expected_version").is_some();
+    let request_id = if correlated {
+        ensure!(
+            matches!(command, "approval.grant" | "approval.deny"),
+            "request correlation applies only to grant or deny"
+        );
+        let id = required(&args, "request_id")?;
+        identifier(id)?;
+        required(&args, "expected_version")?;
+        if command == "approval.grant" {
+            required(&args, "id")?;
+        }
+        Some(id)
+    } else {
+        None
+    };
     let task = required(&args, "task_id")?;
     let artifact = required(&args, "artifact")?;
     let environment = required(&args, "environment")?;
@@ -334,6 +355,16 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     // It must not require widening every task's standing charter first.
     let charter = store.active_charter(task)?;
     let charter_hash = hash(&charter);
+    // Authority and request binding are rechecked under the same write lock.
+    let request = request_id
+        .map(|id| crate::needs::approval_request(store, id, &args, &charter_hash))
+        .transpose()?;
+    if command == "approval.deny" {
+        let request = request.context("approval.deny requires request_id")?;
+        let result = crate::mail::approval_answer(store, &request, "denied", &args)?;
+        tx.commit()?;
+        return Ok(result);
+    }
     let mut approver = None;
     let id = if command == "approval.grant" {
         // The approver is recorded and must be someone other than the task's
@@ -380,6 +411,13 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
         command,
         &json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"approver":approver}),
     )?;
+    if let Some(request) = request {
+        ensure!(
+            command == "approval.grant",
+            "request_id applies only to grant or deny"
+        );
+        crate::mail::approval_answer(store, &request, "approved", &args)?;
+    }
     tx.commit()?;
     let mut result = json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"consumed":command=="approval.consume"});
     if let Some(approver) = approver {
@@ -598,7 +636,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             Ok(json!({"messages":messages}))
         }
-        "approval.grant" | "approval.consume" => approval(store, command, args),
+        "approval.grant" | "approval.consume" | "approval.deny" => approval(store, command, args),
         "delivery.check" => {
             let task = required(&args, "task_id")?;
             // Read authority and match/consume an approval under the same write

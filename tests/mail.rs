@@ -3,6 +3,7 @@ use privateer::{
     store::{Caller, Store},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 
 fn fleet() -> (tempfile::TempDir, Store) {
@@ -35,6 +36,11 @@ fn fleet() -> (tempfile::TempDir, Store) {
         .unwrap();
     }
     (temp, store)
+}
+
+fn legacy_outcome_id(prefix: &str, request: &str) -> String {
+    let digest = Sha256::digest(json!(request).to_string().as_bytes());
+    format!("{prefix}-{digest:x}")
 }
 
 fn send(store: &mut Store, args: Value) -> anyhow::Result<Value> {
@@ -1460,4 +1466,992 @@ fn naming_another_ships_task_or_peer_points_to_the_cross_ship_link() {
     ));
     assert!(peer.contains("peer infra is not configured"), "{peer}");
     assert!(peer.contains("fleet-<ship>"), "{peer}");
+}
+
+#[test]
+fn withdrawal_is_sender_only_durable_and_not_an_ack_or_reply() {
+    let (temp, mut s) = fleet();
+    let request = send(&mut s, json!({"id":"question","from":"apps","to":"captain","kind":"decision","body":"Choose?","task_id":"main"})).unwrap();
+    dispatch(
+        &mut s,
+        "mail.ack",
+        json!({"address":"captain","through_seq":request["seq"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        dispatch(
+            &mut s,
+            "mail.withdraw",
+            json!({"actor":"infra","id":"question","reason":"obsolete"})
+        )
+        .is_err()
+    );
+    s.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    assert!(dispatch(&mut s, "runtime.needs", json!({})).is_err());
+    assert!(
+        dispatch(
+            &mut s,
+            "mail.withdraw",
+            json!({"actor":"infra","id":"question","reason":"obsolete"})
+        )
+        .is_err()
+    );
+    // A client may legitimately occupy the old predictable runtime ID.
+    let occupied_id = legacy_outcome_id("end", "question");
+    let occupied = send(&mut s, json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"unrelated history"})).unwrap();
+    // Existing actor-omitted callers resolve to the actual agent, not the
+    // request sender; explicit form remains an idempotent retry.
+    let args = json!({"actor":"apps","id":"question","reason":"obsolete"});
+    let closed = dispatch(
+        &mut s,
+        "mail.withdraw",
+        json!({"id":"question","reason":"obsolete"}),
+    )
+    .unwrap();
+    assert_eq!(closed["state"], "withdrawn");
+    assert!(closed["answered_by"].is_null());
+    assert!(!closed["ended_by"].is_null());
+    assert_ne!(closed["ended_by"], occupied_id);
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+        occupied
+    );
+    assert_eq!(dispatch(&mut s, "mail.withdraw", args).unwrap(), closed);
+    assert!(
+        dispatch(
+            &mut s,
+            "mail.withdraw",
+            json!({"actor":"apps","id":"question","reason":"changed"})
+        )
+        .is_err()
+    );
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"question"})).unwrap()["state"],
+        "withdrawn"
+    );
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(send(&mut s,json!({"from":"captain","to":"apps","kind":"reply","correlation":"question","body":"late"})).is_err());
+}
+
+#[test]
+fn omitted_withdraw_actor_never_impersonates_sender_or_captain() {
+    let (_temp, mut s) = fleet();
+    send(&mut s,json!({"id":"captains-question","from":"captain","to":"apps","kind":"request","body":"Ready?"})).unwrap();
+    send(&mut s,json!({"id":"apps-question","from":"apps","to":"captain","kind":"request","body":"Choose?"})).unwrap();
+    s.set_caller(Caller::Agent {
+        actor: "infra".into(),
+    });
+    for id in ["captains-question", "apps-question"] {
+        assert!(
+            dispatch(
+                &mut s,
+                "mail.withdraw",
+                json!({"id":id,"reason":"not mine"})
+            )
+            .is_err()
+        );
+        assert!(
+            dispatch(
+                &mut s,
+                "mail.withdraw",
+                json!({"id":id,"actor":"captain","reason":"not mine"})
+            )
+            .is_err()
+        );
+    }
+    s.set_caller(Caller::Operator);
+    assert!(
+        dispatch(
+            &mut s,
+            "mail.withdraw",
+            json!({"id":"apps-question","reason":"x".repeat(2001)})
+        )
+        .is_err()
+    );
+    // Captain-desk operator selection, including the legacy omitted reason.
+    for id in ["captains-question", "apps-question"] {
+        let closed = dispatch(&mut s, "mail.withdraw", json!({"id":id})).unwrap();
+        assert_eq!(closed["state"], "withdrawn");
+        assert_eq!(closed["end_reason"], "");
+        assert!(closed["answered_by"].is_null());
+        assert!(closed["remote"].is_null());
+    }
+    assert_eq!(s.task("main").unwrap()["owner"], "apps");
+}
+
+#[test]
+fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        b_home,
+    } = pair();
+    send(&mut a,json!({"id":"retry-end","from":"apps","to":"infra","kind":"request","body":"Still needed?"})).unwrap();
+    dispatch(&mut a,"peer.put",json!({"name":"home-b","transport":"local","executable":"/nonexistent/privateer","home":b_home})).unwrap();
+    a.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    let args = json!({"id":"retry-end","reason":"obsolete"});
+    let closed = dispatch(&mut a, "mail.withdraw", args.clone()).unwrap();
+    assert_eq!(closed["state"], "withdrawn");
+    assert_ne!(closed["remote"], "withdrawn");
+    assert_ne!(closed["remote"], "unknown");
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"retry-end"})).unwrap()["state"],
+        "open"
+    );
+    let home = a.home().to_owned();
+    drop(a);
+    let mut a = Store::open(&home).unwrap();
+    a.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    // Retry after restart retains the same closure even while transport fails.
+    let waiting = dispatch(&mut a, "mail.withdraw", args.clone()).unwrap();
+    assert_eq!(waiting["ended_by"], closed["ended_by"]);
+    assert_ne!(waiting["remote"], "withdrawn");
+    a.set_caller(Caller::Operator);
+    dispatch(&mut a,"peer.put",json!({"name":"home-b","transport":"local","executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home})).unwrap();
+    a.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    assert_eq!(
+        dispatch(&mut a, "mail.flush", json!({})).unwrap()["delivered"],
+        1
+    );
+    let recovered = dispatch(&mut a, "mail.withdraw", args).unwrap();
+    assert_eq!(recovered["remote"], "withdrawn");
+    assert_eq!(recovered["ended_by"], closed["ended_by"]);
+    let theirs = dispatch(&mut b, "mail.show", json!({"id":"retry-end"})).unwrap();
+    assert_eq!(theirs["ended_by"], closed["ended_by"]);
+    let notice = dispatch(&mut a, "mail.show", json!({"id":closed["ended_by"]})).unwrap();
+    let wire = json!({"id":notice["id"],"from":"apps","to":"infra","kind":"notice","correlation":"retry-end","body":notice["body"],"payload":notice["payload"]});
+    let duplicate = dispatch(&mut b, "mail.deliver", wire.clone()).unwrap();
+    assert_eq!(duplicate["duplicate"], true);
+    assert_eq!(duplicate["request_end"]["ended_by"], closed["ended_by"]);
+    assert_eq!(duplicate["request_end"]["state"], "withdrawn");
+    send(
+        &mut a,
+        json!({"id":"empty-reason","from":"apps","to":"infra","kind":"request","body":"Needed?"}),
+    )
+    .unwrap();
+    let legacy = dispatch(&mut a, "mail.withdraw", json!({"id":"empty-reason"})).unwrap();
+    assert_eq!(legacy["remote"], "withdrawn");
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"empty-reason"})).unwrap()["end_reason"],
+        ""
+    );
+    assert!(recovered["answered_by"].is_null());
+    assert_eq!(
+        dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap()["acknowledged_through"],
+        0
+    );
+    // Ordinary retention can remove the acknowledged closed request while
+    // its unread closure remains. Redelivery must still succeed as a no-op,
+    // with unknown application evidence rather than blocking the peer FIFO.
+    dispatch(
+        &mut b,
+        "mail.ack",
+        json!({"address":"infra","through_seq":theirs["seq"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        privateer::mail::prune(&b, Store::now_ms() + 1, false).unwrap(),
+        1
+    );
+    assert!(dispatch(&mut b, "mail.show", json!({"id":"retry-end"})).is_err());
+    let retained = dispatch(&mut b, "mail.show", json!({"id":closed["ended_by"]})).unwrap();
+    let redelivered = dispatch(&mut b, "mail.deliver", wire).unwrap();
+    assert_eq!(redelivered["duplicate"], true);
+    assert!(redelivered["request_end"].is_null());
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":closed["ended_by"]})).unwrap(),
+        retained
+    );
+}
+
+#[test]
+fn transport_results_require_matching_closure_receipt_for_remote_state() {
+    use std::os::unix::fs::PermissionsExt;
+    for (response, error) in [
+        ("{'ok':True,'result':{'request_end':None}}", None),
+        (
+            "{'ok':True,'result':{'request_end':{'id':'wrong-request','state':'withdrawn','ended_by':r['args']['id']}}}",
+            None,
+        ),
+        (
+            "{'ok':True,'result':{'request_end':{'id':r['args'].get('correlation'),'state':'withdrawn','ended_by':'wrong-closure'}}}",
+            None,
+        ),
+        ("{'ok':False,'error':'withdrawn'}", Some("withdrawn")),
+        ("{'ok':False,'error':'answered'}", Some("answered")),
+    ] {
+        let Pair {
+            _temp,
+            mut a,
+            mut b,
+            b_home,
+        } = pair();
+        send(
+            &mut a,
+            json!({"id":"legacy-end","from":"apps","to":"infra","kind":"request","body":"Needed?"}),
+        )
+        .unwrap();
+        // Disposable peer: either acknowledges transport without applying
+        // the closure, or fails with state-like error text. No real home,
+        // role or config is bypassed.
+        let peer = _temp.path().join("legacy-peer");
+        fs::write(&peer,format!("#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))\n")).unwrap();
+        fs::set_permissions(&peer, fs::Permissions::from_mode(0o755)).unwrap();
+        dispatch(
+            &mut a,
+            "peer.put",
+            json!({"name":"home-b","transport":"local","executable":peer,"home":b_home}),
+        )
+        .unwrap();
+        let result = dispatch(
+            &mut a,
+            "mail.withdraw",
+            json!({"id":"legacy-end","reason":"obsolete"}),
+        )
+        .unwrap();
+        let expected_remote = error
+            .map(|e| format!("error: {e}"))
+            .unwrap_or_else(|| "unknown".to_owned());
+        assert_eq!(result["remote"], expected_remote, "{result}");
+        assert_ne!(result["remote"], "withdrawn");
+        assert_eq!(result["state"], "withdrawn");
+        assert!(result["answered_by"].is_null());
+        let notice = dispatch(&mut a, "mail.show", json!({"id":result["ended_by"]})).unwrap();
+        assert_eq!(
+            notice["delivery"],
+            if error.is_some() {
+                "pending"
+            } else {
+                "delivered"
+            }
+        );
+        assert_eq!(notice["delivery_error"], json!(error));
+        assert_eq!(notice["delivery_attempts"], 1);
+        assert_eq!(
+            dispatch(&mut b, "mail.show", json!({"id":"legacy-end"})).unwrap()["state"],
+            "open"
+        );
+        // Closure, raw transport failure and lack of application evidence
+        // survive reopening the disposable sender home.
+        let durable = dispatch(&mut a, "mail.show", json!({"id":"legacy-end"})).unwrap();
+        let home = a.home().to_owned();
+        drop(a);
+        let mut a = Store::open(&home).unwrap();
+        assert_eq!(
+            dispatch(&mut a, "mail.show", json!({"id":"legacy-end"})).unwrap(),
+            durable
+        );
+        assert_eq!(
+            dispatch(&mut a, "mail.show", json!({"id":result["ended_by"]})).unwrap(),
+            notice
+        );
+        let applied: Option<String> = a
+            .connection()
+            .query_row(
+                "SELECT remote_end_state FROM mail WHERE id=?1",
+                [result["ended_by"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, None);
+    }
+}
+
+#[test]
+fn terminal_task_closes_linked_questions_and_preserves_history() {
+    for status in ["done", "cancelled"] {
+        let (_temp, mut s) = fleet();
+        send(&mut s,json!({"id":"linked","from":"apps","to":"captain","kind":"request","body":"question","task_id":"main"})).unwrap();
+        send(&mut s,json!({"id":"unlinked","from":"apps","to":"captain","kind":"request","body":"question"})).unwrap();
+        let occupied_id = legacy_outcome_id("end", "linked");
+        let occupied = send(&mut s,json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"prior history"})).unwrap();
+        dispatch(
+            &mut s,
+            "task.handoff",
+            json!({"actor":"apps","id":"main","target":"infra"}),
+        )
+        .unwrap();
+        dispatch(&mut s, "task.accept", json!({"actor":"infra","id":"main"})).unwrap();
+        // Custody does not confer authorship of the old owner's requests.
+        assert!(
+            dispatch(
+                &mut s,
+                "mail.withdraw",
+                json!({"actor":"infra","id":"linked","reason":"not mine"})
+            )
+            .is_err()
+        );
+        dispatch(
+            &mut s,
+            "task.update",
+            json!({"actor":"infra","id":"main","status":status}),
+        )
+        .unwrap();
+        let linked = dispatch(&mut s, "mail.show", json!({"id":"linked"})).unwrap();
+        assert_eq!(linked["state"], format!("task_{status}"));
+        assert_eq!(s.task("main").unwrap()["owner"], "infra");
+        assert_ne!(linked["ended_by"], occupied_id);
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+            occupied
+        );
+        assert!(linked["answered_by"].is_null());
+        assert_eq!(
+            dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["source_id"],
+            "unlinked"
+        );
+        assert!(
+            send(
+                &mut s,
+                json!({"from":"apps","to":"captain","kind":"request","body":"new","task_id":"main"})
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn closure_crosses_homes_and_inflight_reply_wins_without_reopening() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    send(
+        &mut a,
+        json!({"id":"withdraw-me","from":"apps","to":"infra","kind":"request","body":"question"}),
+    )
+    .unwrap();
+    // Local clients cannot forge closures; malformed/unauthored remote
+    // closures roll back both the notice and the request change.
+    assert!(send(&mut a,json!({"id":"local-spoof","from":"apps","to":"infra","kind":"notice","correlation":"withdraw-me","payload":{"request_end":{"version":1,"state":"withdrawn","reason":"fake"}}})).is_err());
+    dispatch(
+        &mut b,
+        "ship.put",
+        json!({"name":"research","location":{"peer":"home-a"}}),
+    )
+    .unwrap();
+    let wire = json!({"id":"bad-closure","from":"apps","to":"infra","kind":"notice","correlation":"withdraw-me","payload":{"request_end":{"version":1,"state":"withdrawn","reason":"obsolete"}}});
+    let before: i64 = b
+        .connection()
+        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
+        .unwrap();
+    for (field, value) in [
+        ("from", json!("research")),
+        ("to", json!("captain")),
+        ("kind", json!("request")),
+        ("correlation", Value::Null),
+        ("correlation", json!("unknown")),
+    ] {
+        let mut bad = wire.clone();
+        bad[field] = value;
+        assert!(dispatch(&mut b, "mail.deliver", bad).is_err());
+    }
+    for end in [
+        json!({"version":2,"state":"withdrawn","reason":"obsolete"}),
+        json!({"version":1,"state":"approved","reason":"fake"}),
+        json!({"version":1,"state":"withdrawn","reason":null}),
+        json!({"version":1,"state":"withdrawn","reason":"x".repeat(2001)}),
+    ] {
+        let mut bad = wire.clone();
+        bad["payload"]["request_end"] = end;
+        assert!(dispatch(&mut b, "mail.deliver", bad).is_err());
+    }
+    assert_eq!(
+        b.connection()
+            .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
+        "open"
+    );
+    let occupied_id = legacy_outcome_id("end", "withdraw-me");
+    let occupied = send(&mut a,json!({"id":occupied_id,"from":"apps","to":"infra","kind":"notice","body":"old unrelated wire history"})).unwrap();
+    let result = dispatch(
+        &mut a,
+        "mail.withdraw",
+        json!({"actor":"apps","id":"withdraw-me","reason":"no longer needed"}),
+    )
+    .unwrap();
+    assert_eq!(result["remote"], "withdrawn");
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
+        "withdrawn"
+    );
+    assert_ne!(
+        dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["ended_by"],
+        occupied_id
+    );
+    let historical = dispatch(&mut b, "mail.show", json!({"id":occupied_id})).unwrap();
+    assert_eq!(historical["body"], occupied["body"]);
+    // A new reply after observing closure is refused.
+    assert!(send(&mut b,json!({"from":"infra","to":"apps","kind":"reply","correlation":"withdraw-me","body":"late"})).is_err());
+    // Hold only B's fixture outbox, so its real reply is committed before A's
+    // withdrawal but crosses the subprocess boundary afterwards.
+    send(
+        &mut a,
+        json!({"id":"race-wire","from":"apps","to":"infra","kind":"request","body":"question"}),
+    )
+    .unwrap();
+    b.connection()
+        .execute(
+            "INSERT INTO mail_delivery_retry VALUES('home-a',1,?1,0)",
+            [Store::now_ms() + 60_000],
+        )
+        .unwrap();
+    let reply = send(&mut b,json!({"id":"inflight","from":"infra","to":"apps","kind":"reply","correlation":"race-wire","body":"already sent"})).unwrap();
+    assert_eq!(reply["delivery"], "pending");
+    let crossed = dispatch(
+        &mut a,
+        "mail.withdraw",
+        json!({"actor":"apps","id":"race-wire","reason":"obsolete"}),
+    )
+    .unwrap();
+    assert_ne!(
+        crossed["remote"], "withdrawn",
+        "an inflight answer was not withdrawn"
+    );
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"race-wire"})).unwrap()["state"],
+        "answered"
+    );
+    assert_eq!(
+        dispatch(&mut b, "mail.flush", json!({})).unwrap()["delivered"],
+        1
+    );
+    for store in [&mut a, &mut b] {
+        assert_eq!(
+            dispatch(store, "mail.show", json!({"id":"race-wire"})).unwrap()["state"],
+            "answered"
+        );
+    }
+    let wire = json!({"id":"inflight","from":"infra","to":"apps","kind":"reply","correlation":"race-wire","body":"already sent"});
+    assert_eq!(
+        dispatch(&mut a, "mail.deliver", wire).unwrap()["duplicate"],
+        true
+    );
+}
+
+#[test]
+fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
+    let (temp, mut s) = fleet();
+    send(&mut s,json!({"id":"decision","from":"apps","to":"captain","kind":"decision","body":"Which?","payload":{"choices":["a","b"]}})).unwrap();
+    send(&mut s,json!({"id":"release","from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"sha256:exact","environment":"production"}})).unwrap();
+    let first = dispatch(&mut s, "runtime.needs", json!({"limit":1})).unwrap();
+    assert_eq!(first["items"][0]["source_id"], "decision");
+    assert_eq!(first["items"][0]["choices"], json!(["a", "b"]));
+    let second = dispatch(
+        &mut s,
+        "runtime.needs",
+        json!({"after":first["next_after"]}),
+    )
+    .unwrap();
+    let item = &second["items"][0];
+    assert_eq!(item["kind"], "approval");
+    let mut approval = json!({"id":"grant-exact","request_id":"release","expected_version":item["version"],"task_id":"main","artifact":"sha256:exact","environment":"production","approver":"captain"});
+    let stable = item["id"].clone();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(
+        dispatch(
+            &mut s,
+            "runtime.needs",
+            json!({"after":first["next_after"]})
+        )
+        .unwrap()["items"][0]["id"],
+        stable
+    );
+    // Every supplied correlation field must belong to a complete typed pair.
+    let before_mail: i64 = s
+        .connection()
+        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
+        .unwrap();
+    for (request, version) in [
+        (None, Some(approval["expected_version"].clone())),
+        (
+            Some(Value::Null),
+            Some(approval["expected_version"].clone()),
+        ),
+        (Some(json!(42)), Some(approval["expected_version"].clone())),
+        (Some(json!({})), Some(approval["expected_version"].clone())),
+        (Some(json!([])), Some(approval["expected_version"].clone())),
+        (
+            Some(json!(false)),
+            Some(approval["expected_version"].clone()),
+        ),
+        (
+            Some(json!("not a valid id")),
+            Some(approval["expected_version"].clone()),
+        ),
+        (Some(json!("release")), Some(json!({}))),
+        (Some(json!("release")), Some(json!([]))),
+        (Some(json!("release")), Some(json!(false))),
+        (Some(json!("release")), None),
+        (Some(json!("release")), Some(Value::Null)),
+        (Some(json!("release")), Some(json!(42))),
+        (Some(json!("")), Some(approval["expected_version"].clone())),
+        (Some(json!("release")), Some(json!(""))),
+    ] {
+        let mut invalid = approval.clone();
+        invalid.as_object_mut().unwrap().remove("request_id");
+        invalid.as_object_mut().unwrap().remove("expected_version");
+        if let Some(v) = request {
+            invalid["request_id"] = v;
+        }
+        if let Some(v) = version {
+            invalid["expected_version"] = v;
+        }
+        assert!(
+            dispatch(&mut s, "approval.grant", invalid.clone()).is_err(),
+            "{invalid}"
+        );
+        assert!(dispatch(&mut s, "approval.deny", invalid.clone()).is_err());
+        assert!(dispatch(&mut s, "approval.consume", invalid).is_err());
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["state"],
+            "open"
+        );
+        assert_eq!(
+            s.connection()
+                .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.connection()
+                .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before_mail
+        );
+    }
+    // Consume cannot accept correlation, even if correctly bound.
+    assert!(dispatch(&mut s, "approval.consume", approval.clone()).is_err());
+    let occupied_id = legacy_outcome_id("approval-answer", "release");
+    let occupied = send(&mut s, json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"unrelated approval history"})).unwrap();
+    approval["artifact"] = json!("different");
+    assert!(dispatch(&mut s, "approval.grant", approval.clone()).is_err());
+    approval["artifact"] = json!("sha256:exact");
+    s.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    assert!(dispatch(&mut s, "approval.grant", approval.clone()).is_err());
+    s.set_caller(Caller::Operator);
+    dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
+    let granted_request = dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap(),
+        granted_request
+    );
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["state"],
+        "approved"
+    );
+    assert_ne!(
+        dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["answered_by"],
+        occupied_id
+    );
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+        occupied
+    );
+    assert!(dispatch(&mut s, "approval.deny", approval.clone()).is_err());
+    assert!(dispatch(&mut s, "approval.consume", approval.clone()).is_err());
+    let mut version_only = approval.clone();
+    version_only.as_object_mut().unwrap().remove("request_id");
+    assert!(dispatch(&mut s, "approval.consume", version_only).is_err());
+    assert_eq!(
+        s.connection()
+            .query_row(
+                "SELECT consumed FROM approvals WHERE id='grant-exact'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    dispatch(&mut s, "approval.consume", json!({"id":"grant-exact","task_id":"main","artifact":"sha256:exact","environment":"production"})).unwrap();
+    assert!(dispatch(&mut s, "approval.grant", approval).is_err());
+    assert_eq!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn denial_is_distinct_and_ordinary_reply_never_grants() {
+    let (temp, mut s) = fleet();
+    for id in ["deny", "plain"] {
+        send(&mut s,json!({"id":id,"from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
+    }
+    let version =
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["version"].clone();
+    let args = json!({"request_id":"deny","expected_version":version,"task_id":"main","artifact":"abc","environment":"production","approver":"captain"});
+    // Even captain-authored ordinary mail with the right-looking payload
+    // cannot masquerade as the authoritative response to an open request.
+    let occupied_id = legacy_outcome_id("approval-answer", "deny");
+    let occupied = send(&mut s,json!({"id":occupied_id,"from":"captain","to":"apps","kind":"notice","correlation":"deny","body":"not a runtime response","payload":{"approval_outcome":"denied","approval_id":null,"artifact":"abc","environment":"production"}})).unwrap();
+    let answer = dispatch(&mut s, "approval.deny", args.clone()).unwrap();
+    assert_eq!(answer["kind"], "reply");
+    assert_ne!(answer["id"], occupied_id);
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(dispatch(&mut s, "approval.deny", args).unwrap(), answer);
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+        occupied
+    );
+    send(&mut s,json!({"from":"captain","to":"apps","kind":"reply","correlation":"plain","body":"approved"})).unwrap();
+    assert_eq!(
+        s.connection()
+            .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"deny"})).unwrap()["state"],
+        "denied"
+    );
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
+    let (_temp, mut s) = fleet();
+    send(&mut s,json!({"from":"apps","to":"captain","kind":"notice","body":"BLOCKED CI red, production needs approval"})).unwrap();
+    dispatch(&mut s,"task.create",json!({"id":"dependency-wait","charter_id":"project","owner":"apps","title":"Await runtime review before UI implementation (intentional scheduling)"})).unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"actor":"apps","id":"dependency-wait","status":"blocked"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"actor":"apps","id":"main","status":"blocked"}),
+    )
+    .unwrap();
+    let now = Store::now_ms();
+    for (id, status) in [("queued", "queued"), ("orphan", "orphaned")] {
+        s.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",rusqlite::params![id,json!({"id":id,"status":status,"task_id":"main","created_ms":now-61_000,"incarnation":"inc","reason":"typed reason"}).to_string()]).unwrap();
+    }
+    let before: i64 = s
+        .connection()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    let result = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    let after: i64 = s
+        .connection()
+        .query_row("SELECT total_changes()", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(result["items"].as_array().unwrap().len(), 2);
+    assert!(
+        result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["source"] == "job")
+    );
+    assert!(
+        result["unknown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "task_captain_actionability")
+    );
+    assert!(
+        result["unknown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "ci")
+    );
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"actor":"apps","id":"main","status":"done"}),
+    )
+    .unwrap();
+    let result = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["items"][0]["evidence"], "orphaned_job");
+    s.connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.status','succeeded')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let bounded_unavailable = |store: &mut Store| {
+        let started = std::time::Instant::now();
+        let value = dispatch(store, "runtime.needs", json!({"limit":1})).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(value["available"], false, "{value}");
+        assert!(value["items"].as_array().unwrap().is_empty());
+        assert!(!value["unknown"].as_array().unwrap().is_empty());
+        // No permanent timeout/progress changes to ordinary command connections.
+        assert_eq!(
+            store
+                .connection()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            10_000
+        );
+        assert_eq!(store.connection().query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<200000) SELECT sum(x) FROM n",[],|r| r.get::<_,i64>(0)).unwrap(),20_000_100_000);
+    };
+    // Oversized JSON is refused before an uninterruptible Rust parse/JSON opcode.
+    s.connection()
+        .execute(
+            "UPDATE jobs SET record=?1 WHERE id='queued'",
+            [json!({"status":"succeeded","large":"x".repeat(70_000)}).to_string()],
+        )
+        .unwrap();
+    bounded_unavailable(&mut s);
+    s.connection().execute("DELETE FROM jobs", []).unwrap();
+    // A real large table forces scan/JSON/sort work despite limit:1. It cannot
+    // quietly return [] after the work budget is exhausted.
+    s.connection().execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000)
+        INSERT INTO jobs SELECT 'large-'||x,'{\"task_id\":\"main\",\"status\":\"succeeded\",\"created_ms\":0}' FROM n;").unwrap();
+    bounded_unavailable(&mut s);
+    s.connection().execute("DELETE FROM jobs", []).unwrap();
+    // Pathological metadata CPU work is covered before any item query as well.
+    s.connection().execute_batch("ALTER TABLE metadata RENAME TO saved_metadata;
+        CREATE VIEW metadata AS SELECT key,value FROM saved_metadata WHERE
+        (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;").unwrap();
+    bounded_unavailable(&mut s);
+}
+
+#[test]
+fn reply_withdraw_and_terminal_update_serialize_without_lost_facts() {
+    for _ in 0..8 {
+        let (temp, mut s) = fleet();
+        send(&mut s,json!({"id":"race","from":"apps","to":"captain","kind":"request","body":"question","task_id":"main"})).unwrap();
+        let home = temp.path().join("home");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = [("mail.withdraw",json!({"actor":"apps","id":"race","reason":"obsolete"})),("mail.send",json!({"id":"race-answer","from":"captain","to":"apps","kind":"reply","correlation":"race","body":"answer"})),("task.update",json!({"actor":"apps","id":"main","status":"done"}))].into_iter().map(|(cmd,args)| {
+            let barrier = barrier.clone(); let home = home.clone();
+            std::thread::spawn(move || { let mut s = Store::open(&home).unwrap(); barrier.wait(); dispatch(&mut s,cmd,args).is_ok() })
+        }).collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let request = dispatch(&mut s, "mail.show", json!({"id":"race"})).unwrap();
+        assert!(matches!(
+            request["state"].as_str(),
+            Some("answered" | "withdrawn" | "task_done")
+        ));
+        let replies: i64 = s
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE kind='reply' AND correlation='race'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replies, if request["state"] == "answered" { 1 } else { 0 });
+        assert!(
+            dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn stale_approval_version_is_not_grantable_and_disappears() {
+    let (_temp, mut s) = fleet();
+    send(&mut s,json!({"id":"stale","from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
+    let version =
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["version"].clone();
+    let original = s.charter("project").unwrap();
+    let origin: String = s
+        .connection()
+        .query_row(
+            "SELECT value FROM metadata WHERE key='runtime_origin'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let request = dispatch(&mut s, "mail.show", json!({"id":"stale"})).unwrap();
+    let task = s.task("main").unwrap();
+    // Corrupt JSON and structurally invalid authority are NOT revoked/stale.
+    // In particular, neither may turn this exact actionable approval into an
+    // available:true empty page. No read may repair, ack or change custody.
+    let mut invalid = original.clone();
+    invalid["active"] = json!("not-a-boolean");
+    for source in ["not-json".to_owned(), invalid.to_string()] {
+        s.connection()
+            .execute("UPDATE charters SET data=?1 WHERE id='project'", [&source])
+            .unwrap();
+        let before = s.connection().total_changes();
+        let value = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+        assert_eq!(value["available"], false, "{value}");
+        assert!(value["items"].as_array().unwrap().is_empty());
+        assert!(value["next_after"].is_null());
+        assert_eq!(value["unknown"], json!(["runtime_observation"]));
+        assert_eq!(s.connection().total_changes(), before);
+        assert_eq!(s.task("main").unwrap(), task);
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":"stale"})).unwrap(),
+            request
+        );
+        assert_eq!(
+            s.connection()
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='runtime_origin'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            origin
+        );
+        assert_eq!(
+            s.connection()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            10_000
+        );
+        assert_eq!(s.connection().query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<200000) SELECT sum(x) FROM n", [], |r| r.get::<_,i64>(0)).unwrap(), 20_000_100_000);
+    }
+    let mut revoked = original.clone();
+    revoked["active"] = json!(false);
+    s.connection()
+        .execute(
+            "UPDATE charters SET data=?1 WHERE id='project'",
+            [revoked.to_string()],
+        )
+        .unwrap();
+    let value = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    assert_eq!(value["available"], true);
+    assert!(value["items"].as_array().unwrap().is_empty());
+    s.connection()
+        .execute(
+            "UPDATE charters SET data=?1 WHERE id='project'",
+            [original.to_string()],
+        )
+        .unwrap();
+    let value = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    assert_eq!(value["available"], true);
+    assert_eq!(value["items"][0]["version"], version);
+    assert_eq!(value["items"][0]["source_id"], "stale");
+    s.connection()
+        .execute(
+            "UPDATE charters SET data=json_set(data,'$.objective','changed') WHERE id='project'",
+            [],
+        )
+        .unwrap();
+    assert!(dispatch(&mut s,"approval.grant",json!({"id":"stale-grant","request_id":"stale","expected_version":version,"task_id":"main","artifact":"abc","environment":"production","approver":"captain"})).is_err());
+    assert!(
+        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn terminal_task_closure_recovers_outbox_across_restart_and_redelivery() {
+    let Pair {
+        _temp,
+        mut a,
+        mut b,
+        ..
+    } = pair();
+    let home = a.home().to_owned();
+    dispatch(
+        &mut a,
+        "charter.put",
+        json!({"id":"project","repo":_temp.path(),"objective":"Fixture","min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut a,
+        "task.create",
+        json!({"id":"main","charter_id":"project","owner":"apps","title":"Fixture"}),
+    )
+    .unwrap();
+    send(&mut a,json!({"id":"linked-remote","from":"apps","to":"infra","kind":"request","body":"question","task_id":"main"})).unwrap();
+    dispatch(
+        &mut a,
+        "task.update",
+        json!({"id":"main","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"linked-remote"})).unwrap()["state"],
+        "open"
+    );
+    let local = dispatch(&mut a, "mail.show", json!({"id":"linked-remote"})).unwrap();
+    let closure_id = local["ended_by"].clone();
+    drop(a);
+    let mut a = Store::open(&home).unwrap();
+    assert_eq!(
+        dispatch(&mut a, "mail.flush", json!({})).unwrap()["delivered"],
+        1
+    );
+    let remote = dispatch(&mut b, "mail.show", json!({"id":"linked-remote"})).unwrap();
+    assert_eq!(remote["state"], "task_done");
+    assert!(remote["task_id"].is_null());
+    assert_eq!(remote["ended_by"], closure_id);
+    let closure = dispatch(&mut b, "mail.show", json!({"id":closure_id})).unwrap();
+    assert_eq!(closure["kind"], "notice");
+    assert_eq!(closure["correlation"], "linked-remote");
+    assert_eq!(
+        dispatch(&mut b, "mail.deliver", closure).unwrap()["duplicate"],
+        true
+    );
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"linked-remote"})).unwrap()["state"],
+        "task_done"
+    );
+    // Historical notices may still reference the terminal task.
+    send(
+        &mut a,
+        json!({"from":"apps","to":"infra","kind":"notice","body":"finished","task_id":"main"}),
+    )
+    .unwrap();
 }

@@ -189,103 +189,65 @@ fn click_text(app: &mut App, screen: &str, label: &str) {
 }
 
 #[test]
-fn mouse_navigation_selects_visible_tabs_rows_and_details_without_opening_agents() {
+fn mouse_fleet_selection_and_scroll_never_open_agents_and_resize_clears_hit_map() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let mut app = App {
         snapshot: Snapshot::demo(),
-        compact: true,
         ..App::default()
     };
-    app.select_ship(Some("apps".into()));
-    for (tab, label) in [
-        (1, "2 Assignments"),
-        (2, "3 Terminals"),
-        (3, "4 Logbook"),
-        (0, "1 Bridge"),
-    ] {
-        let screen = render(&mut app, 120, 34);
-        click_text(&mut app, &screen, label);
-        assert_eq!(app.tab, tab);
-    }
-    app.select_tab(1);
-    let screen = render(&mut app, 120, 34);
-    click_text(&mut app, &screen, "Investigate the failing build");
-    let screen = render(&mut app, 120, 34);
-    assert!(screen.contains("Task: app-build"));
-    app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 80, 25));
+    let screen = render(&mut app, 140, 40);
+    click_text(&mut app, &screen, "apps ·");
+    assert_eq!(app.ship.as_deref(), Some("apps"));
+    assert!(!app.board_requested && !app.watch_requested);
+    app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 80, 18));
     assert!(app.scroll > 0);
-    let before = app.tab;
-    app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 110, 3));
-    assert_eq!(app.tab, before);
     render(&mut app, 20, 8);
     app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 15, 3));
-    assert_eq!(
-        app.tab, before,
-        "a resize notice must clear the old hit map"
-    );
+    assert_eq!(app.ship.as_deref(), Some("apps"));
 }
 
 #[test]
-fn every_tab_label_is_clickable_on_the_single_row_tab_bar() {
-    use crossterm::event::{MouseButton, MouseEventKind};
+fn bridge_drops_navigation_tabs_board_and_watch_at_all_supported_widths() {
     let mut app = App {
         snapshot: Snapshot::demo(),
-        compact: true,
         ..App::default()
     };
-    app.select_ship(Some("apps".into()));
-    for (tab, label) in [
-        (0, "1 Bridge"),
-        (1, "2 Assignments"),
-        (2, "3 Terminals"),
-        (3, "4 Logbook"),
-    ] {
-        app.select_tab((tab + 1) % 4);
-        let screen = render(&mut app, 120, 34);
-        let (row, line) = screen
-            .lines()
-            .enumerate()
-            .find(|(_, line)| line.contains(label))
-            .unwrap();
-        assert_eq!(row, 3, "tab labels sit on the single tab row");
-        let start = line.find(label).unwrap();
-        let start = line[..start].chars().count() as u16;
-        let end = start + label.chars().count() as u16 - 1;
-        for column in [start, end] {
-            app.select_tab((tab + 1) % 4);
-            app.handle_mouse(mouse_at(
-                MouseEventKind::Down(MouseButton::Left),
-                column,
-                row as u16,
-            ));
-            assert_eq!(app.tab, tab, "click on {label:?} at column {column}");
+    for width in [40, 80, 120] {
+        let screen = render(&mut app, width, 34);
+        for dropped in [
+            "Navigation",
+            "Assignments",
+            "Terminals",
+            "Logbook",
+            "[b Board]",
+            "[w Watch]",
+        ] {
+            assert!(!screen.contains(dropped));
         }
+        assert!(screen.contains("Needs you"));
     }
 }
 
 #[test]
 fn mouse_selection_tracks_the_scrolled_list_instead_of_its_first_record() {
-    let mut snapshot = Snapshot::demo();
-    let template = snapshot.tasks[0].clone();
-    snapshot.tasks = (0..30)
+    let template = privateer::dashboard::captain::sample_mail()[0].clone();
+    let mail = (0..30)
         .map(|n| {
-            let mut task = template.clone();
-            task.id = format!("task-{n}");
-            task.title = format!("Assignment {n}");
-            task
+            let mut m = template.clone();
+            m.id = format!("mail-{n}");
+            m.subject = format!("History {n}");
+            m
         })
         .collect();
     let mut app = App {
-        snapshot,
-        selected: 29,
+        mail,
         ..App::default()
     };
-    app.ship = Some("navigator".into());
-    app.tab = 1;
-    app.focus_content = true;
-    let screen = render(&mut app, 80, 20);
-    click_text(&mut app, &screen, "Assignment 28");
-    assert_eq!(app.selected_task().unwrap().id, "task-28");
+    app.open_inbox();
+    app.selected = 29;
+    let screen = render(&mut app, 120, 34);
+    click_text(&mut app, &screen, "History 28");
+    assert_eq!(app.mail[app.selected].id, "mail-28");
 }
 
 #[test]
@@ -299,7 +261,7 @@ fn compact_view_keeps_failures_visible_and_untrusted_controls_are_not_rendered()
     };
     let text = render(&mut app, 120, 34);
     assert!(text.contains("STATE UNAVAILABLE"));
-    assert!(text.contains("Repeated connection facts"));
+    assert!(text.contains("not an all-clear"));
     assert!(!text.contains('\x1b'));
     assert_eq!(clean("hello\x1b[2J\u{202e}world", 100), "hello[2Jworld");
     for (w, h) in [(1, 1), (20, 8), (40, 14), (80, 24)] {
@@ -581,12 +543,12 @@ fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
         ..App::default()
     };
     let home = render(&mut app, 120, 34);
-    assert!(home.contains("Fleet overview"));
-    assert!(home.contains("Research"));
+    assert!(home.contains("Fleet"));
+    assert!(home.contains("research"));
     app.select_ship(Some("navigator".into()));
     let view = render(&mut app, 120, 34);
-    assert!(view.contains("DEMO / sample data"));
-    assert!(view.contains("Conversation and agent launch are not connected"));
+    assert!(view.contains("DEMO / sample only"));
+    assert!(app.focus_target().is_err());
     if let Some(path) = std::env::var_os("PRIVATEER_DASHBOARD_PREVIEW") {
         fs::write(&path, &home).unwrap();
         app.select_ship(Some("apps".into()));
@@ -623,11 +585,10 @@ fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh
         ..App::default()
     };
     let before = serde_json::to_value(&app.snapshot).unwrap();
-    let screen = render(&mut app, 120, 34);
-    click_text(&mut app, &screen, "[i Inbox]");
+    app.bridge_key(crossterm::event::KeyCode::Char('i'));
     assert!(app.inbox_open && app.ship.is_none());
     let screen = render(&mut app, 120, 34);
-    click_text(&mut app, &screen, "Reply · Build investigation");
+    click_text(&mut app, &screen, "Build investigation update");
     assert_eq!(app.selected, 1);
     app.update_herdr(View::demo());
     assert_eq!(
@@ -637,20 +598,13 @@ fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh
     assert!(render(&mut app, 120, 34).contains("still owned by Apps"));
     assert!(app.selected_pane().is_none());
     assert!(app.assignment_indices().is_empty());
-    let screen = render(&mut app, 120, 34);
-    click_text(&mut app, &screen, "[l Talk to liaison]");
-    assert_eq!(app.ship.as_deref(), Some("navigator"));
+    app.bridge_key(crossterm::event::KeyCode::Esc);
     assert!(!app.inbox_open);
-    assert!(
-        app.board_requested,
-        "Talk must open the conversation, not just its dashboard view"
-    );
-    assert!(render(&mut app, 120, 34).contains("Liaison · your default contact"));
+    assert!(!app.board_requested);
     assert_eq!(serde_json::to_value(&app.snapshot).unwrap(), before);
     app.select_ship(None);
     app.move_selection(true);
-    assert!(app.inbox_open);
-    app.move_selection(true);
+    assert!(!app.inbox_open);
     assert_eq!(app.ship.as_deref(), Some("navigator"));
 }
 
@@ -754,10 +708,7 @@ fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
     app.select_ship(Some("apps".into()));
     let bridge = render(&mut app, 140, 40);
     assert!(!bridge.contains("Repeated connection facts"));
-    assert!(
-        !bridge.contains("Investigate the failing build"),
-        "assignments belong in their own view"
-    );
+    assert!(bridge.contains("Investigate the failing build"));
     app.select_tab(1);
     assert!(render(&mut app, 140, 40).contains("Investigate the failing build"));
     assert_eq!(app.assignment_indices().len(), 1);
@@ -771,8 +722,8 @@ fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
     assert!(!render(&mut app, 140, 40).contains("Sample logbook outcome"));
     app.select_ship(None);
     let home = render(&mut app, 140, 40);
-    assert!(home.contains("4 ships"));
-    assert!(home.contains("Research"));
+    assert!(home.contains("Fleet"));
+    assert!(home.contains("research"));
 }
 
 #[test]
@@ -792,7 +743,7 @@ fn accepted_handoff_moves_the_same_assignment_and_preserves_custody_history() {
     incoming.select_ship(Some("infrastructure".into()));
     incoming.select_tab(1);
     assert_eq!(incoming.selected_task().unwrap().owner, "navigator");
-    assert!(render(&mut incoming, 140, 40).contains("Incoming"));
+    assert!(incoming.selected_task().unwrap().handoff_to.as_deref() == Some("infrastructure"));
     dispatch(
         &mut store,
         "task.accept",
@@ -813,7 +764,13 @@ fn accepted_handoff_moves_the_same_assignment_and_preserves_custody_history() {
     outgoing.select_tab(1);
     assert!(outgoing.assignment_indices().is_empty());
     outgoing.select_tab(3);
-    assert!(render(&mut outgoing, 140, 40).contains("offered a handoff"));
+    assert!(
+        outgoing
+            .snapshot
+            .custody
+            .iter()
+            .any(|c| c.kind == "task.handoff" && c.actor == "navigator")
+    );
 }
 
 #[test]
@@ -1098,8 +1055,8 @@ fn outcome_notices_expire_clear_on_navigation_and_render_once() {
 fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
     let mut app = App::default();
     let screen = render(&mut app, 120, 34);
-    assert!(screen.contains("No ships yet · n: create your first ship"));
-    assert!(screen.contains("0 ships · 0 assignments · 0 pending issues"));
+    assert!(screen.contains("Runtime needs not observed"));
+    assert!(app.snapshot.ships.is_empty());
     assert!(!screen.contains("[l Talk to liaison]"));
     let mut demo = App {
         snapshot: Snapshot::demo(),
@@ -1107,8 +1064,8 @@ fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
         ..App::default()
     };
     let screen = render(&mut demo, 120, 34);
-    assert!(screen.contains("[l Talk to liaison]"));
-    assert!(screen.contains("1 pending issue\n") || screen.contains("· 1 pending issue "));
+    assert!(!screen.contains("[l Talk to liaison]"));
+    assert!(screen.contains("DEMO / sample only"));
 }
 
 #[test]
@@ -1131,25 +1088,21 @@ fn fleet_overview_says_how_to_talk_to_the_liaison() {
         ..App::default()
     };
     let screen = render(&mut app, 160, 34);
-    assert!(
-        screen.contains(
-            "Talk to contact directly: privateer --home '/isolated/it'\"'\"'s/.privateer' start"
-        ),
-        "{screen}"
-    );
-    assert!(screen.contains("[l Talk to liaison]") && screen.contains("l talk to liaison"));
+    assert!(screen.contains("contact · origin/home /isolated/it's/.privateer"));
+    assert!(!screen.contains("[l Talk to liaison]"));
     app.herdr_configured = true;
     let screen = render(&mut app, 160, 34);
-    assert!(
-        screen.contains("l: talk to contact · opens its first mate in a Herdr tab"),
-        "{screen}"
-    );
+    assert!(!screen.contains("opens its first mate"));
+    assert!(!app.board_requested);
 }
 
 #[test]
-fn a_message_leaving_the_inbox_yields_to_the_one_that_took_its_place() {
+fn a_message_leaving_history_requires_explicit_reselection_not_an_adjacent_row() {
+    use crossterm::event::KeyCode;
     use privateer::dashboard::captain::Mail;
     let mail = |id: &str| Mail {
+        identity: None,
+        origin: None,
         id: id.into(),
         kind: "notice".into(),
         from: "apps".into(),
@@ -1164,13 +1117,20 @@ fn a_message_leaving_the_inbox_yields_to_the_one_that_took_its_place() {
     let mut app = App::default();
     app.open_inbox();
     app.update_mail(vec![mail("a"), mail("b"), mail("c")], Vec::new());
-    app.selected = 1;
+    app.bridge_key(KeyCode::Down); // explicitly select c after initial arrival
+    app.bridge_key(KeyCode::Up); // b
     app.scroll = 4;
     app.update_mail(vec![mail("a"), mail("c")], Vec::new());
-    assert_eq!(app.mail[app.selected].id, "c");
+    app.bridge_key(KeyCode::Enter);
+    assert!(app.history_read.is_none());
+    assert!(app.selected_history().is_none());
     assert_eq!(app.scroll, 0);
     app.update_mail(vec![mail("a")], Vec::new());
-    assert_eq!(app.mail[app.selected].id, "a");
+    app.bridge_key(KeyCode::Enter);
+    assert!(app.history_read.is_none());
+    app.bridge_key(KeyCode::Up);
+    app.bridge_key(KeyCode::Enter);
+    assert_eq!(app.history_read.take().unwrap().id, "a");
     app.update_mail(Vec::new(), Vec::new());
-    assert_eq!(app.selected, 0);
+    assert!(app.selected_history().is_none());
 }
