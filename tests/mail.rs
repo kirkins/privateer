@@ -3,6 +3,7 @@ use privateer::{
     store::{Caller, Store},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 
 fn fleet() -> (tempfile::TempDir, Store) {
@@ -1499,11 +1500,25 @@ fn withdrawal_is_sender_only_durable_and_not_an_ack_or_reply() {
         )
         .is_err()
     );
+    // A client may legitimately occupy the old predictable runtime ID.
+    let occupied_id = format!(
+        "end-{}",
+        format!(
+            "{:x}",
+            Sha256::digest(json!("question").to_string().as_bytes())
+        )
+    );
+    let occupied = send(&mut s, json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"unrelated history"})).unwrap();
     let args = json!({"actor":"apps","id":"question","reason":"obsolete"});
     let closed = dispatch(&mut s, "mail.withdraw", args.clone()).unwrap();
     assert_eq!(closed["state"], "withdrawn");
     assert!(closed["answered_by"].is_null());
     assert!(!closed["ended_by"].is_null());
+    assert_ne!(closed["ended_by"], occupied_id);
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+        occupied
+    );
     assert_eq!(dispatch(&mut s, "mail.withdraw", args).unwrap(), closed);
     assert!(
         dispatch(
@@ -1653,6 +1668,61 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
         .unwrap()["items"][0]["id"],
         stable
     );
+    // Every supplied correlation field must belong to a complete typed pair.
+    let before_mail: i64 = s
+        .connection()
+        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
+        .unwrap();
+    for (request, version) in [
+        (None, Some(approval["expected_version"].clone())),
+        (
+            Some(Value::Null),
+            Some(approval["expected_version"].clone()),
+        ),
+        (Some(json!(42)), Some(approval["expected_version"].clone())),
+        (Some(json!("release")), None),
+        (Some(json!("release")), Some(Value::Null)),
+        (Some(json!("release")), Some(json!(42))),
+        (Some(json!("")), Some(approval["expected_version"].clone())),
+        (Some(json!("release")), Some(json!(""))),
+    ] {
+        let mut invalid = approval.clone();
+        invalid.as_object_mut().unwrap().remove("request_id");
+        invalid.as_object_mut().unwrap().remove("expected_version");
+        if let Some(v) = request {
+            invalid["request_id"] = v;
+        }
+        if let Some(v) = version {
+            invalid["expected_version"] = v;
+        }
+        assert!(
+            dispatch(&mut s, "approval.grant", invalid.clone()).is_err(),
+            "{invalid}"
+        );
+        assert!(dispatch(&mut s, "approval.deny", invalid).is_err());
+        assert_eq!(
+            s.connection()
+                .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.connection()
+                .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before_mail
+        );
+    }
+    // Consume cannot accept correlation, even if correctly bound.
+    assert!(dispatch(&mut s, "approval.consume", approval.clone()).is_err());
+    let occupied_id = format!(
+        "approval-answer-{}",
+        format!(
+            "{:x}",
+            Sha256::digest(json!("release").to_string().as_bytes())
+        )
+    );
+    let occupied = send(&mut s, json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"unrelated approval history"})).unwrap();
     approval["artifact"] = json!("different");
     assert!(dispatch(&mut s, "approval.grant", approval.clone()).is_err());
     approval["artifact"] = json!("sha256:exact");
@@ -1666,6 +1736,14 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
     assert_eq!(
         dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["state"],
         "approved"
+    );
+    assert_ne!(
+        dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["answered_by"],
+        occupied_id
+    );
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+        occupied
     );
     assert!(dispatch(&mut s, "approval.deny", approval.clone()).is_err());
     dispatch(&mut s, "approval.consume", json!({"id":"grant-exact","task_id":"main","artifact":"sha256:exact","environment":"production"})).unwrap();
