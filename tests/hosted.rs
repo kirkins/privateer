@@ -388,6 +388,82 @@ fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
 }
 
 #[test]
+fn bounded_hosted_crew_plan_retains_its_lifecycle_adapter_without_inheriting_selection() {
+    let place = Place::new();
+    place.json(
+        "bundle.configure",
+        json!({"registry":{
+            "schema_version":1,"pi_version":"1.2.0",
+            "integrations":{"reviewed":true,"extensions":[]},"bundles":[]
+        }}),
+    );
+    let mut profile = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    profile["tool_bundles"] = json!([]);
+    place.json("ship.put", json!({"name":"infra","first_mate":profile}));
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    for task in ["legacy-crew", "bounded-crew"] {
+        place.json(
+            "task.create",
+            json!({"id":task,"parent":"infra-duty","owner":"infra","title":task}),
+        );
+    }
+    let legacy = place.agent(
+        "agent.start",
+        json!({"id":"legacy","task_id":"legacy-crew"}),
+    );
+    assert_eq!(legacy["hosted"], true);
+    assert!(
+        !legacy["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--tool-bundles")
+    );
+    until("legacy hosted crew", || {
+        place.json("job.status", json!({"id":"legacy"}))["status"] == "succeeded"
+    });
+    fs::remove_file(place.root.join("crew-argv")).unwrap();
+
+    let bounded = place.agent(
+        "agent.start",
+        json!({"id":"bounded","task_id":"bounded-crew","tool_bundles":[]}),
+    );
+    assert_eq!(bounded["hosted"], true);
+    let command = bounded["command"].as_array().unwrap();
+    assert!(command.iter().any(|v| v == "--tool-bundles"));
+    assert!(!command.iter().any(|v| v == "--print"));
+    let at = command.iter().rposition(|v| v == "--").unwrap();
+    assert!(
+        command[..at]
+            .windows(2)
+            .any(|p| p[0] == "-e" && p[1].as_str().unwrap().ends_with("attended/crew.ts"))
+    );
+    // A deliberately unsupported activation wrapper cannot run a bounded
+    // session, even in a real hosted supervisor. The separate native fixture
+    // qualifies this same injected argv with the installed Pi 1.2 binary.
+    until("bounded refusal", || {
+        place.json("job.status", json!({"id":"bounded"}))["status"] == "failed"
+    });
+    assert_eq!(
+        place.json("job.status", json!({"id":"bounded"}))["exit_code"],
+        2
+    );
+    assert!(!place.root.join("crew-argv").exists());
+}
+
+#[test]
 fn a_hosted_crew_session_ends_when_its_work_settles() {
     let output = support::command("node")
         .arg("tests/hosted-crew.mjs")
@@ -432,4 +508,9 @@ fn a_ships_spaces_lead_the_sidebar_with_its_crew_under_its_first_mate() {
     place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
     assert_eq!(herdr.order(), ["w2", "w3", "w1"]);
     fs::write(place.root.join("release"), "").unwrap();
+    // Do not delete the temporary release signal before the fake first mate
+    // observes it: that leaves its polling shell alive after a green test.
+    until("the hosted first mate to release its lease", || {
+        place.json("ship.presence", json!({"ship":"infra"}))["attended"] == false
+    });
 }

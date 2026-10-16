@@ -557,6 +557,19 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
             _ => json!({}),
         });
     let mut first_mate = json!({"manifest": manifest, "duty_task": duty, "options": options});
+    // Re-running init must not silently turn a bounded ship into a legacy
+    // ambient-resource launch. A different harness needs an explicit profile
+    // update by the captain, not an implicit downgrade.
+    if let Some(selected) = previous
+        .as_ref()
+        .and_then(|s| s["first_mate"].get("tool_bundles"))
+    {
+        ensure!(
+            harness == "pi",
+            "explicitly reconfigure tool_bundles before changing harness"
+        );
+        first_mate["tool_bundles"] = selected.clone();
+    }
     // A hosted first mate stays hosted.
     if let Some(host) = previous
         .as_ref()
@@ -766,8 +779,23 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     } else {
         format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4())
     };
-    // A hosted first mate carries on the ship folder's latest conversation.
-    if hosted && matches!(harness.as_str(), "pi" | "pi-signed") && !chooses("--session") {
+    // Bounded resource runs must be fresh: old history can retain facts from
+    // resources no longer selected. Omitted selection keeps legacy resumes.
+    let bundle_plan = profile["first_mate"]
+        .get("tool_bundles")
+        .map(|selected| -> Result<Value> {
+            ensure!(
+                harness == "pi" && own_harness,
+                "bounded tool bundles require the configured Pi harness"
+            );
+            crate::tool_bundles::resolve(&store, selected, "first_mate")
+        })
+        .transpose()?;
+    if hosted
+        && bundle_plan.is_none()
+        && matches!(harness.as_str(), "pi" | "pi-signed")
+        && !chooses("--session")
+    {
         route.push("--continue".to_owned());
     }
     let control = crate::executable::installed()?;
@@ -775,8 +803,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let policy = serde_json::to_string(&crate::permissions::load()?)?;
     let launch = || {
         let mut command = std::process::Command::new("python3");
+        command.arg(plugins.join("native_launch.py"));
+        if let Some(plan) = &bundle_plan {
+            command.arg("--tool-bundles").arg(plan.to_string());
+        }
         command
-            .arg(plugins.join("native_launch.py"))
             .arg("--attended-policy")
             .arg(&policy)
             .arg(&harness)

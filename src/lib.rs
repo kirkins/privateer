@@ -25,6 +25,7 @@ pub mod project;
 pub mod releases;
 pub mod service;
 pub mod store;
+mod tool_bundles;
 pub mod watch;
 pub mod workspace;
 
@@ -45,6 +46,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "history.prune",
     "ship.put",
     "permissions.set",
+    "bundle.configure",
 ];
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -66,6 +68,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     }
     match command.split('.').next().unwrap_or("") {
         "upgrade" if command == "upgrade.status" => releases::status(),
+        "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
         "permissions" => permissions::dispatch(store, command, args),
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),

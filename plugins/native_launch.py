@@ -24,9 +24,25 @@ def native_environment():
     return env
 
 
-def launch(harness, argv, control=None):
+def launch(harness, argv, control=None, bundles=None, attended=False):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
+    if bundles is not None:
+        if harness != "pi":
+            raise ValueError("bounded resources support only Pi")
+        from pi_bundles import preflight
+        directory = Path(__file__).resolve().parent
+        extensions = [directory / "attended/mail.ts"] if attended else []
+        crew = str(directory / "attended/crew.ts")
+        # #96 injects the lifecycle adapter after plugin planning for hosted
+        # crew. Recognize that exact runtime-owned seam, never an inherited
+        # first-mate selection or arbitrary -e override. Stale hosted markers
+        # alone cannot add the extension to a nested/headless run.
+        flags = argv[:argv.index("--")] if "--" in argv else argv
+        if os.environ.get("PRIVATEER_HOSTED_CREW") == "1" and any(
+                flags[i:i+2] == ["-e", crew] for i in range(len(flags))):
+            extensions.append(crew)
+        argv = preflight(bundles, argv, env=native_environment(), runtime_extensions=extensions)
     if harness == "opencode-v2":
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),
                                   *argv], native_environment())
@@ -53,13 +69,17 @@ def launch(harness, argv, control=None):
 def main():
     try:
         args = sys.argv[1:]
+        bundles = None
+        if args[0] == "--tool-bundles":
+            bundles = json.loads(args[1])
+            args = args[2:]
         if args[0] == "--attended-policy":
             from tool_permissions import attended_argv
             value, harness = json.loads(args[1]), args[2]
-            if harness not in PROFILES and value.get("mode") == "standard":
+            if bundles is None and harness not in PROFILES and value.get("mode") == "standard":
                 # Preserve the human CLI's existing custom-harness escape hatch.
                 os.execvpe(args[3], args[3:], native_environment())
-            launch(harness, attended_argv(harness, args[3:], value))
+            launch(harness, attended_argv(harness, args[3:], value), bundles=bundles, attended=True)
         else:
             if args[0] == "--opencode-yolo":
                 if args[1] != "opencode":
@@ -70,7 +90,7 @@ def main():
             if args[0] == "--control":
                 control = json.loads(args[1])
                 args = args[2:]
-            launch(args[0], args[1:], control)
+            launch(args[0], args[1:], control, bundles=bundles)
     except Exception as error:
         from tool_permissions import UnsupportedYolo
         if isinstance(error, UnsupportedYolo):
