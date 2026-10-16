@@ -323,7 +323,7 @@ are from the last attempted native trial, not continuous account monitoring):
 | Cursor | Fresh guarded repair, unchanged independent tests, recorded light test job, mail, exact resume and recall on 2026.10.14-941492e (`auto`, native sandbox) | Other models/profiles remain separate |
 | AGY | Guarded repair, unchanged tests, recorded light test job, mail, exact resume and recall | Other models/profiles remain separate |
 | Gemini | Installed 0.63.0 parser; subprocess completion/failure, focused mail and exact-identity resume fixtures | Existing Google quota exhausted; live repair/recall pending |
-| OpenCode V1 | Installed parser and command plans | Live worker qualification pending |
+| OpenCode V1 | Installed parser, command plans and route backoff for free-allowance exhaustion | Live worker qualification not established: both live runs returned an upstream server error, so a successful output shape and a real exhaustion were not observed |
 | OpenCode V2 | Live 2.0.29 repair, unchanged independent tests, recorded light test job, mail, exact session resume and conversation recall through OpenCode Go (`opencode-go/deepseek-v4.1-flash`); final completion verified against the native saved projection | Other models/profiles remain separate; earlier Copilot/Google/OpenAI account blockers were not retried; attended evidence is below |
 | OMP | Native RPC initialization, exact resume and cross-repository refusal; subprocess lifecycle fixtures | Last live attempt lacked account credits |
 | Grok | Owned native ACP initialization, exact load and model/effort confirmation; subprocess lifecycle fixtures | Last live attempt returned HTTP 429 |
