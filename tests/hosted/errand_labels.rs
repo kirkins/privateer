@@ -48,7 +48,15 @@ fn finish(place: &Place, id: &str) {
         .unwrap();
     fs::write(place.root.join(format!("{id}-release")), "").unwrap();
     until("headless job success", || {
-        place.agent("job.status", json!({"id":id}))["status"] == "succeeded"
+        let job = place.agent("job.status", json!({"id":id}));
+        match job["status"].as_str().unwrap() {
+            "succeeded" => true,
+            "failed" | "cancelled" | "timed_out" | "orphaned" => {
+                place.wake_diagnostics("errand terminal failure", id, &job);
+                panic!("errand fixture job failed: {job}");
+            }
+            _ => false,
+        }
     });
     until(
         "actual errand payload exit before fixture cleanup",

@@ -29,7 +29,7 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 struct Place {
-    _temp: tempfile::TempDir,
+    _temp: Option<tempfile::TempDir>,
     root: PathBuf,
     folder: PathBuf,
     path: String,
@@ -63,7 +63,7 @@ impl Place {
         .unwrap();
         fs::set_permissions(bin.join("pi"), fs::Permissions::from_mode(0o755)).unwrap();
         let place = Self {
-            _temp: temp,
+            _temp: Some(temp),
             path: format!("{}:/usr/bin:/bin", bin.display()),
             root,
             folder,
@@ -264,6 +264,82 @@ impl Place {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM wakes", [], |r| r.get(0))
             .unwrap()
+    }
+}
+
+// Panic recovery is not a passing lifecycle proof. Preserve original evidence
+// and normally release only this fixture's scripted children BEFORE any removal.
+impl Drop for Place {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        if let Some(temp) = self._temp.take() {
+            let _ = temp.keep();
+        }
+        let mut pids = vec![];
+        if let Ok(files) = fs::read_dir(&self.root) {
+            for entry in files.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "pi-pid" || (name.starts_with("errand-") && name.ends_with("-pid")) {
+                    if let Ok(raw) = fs::read_to_string(entry.path()) {
+                        if let Ok(pid) = raw.trim().parse::<i32>() {
+                            pids.push(pid);
+                        }
+                    }
+                    let release = if name == "pi-pid" {
+                        "release".into()
+                    } else {
+                        format!("{}-release", name.trim_end_matches("-pid"))
+                    };
+                    let _ = fs::write(self.root.join(release), "");
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while pids.iter().any(|pid| unsafe { libc::kill(*pid, 0) } == 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Also allow the hosted wrapper to release its lease after reaping.
+        while Instant::now() < deadline {
+            let live = rusqlite::Connection::open(self.folder.join(".privateer/privateer.sqlite"))
+                .and_then(|db| {
+                    db.query_row("SELECT COUNT(*) FROM presence", [], |r| r.get::<_, i64>(0))
+                })
+                .unwrap_or(0);
+            if live == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let alive: Vec<_> = pids
+            .iter()
+            .filter(|pid| unsafe { libc::kill(**pid, 0) } == 0)
+            .collect();
+        eprintln!(
+            "FAILED fixture preserved at {}; scripted payloads still alive: {alive:?}; not passing lifecycle proof",
+            self.root.display()
+        );
+        if let Some(evidence) = std::env::var_os("ERRAND_LABELS_EVIDENCE") {
+            fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+                fs::create_dir_all(to)?;
+                for entry in fs::read_dir(from)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        copy(&entry.path(), &to.join(entry.file_name()))?;
+                    } else if entry.file_type()?.is_file() {
+                        fs::copy(entry.path(), to.join(entry.file_name()))?;
+                    }
+                }
+                Ok(())
+            }
+            let dest = PathBuf::from(evidence).join(self.root.file_name().unwrap());
+            if let Err(error) = copy(&self.root, &dest) {
+                eprintln!("fixture evidence copy failed: {error}");
+            }
+        }
     }
 }
 
