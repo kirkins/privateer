@@ -28,6 +28,7 @@ pub mod presence;
 pub mod project;
 pub mod releases;
 pub mod routes;
+pub mod scheduling;
 pub mod service;
 pub mod store;
 pub mod stow;
@@ -81,6 +82,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "upgrade" if command == "upgrade.status" => releases::status(),
         "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
         "permissions" => permissions::dispatch(store, command, args),
+        "work" => scheduling::dispatch(store, command, args),
+        "task" if matches!(command, "task.enqueue" | "task.defer") => {
+            scheduling::dispatch(store, command, args)
+        }
         "job" | "resource" => jobs::dispatch(store, command, args),
         "peer" => peers::dispatch(store, command, args),
         "plugin" => plugins::dispatch(store, command, args),
@@ -236,7 +241,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 // through job.start with heavy and wait_for_capacity.
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))
             });
-            for key in ["id", "estimate", "wait_for_capacity", "max_wait_secs"] {
+            for key in [
+                "id",
+                "estimate",
+                "wait_for_capacity",
+                "max_wait_secs",
+                "work_offer",
+            ] {
                 if let Some(value) = args.get(key) {
                     job[key] = value.clone();
                 }

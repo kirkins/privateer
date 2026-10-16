@@ -164,7 +164,7 @@ pub fn attended(store: &Store, ship: &str) -> Result<bool> {
     )?)
 }
 
-fn presence(store: &Store, ship: &str) -> Result<Value> {
+pub(crate) fn presence(store: &Store, ship: &str) -> Result<Value> {
     let lease = store
         .connection()
         .query_row(

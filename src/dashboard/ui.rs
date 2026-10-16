@@ -631,10 +631,13 @@ impl App {
                     .take(3)
                     .map(|t| {
                         format!(
-                            "{} {} [{}; owner {}{}; origin/home {}]",
+                            "{} {} [{}{}; owner {}{}; origin/home {}]",
                             clean(&t.id, 160),
                             clean(&t.title, 512),
                             clean(&t.status, 40),
+                            t.scheduling
+                                .as_ref()
+                                .map_or(String::new(), |s| format!("; schedule {}", clean(s, 180))),
                             clean(&t.owner, 160),
                             t.handoff_to.as_ref().map_or(String::new(), |to| format!(
                                 "; offered to {} (not accepted)",
@@ -801,7 +804,9 @@ impl App {
                     .unwrap_or(""),
                 2000,
             )));
-            if n.item["kind"] == "blocker" {
+            if n.item["evidence"] == "scheduling_fault" {
+                lines.push(Line::from("Scheduling fault: work needs reassessment before another attempt. No automatic model retry."));
+            } else if n.item["kind"] == "blocker" {
                 lines.push(Line::from(format!("Recorded {} · status {} · incarnation {}. No live process proof; no inline mutation.",n.item["evidence"],n.item["status"],n.item["incarnation"])));
             }
             if n.item["kind"] == "approval" {

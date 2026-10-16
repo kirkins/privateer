@@ -240,6 +240,7 @@ impl Store {
         crate::context::init(&store)?;
         crate::attention::init(&store)?;
         crate::presence::init(&store)?;
+        crate::scheduling::init(&store)?;
         Ok(store)
     }
 

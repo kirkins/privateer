@@ -51,6 +51,14 @@ pub fn init(store: &Store) -> Result<()> {
             tx.execute_batch(&format!("ALTER TABLE wakes ADD COLUMN {column} TEXT;"))?;
         }
     }
+    let has_reason: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name='reason')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_reason {
+        tx.execute_batch("ALTER TABLE wakes ADD COLUMN reason TEXT NOT NULL DEFAULT 'mail';")?;
+    }
     // One native session per ship and focus, so topics never share a
     // conversation.
     tx.execute_batch(
@@ -387,9 +395,10 @@ fn job_status(store: &mut Store, job_id: &str) -> Result<Value> {
 /// Record the outcome of wakes whose first mate has finished.
 fn settle(store: &mut Store) -> Result<Vec<Value>> {
     let running: Vec<(String, String)> = {
-        let mut statement = store
-            .connection()
-            .prepare("SELECT id, job_id FROM wakes WHERE status='running'")?;
+        let mut statement = store.connection().prepare(
+            "SELECT id, job_id FROM wakes WHERE status='running' AND job_id IS NOT NULL
+                AND (reason<>'work' OR EXISTS(SELECT 1 FROM jobs WHERE jobs.id=wakes.job_id))",
+        )?;
         statement
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
@@ -557,7 +566,7 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     }
     let now = Store::now_ms();
     let running: bool = store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status='running')",
+        "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status IN ('offered','running'))",
         [&name],
         |r| r.get(0),
     )?;
@@ -771,6 +780,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
     let routes = crate::routes::scan(store)?;
+    let work = crate::scheduling::tick(store)?;
     let mut considered = vec![];
     for ship in ships(store)? {
         considered.push(consider(store, &ship)?);
@@ -780,7 +790,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 
@@ -832,7 +842,8 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
     }
     loop {
         let report = tick_with_delivery_budget(store, Duration::from_millis(delivery_budget))?;
-        let acted = report["settled"].as_array().is_some_and(|s| !s.is_empty())
+        let acted = report["work"].as_array().is_some_and(|w| !w.is_empty())
+            || report["settled"].as_array().is_some_and(|s| !s.is_empty())
             || report["reconciled"]
                 .as_array()
                 .is_some_and(|s| !s.is_empty())

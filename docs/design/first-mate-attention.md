@@ -1,6 +1,6 @@
 # Proposal: a first mate's attention
 
-Status: proposal for review; nothing here is implemented.
+Status: historical proposal. Errands, backlog ordering and attention reports are implemented; [automatic prepared-work scheduling](../scheduling.md) adds durable pickup and resumption.
 
 ## What happened
 

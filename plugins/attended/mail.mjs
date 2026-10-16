@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import { isAbsolute } from "node:path";
 import { QuietCompaction, RECORDS_TYPE, renderRecords } from "./quiet.mjs";
 import { FollowThrough, FOLLOW_TYPE, renderFollowThrough } from "./follow.mjs";
+import { WorkDelivery, WORK_TYPE, renderWork } from "./work.mjs";
 
 const execute = promisify(execFile);
 const TYPE = "privateer-mail";
@@ -27,6 +28,7 @@ export class AttendedMail {
       });
       return JSON.parse(result.stdout);
     });
+    this.work = new WorkDelivery(api, config, generation => this.owned(generation), (command,args) => this.call(command,args));
     this.generation = 0;
     this.disposed = false;
   }
@@ -39,6 +41,7 @@ export class AttendedMail {
 
   stop() {
     this.running = false;
+    this.work.stop();
     this.generation++;
     if (this.timer) this.cancel(this.timer);
     this.timer = undefined;
@@ -101,7 +104,12 @@ export class AttendedMail {
       await this.flight;
     }
     if (!this.running || this.disposed || generation !== this.generation) return;
-    const operation = this.deliver(mode, generation).catch(() => {
+    const operation = this.deliver(mode, generation).then(async result => {
+      if (mode === "wake") await this.work.poll(this.ctx, generation,
+        !this.paused && !this.busy && !this.pending && this.ctx.isIdle(),
+        () => this.running && !this.disposed && this.generation === generation);
+      return result;
+    }).catch(() => {
       if (this.running && generation === this.generation) this.status("⚓ mail unavailable; inbox preserved");
     });
     this.flight = operation;
@@ -147,7 +155,7 @@ export class AttendedMail {
     } catch (error) { this.pending = false; throw error; }
   }
 
-  began() { if (!this.running || this.disposed) return; this.busy = true; this.pending = false; this.lastStop = undefined; }
+  began() { if (!this.running || this.disposed) return; this.busy = true; this.pending = false; this.lastStop = undefined; void this.work.began(); }
   messageEnded(event) {
     if (!this.running || this.disposed) return;
     if (event.message?.role === "assistant") this.lastStop = event.message.stopReason;
@@ -156,6 +164,7 @@ export class AttendedMail {
     if (!this.running || this.disposed) return;
     this.busy = false;
     this.pending = false;
+    void this.work.settled();
     if (event.aborted === true || ["aborted", "error"].includes(this.lastStop)) {
       this.paused = true;
       if (this.config.hosted) {
@@ -221,7 +230,7 @@ export default function attended(api) {
       const window = ctx?.getContextUsage?.()?.contextWindow ?? ctx?.model?.contextWindow;
       if (!mail.running || !Number.isFinite(tokens) || !(window > 0)) return;
       if (!await mail.owned(mail.generation)) return;
-      await mail.call("attention.report", { ship: config.ship, kind, tokens: Math.round(tokens), window, ...extra });
+      await mail.call("attention.report", { ship: config.ship, kind, tokens: Math.round(tokens), window, holder: config.holder, ...extra });
     } catch { /* attention reports are best effort */ }
   };
   if (config.harness !== "omp") {
@@ -242,6 +251,7 @@ export default function attended(api) {
       else if (args.trim() === "resume") { mail.paused = false; await mail.poll(); }
       else mail.status(mail.paused ? "⚓ mail paused; /privateer-mail resume" : "⚓ mail enabled");
     } });
+  api.registerMessageRenderer(WORK_TYPE, renderWork);
   api.registerMessageRenderer(RECORDS_TYPE, renderRecords);
   api.registerMessageRenderer(TYPE, message => ({
     render(width) {

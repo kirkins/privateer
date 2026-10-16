@@ -1,0 +1,154 @@
+use super::delivery::{native_event, poll, profile};
+use super::*;
+
+fn enqueue(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    let tx = store.write_transaction()?;
+    let task = owner(store, id)?;
+    profile(store, task["owner"].as_str().context("task owner missing")?)?;
+    ensure!(
+        stopped_ancestor(store, id)?.is_none(),
+        "a scheduled ancestor is explicitly stopped"
+    );
+    ensure!(
+        !live_jobs(store, id)?,
+        "task still has live or uncertain jobs"
+    );
+    let old = load(store, id)?;
+    ensure!(
+        old.as_ref()
+            .is_none_or(|w| !matches!(w.state.as_str(), "offered" | "claimed" | "executing")),
+        "task already has an execution claim"
+    );
+    let brief = match args.get("brief") {
+        Some(value) => value.as_str().context("brief must be text")?.to_owned(),
+        None => crate::context::current_note(
+            store,
+            task["owner"].as_str().unwrap(),
+            &format!("assignment:{id}"),
+        )?
+        .and_then(|n| n["body"].as_str().map(str::to_owned))
+        .context("prepare an assignment or supply brief before enqueueing")?,
+    };
+    ensure!(
+        !brief.trim().is_empty() && brief.len() <= BRIEF_BYTES,
+        "brief must contain 1..16384 bytes"
+    );
+    let now = Store::now_ms();
+    let work = Scheduled {
+        task_id: id.into(),
+        owner: task["owner"].as_str().unwrap().into(),
+        revision: old.map_or(1, |w| w.revision.saturating_add(1)),
+        brief,
+        state: "ready".into(),
+        wait: None,
+        not_before_ms: now,
+        offer_id: None,
+        holder: None,
+        job_id: None,
+        profile: None,
+        charter_hash: None,
+        attempts: 0,
+        created_ms: now,
+        last_checked_ms: now,
+        lease_until_ms: 0,
+        reason: None,
+    };
+    save(store, &work)?;
+    store
+        .connection()
+        .execute("UPDATE tasks SET status='open' WHERE id=?1", [id])?;
+    store.audit("task.enqueue", &json!({"id":id,"revision":work.revision}))?;
+    tx.commit()?;
+    Ok(view(&work))
+}
+
+fn defer(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    let tx = store.write_transaction()?;
+    owner(store, id)?;
+    let mut work = load(store, id)?.context("task is not scheduled")?;
+    if matches!(work.state.as_str(), "offered" | "claimed") {
+        ensure!(
+            args["offer_id"].as_str() == work.offer_id.as_deref(),
+            "current offer_id is required"
+        );
+    }
+    let wait = args.get("wait").context("wait is required")?;
+    let kind = required(wait, "kind")?;
+    let reason = required(wait, "reason")?;
+    ensure!(
+        !reason.trim().is_empty() && reason.len() <= 1000,
+        "wait reason must contain 1..1000 bytes"
+    );
+    match kind {
+        "time" | "attention" => {
+            let at = wait["until_ms"]
+                .as_i64()
+                .context("wait.until_ms is required")?;
+            ensure!(at > Store::now_ms(), "wait deadline must be in the future");
+        }
+        "task" => {
+            let dependency = required(wait, "ref")?;
+            ensure!(dependency != id, "a task cannot wait on itself");
+            store.task(dependency)?;
+            let mut seen = std::collections::HashSet::from([id.to_owned()]);
+            let mut next = dependency.to_owned();
+            for _ in 0..128 {
+                ensure!(seen.insert(next.clone()), "cyclic scheduling dependency");
+                let Some(w) = load(store, &next)? else {
+                    break;
+                };
+                let Some(wait) = w.wait.filter(|w| w["kind"] == "task") else {
+                    break;
+                };
+                next = required(&wait, "ref")?.to_owned();
+                ensure!(seen.len() < 128, "scheduling dependency limit exceeded");
+            }
+        }
+        "request" => {
+            let request =
+                crate::mail::find(store, required(wait, "ref")?)?.context("unknown request")?;
+            ensure!(
+                request["from"] == work.owner
+                    && request["task_id"] == id
+                    && request["state"] == "open",
+                "wait must reference this task's own open request"
+            );
+        }
+        "manual" => {}
+        _ => bail!("wait.kind must be time, attention, task, request or manual"),
+    }
+    work.state = if kind == "manual" {
+        "stopped"
+    } else {
+        "waiting"
+    }
+    .into();
+    work.reason = Some(reason.into());
+    work.wait = Some(wait.clone());
+    work.not_before_ms = wait["until_ms"].as_i64().unwrap_or(0);
+    work.last_checked_ms = Store::now_ms();
+    finish_wake(store, &work, "succeeded", work.last_checked_ms)?;
+    save(store, &work)?;
+    store
+        .connection()
+        .execute("UPDATE tasks SET status='blocked' WHERE id=?1", [id])?;
+    store.audit("task.defer", &json!({"id":id,"wait":wait}))?;
+    tx.commit()?;
+    Ok(view(&work))
+}
+
+pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
+    match command {
+        "task.enqueue" => enqueue(store, &args),
+        "task.defer" => defer(store, &args),
+        "work.poll" => poll(store, &args),
+        "work.started" | "work.release" | "work.settled" => native_event(store, command, &args),
+        "work.status" => {
+            let ship = required(&args, "ship")?;
+            Ok(json!({"ship":ship,"tasks":snapshot(store,ship)?}))
+        }
+        _ => bail!("unknown scheduling command {command}"),
+    }
+}

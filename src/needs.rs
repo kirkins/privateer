@@ -176,7 +176,21 @@ fn observe(
     )?;
     ensure!(!oversized, "runtime observation source exceeds byte bound");
     budget.check()?;
-    let mut statement = tx.prepare(
+    let schedule_union = if crate::scheduling::available(store)? {
+        let oversized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_schedule WHERE length(CAST(record AS BLOB))>65536)",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !oversized,
+            "scheduling observation source exceeds byte bound"
+        );
+        "UNION ALL SELECT 'schedule',s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id WHERE json_extract(s.record,'$.state')='fault' AND t.status NOT IN ('done','cancelled')"
+    } else {
+        ""
+    };
+    let mut statement = tx.prepare(&format!(
         "SELECT source,id FROM (
           SELECT 'mail' source,m.id FROM mail m LEFT JOIN tasks t ON t.id=m.task_id
             WHERE m.recipient='captain' AND m.state='open' AND m.kind IN ('request','decision')
@@ -185,7 +199,8 @@ fn observe(
             WHERE json_extract(j.record,'$.status')='orphaned' OR
               (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
                AND t.status NOT IN ('done','cancelled'))
-        ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3")?;
+          {schedule_union}
+        ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
     let rows = statement
         .query_map(params![now - 60_000, after, limit + 1], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -294,6 +309,22 @@ fn observe(
                     job["status"],
                     job["reason"]
                 ])));
+                item["actions"] = json!([]);
+            }
+            "schedule" => {
+                let state = crate::scheduling::fault_item(store, &id)?;
+                item["kind"] = json!("blocker");
+                item["evidence"] = json!("scheduling_fault");
+                for key in [
+                    "ship",
+                    "task_id",
+                    "status",
+                    "summary",
+                    "created_ms",
+                    "version",
+                ] {
+                    item[key] = state[key].clone();
+                }
                 item["actions"] = json!([]);
             }
             _ => unreachable!(),

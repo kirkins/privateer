@@ -187,6 +187,8 @@ pub struct Task {
     pub status: String,
     #[serde(default)]
     pub handoff_to: Option<String>,
+    #[serde(default)]
+    pub scheduling: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -310,7 +312,13 @@ impl Snapshot {
         ensure!(schema == "1", "unsupported dashboard state schema {schema}");
         let mut snapshot = Self::default();
         {
-            let mut q = tx.prepare("SELECT substr(id,1,160),substr(owner,1,160),substr(title,1,512),status,handoff_to FROM tasks ORDER BY CASE WHEN status IN ('running','blocked','open') THEN 0 ELSE 1 END,id LIMIT 201")?;
+            let scheduled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_schedule')",[],|r|r.get(0))?;
+            let scheduling = if scheduled {
+                "COALESCE((SELECT CASE WHEN length(CAST(record AS BLOB))>65536 THEN 'unknown scheduling source' ELSE substr(COALESCE(json_extract(record,'$.state'),'unknown'),1,40)||COALESCE(' · '||substr(json_extract(record,'$.reason'),1,120),'') END FROM task_schedule WHERE task_id=tasks.id),'unscheduled')"
+            } else {
+                "NULL"
+            };
+            let mut q = tx.prepare(&format!("SELECT substr(id,1,160),substr(owner,1,160),substr(title,1,512),status,handoff_to,{scheduling} FROM tasks ORDER BY CASE WHEN status IN ('running','blocked','open') THEN 0 ELSE 1 END,id LIMIT 201"))?;
             for row in q.query_map([], |r| {
                 Ok(Task {
                     home: Some(home.to_path_buf()),
@@ -319,6 +327,7 @@ impl Snapshot {
                     title: r.get(2)?,
                     status: r.get(3)?,
                     handoff_to: r.get(4)?,
+                    scheduling: r.get(5)?,
                 })
             })? {
                 snapshot.tasks.push(row?);
@@ -437,6 +446,7 @@ impl Snapshot {
                     title: "Coordinate the next voyage".into(),
                     status: "running".into(),
                     handoff_to: None,
+                    scheduling: None,
                 },
                 Task {
                     home: None,
@@ -445,6 +455,7 @@ impl Snapshot {
                     title: "Investigate the failing build".into(),
                     status: "running".into(),
                     handoff_to: Some("infrastructure".into()),
+                    scheduling: None,
                 },
                 Task {
                     home: None,
@@ -453,6 +464,7 @@ impl Snapshot {
                     title: "Check the provider route".into(),
                     status: "blocked".into(),
                     handoff_to: None,
+                    scheduling: None,
                 },
             ],
             pending: vec![Notice {
