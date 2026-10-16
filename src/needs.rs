@@ -209,6 +209,9 @@ fn observe(
     let more = rows.len() > limit;
     let mut items = vec![];
     let mut cursor = None;
+    // Read once, and only when a job is waiting: reservations no live process
+    // holds, which keep queued work waiting until the captain recovers them.
+    let mut stale: Option<Vec<Value>> = None;
     for (source, id) in rows.into_iter().take(limit) {
         budget.check()?;
         let key = format!("{source}:{id}");
@@ -284,10 +287,18 @@ fn observe(
                     tx.query_row("SELECT record FROM jobs WHERE id=?1", [&id], |r| r.get(0))?;
                 let job: Value = serde_json::from_str(&raw)?;
                 item["kind"] = json!("blocker");
-                item["evidence"] = json!(if job["status"] == "queued" {
-                    "capacity_wait"
+                let blocking = if job["status"] == "queued" {
+                    if stale.is_none() {
+                        stale = Some(crate::jobs::stale_reservations(store)?);
+                    }
+                    stale.clone().unwrap_or_default()
                 } else {
-                    "orphaned_job"
+                    vec![]
+                };
+                item["evidence"] = json!(match job["status"].as_str() {
+                    Some("queued") if !blocking.is_empty() => "stuck_heavy_capacity",
+                    Some("queued") => "capacity_wait",
+                    _ => "orphaned_job",
                 });
                 item["task_id"] = job["task_id"].clone();
                 item["ship"] =
@@ -304,10 +315,19 @@ fn observe(
                         .collect::<String>()
                 );
                 item["created_ms"] = job["created_ms"].clone();
+                if job["status"] == "queued" {
+                    item["waited_ms"] =
+                        json!(now.saturating_sub(job["created_ms"].as_i64().unwrap_or(now)));
+                }
+                if !blocking.is_empty() {
+                    item["blocking"] = json!(blocking.iter().take(5).collect::<Vec<_>>());
+                }
+                let blocking_keys: Vec<&Value> = blocking.iter().map(|r| &r["key"]).collect();
                 item["version"] = json!(crate::core::hash(&json!([
                     job["incarnation"],
                     job["status"],
-                    job["reason"]
+                    job["reason"],
+                    blocking_keys
                 ])));
                 item["actions"] = json!([]);
             }

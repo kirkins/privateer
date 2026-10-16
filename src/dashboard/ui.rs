@@ -806,6 +806,15 @@ impl App {
             )));
             if n.item["evidence"] == "scheduling_fault" {
                 lines.push(Line::from("Scheduling fault: work needs reassessment before another attempt. No automatic model retry."));
+            } else if n.item["evidence"] == "stuck_heavy_capacity" {
+                lines.push(Line::from("Waiting behind capacity no live process holds. Check that each job below is gone, then recover it:"));
+                for held in n.item["blocking"].as_array().into_iter().flatten() {
+                    lines.push(Line::from(format!(
+                        "{} · {}",
+                        clean(held["job_id"].as_str().unwrap_or("?"), 160),
+                        clean(held["recover"].as_str().unwrap_or(""), 1024)
+                    )));
+                }
             } else if n.item["kind"] == "blocker" {
                 lines.push(Line::from(format!("Recorded {} · status {} · incarnation {}. No live process proof; no inline mutation.",n.item["evidence"],n.item["status"],n.item["incarnation"])));
             }
