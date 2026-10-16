@@ -30,7 +30,7 @@ export function installQueueRetention(prototype, state, patch, touch) {
   const hidden = message => operational(message, state.home);
   const resume = mode => {
     if (flights.has(mode.session)) return;
-    const s = mode.session;
+    const s = mode.session, epoch = state.epoch;
     flights.add(s);
     void (async () => {
       // Tree navigation resumes in the idle microtask. Yield a macrotask so
@@ -38,7 +38,7 @@ export function installQueueRetention(prototype, state, patch, touch) {
       for (;;) {
         await s.waitForIdle();
         await new Promise(resolve => setImmediate(resolve));
-        if (state.disposed || mode.session !== s) return;
+        if (state.disposed || state.epoch !== epoch || mode.session !== s) return;
         if (s.isIdle) break;
       }
       if (s.isCompacting || mode.compactionQueuedMessages.length) return;

@@ -95,6 +95,11 @@ export async function policyAndClock() {
       handlers.get("agent_start")({},ctx);assert.equal(timers.size,1);
     }
     handlers.get("session_shutdown")();assert.equal(timers.size,0);
+    // Session replacement may retain and rebind this extension runtime.
+    assert(controller.state.disposed);
+    handlers.get("session_start")({},ctx);assert(!controller.state.disposed);
+    handlers.get("agent_start")({},ctx);assert.equal(timers.size,1);
+    handlers.get("session_shutdown")();assert.equal(timers.size,0);
     const reloaded=registerCalm(api,{},env,{...deps,warn(){}});
     assert(reloaded.state.enabled);handlers.get("session_start")({},ctx);assert.equal(timers.size,0);
     const failure=registerCalm(api,{},env,{...deps,warn(){},write(){throw Error("read-only");}});

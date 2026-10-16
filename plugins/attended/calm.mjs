@@ -10,7 +10,7 @@ export function registerCalm(api, host, env = process.env, dependencies = {}) {
       || !(env.PRIVATEER_HOSTED_CREW === "1" || ["pi", "pi-signed"].includes(env.PRIVATEER_ATTENDED_HARNESS))) return;
   globalThis[SLOT]?.dispose();
   const warnings = new Set();
-  const state = { home: env.PRIVATEER_HOME, enabled: false, disposed: false,
+  const state = { home: env.PRIVATEER_HOME, enabled: false, disposed: false, epoch: 0,
     warn(adapter) {
       if (warnings.has(adapter)) return;
       warnings.add(adapter);
@@ -20,19 +20,21 @@ export function registerCalm(api, host, env = process.env, dependencies = {}) {
     } };
   try { state.enabled = (dependencies.read ?? readPreference)(state.home); }
   catch { state.warn("preference read"); }
-  const layouts = installLayouts(host, state);
-  let boat = new WorkingBoat(dependencies), running = false;
+  let layouts = installLayouts(host, state);
+  let boat = new WorkingBoat(dependencies), running = false, disposed = false;
   const subscriptions = [];
   const on = (event, handler) => subscriptions.push(api.on(event, handler));
   const apply = () => {
-    if (state.enabled && running && state.ctx?.mode === "tui") {
+    if (!state.disposed && state.enabled && running && state.ctx?.mode === "tui") {
       if (boat.start(state.ctx) === false) state.warn("working boat");
     } else boat.stop();
   };
   const controller = {
     state,
     dispose() {
-      if (state.disposed) return;
+      if (disposed) return;
+      disposed = true;
+      state.epoch++;
       running = false;
       boat.stop();
       layouts.dispose();
@@ -41,6 +43,14 @@ export function registerCalm(api, host, env = process.env, dependencies = {}) {
   };
   globalThis[SLOT] = controller;
   on("session_start", (_event, ctx) => {
+    if (disposed) return;
+    state.ctx = ctx;
+    state.epoch++;
+    // Hosts may rebind a retained runtime or create a new extension factory.
+    // Both paths must rebuild after session-scoped shutdown cleanup.
+    if (state.disposed) { state.disposed = false; layouts = installLayouts(host, state); }
+    try { state.enabled = (dependencies.read ?? readPreference)(state.home); }
+    catch { state.warn("preference read"); }
     boat.stop(); boat = new WorkingBoat(dependencies);
     running = !ctx.isIdle(); state.ctx = ctx; apply();
   });
@@ -48,7 +58,12 @@ export function registerCalm(api, host, env = process.env, dependencies = {}) {
   // agent_end can be followed by automatic work. Only settle is final, also
   // for abort and provider errors. No command, tool or model execution hook.
   on("agent_settled", () => { running = false; apply(); });
-  on("session_shutdown", () => controller.dispose());
+  on("session_shutdown", () => {
+    state.epoch++;
+    running = false;
+    boat.stop();
+    layouts.dispose();
+  });
   api.registerCommand("calm", { description: "Toggle the home-local conversation-only Pi view",
     handler: async (_args, ctx) => {
       if (state.disposed) return;
