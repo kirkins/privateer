@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod admission;
 mod bundled;
+pub mod captain;
 pub mod cli;
 pub mod context;
 pub mod core;
@@ -81,6 +82,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
+        "captain" => captain::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
         "ship"
             if matches!(

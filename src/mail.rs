@@ -878,8 +878,8 @@ fn requests(store: &Store, args: &Value) -> Result<Value> {
     };
     let state = optional_str(args, "state")?;
     ensure!(
-        state.is_none_or(|s| matches!(s, "open" | "answered" | "overdue")),
-        "state must be open, answered or overdue"
+        state.is_none_or(|s| matches!(s, "open" | "answered" | "overdue" | "withdrawn")),
+        "state must be open, answered, overdue or withdrawn"
     );
     let now = Store::now_ms();
     let mut statement = store.connection().prepare(&format!(
@@ -896,6 +896,50 @@ fn requests(store: &Store, args: &Value) -> Result<Value> {
         .filter(|m| state != Some("overdue") || m["overdue"] == true)
         .collect();
     Ok(json!({"address": address, "requests": found}))
+}
+
+/// Withdraw a request its sender no longer needs answered, so it stops
+/// waiting on the recipient: the work was done another way, or the question
+/// went stale. Only the sender may, and only while it is open. The copy in a
+/// peer's home is withdrawn too, when the peer can be reached.
+fn withdraw(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    identifier(id)?;
+    let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
+    if let Caller::Agent { actor } = store.caller() {
+        ensure!(
+            message["from"] == actor.as_str(),
+            "only {} can withdraw its request {id}",
+            message["from"].as_str().unwrap_or("its sender")
+        );
+    }
+    ensure!(
+        matches!(message["kind"].as_str(), Some("request" | "decision")),
+        "only requests and decisions are withdrawn"
+    );
+    ensure!(message["state"] == "open", "{id} is no longer open");
+    store.connection().execute(
+        "UPDATE mail SET state='withdrawn', answered_ms=?2 WHERE id=?1 AND state='open'",
+        params![id, Store::now_ms()],
+    )?;
+    let reason = optional_str(args, "reason")?.unwrap_or("");
+    store.audit("mail.withdraw", &json!({"id": id, "reason": reason}))?;
+    let mut remote = Value::Null;
+    let to = message["to"].as_str().unwrap_or_default();
+    if let Some(peer) = ship(store, to)?.as_ref().and_then(remote_peer) {
+        remote = match crate::peers::call_peer(
+            store,
+            peer,
+            &format!("withdraw-{}", uuid::Uuid::new_v4()),
+            "mail.withdraw",
+            json!({"id": id, "reason": reason}),
+        ) {
+            Ok(response) if response["ok"] == true => json!("withdrawn"),
+            Ok(response) => response["error"].clone(),
+            Err(error) => json!(format!("{error:#}")),
+        };
+    }
+    Ok(json!({"id": id, "state": "withdrawn", "remote": remote}))
 }
 
 /// Counts for `status`: unacknowledged mail and requests still owed a reply.
@@ -974,6 +1018,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "mail.requests" => requests(store, &args),
         "mail.deliver" => deliver(store, &args),
         "mail.flush" => flush(store, &args),
+        "mail.withdraw" => withdraw(store, &args),
         _ => bail!("unknown mailbox command {command}"),
     }
 }
