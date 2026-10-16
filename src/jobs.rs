@@ -299,6 +299,47 @@ fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     rows.map(|raw| Ok(serde_json::from_str(&raw?)?)).collect()
 }
+/// Capacity reservations no live process can be shown to hold: the supervisor
+/// is gone, and the payload group is gone or was never recorded, past the start
+/// grace. Observation only: the ledger is opened read-only and nothing is
+/// released. The command to recover each one is the captain's to run.
+pub(crate) fn stale_reservations(store: &Store) -> Result<Vec<Value>> {
+    let path = ledger_dir(store)?.join("resources.sqlite");
+    if !path.is_file() {
+        return Ok(vec![]);
+    }
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let mut stale = vec![];
+    for r in reservations(&conn)? {
+        if !(r.heavy || r.demand.is_some()) || Store::now_ms() - r.created_ms <= START_GRACE_MS {
+            continue;
+        }
+        let supervisor = match &r.supervisor {
+            Some(p) => same_process(p)?,
+            None => false,
+        };
+        let payload = match &r.payload {
+            Some(p) => group_alive(p)?,
+            None => false,
+        };
+        if supervisor || payload {
+            continue;
+        }
+        // Without a recorded payload no process can be proven absent, so
+        // recovery needs force after the captain has checked by hand.
+        let mut args = json!({"key": r.key});
+        if r.payload.is_none() {
+            args["force"] = json!(true);
+        }
+        stale.push(json!({
+            "key": r.key, "job_id": r.job_id, "home": r.home, "heavy": r.heavy,
+            "created_ms": r.created_ms, "payload_recorded": r.payload.is_some(),
+            "recover": format!("privateer --home {} resource.recover --json '{args}'", r.home.display()),
+        }));
+    }
+    Ok(stale)
+}
 fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
     format!("{}:{id}:{incarnation}", home.display())
 }

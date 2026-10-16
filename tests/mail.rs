@@ -2169,12 +2169,8 @@ fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
     )
     .unwrap();
     let now = Store::now_ms();
-    for (id, status, heavy) in [
-        ("queued", "queued", true),
-        ("normal-queued", "queued", false),
-        ("orphan", "orphaned", false),
-    ] {
-        s.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",rusqlite::params![id,json!({"id":id,"status":status,"heavy":heavy,"task_id":"main","created_ms":now-61_000,"incarnation":"inc","reason":"typed reason"}).to_string()]).unwrap();
+    for (id, status) in [("queued", "queued"), ("orphan", "orphaned")] {
+        s.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",rusqlite::params![id,json!({"id":id,"status":status,"task_id":"main","created_ms":now-61_000,"incarnation":"inc","reason":"typed reason"}).to_string()]).unwrap();
     }
     let before: i64 = s
         .connection()
@@ -2194,15 +2190,6 @@ fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
             .iter()
             .all(|item| item["source"] == "job")
     );
-    let stuck = result["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["source_id"] == "queued")
-        .unwrap();
-    assert_eq!(stuck["evidence"], "stuck_heavy_capacity");
-    assert_eq!(stuck["heavy"], true);
-    assert!(stuck["waited_ms"].as_i64().unwrap() >= 60_000);
     assert!(
         result["unknown"]
             .as_array()
@@ -2467,4 +2454,61 @@ fn terminal_task_closure_recovers_outbox_across_restart_and_redelivery() {
         json!({"from":"apps","to":"infra","kind":"notice","body":"finished","task_id":"main"}),
     )
     .unwrap();
+}
+
+#[test]
+fn needs_names_capacity_held_by_no_live_process_and_leaves_ordinary_waits_alone() {
+    let (temp, mut s) = fleet();
+    let ledger = temp.path().join("ledger");
+    std::fs::write(
+        temp.path().join("home/config.json"),
+        json!({"resource_home": ledger}).to_string(),
+    )
+    .unwrap();
+    let now = Store::now_ms();
+    let job = json!({"id":"build","status":"queued","heavy":true,"task_id":"main",
+        "created_ms":now-61_000,"incarnation":"inc","reason":"waiting for capacity"});
+    s.connection()
+        .execute(
+            "INSERT INTO jobs(id,record) VALUES('build',?1)",
+            [job.to_string()],
+        )
+        .unwrap();
+    let evidence = |s: &mut Store| {
+        let needs = dispatch(s, "runtime.needs", json!({})).unwrap();
+        needs["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["source_id"] == "build")
+            .unwrap()
+            .clone()
+    };
+    // Waiting behind live work, or nothing at all, is an ordinary wait.
+    assert_eq!(evidence(&mut s)["evidence"], "capacity_wait");
+    dispatch(&mut s, "resource.status", json!({})).unwrap();
+    let key = "/elsewhere:gone:inc";
+    let held = json!({"key":key,"home":"/elsewhere","job_id":"gone","incarnation":"inc","heavy":true,
+        "state":"orphaned","created_ms":now-120_000,
+        "supervisor":{"pid":1_073_741_823,"started":"linux:test:1","zombie":false},"payload":null});
+    let conn = rusqlite::Connection::open(ledger.join("resources.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO reservations(key,record) VALUES(?1,?2)",
+        rusqlite::params![key, held.to_string()],
+    )
+    .unwrap();
+    let item = evidence(&mut s);
+    assert_eq!(item["evidence"], "stuck_heavy_capacity", "{item}");
+    let recover = item["blocking"][0]["recover"].as_str().unwrap();
+    assert!(
+        recover.contains("resource.recover")
+            && recover.contains(key)
+            && recover.contains("\"force\":true"),
+        "{recover}"
+    );
+    // Observing never releases anything.
+    let kept: i64 = conn
+        .query_row("SELECT count(*) FROM reservations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kept, 1);
 }
