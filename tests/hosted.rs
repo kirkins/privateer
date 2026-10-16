@@ -479,7 +479,7 @@ fn a_hosted_crew_session_ends_when_its_work_settles() {
 }
 
 #[test]
-fn a_ships_spaces_lead_the_sidebar_with_its_crew_under_its_first_mate() {
+fn an_untagged_live_first_mate_is_repaired_before_its_crew_in_the_sidebar() {
     let place = Place::new();
     let socket = place.root.join("config/herdr/herdr.sock");
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -501,12 +501,79 @@ fn a_ships_spaces_lead_the_sidebar_with_its_crew_under_its_first_mate() {
     );
     assert_eq!(place.tick()["hosted"]["workspace"], "w2");
     assert_eq!(herdr.order(), ["w2", "w1"]);
+    until("the first mate's live workspace binding", || {
+        place.json("ship.presence", json!({"ship":"infra"}))["lease"]["binding"]["pane"]["workspace_id"]
+            == "w2"
+    });
+    let forget_mate = || {
+        let mut spaces = herdr.spaces.lock().unwrap();
+        spaces.iter_mut().find(|(id, _)| id == "w2").unwrap().1 = json!({});
+        // Reproduce a space predating metadata, below the captain's space.
+        spaces.sort_by_key(|(id, _)| id.clone());
+    };
+    forget_mate();
+    place.tick();
+    assert_eq!(herdr.order(), ["w2", "w1"]);
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(
+        herdr.spaces.lock().unwrap()[0].1,
+        json!({"privateer":"mate","ship":"infra"})
+    );
+    // Losing metadata again must also be repaired by a crew launch, without
+    // waiting for the next dispatcher pass.
+    forget_mate();
     place.json(
         "task.create",
         json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
     );
     place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
     assert_eq!(herdr.order(), ["w2", "w3", "w1"]);
+    assert_eq!(
+        herdr.spaces.lock().unwrap()[0].1,
+        json!({"privateer":"mate","ship":"infra"})
+    );
+    // A misplaced crew must not decide ship order. Mate position wins, and
+    // ships with no mate follow all mate/crew groups in ship-name order.
+    {
+        let mut spaces = herdr.spaces.lock().unwrap();
+        spaces.insert(
+            0,
+            ("orphan-z".into(), json!({"privateer":"crew","ship":"z"})),
+        );
+        spaces.insert(
+            1,
+            (
+                "other-crew".into(),
+                json!({"privateer":"crew","ship":"other"}),
+            ),
+        );
+        spaces.insert(
+            2,
+            ("orphan-a".into(), json!({"privateer":"crew","ship":"a"})),
+        );
+        spaces.insert(
+            4,
+            (
+                "other-mate".into(),
+                json!({"privateer":"mate","ship":"other"}),
+            ),
+        );
+        spaces.push(("captain-2".into(), json!({})));
+    }
+    place.tick();
+    assert_eq!(
+        herdr.order(),
+        [
+            "w2",
+            "w3",
+            "other-mate",
+            "other-crew",
+            "orphan-a",
+            "orphan-z",
+            "w1",
+            "captain-2"
+        ]
+    );
     fs::write(place.root.join("release"), "").unwrap();
     // Do not delete the temporary release signal before the fake first mate
     // observes it: that leaves its polling shell alive after a green test.

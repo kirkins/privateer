@@ -11,6 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod sidebar;
+
 const RESPONSE_LIMIT: usize = 1_048_576;
 const DEADLINE: Duration = Duration::from_millis(800);
 
@@ -460,10 +462,15 @@ impl Client {
 
     /// Keep Privateer's spaces together at the top of the sidebar: the bridge
     /// first, then each ship's first mate followed by its crew. Ships keep
-    /// their current order; other spaces are left alone below.
+    /// their first mates' current order, then name for ships without a mate.
+    /// Orphan crew follow all first mates; other spaces are left alone below.
     pub fn arrange(&mut self) -> Result<()> {
+        self.arrange_with_mates(&[])
+    }
+
+    pub(crate) fn arrange_with_mates(&mut self, local: &[(String, Binding)]) -> Result<()> {
         let listed = self.request("workspace.list", json!({}))?;
-        let spaces: Vec<(String, String, String)> = listed["workspaces"]
+        let mut spaces: Vec<(String, String, String)> = listed["workspaces"]
             .as_array()
             .context("workspace list missing")?
             .iter()
@@ -475,12 +482,47 @@ impl Client {
                 ))
             })
             .collect();
+        // Metadata is presentation state and can disappear on a host restart.
+        // Recover mates from leases, but only while the bound terminal still
+        // exists on this socket incarnation. Never guess from a space's label.
+        let mut mates = sidebar::fleet_mates();
+        mates.extend_from_slice(local);
+        if !mates.is_empty() {
+            let view = self.snapshot()?;
+            for (ship, binding) in mates {
+                if binding.socket != self.path
+                    || !view.panes.iter().any(|p| binding.matches(&view, p))
+                {
+                    continue;
+                }
+                if let Some((id, role, owner)) = spaces
+                    .iter_mut()
+                    .find(|(id, _, _)| id == &binding.pane.workspace_id)
+                {
+                    if role == "mate" && owner == &ship {
+                        continue;
+                    }
+                    self.tag(id, "mate", &ship)?;
+                    *role = "mate".into();
+                    *owner = ship;
+                }
+            }
+        }
         let mut ships: Vec<&str> = vec![];
         for (_, role, ship) in &spaces {
             if matches!(role.as_str(), "mate" | "crew") && !ships.contains(&ship.as_str()) {
                 ships.push(ship);
             }
         }
+        ships.sort_by_key(|ship| {
+            (
+                spaces
+                    .iter()
+                    .position(|(_, role, owner)| role == "mate" && owner.as_str() == *ship)
+                    .unwrap_or(usize::MAX),
+                *ship,
+            )
+        });
         let of = |role: &str, ship: Option<&str>| -> Vec<String> {
             spaces
                 .iter()
