@@ -25,6 +25,7 @@ pub mod project;
 pub mod releases;
 pub mod service;
 pub mod store;
+pub mod stow;
 mod tool_bundles;
 pub mod watch;
 pub mod workspace;
@@ -47,6 +48,9 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "ship.put",
     "permissions.set",
     "bundle.configure",
+    "stow.start",
+    "stow.status",
+    "stow.resume",
 ];
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -76,6 +80,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "workspace" => workspace::dispatch(store, command, args),
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
+        "stow" => stow::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
         "ship"
             if matches!(

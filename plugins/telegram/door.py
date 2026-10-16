@@ -42,6 +42,7 @@ HELP = (
     "/ships — the fleet's ships and what they handle\n"
     "/waiting — questions and decisions still waiting on you\n"
     "/yolo on|off|status — tool approval mode for every first mate\n"
+    "/stow [status|resume] — checkpoint every ship and hold new jobs, e.g. before an update\n"
     "/voice [on|off] — speak messages as voice notes (needs [tts])\n"
     "/help — this message\n\n"
     "Photos and files are saved and the ship is handed their path. Voice notes are "
@@ -52,6 +53,7 @@ COMMANDS = [
     {"command": "to", "description": "Send to a ship, or pick one"},
     {"command": "status", "description": "What the fleet is doing"},
     {"command": "yolo", "description": "Fleet tool approvals: on, off or status"},
+    {"command": "stow", "description": "Checkpoint the fleet: stow, status or resume"},
     {"command": "ships", "description": "The fleet's ships"},
     {"command": "waiting", "description": "What is waiting on you"},
     {"command": "voice", "description": "Toggle spoken messages"},
@@ -377,6 +379,8 @@ class Door:
                 args = {} if rest in ("", "status") else {"mode":"yolo" if rest == "on" else "standard"}
                 value = self.runtime.call("permissions", args)
                 self.say(f"Fleet tool mode: {value['mode']}. Applies to every first mate's next launch; running sessions keep their current mode.")
+            elif name == "stow":
+                self.cmd_stow(rest, msg_id)
             elif name == "voice":
                 import tts
                 self.say(tts.voice_reply(self.cfg, rest))
@@ -384,6 +388,34 @@ class Door:
                 self.say(f"❓ unknown command /{name} — try /help", reply_to=msg_id)
         except RuntimeError as e:
             self.say(f"⚠️ {e}", reply_to=msg_id)
+
+    def cmd_stow(self, rest: str, msg_id) -> None:
+        action = {"": "start", "status": "status", "resume": "resume"}.get(rest)
+        if action is None:
+            self.say("Usage: /stow [status|resume]", reply_to=msg_id)
+            return
+        out = self.runtime.call("stow", {"action": action})
+        if action == "start":
+            names = ", ".join(s["ship"] for s in out["ships"])
+            self.say(f"🧳 Stowing the fleet: new jobs are held. Asked {names} to checkpoint. /stow status shows who is done.")
+        elif action == "resume":
+            self.say("⚓ Fleet resumed: new jobs start again.")
+        elif not out.get("stow"):
+            self.say("The fleet has never been stowed.")
+        else:
+            lines = []
+            for ship in out["ships"]:
+                if ship.get("error"):
+                    lines.append(f"{ship['ship']}: {ship['error']}")
+                    continue
+                moving = ship.get("jobs_moving", 0)
+                state = "stowed" if ship.get("replied") else "not yet"
+                lines.append(f"{ship['ship']}: {state}" + (f", {moving} job(s) running" if moving else ""))
+            if out.get("held"):
+                lines.append("Ready to update." if out.get("ready") else "Not ready yet.")
+            else:
+                lines.append("The fleet has resumed.")
+            self.say("\n".join(lines))
 
     def cmd_to(self, rest: str, msg_id) -> None:
         if not rest:

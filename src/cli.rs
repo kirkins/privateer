@@ -32,6 +32,7 @@ pub const VERBS: &[&str] = &[
     "permissions",
     "watch",
     "upgrade",
+    "stow",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -700,6 +701,85 @@ onboarding happened until the conversation and runtime records support it.
     )
 }
 
+fn print_stow(action: &str, out: &Value) {
+    let ships = out["ships"].as_array().cloned().unwrap_or_default();
+    let name = |s: &Value| s["ship"].as_str().unwrap_or("").to_owned();
+    match action {
+        "start" => {
+            println!(
+                "Stowing the fleet ({}): new jobs are held until `privateer stow resume`.",
+                out["stow"].as_str().unwrap_or("")
+            );
+            for ship in &ships {
+                match ship["error"].as_str() {
+                    None => println!("  asked {} to stow", name(ship)),
+                    Some(error) => println!("  could not ask {}: {error}", name(ship)),
+                }
+            }
+            println!("Follow it with `privateer stow status`.");
+        }
+        "resume" => {
+            println!(
+                "Resumed the fleet ({}): new jobs start again.",
+                out["stow"].as_str().unwrap_or("")
+            );
+        }
+        _ if out["stow"].is_null() => println!("The fleet has never been stowed."),
+        _ => {
+            let state = if out["held"] == true {
+                "held"
+            } else {
+                "resumed"
+            };
+            println!("Stow {} ({state}):", out["stow"].as_str().unwrap_or(""));
+            for ship in &ships {
+                if let Some(error) = ship["error"].as_str() {
+                    println!("  {}: {error}", name(ship));
+                    continue;
+                }
+                let replied = if ship["replied"] == true {
+                    "stowed"
+                } else {
+                    "not yet"
+                };
+                let jobs: Vec<String> = ship["jobs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|j| {
+                        format!(
+                            "{} {}",
+                            j["task_id"].as_str().unwrap_or(""),
+                            j["status"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect();
+                let jobs = if jobs.is_empty() {
+                    "no jobs".to_owned()
+                } else {
+                    jobs.join(", ")
+                };
+                println!("  {}: {replied}; {jobs}", name(ship));
+                if let Some(reply) = ship["reply"].as_str() {
+                    for line in reply.lines().take(6) {
+                        println!("      {line}");
+                    }
+                }
+            }
+            if out["held"] == true {
+                println!(
+                    "{}",
+                    if out["ready"] == true {
+                        "Ready: every ship has stowed and no job is running."
+                    } else {
+                        "Not ready yet: wait for every ship to reply and running jobs to finish."
+                    }
+                );
+            }
+        }
+    }
+}
+
 fn print_mail(message: &Value) {
     let state = message["state"]
         .as_str()
@@ -1274,6 +1354,17 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     "correlation": id, "body": body}),
             )?;
             println!("Sent {kind} to {}.", message["from"].as_str().unwrap_or(""));
+        }
+        "stow" => {
+            let action = p.first().map(String::as_str).unwrap_or("start");
+            let command = match action {
+                "start" => "stow.start",
+                "status" => "stow.status",
+                "resume" => "stow.resume",
+                _ => bail!("usage: privateer stow [status|resume]"),
+            };
+            let out = crate::dispatch(&mut store, command, json!({}))?;
+            print_stow(action, &out);
         }
         "wakes" => {
             let wakes = crate::dispatch(&mut store, "wake.list", json!({"limit": 10}))?;

@@ -127,6 +127,10 @@ The detached launch clears the creator's execution identity while retaining
 configured fleet, resource, plugin and configuration paths. Its first-mate jobs
 run as agents bound to the child ship.
 
+## Stowing the fleet
+
+Before the captain updates or restarts Privateer, `privateer stow` (or `/stow` at a front door) checkpoints the fleet. It records a stow in the host's resource ledger, which every home on the host shares, and sends each active fleet ship an ordinary captain request asking it to finish its step, commit work in its workspaces, cancel queued jobs it will not need, replace its handoff notes and pins, and reply with what it left in flight. While a stow is in force, job admission refuses every new job under the ledger's lock, in every home; a job started with `wait_for_capacity` keeps its place in the queue instead. First mates' wakes are exempt, because `serve` records a wake before starting its job, so ships can wake to stow, and running jobs finish on their own. `privateer stow status` reads, from records only, which ships have replied, their replies and their unfinished jobs; it reports ready once every ship has replied and nothing but queued jobs remains. `privateer stow resume` lifts the hold and sends each ship a notice to carry on. Stow, status and resume are operator commands (`stow.start`, `stow.status`, `stow.resume`).
+
 ## Front doors
 
 A front door carries the captain's conversation to wherever the captain is: a chat service, a phone, voice. It is a long-running trusted adapter registered once for the whole fleet, not for one ship, and it owns no fleet state. Registering a door is an operator command, because a door speaks as the captain: `privateer door add NAME [--manifest PATH] [--config PATH] [--to SHIP]` records it in the fleet registry (a bundled door such as `telegram` needs no `--manifest`). Its manifest is a version 1 plugin manifest with `"kind": "front-door"`, and `"config_required": true` when it cannot run without private configuration, which must be a user-owned `0600` file. Harness planning refuses a front-door manifest and `door add` refuses a harness manifest.
