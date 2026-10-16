@@ -28,7 +28,7 @@ class TerminalText:
     def _csi(self, sequence):
         body, command = sequence[2:-1], sequence[-1]
         if body.startswith("?"):
-            assert command in "hl" and all(p in {"25", "1000", "1002", "1003", "1006", "1049", "2004", "2026", "7"} for p in body[1:].split(";")), sequence
+            assert command in "hl" and all(p in {"25", "1000", "1002", "1003", "1006", "1015", "1049", "2004", "2026", "7"} for p in body[1:].split(";")), sequence
             if body == "?1049" and command == "h":
                 self._erase(0, self.rows * self.columns)
                 self.row = self.column = 0

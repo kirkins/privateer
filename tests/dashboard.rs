@@ -1088,7 +1088,7 @@ fn fleet_overview_says_how_to_talk_to_the_liaison() {
         ..App::default()
     };
     let screen = render(&mut app, 160, 34);
-    assert!(screen.contains("contact · /isolated/it's/.privateer"));
+    assert!(screen.contains("contact · origin/home /isolated/it's/.privateer"));
     assert!(!screen.contains("[l Talk to liaison]"));
     app.herdr_configured = true;
     let screen = render(&mut app, 160, 34);

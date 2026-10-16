@@ -42,6 +42,18 @@ class TerminalEvidence(unittest.TestCase):
         text.feed(b"\x1b[2J")
         self.assertFalse(text.contains("Recorded"))
 
+    def test_crossterm_mouse_reporting_modes_change_no_text_or_freshness(self):
+        text = TerminalText(4, 60)
+        text.feed(b"Recorded answer")
+        before = text.revision
+        text.feed(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h")
+        text.feed(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l")
+        self.assertTrue(text.contains("Recorded answer"))
+        self.assertFalse(text.contains("Recorded answer", since=before))
+        self.assertEqual(text.revision, before)
+        with self.assertRaises(AssertionError):
+            text.feed(b"\x1b[?9999h")
+
     def test_unsupported_controls_and_unbounded_escape_fail_closed(self):
         text = TerminalText(4, 60)
         with self.assertRaises(AssertionError):
