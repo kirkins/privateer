@@ -1,9 +1,0 @@
-
-running 4 tests
-test routes::tests::quota_exhaustion_is_long_backoff_but_plain_rate_limit_is_short ... ok
-test routes::tests::reset_timestamp_iso8601_is_parsed_as_an_absolute_time ... ok
-test routes::tests::free_allowance_uses_reset_hint_or_full_allowance_window ... ok
-test routes::tests::ordinary_throttle_keeps_doubling_and_fifteen_minute_cap ... ok
-
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
-

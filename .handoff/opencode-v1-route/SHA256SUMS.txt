@@ -1,7 +1,0 @@
-73cbc788bea81dafb20af603e59855efe7351cd09a55e33cc1dc3ed71b3f88c9  .handoff/opencode-v1-route/clippy.stderr.log
-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  .handoff/opencode-v1-route/clippy.stdout.log
-adb95f4f57c28044614504b0a3de640544f2c4cd0631f848e1fc0be36b27d7e3  .handoff/opencode-v1-route/free-opencode-stdout.jsonl
-bc8d9cebaa25bd560476987f454eb64723cc8b7d89c22765f0722c6bd02167c2  .handoff/opencode-v1-route/implementation.patch
-c45a5627c6e4f78842cca6a2d243b98fbf1776f372f046c53cfd781aacaac91c  .handoff/opencode-v1-route/paid-opencode-stdout.jsonl
-1adf0d98a326d886d426c3ff6cc204218ba268c9f8034eaca93d9c0110e75bf1  .handoff/opencode-v1-route/qualification.md
-99d85ae9504c413b661f6d4d78dbd5a46b8fed5ef5f02ad08e9c17be86e40080  .handoff/opencode-v1-route/routes-tests.stdout.log
