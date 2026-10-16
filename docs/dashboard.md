@@ -86,12 +86,20 @@ homes without equivalent reviewed guards cannot mutate through this surface.
 Errors retain the draft and stable ID, not an automatic retry with a new ID.
 Only a proved identical committed outcome reaches the runtime's idempotent retry
 path after closure. Refresh removes only genuinely closed items. Stale selection
-never silently moves an action onto the row that replaced it.
+never silently moves an action onto the row that replaced it. Selection pins
+physical directory/database identity, durable origin and source ID, not just home
+and ID. A same-origin copy with identical IDs requires explicit reselection after
+a complete fresh scan. Ordinary observed-time changes do not invalidate a draft;
+an already-open draft keeps its immutable original binding and refuses replacement.
 
 Attention queries one local home/page per worker pass (250 ms cadence), at most
 100 items/page, four pages/scan, 200 retained sources and 400 retained items.
 Partial scans do not replace a completed observation. Bounds/unavailable sources
 retain old items as stale with explicit errors. Empty continuation pages count.
+Each scan pins physical identity and origin independently of items, including an
+empty first continuation page. Every page rechecks identity after the query;
+replacement discards the pending scan/cursor and restarts at the beginning, never
+combining generations or publishing partial all-clear results.
 Per-home successful scans wait two seconds; failures back off up to sixteen
 seconds rather than retrying each input tick. Action rechecks have the same
 four-page bound; observations older than ten
@@ -120,7 +128,11 @@ history queries use an existing READ_ONLY Store and existing mail query dispatch
 never CLI initialization/migration. Explicit Enter uses the same origin and
 filesystem-identity-pinned existing-home action open, allowlisting mail.ack only.
 Read/unread markers are generation-bound to that identity and origin, invalidated
-on replacement, retirement, ambiguity or failed observation. Before acknowledgement
+on replacement, retirement, ambiguity or failed observation. History selection
+also pins physical generation, origin and message ID: disappearance or replacement
+clears selection rather than selecting an adjacent row. Enter cannot mark another
+row until explicit navigation/reselection. Truncated/unavailable fleet scope refuses
+history write intent; retained rows may remain visible read-only. Before acknowledgement
 the pinned connection rechecks the selected message and actual unread mailbox
 prefix against the observed page. Requests merged from later pages cannot skip
 unseen earlier mail. Operator privacy is checked before loading captain bodies,
@@ -172,6 +184,14 @@ cargo test --locked --all-features -j1 -- --test-threads=1
 cargo check --locked --no-default-features --bin privateer -j1
 python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
 ```
+
+Both PTYs and their local fixture CLI children receive a literal clean environment
+allowlist with disposable HOME, XDG, fleet, resource and temporary roots, a fixed
+system PATH and no inherited credentials, actor/role or Herdr endpoints. Only these
+disposable authless children are isolated from the supervisor's role: the supervising
+agent environment and real operator guards remain unchanged. The actual absolute
+built binaries are used. Exit/reap and terminal/screen/mouse restoration are checked
+before fixture cleanup; forced fallback cleanup is a failure, never a pass.
 
 These are offline/local qualifications, not live Herdr/API canaries or proof of
 native model autonomy. Live fleet adoption/deployment requires separate approval.

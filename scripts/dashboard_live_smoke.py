@@ -20,6 +20,24 @@ import threading
 import time
 
 
+def fixture_environment(root):
+    """Allowlist for disposable AUTHLESS fixture children only, never the supervisor.
+
+    No inherited role, actor, credentials, endpoints, user config or executable path.
+    Absence of an agent role is appropriate ONLY for these new local test stores.
+    """
+    root = root.resolve()
+    paths = {"HOME": root / "user", "XDG_CONFIG_HOME": root / "config",
+             "XDG_STATE_HOME": root / "state", "XDG_DATA_HOME": root / "data",
+             "XDG_CACHE_HOME": root / "cache", "XDG_RUNTIME_DIR": root / "run",
+             "TMPDIR": root / "tmp", "PRIVATEER_RESOURCE_HOME": root / "ledger"}
+    for path in paths.values():
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return {**{key: str(path) for key, path in paths.items()},
+            "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "TERM": "xterm-256color",
+            "PRIVATEER_FLEET": str(root / "fleet.sqlite"), "PRIVATEER_SERVICE": "none"}
+
+
 class Herdr:
     def __init__(self, root):
         self.path = root / "herdr.sock"
@@ -64,6 +82,7 @@ class Herdr:
         self.stopped = True
         self.listener.close()
         self.thread.join(timeout=2)
+        assert not self.thread.is_alive(), "fake Herdr thread did not stop"
         assert not self.errors, self.errors
 
 
@@ -129,6 +148,9 @@ class Tui:
             after = termios.tcgetattr(self.fd)
             for flag in [termios.ECHO, termios.ICANON, termios.ISIG]:
                 assert (self.before[3] & flag) == (after[3] & flag), "terminal mode not restored"
+            assert b"\x1b[?1049l" in self.output, "alternate screen not restored"
+            assert b"\x1b[?1006l" in self.output, "mouse capture not restored"
+            print(f"Live fixture PID {self.pid}: exited 0, reaped, terminal/screen/mouse restored before cleanup")
         finally:
             if not self.reaped:
                 os.kill(self.pid, signal.SIGKILL)
@@ -141,12 +163,9 @@ def run(binary, runtime):
         root = Path(temporary).resolve()
         folder = root / "apps"
         folder.mkdir()
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("PRIVATEER_", "HERDR_"))}
-        env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"),
-                   XDG_STATE_HOME=str(root / "state"), XDG_DATA_HOME=str(root / "data"),
-                   PRIVATEER_FLEET=str(root / "fleet.sqlite"), PRIVATEER_SERVICE="none",
-                   PRIVATEER_RESOURCE_HOME=str(root / "ledger"), TERM="xterm-256color")
+        env = fixture_environment(root)
+        # Dashboard discovery is confined to the fixture's registered fleet.
+        binary, runtime = binary.resolve(strict=True), runtime.resolve(strict=True)
 
         def cli(*args):
             output = subprocess.run([str(runtime), *args], cwd=folder, env=env,
@@ -182,15 +201,23 @@ def run(binary, runtime):
                 "body": "Exact release?", "payload": {"artifact": "sha256:fixture", "environment": "offline"}})
             tui.keys(b"\x1b")
             tui.until(lambda: b"Exact release?" in tui.output, "typed approval did not load")
+            approval_start = len(tui.output)
             tui.keys(b"\t\rd\r")
             tui.until(lambda: command("mail.show", {"id": "approval"})["state"] == "denied",
                       "inline denial did not record exact outcome")
+            tui.until(lambda: b"Recorded answer" in tui.output[approval_start:],
+                      "UI did not consume the denial outcome before opening history")
+            before_history = command("mail.inbox", {"address": "captain"})["acknowledged_through"]
             tui.keys(b"i")
             tui.drain(2.5)
+            assert b"Mail history" in tui.output, "history did not open"
+            assert command("mail.inbox", {"address": "captain"})["acknowledged_through"] == before_history
             assert command("mail.show", {"id": "question"})["state"] == "answered"
             assert server.focuses == 1, "refresh/history stole focus"
         finally:
-            if tui:
-                tui.close()
-            server.close()
+            try:
+                if tui:
+                    tui.close()
+            finally:
+                server.close()
         print("Bridge live PTY passed: existing focus, correlated inline reply, exact denial, separate history, quit/restoration; no launch/live service.")

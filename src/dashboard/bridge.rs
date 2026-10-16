@@ -52,6 +52,33 @@ impl Need {
     pub fn id(&self) -> &str {
         self.item["id"].as_str().unwrap_or("")
     }
+    pub fn same_content(&self, other: &Need) -> bool {
+        let mut expected = self.item.clone();
+        let mut current = other.item.clone();
+        for item in [&mut expected, &mut current] {
+            if let Some(object) = item.as_object_mut() {
+                object.remove("observed_ms");
+            }
+        }
+        expected == current
+    }
+    pub fn binding(&self) -> Binding {
+        Binding {
+            home: self.home.clone(),
+            identity: self.identity.clone(),
+            origin: self.item["origin"].as_str().unwrap_or("").into(),
+            id: self.id().into(),
+        }
+    }
+}
+
+/// Operator selection follows a source only within its observed physical generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub home: PathBuf,
+    pub identity: Identity,
+    pub origin: String,
+    pub id: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -69,6 +96,8 @@ pub struct Source {
     failures: u32,
     #[serde(skip)]
     pending: Vec<Need>,
+    #[serde(skip)]
+    scan: Option<(Identity, String)>,
     #[serde(skip)]
     after: Option<String>,
     #[serde(skip)]
@@ -116,6 +145,10 @@ impl Attention {
         for source in &mut self.sources {
             if !homes.contains_key(&source.home) {
                 source.available = false;
+                source.pending.clear();
+                source.scan = None;
+                source.after = None;
+                source.pages = 0;
                 source.error =
                     Some("Home no longer configured; retained history is not resolution".into());
                 for item in &mut source.items {
@@ -153,6 +186,9 @@ impl Attention {
                 "home unavailable/retired"
             );
             let identity = Identity::read(&source.home)?;
+            if let Some((pinned, _)) = &source.scan {
+                ensure!(pinned == &identity, "home replaced during pagination");
+            }
             let store = Store::open_readonly(&source.home, caller.clone())?;
             ensure!(
                 Identity::read(&source.home)? == identity,
@@ -163,6 +199,10 @@ impl Attention {
                 &json!({"address":"captain","limit":PAGE_LIMIT,"after":source.after}),
             )?;
             ensure!(
+                Identity::read(&source.home)? == identity,
+                "home replaced during observation"
+            );
+            ensure!(
                 page["schema_version"] == 1 && page["available"] == true,
                 "{}",
                 page["reason"]
@@ -170,15 +210,10 @@ impl Attention {
                     .unwrap_or("runtime.needs unavailable")
             );
             let origin = page["origin"].as_str().context("missing durable origin")?;
-            if source.pages > 0 {
-                ensure!(
-                    source.origin.as_deref() == Some(origin),
-                    "origin changed during pagination"
-                );
-                ensure!(
-                    source.pending.iter().all(|n| n.identity == identity),
-                    "home replaced during pagination"
-                );
+            if let Some((_, pinned_origin)) = &source.scan {
+                ensure!(pinned_origin == origin, "origin changed during pagination");
+            } else {
+                source.scan = Some((identity.clone(), origin.into()));
             }
             source.origin = Some(origin.into());
             source.unknown = serde_json::from_value(page["unknown"].clone())?;
@@ -206,6 +241,7 @@ impl Attention {
             if source.after.is_none() {
                 source.items = std::mem::take(&mut source.pending);
                 source.pages = 0;
+                source.scan = None;
                 source.available = true;
                 source.checked_ms = Store::now_ms();
                 source.next_due_ms = source.checked_ms + 2000;
@@ -220,6 +256,7 @@ impl Attention {
             source.failures = source.failures.saturating_add(1);
             source.next_due_ms = Store::now_ms() + (1000_i64 << source.failures.min(4));
             source.pending.clear();
+            source.scan = None;
             source.after = None;
             source.pages = 0;
             for item in &mut source.items {
@@ -277,7 +314,7 @@ impl Attention {
                     && Store::now_ms() - s.checked_ms < FRESH_MS
                     && s.items
                         .iter()
-                        .any(|n| n.id() == need.id() && n.item == need.item)
+                        .any(|n| n.binding() == need.binding() && n.same_content(need))
             })
     }
 }
@@ -309,8 +346,8 @@ fn execute_as(
     caller.require_operator("bridge answer")?;
     let need = &answer.need;
     ensure!(
-        snapshot.presentation_error.is_none(),
-        "presentation conflict"
+        !snapshot.truncated && snapshot.presentation_error.is_none(),
+        "presentation scope truncated/unavailable"
     );
     ensure!(
         attention.actionable(need),
@@ -677,6 +714,23 @@ mod tests {
         .unwrap();
         observe(&mut app, store.home());
         let answer = intent(&mut app, "yes");
+        // A normal refresh changes observed_ms, not selection or draft authority.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        observe(&mut app, store.home());
+        assert!(app.attention.actionable(&answer.need));
+        assert_eq!(app.answer.as_ref().unwrap().id, answer.id);
+        let mut truncated = app.snapshot.clone();
+        truncated.truncated = true;
+        assert!(
+            execute_as(
+                &truncated,
+                Some(store.home()),
+                &app.attention,
+                &answer,
+                Caller::Operator
+            )
+            .is_err()
+        );
         assert!(
             execute_as(
                 &app.snapshot,
@@ -708,6 +762,26 @@ mod tests {
                 .to_string()
                 .contains("replaced")
         );
+        observe(&mut app, &home);
+        assert_eq!(app.attention.items()[0].id(), answer.need.id());
+        assert_ne!(app.attention.items()[0].identity, answer.need.identity);
+        assert!(app.need_id.is_none());
+        // An immutable open draft never rebinds, even after a complete fresh scan.
+        app.bridge_key(KeyCode::Enter);
+        let old_intent = app.answer_action.take().unwrap();
+        assert_eq!(old_intent.need.identity, answer.need.identity);
+        assert!(act(&app, &home, &old_intent).is_err());
+        app.bridge_key(KeyCode::Esc);
+        app.bridge_key(KeyCode::Enter);
+        assert!(app.answer.is_none() && app.answer_action.is_none());
+        app.bridge_key(KeyCode::Down); // explicit reselection of the copied generation
+        let new_intent = intent(&mut app, "fresh answer");
+        assert_ne!(new_intent.need.identity, answer.need.identity);
+        assert_eq!(
+            act(&app, &home, &new_intent).unwrap()["body"],
+            "fresh answer"
+        );
+        app.answer = None;
         fs::remove_dir_all(&home).unwrap();
         observe(&mut app, &home);
         assert_eq!(app.attention.items().len(), 1);
@@ -762,6 +836,73 @@ mod tests {
             0o640
         );
         assert_eq!(fs::read_dir(&old).unwrap().count(), 1);
+
+        // Real runtime.needs source-key pagination can start with EMPTY items
+        // and a nonnull cursor: exact approvals whose authority is now obsolete.
+        let (root, mut store, mut app) = fixture();
+        for i in 0..PAGE_LIMIT {
+            crate::dispatch(&mut store, "mail.send", json!({"id":format!("stale-{i:03}"),"from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Exact?","payload":{"artifact":"old","environment":"fixture"}})).unwrap();
+        }
+        let mut charter = store.charter("project").unwrap();
+        charter["objective"] = json!("Changed authority");
+        crate::dispatch(&mut store, "charter.put", charter).unwrap();
+        crate::dispatch(&mut store,"mail.send",json!({"id":"zz-tail","from":"apps","to":"captain","kind":"request","body":"Retained fact"})).unwrap();
+        let page = crate::needs::query(&store, &json!({"limit":PAGE_LIMIT})).unwrap();
+        assert_eq!(page["available"], true);
+        assert!(page["items"].as_array().unwrap().is_empty());
+        assert!(page["next_after"].as_str().is_some());
+        observe(&mut app, store.home());
+        assert!(app.attention.sources[0].pending.is_empty());
+        assert!(app.attention.sources[0].scan.is_some());
+        assert!(!app.attention.sources[0].available);
+        observe(&mut app, store.home());
+        assert_eq!(app.attention.items()[0].item["source_id"], "zz-tail");
+        // Begin another scan, again with an EMPTY first continuation page.
+        observe(&mut app, store.home());
+        assert!(app.attention.sources[0].pending.is_empty());
+        assert!(app.attention.sources[0].after.is_some());
+        store
+            .connection()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let home = store.home().to_owned();
+        let saved = root.path().join("saved");
+        fs::rename(&home, &saved).unwrap();
+        fs::create_dir(&home).unwrap();
+        fs::copy(
+            saved.join("privateer.sqlite"),
+            home.join("privateer.sqlite"),
+        )
+        .unwrap();
+        let mut replacement = Store::open_existing_action(&home, Caller::Operator).unwrap();
+        crate::dispatch(&mut replacement,"mail.send",json!({"id":"000-fresh","from":"apps","to":"captain","kind":"request","body":"Earlier key in copied home"})).unwrap();
+        observe(&mut app, &home);
+        let source = &app.attention.sources[0];
+        assert!(!source.available);
+        assert!(source.error.as_ref().unwrap().contains("replaced"));
+        assert!(source.scan.is_none() && source.after.is_none() && source.pending.is_empty());
+        assert_eq!(source.items.len(), 1);
+        assert!(source.items[0].stale);
+        // Restart from the beginning, never publish a partial all-clear.
+        observe(&mut app, &home);
+        assert!(!app.attention.sources[0].available);
+        assert_eq!(app.attention.items().len(), 1);
+        observe(&mut app, &home);
+        assert!(app.attention.sources[0].available);
+        assert_eq!(
+            app.attention
+                .items()
+                .iter()
+                .map(|n| n.item["source_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["000-fresh", "zz-tail"]
+        );
+        assert!(
+            app.attention
+                .items()
+                .iter()
+                .all(|n| !n.stale && n.identity == Identity::read(&home).unwrap())
+        );
     }
 
     #[test]

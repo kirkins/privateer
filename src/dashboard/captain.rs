@@ -37,6 +37,24 @@ pub struct Mail {
     pub acknowledged: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryBinding {
+    home: Option<std::path::PathBuf>,
+    identity: Option<super::bridge::Identity>,
+    origin: Option<String>,
+    id: String,
+}
+impl Mail {
+    pub fn binding(&self) -> HistoryBinding {
+        HistoryBinding {
+            home: self.home.clone(),
+            identity: self.identity.clone(),
+            origin: self.origin.clone(),
+            id: self.id.clone(),
+        }
+    }
+}
+
 pub fn sample_mail() -> Vec<Mail> {
     vec![
         Mail {
@@ -154,6 +172,7 @@ impl App {
         self.select_ship(None);
         self.inbox_open = true;
         self.selected = 0;
+        self.mail_id = self.mail.first().map(Mail::binding);
         self.scroll = 0;
         self.focus_content = true;
     }
@@ -317,7 +336,11 @@ impl App {
             .map(|e| Line::from(format!("Mailbox unavailable: {}", clean(e, 512))))
             .collect();
         let Some(mail) = self.mail.get(self.selected) else {
-            lines.push(Line::from("No messages for the captain."));
+            lines.push(Line::from(if self.mail.is_empty() {
+                "No messages for the captain."
+            } else {
+                "Select a history item again; refresh changed the selection."
+            }));
             return lines;
         };
         lines.extend([

@@ -11,6 +11,9 @@ import signal
 import struct
 import termios
 import time
+import tempfile
+
+from dashboard_live_smoke import fixture_environment
 
 
 def main():
@@ -18,20 +21,31 @@ def main():
     parser.add_argument("--binary", default="target/debug/privateer-dashboard")
     args = parser.parse_args()
     binary = Path(args.binary).resolve()
-    demo(str(binary))
-    from dashboard_live_smoke import run
-    run(binary, binary.with_name("privateer"))
+    supervisor = dict(os.environ)
+    try:
+        demo(str(binary))
+        from dashboard_live_smoke import run
+        run(binary, binary.with_name("privateer"))
+    finally:
+        assert dict(os.environ) == supervisor, "fixture changed supervisor environment"
+        print("Fixture supervisor environment unchanged; role:", supervisor.get("PRIVATEER_ROLE", "unset"))
 
 
 def demo(binary):
+    with tempfile.TemporaryDirectory(prefix="privateer-demo-", dir="/tmp") as temporary:
+        env = fixture_environment(Path(temporary))
+        _demo(str(Path(binary).resolve(strict=True)), env)
+
+
+def _demo(binary, env):
     gate_read, gate_write = os.pipe()
     pid, terminal = pty.fork()
     if pid == 0:
         os.close(gate_write)
         os.read(gate_read, 1)
         os.close(gate_read)
-        os.environ["TERM"] = "xterm-256color"
-        os.execv(binary, [binary, "--demo"])
+        os.chdir(env["HOME"])
+        os.execve(binary, [binary, "--demo"], env)
     os.close(gate_read)
     before = termios.tcgetattr(terminal)
     output = bytearray()
@@ -96,6 +110,7 @@ def demo(binary):
             assert (before[3] & flag) == (after[3] & flag), "terminal mode was not restored"
         assert b"\x1b[?1049l" in output, "alternate screen was not restored"
         assert b"\x1b[?1006l" in output, "mouse capture was not restored"
+        print(f"Demo fixture PID {pid}: exited 0, reaped, terminal/screen/mouse restored before cleanup")
         print("Bridge demo PTY passed: fleet selection, separate history, demo refusal, resize, quit and terminal/mouse restoration.")
     finally:
         if not reaped:

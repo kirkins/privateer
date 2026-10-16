@@ -421,16 +421,17 @@ fn run(opts: Options) -> Result<()> {
                     if app.answer.is_none() && key.code == KeyCode::Char('q') {
                         break;
                     }
-                    if app.inbox_open && key.code == KeyCode::Enter && !app.mail_pending {
-                        if let (Some(mail), Some((_, sender))) =
-                            (app.mail.get(app.selected), &state)
-                        {
-                            if sender.try_send(Action::Read(mail.clone())).is_ok() {
-                                app.mail_pending = true;
-                            }
-                        }
-                    } else if app.bridge_key(key.code) {
+                    if app.bridge_key(key.code) {
                         request_focus(&mut app, herdr.as_ref().map(|(_, s)| s));
+                    }
+                    if let Some(mail) = app.history_read.take()
+                        && let Some((_, sender)) = &state
+                    {
+                        if sender.try_send(Action::Read(mail)).is_ok() {
+                            app.mail_pending = true;
+                        } else {
+                            app.notice = "History read queue busy; reselect and retry.".into();
+                        }
                     }
                     if app.inbox_open
                         && key.code == KeyCode::Char('i')

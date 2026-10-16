@@ -1823,6 +1823,7 @@ fn local_presentation_metadata_and_terminal_fields_still_require_valid_configura
 
 #[test]
 fn mailbox_refresh_preserves_scroll_by_home_and_id_and_resets_after_ack_and_reply() {
+    use crossterm::event::KeyCode;
     use privateer::dashboard::{fleet, mailbox::Mailbox, ui::App};
     let m = Machine::new();
     let apps = m.ship("apps");
@@ -1847,6 +1848,8 @@ fn mailbox_refresh_preserves_scroll_by_home_and_id_and_resets_after_ack_and_repl
     };
     app.open_inbox();
     app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    app.bridge_key(KeyCode::Up); // explicit first selection after the async load
+    app.bridge_key(KeyCode::Up);
     assert_eq!(app.mail[app.selected].home.as_ref(), Some(&apps_home));
     assert!(scroll_to(&mut app, "LONG-NOTICE-END"));
     let offset = app.scroll;
@@ -1869,6 +1872,9 @@ fn mailbox_refresh_preserves_scroll_by_home_and_id_and_resets_after_ack_and_repl
     mailbox.mark_read(&proxy, &app.mail[app.selected]).unwrap();
     mailbox.refresh(&proxy, &snapshot, None);
     app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    app.bridge_key(KeyCode::Enter);
+    assert!(app.history_read.is_none());
+    app.bridge_key(KeyCode::Down); // deliberately choose the remaining home's row
     assert_eq!(app.mail[app.selected].id, "same-id");
     assert_eq!(app.mail[app.selected].home.as_ref(), Some(&infra_home));
     assert_eq!(app.scroll, 0);
@@ -1893,6 +1899,8 @@ fn mailbox_refresh_preserves_scroll_by_home_and_id_and_resets_after_ack_and_repl
     m.json(&apps, "mail.send", json!({"id":"after-reply","from":"apps","to":"captain","kind":"notice","body":"After reply details"}));
     mailbox.refresh(&proxy, &snapshot, None);
     app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    app.bridge_key(KeyCode::Up);
+    app.bridge_key(KeyCode::Up);
     assert_eq!(app.mail[app.selected].id, "request");
     assert!(scroll_to(&mut app, "REQUEST-END"));
     let offset = app.scroll;
@@ -1905,6 +1913,9 @@ fn mailbox_refresh_preserves_scroll_by_home_and_id_and_resets_after_ack_and_repl
     m.json(&infra, "mail.send", json!({"from":"captain","to":"infra","kind":"reply","correlation":"request","body":"Proceed"}));
     mailbox.refresh(&proxy, &snapshot, None);
     app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+    app.bridge_key(KeyCode::Enter);
+    assert!(app.history_read.is_none());
+    app.bridge_key(KeyCode::Down);
     assert_eq!(app.mail[app.selected].id, "after-reply");
     assert_eq!(app.scroll, 0);
     assert!(screen(&mut app).contains("After reply details"));

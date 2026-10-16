@@ -258,6 +258,11 @@ impl Mailbox {
             }
         }
         messages.sort_by_key(|m| (priority(m), m.home.clone(), m.seq));
+        if readonly && (snapshot.truncated || snapshot.presentation_error.is_some()) {
+            self.valid.clear();
+            self.read.clear();
+            errors.push("History scope truncated/unavailable; retained rows are read-only".into());
+        }
         self.messages = messages;
         self.errors = errors;
     }
@@ -306,7 +311,9 @@ impl Mailbox {
         let scope = super::bridge::homes(snapshot, fallback);
         anyhow::ensure!(scope.len() <= 200, "history scope exceeds bound");
         anyhow::ensure!(
-            snapshot.presentation_error.is_none() && scope.get(home).is_some_and(Option::is_none),
+            !snapshot.truncated
+                && snapshot.presentation_error.is_none()
+                && scope.get(home).is_some_and(Option::is_none),
             "history home retired/unavailable"
         );
         anyhow::ensure!(
@@ -455,6 +462,12 @@ mod tests {
             Some(Caller::Operator),
         );
         assert!(mailbox.errors.is_empty(), "{:?}", mailbox.errors);
+        let mut app = super::super::ui::App::default();
+        app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+        app.bridge_key(crossterm::event::KeyCode::Char('i'));
+        app.bridge_key(crossterm::event::KeyCode::Enter);
+        let selected = app.history_read.take().unwrap();
+        assert_eq!(selected.id, "second"); // priority-sorted, not sequence order
         let first = mailbox
             .messages
             .iter()
@@ -468,7 +481,7 @@ mod tests {
             .unwrap()
             .clone();
         mailbox
-            .mark_read_existing_as(&snapshot, Some(&home), &second, Caller::Operator)
+            .mark_read_existing_as(&snapshot, Some(&home), &selected, Caller::Operator)
             .unwrap();
         assert_eq!(
             crate::dispatch(&mut store, "mail.inbox", json!({"address":"captain"})).unwrap()["acknowledged_through"],
@@ -484,9 +497,26 @@ mod tests {
             crate::dispatch(&mut store, "mail.inbox", json!({"address":"captain"})).unwrap()["acknowledged_through"],
             0
         );
+        app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+        app.bridge_key(crossterm::event::KeyCode::Down);
+        app.bridge_key(crossterm::event::KeyCode::Enter);
+        let selected = app.history_read.take().unwrap();
+        assert_eq!(selected.id, "first");
         mailbox
-            .mark_read_existing_as(&snapshot, Some(&home), &first, Caller::Operator)
+            .mark_read_existing_as(&snapshot, Some(&home), &selected, Caller::Operator)
             .unwrap();
+        mailbox.refresh_mode(
+            Path::new(""),
+            &snapshot,
+            Some(&home),
+            Some(Caller::Operator),
+        );
+        app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+        app.bridge_key(crossterm::event::KeyCode::Enter);
+        assert!(
+            app.history_read.is_none(),
+            "disappearing row must not select adjacent decision"
+        );
         assert_eq!(
             crate::dispatch(&mut store, "mail.inbox", json!({"address":"captain"})).unwrap()["acknowledged_through"],
             second.seq
@@ -507,6 +537,50 @@ mod tests {
                 )
                 .is_err()
         );
+        let mut incomplete = snapshot.clone();
+        incomplete.truncated = true;
+        assert!(
+            mailbox
+                .mark_read_existing_as(&incomplete, Some(&home), &second, Caller::Operator)
+                .is_err()
+        );
+        incomplete.truncated = false;
+        incomplete.presentation_error = Some("unavailable scope".into());
+        assert!(
+            mailbox
+                .mark_read_existing_as(&incomplete, Some(&home), &second, Caller::Operator)
+                .is_err()
+        );
+        crate::dispatch(&mut store,"mail.send",json!({"id":"third","from":"apps","to":"captain","kind":"notice","body":"Unread in copied generation"})).unwrap();
+        app.bridge_key(crossterm::event::KeyCode::Down);
+        mailbox.refresh_mode(
+            Path::new(""),
+            &snapshot,
+            Some(&home),
+            Some(Caller::Operator),
+        );
+        app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+        app.bridge_key(crossterm::event::KeyCode::Down);
+        assert_eq!(app.selected_history().unwrap().id, "third");
+        let third = app.selected_history().unwrap().clone();
+        // Unobserved prefix changes are refused before any acknowledgement.
+        crate::dispatch(&mut store,"mail.send",json!({"id":"fourth","from":"apps","to":"captain","kind":"notice","body":"Changed prefix"})).unwrap();
+        assert!(
+            mailbox
+                .mark_read_existing_as(&snapshot, Some(&home), &third, Caller::Operator)
+                .is_err()
+        );
+        assert_eq!(
+            crate::dispatch(&mut store, "mail.inbox", json!({"address":"captain"})).unwrap()["acknowledged_through"],
+            second.seq
+        );
+        mailbox.refresh_mode(
+            Path::new(""),
+            &snapshot,
+            Some(&home),
+            Some(Caller::Operator),
+        );
+        app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
         store
             .connection()
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -523,6 +597,42 @@ mod tests {
             mailbox
                 .mark_read_existing_as(&snapshot, Some(&home), &first, Caller::Operator)
                 .is_err()
+        );
+        mailbox.refresh_mode(
+            Path::new(""),
+            &snapshot,
+            Some(&home),
+            Some(Caller::Operator),
+        );
+        app.update_mail(mailbox.messages.clone(), mailbox.errors.clone());
+        app.bridge_key(crossterm::event::KeyCode::Enter);
+        assert!(
+            app.history_read.is_none(),
+            "same-origin copied IDs must require reselection"
+        );
+        assert!(
+            mailbox
+                .mark_read_existing_as(&snapshot, Some(&home), &third, Caller::Operator)
+                .is_err()
+        );
+        // Explicit navigation now binds the fresh physical generation.
+        app.bridge_key(crossterm::event::KeyCode::Up); // last row: fourth
+        app.bridge_key(crossterm::event::KeyCode::Up); // third
+        app.bridge_key(crossterm::event::KeyCode::Enter);
+        let selected = app.history_read.take().unwrap();
+        assert_eq!(selected.id, "third");
+        assert_ne!(selected.identity, third.identity);
+        mailbox
+            .mark_read_existing_as(&snapshot, Some(&home), &selected, Caller::Operator)
+            .unwrap();
+        let mut copied = Store::open_existing_action(&home, Caller::Operator).unwrap();
+        assert_eq!(
+            crate::dispatch(&mut copied, "mail.inbox", json!({"address":"captain"})).unwrap()["acknowledged_through"],
+            third.seq
+        );
+        assert_eq!(
+            crate::dispatch(&mut store, "mail.inbox", json!({"address":"captain"})).unwrap()["acknowledged_through"],
+            second.seq
         );
         let missing = root.path().join("missing");
         mailbox.refresh_mode(

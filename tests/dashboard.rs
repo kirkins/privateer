@@ -1097,7 +1097,7 @@ fn fleet_overview_says_how_to_talk_to_the_liaison() {
 }
 
 #[test]
-fn a_message_leaving_the_inbox_yields_to_the_one_that_took_its_place() {
+fn a_message_leaving_history_requires_explicit_reselection_not_an_adjacent_row() {
     use privateer::dashboard::captain::Mail;
     let mail = |id: &str| Mail {
         identity: None,
@@ -1116,13 +1116,20 @@ fn a_message_leaving_the_inbox_yields_to_the_one_that_took_its_place() {
     let mut app = App::default();
     app.open_inbox();
     app.update_mail(vec![mail("a"), mail("b"), mail("c")], Vec::new());
-    app.selected = 1;
+    app.bridge_key(KeyCode::Down); // explicitly select c after initial arrival
+    app.bridge_key(KeyCode::Up); // b
     app.scroll = 4;
     app.update_mail(vec![mail("a"), mail("c")], Vec::new());
-    assert_eq!(app.mail[app.selected].id, "c");
+    app.bridge_key(KeyCode::Enter);
+    assert!(app.history_read.is_none());
+    assert!(app.selected_history().is_none());
     assert_eq!(app.scroll, 0);
     app.update_mail(vec![mail("a")], Vec::new());
-    assert_eq!(app.mail[app.selected].id, "a");
+    app.bridge_key(KeyCode::Enter);
+    assert!(app.history_read.is_none());
+    app.bridge_key(KeyCode::Up);
+    app.bridge_key(KeyCode::Enter);
+    assert_eq!(app.history_read.take().unwrap().id, "a");
     app.update_mail(Vec::new(), Vec::new());
-    assert_eq!(app.selected, 0);
+    assert!(app.selected_history().is_none());
 }

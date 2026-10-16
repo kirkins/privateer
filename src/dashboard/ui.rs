@@ -1,6 +1,6 @@
 use super::{
-    bridge::{Answer, Attention, FRESH_MS, RECENT_MS},
-    captain::{Composer, Exchange, Mail},
+    bridge::{Answer, Attention, Binding, FRESH_MS, RECENT_MS},
+    captain::{Composer, Exchange, HistoryBinding, Mail},
     herdr,
     model::{Snapshot, Task, clean},
 };
@@ -55,7 +55,9 @@ impl PendingBoard {
 #[derive(Default)]
 pub struct App {
     pub attention: Attention,
-    pub need_id: Option<(PathBuf, String)>,
+    pub need_id: Option<Binding>,
+    pub mail_id: Option<HistoryBinding>,
+    pub history_read: Option<Mail>,
     pub answer: Option<Answer>,
     pub answer_action: Option<Answer>,
     pub needs_focus: bool,
@@ -319,7 +321,9 @@ impl App {
                     .attention
                     .items()
                     .get(self.selected)
-                    .map(|n| (n.home.clone(), n.id().to_owned()));
+                    .map(|n| n.binding());
+            } else {
+                self.mail_id = self.mail.get(self.selected).map(Mail::binding);
             }
         } else if !self.snapshot.ships.is_empty() {
             let current = self.ship_index();
@@ -334,18 +338,37 @@ impl App {
         }
         self.scroll = 0;
     }
-    pub fn update_mail(&mut self, messages: Vec<Mail>, errors: Vec<String>) {
-        let selected = self
-            .mail
+    /// Only an explicitly selected, still-bound history row can become read intent.
+    pub fn selected_history(&self) -> Option<&Mail> {
+        self.mail
             .get(self.selected)
-            .map(|m| (m.home.clone(), m.id.clone()));
+            .filter(|m| self.inbox_open && self.mail_id.as_ref() == Some(&m.binding()))
+    }
+    pub fn update_mail(&mut self, messages: Vec<Mail>, errors: Vec<String>) {
         self.mail = messages;
         self.mail_errors = errors;
         if self.inbox_open {
-            let index = selected
-                .and_then(|(home, id)| self.mail.iter().position(|m| m.home == home && m.id == id));
-            self.selected = index.unwrap_or(self.selected.min(self.mail.len().saturating_sub(1)));
+            let index = self.mail_id.as_ref().and_then(|binding| {
+                let selected = self.mail.iter().find(|m| &m.binding() == binding)?;
+                if selected.origin.is_some()
+                    && self.mail.iter().any(|m| {
+                        m.origin == selected.origin
+                            && (m.home != selected.home || m.identity != selected.identity)
+                    })
+                {
+                    return None;
+                }
+                let mut matches = self
+                    .mail
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| &m.binding() == binding);
+                let first = matches.next().map(|(i, _)| i);
+                first.filter(|_| matches.next().is_none())
+            });
+            self.selected = index.unwrap_or(usize::MAX);
             if index.is_none() {
+                self.mail_id = None;
                 self.scroll = 0;
             }
         }
@@ -354,17 +377,28 @@ impl App {
         self.attention = attention;
         if self.needs_focus {
             // Never silently select the replacement when an actionable row disappears.
-            if let Some((home, id)) = &self.need_id {
-                if let Some(index) = self
+            let index = self.need_id.as_ref().and_then(|binding| {
+                if self
                     .attention
-                    .items()
+                    .sources
                     .iter()
-                    .position(|n| &n.home == home && n.id() == id)
+                    .filter(|s| s.origin.as_ref() == Some(&binding.origin))
+                    .count()
+                    != 1
                 {
-                    self.selected = index;
-                } else {
-                    self.selected = usize::MAX;
+                    return None;
                 }
+                let items = self.attention.items();
+                let mut matches = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| &n.binding() == binding);
+                let first = matches.next().map(|(i, _)| i);
+                first.filter(|_| matches.next().is_none())
+            });
+            self.selected = index.unwrap_or(usize::MAX);
+            if index.is_none() {
+                self.need_id = None;
             }
         }
     }
@@ -452,7 +486,7 @@ impl App {
             .filter(|n| {
                 self.need_id
                     .as_ref()
-                    .is_some_and(|(home, id)| home == &n.home && id == n.id())
+                    .is_some_and(|binding| binding == &n.binding())
             })
         else {
             self.notice = "Select an attention item again.".into();
@@ -514,17 +548,19 @@ impl App {
                 self.selected = 0;
                 self.scroll = 0;
                 if self.needs_focus {
-                    self.need_id = self
-                        .attention
-                        .items()
-                        .first()
-                        .map(|n| (n.home.clone(), n.id().to_owned()));
+                    self.need_id = self.attention.items().first().map(|n| n.binding());
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(true),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
+            KeyCode::Enter if self.inbox_open && !self.mail_pending => {
+                self.history_read = self.selected_history().cloned();
+                if self.history_read.is_none() {
+                    self.notice = "Select a history item again.".into();
+                }
+            }
             KeyCode::Enter | KeyCode::Char('r') if self.needs_focus => self.begin_answer(),
             KeyCode::Enter if !self.inbox_open => return true,
             _ => {}
@@ -550,11 +586,9 @@ impl App {
                     self.scroll = 0;
                     if !self.inbox_open {
                         self.needs_focus = true;
-                        self.need_id = self
-                            .attention
-                            .items()
-                            .get(index)
-                            .map(|n| (n.home.clone(), n.id().to_owned()));
+                        self.need_id = self.attention.items().get(index).map(|n| n.binding());
+                    } else {
+                        self.mail_id = self.mail.get(index).map(Mail::binding);
                     }
                 }
             }
@@ -810,8 +844,8 @@ impl App {
                     ))
                 })
                 .collect();
-            let mut state =
-                ListState::default().with_selected((!items.is_empty()).then_some(self.selected));
+            let mut state = ListState::default()
+                .with_selected((self.selected < items.len()).then_some(self.selected));
             frame.render_stateful_widget(
                 List::new(items).block(block).highlight_style(list_style),
                 parts[0],
