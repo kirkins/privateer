@@ -349,6 +349,12 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         text.push_str(&line);
         text.push('\n');
     }
+    // A hand-edited routes file must not stop wakes; launches fail closed.
+    match crate::crew_routes::summary(store, ship) {
+        Ok(Some(line)) => text.push_str(&format!("{line}\n")),
+        Ok(None) => {}
+        Err(error) => text.push_str(&format!("Routes file unreadable: {error:#}\n")),
+    }
     if let Some(line) = crate::attention::line(&attention) {
         text.push_str(&line);
         text.push('\n');

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod context;
 pub mod core;
 pub mod crew;
+pub mod crew_routes;
 pub mod cursor_mail;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
@@ -100,6 +101,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "upgrade" if command == "upgrade.status" => releases::status(),
         "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
         "permissions" => permissions::dispatch(store, command, args),
+        "routes" => crew_routes::dispatch(store, command, args),
         "work" => scheduling::dispatch(store, command, args),
         "task" if matches!(command, "task.enqueue" | "task.defer") => {
             scheduling::dispatch(store, command, args)
@@ -147,6 +149,50 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let request_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&args)?));
             if let Some(existing) = jobs::agent_replay(store, &args, &request_hash)? {
                 return Ok(existing);
+            }
+            // The captain's routes come first: crew take the route they name
+            // or the first listed one that is not backing off, and agents
+            // launch nothing unlisted. Wakes and errands bring their own route.
+            let requested = args
+                .as_object_mut()
+                .unwrap()
+                .remove("route")
+                .map(|r| {
+                    r.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow::anyhow!("route must be a route name"))
+                })
+                .transpose()?;
+            if charter.get("provider_plugin").is_none_or(Value::is_null)
+                && !workspace::is_wake(store, &args)?
+                && let Some(ship) = owner.as_str()
+            {
+                match args.get("manifest").and_then(Value::as_str) {
+                    Some(manifest) => {
+                        anyhow::ensure!(requested.is_none(), "pass route or manifest, not both");
+                        crew_routes::check(store, ship, "crew", manifest, &args["options"])?;
+                    }
+                    None => {
+                        if let Some(choice) =
+                            crew_routes::choose(store, ship, "crew", requested.as_deref())?
+                        {
+                            // The agent may add settings such as effort; the
+                            // route decides the provider and model.
+                            let mut options = choice.options;
+                            if let Some(extra) = args.get("options").and_then(Value::as_object) {
+                                for (key, value) in extra {
+                                    if !matches!(key.as_str(), "provider" | "model") {
+                                        options[key] = value.clone();
+                                    }
+                                }
+                            }
+                            args["manifest"] = choice.manifest;
+                            args["options"] = options;
+                        }
+                    }
+                }
+            } else {
+                anyhow::ensure!(requested.is_none(), "route applies only to crew launches");
             }
             // Crew default to their ship's first-mate harness and model, the
             // route the captain chose, unless the charter pins a provider.
