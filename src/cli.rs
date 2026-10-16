@@ -825,6 +825,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         );
         command = launch();
         command.arg("-e").arg(extension);
+        if matches!(harness.as_str(), "pi" | "pi-signed") {
+            let calm = plugins.join("attended/calm.ts");
+            ensure!(calm.is_file(), "Pi calm extension missing");
+            command.arg("-e").arg(calm);
+        }
     } else if harness == "claude" {
         let plugins = fs::canonicalize(plugins_dir()?)?;
         let plugin = plugins.join("attended-claude");
