@@ -393,17 +393,19 @@ pub(crate) fn contains_cwd(store: &Store, task: &str, repo: &Path, cwd: &Path) -
     }
 }
 
-/// First-mate wake jobs stay in their ship repository. The wake row is written
-/// by activation before agent.start; a caller-supplied wake string is not proof.
+/// First-mate wake jobs and errands stay in their ship repository, headless.
+/// Their rows are written before agent.start; a caller-supplied wake string is
+/// not proof.
 pub(crate) fn is_wake(store: &Store, args: &Value) -> Result<bool> {
     let Some(id) = args.get("id").and_then(Value::as_str) else {
         return Ok(false);
     };
-    Ok(store.connection().query_row(
+    let wake: bool = store.connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1 AND status='running')",
         [id],
         |r| r.get(0),
-    )?)
+    )?;
+    Ok(wake || crate::errand::running(store, id)?)
 }
 pub(crate) fn execution(
     store: &Store,

@@ -66,6 +66,13 @@ if mode.startswith("sleep"):
 def call(command, args):
     out = subprocess.run(cli + [command, "--json", json.dumps(args)], capture_output=True, text=True, check=True)
     return json.loads(out.stdout)
+errand = re.search(r"^Errand (errand-\S+)", prompt, re.M)
+if errand:
+    # An errand ends with its verdict as the final reply, as a model would.
+    verdict = "Reviewed: %s. Brief seen: %s" % (errand.group(1), "the cache" in prompt)
+    print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}), flush=True)
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 900, "cached_input_tokens": 0, "output_tokens": 40}}))
+    sys.exit(0)
 for m in call("mail.inbox", {"address": ship})["messages"]:
     if m["kind"] == "request" and m["state"] == "open":
         call("mail.send", {"from": ship, "to": m["from"], "kind": "reply", "correlation": m["id"], "body": "handled by " + ship})

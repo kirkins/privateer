@@ -350,6 +350,13 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             }
         }
     }
+    let errands = crate::errand::active(store, ship)?;
+    if !errands.is_empty() {
+        text.push_str("Errands running (their verdicts arrive as mail):\n");
+        for (id, focus, brief) in &errands {
+            text.push_str(&format!("- {id} on {focus}: {}\n", clip(brief, LINE_CHARS)));
+        }
+    }
     if !idle.is_empty() {
         text.push_str(
             "Running tasks with nothing moving them (no job, open request or pinned wait):\n",

@@ -777,3 +777,117 @@ fn liaison_wakes_keep_duty_fallback_for_ineligible_or_foreign_tasks() {
         assert_eq!(job["agent_actor"], "infra");
     }
 }
+
+/// Tick until the errand has settled, and return its record.
+fn errand_settled(fleet: &mut Fleet, id: &str) -> Value {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        fleet.tick();
+        let list = fleet.ok("errand.list", json!({}), Some("infra"));
+        let errand = list["errands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .cloned()
+            .unwrap();
+        if errand["status"] != "running" {
+            return errand;
+        }
+        assert!(std::time::Instant::now() < until, "errand never settled");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    fleet.ok(
+        "note.put",
+        json!({"ship":"infra","focus":"task:infra-repair","body":"Crew rebuilt the cache index; review it before merging."}),
+        Some("infra"),
+    );
+    // Only the ship that owns the focus sends errands on it.
+    let refused = fleet.refused(
+        "errand.start",
+        json!({"focus":"task:infra-repair","brief":"Review it"}),
+        Some("apps"),
+    );
+    assert!(refused.contains("not owned by apps"), "{refused}");
+
+    let started = fleet.ok(
+        "errand.start",
+        json!({"focus":"task:infra-repair","brief":"Review the cache rebuild and say whether it can merge."}),
+        Some("infra"),
+    );
+    assert_eq!(started["mode"], "fresh");
+    let id = started["errand"].as_str().unwrap().to_owned();
+    let bearings = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("- {id} on task:infra-repair"))
+    );
+    let errand = errand_settled(&mut fleet, &id);
+    assert_eq!(errand["status"], "succeeded", "{errand}");
+    // It started from the focus's records, not the first mate's thread.
+    let prompt = fleet.prompts().pop().unwrap();
+    assert!(
+        prompt.contains(&format!("Errand {id} for the ship infra")),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Review the cache rebuild"));
+    assert!(prompt.contains("review it before merging"));
+    // The first mate receives the verdict and no crew outcome for the errand.
+    let inbox = fleet.ok("mail.inbox", json!({"address":"infra"}), Some("infra"));
+    let mail: Vec<&Value> = inbox["messages"].as_array().unwrap().iter().collect();
+    assert_eq!(mail.len(), 1, "{inbox}");
+    assert_eq!(mail[0]["from"], "crew");
+    assert_eq!(
+        mail[0]["body"],
+        format!("Errand on task:infra-repair, verdict:\nReviewed: {id}. Brief seen: True")
+    );
+
+    // A follow-up on the same focus continues the errand's session.
+    let again = fleet.ok(
+        "errand.start",
+        json!({"focus":"task:infra-repair","brief":"Check the fix to the cache test."}),
+        Some("infra"),
+    );
+    assert_eq!(again["mode"], "resume");
+    let next = again["errand"].as_str().unwrap().to_owned();
+    assert_eq!(errand_settled(&mut fleet, &next)["status"], "succeeded");
+    let prompt = fleet.prompts().pop().unwrap();
+    assert!(
+        prompt.starts_with(&format!("Errand {next}, continuing on task:infra-repair")),
+        "{prompt}"
+    );
+
+    // An errand that dies without a reply says so.
+    fleet.mode("fail");
+    let failing = fleet.ok(
+        "errand.start",
+        json!({"focus":"thread:outage","brief":"Catch up on the outage thread."}),
+        Some("infra"),
+    );
+    let failed = failing["errand"].as_str().unwrap().to_owned();
+    assert_eq!(errand_settled(&mut fleet, &failed)["status"], "failed");
+    let inbox = fleet.ok("mail.inbox", json!({"address":"infra"}), Some("infra"));
+    let last = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert!(
+        last["body"].as_str().unwrap().contains("without a verdict"),
+        "{last}"
+    );
+    assert_eq!(last["urgency"], "high");
+}

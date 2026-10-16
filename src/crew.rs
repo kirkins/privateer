@@ -47,13 +47,15 @@ fn owning_ship(store: &Store, task_id: &str) -> Result<Option<String>> {
     Ok(here.then_some(owner))
 }
 
-/// A first mate's own wake job. Serve records the wake before starting it.
+/// A first mate's own wake job or errand, recorded before it starts. An
+/// errand's verdict is its report, so its outcome is not mailed again.
 fn wake_job(store: &Store, job_id: &str) -> Result<bool> {
-    Ok(store.connection().query_row(
+    let wake: bool = store.connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)",
         [job_id],
         |r| r.get(0),
-    )?)
+    )?;
+    Ok(wake || crate::errand::is_errand(store, job_id)?)
 }
 
 /// The last bytes of a log, as readable text. Missing logs read as empty.

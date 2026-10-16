@@ -10,6 +10,7 @@ pub mod cursor_mail;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod door;
+pub mod errand;
 mod executable;
 pub mod fleet;
 pub mod herdr;
@@ -98,6 +99,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "note" | "focus" => context::dispatch(store, command, args),
         "ship" | "mail" => mail::dispatch(store, command, args),
         "wake" => activation::dispatch(store, command, args),
+        "errand" => errand::dispatch(store, command, args),
         "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let mut args = args;

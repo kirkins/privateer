@@ -88,7 +88,7 @@ fn session_started(harness: &str, event: &Value) -> Option<String> {
         .then(|| id.to_owned())
 }
 
-fn read_session(harness: &str, log: &str) -> Option<String> {
+pub(crate) fn read_session(harness: &str, log: &str) -> Option<String> {
     log.lines()
         .take(10_000)
         .filter(|line| line.len() <= 65_536)
@@ -97,7 +97,7 @@ fn read_session(harness: &str, log: &str) -> Option<String> {
 }
 
 /// The manifest's declared harness id, which selects session decoding.
-fn harness_id(profile: &Value) -> String {
+pub(crate) fn harness_id(profile: &Value) -> String {
     profile["manifest"]
         .as_str()
         .and_then(|reference| crate::bundled::resolve(reference).ok())
@@ -349,7 +349,7 @@ fn wake_text(
 /// Normalize the token usage a harness printed as JSON lines on stdout.
 /// Codex and native guards report per turn (`turn.completed` or a failed
 /// native turn), Claude a cumulative `result`; otherwise use the last object.
-fn usage(log: &str) -> Option<Value> {
+pub(crate) fn usage(log: &str) -> Option<Value> {
     let mut turns: Option<Map<String, Value>> = None;
     let mut result = None;
     let mut last = None;
@@ -518,7 +518,7 @@ fn bind_session(store: &Store, wake: &str, outcome: &str, log: &str) -> Result<(
 
 /// A focus session worth resuming: same harness, last turn inside the cache
 /// window, and below the rotation limit.
-fn warm_session(
+pub(crate) fn warm_session(
     store: &Store,
     ship: &str,
     focus: &str,
@@ -757,6 +757,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     crate::host::repair(store);
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
+    let errands = crate::errand::settle(store)?;
     let mut considered = vec![];
     for ship in ships(store)? {
         considered.push(consider(store, &ship)?);
@@ -766,7 +767,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "ships": considered, "workspaces": workspaces}),
+        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "ships": considered, "workspaces": workspaces}),
     )
 }
 
