@@ -8,7 +8,8 @@ search credential stores, or infer which personal extensions are required.
 The first stage supports named/versioned **local skills and their supporting
 scripts/files**. Optional MCP servers and optional executable tool extensions
 are deferred: definitions containing those fields fail validation, rather than
-silently dropping them. There is no credential broker or secret injection in
+silently dropping them. The separate [stage-two offline MCP factory qualification](pi-mcp-stage2-qualification.md)
+adds test fixtures/design evidence only; it does not enable MCP in this registry. There is no credential broker or secret injection in
 this stage. Keep API adapters needing credentials disabled until their
 credential-reference/selected-client boundary is separately qualified. Never
 put credential values in bundles, prompts, argv, registry definitions or scripts.
