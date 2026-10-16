@@ -1223,6 +1223,9 @@ fn a_lone_heavy_job_needs_only_the_floor_while_others_count_its_estimate() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
+    // Cancel only a job whose payload is recorded: one caught while still
+    // starting keeps its reservation, rightly, until it is recovered.
+    wait(&home, "first-build", &["running"]);
     thread::sleep(Duration::from_millis(1500));
     let refused = heavy_job(&other, "second-build", json!({}));
     let error = String::from_utf8_lossy(&refused.stderr);
@@ -1249,6 +1252,7 @@ fn a_lone_heavy_job_needs_only_the_floor_while_others_count_its_estimate() {
         "{}",
         String::from_utf8_lossy(&alone.stderr)
     );
+    wait(&other, "second-build", &["running"]);
     ok(&other, "job.cancel", json!({"id":"second-build"}));
 }
 
