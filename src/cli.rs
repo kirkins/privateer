@@ -33,6 +33,7 @@ pub const VERBS: &[&str] = &[
     "watch",
     "upgrade",
     "stow",
+    "backlog",
 ];
 const GENERATED: &str = "<!-- privateer:generated -->";
 /// Harness binaries in order of preference, with their bundled adapter ids.
@@ -253,6 +254,7 @@ Use your agent identity for mail and delegation through these JSON commands or
 - Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`. You need not poll it: when it ends you get its outcome. While a change is in progress, run the tests that cover it, not the whole suite at every review round; the pull request's CI runs the full suite on every platform, so run it locally once, if at all, on the commit you open the PR from. A queued job keeps its place in line: cancel it only when the commit it tests is wrong, never to re-queue the same check.
 - Delegate with `task.create {{"id":"...","owner":"<ship>","title":"...","charter_id":"{ship}"}}`; hand off with `task.handoff`, which takes effect when the recipient runs `task.accept`.
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
+- Work you are not starting now waits in your backlog as an open task: `task.create` it, order it with `task.rank {{"id":"<task>","rank":1}}` (1 starts first), and read it with `task.backlog {{"ship":"{ship}"}}`. When something finishes and your attention allows, start the top of the backlog; a task that becomes blocked leaves the work in hand, with its blocker recorded, so it never holds a place.
 - Never end a turn on a promise. If you say what you will do next, start it in this turn (its crew, its check or the step itself), or record what wakes you for it: set the task blocked, or pin the wait with `note.pin` key `waiting`. A turn ends the moment you reply without a tool call, and nothing wakes you for work you only announced.
 - Before you stop, replace the handoff note for each focus you worked on: `note.put {{"ship":"{ship}","focus":"task:<id>|thread:<id>|captain|ship","body":"..."}}`. Keep it under 2 KB, in plain sentences, and to judgement: what you are doing and why, what you are waiting on, what comes next. Facts are already recorded; leave logs to them, and keep temporary paths and copied state that will go stale out of the note. Pin the few exact facts you must carry, such as a frozen head, a gate job or a PR, with `note.pin {{"ship":"{ship}","focus":"...","key":"head","value":"..."}}` (at most eight per focus; an empty value unpins); each wake shows them. Put lasting preferences and conventions in the `ship` note. Keep notes and assignments in Privateer, never in `/tmp` or other scratch files, which nobody else can read and a reboot loses.
 - Repositories live in `projects/`. Add one with `project.add {{"url":"<git url>","name":"<optional>"}}`, or to a ship you created with `"target":"<ship>"`.
@@ -1410,6 +1412,40 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     "correlation": id, "body": body}),
             )?;
             println!("Sent {kind} to {}.", message["from"].as_str().unwrap_or(""));
+        }
+        "backlog" => {
+            let ship = crate::presence::folder_ship(&store)
+                .context("run privateer backlog in a ship's folder")?;
+            if let [task, rank] = p.as_slice() {
+                let rank = match rank.as_str() {
+                    "clear" => Value::Null,
+                    n => json!(
+                        n.parse::<i64>()
+                            .context("usage: privateer backlog [TASK RANK|clear]")?
+                    ),
+                };
+                crate::dispatch(&mut store, "task.rank", json!({"id": task, "rank": rank}))?;
+            } else {
+                ensure!(p.is_empty(), "usage: privateer backlog [TASK RANK|clear]");
+            }
+            let backlog = crate::dispatch(&mut store, "task.backlog", json!({"ship": ship}))?;
+            let tasks = backlog["backlog"].as_array().cloned().unwrap_or_default();
+            if tasks.is_empty() {
+                println!("{ship} has nothing waiting to start.");
+            } else {
+                println!("Backlog for {ship}, next first:");
+                for task in tasks {
+                    let rank = task["rank"]
+                        .as_i64()
+                        .map(|n| format!("#{n} "))
+                        .unwrap_or_default();
+                    println!(
+                        "  {rank}{}: {}",
+                        task["id"].as_str().unwrap_or(""),
+                        task["title"].as_str().unwrap_or("")
+                    );
+                }
+            }
         }
         "stow" => {
             let action = p.first().map(String::as_str).unwrap_or("start");

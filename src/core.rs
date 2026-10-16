@@ -190,6 +190,37 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
     store.task(id)
 }
 
+/// `task.rank {id, rank}`: where an open task stands in its ship's backlog,
+/// 1 first; a null rank returns it to oldest-first among the unranked. The
+/// owner orders its own backlog; the operator may order any.
+fn task_rank(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    let task = store.task(id)?;
+    let owner = task["owner"].as_str().unwrap_or_default().to_owned();
+    if let crate::store::Caller::Agent { actor } = store.caller() {
+        anyhow::ensure!(*actor == owner, "only {owner} orders its own backlog");
+    }
+    anyhow::ensure!(
+        task["status"] == "open",
+        "only open tasks wait in the backlog; {id} is {}",
+        task["status"].as_str().unwrap_or("")
+    );
+    let rank = match args.get("rank").filter(|v| !v.is_null()) {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .filter(|n| (1..=10_000).contains(n))
+                .ok_or_else(|| anyhow::anyhow!("rank is 1..10000, or null to clear it"))?,
+        ),
+    };
+    store
+        .connection()
+        .execute("UPDATE tasks SET rank=?2 WHERE id=?1", params![id, rank])?;
+    store.audit("task.rank", &json!({"id": id, "rank": rank}))?;
+    Ok(json!({"id": id, "rank": rank, "backlog": crate::context::backlog(store, &owner)?}))
+}
+
 fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
     let id = required(&args, "id")?;
     let actor = required(&args, "actor")?;
@@ -557,6 +588,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "task.create" => task_create(store, args),
         "task.show" => store.task(required(&args, "id")?),
         "task.update" | "task.handoff" | "task.accept" => task_change(store, command, args),
+        "task.rank" => task_rank(store, &args),
+        "task.backlog" => {
+            let ship = required(&args, "ship")?;
+            Ok(json!({"ship": ship, "backlog": crate::context::backlog(store, ship)?}))
+        }
         "task.list" => {
             let mut s=store.connection().prepare("SELECT id FROM tasks WHERE (?1 IS NULL OR owner=?1) AND (?2 IS NULL OR status=?2) ORDER BY id LIMIT ?3")?;
             let mut tasks = Vec::new();

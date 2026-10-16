@@ -194,6 +194,8 @@ impl Store {
             // Events written before this column existed have no time and are
             // treated as older than any retention cutoff.
             ("events", "time_ms", "INTEGER"),
+            // A ship's backlog order: open tasks with a rank start first.
+            ("tasks", "rank", "INTEGER"),
         ] {
             let present: bool = migrate.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
