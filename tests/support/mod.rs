@@ -61,6 +61,11 @@ with log.open("a") as f:
 mode = mode_file.read_text().strip() if mode_file.exists() else "normal"
 if mode == "fail":
     sys.exit(1)
+if mode == "throttle":
+    # How Pi ends a run the provider refused, as seen in this fleet's logs.
+    print(json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": "error",
+        "errorMessage": "429: {\"type\":\"upstream_unavailable\"}", "content": []}}), flush=True)
+    sys.exit(1)
 if mode.startswith("sleep"):
     time.sleep(float(mode.split()[1]))
 def call(command, args):

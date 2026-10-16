@@ -687,6 +687,15 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         }
         _ => None,
     };
+    // A headless wake on a backed-off route would only fail; its mail waits.
+    if let Some(route) = profile["manifest"]
+        .as_str()
+        .and_then(|m| crate::routes::route_of(m, &profile["options"]))
+    {
+        if crate::routes::refusal(store, &route)?.is_some() {
+            return Ok(json!({"ship": name, "skipped": "model route backing off"}));
+        }
+    }
     let text = wake_text(store, &wake, &name, &mail, through, resume.is_some())?;
     let mut start = json!({
         "id": wake, "task_id": task, "manifest": profile["manifest"],
@@ -758,6 +767,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
+    let routes = crate::routes::scan(store)?;
     let mut considered = vec![];
     for ship in ships(store)? {
         considered.push(consider(store, &ship)?);
@@ -767,7 +777,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "ships": considered, "workspaces": workspaces}),
+        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "ships": considered, "workspaces": workspaces}),
     )
 }
 

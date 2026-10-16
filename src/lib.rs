@@ -27,6 +27,7 @@ pub mod plugins;
 pub mod presence;
 pub mod project;
 pub mod releases;
+pub mod routes;
 pub mod service;
 pub mod store;
 pub mod stow;
@@ -143,6 +144,15 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     }
                 }
             }
+            // A provider that is throttling this route only fails another run.
+            let model_route = args["manifest"]
+                .as_str()
+                .and_then(|m| routes::route_of(m, &args["options"]));
+            if let Some(route) = &model_route {
+                if let Some(refusal) = routes::refusal(store, route)? {
+                    anyhow::bail!(refusal);
+                }
+            }
             // Crew of a hosted ship run live in their own space, where the
             // captain can watch and steer them, when the host answers.
             let hosted = !workspace::is_wake(store, &args)? && {
@@ -239,6 +249,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             if hosted {
                 job["hosted"] = serde_json::json!(true);
+            }
+            if let Some(route) = model_route {
+                job["model_route"] = serde_json::json!(route);
             }
             jobs::start_agent(store, job)
         }
