@@ -77,7 +77,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
-        "ship" if matches!(command, "ship.create" | "ship.retire" | "ship.actions") => {
+        "ship"
+            if matches!(
+                command,
+                "ship.create" | "ship.retire" | "ship.actions" | "ship.scope"
+            ) =>
+        {
             fleet::dispatch(store, command, args)
         }
         "ship" if matches!(command, "ship.attend" | "ship.leave" | "ship.presence") => {

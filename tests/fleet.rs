@@ -653,3 +653,67 @@ fn running_init_again_keeps_the_first_mates_harness_and_model() {
     assert_eq!(kept["manifest"], "bundled:pi");
     assert_eq!(kept["options"], pi);
 }
+
+#[test]
+fn a_scope_change_reaches_every_ship_and_only_its_ship_or_creator_makes_it() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    let made = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.create",
+        json!({"name":"tooling","scope":"Desktop tools and machine upkeep"}),
+    );
+    assert!(made.status.success(), "{}", stderr(&made));
+    let tooling = machine.ships.join("tooling");
+
+    let scope = "Desktop tools; machine upkeep belongs to apps";
+    let changed = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.scope",
+        json!({"name":"tooling","scope":scope}),
+    );
+    assert!(changed.status.success(), "{}", stderr(&changed));
+    for home in [&tooling, &liaison, &apps] {
+        let seen = machine.json(home, "ship.show", json!({"name":"tooling"}));
+        assert_eq!(seen["scope"], scope, "as seen from {}", home.display());
+    }
+    // The ship's own record keeps everything else, and it learns the news.
+    let own = machine.json(&tooling, "ship.show", json!({"name":"tooling"}));
+    assert_eq!(own["location"], "here");
+    assert!(own["first_mate"]["manifest"].is_string());
+    let agents = fs::read_to_string(tooling.join("AGENTS.md")).unwrap();
+    assert!(agents.contains(scope), "{agents}");
+    let inbox = machine.json(&tooling, "mail.inbox", json!({"address":"tooling"}));
+    assert!(
+        inbox["messages"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains(scope)
+    );
+
+    // The liaison did not create apps, so apps restates its own scope.
+    let refused = machine.as_agent(
+        &liaison,
+        "liaison",
+        "ship.scope",
+        json!({"name":"apps","scope":"Anything"}),
+    );
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("only ships it created"),
+        "{}",
+        stderr(&refused)
+    );
+    let restated = machine.as_agent(
+        &apps,
+        "apps",
+        "ship.scope",
+        json!({"name":"apps","scope":"Apps and machine upkeep"}),
+    );
+    assert!(restated.status.success(), "{}", stderr(&restated));
+    let seen = machine.json(&liaison, "ship.show", json!({"name":"apps"}));
+    assert_eq!(seen["scope"], "Apps and machine upkeep");
+}
