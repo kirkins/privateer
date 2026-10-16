@@ -877,6 +877,22 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     } else {
         format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4())
     };
+    if hosted
+        && let Err(error) = crate::host::validate_start(&mut store, &ship, &profile["first_mate"])
+    {
+        let _ = crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
+        crate::presence::leave(&store, &ship, &holder)?;
+        return Err(error);
+    }
+    let _hosted_lease = if hosted {
+        Some(crate::host::Lease {
+            store: &store,
+            ship: &ship,
+            holder: &holder,
+        })
+    } else {
+        None
+    };
     // Bounded resource runs must be fresh: old history can retain facts from
     // resources no longer selected. Omitted selection keeps legacy resumes.
     let bundle_plan = profile["first_mate"]
@@ -975,6 +991,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             return Err(error).with_context(|| format!("cannot start {binary}; is it installed?"));
         }
     };
+    if hosted {
+        // A failure to record readiness leaves the conservative reserved retry
+        // in place; never abandon an already spawned native process over it.
+        let _ = crate::host::started(&store, &ship, &holder);
+    }
     // Ctrl-C belongs to the harness; this process must live to release
     // presence afterwards.
     unsafe {
@@ -1009,6 +1030,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let status = child.wait()?;
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = heartbeat.join();
+    if hosted && !status.success() {
+        crate::host::failed(
+            &store,
+            &ship,
+            &holder,
+            "hosted native process exited unsuccessfully",
+        )?;
+    }
     crate::presence::leave(&store, &ship, &holder)?;
     std::process::exit(status.code().unwrap_or(1));
 }

@@ -11,7 +11,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use support::BIN;
 
@@ -46,8 +49,12 @@ impl Place {
             format!(
                 "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
+                 printf '%s\\n' \"$$\" > '{root}/pi-pid'\n\
+                 printf '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\" > '{root}/pi-context'\n\
                  printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
-                 while [ ! -e '{root}/release' ]; do sleep 0.05; done\n",
+                 if [ -e '{root}/native-fail' ]; then exit 17; fi\n\
+                 while [ ! -e '{root}/release' ]; do sleep 0.05; done\n\
+                 printf '%s\\n' '{{\"type\":\"session\",\"id\":\"fixture-session\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
                 root = root.display()
             ),
         )
@@ -117,6 +124,63 @@ impl Place {
         let line = self.ok(&["serve", "--json", r#"{"once":true}"#]);
         serde_json::from_str::<Value>(&line).unwrap()["ships"][0].take()
     }
+    fn at(&self, name: &str, command: &str, args: Value) -> Value {
+        let home = self.folder.parent().unwrap().join(name).join(".privateer");
+        let output = self
+            .command(&[
+                "--home",
+                home.to_str().unwrap(),
+                command,
+                "--json",
+                &args.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+    fn database(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.folder.join(".privateer/privateer.sqlite")).unwrap()
+    }
+    fn retry_now(&self) {
+        self.database()
+            .execute("UPDATE host_launches SET retry_ms=0", [])
+            .unwrap();
+    }
+    fn launch_state(&self) -> (i64, i64, Option<String>) {
+        self.database()
+            .query_row(
+                "SELECT failures,retry_ms,error FROM host_launches WHERE ship='infra'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+    fn native_pid(&self) -> i32 {
+        fs::read_to_string(self.root.join("pi-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+    fn stop_native(&self, ship: &str) {
+        let pid = self.native_pid();
+        fs::write(self.root.join("release"), "").unwrap();
+        until("hosted lease release", || {
+            self.at(ship, "ship.presence", json!({"ship":ship}))["attended"] == false
+        });
+        until(
+            "actual native payload exit, before fixture cleanup",
+            || unsafe { libc::kill(pid, 0) } == -1,
+        );
+        for file in ["release", "pi-pid", "pi-env", "pi-context", "pi-argv"] {
+            fs::remove_file(self.root.join(file)).unwrap();
+        }
+    }
     fn wakes(&self) -> i64 {
         rusqlite::Connection::open(self.folder.join(".privateer/privateer.sqlite"))
             .unwrap()
@@ -132,6 +196,8 @@ struct Herdr {
     requests: Arc<Mutex<Vec<Value>>>,
     spaces: Arc<Mutex<Vec<(String, Value)>>>,
     panes: Arc<Mutex<Vec<Value>>>,
+    reject_create: Arc<AtomicBool>,
+    suppress_input: Arc<AtomicBool>,
 }
 
 impl Herdr {
@@ -146,6 +212,9 @@ impl Herdr {
                 "agent":null,"agent_status":"unknown"})
         };
         let panes = Arc::new(Mutex::new(vec![pane(1)]));
+        let reject_create = Arc::new(AtomicBool::new(false));
+        let suppress_input = Arc::new(AtomicBool::new(false));
+        let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
         std::thread::spawn(move || {
@@ -163,6 +232,24 @@ impl Herdr {
                     continue;
                 };
                 let params = &request["params"];
+                if request["method"] == "workspace.create" && reject.load(Ordering::SeqCst) {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":request["id"],"error":"fixture host unavailable"})
+                    );
+                    seen.lock().unwrap().push(request);
+                    continue;
+                }
+                if request["method"] == "pane.send_input" && suppress.load(Ordering::SeqCst) {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":request["id"],"result":{"type":"ok"}})
+                    );
+                    seen.lock().unwrap().push(request);
+                    continue;
+                }
                 let result = match request["method"].as_str().unwrap_or("") {
                     "session.snapshot" => {
                         json!({"snapshot":{"version":"test","protocol":20,"panes":*live.lock().unwrap()}})
@@ -241,6 +328,8 @@ impl Herdr {
             requests,
             spaces,
             panes,
+            reject_create,
+            suppress_input,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -261,6 +350,438 @@ impl Herdr {
             .map(|(id, _)| id.clone())
             .collect()
     }
+}
+
+#[test]
+fn hosting_inherits_only_with_the_native_route_and_explicit_overrides_win() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+            (
+                "FIXTURE_AUTH".into(),
+                "native-environment-sentinel-not-a-credential".into(),
+            ),
+        ],
+    );
+    place.json(
+        "bundle.configure",
+        json!({"registry":{
+        "schema_version":1,"pi_version":"1.2.0",
+        "integrations":{"reviewed":true,"extensions":[]},"bundles":[]}}),
+    );
+    let mut parent = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    let route = json!({"provider":"fixture-provider", "model":"fixture-model"});
+    parent["options"] = route.clone();
+    parent["tool_bundles"] = json!([]);
+    parent["batch_secs"] = json!(123);
+    parent["retry_backoff_secs"] = json!(0);
+    place.json("ship.put", json!({"name":"infra","first_mate":parent}));
+    let original = place.json("ship.show", json!({"name":"infra"}));
+    for (name, extra, host, options) in [
+        ("implicit", json!({}), json!("herdr"), route.clone()),
+        (
+            "same",
+            json!({"harness":"pi"}),
+            json!("herdr"),
+            route.clone(),
+        ),
+        ("headless", json!({"host":null}), Value::Null, route.clone()),
+        (
+            "codex",
+            json!({"harness":"codex"}),
+            Value::Null,
+            json!({"sandbox":"workspace-write"}),
+        ),
+        (
+            "signed",
+            json!({"harness":"pi-signed"}),
+            Value::Null,
+            json!({}),
+        ),
+        (
+            "explicit",
+            json!({"harness":"pi-signed","host":"herdr"}),
+            json!("herdr"),
+            json!({}),
+        ),
+    ] {
+        let mut args = extra;
+        args["name"] = json!(name);
+        args["actions"] = json!(["inspect", "spawn", "message"]);
+        place.agent("ship.create", args);
+        let profile = place.at(name, "ship.show", json!({"name":name}))["first_mate"].take();
+        assert_eq!(profile["host"], host, "{name}: {profile}");
+        assert_eq!(profile["options"], options, "{name}: {profile}");
+        assert!(profile.get("tool_bundles").is_none(), "{profile}");
+        assert!(profile.get("config").is_none(), "{profile}");
+        assert_eq!(profile["batch_secs"], 5);
+        assert_eq!(profile["retry_backoff_secs"], 60);
+        assert_eq!(profile["duty_task"], format!("{name}-duty"));
+        let charter = place.at(name, "charter.show", json!({"id":name}));
+        assert_eq!(charter["actions"], json!(["inspect", "spawn", "message"]));
+        assert_eq!(charter["production_requires_approval"], true);
+    }
+    assert_eq!(place.json("ship.show", json!({"name":"infra"})), original);
+    assert_eq!(herdr.calls("workspace.create").len(), 0);
+    let refused = place
+        .command(&[
+            "ship.create",
+            "--json",
+            r#"{"name":"invalid","host":"other-host"}"#,
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(!place.root.join("invalid").exists());
+    // A custom manifest that merely declares Pi's id is not a native-route
+    // inheritance credential. Keep the old eligibility rule, not an id match.
+    let custom = place.root.join("custom-pi.json");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/pi/manifest.json"),
+        &custom,
+    )
+    .unwrap();
+    let mut custom_parent = original["first_mate"].clone();
+    custom_parent["manifest"] = json!(custom);
+    custom_parent
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_bundles");
+    place.json(
+        "ship.put",
+        json!({"name":"infra","first_mate":custom_parent}),
+    );
+    place.agent(
+        "ship.create",
+        json!({"name":"unrelated-native","harness":"pi"}),
+    );
+    let unrelated = place.at(
+        "unrelated-native",
+        "ship.show",
+        json!({"name":"unrelated-native"}),
+    );
+    assert!(unrelated["first_mate"].get("host").is_none());
+    assert_eq!(unrelated["first_mate"]["options"], json!({}));
+    place.json(
+        "ship.put",
+        json!({"name":"infra","first_mate":original["first_mate"]}),
+    );
+    // No mail or child bundle configuration is needed. The real native boundary
+    // gets the inherited route, original native HOME/auth environment and the
+    // child's own control/home identity, never its creator's bundle selection.
+    let tick = place.at("implicit", "serve", json!({"once":true}));
+    assert!(tick["ships"][0]["hosted"].is_object(), "{tick}");
+    until("inherited child's actual native process", || {
+        place.root.join("pi-env").exists()
+    });
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    let argv: Vec<_> = argv.lines().collect();
+    assert!(
+        argv.windows(2)
+            .any(|p| p == ["--provider", "fixture-provider"])
+    );
+    assert!(argv.windows(2).any(|p| p == ["--model", "fixture-model"]));
+    assert!(argv.contains(&"--continue"));
+    assert!(!argv.contains(&"--print"));
+    let context = fs::read_to_string(place.root.join("pi-context")).unwrap();
+    let context: Vec<_> = context.lines().collect();
+    assert_eq!(
+        context[0],
+        place.root.join("implicit/.privateer").to_str().unwrap()
+    );
+    assert_eq!(
+        fs::canonicalize(context[1]).unwrap(),
+        fs::canonicalize(BIN).unwrap()
+    );
+    assert_eq!(context[2], place.root.to_str().unwrap());
+    assert_eq!(context[3], "native-environment-sentinel-not-a-credential");
+    assert_eq!(herdr.order(), ["w2", "w1"]);
+    assert_eq!(
+        herdr.spaces.lock().unwrap()[0].1,
+        json!({"privateer":"mate","ship":"implicit"})
+    );
+    assert_eq!(
+        place.at("implicit", "serve", json!({"once":true}))["ships"][0]["skipped"],
+        "its live first mate has the mail"
+    );
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    place.stop_native("implicit");
+}
+
+#[test]
+fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    assert!(
+        place.json("mail.inbox", json!({"address":"infra"}))["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Attendance, native compatibility, effective authority and cwd all apply
+    // before an idle launch just as they do for mail-driven work.
+    place.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"captain-fixture","ttl_secs":90}),
+    );
+    assert_eq!(place.tick()["skipped"], "captain's session is aboard");
+    place.json(
+        "ship.leave",
+        json!({"ship":"infra","holder":"captain-fixture"}),
+    );
+    let original = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    let mut unsupported = original.clone();
+    unsupported["manifest"] = json!("bundled:codex");
+    place.json("ship.put", json!({"name":"infra","first_mate":unsupported}));
+    assert!(
+        place.tick()["host_error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be hosted")
+    );
+    place.json("ship.put", json!({"name":"infra","first_mate":original}));
+    let wrong_repo = place.root.join("other-repo");
+    fs::create_dir(&wrong_repo).unwrap();
+    place.json("charter.put", json!({"id":"infra","repo":wrong_repo}));
+    place.retry_now();
+    assert!(
+        place.tick()["host_error"]
+            .as_str()
+            .unwrap()
+            .contains("cwd escapes")
+    );
+    place.json("charter.put", json!({"id":"infra","repo":place.folder}));
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/codex/manifest.json");
+    place.json(
+        "charter.put",
+        json!({"id":"infra","provider_plugin":{"manifest":manifest}}),
+    );
+    place.retry_now();
+    assert!(
+        place.tick()["host_error"]
+            .as_str()
+            .unwrap()
+            .contains("selected provider adapter")
+    );
+    place.json("charter.put", json!({"id":"infra","provider_plugin":null}));
+    place.json("charter.revoke", json!({"id":"infra"}));
+    place.retry_now();
+    assert!(
+        place.tick()["host_error"]
+            .as_str()
+            .unwrap()
+            .contains("revoked")
+    );
+    place.json("charter.put", json!({"id":"infra","active":true}));
+    place
+        .database()
+        .execute("UPDATE tasks SET status='done' WHERE id='infra-duty'", [])
+        .unwrap();
+    place.retry_now();
+    assert!(
+        place.tick()["host_error"]
+            .as_str()
+            .unwrap()
+            .contains("terminal")
+    );
+    place
+        .database()
+        .execute("UPDATE tasks SET status='open' WHERE id='infra-duty'", [])
+        .unwrap();
+    assert_eq!(herdr.calls("workspace.create").len(), 0);
+    assert_eq!(
+        place.json("ship.presence", json!({"ship":"infra"}))["attended"],
+        false
+    );
+    place.retry_now();
+
+    // Racing ordinary maintenance passes cannot launch twice. Each starts a
+    // fresh Store/process; there is no resident-service startup special case.
+    let mut passes = vec![];
+    for _ in 0..3 {
+        passes.push(
+            place
+                .command(&["serve", "--json", r#"{"once":true}"#])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let mut succeeded = 0;
+    for pass in passes {
+        let output = pass.wait_with_output().unwrap();
+        if output.status.success() {
+            succeeded += 1;
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("another serve is already running")
+            );
+        }
+    }
+    assert!(succeeded > 0);
+    until("idle native process without any mail", || {
+        place.root.join("pi-env").exists()
+    });
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(place.wakes(), 0);
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    assert!(holder.as_str().unwrap().starts_with("host:"));
+    assert_eq!(place.tick()["skipped"], "its live first mate has the mail");
+    assert_eq!(herdr.order(), ["w2", "w1"]);
+    place.stop_native("infra");
+
+    // A host refusal releases only its launch lease and stores a bounded retry.
+    // Repeated fresh dispatcher processes neither call the host again nor append
+    // an error/audit every tick. Setting retry_ms is a deterministic clock jump.
+    herdr.reject_create.store(true, Ordering::SeqCst);
+    place.retry_now();
+    assert!(place.tick()["host_error"].is_string());
+    assert_eq!(
+        place.json("ship.presence", json!({"ship":"infra"}))["attended"],
+        false
+    );
+    let state = place.launch_state();
+    assert_eq!(state.0, 1);
+    let remaining = state.1 - privateer::store::Store::now_ms();
+    assert!((50_000..=60_000).contains(&remaining), "{state:?}");
+    let calls = herdr.calls("workspace.create").len();
+    let audit: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))
+        .unwrap();
+    for _ in 0..3 {
+        let report = place.tick();
+        assert_eq!(report["host_backoff_until_ms"], state.1);
+        assert!(report["host_error"].is_null(), "{report}");
+    }
+    assert_eq!(herdr.calls("workspace.create").len(), calls);
+    assert_eq!(place.launch_state(), state);
+    assert_eq!(
+        place
+            .database()
+            .query_row("SELECT COUNT(*) FROM audit", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        audit
+    );
+    // Host backoff does not consume mail, block the headless fallback, or compete
+    // with a running wake. Its real native payload must exit before cleanup.
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"fallback"}),
+    );
+    let report = place.tick();
+    assert!(report["wake"].is_string(), "{report}");
+    assert_eq!(report["host_backoff_until_ms"], state.1);
+    until("headless native payload", || {
+        place.root.join("pi-env").exists()
+    });
+    let pid = place.native_pid();
+    place.retry_now();
+    assert_eq!(place.tick()["skipped"], "first mate already awake");
+    assert_eq!(herdr.calls("workspace.create").len(), calls);
+    fs::write(place.root.join("release"), "").unwrap();
+    until("headless fallback result", || {
+        place.json("job.status", json!({"id":report["wake"]}))["status"] == "succeeded"
+    });
+    until(
+        "headless payload gone",
+        || unsafe { libc::kill(pid, 0) } == -1,
+    );
+    for file in ["release", "pi-pid", "pi-env", "pi-context", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    herdr.reject_create.store(false, Ordering::SeqCst);
+    // A host that accepts input but never runs it leaves an unadopted lease.
+    // Even its expiry and dispatcher restart cannot lose the reserved backoff.
+    herdr.suppress_input.store(true, Ordering::SeqCst);
+    let pending = place.tick();
+    assert!(pending["hosted"].is_object(), "{pending}");
+    let state = place.launch_state();
+    assert_eq!(state.0, 2);
+    assert!((100_000..=120_000).contains(&(state.1 - privateer::store::Store::now_ms())));
+    assert!(!place.root.join("pi-env").exists());
+    place
+        .database()
+        .execute("UPDATE presence SET expires_ms=0 WHERE ship='infra'", [])
+        .unwrap();
+    assert_eq!(place.tick()["host_backoff_until_ms"], state.1);
+    assert!(!place.root.join("pi-env").exists());
+    assert_eq!(place.launch_state(), state);
+    // Saturate repeated failures without wall-clock sleeps; the deadline and
+    // row count remain bounded, and later configuration/host recovery works.
+    herdr.reject_create.store(true, Ordering::SeqCst);
+    for _ in 0..9 {
+        place.retry_now();
+        assert!(place.tick()["host_error"].is_string());
+    }
+    let state = place.launch_state();
+    assert_eq!(state.0, 7);
+    assert!((3_590_000..=3_600_000).contains(&(state.1 - privateer::store::Store::now_ms())));
+    assert_eq!(
+        place
+            .database()
+            .query_row("SELECT COUNT(*) FROM host_launches", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    herdr.reject_create.store(false, Ordering::SeqCst);
+    herdr.suppress_input.store(false, Ordering::SeqCst);
+    // A real native startup failure after adoption is also rate limited.
+    fs::write(place.root.join("native-fail"), "").unwrap();
+    place.retry_now();
+    assert!(place.tick()["hosted"].is_object());
+    until("native refusal lease release", || {
+        place.root.join("pi-env").exists()
+            && place.json("ship.presence", json!({"ship":"infra"}))["attended"] == false
+    });
+    let pid = place.native_pid();
+    until(
+        "failed native payload gone",
+        || unsafe { libc::kill(pid, 0) } == -1,
+    );
+    assert!(place.launch_state().2.unwrap().contains("unsuccessfully"));
+    let calls = herdr.calls("workspace.create").len();
+    assert!(place.tick()["host_backoff_until_ms"].is_number());
+    assert_eq!(herdr.calls("workspace.create").len(), calls);
+    for file in ["native-fail", "pi-pid", "pi-env", "pi-context", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    place.retry_now();
+    let recovered = place.tick();
+    assert!(recovered["hosted"].is_object(), "{recovered}");
+    until("idle recovery native process", || {
+        place.root.join("pi-env").exists()
+    });
+    assert_eq!(place.launch_state().0, 0);
+    assert_eq!(place.wakes(), 1); // only the real mail fallback; idle uses no prompt
+    assert_eq!(place.tick()["skipped"], "its live first mate has the mail");
+    place.stop_native("infra");
 }
 
 #[test]
