@@ -54,7 +54,7 @@ fn report(store: &Store, args: &Value) -> Result<Value> {
         "DELETE FROM attention WHERE ship=?1 AND at_ms < ?2",
         params![ship, now - KEEP_MS],
     )?;
-    Ok(summary_for(store, ship)?)
+    summary_for(store, ship)
 }
 
 /// The last hour of a ship's attention, or null with no reports yet.
