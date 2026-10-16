@@ -20,31 +20,8 @@ impl Fleet {
             fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let ship = root.join("engineering");
-        fs::create_dir(&ship).unwrap();
-        for args in [
-            &["init", "-q"][..],
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-        ] {
-            assert!(
-                Command::new("git")
-                    .args(args)
-                    .current_dir(&ship)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
+        // Not a Git checkout, so crew run in place without a Treehouse lease.
+        fs::create_dir(root.join("engineering")).unwrap();
         let fleet = Self { _tmp: tmp, root };
         fleet.ok(
             None,
