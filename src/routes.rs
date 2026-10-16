@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 const FIRST_BACKOFF_MS: i64 = 30_000;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const FREE_ALLOWANCE_BACKOFF_MS: i64 = 24 * 60 * 60_000;
+/// A stated reset is read from free text; never trust one past two days, so a
+/// misread hint cannot park a route for longer than an allowance can last.
+const MAX_FREE_ALLOWANCE_BACKOFF_MS: i64 = 2 * FREE_ALLOWANCE_BACKOFF_MS;
 const CURSOR: &str = "routes_scanned_ms";
 
 pub fn init(conn: &Connection) -> Result<()> {
@@ -288,7 +291,10 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
                 .unwrap_or(0)
                 + 1;
             let backoff = if failure.free_allowance {
-                failure.reset_ms.unwrap_or(FREE_ALLOWANCE_BACKOFF_MS)
+                failure
+                    .reset_ms
+                    .unwrap_or(FREE_ALLOWANCE_BACKOFF_MS)
+                    .min(MAX_FREE_ALLOWANCE_BACKOFF_MS)
             } else {
                 FIRST_BACKOFF_MS
                     .saturating_mul(1i64 << (failures - 1).min(10))
@@ -420,6 +426,18 @@ mod tests {
             .query_row("SELECT until_ms FROM model_routes", [], |r| r.get(0))
             .unwrap();
         assert!((until - Store::now_ms() - FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
+
+        // A misread hint (here, an epoch years away) parks the route two days at most.
+        let misread = classify(&error_log(
+            "Free usage limit exceeded; retry-after: 99999999999",
+        ))
+        .unwrap();
+        assert!(misread.reset_ms.unwrap() > MAX_FREE_ALLOWANCE_BACKOFF_MS);
+        record(&conn, "opencode/-/space-bunny-free", Some(&misread)).unwrap();
+        let until: i64 = conn
+            .query_row("SELECT until_ms FROM model_routes", [], |r| r.get(0))
+            .unwrap();
+        assert!((until - Store::now_ms() - MAX_FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
     }
 
     #[test]
