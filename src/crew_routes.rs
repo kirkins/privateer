@@ -14,6 +14,17 @@ use std::{
 
 const KINDS: [&str; 2] = ["crew", "errand"];
 const COSTS: [&str; 3] = ["free", "plan", "credits"];
+const SUMMARY_NOTE_CHARS: usize = 80;
+
+fn summary_note(note: &str) -> String {
+    let mut chars = note.chars();
+    let prefix: String = chars.by_ref().take(SUMMARY_NOTE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
 
 fn path() -> Result<PathBuf> {
     let path = crate::fleet::registry_path()?.with_extension("routes.json");
@@ -293,7 +304,15 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         let mut shown = vec![];
         for name in names {
             let route = &policy["routes"][name.as_str()];
-            let mut label = format!("{name} ({})", route["cost"].as_str().unwrap_or("?"));
+            let cost = route["cost"].as_str().unwrap_or("?");
+            let note = route["note"]
+                .as_str()
+                .filter(|note| !note.is_empty())
+                .map(summary_note);
+            let mut label = match note {
+                Some(note) => format!("{name} ({cost}; {note})"),
+                None => format!("{name} ({cost})"),
+            };
             if identity(route)
                 .map(|id| crate::routes::refusal(store, &id))
                 .transpose()?

@@ -1,0 +1,54 @@
+{
+  "crew": [
+    "luna",
+    "deepseek-flash"
+  ],
+  "errand": [
+    "deepseek-flash",
+    "luna"
+  ],
+  "routes": {
+    "agy": {
+      "cost": "free",
+      "manifest": "bundled:agy",
+      "note": "PROPOSED, PENDING INTEGRATION: AGY Gemini 3.8 Flash Medium; keep out of launch order until fleet integration and accounting are reviewed.",
+      "options": {
+        "model": "gemini-3.8-flash-medium"
+      }
+    },
+    "deepseek-flash": {
+      "cost": "plan",
+      "manifest": "bundled:pi",
+      "note": "Pi + DeepSeek V4.1 Flash on the OpenCode Go plan ($16 per 5 h, $40/week).",
+      "options": {
+        "model": "deepseek-v4.1-flash",
+        "provider": "opencode-go"
+      }
+    },
+    "luna": {
+      "cost": "credits",
+      "manifest": "bundled:codex",
+      "note": "Codex + GPT-6 Luna on cheap ChatGPT credits; default for implementation crew.",
+      "options": {
+        "model": "gpt-6-luna",
+        "sandbox": "danger-full-access"
+      }
+    },
+    "space-bunny-free": {
+      "cost": "free",
+      "manifest": "bundled:opencode",
+      "note": "PROPOSED, PENDING LIVE QUALIFICATION: OpenCode free route; free models share about 24 h allowance; stated zero-retention is not live-verified.",
+      "options": {
+        "model": "space-bunny-free"
+      }
+    }
+  },
+  "ships": {
+    "sysadmin": {
+      "crew": [
+        "luna",
+        "deepseek-flash"
+      ]
+    }
+  }
+}
