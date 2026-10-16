@@ -139,9 +139,20 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
             .context("the ship has no duty task")?
             .to_owned(),
     };
-    let harness = crate::activation::harness_id(&profile);
+    // The captain's errand routes when listed, otherwise the ship's own.
+    let requested = args
+        .get("route")
+        .map(|r| r.as_str().context("route must be a route name"))
+        .transpose()?;
+    let (manifest, options) = match crate::crew_routes::choose(store, &ship, "errand", requested)? {
+        Some(route) => (route.manifest, route.options),
+        None => (profile["manifest"].clone(), profile["options"].clone()),
+    };
+    // Bundles and plugin config belong to the ship's own route.
+    let own = manifest == profile["manifest"];
+    let harness = crate::activation::harness_id(&json!({"manifest": manifest}));
     let key = session_key(focus);
-    let resume = if profile.get("tool_bundles").is_none() {
+    let resume = if !own || profile.get("tool_bundles").is_none() {
         crate::activation::warm_session(store, &ship, &key, &harness, &profile)?
     } else {
         None
@@ -162,12 +173,12 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9)",
         params![id, ship, focus, task_id, brief, mode, Store::now_ms(), harness, resume],
     )?;
-    let mut launch = json!({"id": id, "task_id": task_id, "manifest": profile["manifest"],
-        "options": profile["options"], "wake": text});
-    if let Some(selected) = profile.get("tool_bundles") {
+    let mut launch = json!({"id": id, "task_id": task_id, "manifest": manifest,
+        "options": options, "wake": text});
+    if let Some(selected) = profile.get("tool_bundles").filter(|_| own) {
         launch["tool_bundles"] = selected.clone();
     }
-    if let Some(config) = profile.get("config") {
+    if let Some(config) = profile.get("config").filter(|_| own) {
         launch["config"] = config.clone();
     }
     if let Some(session) = &resume {
