@@ -394,6 +394,69 @@ fn set_actions(store: &mut Store, args: &Value) -> Result<Value> {
     Ok(json!({"ship": name, "actions": charter["actions"], "by": by}))
 }
 
+/// Change what a ship is for, everywhere the fleet reads it: its own record,
+/// every other ship's directory entry and its generated AGENTS.md. A scope
+/// routes work and grants nothing, so a ship may restate its own; otherwise
+/// only its creator or the captain may. A ship whose scope someone else
+/// changed is told.
+fn set_scope(store: &mut Store, args: &Value) -> Result<Value> {
+    let name = required(args, "name")?;
+    let scope = args
+        .get("scope")
+        .and_then(Value::as_str)
+        .context("scope is required")?;
+    let limit = crate::mail::MAX_SCOPE_CHARS;
+    ensure!(
+        scope.chars().count() <= limit,
+        "scope is limited to {limit} characters"
+    );
+    let by = match store.caller() {
+        Caller::Agent { actor } => actor.clone(),
+        Caller::Operator => crate::mail::CAPTAIN.into(),
+    };
+    let member = if by == name {
+        members(&registry()?)?
+            .into_iter()
+            .find(|m| m.name == name)
+            .with_context(|| format!("no active ship named {name} in the fleet"))?
+    } else {
+        managed(store, name, "change the scope of")?
+    };
+    ensure!(member.home.is_dir(), "{name}'s folder is gone");
+    let set = "UPDATE ships SET record=json_set(record,'$.scope',?2) WHERE name=?1";
+    let own = Store::open(&member.home)?;
+    ensure!(
+        own.connection().execute(
+            &format!("{set} AND json_extract(record,'$.location')='here'"),
+            params![name, scope],
+        )? == 1,
+        "{name} is not hosted in its fleet home"
+    );
+    let peer = format!("fleet-{name}");
+    for other in members(&registry()?)? {
+        if other.name != name && other.home.is_dir() {
+            Store::open(&other.home)?.connection().execute(
+                &format!("{set} AND json_extract(record,'$.location.peer')=?3"),
+                params![name, scope, peer],
+            )?;
+        }
+    }
+    crate::cli::write_instructions(own.home(), name, scope, crate::door::is_liaison(own.home()))?;
+    if by != name {
+        crate::mail::dispatch(
+            store,
+            "mail.send",
+            json!({"from": by, "to": name, "kind": "notice",
+                "body": format!("{by} changed your scope to: {scope}")}),
+        )?;
+    }
+    store.audit(
+        "ship.scope",
+        &json!({"ship": name, "scope": scope, "by": by}),
+    )?;
+    Ok(json!({"ship": name, "scope": scope, "by": by}))
+}
+
 fn list() -> Result<Value> {
     let conn = registry()?;
     let mut statement = conn.prepare(
@@ -422,6 +485,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship.create" => create(store, &args),
         "ship.retire" => retire(store, &args),
         "ship.actions" => set_actions(store, &args),
+        "ship.scope" => set_scope(store, &args),
         _ => bail!("unknown fleet command {command}"),
     }
 }

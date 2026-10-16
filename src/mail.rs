@@ -18,7 +18,7 @@ pub const CREW: &str = "crew";
 const KINDS: &[&str] = &["request", "reply", "notice", "decision"];
 const URGENCIES: &[&str] = &["low", "normal", "high"];
 const MAX_MESSAGE_BYTES: usize = 65_536;
-const MAX_SCOPE_CHARS: usize = 2_000;
+pub(crate) const MAX_SCOPE_CHARS: usize = 2_000;
 /// Extra local classifications cannot turn a bounded flush into a backlog
 /// scan. They do not consume its separate allowance for network attempts.
 const EXTRA_CLASSIFICATIONS: i64 = 50;

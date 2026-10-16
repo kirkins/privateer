@@ -144,7 +144,7 @@ fn absolute(path: &str) -> Result<PathBuf> {
 }
 
 /// Whether a ship home was set up as the captain's liaison.
-fn is_liaison(home: &Path) -> bool {
+pub(crate) fn is_liaison(home: &Path) -> bool {
     let mut raw = Vec::new();
     let read =
         fs::File::open(home.join("config.json")).and_then(|f| f.take(65_537).read_to_end(&mut raw));

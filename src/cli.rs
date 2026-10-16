@@ -194,6 +194,31 @@ fn shell_token(text: &str) -> String {
     }
 }
 
+/// Write the first mate's AGENTS.md beside `home`, unless the captain has
+/// taken the file over; returns whether Privateer owns it.
+pub(crate) fn write_instructions(
+    home: &Path,
+    ship: &str,
+    scope: &str,
+    liaison: bool,
+) -> Result<bool> {
+    let agents = home.parent().context("ship folder")?.join("AGENTS.md");
+    let ours = fs::read_to_string(&agents).map_or(true, |t| t.starts_with(GENERATED));
+    if ours {
+        let cli = format!(
+            "{} --home {}",
+            shell_token(&crate::executable::installed()?.to_string_lossy()),
+            shell_token(&home.to_string_lossy())
+        );
+        let mut text = instructions(ship, scope, &cli);
+        if liaison {
+            text.push_str(&liaison_instructions(ship));
+        }
+        fs::write(&agents, text)?;
+    }
+    Ok(ours)
+}
+
 fn instructions(ship: &str, scope: &str, cli: &str) -> String {
     let scope = if scope.is_empty() {
         String::new()
@@ -230,6 +255,7 @@ Use your agent identity for mail and delegation through these JSON commands or
 - Reuse repository URLs from the task, existing projects or Git remotes before asking the captain to repeat them.
 - Tool permissions are launch policy, separate from your charter. Routine `git` and `gh` calls are pre-approved for Claude. If a tool is denied, report the blocker; do not send the captain hand-edit instructions for `.claude` settings. The captain can add a fleet rule with `privateer permissions allow 'Tool(rule)'`, or use `privateer permissions yolo` / Telegram `/yolo on` for every first mate. Agents cannot change this policy themselves. Settings apply on the next launch, including resumed wakes.
 - New area of work? Create a ship for it: `ship.create {{"name":"...","scope":"...","objective":"..."}}` (beside this folder; it gets your charter's actions, or the subset you pass as `"actions"`). Change a ship you created with `ship.actions {{"name":"...","actions":[...]}}`, within your own actions, and retire it with `ship.retire {{"name":"..."}}`. `fleet.list {{}}` shows every ship on this machine.
+- Scopes route work: check `ship.list {{}}` before creating a ship, and give it a scope that does not overlap a neighbour's. When an area of work moves between ships, change their scopes so mail follows it: `ship.scope {{"name":"...","scope":"..."}}` restates your own scope or that of a ship you created; ask any other ship to restate its own.
 
 ## Crew
 
@@ -471,11 +497,6 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     fs::create_dir_all(folder.join("projects"))?;
     let mut store = Store::open(home)?;
     let binary = crate::executable::installed()?;
-    let cli = format!(
-        "{} --home {}",
-        shell_token(&binary.to_string_lossy()),
-        shell_token(&store.home().to_string_lossy())
-    );
 
     let liaison = setup.liaison || existing.as_ref().is_some_and(|c| c["preset"] == "liaison");
     let mut config = json!({"ship":ship});
@@ -584,15 +605,7 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
         json!({"name": ship, "scope": scope, "accepts": accepts, "first_mate": first_mate}),
     )?;
 
-    let agents = folder.join("AGENTS.md");
-    let ours = fs::read_to_string(&agents).map_or(true, |t| t.starts_with(GENERATED));
-    if ours {
-        let mut text = instructions(&ship, &scope, &cli);
-        if liaison {
-            text.push_str(&liaison_instructions(&ship));
-        }
-        fs::write(&agents, text)?;
-    }
+    let ours = write_instructions(store.home(), &ship, &scope, liaison)?;
     let claude = folder.join("CLAUDE.md");
     if !claude.exists() {
         fs::write(&claude, "@AGENTS.md\n")?;
@@ -662,6 +675,10 @@ the subset you choose. Production deployment stays with the captain, bound to
 an exact artifact and environment. Keep turns short and stay responsive: route
 lasting work to the ship that owns it, so each outcome keeps one owner. A
 contact role grants no command over ships you did not create.
+When the captain moves an area of work from one ship to another, change the
+scopes so routing follows the decision: `ship.scope` for ships you created, and
+a request to any other ship to restate its own. A note keeps your reasoning;
+scopes are what every ship reads to find an owner.
 
 ## Onboarding the captain
 
