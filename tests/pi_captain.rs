@@ -15,14 +15,16 @@ fn the_captains_slash_commands_run_the_fleet_cli_as_the_captain() {
     fs::create_dir_all(&folder).unwrap();
     let env = |command: &mut std::process::Command| {
         command
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("HOME", &root)
             .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
             .env("PRIVATEER_SERVICE", "none")
             .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"));
     };
     let mut init = support::command(env!("CARGO_BIN_EXE_privateer"));
-    init.arg("init").current_dir(&folder);
+    // Only init needs the fake harness; Node keeps the inherited PATH.
+    init.arg("init")
+        .current_dir(&folder)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
     env(&mut init);
     let made = init.output().unwrap();
     assert!(
