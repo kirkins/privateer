@@ -559,7 +559,7 @@ fn an_untagged_live_first_mate_is_repaired_before_its_crew_in_the_sidebar() {
         register(name, &home);
     }
     let unreadable = fixtures.join("a-unreadable/privateer.sqlite");
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o0)).unwrap();
     let old = fixtures.join("a-old");
     fs::create_dir(&old).unwrap();
     let path = old.join("privateer.sqlite");
