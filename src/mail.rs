@@ -1070,9 +1070,15 @@ fn pending(store: &Store, args: &Value) -> Result<Value> {
         "seq":r.get::<_,i64>(0)?,"id":r.get::<_,String>(1)?,"from":r.get::<_,String>(2)?,
         "kind":r.get::<_,String>(3)?,"urgency":r.get::<_,String>(4)?,"task_id":r.get::<_,Option<String>>(5)?
     })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    // The current one-line reading travels with the notice so a hosted first
+    // mate acts on the measured value, not a stale belief.
+    let attention = crate::attention::summary_for(store, address)
+        .ok()
+        .and_then(|summary| crate::attention::line(&summary));
     Ok(
         json!({"address":address,"after_seq":after,"acknowledged_through":acknowledged,
-        "count":count,"through_seq":through,"actionable":actionable,"headers":headers}),
+        "count":count,"through_seq":through,"actionable":actionable,"headers":headers,
+        "attention":attention}),
     )
 }
 
