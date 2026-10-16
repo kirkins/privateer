@@ -805,3 +805,114 @@ fn a_stow_asks_every_ship_holds_new_jobs_but_not_wakes_and_resumes() {
         machine.json(&apps, "job.cancel", json!({"id":id}));
     }
 }
+
+#[test]
+fn the_liaison_sees_what_waits_on_the_captain_and_relays_the_captains_answers() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    let send = |folder: &Path, actor: &str, args: Value| -> Value {
+        let out = machine.as_agent(folder, actor, "mail.send", args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let asked = send(
+        &apps,
+        "apps",
+        json!({"from":"apps","to":"captain","kind":"request","body":"May I cancel the 258 obsolete checks?"}),
+    );
+    let stale = send(
+        &liaison,
+        "liaison",
+        json!({"from":"liaison","to":"captain","kind":"request","body":"Testing is blocked on memory."}),
+    );
+
+    // The liaison sees the whole fleet's list; another ship does not.
+    let out = machine.as_agent(&liaison, "liaison", "captain.waiting", json!({}));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let waiting: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<(&str, &str)> = waiting["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| {
+            (
+                w["ship"].as_str().unwrap(),
+                w["mail"]["id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("apps", asked["id"].as_str().unwrap()),
+            ("liaison", stale["id"].as_str().unwrap())
+        ]
+    );
+    let refused = machine.as_agent(&apps, "apps", "captain.waiting", json!({}));
+    assert!(!refused.status.success());
+
+    // The captain answers in conversation with the liaison.
+    let said = machine.json(
+        &liaison,
+        "mail.send",
+        json!({"from":"captain","to":"liaison","kind":"notice","body":"Yes, cancel the obsolete checks."}),
+    );
+    let relay = |source: &str| {
+        machine.as_agent(
+            &liaison,
+            "liaison",
+            "captain.relay",
+            json!({"request":asked["id"],"source":source,"body":"Approved: cancel them."}),
+        )
+    };
+    // Only the captain's own message can stand behind a relayed answer.
+    let invented = relay(stale["id"].as_str().unwrap());
+    assert!(!invented.status.success());
+    assert!(
+        stderr(&invented).contains("not the captain's message"),
+        "{}",
+        stderr(&invented)
+    );
+    let relayed = relay(said["id"].as_str().unwrap());
+    assert!(relayed.status.success(), "{}", stderr(&relayed));
+    let request = machine.json(&apps, "mail.show", json!({"id":asked["id"]}));
+    assert_eq!(request["state"], "answered");
+    let reply = machine.json(&apps, "mail.show", json!({"id":request["answered_by"]}));
+    assert_eq!(reply["from"], "captain");
+    assert_eq!(reply["body"], "Approved: cancel them.");
+    assert_eq!(reply["payload"]["relayed_by"], "liaison");
+    assert_eq!(
+        reply["payload"]["captain_said"],
+        "Yes, cancel the obsolete checks."
+    );
+    assert!(!relay(said["id"].as_str().unwrap()).status.success());
+
+    // Only its sender withdraws a stale request, and it stops waiting.
+    let withdraw = |folder: &Path, actor: &str, id: &Value| {
+        machine.as_agent(
+            folder,
+            actor,
+            "mail.withdraw",
+            json!({"id":id,"reason":"memory is fixed"}),
+        )
+    };
+    assert!(!withdraw(&apps, "apps", &stale["id"]).status.success());
+    let out = withdraw(&liaison, "liaison", &stale["id"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let waiting = machine.json(&liaison, "captain.waiting", json!({}));
+    assert_eq!(waiting["waiting"], json!([]));
+
+    // A request to another ship is withdrawn in both homes.
+    let question = send(
+        &liaison,
+        "liaison",
+        json!({"from":"liaison","to":"apps","kind":"request","body":"Still need the region?"}),
+    );
+    let out = withdraw(&liaison, "liaison", &question["id"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["remote"], "withdrawn", "{result}");
+    let theirs = machine.json(&apps, "mail.show", json!({"id":question["id"]}));
+    assert_eq!(theirs["state"], "withdrawn");
+}

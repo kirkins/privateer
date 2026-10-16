@@ -711,20 +711,9 @@ impl<'a> Session<'a> {
     }
 
     /// Requests and decisions the captain still owes an answer, fleet-wide.
+    /// The same list the liaison reads with `captain.waiting`.
     fn waiting(&mut self) -> Result<Value> {
-        let mut waiting = vec![];
-        for (ship, home) in members()? {
-            let store = self.store(&home)?;
-            let open = crate::mail::dispatch(
-                store,
-                "mail.requests",
-                json!({"address": crate::mail::CAPTAIN, "state": "open"}),
-            )?;
-            for mail in open["requests"].as_array().into_iter().flatten() {
-                waiting.push(json!({"ship": ship, "mail": mail}));
-            }
-        }
-        Ok(json!({"waiting": waiting}))
+        crate::captain::waiting()
     }
 }
 
