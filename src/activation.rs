@@ -763,6 +763,9 @@ pub fn tick(store: &mut Store) -> Result<Value> {
 }
 
 fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Value> {
+    let bridge = crate::host::bridge::maintain(store).unwrap_or_else(
+        |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
+    );
     crate::host::repair(store);
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
@@ -777,7 +780,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "ships": considered, "workspaces": workspaces}),
+        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 

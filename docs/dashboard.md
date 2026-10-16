@@ -16,6 +16,69 @@ The dashboard dependencies remain optional. Ordinary builds of `privateer`
 need no TUI. Demo mode opens no runtime home, registry or socket, even with
 inherited Herdr variables; its mail and work are explicitly samples.
 
+## Hosted machine bridge
+
+With a local ship's `first_mate.host = "herdr"`, host orchestration in `serve`
+maintains one background `bridge` space for the machine's **per-user fleet
+registry**, shared by independent home dispatchers. It uses the release's bundled
+`privateer-dashboard`, or an executable sibling of the source/legacy runtime;
+a PATH-only wrapper is not an automatic hosting target. Paths are shell-quoted,
+cwd is the hosting ship folder, and the bridge observes the fleet with **no
+current-home fallback**. Another dispatcher never retargets a live bridge.
+Explicit dashboard invocation and its observation loop still create, arrange and
+focus nothing. No harness/model/provider is launched or changed by this feature.
+
+Coordination lives beside the existing fleet registry at `<registry>.bridge/`:
+an owned 0700 directory, no symlinks, private regular single-link files, an atomic
+cross-home `guard` flock, a bounded atomically replaced/fsynced claim and a separate
+`live` flock held by the **direct dashboard process** until exit. The claim pins
+registry, guard/live-file incarnations and hosting-home identities/origin, a
+unique launch token, full socket
+device/inode incarnation, pane/workspace/tab/terminal and exact agent/session.
+The operator-only startup handshake validates that token and the new endpoint;
+it does not mutate Herdr. No titles or metadata tokens confer ownership.
+
+Ordinary ticks create without focus, label/tag the verified space as `bridge`,
+and repair its presentation. Bare operator `privateer` first revalidates that
+claim, hosting and live lease and uses `pane.focus` exactly once; it does not
+send input or exec another dashboard when reuse succeeds. Hosting-off, missing
+installation/socket, unknown home and unverifiable ownership retain the existing
+inline dashboard/onboarding fallback. Agent entry remains refused. Herdr snapshot
+and focus are separate operations, not an atomic occupant lock.
+
+Closing a bridge permits recreation only after a valid same-incarnation snapshot
+shows its entire old location gone **and** its direct dashboard's kernel lease
+has disappeared. A removed or replaced lease/guard path is not lease expiry:
+its recorded device/inode must still match. A transient missing pane while the dashboard still lives, or an
+unadopted launch whose pane still exists, cannot cause another create or input
+replay. A new claim fences delayed old-token adoption. Retries reserve durable
+60-second exponential backoff capped at an hour, independently of wake budgets.
+A changed socket, unexpected occupant, ambiguous/malformed snapshot, replaced
+registry/home, or a create with an unknown outcome fails closed. In particular,
+a lost create acknowledgement without an exact recorded endpoint is retained
+for explicit recovery rather than guessed away by elapsed time. This does not
+add a generic force-recovery/kill/close command or claim autonomous recovery from
+arbitrary Herdr server replacement.
+
+**Ordering limitation:** documentation-only inspection of Herdr's embedded JSON
+API schema (artifact SHA-256
+`17d7536f2da50859523680ef279dffcac8e4a235f4e46fe8da6c2ec44141897c`)
+found `workspace.move_block {workspace_ids,before_workspace_id}`, ordinary
+`workspace.move {workspace_id,insert_index}`, and presentation metadata; no
+supported global pin/outside-machine-row parameter or RPC. No Herdr process/socket
+was invoked for this check. The accepted fallback is first **under Local**, using
+existing local workspace grouping: bridge, valid mates and their crew. No global
+machine-row reorder, remote-group mutation, invented pin field or configuration
+change is attempted. Unrelated spaces retain their relative order.
+
+One fake-Herdr behavior scenario in `tests/hosted.rs` exercises overlapping
+independent homes, exactly one initial launch/pane, one explicit bare-entry focus,
+restart/presentation recovery, stale/ambiguous/replaced endpoint refusal, durable
+retry, pending-token fencing and closure/recreation. Direct dashboard children
+use disposable PTYs and must exit 0, be reaped, restore terminal settings and
+release their kernel lease before fixture cleanup. It asserts no automatic focus;
+it is not a rendering or live-Herdr qualification.
+
 ## Fleet and focus
 
 Fleet discovery uses the existing per-user registry (`PRIVATEER_FLEET` can select
