@@ -5,6 +5,9 @@
 //! (`captain`), or the ship's long-lived knowledge (`ship`). The runtime
 //! records facts; a first mate keeps one short handoff note per focus holding
 //! its judgement, which replaces the previous note (a few versions are kept).
+//! Exact identifiers it must carry go in a focus's few pins instead, and a
+//! crew task's assignment is a longer document (`assignment:<task>`) that the
+//! crew read and the first mate's wakes never load.
 //! Bearings summarize a ship from records; digests return a focus's history
 //! on demand, curated and bounded, rather than preloading everything.
 use crate::store::{Caller, Store, identifier, required};
@@ -14,14 +17,21 @@ use serde_json::{Value, json};
 
 const NOTE_BYTES: usize = 2_048;
 const SHIP_NOTE_BYTES: usize = 4_096;
+const ASSIGNMENT_BYTES: usize = 16_384;
+const PINS_PER_FOCUS: i64 = 8;
+const PIN_VALUE_CHARS: usize = 200;
 const NOTE_VERSIONS: i64 = 5;
+/// The longest average word a readable note has.
+const READABLE_WORD_BYTES: usize = 12;
 const LINE_CHARS: usize = 100;
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS notes(ship TEXT NOT NULL, focus TEXT NOT NULL, version INTEGER NOT NULL,
            body TEXT NOT NULL, author TEXT NOT NULL, created_ms INTEGER NOT NULL,
-           PRIMARY KEY(ship, focus, version));",
+           PRIMARY KEY(ship, focus, version));
+         CREATE TABLE IF NOT EXISTS pins(ship TEXT NOT NULL, focus TEXT NOT NULL, key TEXT NOT NULL,
+           value TEXT NOT NULL, set_ms INTEGER NOT NULL, PRIMARY KEY(ship, focus, key));",
     )?;
     Ok(())
 }
@@ -58,13 +68,13 @@ fn local_ship(store: &Store, ship: &str) -> Result<()> {
 pub fn check_focus(store: &Store, ship: &str, focus: &str) -> Result<()> {
     match focus.split_once(':') {
         None if matches!(focus, "captain" | "ship") => Ok(()),
-        Some(("task", id)) => {
+        Some(("task" | "assignment", id)) => {
             let task = store.task(id)?;
             ensure!(task["owner"] == ship, "task {id} is not owned by {ship}");
             Ok(())
         }
         Some(("thread", id)) => identifier(id),
-        _ => bail!("focus must be task:<id>, thread:<id>, captain or ship"),
+        _ => bail!("focus must be task:<id>, assignment:<id>, thread:<id>, captain or ship"),
     }
 }
 
@@ -125,12 +135,24 @@ fn note_put(store: &Store, args: &Value) -> Result<Value> {
     let body = required(args, "body")?;
     let cap = if focus == "ship" {
         SHIP_NOTE_BYTES
+    } else if focus.starts_with("assignment:") {
+        ASSIGNMENT_BYTES
     } else {
         NOTE_BYTES
     };
     ensure!(
         body.len() <= cap,
-        "a {focus} note is limited to {cap} bytes; keep it to judgement: doing, why, waiting on, next"
+        "a {focus} note is limited to {cap} bytes; keep it to judgement: doing, why, waiting on, next. Pin exact ids with note.pin and leave logs to the records instead of dropping spaces to fit"
+    );
+    // Squeezing a note under its cap by deleting spaces leaves text the next
+    // wake must decode. Ordinary prose, ids and paths included, averages well
+    // under twelve characters a word; squeezed notes run from fifteen to forty.
+    let words = body.split_whitespace().count().max(1);
+    let letters = body.split_whitespace().map(str::len).sum::<usize>();
+    ensure!(
+        body.len() < 200 || letters <= READABLE_WORD_BYTES * words,
+        "this note averages {} characters a word, which reads as text with its spaces removed; write it in sentences, and leave ids, hashes and logs to the records (job.status, mail.show, focus.digest)",
+        letters / words
     );
     let author = match store.caller() {
         Caller::Agent { actor } => actor.clone(),
@@ -176,7 +198,69 @@ fn note_get(store: &Store, args: &Value) -> Result<Value> {
             )
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!({"ship": ship, "focus": focus, "notes": notes}))
+    let mut out =
+        json!({"ship": ship, "focus": focus, "notes": notes, "pins": pins(store, ship, focus)?});
+    // Crew read their task's note; its assignment comes with it.
+    if let Some(("task", id)) = focus.split_once(':') {
+        out["assignment"] = current_note(store, ship, &format!("assignment:{id}"))?
+            .map_or(Value::Null, |note| note["body"].clone());
+    }
+    Ok(out)
+}
+
+/// A focus's pinned facts, by key.
+pub fn pins(store: &Store, ship: &str, focus: &str) -> Result<Value> {
+    let mut statement = store
+        .connection()
+        .prepare("SELECT key, value FROM pins WHERE ship=?1 AND focus=?2 ORDER BY key")?;
+    let pins = statement
+        .query_map(params![ship, focus], |r| {
+            Ok((r.get::<_, String>(0)?, Value::String(r.get(1)?)))
+        })?
+        .collect::<rusqlite::Result<serde_json::Map<_, _>>>()?;
+    Ok(Value::Object(pins))
+}
+
+/// Pin an exact fact to a focus, such as a frozen head, a gate job or a PR,
+/// so it need not be carried in the note's prose. An empty or null value
+/// unpins it.
+fn note_pin(store: &Store, args: &Value) -> Result<Value> {
+    let ship = required(args, "ship")?;
+    let focus = required(args, "focus")?;
+    local_ship(store, ship)?;
+    check_focus(store, ship, focus)?;
+    let key = required(args, "key")?;
+    identifier(key)?;
+    ensure!(key.len() <= 32, "a pin key is at most 32 characters");
+    let value = args.get("value").and_then(Value::as_str).unwrap_or("");
+    let tx = store.write_transaction()?;
+    if value.is_empty() {
+        tx.execute(
+            "DELETE FROM pins WHERE ship=?1 AND focus=?2 AND key=?3",
+            params![ship, focus, key],
+        )?;
+    } else {
+        ensure!(
+            value.chars().count() <= PIN_VALUE_CHARS && !value.contains('\n'),
+            "a pin is one line of at most {PIN_VALUE_CHARS} characters; judgement belongs in the note"
+        );
+        let others: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pins WHERE ship=?1 AND focus=?2 AND key<>?3",
+            params![ship, focus, key],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            others < PINS_PER_FOCUS,
+            "a focus holds at most {PINS_PER_FOCUS} pins; unpin one that no longer matters"
+        );
+        tx.execute(
+            "INSERT INTO pins(ship, focus, key, value, set_ms) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(ship, focus, key) DO UPDATE SET value=excluded.value, set_ms=excluded.set_ms",
+            params![ship, focus, key, value, Store::now_ms()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(json!({"ship": ship, "focus": focus, "pins": pins(store, ship, focus)?}))
 }
 
 fn note_list(store: &Store, args: &Value) -> Result<Value> {
@@ -376,8 +460,13 @@ fn digest(store: &Store, args: &Value) -> Result<Value> {
 /// whose latest note predates the cutoff. Captain and ship notes are kept.
 pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
     let stale = "(focus LIKE 'thread:%' OR (focus LIKE 'task:%' AND EXISTS(
-           SELECT 1 FROM tasks t WHERE t.id = substr(notes.focus, 6) AND t.status IN ('done','cancelled'))))
+           SELECT 1 FROM tasks t WHERE t.id = substr(notes.focus, 6) AND t.status IN ('done','cancelled')))
+         OR (focus LIKE 'assignment:%' AND EXISTS(
+           SELECT 1 FROM tasks t WHERE t.id = substr(notes.focus, 12) AND t.status IN ('done','cancelled'))))
          AND (SELECT MAX(created_ms) FROM notes n WHERE n.ship=notes.ship AND n.focus=notes.focus) < ?1";
+    let stale_pins = "(focus LIKE 'thread:%' OR (focus LIKE 'task:%' AND EXISTS(
+           SELECT 1 FROM tasks t WHERE t.id = substr(pins.focus, 6) AND t.status IN ('done','cancelled'))))
+         AND (SELECT MAX(set_ms) FROM pins p WHERE p.ship=pins.ship AND p.focus=pins.focus) < ?1";
     let count: i64 = store.connection().query_row(
         &format!("SELECT COUNT(*) FROM notes WHERE {stale}"),
         [cutoff_ms],
@@ -387,6 +476,9 @@ pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
         store
             .connection()
             .execute(&format!("DELETE FROM notes WHERE {stale}"), [cutoff_ms])?;
+        store
+            .connection()
+            .execute(&format!("DELETE FROM pins WHERE {stale_pins}"), [cutoff_ms])?;
     }
     Ok(count)
 }
@@ -396,6 +488,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "note.put" => note_put(store, &args),
         "note.get" => note_get(store, &args),
         "note.list" => note_list(store, &args),
+        "note.pin" => note_pin(store, &args),
         "focus.digest" => digest(store, &args),
         "ship.bearings" => bearings(store, required(&args, "ship")?),
         _ => bail!("unknown context command {command}"),

@@ -78,9 +78,9 @@ fn notes_replace_each_other_and_keep_only_recent_versions() {
 #[test]
 fn notes_are_bounded_and_scoped_to_valid_foci() {
     let (_temp, mut s) = fleet();
-    assert!(put(&mut s, "task:repair", &"x".repeat(2_049)).is_err());
-    put(&mut s, "ship", &"x".repeat(4_000)).unwrap();
-    assert!(put(&mut s, "ship", &"x".repeat(4_097)).is_err());
+    assert!(put(&mut s, "task:repair", &"word ".repeat(410)).is_err());
+    put(&mut s, "ship", &"word ".repeat(800)).unwrap();
+    assert!(put(&mut s, "ship", &"word ".repeat(820)).is_err());
     for focus in [
         "task:feature",
         "task:missing",
@@ -270,4 +270,98 @@ fn prune_drops_notes_for_finished_tasks_and_old_threads_only() {
     let mut left = left;
     left.sort();
     assert_eq!(left, ["captain", "ship", "task:repair"]);
+}
+
+#[test]
+fn a_note_squeezed_by_dropping_spaces_is_refused_while_prose_with_ids_is_kept() {
+    let (_temp, mut s) = fleet();
+    let prose = "Waiting on the hosting gate before starting the bridge crew. The fixture \
+        emitted a session id that is not a UUID, so planning failed before the job existed; \
+        I fixed the fixture at ad536c874dc193b7d7bc2aa0367b747dcf68ec03 in \
+        /home/captain/.local/state/privateer-host/worktrees/7316ffd9 and queued one focused \
+        run. Next: read its logs, then the full suite, then open the PR.";
+    put(&mut s, "task:repair", prose).unwrap();
+    let squeezed = "Diagnosticworker cb32424c terminalSUCCEEDED0(handoff308/309), focused92157bb0 \
+        terminalFAILED101 independently FULLlogs/status/command read. Literalclean103c pre/post. \
+        Source4lease7316ffd retained. FIRSTbackofffallback actuallySUCCEEDED/native0/payloadexit, \
+        SECONDdue missing-socketattempt reportshosterror asintended, butmode=resume/planningFAILED \
+        beforejobcreated; diagnosticthen lookedupnonexistentjobandpanicked.";
+    let refused = put(&mut s, "task:repair", squeezed)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("spaces removed"), "{refused}");
+    let kept = dispatch(
+        &mut s,
+        "note.get",
+        json!({"ship":"infra","focus":"task:repair"}),
+    )
+    .unwrap();
+    assert_eq!(kept["notes"][0]["body"], prose);
+}
+
+#[test]
+fn an_assignment_reaches_its_crew_and_pins_hold_a_few_exact_facts() {
+    let (_temp, mut s) = fleet();
+    // An assignment is longer than a handoff note and comes with the task's note.
+    let assignment =
+        "Rebuild the cache index, keep the old one until the new one passes. ".repeat(120);
+    assert!(assignment.len() > 2_048 && assignment.len() < 16_384);
+    dispatch(
+        &mut s,
+        "note.put",
+        json!({"ship":"infra","focus":"assignment:repair","body":assignment}),
+    )
+    .unwrap();
+    put(&mut s, "task:repair", "Waiting on the crew's first report.").unwrap();
+    let read = dispatch(
+        &mut s,
+        "note.get",
+        json!({"ship":"infra","focus":"task:repair"}),
+    )
+    .unwrap();
+    assert_eq!(read["assignment"], assignment.as_str());
+    assert_eq!(
+        read["notes"][0]["body"],
+        "Waiting on the crew's first report."
+    );
+    assert!(
+        dispatch(
+            &mut s,
+            "note.put",
+            json!({"ship":"infra","focus":"assignment:feature","body":"Not infra's task."}),
+        )
+        .is_err()
+    );
+
+    let pin = |s: &mut Store, key: &str, value: &str| {
+        dispatch(
+            s,
+            "note.pin",
+            json!({"ship":"infra","focus":"task:repair","key":key,"value":value}),
+        )
+    };
+    for n in 0..8 {
+        pin(&mut s, &format!("fact{n}"), &format!("value {n}")).unwrap();
+    }
+    let full = pin(&mut s, "ninth", "one too many")
+        .unwrap_err()
+        .to_string();
+    assert!(full.contains("at most 8 pins"), "{full}");
+    // Replacing a pin and unpinning one never count against the limit.
+    pin(&mut s, "fact0", "ad536c874dc193b7d7bc2aa0367b747dcf68ec03").unwrap();
+    pin(&mut s, "fact1", "").unwrap();
+    pin(&mut s, "head", "86dc091").unwrap();
+    assert!(pin(&mut s, "log", "line one\nline two").is_err());
+    let read = dispatch(
+        &mut s,
+        "note.get",
+        json!({"ship":"infra","focus":"task:repair"}),
+    )
+    .unwrap();
+    assert_eq!(
+        read["pins"]["fact0"],
+        "ad536c874dc193b7d7bc2aa0367b747dcf68ec03"
+    );
+    assert_eq!(read["pins"]["head"], "86dc091");
+    assert!(read["pins"].get("fact1").is_none());
 }

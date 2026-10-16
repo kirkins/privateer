@@ -426,6 +426,19 @@ fn wakes_group_mail_by_focus_carry_handoff_notes_and_run_under_the_focus_task() 
         note["notes"][0]["body"],
         format!("Seen through seq {}", first["seq"])
     );
+    // Pins ride along with the note; a crew assignment stays out of wakes.
+    dispatch(
+        &mut fleet.store,
+        "note.pin",
+        json!({"ship":"infra","focus":"task:infra-repair","key":"head","value":"ad536c8"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut fleet.store,
+        "note.put",
+        json!({"ship":"infra","focus":"assignment:infra-repair","body":"Rebuild the cache index and report the timings."}),
+    )
+    .unwrap();
     // Later mail on the same task brings that note back; an unrelated
     // question is its own thread, run under the duty task.
     fleet.send(
@@ -445,6 +458,8 @@ fn wakes_group_mail_by_focus_carry_handoff_notes_and_run_under_the_focus_task() 
     assert!(prompt.contains("## task:infra-repair"), "{prompt}");
     assert!(prompt.contains("Your handoff note (v1)"));
     assert!(prompt.contains(&format!("Seen through seq {}", first["seq"])));
+    assert!(prompt.contains("Pinned: head=ad536c8"), "{prompt}");
+    assert!(!prompt.contains("Rebuild the cache index"));
     assert!(prompt.contains("## thread:unrelated"));
     assert!(prompt.contains("Bearings for infra"));
     // Mail with no owned task runs under the duty task.

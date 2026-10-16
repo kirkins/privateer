@@ -298,6 +298,16 @@ fn wake_text(
                 note["body"].as_str().unwrap_or("")
             ));
         }
+        // Pins change between wakes and are short, so even a resumed
+        // session sees the current ones.
+        let pins = crate::context::pins(store, ship, focus)?;
+        if let Some(pins) = pins.as_object().filter(|p| !p.is_empty()) {
+            let line: Vec<String> = pins
+                .iter()
+                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+                .collect();
+            section.push_str(&format!("Pinned: {}\n", line.join(", ")));
+        }
         let mut items = 0;
         for item in mail.iter().filter(|m| m.focus == *focus) {
             if text.len() + section.len() + item.summary.len() > MAX_WAKE_BYTES {
