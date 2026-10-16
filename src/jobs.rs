@@ -126,6 +126,10 @@ struct Reservation {
     /// Resolved estimate counted by admission while recently admitted.
     #[serde(default)]
     demand: Option<Demand>,
+    /// A first mate's wake, which a fleet stow does not hold back: the
+    /// first mate must wake to stow.
+    #[serde(default)]
+    wake: bool,
 }
 
 /// A job waiting for capacity, first come first served across homes.
@@ -251,9 +255,34 @@ fn ledger(path: &Path) -> Result<Connection> {
     )?;
     admission::init(&conn)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS queue (key TEXT PRIMARY KEY, record TEXT NOT NULL);",
+        "CREATE TABLE IF NOT EXISTS queue (key TEXT PRIMARY KEY, record TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS stows (id TEXT PRIMARY KEY, started_ms INTEGER NOT NULL,
+           resumed_ms INTEGER, ships TEXT NOT NULL);",
     )?;
     Ok(conn)
+}
+/// The host's resource ledger, where a fleet stow holds new jobs.
+pub(crate) fn host_ledger(store: &Store) -> Result<Connection> {
+    ledger(&ledger_path(store)?)
+}
+/// The fleet stow holding new jobs on this host, if one is in force.
+pub(crate) fn stowed(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM stows WHERE resumed_ms IS NULL ORDER BY started_ms DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+/// Whether a job is a first mate's wake: `serve` records the wake, with its
+/// job id, before starting it.
+fn is_wake(store: &Store, id: &str) -> Result<bool> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)",
+        [id],
+        |r| r.get(0),
+    )?)
 }
 fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
     let mut stmt = conn.prepare("SELECT record FROM reservations ORDER BY key")?;
@@ -307,6 +336,16 @@ fn reserve(
 ) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
+        // A stowed fleet starts no new work until the captain resumes it;
+        // a job waiting for capacity keeps its place in the queue.
+        if !reservation.wake {
+            if let Some(stow) = stowed(conn)? {
+                refuse_unless!(
+                    false,
+                    "the fleet is stowed ({stow}) while the captain maintains it; new jobs start after `privateer stow resume`"
+                );
+            }
+        }
         if reservation.heavy || estimate.is_some() {
             let queue = live_queue(conn)?;
             let ahead = queue
@@ -1015,6 +1054,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         payload: None,
         charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
         demand: None,
+        wake: is_wake(store, &id)?,
     };
     let conn = store.connection();
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -1274,6 +1314,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             payload: None,
             charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
             demand: None,
+            wake: is_wake(store, &job.id)?,
         };
         let cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
         match reserve(

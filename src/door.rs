@@ -592,6 +592,24 @@ impl<'a> Session<'a> {
                 crate::permissions::load()
             }
             "permissions" => crate::permissions::set(&crate::store::Caller::Operator, args),
+            // The captain stows or resumes the whole fleet from the door.
+            "stow" => {
+                let command = match args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("status")
+                {
+                    "start" => "stow.start",
+                    "status" => "stow.status",
+                    "resume" => "stow.resume",
+                    other => bail!("unknown stow action {other:?}"),
+                };
+                let (_, home) = members()?
+                    .into_iter()
+                    .next()
+                    .context("the fleet has no ships")?;
+                crate::dispatch(self.store(&home)?, command, json!({}))
+            }
             _ => bail!("unknown door command {command:?}"),
         }
     }

@@ -5,6 +5,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 
@@ -716,4 +718,90 @@ fn a_scope_change_reaches_every_ship_and_only_its_ship_or_creator_makes_it() {
     assert!(restated.status.success(), "{}", stderr(&restated));
     let seen = machine.json(&liaison, "ship.show", json!({"name":"apps"}));
     assert_eq!(seen["scope"], "Apps and machine upkeep");
+}
+
+#[test]
+fn a_stow_asks_every_ship_holds_new_jobs_but_not_wakes_and_resumes() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    let job = |id: &str, wait: bool| {
+        machine.run(
+            &apps,
+            &[
+                "job.start",
+                "--json",
+                &json!({"task_id":"apps-duty","id":id,"command":["sleep","30"],"heavy":false,"wait_for_capacity":wait})
+                    .to_string(),
+            ],
+        )
+    };
+
+    let out = machine.ok(&liaison, &["stow"]);
+    assert!(out.contains("asked apps to stow"), "{out}");
+    assert!(out.contains("asked liaison to stow"), "{out}");
+    let inbox = machine.json(&apps, "mail.inbox", json!({"address":"apps"}));
+    let request = &inbox["messages"][0];
+    assert_eq!(request["from"], "captain");
+    assert_eq!(request["kind"], "request");
+    assert!(!machine.run(&liaison, &["stow"]).status.success());
+
+    // New work waits; a job that may wait keeps its place for after.
+    let held = job("held", false);
+    assert!(!held.status.success());
+    assert!(stderr(&held).contains("stowed"), "{}", stderr(&held));
+    let queued = job("queued", true);
+    assert!(queued.status.success(), "{}", stderr(&queued));
+    let status = machine.json(&apps, "job.status", json!({"id":"queued"}));
+    assert_eq!(status["status"], "queued", "{status}");
+
+    // The stow request wakes the first mate: wakes are not held.
+    thread::sleep(Duration::from_millis(5_500));
+    machine.ok(&apps, &["serve", "--json", r#"{"once":true}"#]);
+    let wakes = machine.json(&apps, "wake.list", json!({}));
+    let wake = &wakes["wakes"][0];
+    assert!(
+        !wake["error"].as_str().unwrap_or("").contains("stowed"),
+        "{wake}"
+    );
+    assert!(wake["job_id"].is_string(), "{wake}");
+
+    // Not ready until each ship has replied.
+    let status = machine.json(&liaison, "stow.status", json!({}));
+    assert_eq!(status["held"], true);
+    assert_eq!(status["ready"], false);
+    for (folder, ship) in [(&apps, "apps"), (&liaison, "liaison")] {
+        let id = format!("{}-{ship}", status["stow"].as_str().unwrap());
+        machine.json(
+            folder,
+            "mail.send",
+            json!({"from":ship,"to":"captain","kind":"reply","correlation":id,"body":"Stowed; nothing in flight."}),
+        );
+    }
+    let status = machine.json(&liaison, "stow.status", json!({}));
+    let apps_status = status["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["ship"] == "apps")
+        .unwrap()
+        .clone();
+    assert_eq!(apps_status["replied"], true);
+    assert_eq!(apps_status["reply"], "Stowed; nothing in flight.");
+
+    let out = machine.ok(&liaison, &["stow", "resume"]);
+    assert!(out.contains("Resumed"), "{out}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while machine.json(&apps, "job.status", json!({"id":"queued"}))["status"] == "queued" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queued job never started"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let started = job("after", false);
+    assert!(started.status.success(), "{}", stderr(&started));
+    for id in ["queued", "after"] {
+        machine.json(&apps, "job.cancel", json!({"id":id}));
+    }
 }
