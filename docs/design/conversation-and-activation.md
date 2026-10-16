@@ -215,7 +215,7 @@ Suggested defaults, all adjustable: production grants notify the captain; no vet
 
 ## Flotillas (later version)
 
-A flotilla is a group of ships commanded by one ship: the commanding ship can assign them work and supervise them, while flotilla ships still keep their own charters and mailboxes. It is a deliberate, opt-in exception to flatness for cases where one ship should own a domain spanning several homes. It is out of scope for the first version and will be designed once ships, mailboxes and activation are running.
+A flotilla is a group of ships commanded by one ship: the commanding ship can assign them work and supervise them, while flotilla ships still keep their own charters and mailboxes. It is a deliberate, opt-in exception to flatness for cases where one ship should own a domain spanning several homes. It is out of scope for the first version and will be designed once ships, mailboxes and activation are running. Those are running now; the [flotilla proposal](flotillas.md) works through a first case, an iOS fleet sharing one Mac, and separates what needs a commander from what the runtime can arbitrate alone.
 
 ## Build order
 
