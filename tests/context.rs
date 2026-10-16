@@ -436,3 +436,67 @@ fn bearings_name_running_tasks_that_nothing_is_moving() {
         .collect();
     assert_eq!(idle, ["announced", "delegated", "delegated-step"]);
 }
+
+#[test]
+fn a_backlog_starts_ranked_tasks_first_and_holds_only_unstarted_work() {
+    let (_temp, mut s) = fleet();
+    for id in ["docs", "audit"] {
+        dispatch(
+            &mut s,
+            "task.create",
+            json!({"id":id,"charter_id":"fleet","owner":"infra","title":format!("Do {id}")}),
+        )
+        .unwrap();
+    }
+    let order = |s: &mut Store| -> Vec<String> {
+        dispatch(s, "task.backlog", json!({"ship":"infra"})).unwrap()["backlog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // Unranked tasks wait oldest first.
+    assert_eq!(order(&mut s), ["repair", "cleanup", "docs", "audit"]);
+    s.set_caller(Caller::Agent {
+        actor: "infra".into(),
+    });
+    dispatch(&mut s, "task.rank", json!({"id":"audit","rank":1})).unwrap();
+    dispatch(&mut s, "task.rank", json!({"id":"docs","rank":2})).unwrap();
+    assert_eq!(order(&mut s), ["audit", "docs", "repair", "cleanup"]);
+    // A cleared rank falls back among the unranked; equal ranks go oldest first.
+    dispatch(&mut s, "task.rank", json!({"id":"docs","rank":null})).unwrap();
+    dispatch(&mut s, "task.rank", json!({"id":"cleanup","rank":1})).unwrap();
+    assert_eq!(order(&mut s), ["cleanup", "audit", "repair", "docs"]);
+
+    // Starting a task takes it out of the backlog and to the top of the work.
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"repair","actor":"infra","status":"running"}),
+    )
+    .unwrap();
+    assert_eq!(order(&mut s), ["cleanup", "audit", "docs"]);
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert_eq!(
+        bearings["open_tasks"],
+        json!([
+            "task repair [running]: Repair the staging deploy pipeline",
+            "task cleanup [open #1]: Clean up old build artifacts",
+            "task audit [open #1]: Do audit",
+            "task docs [open]: Do docs"
+        ])
+    );
+    assert_eq!(bearings["backlog"][0]["id"], "cleanup");
+    // Only open tasks are ranked, and only by their own ship.
+    assert!(dispatch(&mut s, "task.rank", json!({"id":"repair","rank":1})).is_err());
+    s.set_caller(Caller::Agent {
+        actor: "apps".into(),
+    });
+    let refused = dispatch(&mut s, "task.rank", json!({"id":"docs","rank":1})).unwrap_err();
+    assert!(
+        refused.to_string().contains("only infra orders"),
+        "{refused}"
+    );
+    assert!(dispatch(&mut s, "task.backlog", json!({"ship":"infra"})).is_err());
+}

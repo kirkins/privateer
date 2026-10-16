@@ -294,11 +294,18 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     };
     let tasks = lines(
-        "SELECT id, status, title FROM tasks WHERE owner=?1 AND status NOT IN ('done','cancelled')
-         ORDER BY id LIMIT 20",
+        // Work in hand first, then the backlog in the order it starts.
+        &format!(
+            "SELECT id, status, title, rank FROM tasks WHERE owner=?1 AND status NOT IN ('done','cancelled')
+             ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END, {BACKLOG_ORDER} LIMIT 20"
+        ),
         &|r| {
+            let rank = r
+                .get::<_, Option<i64>>(3)?
+                .map(|n| format!(" #{n}"))
+                .unwrap_or_default();
             Ok(format!(
-                "task {} [{}]: {}",
+                "task {} [{}{rank}]: {}",
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 clip(&r.get::<_, String>(2)?, LINE_CHARS)
@@ -378,6 +385,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     }
     Ok(json!({
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
+        "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
         "idle_tasks": idle, "text": text,
     }))
@@ -406,6 +414,27 @@ pub fn idle_tasks(store: &Store, ship: &str) -> Result<Vec<Value>> {
     )?;
     let rows = statement.query_map([ship], |r| {
         Ok(json!({"id": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?}))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Open tasks start in this order: ranked ones by rank, then the rest oldest
+/// first.
+pub(crate) const BACKLOG_ORDER: &str = "rank IS NULL, rank, rowid";
+
+/// A ship's backlog: open tasks it has not started, next first. The duty
+/// task is ongoing by design, not waiting work.
+pub fn backlog(store: &Store, ship: &str) -> Result<Vec<Value>> {
+    let mut statement = store.connection().prepare(&format!(
+        "SELECT id, title, rank FROM tasks WHERE owner=?1 AND status='open'
+           AND id <> ?1 || '-duty'
+         ORDER BY {BACKLOG_ORDER} LIMIT 100"
+    ))?;
+    let rows = statement.query_map([ship], |r| {
+        Ok(
+            json!({"id": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?,
+            "rank": r.get::<_, Option<i64>>(2)?}),
+        )
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
