@@ -23,6 +23,10 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
     // likely warm (0 disables resuming), and rotate after this many wakes.
     ("cache_window_secs", 300, 0, 86_400),
     ("session_max_wakes", 6, 1, 1_000),
+    // A live first mate compacts its session once it has been quiet this long
+    // with its context at least this full (0 seconds turns it off).
+    ("quiet_compact_secs", 600, 0, 86_400),
+    ("quiet_compact_percent", 40, 1, 100),
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;

@@ -959,6 +959,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         .env("PRIVATEER_CONTROL_CLI", control)
         .env("PRIVATEER_ATTENDED_HARNESS", &harness)
         .env("PRIVATEER_PRESENCE_HOLDER", &holder);
+    for (name, key) in [
+        ("PRIVATEER_QUIET_COMPACT_SECS", "quiet_compact_secs"),
+        ("PRIVATEER_QUIET_COMPACT_PERCENT", "quiet_compact_percent"),
+    ] {
+        if let Some(value) = profile["first_mate"][key].as_u64() {
+            command.env(name, value.to_string());
+        }
+    }
     if hosted {
         command.env("PRIVATEER_HOSTED", "1");
     }

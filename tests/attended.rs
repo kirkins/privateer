@@ -410,7 +410,7 @@ fn pi_family_starts_with_the_optional_extension_and_preserves_native_routes() {
         let fake = ship.root.join("bin").join(harness);
         fs::write(&fake,format!(r#"#!/usr/bin/env python3
 import json,os,subprocess,sys
-env = {{k:os.environ.get(k) for k in ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_HOME","PRIVATEER_CONTROL_CLI","PRIVATEER_PRESENCE_HOLDER","PRIVATEER_ATTENDED_HARNESS","PI_CODING_AGENT_DIR","ZAI_BASE_URL","CLAUDECODE"]}}
+env = {{k:os.environ.get(k) for k in ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_HOME","PRIVATEER_CONTROL_CLI","PRIVATEER_PRESENCE_HOLDER","PRIVATEER_ATTENDED_HARNESS","PRIVATEER_QUIET_COMPACT_SECS","PI_CODING_AGENT_DIR","ZAI_BASE_URL","CLAUDECODE"]}}
 p = subprocess.run([os.environ["PRIVATEER_CONTROL_CLI"],"ship.presence","--json",'{{"ship":"infra"}}'],capture_output=True,text=True,check=True)
 with open({:?},"w") as out: json.dump({{"env":env,"argv":sys.argv[1:],"presence":json.loads(p.stdout)}},out)
 sys.exit(7)
@@ -477,6 +477,7 @@ sys.exit(7)
         assert_eq!(seen["argv"][prompt_at], "literal; $value");
         assert_eq!(seen["env"]["PRIVATEER_ROLE"], "agent");
         assert_eq!(seen["env"]["PRIVATEER_ACTOR"], "infra");
+        assert_eq!(seen["env"]["PRIVATEER_QUIET_COMPACT_SECS"], "600");
         assert_eq!(seen["env"]["PRIVATEER_ATTENDED_HARNESS"], harness);
         assert_eq!(
             seen["env"]["PRIVATEER_HOME"],
