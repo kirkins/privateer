@@ -355,13 +355,58 @@ fn bounded_discovery_and_retired_fallback_are_not_complete_empty_history() {
     connection
         .execute("UPDATE ships SET retired_ms=1 WHERE name='apps'", [])
         .unwrap();
+    let home = apps.join(".privateer");
+    let registered_home: String = connection
+        .query_row("SELECT home FROM ships WHERE name='apps'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        Path::new(&registered_home),
+        fs::canonicalize(&home).unwrap()
+    );
+    for spelling in [
+        registered_home.clone(),
+        format!("{registered_home}/"),
+        format!("{registered_home}/."),
+    ] {
+        assert!(
+            fleet::read(&registry, Some(Path::new(&spelling)))
+                .unwrap_err()
+                .to_string()
+                .contains("retired"),
+            "retired fallback spelling accepted: {spelling}"
+        );
+        let output = m
+            .command(env!("CARGO_BIN_EXE_privateer-dashboard"), &m.root)
+            .args(["--home", &spelling, "--once", "--no-herdr"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "retired CLI fallback: {spelling}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("retired"));
+    }
+    // Canonicalization must not turn an unapproved symlink into a valid home.
+    let alias = m.root.join("alias");
+    std::os::unix::fs::symlink(&home, &alias).unwrap();
     assert!(
-        fleet::read(&registry, Some(&apps.join(".privateer")))
+        fleet::read(&registry, Some(&alias))
             .unwrap_err()
             .to_string()
-            .contains("retired")
+            .contains("symlink")
     );
     assert!(!fleet::read(&registry, None).unwrap().scope_complete());
+    // With no retired registration, a genuine fallback still observes the home.
+    connection
+        .execute("DELETE FROM ships WHERE name='apps'", [])
+        .unwrap();
+    let fallback = fleet::read(&registry, Some(&home)).unwrap();
+    assert!(fallback.scope_complete());
+    let output = m
+        .command(env!("CARGO_BIN_EXE_privateer-dashboard"), &m.root)
+        .args(["--home", home.to_str().unwrap(), "--once", "--no-herdr"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let fallback: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(fallback["snapshot"]["discovery"], "complete");
     assert!(apps.join(".privateer/privateer.sqlite").is_file());
 }
 
@@ -1580,7 +1625,10 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     app.open_liaison();
     assert_eq!(app.ship.as_deref(), Some("apps"));
     assert_eq!(app.selected_pane().unwrap().pane_id, "demo:apps");
-    assert!(screen(&mut app).contains(&"é".repeat(30)));
+    let details = screen(&mut app);
+    assert!(details.contains("Selected ship:"));
+    assert!(details.contains("Recorded scope:"));
+    assert!(details.contains(&"é".repeat(30)));
     app.select_ship(Some("infra".into()));
     assert_eq!(app.selected_pane().unwrap().pane_id, "demo:infrastructure");
     for (pane, terminal, liaison, reason) in [
@@ -1621,7 +1669,12 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
         for section in ["tasks", "pending", "activity", "jobs", "custody"] {
             assert_eq!(failed[section], baseline[section], "{section}");
         }
-        assert!(view["mail_errors"].as_array().unwrap().is_empty());
+        assert!(view["mail_errors"].as_array().unwrap().iter().any(|error| {
+            error
+                .as_str()
+                .unwrap()
+                .contains("History discovery scope incomplete/unknown/unavailable")
+        }));
         app.update_snapshot(fleet::read(&registry, None).unwrap());
         assert!(
             app.snapshot
@@ -1773,8 +1826,13 @@ fn foreign_and_invalid_local_claims_block_navigation_without_hiding_durable_work
         for section in ["tasks", "pending", "activity", "jobs", "custody"] {
             assert_eq!(result["snapshot"][section], baseline[section], "{section}");
         }
-        assert!(result["mail_errors"].as_array().unwrap().is_empty());
-        assert_eq!(result["mail"].as_array().unwrap().len(), 2);
+        assert!(!snapshot.scope_complete());
+        assert!(result["mail_errors"].as_array().unwrap().iter().any(|error| {
+            error.as_str().unwrap().contains("History discovery scope incomplete/unknown/unavailable")
+        }));
+        let mail = result["mail"].as_array().unwrap();
+        assert_eq!(mail.len(), 2);
+        assert!(mail.iter().all(|row| row["body"] == "Still visible" && row["acknowledged"] == false));
         if !peer.is_empty() {
             assert!(snapshot.ships.iter().any(|ship| ship.id == peer && ship.terminals.iter().any(|b| b.pane_id == pane.pane_id)));
         }
@@ -1791,6 +1849,8 @@ fn foreign_and_invalid_local_claims_block_navigation_without_hiding_durable_work
         app.select_ship(None);
         app.open_liaison();
         assert!(app.selected_pane().is_none());
+        app.compose();
+        assert!(app.composer.is_none(), "incomplete scope must refuse writes");
     }
     for path in [&apps_config, &infra_config] {
         fs::write(

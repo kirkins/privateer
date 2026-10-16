@@ -128,18 +128,24 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     };
     if members.is_empty() {
         return fallback.map_or(Ok(Snapshot::default()), |home| {
-            // An explicit fallback is not permission to resurrect a retired home.
+            // Validate the supplied path (including symlink policy) before
+            // normalization. Registration uses Store::home(), a canonical path;
+            // alternate spellings must not resurrect that same retired home.
+            let identity = super::bridge::Identity::read(home)?;
             if registry.exists() {
                 let conn = connection(registry)?;
                 let retired: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM ships WHERE home=?1 AND retired_ms IS NOT NULL)",
-                    [home.to_string_lossy().as_ref()],
+                    [identity.normalized_home.to_string_lossy().as_ref()],
                     |r| r.get(0),
                 )?;
                 ensure!(!retired, "fallback home is retired");
             }
             let mut snapshot = Snapshot::read(home)?;
-            let identity = super::bridge::Identity::read(home)?;
+            ensure!(
+                super::bridge::Identity::read(home)? == identity,
+                "fallback home replaced during observation"
+            );
             for ship in &mut snapshot.ships {
                 ship.live = Some(ShipState {
                     home: home.to_path_buf(),

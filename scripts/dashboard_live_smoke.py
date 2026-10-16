@@ -181,6 +181,9 @@ def run(binary, runtime):
             return json.loads(cli(verb, "--json", json.dumps(args)))
 
         cli("init", "--ship", "apps", "--harness", "codex")
+        task = command("task.show", {"id": "apps-duty"})
+        assert task["owner"] == "apps" and task["charter_id"] == "apps", task
+        task_id = task["id"]
         presentation = folder / ".privateer" / "dashboard.json"
         presentation.write_text(json.dumps({"ships": [{"id": "apps", "name": "apps",
             "terminals": [{"pane_id": "w1:p1", "terminal_id": "terminal-1"}]}]}))
@@ -189,7 +192,7 @@ def run(binary, runtime):
         # Harmless clipped recorded jobs must not turn complete discovery unknown.
         with sqlite3.connect(folder / ".privateer" / "privateer.sqlite") as database:
             database.executemany("INSERT INTO jobs(id,record) VALUES(?,?)", [
-                (f"history-{i}", json.dumps({"task_id": "apps", "status": "succeeded"}))
+                (f"history-{i}", json.dumps({"task_id": task_id, "status": "succeeded"}))
                 for i in range(201)])
         once = json.loads(subprocess.check_output(
             [str(binary), "--once", "--no-herdr"], cwd=folder, env=env, timeout=15))
@@ -214,7 +217,7 @@ def run(binary, runtime):
             assert reply["body"] == "Go ahead"
             assert command("mail.inbox", {"address": "captain"})["acknowledged_through"] == 0
             command("mail.send", {"id": "approval", "from": "apps", "to": "captain",
-                "kind": "request", "request_kind": "production_approval", "task_id": "apps",
+                "kind": "request", "request_kind": "production_approval", "task_id": task_id,
                 "body": "Exact release?", "payload": {"artifact": "sha256:fixture", "environment": "offline"}})
             tui.keys(b"\x1b")
             tui.until(lambda: tui.text.contains("Exact release?"), "typed approval did not load")

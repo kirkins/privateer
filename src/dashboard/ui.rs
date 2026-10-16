@@ -651,7 +651,7 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(" · ");
                 let location = home.map_or("origin/home unobserved".into(), |h| {
-                    clean(&h.display().to_string(), 512)
+                    format!("origin/home {}", clean(&h.display().to_string(), 512))
                 });
                 let state = s.live.as_ref().and_then(|l| l.error.as_ref()).map_or_else(
                     || {
@@ -721,6 +721,26 @@ impl App {
                 "Revalidated before mutation; unknown live/external evidence is not health.",
             ));
             return lines;
+        }
+        if let Some(ship) = self
+            .ship
+            .as_ref()
+            .and_then(|id| self.snapshot.ships.iter().find(|ship| &ship.id == id))
+        {
+            lines.push(Line::from(format!(
+                "Selected ship: {} · {}",
+                clean(&ship.name, 160),
+                clean(&ship.id, 160)
+            )));
+            lines.push(Line::from(format!(
+                "{} scope: {}",
+                if self.demo { "Sample" } else { "Recorded" },
+                if ship.description.is_empty() {
+                    "not observed".into()
+                } else {
+                    clean(&ship.description, 512)
+                }
+            )));
         }
         if let Some(error) = &self.attention.error {
             lines.push(Line::from(format!("UNAVAILABLE: {}", clean(error, 512))));
