@@ -65,12 +65,19 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
         store.connection(),
         rusqlite::TransactionBehavior::Deferred,
     )?;
-    let origin: String = tx.query_row(
-        "SELECT value FROM metadata WHERE key='runtime_origin'",
-        [],
-        |r| r.get(0),
-    )?;
     let now = Store::now_ms();
+    let origin = tx.query_row::<String, _, _>(
+        "SELECT value FROM metadata WHERE key='runtime_origin'
+         AND EXISTS(SELECT 1 FROM metadata WHERE key='schema' AND value='1')
+         AND (SELECT COUNT(*) FROM pragma_table_info('mail') WHERE name IN ('ended_by','ended_ms','end_reason'))=3",
+        [], |r| r.get(0));
+    let Ok(origin) = origin else {
+        return Ok(
+            json!({"schema_version":1,"available":false,"origin":null,"address":"captain",
+            "observed_ms":now,"items":[],"next_after":null,"unknown":["runtime_schema"],
+            "reason":"Runtime needs schema unavailable; initialize or upgrade through the normal operator workflow."}),
+        );
+    };
     let mut statement = tx.prepare(
         "SELECT source,id FROM (
           SELECT 'mail' source,m.id FROM mail m LEFT JOIN tasks t ON t.id=m.task_id
@@ -205,7 +212,7 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     drop(statement);
     tx.commit()?;
     Ok(
-        json!({"schema_version":1,"origin":origin,"address":"captain","observed_ms":now,
+        json!({"schema_version":1,"available":true,"origin":origin,"address":"captain","observed_ms":now,
         "items":items,"next_after":if more { cursor } else { None },
         "unknown":["live_process_liveness","wake_backoff","hourly_wake_budget","dispatcher_liveness","herdr_reachability","attended_mail_pause","ci","provider_health","remote_homes","legacy_unvalidated_approval_requests" ]}),
     )

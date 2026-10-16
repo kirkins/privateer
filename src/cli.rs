@@ -1024,7 +1024,11 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
     if verb == "start" {
         return start(&home, args);
     }
-    let mut store = Store::open_as(&home, caller)?;
+    let mut store = if verb == "runtime.needs" {
+        Store::open_readonly(&home, caller)?
+    } else {
+        Store::open_as(&home, caller)?
+    };
     if verb == "ship" {
         let flags = flags(args, &["scope", "folder", "harness", "objective"])?;
         let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] | privateer ship retire NAME";

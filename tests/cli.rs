@@ -960,3 +960,68 @@ fn generated_first_mate_commands_work_from_a_folder_with_shell_metacharacters() 
     );
     assert!(!folder.ship.join("escaped").exists());
 }
+
+#[test]
+fn runtime_needs_never_creates_or_migrates_a_home() {
+    let folder = Folder::new("observation");
+    let home = folder.root.join("absent-home");
+    let args = [
+        "--home",
+        home.to_str().unwrap(),
+        "runtime.needs",
+        "--json",
+        "{}",
+    ];
+    let output = folder.run_in(&folder.ship, &args);
+    assert!(!output.status.success());
+    assert!(!home.exists());
+    fs::create_dir(&home).unwrap();
+    let database = home.join("privateer.sqlite");
+    let old = rusqlite::Connection::open(&database).unwrap();
+    old.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO metadata VALUES('schema','1');").unwrap();
+    drop(old);
+    let before = fs::read(&database).unwrap();
+    let output = folder.run_in(&folder.ship, &args);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["available"], false);
+    assert_eq!(result["unknown"], json!(["runtime_schema"]));
+    assert!(result["origin"].is_null());
+    assert_eq!(fs::read(&database).unwrap(), before);
+    // An agent is refused before an existing or missing home is opened.
+    let agent_home = folder.root.join("agent-absent");
+    let output = folder.run_in(
+        &folder.ship,
+        &[
+            "--role",
+            "agent",
+            "--actor",
+            "apps",
+            "--home",
+            agent_home.to_str().unwrap(),
+            "runtime.needs",
+            "--json",
+            "{}",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(!agent_home.exists());
+    drop(privateer::store::Store::open(&home).unwrap());
+    let mut store =
+        privateer::store::Store::open_readonly(&home, privateer::store::Caller::Operator).unwrap();
+    assert!(
+        privateer::dispatch(&mut store, "runtime.needs", json!({})).unwrap()["available"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        store
+            .connection()
+            .execute("INSERT INTO metadata VALUES('unexpected','write')", [])
+            .is_err()
+    );
+}

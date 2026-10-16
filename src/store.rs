@@ -79,6 +79,28 @@ impl Caller {
 }
 
 impl Store {
+    /// Observation-only commands must not initialize or migrate a home.
+    pub fn open_readonly(home: &Path, caller: Caller) -> Result<Self> {
+        caller.require_operator("read-only captain observation")?;
+        if !home.is_absolute() {
+            bail!("home must be an absolute path");
+        }
+        reject_symlinks(home)?;
+        let home = fs::canonicalize(home).context("existing Privateer home required")?;
+        let database = home.join("privateer.sqlite");
+        reject_symlinks(&database)?;
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .context("existing Privateer database required")?;
+        connection.busy_timeout(Duration::from_secs(10))?;
+        connection.execute_batch("PRAGMA query_only=ON;")?;
+        Ok(Self {
+            home,
+            connection,
+            caller,
+        })
+    }
+
     pub fn open_as(home: &Path, caller: Caller) -> Result<Self> {
         if matches!(caller, Caller::Agent { .. }) && !home.join("privateer.sqlite").is_file() {
             bail!("agents require an existing ship home");

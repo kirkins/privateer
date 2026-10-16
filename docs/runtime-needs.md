@@ -4,11 +4,15 @@
 single local runtime query for captain attention. It is **operator-only**; it does
 not make the captain mailbox readable to agents. An operator may invoke it on a
 configured peer using the existing peer protocol. It performs no network calls,
-acknowledgements, recovery, job reconciliation, migrations, or creation. Normal
-Store opening still initializes/migrates the home as before. The query itself uses
-a consistent deferred read transaction.
+acknowledgements, recovery, job reconciliation, migrations, or creation. The direct
+CLI opens an existing database read-only (`Store::open_readonly` for consumers).
+An absent home fails without creating it; an uninitialized/older schema returns
+`available:false`, null origin, no items, and `unknown:["runtime_schema"]` rather
+than migrating it or claiming it is quiet. Generic RPC servers/consumers still
+own their normal Store startup lifecycle; the query itself never initializes a
+Store. It uses a consistent deferred read transaction.
 
-Response: `schema_version:1`, durable home `origin` UUID, `observed_ms`, `items`,
+Response: `schema_version:1`, `available`, durable home `origin` UUID, `observed_ms`, `items`,
 `next_after` (null at end), and `unknown` evidence categories. Limit is clamped to
 1..100, ordered by source and source ID, not by unread order. Cursors are opaque
 source keys, not snapshots: refresh from the first page to see earlier arrivals.
@@ -50,7 +54,7 @@ Supported typed facts:
 
 No text/unread heuristics. Unknown categories explicitly include live liveness,
 wake backoff/hourly budget, dispatcher, Herdr, attended-mail pause, CI, provider
-health and remote homes. No CI/service/credential integration is claimed. Missing
+health, remote homes, and legacy unvalidated approval requests. No CI/service/credential integration is claimed. Missing
 external evidence is not reported as healthy. The UI must not silently convert
 `unknown` into an all-clear signal. These categories can be added as separately
 reviewed authoritative adapters without changing item identity conventions.
