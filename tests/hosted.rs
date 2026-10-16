@@ -181,15 +181,70 @@ impl Place {
             fs::remove_file(self.root.join(file)).unwrap();
         }
     }
-    fn stop_wake(&self, wake: &str) {
-        until("headless native payload", || {
-            self.root.join("pi-env").exists()
-        });
+    fn wake_diagnostics(&self, phase: &str, wake: &str, job: &Value) {
+        println!("{phase}: job.status {job}");
+        let db = self.database();
+        for query in [
+            "SELECT json_object('id',id,'focus',focus,'focuses',focuses,'mode',mode,'status',status,'error',error,'harness',harness,'session_id',session_id) FROM wakes ORDER BY created_ms,id",
+            "SELECT json_object('ship',ship,'focus',focus,'harness',harness,'session_id',session_id,'wakes',wakes,'last_turn_ms',last_turn_ms) FROM sessions ORDER BY ship,focus",
+        ] {
+            let mut stmt = db.prepare(query).unwrap();
+            for row in stmt.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+                println!("{phase}: {}", row.unwrap());
+            }
+        }
+        let dir = self
+            .folder
+            .join(".privateer/jobs")
+            .join(wake)
+            .join(job["incarnation"].as_str().unwrap());
+        let mut logs: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.file_name().unwrap().to_string_lossy().contains(".log"))
+            .collect();
+        logs.sort();
+        for log in logs {
+            let bytes = fs::read(&log).unwrap();
+            println!(
+                "{phase}: COMPLETE {} ({} bytes)\n{}\nEND {}",
+                log.display(),
+                bytes.len(),
+                String::from_utf8_lossy(&bytes),
+                log.display()
+            );
+        }
+    }
+    fn wait_wake(&self, phase: &str, wake: &str, payload: bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let job = self.json("job.status", json!({"id":wake}));
+            let terminal = matches!(
+                job["status"].as_str().unwrap(),
+                "succeeded" | "failed" | "cancelled" | "timed_out" | "orphaned"
+            );
+            if (payload && !terminal && self.root.join("pi-env").exists())
+                || (!payload && job["status"] == "succeeded")
+            {
+                return job;
+            }
+            if terminal || Instant::now() >= deadline {
+                self.wake_diagnostics(phase, wake, &job);
+                panic!(
+                    "{phase}: expected successful headless fallback (waiting for payload={payload}), got {job}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    fn stop_wake(&self, phase: &str, report: &Value) {
+        println!("{phase}: wake report {report}");
+        let wake = report["wake"].as_str().unwrap();
+        self.wait_wake(phase, wake, true);
         let pid = self.native_pid();
         fs::write(self.root.join("release"), "").unwrap();
-        until("headless fallback result", || {
-            self.json("job.status", json!({"id":wake}))["status"] == "succeeded"
-        });
+        let job = self.wait_wake(phase, wake, false);
+        self.wake_diagnostics(phase, wake, &job);
         until(
             "actual headless payload exit, before fixture cleanup",
             || unsafe { libc::kill(pid, 0) } == -1,
@@ -743,7 +798,7 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
     place.retry_now();
     assert_eq!(place.tick()["skipped"], "first mate already awake");
     assert_eq!(herdr.calls("workspace.create").len(), calls);
-    place.stop_wake(report["wake"].as_str().unwrap());
+    place.stop_wake("idle backoff fallback", &report);
     herdr.reject_create.store(false, Ordering::SeqCst);
     // A host that accepts input but never runs it leaves an unadopted lease.
     // Even its expiry and dispatcher restart cannot lose the reserved backoff.
@@ -898,7 +953,7 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(place.launch_state(), state);
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
     assert_eq!(place.wakes(), 1);
-    place.stop_wake(report["wake"].as_str().unwrap());
+    place.stop_wake("adopted host backoff fallback", &report);
 
     // Only a due attempt reports a new host error. Jump the durable deadline
     // rather than deleting backoff, then prove missing Herdr still falls back
@@ -927,7 +982,7 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert!(presence["lease"].is_null(), "{presence}");
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
     assert_eq!(place.wakes(), 2);
-    place.stop_wake(report["wake"].as_str().unwrap());
+    place.stop_wake("due missing-socket fallback", &report);
 }
 
 #[test]

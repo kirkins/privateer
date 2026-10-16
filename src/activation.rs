@@ -35,7 +35,7 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, finished_ms INTEGER, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);
          CREATE TABLE IF NOT EXISTS host_launches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
-           failures INTEGER NOT NULL, retry_ms INTEGER NOT NULL, error TEXT);", 
+           failures INTEGER NOT NULL, retry_ms INTEGER NOT NULL, error TEXT);",
     )?;
     for column in ["focuses", "harness", "session_id", "dispatcher_generation"] {
         let present: bool = tx.query_row(
