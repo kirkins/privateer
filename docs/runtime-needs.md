@@ -12,11 +12,19 @@ than migrating it or claiming it is quiet. Generic RPC servers/consumers still
 own their normal Store startup lifecycle; the query itself never initializes a
 Store. It uses a consistent deferred read transaction.
 
-Observation has a cooperative 250ms deadline and a 2,000,000 SQLite VM-instruction
-budget (checked every 1,000 instructions), installed **before metadata/schema
-reads**. Lock waits are capped at 25ms; scoped hooks/timeout are removed/restored
-on every exit, leaving normal commands' write-wait policy unchanged. Source
-JSON/text is preflighted with a 64KiB per-field bound before materialization.
+Observation has a cooperative 250ms deadline, installed **before metadata/schema
+reads**. A SQLite progress hook stops at 2,000 callbacks (every 1,000 VM
+instructions). Independently, a shared 4,096-checkpoint budget covers source
+phases, page items and every authoritative task/ancestor read, checking the same
+deadline. This also bounds repeated small SQL statements whose individual VM
+runs never reach a progress callback; the callback count alone is not a strict
+2,000,000-instruction bound across such statements. Cyclic ancestry is rejected
+with a per-authority-read visited set, without repairing the graph. Authority is
+read through the same effective-charter traversal used by production grants.
+Lock waits are capped at 25ms; scoped hooks/timeout are removed/restored on every
+exit, leaving normal commands' write-wait policy unchanged. Source JSON/text is
+preflighted with a 64KiB per-field bound before materialization; task references
+and other small authority fields have a 160-byte bound.
 An exhausted budget, lock failure, oversized or invalid source returns
 `available:false`, no partial items/cursor, and an explicit unknown category (or
 refuses the observation). It MUST NOT be rendered as quiet/healthy. The result
@@ -46,6 +54,9 @@ Supported typed facts:
 * **approval**: only a request with `request_kind:"production_approval"`, to
   captain, local `task_id`, and payload `{artifact,environment,choices?}`. Sending
   captures the current charter hash; obsolete/revoked authority is omitted.
+  Explicit terminal/cancelled authority is also non-actionable. Corrupt charter
+  JSON, an invalid active flag, missing ancestry or a cycle instead makes the
+  observation unavailable, never an available empty/partial page.
   `artifact`, `environment` and `version` are the exact grant binding, not parsed
   prose. Approve via existing `approval.grant` with `request_id`,
   `expected_version`, `task_id`, `artifact`, `environment`, `approver:"captain"`,

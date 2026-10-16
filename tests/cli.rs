@@ -1029,28 +1029,122 @@ fn runtime_needs_never_creates_or_migrates_a_home() {
     locker
         .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
         .unwrap();
-    let mut command = folder.command_in(&folder.ship, &args);
-    command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    let started = std::time::Instant::now();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    // Every corrupt-ancestry phase uses this subprocess watchdog too: a
+    // regression must be killed AND reaped, not hang the serial test suite.
+    let observe_with_watchdog = || {
+        let mut command = folder.command_in(&folder.ship, &args);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(5) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("runtime observation exceeded coarse watchdog");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        if started.elapsed() > std::time::Duration::from_secs(5) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("locked runtime observation exceeded coarse watchdog");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let output = observe_with_watchdog();
     if output.status.success() {
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["available"], false, "locked store must not be quiet");
         assert!(!value["unknown"].as_array().unwrap().is_empty());
     }
     locker.execute_batch("ROLLBACK").unwrap();
+    drop(locker);
+
+    // Build a real typed approval before corrupting only this disposable DB.
+    use privateer::{dispatch, store::Store};
+    let mut store = Store::open(&home).unwrap();
+    dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":"apps","scope":"fixture"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "charter.put",
+        json!({"id":"project","objective":"Fixture","repo":folder.ship,"min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "task.create",
+        json!({"id":"main","charter_id":"project","owner":"apps","title":"Fixture"}),
+    )
+    .unwrap();
+    dispatch(&mut store, "mail.send", json!({"id":"release","from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
+    drop(store);
+    let output = observe_with_watchdog();
+    assert!(output.status.success());
+    let baseline: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(baseline["available"], true);
+    assert_eq!(baseline["items"].as_array().unwrap().len(), 1);
+
+    for phase in ["self-cycle", "two-node-cycle", "long-short-queries"] {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        match phase {
+            "self-cycle" => {
+                conn.execute("UPDATE tasks SET parent='main' WHERE id='main'", [])
+                    .unwrap();
+            }
+            "two-node-cycle" => {
+                conn.execute_batch("INSERT INTO tasks VALUES('ancestor','project','apps','Fixture','open','main',1,NULL);
+                UPDATE tasks SET parent='ancestor' WHERE id='main';").unwrap();
+            }
+            _ => {
+                conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+                INSERT INTO tasks SELECT 'chain-'||x,'project','apps','Fixture','open',CASE WHEN x<5000 THEN 'chain-'||(x+1) END,1,NULL FROM n;
+                UPDATE tasks SET parent='chain-1' WHERE id='main';").unwrap();
+            }
+        }
+        drop(conn);
+        let before = fs::read(&database).unwrap();
+        let output = observe_with_watchdog();
+        assert!(
+            output.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["available"], false, "{phase}: {value}");
+        assert!(value["items"].as_array().unwrap().is_empty());
+        assert!(value["next_after"].is_null());
+        assert_eq!(value["unknown"], json!(["runtime_observation"]));
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            before,
+            "{phase}: read repaired/wrote source"
+        );
+        let store = Store::open_readonly(&home, privateer::store::Caller::Operator).unwrap();
+        assert_eq!(store.task("main").unwrap()["owner"], "apps");
+        assert_eq!(store.task("main").unwrap()["handoff_to"], Value::Null);
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='runtime_origin'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            baseline["origin"].as_str().unwrap()
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("SELECT state FROM mail WHERE id='release'", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "open"
+        );
+    }
 }

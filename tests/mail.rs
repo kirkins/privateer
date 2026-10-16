@@ -2063,6 +2063,77 @@ fn stale_approval_version_is_not_grantable_and_disappears() {
     send(&mut s,json!({"id":"stale","from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
     let version =
         dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["version"].clone();
+    let original = s.charter("project").unwrap();
+    let origin: String = s
+        .connection()
+        .query_row(
+            "SELECT value FROM metadata WHERE key='runtime_origin'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let request = dispatch(&mut s, "mail.show", json!({"id":"stale"})).unwrap();
+    let task = s.task("main").unwrap();
+    // Corrupt JSON and structurally invalid authority are NOT revoked/stale.
+    // In particular, neither may turn this exact actionable approval into an
+    // available:true empty page. No read may repair, ack or change custody.
+    let mut invalid = original.clone();
+    invalid["active"] = json!("not-a-boolean");
+    for source in ["not-json".to_owned(), invalid.to_string()] {
+        s.connection()
+            .execute("UPDATE charters SET data=?1 WHERE id='project'", [&source])
+            .unwrap();
+        let before = s.connection().total_changes();
+        let value = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+        assert_eq!(value["available"], false, "{value}");
+        assert!(value["items"].as_array().unwrap().is_empty());
+        assert!(value["next_after"].is_null());
+        assert_eq!(value["unknown"], json!(["runtime_observation"]));
+        assert_eq!(s.connection().total_changes(), before);
+        assert_eq!(s.task("main").unwrap(), task);
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":"stale"})).unwrap(),
+            request
+        );
+        assert_eq!(
+            s.connection()
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='runtime_origin'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            origin
+        );
+        assert_eq!(
+            s.connection()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            10_000
+        );
+        assert_eq!(s.connection().query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<200000) SELECT sum(x) FROM n", [], |r| r.get::<_,i64>(0)).unwrap(), 20_000_100_000);
+    }
+    let mut revoked = original.clone();
+    revoked["active"] = json!(false);
+    s.connection()
+        .execute(
+            "UPDATE charters SET data=?1 WHERE id='project'",
+            [revoked.to_string()],
+        )
+        .unwrap();
+    let value = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    assert_eq!(value["available"], true);
+    assert!(value["items"].as_array().unwrap().is_empty());
+    s.connection()
+        .execute(
+            "UPDATE charters SET data=?1 WHERE id='project'",
+            [original.to_string()],
+        )
+        .unwrap();
+    let value = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    assert_eq!(value["available"], true);
+    assert_eq!(value["items"][0]["version"], version);
+    assert_eq!(value["items"][0]["source_id"], "stale");
     s.connection()
         .execute(
             "UPDATE charters SET data=json_set(data,'$.objective','changed') WHERE id='project'",

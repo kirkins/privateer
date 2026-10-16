@@ -6,6 +6,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Only these known lifecycle refusals may be omitted from an observation.
+// Parse, SQL, missing-record and invalid-ancestry errors must remain unavailable.
+#[derive(Debug)]
+struct InactiveAuthority(&'static str);
+
+impl std::fmt::Display for InactiveAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for InactiveAuthority {}
+
 pub struct Store {
     home: PathBuf,
     connection: Connection,
@@ -254,26 +266,54 @@ impl Store {
     pub fn active_charter(&self, task_id: &str) -> Result<Value> {
         self.authorize_inner(task_id, None, false)
     }
+    /// Use exactly the grant's authority/hash semantics, with observation-only
+    /// checkpoints across short SQL statements and Rust ancestry work. Only
+    /// explicit lifecycle refusals are stale; all invalid source errors survive.
+    pub(crate) fn observe_active_charter(
+        &self,
+        task_id: &str,
+        mut checkpoint: impl FnMut(&str) -> Result<()>,
+    ) -> Result<Option<Value>> {
+        match self.authorize_checked(task_id, None, false, &mut checkpoint) {
+            Ok(charter) => Ok(Some(charter)),
+            Err(error) if error.is::<InactiveAuthority>() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     /// Completion prevents admission of new work. A job already running may
     /// finish recording its result; cancellation and revocation still stop it.
     pub fn authorize_running(&self, task_id: &str, action: &str) -> Result<Value> {
         self.authorize_inner(task_id, Some(action), true)
     }
     fn authorize_inner(&self, task_id: &str, action: Option<&str>, running: bool) -> Result<Value> {
+        self.authorize_checked(task_id, action, running, &mut |_| Ok(()))
+    }
+    fn authorize_checked(
+        &self,
+        task_id: &str,
+        action: Option<&str>,
+        running: bool,
+        checkpoint: &mut impl FnMut(&str) -> Result<()>,
+    ) -> Result<Value> {
+        checkpoint(task_id)?;
         let task = self.task(task_id)?;
         if task["status"] == "cancelled" || (!running && task["status"] == "done") {
-            bail!("task is terminal");
+            return Err(InactiveAuthority("task is terminal").into());
         }
         let mut current = task.clone();
         while let Some(parent) = current["parent"].as_str() {
+            checkpoint(parent)?;
             current = self.task(parent)?;
             if current["status"] == "cancelled" {
-                bail!("parent task was cancelled");
+                return Err(InactiveAuthority("parent task was cancelled").into());
             }
         }
         let charter = self.charter(task["charter_id"].as_str().unwrap())?;
-        if charter["active"] != true {
-            bail!("charter was revoked");
+        let active = charter["active"]
+            .as_bool()
+            .context("invalid charter active flag")?;
+        if !active {
+            return Err(InactiveAuthority("charter was revoked").into());
         }
         if let Some(action) = action {
             if !charter["actions"]

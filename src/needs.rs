@@ -3,6 +3,8 @@ use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, ensure};
 use rusqlite::params;
 use serde_json::{Value, json};
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 // Per-observation only: never shorten ordinary commands' writer wait policy.
@@ -11,6 +13,7 @@ struct ObservationBudget<'a> {
     conn: &'a rusqlite::Connection,
     previous_busy_ms: u64,
     deadline: Instant,
+    checkpoints: Cell<u32>,
 }
 
 impl<'a> ObservationBudget<'a> {
@@ -30,7 +33,20 @@ impl<'a> ObservationBudget<'a> {
             conn,
             previous_busy_ms,
             deadline,
+            checkpoints: Cell::new(0),
         })
+    }
+
+    // VM progress callbacks may never fire across repeated small statements.
+    // Bound Rust/statement work independently, across the whole observation.
+    fn check(&self) -> Result<()> {
+        let checkpoints = self.checkpoints.get() + 1;
+        self.checkpoints.set(checkpoints);
+        ensure!(
+            checkpoints <= 4096 && Instant::now() < self.deadline,
+            "runtime observation work/deadline exhausted"
+        );
+        Ok(())
     }
 }
 
@@ -102,9 +118,9 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     let after = args.get("after").and_then(Value::as_str).unwrap_or("");
     ensure!(after.len() <= 512, "cursor exceeds 512 bytes");
     let budget = ObservationBudget::new(store.connection())?;
-    let observed = observe(store, limit, after);
+    let observed = observe(store, limit, after, &budget);
     match observed {
-        Ok(value) if Instant::now() < budget.deadline => Ok(value),
+        Ok(value) if budget.check().is_ok() => Ok(value),
         _ => Ok(
             json!({"schema_version":1,"available":false,"origin":null,"address":"captain",
             "observed_ms":Store::now_ms(),"items":[],"next_after":null,
@@ -114,7 +130,13 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     }
 }
 
-fn observe(store: &Store, limit: usize, after: &str) -> Result<Value> {
+fn observe(
+    store: &Store,
+    limit: usize,
+    after: &str,
+    budget: &ObservationBudget<'_>,
+) -> Result<Value> {
+    budget.check()?;
     // The budget already covers metadata/schema and all item reads.
     // A deferred read transaction gives a consistent view without a writer lock.
     let tx = rusqlite::Transaction::new_unchecked(
@@ -137,18 +159,23 @@ fn observe(store: &Store, limit: usize, after: &str) -> Result<Value> {
     // Bound JSON/text materialization too: a single SQLite JSON opcode or Rust
     // parse cannot be interrupted by a VM progress callback. Refuse, never skip
     // oversized sources and accidentally return a quiet partial observation.
+    budget.check()?;
     let oversized: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM jobs WHERE length(CAST(record AS BLOB))>65536
             OR length(CAST(id AS BLOB))>160)
          OR EXISTS(SELECT 1 FROM mail WHERE length(CAST(payload AS BLOB))>65536
             OR length(CAST(body AS BLOB))>65536 OR length(CAST(id AS BLOB))>160)
-         OR EXISTS(SELECT 1 FROM charters WHERE length(CAST(data AS BLOB))>65536)
+         OR EXISTS(SELECT 1 FROM charters WHERE length(CAST(data AS BLOB))>65536
+            OR length(CAST(id AS BLOB))>160)
          OR EXISTS(SELECT 1 FROM tasks WHERE length(CAST(title AS BLOB))>65536
-            OR length(CAST(id AS BLOB))>160 OR length(CAST(owner AS BLOB))>160)",
+            OR length(CAST(id AS BLOB))>160 OR length(CAST(owner AS BLOB))>160
+            OR length(CAST(parent AS BLOB))>160 OR length(CAST(charter_id AS BLOB))>160
+            OR length(CAST(handoff_to AS BLOB))>160 OR length(CAST(status AS BLOB))>160)",
         [],
         |r| r.get(0),
     )?;
     ensure!(!oversized, "runtime observation source exceeds byte bound");
+    budget.check()?;
     let mut statement = tx.prepare(
         "SELECT source,id FROM (
           SELECT 'mail' source,m.id FROM mail m LEFT JOIN tasks t ON t.id=m.task_id
@@ -168,6 +195,7 @@ fn observe(store: &Store, limit: usize, after: &str) -> Result<Value> {
     let mut items = vec![];
     let mut cursor = None;
     for (source, id) in rows.into_iter().take(limit) {
+        budget.check()?;
         let key = format!("{source}:{id}");
         cursor = Some(key.clone());
         let mut item = json!({"id":format!("{origin}:{key}"),"origin":origin,"source":source,"source_id":id,"observed_ms":now});
@@ -187,17 +215,19 @@ fn observe(store: &Store, limit: usize, after: &str) -> Result<Value> {
                     }) {
                         continue;
                     }
-                    // Revoked or replaced authority cannot present an actionable grant.
-                    let charter = match store.active_charter(task) {
-                        Ok(charter) => charter,
-                        Err(error) => {
-                            // Revoked authority is not actionable, but SQL
-                            // interruption/lock failure is unavailable, not quiet.
-                            if error.downcast_ref::<rusqlite::Error>().is_some() {
-                                return Err(error);
-                            }
-                            continue;
-                        }
+                    // Share production's effective authority/hash, but bound
+                    // every ancestry read even if no VM callback fires. Invalid
+                    // source is unavailable; only explicit revocation/lifecycle
+                    // refusal (or a replaced hash below) is a stale omission.
+                    let mut ancestors = HashSet::new();
+                    let charter = store.observe_active_charter(task, |id| {
+                        budget.check()?;
+                        ensure!(ancestors.insert(id.to_owned()), "cyclic task ancestry");
+                        Ok(())
+                    })?;
+                    budget.check()?;
+                    let Some(charter) = charter else {
+                        continue;
                     };
                     if payload["charter_hash"] != crate::core::hash(&charter) {
                         continue;
@@ -270,6 +300,7 @@ fn observe(store: &Store, limit: usize, after: &str) -> Result<Value> {
         }
         items.push(item);
     }
+    budget.check()?;
     drop(statement);
     tx.commit()?;
     Ok(
