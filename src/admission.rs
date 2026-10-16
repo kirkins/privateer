@@ -308,15 +308,24 @@ pub fn admit(
         host.cpus
     );
     // Memory: running out is worse than waiting, so the job's own estimate
-    // must fit above the floor too.
-    let left =
-        host.memory_available_bytes as i128 - recent_memory as i128 - demand.memory_bytes as i128;
+    // must fit above the floor too, while other estimated jobs run. The
+    // estimate keeps big jobs from starting together; it must not keep the
+    // only one from starting on a small machine whose person is using it, so
+    // a job running alone needs only the floor.
+    let alone = held.iter().all(|h| h.demand.is_none());
+    let own = if alone { 0 } else { demand.memory_bytes };
+    let left = host.memory_available_bytes as i128 - recent_memory as i128 - own as i128;
     refuse_unless!(
         left >= settings.min_available_memory_bytes as i128,
-        "admission refused: {} MiB available, {} MiB recently admitted, {} MiB estimated for this job, {} MiB must stay free; retry later or tune resource.configure",
+        "admission refused: {} MiB available, {} MiB recently admitted, {} MiB estimated for this job{}, {} MiB must stay free; retry later or tune resource.configure",
         mib(host.memory_available_bytes),
         mib(recent_memory),
         mib(demand.memory_bytes),
+        if alone {
+            " (not counted: no other estimated job runs)"
+        } else {
+            ""
+        },
         mib(settings.min_available_memory_bytes)
     );
     Ok(())
