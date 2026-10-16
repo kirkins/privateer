@@ -38,6 +38,7 @@ const settle = async mail => { await mail.flight; };
 try {
   run(["--home",home,"init","--ship","infra","--harness","pi"]);
   own();
+  call("attention.report",{ship:"infra",holder,kind:"sample",tokens:1000,window:100000});
   // One thousand requests produce one bounded native message; bodies stay in SQLite.
   const requests = Array.from({length:1000},(_,n)=>({id:String(n),command:"mail.send",args:{
     id:`burst-${n}`,from:"captain",to:"infra",kind:"request",body:"private durable body, not a notification payload"}}));
@@ -50,6 +51,7 @@ try {
   assert.equal(sent[0].message.details.count,1000);
   assert(sent[0].message.content.length<3000);
   assert(!sent[0].message.content.includes("private durable body"));
+  assert(sent[0].message.content.includes("Attention: normal"), sent[0].message.content);
   assert.deepEqual(sent[0].options,{triggerTurn:true,deliverAs:"followUp"});
   const through = mail.seen;
   assert.equal(call("mail.pending",{address:"infra"}).count,1000);

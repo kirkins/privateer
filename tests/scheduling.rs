@@ -266,7 +266,7 @@ fn stale_or_replaced_attention_never_silently_becomes_healthy() {
 }
 
 #[test]
-fn attention_wait_requires_a_fresh_normal_reading_to_resume() {
+fn attention_wait_resumes_on_a_fresh_normal_reading_before_its_deadline() {
     let mut fleet = Fleet::new(json!({}));
     attend(&mut fleet);
     enqueue(&mut fleet);
@@ -281,20 +281,42 @@ fn attention_wait_requires_a_fresh_normal_reading_to_resume() {
         json!({"id":"infra-repair","wait":{"kind":"attention","reason":"Wait for context to ease","until_ms":privateer::store::Store::now_ms()+100000}}),
     );
     assert_eq!(deferred["state"], "waiting");
-
-    // A fresh high reading at the deadline is still not an all-clear.
-    fleet.store.connection().execute("UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0) WHERE task_id='infra-repair'", []).unwrap();
+    // A high reading alone does not resume it.
     fleet.tick();
     assert_eq!(
         call(&mut fleet, "work.status", json!({"ship":"infra"}))["tasks"][0]["state"],
         "waiting"
     );
-
+    // A fresh normal sample resumes it before the deadline.
     call(
         &mut fleet,
         "attention.report",
         json!({"ship":"infra","holder":"host:scheduler-test","kind":"sample","tokens":1000,"window":100000}),
     );
+    fleet.tick();
+    assert_eq!(
+        call(&mut fleet, "work.status", json!({"ship":"infra"}))["tasks"][0]["state"],
+        "ready"
+    );
+}
+
+#[test]
+fn attention_wait_deadline_hands_off_when_the_reading_never_clears() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    call(
+        &mut fleet,
+        "attention.report",
+        json!({"ship":"infra","holder":"host:scheduler-test","kind":"sample","tokens":90000,"window":100000}),
+    );
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"attention","reason":"Wait for context to ease","until_ms":privateer::store::Store::now_ms()+100000}}),
+    );
+    // Reaching the deadline still hands off to a fresh context while high.
+    fleet.store.connection().execute("UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0) WHERE task_id='infra-repair'", []).unwrap();
     fleet.tick();
     assert_eq!(
         call(&mut fleet, "work.status", json!({"ship":"infra"}))["tasks"][0]["state"],

@@ -168,7 +168,8 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
             Some("time") => now >= work.not_before_ms,
             Some("attention") => {
                 let reading = crate::attention::summary_for(store, &work.owner)?;
-                reading["fresh"] == true && reading["pressure"] == "normal"
+                (reading["fresh"] == true && reading["pressure"] == "normal")
+                    || now >= work.not_before_ms
             }
             Some("task") => {
                 let dependency = store.task(required(&wait, "ref")?)?;

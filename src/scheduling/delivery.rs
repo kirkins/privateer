@@ -143,12 +143,16 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
 }
 
 fn prompt(work: &Scheduled, attention: &Value) -> String {
+    // Only state a reading we actually measured; a headless handoff has none.
+    let attention = crate::attention::line(attention)
+        .map(|line| format!("{line}\n"))
+        .unwrap_or_default();
     format!(
-        "Scheduled work on task {} (revision {}). Offer {}.\n{}\nPrepared assignment:\n{}\n\nYou coordinate this task under its existing charter. Start a concrete step, delegate prepared child work, or complete the task with verified evidence. For a wait use task.defer with id, offer_id and wait {{kind: time|attention|task|request|manual, reason, until_ms or ref}}. A prose note does not schedule resumption. Record your result in the task's note. Include work_offer: \"{}\" on agent.start or job.start for work under this task. Do not enqueue this task again while its claim or payload is live.\n",
+        "Scheduled work on task {} (revision {}). Offer {}.\n{}Prepared assignment:\n{}\n\nYou coordinate this task under its existing charter. Start a concrete step, delegate prepared child work, or complete the task with verified evidence. For a wait use task.defer with id, offer_id and wait {{kind: time|attention|task|request|manual, reason, until_ms or ref}}. A prose note does not schedule resumption. Record your result in the task's note. Include work_offer: \"{}\" on agent.start or job.start for work under this task. Do not enqueue this task again while its claim or payload is live.\n",
         work.task_id,
         work.revision,
         work.offer_id.as_deref().unwrap_or(""),
-        crate::attention::line(attention).unwrap_or_else(|| "Attention: unknown".into()),
+        attention,
         work.brief,
         work.offer_id.as_deref().unwrap_or("")
     )
