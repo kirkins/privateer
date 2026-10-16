@@ -15,6 +15,8 @@ from pathlib import Path
 from native_launch import native_environment
 
 MAX_LINE = 1024 * 1024
+# How long an owned server has to exit after SIGTERM, and after SIGKILL.
+TERM_GRACE_SECS = 5
 
 
 class ProtocolError(Exception):
@@ -221,13 +223,14 @@ class Client:
             self.child.wait(timeout=1)
         except subprocess.TimeoutExpired:
             # Some owned servers keep stdin EOF open as a transport event.
-            # Give their normal signal teardown a chance to flush sessions.
+            # Give their normal signal teardown a chance to flush sessions:
+            # one second was too short on a loaded machine.
             self.child.terminate()
             try:
-                self.child.wait(timeout=1)
+                self.child.wait(timeout=TERM_GRACE_SECS)
             except subprocess.TimeoutExpired:
                 self.child.kill()
-                self.child.wait(timeout=2)
+                self.child.wait(timeout=TERM_GRACE_SECS)
 
 
 def run(request):
