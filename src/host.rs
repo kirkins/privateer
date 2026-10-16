@@ -42,6 +42,14 @@ fn socket() -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
+/// Repair presentation for this dispatcher's live hosted mates, even when
+/// they were opened before workspace metadata existed. Best effort only.
+pub(crate) fn repair(store: &Store) {
+    if let Some(socket) = socket() {
+        let _ = crate::herdr::sidebar::repair(store, &socket);
+    }
+}
+
 /// Launch the ship's first mate in its own background Herdr space. The lease
 /// is claimed first, so a racing launch or captain's session is refused, and
 /// released again if the host refuses.
@@ -65,7 +73,7 @@ pub(crate) fn launch(store: &Store, ship: &str, harness: &str) -> Result<Value> 
         &["start", "--hosted"],
     ) {
         Ok(pane) => {
-            settle(&mut client, &pane.workspace_id, "mate", ship);
+            settle(store, &mut client, &pane.workspace_id, "mate", ship);
             let launched = json!({"holder": holder, "pane": pane.pane_id,
                 "workspace": pane.workspace_id});
             store.audit(
@@ -112,7 +120,7 @@ pub(crate) fn supervise(
         &[],
         &["_job-supervise", job],
     )?;
-    settle(&mut client, &pane.workspace_id, "crew", ship);
+    settle(store, &mut client, &pane.workspace_id, "crew", ship);
     store.audit(
         "host.crew",
         &json!({"job_id": job, "task_id": task, "pane": pane.pane_id, "workspace": pane.workspace_id}),
@@ -122,8 +130,15 @@ pub(crate) fn supervise(
 
 /// Tag a new space and put it in its place in the sidebar. Presentation only:
 /// a refusal never undoes the launch.
-fn settle(client: &mut crate::herdr::Client, workspace: &str, role: &str, ship: &str) {
+fn settle(
+    store: &Store,
+    client: &mut crate::herdr::Client,
+    workspace: &str,
+    role: &str,
+    ship: &str,
+) {
+    let mates = crate::herdr::sidebar::mates(store.connection()).unwrap_or_default();
     let _ = client
         .tag(workspace, role, ship)
-        .and_then(|()| client.arrange());
+        .and_then(|()| client.arrange_with_mates(&mates));
 }

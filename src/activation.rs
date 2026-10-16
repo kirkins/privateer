@@ -761,6 +761,7 @@ pub fn tick(store: &mut Store) -> Result<Value> {
 }
 
 fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Value> {
+    crate::host::repair(store);
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
     let mut considered = vec![];

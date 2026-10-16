@@ -131,6 +131,7 @@ impl Place {
 struct Herdr {
     requests: Arc<Mutex<Vec<Value>>>,
     spaces: Arc<Mutex<Vec<(String, Value)>>>,
+    panes: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Herdr {
@@ -139,14 +140,15 @@ impl Herdr {
         let listener = UnixListener::bind(socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let spaces = Arc::new(Mutex::new(vec![("w1".to_owned(), json!({}))]));
-        let (seen, order) = (requests.clone(), spaces.clone());
+        let pane = |n: usize| {
+            json!({"pane_id":format!("w{n}:p1"),"terminal_id":format!("t{n}"),
+                "workspace_id":format!("w{n}"),"tab_id":format!("w{n}:t1"),
+                "agent":null,"agent_status":"unknown"})
+        };
+        let panes = Arc::new(Mutex::new(vec![pane(1)]));
+        let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
         std::thread::spawn(move || {
-            let pane = |n: usize| {
-                json!({"pane_id":format!("w{n}:p1"),"terminal_id":format!("t{n}"),
-                    "workspace_id":format!("w{n}"),"tab_id":format!("w{n}:t1"),
-                    "agent":null,"agent_status":"unknown"})
-            };
             let mut created: Vec<Value> = vec![];
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -163,13 +165,13 @@ impl Herdr {
                 let params = &request["params"];
                 let result = match request["method"].as_str().unwrap_or("") {
                     "session.snapshot" => {
-                        let panes: Vec<Value> = (0..created.len()).map(|i| pane(i + 2)).collect();
-                        json!({"snapshot":{"version":"test","protocol":20,"panes":panes}})
+                        json!({"snapshot":{"version":"test","protocol":20,"panes":*live.lock().unwrap()}})
                     }
                     "workspace.create" => {
                         created.push(params["env"].clone());
                         let n = created.len() + 1;
                         order.lock().unwrap().push((format!("w{n}"), json!({})));
+                        live.lock().unwrap().push(pane(n));
                         json!({"type":"workspace_created","root_pane":pane(n)})
                     }
                     "workspace.report_metadata" => {
@@ -235,7 +237,11 @@ impl Herdr {
                 seen.lock().unwrap().push(request);
             }
         });
-        Self { requests, spaces }
+        Self {
+            requests,
+            spaces,
+            panes,
+        }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
         self.requests
@@ -495,7 +501,7 @@ fn a_hosted_crew_session_ends_when_its_work_settles() {
 }
 
 #[test]
-fn a_ships_spaces_lead_the_sidebar_with_its_crew_under_its_first_mate() {
+fn an_untagged_live_first_mate_is_repaired_before_its_crew_in_the_sidebar() {
     let place = Place::new();
     let socket = place.root.join("config/herdr/herdr.sock");
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -517,12 +523,265 @@ fn a_ships_spaces_lead_the_sidebar_with_its_crew_under_its_first_mate() {
     );
     assert_eq!(place.tick()["hosted"]["workspace"], "w2");
     assert_eq!(herdr.order(), ["w2", "w1"]);
+    until("the first mate's live workspace binding", || {
+        place.json("ship.presence", json!({"ship":"infra"}))["lease"]["binding"]["pane"]["workspace_id"]
+            == "w2"
+    });
+    let forget_mate = || {
+        let mut spaces = herdr.spaces.lock().unwrap();
+        spaces.iter_mut().find(|(id, _)| id == "w2").unwrap().1 = json!({});
+        // Reproduce a space predating metadata, below the captain's space.
+        spaces.sort_by_key(|(id, _)| id.clone());
+    };
+    // Unhealthy fleet homes sort before our own. Locks must not each cost a
+    // busy timeout; CPU-heavy old/untrusted schemas share ONE query budget.
+    // None may be opened through Store (which would create/migrate them).
+    let fleet = rusqlite::Connection::open(place.root.join("fleet.sqlite")).unwrap();
+    let fixtures = place.root.join("recovery-fixtures");
+    fs::create_dir(&fixtures).unwrap();
+    let mut locked = vec![];
+    let mut originals = vec![];
+    let register = |name: &str, home: &Path| {
+        fleet
+            .execute(
+                "INSERT INTO ships(name,home,created_by,created_ms) VALUES(?1,?2,'captain',0)",
+                rusqlite::params![name, home.to_str().unwrap()],
+            )
+            .unwrap();
+    };
+    for n in 0..64 {
+        let name = format!("a-locked-{n:02}");
+        let home = fixtures.join(&name);
+        fs::create_dir(&home).unwrap();
+        let path = home.join("privateer.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE old(value); BEGIN EXCLUSIVE;")
+            .unwrap();
+        originals.push((path.clone(), fs::read(&path).unwrap()));
+        locked.push(conn);
+        register(&name, &home);
+    }
+    let missing = fixtures.join("missing");
+    register("a-missing", &missing);
+    for (name, bytes) in [
+        ("a-corrupt", b"not a database".as_slice()),
+        ("a-unreadable", b"unreadable"),
+    ] {
+        let home = fixtures.join(name);
+        fs::create_dir(&home).unwrap();
+        let path = home.join("privateer.sqlite");
+        fs::write(&path, bytes).unwrap();
+        originals.push((path, bytes.to_vec()));
+        register(name, &home);
+    }
+    let unreadable = fixtures.join("a-unreadable/privateer.sqlite");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o0)).unwrap();
+    let old = fixtures.join("a-old");
+    fs::create_dir(&old).unwrap();
+    let path = old.join("privateer.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE old(value);")
+        .unwrap();
+    originals.push((path.clone(), fs::read(&path).unwrap()));
+    register("a-old", &old);
+    let alias = fixtures.join("alias");
+    std::os::unix::fs::symlink(&old, &alias).unwrap();
+    register("a-symlink", &alias);
+    // Each view would run beyond the old per-home 500ms deadline. Even if
+    // our own home is never reached, its local binding must still repair it.
+    for n in 0..12 {
+        let name = format!("b-slow-{n:02}");
+        let home = fixtures.join(&name);
+        fs::create_dir(&home).unwrap();
+        let path = home.join("privateer.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE ships(name TEXT, record TEXT);
+             INSERT INTO ships VALUES('{name}', '{{\"location\":\"here\",\"first_mate\":{{\"host\":\"herdr\"}}}}');
+             CREATE VIEW presence AS WITH RECURSIVE spin(x) AS
+               (VALUES(0) UNION ALL SELECT x+1 FROM spin WHERE x<1000000000)
+             SELECT '{name}' AS ship, '{{}}' AS binding, 9223372036854775807 AS expires_ms
+             FROM spin WHERE x=1000000000;"
+        )).unwrap();
+        drop(conn);
+        originals.push((path.clone(), fs::read(&path).unwrap()));
+        register(&name, &home);
+    }
+    forget_mate();
+    let started = Instant::now();
+    assert_eq!(place.tick()["skipped"], "its live first mate has the mail");
+    // A generous watchdog, not a millisecond performance assertion: the old
+    // cumulative lock/query waits take >10s on these same fixtures.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "fleet held up local mail/repair"
+    );
+    assert_eq!(herdr.order(), ["w2", "w1"]);
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(
+        herdr.spaces.lock().unwrap()[0].1,
+        json!({"privateer":"mate","ship":"infra"})
+    );
+    // Losing metadata again must also be repaired by a crew launch, without
+    // waiting for the next dispatcher pass.
+    forget_mate();
     place.json(
         "task.create",
         json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
     );
     place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
     assert_eq!(herdr.order(), ["w2", "w3", "w1"]);
+    assert_eq!(
+        herdr.spaces.lock().unwrap()[0].1,
+        json!({"privateer":"mate","ship":"infra"})
+    );
+    // A misplaced crew must not decide ship order. Mate position wins, and
+    // ships with no mate follow all mate/crew groups in ship-name order.
+    {
+        let mut spaces = herdr.spaces.lock().unwrap();
+        spaces.insert(
+            0,
+            ("orphan-z".into(), json!({"privateer":"crew","ship":"z"})),
+        );
+        spaces.insert(
+            1,
+            (
+                "other-crew".into(),
+                json!({"privateer":"crew","ship":"other"}),
+            ),
+        );
+        spaces.insert(
+            2,
+            ("orphan-a".into(), json!({"privateer":"crew","ship":"a"})),
+        );
+        spaces.insert(
+            4,
+            (
+                "other-mate".into(),
+                json!({"privateer":"mate","ship":"other"}),
+            ),
+        );
+        spaces.push(("captain-2".into(), json!({})));
+    }
+    place.tick();
+    assert_eq!(
+        herdr.order(),
+        [
+            "w2",
+            "w3",
+            "other-mate",
+            "other-crew",
+            "orphan-a",
+            "orphan-z",
+            "w1",
+            "captain-2"
+        ]
+    );
+    until("the sidebar scenario's crew to finish", || {
+        place.json("job.status", json!({"id":"crew-1"}))["status"] == "succeeded"
+    });
+    assert_eq!(herdr.calls("workspace.create").len(), 2);
+
+    // Remove broken entries before the identity phases, checking that recovery
+    // neither created missing homes nor wrote/migrated any existing database.
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!missing.exists());
+    for (path, bytes) in &originals {
+        assert_eq!(
+            &fs::read(path).unwrap(),
+            bytes,
+            "changed {}",
+            path.display()
+        );
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "created sidecars in {}",
+            path.display()
+        );
+    }
+    fleet
+        .execute("DELETE FROM ships WHERE name != 'infra'", [])
+        .unwrap();
+    drop(locked);
+
+    // A plausible binding targeting the captain's w1 is not ownership when
+    // its lease expired, or when ANY authoritative pane identity was reused.
+    let conn =
+        rusqlite::Connection::open(place.folder.join(".privateer/privateer.sqlite")).unwrap();
+    let mut record = place.json("ship.show", json!({"name":"infra"}));
+    record["name"] = json!("stale");
+    conn.execute(
+        "INSERT INTO ships(name,record) VALUES('stale',?1)",
+        [record.to_string()],
+    )
+    .unwrap();
+    let captain = herdr.panes.lock().unwrap()[0].clone();
+    let mut binding =
+        place.json("ship.presence", json!({"ship":"infra"}))["lease"]["binding"].clone();
+    binding["pane"] = captain.clone();
+    binding["pane"]["agent_session"] = json!("captain-session");
+    herdr.panes.lock().unwrap()[0] = binding["pane"].clone();
+    conn.execute(
+        "INSERT INTO presence(ship,holder,started_ms,expires_ms,binding)
+         VALUES('stale','host:stale',0,0,?1)",
+        [binding.to_string()],
+    )
+    .unwrap();
+    let assert_no_retag = |host: &Herdr| {
+        let spaces = host.spaces.lock().unwrap().clone();
+        let tags = host.calls("workspace.report_metadata").len();
+        let moves = host.calls("workspace.move_block").len();
+        place.tick();
+        assert_eq!(
+            *host.spaces.lock().unwrap(),
+            spaces,
+            "stale binding changed captain spaces"
+        );
+        assert_eq!(
+            host.calls("workspace.report_metadata").len(),
+            tags,
+            "stale binding retagged a workspace"
+        );
+        assert_eq!(
+            host.calls("workspace.move_block").len(),
+            moves,
+            "stale binding reordered workspaces"
+        );
+    };
+    assert_no_retag(&herdr); // expired, otherwise exact binding
+    conn.execute(
+        "UPDATE presence SET expires_ms=9223372036854775807 WHERE ship='stale'",
+        [],
+    )
+    .unwrap();
+    for field in [
+        "terminal_id",
+        "pane_id",
+        "workspace_id",
+        "tab_id",
+        "agent_session",
+    ] {
+        let mut reused = binding["pane"].clone();
+        reused[field] = json!(format!("replacement-{field}"));
+        herdr.panes.lock().unwrap()[0] = reused;
+        assert_no_retag(&herdr);
+    }
+    herdr.panes.lock().unwrap()[0] = binding["pane"].clone();
+
+    // Same path and exact pane/terminal/session, different actual socket inode.
+    // Retain the old socket so inode reuse cannot make this a false positive.
+    fs::rename(&socket, socket.with_extension("old")).unwrap();
+    let replacement = Herdr::start(&socket, vec![]);
+    *replacement.spaces.lock().unwrap() = herdr.spaces.lock().unwrap().clone();
+    *replacement.panes.lock().unwrap() = herdr.panes.lock().unwrap().clone();
+    assert_no_retag(&replacement);
+    assert!(replacement.calls("workspace.create").is_empty());
+    assert_eq!(herdr.calls("workspace.create").len(), 2);
+    conn.execute("DELETE FROM presence WHERE ship='stale'", [])
+        .unwrap();
+
     fs::write(place.root.join("release"), "").unwrap();
     // Do not delete the temporary release signal before the fake first mate
     // observes it: that leaves its polling shell alive after a green test.
