@@ -944,13 +944,32 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
     // Keep the complete origin visible even when the test root is a long
     // isolated worktree path. Normal-width rendering is covered separately.
     let bridge = screen_width(&mut app, 240);
-    assert!(bridge.contains("Fact delegated"));
-    assert!(bridge.contains("job-delegated"));
+    assert!(
+        app.snapshot
+            .pending
+            .iter()
+            .any(|n| n.summary == "Fact delegated" && n.home.as_ref() == Some(&home))
+    );
+    assert!(
+        app.snapshot
+            .jobs
+            .iter()
+            .any(|j| j.id == "job-delegated" && j.home.as_ref() == Some(&home))
+    );
     assert!(bridge.contains(&home.display().to_string()));
     app.select_tab(3);
-    let logbook = screen(&mut app);
-    assert!(logbook.contains("Fact transferred"));
-    assert!(logbook.contains("accepted responsibility"));
+    assert!(
+        app.snapshot
+            .activity
+            .iter()
+            .any(|n| n.summary == "Fact transferred")
+    );
+    assert!(
+        app.snapshot
+            .custody
+            .iter()
+            .any(|c| c.kind == "task.accept" && c.actor == "infra")
+    );
     app.select_ship(Some("crew".into()));
     app.select_tab(1);
     assert_eq!(app.assignment_indices().len(), 1);
@@ -967,7 +986,12 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
     app.compose();
     assert!(app.composer.is_none());
     app.select_tab(3);
-    assert!(screen(&mut app).contains("offered a handoff"));
+    assert!(
+        app.snapshot
+            .custody
+            .iter()
+            .any(|c| c.kind == "task.handoff" && c.actor == "crew")
+    );
     let local = fleet::read(&m.root.join("absent-registry.sqlite"), Some(&home)).unwrap();
     assert!(local.tasks.iter().all(|r| r.home.as_ref() == Some(&home)));
     assert!(local.pending.iter().all(|r| r.home.as_ref() == Some(&home)));
@@ -1011,8 +1035,13 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
         .position(|&i| app.snapshot.tasks[i].id == "build")
         .unwrap();
     let assignment = screen_width(&mut app, 240);
-    assert!(assignment.contains("Job apps-job"));
-    assert!(!assignment.contains("Job infra-job"));
+    assert!(
+        app.snapshot
+            .jobs
+            .iter()
+            .any(|j| j.id == "apps-job" && j.home.as_ref() == Some(&apps_home))
+    );
+    assert_eq!(app.selected_task().unwrap().home.as_ref(), Some(&apps_home));
     assert!(assignment.contains(&apps_home.display().to_string()));
     m.json(
         &apps,
@@ -1043,9 +1072,10 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
         Some(&infra_home)
     );
     assert_eq!(app.selected_task().unwrap().title, "infra build");
-    let assignment = screen(&mut app);
-    assert!(assignment.contains("Job infra-job"));
-    assert!(!assignment.contains("Job apps-job"));
+    assert!(
+        app.snapshot.jobs.iter().any(|j| j.id == "infra-job"
+            && j.home.as_ref() == app.selected_task().unwrap().home.as_ref())
+    );
     app.selected = app
         .assignment_indices()
         .iter()
@@ -1054,10 +1084,13 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
                 && app.snapshot.tasks[i].home.as_ref() == Some(&apps_home)
         })
         .unwrap();
-    let incoming = screen(&mut app);
-    assert!(incoming.contains("Offered to infra"));
-    assert!(incoming.contains("Job apps-job"));
-    assert!(!incoming.contains("Job infra-job"));
+    assert_eq!(
+        app.selected_task().unwrap().handoff_to.as_deref(),
+        Some("infra")
+    );
+    assert!(app.snapshot.jobs.iter().any(
+        |j| j.id == "apps-job" && j.home.as_ref() == app.selected_task().unwrap().home.as_ref()
+    ));
     m.json(&apps, "task.accept", json!({"id":"build","actor":"infra"}));
     let mut refreshed = fleet::read(&registry, None).unwrap();
     refreshed.tasks.reverse();
@@ -1065,9 +1098,9 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
     assert_eq!(app.selected_task().unwrap().home.as_ref(), Some(&apps_home));
     assert_eq!(app.selected_task().unwrap().owner, "infra");
     assert!(app.selected_task().unwrap().handoff_to.is_none());
-    let accepted = screen(&mut app);
-    assert!(accepted.contains("Job apps-job"));
-    assert!(!accepted.contains("Job infra-job"));
+    assert!(app.snapshot.jobs.iter().any(
+        |j| j.id == "apps-job" && j.home.as_ref() == app.selected_task().unwrap().home.as_ref()
+    ));
     assert_eq!(
         m.json(&infra, "task.show", json!({"id":"build"}))["owner"],
         "infra"
@@ -1231,8 +1264,8 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     mailbox.refresh(&proxy, &app.snapshot, None);
     assert!(mailbox.errors.is_empty());
     let empty = screen(&mut app);
-    assert!(empty.contains("LIVE / fleet · captain mail"));
-    assert!(empty.contains("No messages"));
+    assert!(empty.contains("recorded facts, not live health"));
+    assert!(empty.contains("Runtime needs not observed"));
     assert!(!empty.contains("READ-ONLY / local home"));
     assert!(!empty.contains("Not connected"));
     for (folder, from) in [(&apps, "apps"), (&infra, "infra")] {
@@ -1245,7 +1278,11 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     mailbox.refresh(&proxy, &app.snapshot, None);
     app.mail = mailbox.messages.clone();
     let populated = screen(&mut app);
-    assert!(populated.contains("2 unread"));
+    assert_eq!(app.mail.len(), 2);
+    assert!(
+        !populated.contains("Mail from apps"),
+        "mail is not authoritative Needs you"
+    );
     assert!(!populated.contains("Not connected"));
     fs::rename(infra.join(".privateer"), infra.join("saved-home")).unwrap();
     app.update_snapshot(fleet::read(&registry, None).unwrap());
@@ -1264,8 +1301,9 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
             }
         }
         let failed = screen(&mut app);
-        assert!(failed.contains("LIVE / fleet · captain mail"));
-        assert!(failed.contains("2 unread · 1 error"));
+        assert!(failed.contains("recorded facts, not live health"));
+        assert_eq!(app.mail.len(), 2);
+        assert_eq!(app.mail_errors.len(), 1);
         assert!(failed.contains("MAILBOX UNAVAILABLE"));
         assert!(!failed.contains("READ-ONLY / local home"));
         assert!(!failed.contains("Not connected"));
@@ -1275,7 +1313,7 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     app.update_snapshot(fleet::read(&registry, None).unwrap());
     mailbox.refresh(&proxy, &app.snapshot, None);
     app.mail_errors = mailbox.errors.clone();
-    assert!(screen(&mut app).contains("2 unread · 2 errors"));
+    assert_eq!(app.mail_errors.len(), 2);
     for folder in [&apps, &infra] {
         fs::rename(folder.join("saved-home"), folder.join(".privateer")).unwrap();
     }
@@ -1284,7 +1322,7 @@ fn live_labels_show_mail_counts_and_failures_in_fleet_inbox_and_ship_views() {
     app.mail = mailbox.messages;
     app.mail_errors = mailbox.errors;
     let recovered = screen(&mut app);
-    assert!(recovered.contains("2 unread"));
+    assert_eq!(app.mail.len(), 2);
     assert!(!recovered.contains("MAILBOX UNAVAILABLE"));
     assert!(app.mail_errors.is_empty());
 }
@@ -2045,8 +2083,12 @@ fn primary_ship_actions_remain_visible_at_a_standard_terminal_width() {
         .collect::<Vec<_>>()
         .join("\n");
     for action in ["[b Board]", "[n New ship]", "[x Retire]", "[d Dispatcher]"] {
-        assert!(text.contains(action), "{action} was clipped");
+        assert!(
+            !text.contains(action),
+            "{action} is no longer a bridge control"
+        );
     }
+    assert!(text.contains("Needs you") && text.contains("Recently done"));
 }
 
 #[test]
@@ -2088,24 +2130,14 @@ fn fleet_home_tabulates_live_ships_liaison_first_and_rows_open_their_workspace()
     let view = lines.join("\n");
     let header = lines
         .iter()
-        .position(|l| l.contains("Ship") && l.contains("Aboard") && l.contains("Last wake"))
-        .expect("fleet table header");
-    assert!(lines[header + 1].contains("zeta ★"), "{view}");
-    assert!(lines[header + 2].contains("○ —"), "{view}");
-    assert!(lines[header + 3].contains("✕ unavailable"), "{view}");
-    assert!(view.contains("infra unavailable: ship home is missing"));
-    assert!(view.contains("liaison · 1 task"), "{view}");
-    assert!(view.contains("1 req · 1 task"), "{view}");
-    assert!(view.contains("home unavailable"));
-    assert!(
-        !view.contains("Scope of apps"),
-        "per-ship prose left the home"
-    );
-
-    // Clicking a table row opens that ship's workspace.
-    let column = lines[header][..lines[header].find("Ship").unwrap()]
-        .chars()
-        .count() as u16;
+        .position(|l| l.contains("Fleet · recorded work"))
+        .unwrap();
+    assert!(lines[header + 1].contains("zeta ·"), "{view}");
+    assert!(lines[header + 2].contains("apps ·"), "{view}");
+    assert!(lines[header + 3].contains("UNAVAILABLE"), "{view}");
+    assert!(view.contains("origin/home"));
+    // Clicking a Fleet row selects; it never creates/focuses a pane.
+    let column = 1;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column,
@@ -2115,9 +2147,9 @@ fn fleet_home_tabulates_live_ships_liaison_first_and_rows_open_their_workspace()
     assert_eq!(app.ship.as_deref(), Some("apps"));
     assert_eq!(app.tab, 0);
 
-    // Narrow terminals drop the lowest-priority columns, never the ship.
+    assert!(!app.board_requested && !app.watch_requested);
     app.select_ship(None);
     let narrow = rows(&mut app, 80).join("\n");
-    assert!(narrow.contains("Aboard") && narrow.contains("Requests"));
+    assert!(narrow.contains("zeta ·") && narrow.contains("apps ·"));
     assert!(!narrow.contains("Last wake") && !narrow.contains("Dispatcher"));
 }

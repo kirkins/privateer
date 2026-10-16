@@ -14,21 +14,21 @@ See [milestone status and validation](docs/milestone-1.md) for what is implement
 
 ## Terminal dashboard
 
-The optional Rust dashboard opens on a Fleet overview with ships in a persistent
-sidebar. Each ship has its own Bridge, Assignments, Terminals and Logbook views:
+The optional Rust dashboard is a single-column bridge: Fleet, authoritative
+Needs you, and timestamped Recently done. Herdr owns terminal navigation:
 
 ```sh
 cargo run --features dashboard --bin privateer-dashboard -- --demo
 ```
 
-The dashboard reads your local fleet, aggregates the captain's real inbox, and
-can board a ship in Herdr, create or retire ships, and manage dispatchers. An
-empty fleet offers a liaison or another first ship in a dedicated folder.
-All changes go through Privateer commands. Demo mode stays sample-only.
-Click a ship, then its workspace tabs; `0` returns home, `i` opens the inbox,
-`m` messages, and `b` boards. Herdr uses only the injected or explicitly selected
-socket, with exact pane bindings. Injection of mail into agent panes is proposed
-but remains disabled pending a safe server-side occupant guard.
+The dashboard reads existing local homes without creating or repairing them.
+Enter focuses a ship's existing validated Herdr mate space; Tab selects typed
+runtime needs for inline correlated replies or exact artifact/environment/version
+approval/denial. No navigation sidebar, per-ship tabs, Board, Watch or pane creation.
+`i` opens separate mail history; acknowledgement is not resolution. Unknown or
+unavailable evidence is never an all-clear. Demo mode stays sample-only.
+Herdr uses only the injected or explicitly selected socket, with exact identity
+checks. No mail injection into existing agent panes is enabled.
 See [dashboard setup and boundaries](docs/dashboard.md).
 
 

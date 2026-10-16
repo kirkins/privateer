@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Mail {
+    #[serde(default)]
+    pub identity: Option<super::bridge::Identity>,
+    #[serde(default)]
+    pub origin: Option<String>,
     pub id: String,
     pub kind: String,
     pub from: String,
@@ -38,6 +42,7 @@ pub fn sample_mail() -> Vec<Mail> {
         Mail {
             payload: serde_json::json!({}),
             home: None, seq: 0, acknowledged: false,
+            identity: None, origin: None,
             id: "demo-decision".into(),
             kind: "Decision".into(),
             from: "Research".into(),
@@ -48,6 +53,7 @@ pub fn sample_mail() -> Vec<Mail> {
         Mail {
             payload: serde_json::json!({}),
             home: None, seq: 0, acknowledged: false,
+            identity: None, origin: None,
             id: "demo-reply".into(),
             kind: "Reply".into(),
             from: "Apps".into(),
@@ -58,6 +64,7 @@ pub fn sample_mail() -> Vec<Mail> {
         Mail {
             payload: serde_json::json!({}),
             home: None, seq: 0, acknowledged: false,
+            identity: None, origin: None,
             id: "demo-notice".into(),
             kind: "Notice".into(),
             from: "Infrastructure".into(),

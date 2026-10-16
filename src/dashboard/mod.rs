@@ -2,6 +2,7 @@
 //! captain mail and management, and attended boarding. Observation never
 //! reconciles jobs or consumes task notifications; the dashboard owns no agents.
 pub mod boat;
+pub mod bridge;
 pub mod captain;
 pub mod fleet;
 pub use crate::herdr;

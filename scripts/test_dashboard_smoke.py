@@ -19,12 +19,11 @@ class BinaryRouting(unittest.TestCase):
             with self.subTest(arguments=arguments), \
                     patch.object(sys, "argv", ["dashboard-smoke.py", *arguments]), \
                     patch.object(smoke, "demo") as demo, \
-                    patch("dashboard_live_smoke.run") as live, \
-                    patch("dashboard_live_smoke.onboarding") as onboarding:
+                    patch("dashboard_live_smoke.run") as live:
                 smoke.main()
                 demo.assert_called_once_with(str(binary))
                 live.assert_called_once_with(binary, binary.with_name("privateer"))
-                onboarding.assert_called_once_with(binary, binary.with_name("privateer"))
+                # Old onboarding/Board controls are intentionally not bridge entry points.
 
 
 if __name__ == "__main__":

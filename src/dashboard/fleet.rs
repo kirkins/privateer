@@ -15,6 +15,8 @@ use std::{
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ShipState {
     pub home: PathBuf,
+    #[serde(default)]
+    pub identity: Option<super::bridge::Identity>,
     pub liaison: bool,
     pub binding: Option<crate::herdr::Binding>,
     pub harness: String,
@@ -94,6 +96,7 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
     let wakes = conn.prepare("SELECT substr(mode,1,40),substr(status,1,40) FROM wakes WHERE ship=?1 ORDER BY created_ms DESC LIMIT 3")?.query_map([name], |r| Ok(Wake {mode:r.get(0)?, status:r.get(1)?}))?.collect::<rusqlite::Result<_>>()?;
     Ok(ShipState {
         home: home.into(),
+        identity: Some(super::bridge::Identity::read(home)?),
         liaison,
         harness,
         binding,
@@ -124,7 +127,18 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
         Vec::new()
     };
     if members.is_empty() {
-        return fallback.map_or(Ok(Snapshot::default()), Snapshot::read);
+        return fallback.map_or(Ok(Snapshot::default()), |home| {
+            let mut snapshot = Snapshot::read(home)?;
+            let identity = super::bridge::Identity::read(home)?;
+            for ship in &mut snapshot.ships {
+                ship.live = Some(ShipState {
+                    home: home.to_path_buf(),
+                    identity: Some(identity.clone()),
+                    ..ShipState::default()
+                });
+            }
+            Ok(snapshot)
+        });
     }
     let mut out = Snapshot {
         truncated: members.len() > ROW_LIMIT,
@@ -181,6 +195,7 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
                 ship.live = Some(live);
                 if observed_homes.insert(home) {
                     out.truncated |= local.truncated;
+                    out.recent.extend(local.recent);
                     out.tasks.extend(local.tasks);
                     out.pending.extend(local.pending);
                     out.activity.extend(local.activity);
@@ -211,11 +226,15 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
             out.ships.push(claim);
         }
     }
-    out.truncated |= out.tasks.len() > ROW_LIMIT
+    out.truncated |= out.recent.len() > ROW_LIMIT
+        || out.tasks.len() > ROW_LIMIT
         || out.pending.len() > ROW_LIMIT
         || out.activity.len() > ROW_LIMIT
         || out.jobs.len() > ROW_LIMIT
         || out.custody.len() > ROW_LIMIT;
+    out.recent
+        .sort_by_key(|r| std::cmp::Reverse(r.completed_ms));
+    out.recent.truncate(ROW_LIMIT);
     out.tasks.truncate(ROW_LIMIT);
     out.pending.truncate(ROW_LIMIT);
     out.activity.truncate(ROW_LIMIT);
