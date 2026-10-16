@@ -1024,4 +1024,33 @@ fn runtime_needs_never_creates_or_migrates_a_home() {
             .execute("INSERT INTO metadata VALUES('unexpected','write')", [])
             .is_err()
     );
+    drop(store);
+    let locker = rusqlite::Connection::open(&database).unwrap();
+    locker
+        .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    let mut command = folder.command_in(&folder.ship, &args);
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(5) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("locked runtime observation exceeded coarse watchdog");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    if output.status.success() {
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["available"], false, "locked store must not be quiet");
+        assert!(!value["unknown"].as_array().unwrap().is_empty());
+    }
+    locker.execute_batch("ROLLBACK").unwrap();
 }

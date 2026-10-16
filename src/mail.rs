@@ -241,11 +241,29 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
         .transpose()
 }
 
+/// Allocate only runtime outcome IDs, under the caller's write lock. Client
+/// IDs remain untouched. The committed request link, not a computed ID, is the
+/// durable idempotency key. Bound retries even in a pathological collision.
+fn outcome_id(store: &Store, prefix: &str) -> Result<String> {
+    for _ in 0..8 {
+        let id = format!("{prefix}-{}", uuid::Uuid::new_v4());
+        let occupied: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1)",
+            [&id],
+            |r| r.get(0),
+        )?;
+        if !occupied {
+            return Ok(id);
+        }
+    }
+    bail!("could not allocate a runtime outcome ID")
+}
+
 /// Record a sender-authored closure as an ordinary correlated notice. Old
 /// peers can retain the notice without understanding it; new peers apply it.
 /// The caller holds the write transaction. Delivery uses the existing outbox.
 fn end_request(store: &Store, request: &Value, state: &str, reason: &str) -> Result<()> {
-    let id = format!("end-{}", crate::core::hash(&request["id"]));
+    let id = outcome_id(store, "end")?;
     let peer = ship(store, request["to"].as_str().context("request recipient")?)?
         .as_ref()
         .and_then(remote_peer)
@@ -325,19 +343,29 @@ pub(crate) fn approval_answer(
     state: &str,
     args: &Value,
 ) -> Result<Value> {
-    let id = format!("approval-answer-{}", crate::core::hash(&request["id"]));
     let payload = json!({"approval_outcome":state,"approval_id":args.get("id"),
         "artifact":args["artifact"],"environment":args["environment"]});
-    if let Some(existing) = by_id(store, &id)? {
+    if request["state"] != "open" {
+        ensure!(
+            request["state"] == state,
+            "approval response differs from recorded outcome"
+        );
+        let id = request["answered_by"]
+            .as_str()
+            .context("closed approval has no recorded answer")?;
+        let existing = by_id(store, id)?.context("recorded approval answer missing")?;
         ensure!(
             existing["from"] == CAPTAIN
+                && existing["to"] == request["from"]
+                && existing["kind"] == "reply"
                 && existing["correlation"] == request["id"]
+                && existing["task_id"] == request["task_id"]
                 && existing["payload"] == payload,
             "approval response differs from recorded outcome"
         );
         return Ok(existing);
     }
-    ensure!(request["state"] == "open", "request is closed");
+    let id = outcome_id(store, "approval-answer")?;
     let now = Store::now_ms();
     store.connection().execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms)

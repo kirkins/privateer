@@ -12,6 +12,19 @@ than migrating it or claiming it is quiet. Generic RPC servers/consumers still
 own their normal Store startup lifecycle; the query itself never initializes a
 Store. It uses a consistent deferred read transaction.
 
+Observation has a cooperative 250ms deadline and a 2,000,000 SQLite VM-instruction
+budget (checked every 1,000 instructions), installed **before metadata/schema
+reads**. Lock waits are capped at 25ms; scoped hooks/timeout are removed/restored
+on every exit, leaving normal commands' write-wait policy unchanged. Source
+JSON/text is preflighted with a 64KiB per-field bound before materialization.
+An exhausted budget, lock failure, oversized or invalid source returns
+`available:false`, no partial items/cursor, and an explicit unknown category (or
+refuses the observation). It MUST NOT be rendered as quiet/healthy. The result
+LIMIT bounds the page, not the scan; a large home may be unavailable even with
+`limit:1`. These are cooperative bounds, not a hard real-time guarantee: SQLite
+callbacks cannot preempt blocked OS/filesystem I/O, database open, or an individual
+native operation. No background recovery or new live adapters are performed.
+
 Response: `schema_version:1`, `available`, durable home `origin` UUID, `observed_ms`, `items`,
 `next_after` (null at end), and `unknown` evidence categories. Limit is clamped to
 1..100, ordered by source and source ID, not by unread order. Cursors are opaque
@@ -37,7 +50,11 @@ Supported typed facts:
   prose. Approve via existing `approval.grant` with `request_id`,
   `expected_version`, `task_id`, `artifact`, `environment`, `approver:"captain"`,
   and a stable explicit grant `id`. Deny with `approval.deny` and the same fields
-  (no grant ID required). The checked response and grant/denial commit together.
+  (no grant ID required). If either correlation field is supplied, **both must
+  be nonempty strings**; null, numeric, malformed or incomplete pairs fail before
+  any mutation. Correlation is refused on consumption/unsupported commands.
+  Legacy grants with BOTH fields omitted remain supported. The checked response
+  and grant/denial commit together under the authority write lock.
   Denial creates no approval. States are `approved` / `denied`, with a correlated
   captain reply recording the outcome. Same grant ID/content or same denial is
   retryable; consumed grants cannot be replayed/reset. Changed binding, stale
@@ -45,12 +62,17 @@ Supported typed facts:
   fails. Plain replies/acknowledgements/agent prose NEVER create a grant. Existing
   `approval.consume`/`delivery.check` remain the exact-artifact, exact-environment
   consumption/deployment gate; this query/action does not deploy anything.
-* **blocker**: explicit blocked tasks; jobs queued for >=60 seconds on nonterminal
+* **blocker**: jobs queued for >=60 seconds on nonterminal
   tasks; recorded orphaned jobs (even on terminal tasks, since payloads may remain).
   Includes typed `evidence`, task/ship, version, and job incarnation where relevant.
   These are last recorded runtime facts, not a live process observation. No generic
   unblock/cancel/"ok" mutation is offered: use existing guarded runtime commands
   after inspecting current evidence. Resolved facts disappear on refresh.
+  Generic `task.status:"blocked"` is NOT a captain-action fact: intentional
+  dependency scheduling stays visible in Fleet, not Needs you. No separately
+  reviewed typed task captain-attention evidence exists yet; task captain
+  actionability is explicitly unknown. The query does not infer it from titles,
+  status, mail prose, or unread counts.
 
 No text/unread heuristics. Unknown categories explicitly include live liveness,
 wake backoff/hourly budget, dispatcher, Herdr, attended-mail pause, CI, provider
@@ -76,6 +98,15 @@ custody transfer. This is a runtime consequence of the task's end, not permissio
 for a new owner to withdraw another sender's question. It changes no custody.
 New requests cannot be linked to terminal tasks. Queries also omit legacy open
 requests already linked to terminal tasks, without backfilling on read.
+
+Runtime closure and approval-answer IDs use fresh UUIDs checked for local
+collision under the same write lock, not predictable hashes of public request
+IDs. Ordinary client IDs (including old `end-<hash>` and
+`approval-answer-<hash>` forms) remain legitimate history, never overwritten or
+accepted as proof of an outcome. The request's committed `ended_by`/`answered_by`
+link and recorded state/content are authoritative for retries, including legacy
+closed requests; no old history is renamed. Outbox retries resend the SAME
+committed notice ID, not a newly allocated one. Allocation retries are bounded.
 
 Closures are ordinary correlated low-urgency notices carrying reserved payload
 `request_end:{version:1,state,reason}`. Local mail.send cannot forge this payload.

@@ -92,7 +92,9 @@ impl Store {
         let connection =
             Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .context("existing Privateer database required")?;
-        connection.busy_timeout(Duration::from_secs(10))?;
+        // Observation-only open must not inherit ordinary writers' ten-second
+        // lock wait. The query installs its own scoped VM/deadline budget.
+        connection.busy_timeout(Duration::from_millis(25))?;
         connection.execute_batch("PRAGMA query_only=ON;")?;
         Ok(Self {
             home,

@@ -38,6 +38,11 @@ fn fleet() -> (tempfile::TempDir, Store) {
     (temp, store)
 }
 
+fn legacy_outcome_id(prefix: &str, request: &str) -> String {
+    let digest = Sha256::digest(json!(request).to_string().as_bytes());
+    format!("{prefix}-{digest:x}")
+}
+
 fn send(store: &mut Store, args: Value) -> anyhow::Result<Value> {
     dispatch(store, "mail.send", args)
 }
@@ -1501,13 +1506,7 @@ fn withdrawal_is_sender_only_durable_and_not_an_ack_or_reply() {
         .is_err()
     );
     // A client may legitimately occupy the old predictable runtime ID.
-    let occupied_id = format!(
-        "end-{}",
-        format!(
-            "{:x}",
-            Sha256::digest(json!("question").to_string().as_bytes())
-        )
-    );
+    let occupied_id = legacy_outcome_id("end", "question");
     let occupied = send(&mut s, json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"unrelated history"})).unwrap();
     let args = json!({"actor":"apps","id":"question","reason":"obsolete"});
     let closed = dispatch(&mut s, "mail.withdraw", args.clone()).unwrap();
@@ -1549,14 +1548,38 @@ fn terminal_task_closes_linked_questions_and_preserves_history() {
         let (_temp, mut s) = fleet();
         send(&mut s,json!({"id":"linked","from":"apps","to":"captain","kind":"request","body":"question","task_id":"main"})).unwrap();
         send(&mut s,json!({"id":"unlinked","from":"apps","to":"captain","kind":"request","body":"question"})).unwrap();
+        let occupied_id = legacy_outcome_id("end", "linked");
+        let occupied = send(&mut s,json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"prior history"})).unwrap();
+        dispatch(
+            &mut s,
+            "task.handoff",
+            json!({"actor":"apps","id":"main","target":"infra"}),
+        )
+        .unwrap();
+        dispatch(&mut s, "task.accept", json!({"actor":"infra","id":"main"})).unwrap();
+        // Custody does not confer authorship of the old owner's requests.
+        assert!(
+            dispatch(
+                &mut s,
+                "mail.withdraw",
+                json!({"actor":"infra","id":"linked","reason":"not mine"})
+            )
+            .is_err()
+        );
         dispatch(
             &mut s,
             "task.update",
-            json!({"actor":"apps","id":"main","status":status}),
+            json!({"actor":"infra","id":"main","status":status}),
         )
         .unwrap();
         let linked = dispatch(&mut s, "mail.show", json!({"id":"linked"})).unwrap();
         assert_eq!(linked["state"], format!("task_{status}"));
+        assert_eq!(s.task("main").unwrap()["owner"], "infra");
+        assert_ne!(linked["ended_by"], occupied_id);
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+            occupied
+        );
         assert!(linked["answered_by"].is_null());
         assert_eq!(
             dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["source_id"],
@@ -1585,6 +1608,52 @@ fn closure_crosses_homes_and_inflight_reply_wins_without_reopening() {
         json!({"id":"withdraw-me","from":"apps","to":"infra","kind":"request","body":"question"}),
     )
     .unwrap();
+    // Local clients cannot forge closures; malformed/unauthored remote
+    // closures roll back both the notice and the request change.
+    assert!(send(&mut a,json!({"id":"local-spoof","from":"apps","to":"infra","kind":"notice","correlation":"withdraw-me","payload":{"request_end":{"version":1,"state":"withdrawn","reason":"fake"}}})).is_err());
+    dispatch(
+        &mut b,
+        "ship.put",
+        json!({"name":"research","location":{"peer":"home-a"}}),
+    )
+    .unwrap();
+    let wire = json!({"id":"bad-closure","from":"apps","to":"infra","kind":"notice","correlation":"withdraw-me","payload":{"request_end":{"version":1,"state":"withdrawn","reason":"obsolete"}}});
+    let before: i64 = b
+        .connection()
+        .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get(0))
+        .unwrap();
+    for (field, value) in [
+        ("from", json!("research")),
+        ("to", json!("captain")),
+        ("kind", json!("request")),
+        ("correlation", Value::Null),
+        ("correlation", json!("unknown")),
+    ] {
+        let mut bad = wire.clone();
+        bad[field] = value;
+        assert!(dispatch(&mut b, "mail.deliver", bad).is_err());
+    }
+    for end in [
+        json!({"version":2,"state":"withdrawn","reason":"obsolete"}),
+        json!({"version":1,"state":"approved","reason":"fake"}),
+        json!({"version":1,"state":"withdrawn","reason":null}),
+    ] {
+        let mut bad = wire.clone();
+        bad["payload"]["request_end"] = end;
+        assert!(dispatch(&mut b, "mail.deliver", bad).is_err());
+    }
+    assert_eq!(
+        b.connection()
+            .query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
+        "open"
+    );
+    let occupied_id = legacy_outcome_id("end", "withdraw-me");
+    let occupied = send(&mut a,json!({"id":occupied_id,"from":"apps","to":"infra","kind":"notice","body":"old unrelated wire history"})).unwrap();
     dispatch(
         &mut a,
         "mail.withdraw",
@@ -1595,6 +1664,12 @@ fn closure_crosses_homes_and_inflight_reply_wins_without_reopening() {
         dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["state"],
         "withdrawn"
     );
+    assert_ne!(
+        dispatch(&mut b, "mail.show", json!({"id":"withdraw-me"})).unwrap()["ended_by"],
+        occupied_id
+    );
+    let historical = dispatch(&mut b, "mail.show", json!({"id":occupied_id})).unwrap();
+    assert_eq!(historical["body"], occupied["body"]);
     // A new reply after observing closure is refused.
     assert!(send(&mut b,json!({"from":"infra","to":"apps","kind":"reply","correlation":"withdraw-me","body":"late"})).is_err());
     // Hold only B's fixture outbox, so its real reply is committed before A's
@@ -1680,6 +1755,19 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
             Some(approval["expected_version"].clone()),
         ),
         (Some(json!(42)), Some(approval["expected_version"].clone())),
+        (Some(json!({})), Some(approval["expected_version"].clone())),
+        (Some(json!([])), Some(approval["expected_version"].clone())),
+        (
+            Some(json!(false)),
+            Some(approval["expected_version"].clone()),
+        ),
+        (
+            Some(json!("not a valid id")),
+            Some(approval["expected_version"].clone()),
+        ),
+        (Some(json!("release")), Some(json!({}))),
+        (Some(json!("release")), Some(json!([]))),
+        (Some(json!("release")), Some(json!(false))),
         (Some(json!("release")), None),
         (Some(json!("release")), Some(Value::Null)),
         (Some(json!("release")), Some(json!(42))),
@@ -1699,7 +1787,12 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
             dispatch(&mut s, "approval.grant", invalid.clone()).is_err(),
             "{invalid}"
         );
-        assert!(dispatch(&mut s, "approval.deny", invalid).is_err());
+        assert!(dispatch(&mut s, "approval.deny", invalid.clone()).is_err());
+        assert!(dispatch(&mut s, "approval.consume", invalid).is_err());
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["state"],
+            "open"
+        );
         assert_eq!(
             s.connection()
                 .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))
@@ -1715,13 +1808,7 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
     }
     // Consume cannot accept correlation, even if correctly bound.
     assert!(dispatch(&mut s, "approval.consume", approval.clone()).is_err());
-    let occupied_id = format!(
-        "approval-answer-{}",
-        format!(
-            "{:x}",
-            Sha256::digest(json!("release").to_string().as_bytes())
-        )
-    );
+    let occupied_id = legacy_outcome_id("approval-answer", "release");
     let occupied = send(&mut s, json!({"id":occupied_id,"from":"apps","to":"captain","kind":"notice","body":"unrelated approval history"})).unwrap();
     approval["artifact"] = json!("different");
     assert!(dispatch(&mut s, "approval.grant", approval.clone()).is_err());
@@ -1732,7 +1819,14 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
     assert!(dispatch(&mut s, "approval.grant", approval.clone()).is_err());
     s.set_caller(Caller::Operator);
     dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
+    let granted_request = dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap(),
+        granted_request
+    );
     assert_eq!(
         dispatch(&mut s, "mail.show", json!({"id":"release"})).unwrap()["state"],
         "approved"
@@ -1746,6 +1840,20 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
         occupied
     );
     assert!(dispatch(&mut s, "approval.deny", approval.clone()).is_err());
+    assert!(dispatch(&mut s, "approval.consume", approval.clone()).is_err());
+    let mut version_only = approval.clone();
+    version_only.as_object_mut().unwrap().remove("request_id");
+    assert!(dispatch(&mut s, "approval.consume", version_only).is_err());
+    assert_eq!(
+        s.connection()
+            .query_row(
+                "SELECT consumed FROM approvals WHERE id='grant-exact'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
     dispatch(&mut s, "approval.consume", json!({"id":"grant-exact","task_id":"main","artifact":"sha256:exact","environment":"production"})).unwrap();
     assert!(dispatch(&mut s, "approval.grant", approval).is_err());
     assert_eq!(
@@ -1759,15 +1867,27 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
 
 #[test]
 fn denial_is_distinct_and_ordinary_reply_never_grants() {
-    let (_temp, mut s) = fleet();
+    let (temp, mut s) = fleet();
     for id in ["deny", "plain"] {
         send(&mut s,json!({"id":id,"from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
     }
     let version =
         dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"][0]["version"].clone();
     let args = json!({"request_id":"deny","expected_version":version,"task_id":"main","artifact":"abc","environment":"production","approver":"captain"});
-    dispatch(&mut s, "approval.deny", args.clone()).unwrap();
-    dispatch(&mut s, "approval.deny", args).unwrap();
+    // Even captain-authored ordinary mail with the right-looking payload
+    // cannot masquerade as the authoritative response to an open request.
+    let occupied_id = legacy_outcome_id("approval-answer", "deny");
+    let occupied = send(&mut s,json!({"id":occupied_id,"from":"captain","to":"apps","kind":"notice","correlation":"deny","body":"not a runtime response","payload":{"approval_outcome":"denied","approval_id":null,"artifact":"abc","environment":"production"}})).unwrap();
+    let answer = dispatch(&mut s, "approval.deny", args.clone()).unwrap();
+    assert_eq!(answer["kind"], "reply");
+    assert_ne!(answer["id"], occupied_id);
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    assert_eq!(dispatch(&mut s, "approval.deny", args).unwrap(), answer);
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
+        occupied
+    );
     send(&mut s,json!({"from":"captain","to":"apps","kind":"reply","correlation":"plain","body":"approved"})).unwrap();
     assert_eq!(
         s.connection()
@@ -1791,6 +1911,13 @@ fn denial_is_distinct_and_ordinary_reply_never_grants() {
 fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
     let (_temp, mut s) = fleet();
     send(&mut s,json!({"from":"apps","to":"captain","kind":"notice","body":"BLOCKED CI red, production needs approval"})).unwrap();
+    dispatch(&mut s,"task.create",json!({"id":"dependency-wait","charter_id":"project","owner":"apps","title":"Await runtime review before UI implementation (intentional scheduling)"})).unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"actor":"apps","id":"dependency-wait","status":"blocked"}),
+    )
+    .unwrap();
     dispatch(
         &mut s,
         "task.update",
@@ -1811,7 +1938,21 @@ fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
         .query_row("SELECT total_changes()", [], |r| r.get(0))
         .unwrap();
     assert_eq!(before, after);
-    assert_eq!(result["items"].as_array().unwrap().len(), 3);
+    assert_eq!(result["items"].as_array().unwrap().len(), 2);
+    assert!(
+        result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["source"] == "job")
+    );
+    assert!(
+        result["unknown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "task_captain_actionability")
+    );
     assert!(
         result["unknown"]
             .as_array()
@@ -1840,6 +1981,43 @@ fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
             .unwrap()
             .is_empty()
     );
+    let bounded_unavailable = |store: &mut Store| {
+        let started = std::time::Instant::now();
+        let value = dispatch(store, "runtime.needs", json!({"limit":1})).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(value["available"], false, "{value}");
+        assert!(value["items"].as_array().unwrap().is_empty());
+        assert!(!value["unknown"].as_array().unwrap().is_empty());
+        // No permanent timeout/progress changes to ordinary command connections.
+        assert_eq!(
+            store
+                .connection()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            10_000
+        );
+        assert_eq!(store.connection().query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<200000) SELECT sum(x) FROM n",[],|r| r.get::<_,i64>(0)).unwrap(),20_000_100_000);
+    };
+    // Oversized JSON is refused before an uninterruptible Rust parse/JSON opcode.
+    s.connection()
+        .execute(
+            "UPDATE jobs SET record=?1 WHERE id='queued'",
+            [json!({"status":"succeeded","large":"x".repeat(70_000)}).to_string()],
+        )
+        .unwrap();
+    bounded_unavailable(&mut s);
+    s.connection().execute("DELETE FROM jobs", []).unwrap();
+    // A real large table forces scan/JSON/sort work despite limit:1. It cannot
+    // quietly return [] after the work budget is exhausted.
+    s.connection().execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000)
+        INSERT INTO jobs SELECT 'large-'||x,'{\"task_id\":\"main\",\"status\":\"succeeded\",\"created_ms\":0}' FROM n;").unwrap();
+    bounded_unavailable(&mut s);
+    s.connection().execute("DELETE FROM jobs", []).unwrap();
+    // Pathological metadata CPU work is covered before any item query as well.
+    s.connection().execute_batch("ALTER TABLE metadata RENAME TO saved_metadata;
+        CREATE VIEW metadata AS SELECT key,value FROM saved_metadata WHERE
+        (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;").unwrap();
+    bounded_unavailable(&mut s);
 }
 
 #[test]

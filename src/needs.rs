@@ -3,6 +3,47 @@ use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, ensure};
 use rusqlite::params;
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
+
+// Per-observation only: never shorten ordinary commands' writer wait policy.
+// SQLite callbacks bound VM work cooperatively, not OS/filesystem I/O.
+struct ObservationBudget<'a> {
+    conn: &'a rusqlite::Connection,
+    previous_busy_ms: u64,
+    deadline: Instant,
+}
+
+impl<'a> ObservationBudget<'a> {
+    fn new(conn: &'a rusqlite::Connection) -> Result<Self> {
+        let previous_busy_ms = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        conn.busy_timeout(Duration::from_millis(25))?;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut callbacks = 0_u32;
+        conn.progress_handler(
+            1000,
+            Some(move || {
+                callbacks += 1;
+                callbacks >= 2000 || Instant::now() >= deadline
+            }),
+        );
+        Ok(Self {
+            conn,
+            previous_busy_ms,
+            deadline,
+        })
+    }
+}
+
+impl Drop for ObservationBudget<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+        // Restore even on unavailable/error/early return. Store owns this
+        // connection; it has no persistent progress handler to replace.
+        let _ = self
+            .conn
+            .busy_timeout(Duration::from_millis(self.previous_busy_ms));
+    }
+}
 
 /// Validate a correlated grant/denial inside core's authority transaction.
 pub(crate) fn approval_request(
@@ -60,6 +101,21 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
         .clamp(1, 100) as usize;
     let after = args.get("after").and_then(Value::as_str).unwrap_or("");
     ensure!(after.len() <= 512, "cursor exceeds 512 bytes");
+    let budget = ObservationBudget::new(store.connection())?;
+    let observed = observe(store, limit, after);
+    match observed {
+        Ok(value) if Instant::now() < budget.deadline => Ok(value),
+        _ => Ok(
+            json!({"schema_version":1,"available":false,"origin":null,"address":"captain",
+            "observed_ms":Store::now_ms(),"items":[],"next_after":null,
+            "unknown":["runtime_observation"],
+            "reason":"Runtime observation unavailable: locked, over budget, oversized, or invalid source. Not an all-clear."}),
+        ),
+    }
+}
+
+fn observe(store: &Store, limit: usize, after: &str) -> Result<Value> {
+    // The budget already covers metadata/schema and all item reads.
     // A deferred read transaction gives a consistent view without a writer lock.
     let tx = rusqlite::Transaction::new_unchecked(
         store.connection(),
@@ -67,7 +123,7 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     )?;
     let now = Store::now_ms();
     let origin = tx.query_row::<String, _, _>(
-        "SELECT value FROM metadata WHERE key='runtime_origin'
+        "SELECT value FROM metadata WHERE key='runtime_origin' AND length(CAST(value AS BLOB))<=160
          AND EXISTS(SELECT 1 FROM metadata WHERE key='schema' AND value='1')
          AND (SELECT COUNT(*) FROM pragma_table_info('mail') WHERE name IN ('ended_by','ended_ms','end_reason'))=3",
         [], |r| r.get(0));
@@ -78,12 +134,26 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
             "reason":"Runtime needs schema unavailable; initialize or upgrade through the normal operator workflow."}),
         );
     };
+    // Bound JSON/text materialization too: a single SQLite JSON opcode or Rust
+    // parse cannot be interrupted by a VM progress callback. Refuse, never skip
+    // oversized sources and accidentally return a quiet partial observation.
+    let oversized: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE length(CAST(record AS BLOB))>65536
+            OR length(CAST(id AS BLOB))>160)
+         OR EXISTS(SELECT 1 FROM mail WHERE length(CAST(payload AS BLOB))>65536
+            OR length(CAST(body AS BLOB))>65536 OR length(CAST(id AS BLOB))>160)
+         OR EXISTS(SELECT 1 FROM charters WHERE length(CAST(data AS BLOB))>65536)
+         OR EXISTS(SELECT 1 FROM tasks WHERE length(CAST(title AS BLOB))>65536
+            OR length(CAST(id AS BLOB))>160 OR length(CAST(owner AS BLOB))>160)",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(!oversized, "runtime observation source exceeds byte bound");
     let mut statement = tx.prepare(
         "SELECT source,id FROM (
           SELECT 'mail' source,m.id FROM mail m LEFT JOIN tasks t ON t.id=m.task_id
             WHERE m.recipient='captain' AND m.state='open' AND m.kind IN ('request','decision')
               AND (m.task_id IS NULL OR t.status NOT IN ('done','cancelled'))
-          UNION ALL SELECT 'task',id FROM tasks WHERE status='blocked'
           UNION ALL SELECT 'job',j.id FROM jobs j LEFT JOIN tasks t ON t.id=json_extract(j.record,'$.task_id')
             WHERE json_extract(j.record,'$.status')='orphaned' OR
               (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
@@ -118,8 +188,16 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
                         continue;
                     }
                     // Revoked or replaced authority cannot present an actionable grant.
-                    let Ok(charter) = store.active_charter(task) else {
-                        continue;
+                    let charter = match store.active_charter(task) {
+                        Ok(charter) => charter,
+                        Err(error) => {
+                            // Revoked authority is not actionable, but SQL
+                            // interruption/lock failure is unavailable, not quiet.
+                            if error.downcast_ref::<rusqlite::Error>().is_some() {
+                                return Err(error);
+                            }
+                            continue;
+                        }
                     };
                     if payload["charter_hash"] != crate::core::hash(&charter) {
                         continue;
@@ -155,23 +233,6 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
                 );
                 item["correlation"] = json!(id);
                 item["created_ms"] = message["created_ms"].clone();
-            }
-            "task" => {
-                let task = store.task(&id)?;
-                item["kind"] = json!("blocker");
-                item["evidence"] = json!("task_blocked");
-                item["ship"] = task["owner"].clone();
-                item["task_id"] = json!(id);
-                item["summary"] = json!(
-                    task["title"]
-                        .as_str()
-                        .unwrap_or("")
-                        .chars()
-                        .take(2000)
-                        .collect::<String>()
-                );
-                item["version"] = json!(crate::core::hash(&task));
-                item["actions"] = json!([]);
             }
             "job" => {
                 let raw: String =
@@ -214,6 +275,6 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     Ok(
         json!({"schema_version":1,"available":true,"origin":origin,"address":"captain","observed_ms":now,
         "items":items,"next_after":if more { cursor } else { None },
-        "unknown":["live_process_liveness","wake_backoff","hourly_wake_budget","dispatcher_liveness","herdr_reachability","attended_mail_pause","ci","provider_health","remote_homes","legacy_unvalidated_approval_requests" ]}),
+        "unknown":["live_process_liveness","wake_backoff","hourly_wake_budget","dispatcher_liveness","herdr_reachability","attended_mail_pause","ci","provider_health","remote_homes","legacy_unvalidated_approval_requests","task_captain_actionability" ]}),
     )
 }

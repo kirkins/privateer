@@ -327,6 +327,24 @@ fn event_list(store: &Store, command: &str, args: Value) -> Result<Value> {
 }
 
 fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
+    // Presence (including null) opts into the complete typed correlation pair.
+    // Validate before any mutation; unsupported commands cannot ignore it.
+    let correlated = args.get("request_id").is_some() || args.get("expected_version").is_some();
+    let request_id = if correlated {
+        ensure!(
+            matches!(command, "approval.grant" | "approval.deny"),
+            "request correlation applies only to grant or deny"
+        );
+        let id = required(&args, "request_id")?;
+        identifier(id)?;
+        required(&args, "expected_version")?;
+        if command == "approval.grant" {
+            required(&args, "id")?;
+        }
+        Some(id)
+    } else {
+        None
+    };
     let task = required(&args, "task_id")?;
     let artifact = required(&args, "artifact")?;
     let environment = required(&args, "environment")?;
@@ -337,13 +355,8 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     // It must not require widening every task's standing charter first.
     let charter = store.active_charter(task)?;
     let charter_hash = hash(&charter);
-    // Optional UI correlation is checked under the same lock as the grant.
-    if command == "approval.grant" && args.get("request_id").is_some() {
-        required(&args, "id")?;
-    }
-    let request = args
-        .get("request_id")
-        .and_then(Value::as_str)
+    // Authority and request binding are rechecked under the same write lock.
+    let request = request_id
         .map(|id| crate::needs::approval_request(store, id, &args, &charter_hash))
         .transpose()?;
     if command == "approval.deny" {
