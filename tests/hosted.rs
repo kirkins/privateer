@@ -2,6 +2,8 @@
 //! session in its own Herdr space. A fake Herdr runs what the dispatcher types
 //! into the new pane, so the real `privateer start --hosted` and its harness
 //! (a fake `pi` on PATH) run as subprocesses.
+#[path = "hosted/errand_labels.rs"]
+mod errand_labels;
 mod support;
 
 use serde_json::{Value, json};
@@ -47,7 +49,7 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
+                "#!/bin/sh\ncase \"$PRIVATEER_JOB\" in errand-*) printf '%s' \"$$\" > '{root}/'$PRIVATEER_JOB'-pid'; while [ ! -e '{root}/'$PRIVATEER_JOB'-release' ]; do sleep 0.05; done; printf '%s\\n' '{{\"type\":\"session\",\"id\":\"22222222-2222-4222-8222-222222222222\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Reviewed fixture\"}}]}}}}'; exit 0;; esac\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
                  printf '%s\\n' \"$$\" > '{root}/pi-pid'\n\
                  printf '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\" > '{root}/pi-context'\n\
@@ -274,6 +276,8 @@ struct Herdr {
     panes: Arc<Mutex<Vec<Value>>>,
     reject_create: Arc<AtomicBool>,
     suppress_input: Arc<AtomicBool>,
+    reject_caption: Arc<AtomicBool>,
+    metadata: Arc<Mutex<std::collections::BTreeMap<(String, String), Value>>>,
 }
 
 impl Herdr {
@@ -290,6 +294,12 @@ impl Herdr {
         let panes = Arc::new(Mutex::new(vec![pane(1)]));
         let reject_create = Arc::new(AtomicBool::new(false));
         let suppress_input = Arc::new(AtomicBool::new(false));
+        let reject_caption = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(Mutex::new(std::collections::BTreeMap::<
+            (String, String),
+            Value,
+        >::new()));
+        let (reject_label, sources) = (reject_caption.clone(), metadata.clone());
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
@@ -317,6 +327,18 @@ impl Herdr {
                     seen.lock().unwrap().push(request);
                     continue;
                 }
+                if request["method"] == "pane.report_metadata"
+                    && params["source"] == "privateer-errands"
+                    && reject_label.load(Ordering::SeqCst)
+                {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":request["id"],"error":"fixture metadata refusal"})
+                    );
+                    seen.lock().unwrap().push(request);
+                    continue;
+                }
                 if request["method"] == "pane.send_input" && suppress.load(Ordering::SeqCst) {
                     let _ = writeln!(
                         stream,
@@ -336,6 +358,24 @@ impl Herdr {
                         order.lock().unwrap().push((format!("w{n}"), json!({})));
                         live.lock().unwrap().push(pane(n));
                         json!({"type":"workspace_created","root_pane":pane(n)})
+                    }
+                    "pane.report_metadata" => {
+                        let mut sources = sources.lock().unwrap();
+                        let metadata = sources
+                            .entry((
+                                params["pane_id"].as_str().unwrap().into(),
+                                params["source"].as_str().unwrap().into(),
+                            ))
+                            .or_insert(json!({}));
+                        for field in ["title", "display_agent"] {
+                            if let Some(value) = params.get(field) {
+                                metadata[field] = value.clone();
+                            }
+                            if params[format!("clear_{field}")] == true {
+                                metadata.as_object_mut().unwrap().remove(field);
+                            }
+                        }
+                        json!({"type":"ok"})
                     }
                     "workspace.report_metadata" => {
                         let mut order = order.lock().unwrap();
@@ -406,6 +446,8 @@ impl Herdr {
             panes,
             reject_create,
             suppress_input,
+            reject_caption,
+            metadata,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {

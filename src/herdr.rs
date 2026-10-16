@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod errands;
 pub(crate) mod sidebar;
 
 const RESPONSE_LIMIT: usize = 1_048_576;
