@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isAbsolute } from "node:path";
 import { QuietCompaction, RECORDS_TYPE, renderRecords } from "./quiet.mjs";
+import { FollowThrough, FOLLOW_TYPE, renderFollowThrough } from "./follow.mjs";
 
 const execute = promisify(execFile);
 const TYPE = "privateer-mail";
@@ -190,6 +191,12 @@ export default function attended(api) {
     afterMs: setting(env.PRIVATEER_QUIET_COMPACT_SECS, 600) * 1000,
     minPercent: setting(env.PRIVATEER_QUIET_COMPACT_PERCENT, 40),
   }, () => mail.owned(mail.generation), (command, args) => mail.call(command, args));
+  // Pi offers the before-settle boundary; OMP settles through agent_end.
+  if (config.harness !== "omp") {
+    const follow = new FollowThrough(config, () => mail.owned(mail.generation), (command, args) => mail.call(command, args));
+    api.on("agent_before_settle", event => (mail.running ? follow.beforeSettle(event) : undefined));
+    api.registerMessageRenderer(FOLLOW_TYPE, renderFollowThrough);
+  }
   const dispose = mail.dispose.bind(mail);
   mail.dispose = () => { quiet.stop(); dispose(); };
   api.on("session_start", (_event, ctx) => { mail.start(ctx); quiet.start(ctx); });
