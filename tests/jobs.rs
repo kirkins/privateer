@@ -1201,6 +1201,58 @@ fn recent_estimates_space_out_heavy_jobs_until_their_ramp_passes() {
 }
 
 #[test]
+fn a_lone_heavy_job_needs_only_the_floor_while_others_count_its_estimate() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    let available = ok(&home, "resource.status", json!({}))["host"]["memory_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // An estimate as large as everything available never fits beside the
+    // floor, so only running alone can admit it.
+    ok(
+        &home,
+        "resource.configure",
+        json!({"max_heavy_jobs":null,"max_load_per_cpu":1000.0,
+            "min_available_memory_bytes":available / 4,
+            "heavy_estimate":{"memory_bytes":available},"ramp_secs":1}),
+    );
+    let first = heavy_job(&home, "first-build", json!({}));
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    thread::sleep(Duration::from_millis(1500));
+    let refused = heavy_job(&other, "second-build", json!({}));
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success());
+    assert!(error.contains("must stay free"), "{error}");
+    // Once the first job has stopped and released its reservation, the
+    // second runs alone.
+    ok(&home, "job.cancel", json!({"id":"first-build"}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ok(&home, "resource.status", json!({}))["reservations"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the cancelled job kept its reservation"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let alone = heavy_job(&other, "second-build", json!({}));
+    assert!(
+        alone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&alone.stderr)
+    );
+    ok(&other, "job.cancel", json!({"id":"second-build"}));
+}
+
+#[test]
 fn memory_floor_and_charter_share_refuse_heavy_work_only() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
