@@ -214,6 +214,46 @@ class Bundles(unittest.TestCase):
                 native_launch.launch('pi', ['pi', *flags, '--', 'brief'], bundles=self.plan([]))
             probe.assert_not_called()
 
+    def test_calm_exact_runtime_adapter_in_legacy_and_bounded_modes(self):
+        import native_launch
+        mail = str(ROOT / 'plugins/attended/mail.ts')
+        crew = str(ROOT / 'plugins/attended/crew.ts')
+        calm = str(ROOT / 'plugins/attended/calm.ts')
+        before = dict(self.env, PRIVATEER_ROLE='agent', PRIVATEER_ACTOR='fixture',
+                      PRIVATEER_HOME=str(self.base / '.privateer'),
+                      PRIVATEER_CONTROL_CLI='/fixture/privateer',
+                      PRIVATEER_ATTENDED_HARNESS='pi', PI_CODING_AGENT_DIR=str(self.agent))
+        for bounded in (False, True):
+            for mode, adapters in (('headless', []), ('attended', [mail, calm]), ('hosted', [crew, calm])):
+                env = dict(before)
+                if mode == 'hosted':
+                    env['PRIVATEER_HOSTED_CREW'] = '1'
+                args = ['pi', *[arg for path in adapters for arg in ('-e', path)],
+                        '--provider', 'chosen', '--model', 'exact', '--', 'brief']
+                with self.subTest(bounded=bounded, mode=mode), patch.dict(os.environ, env, clear=True), \
+                        self.probe(), patch.object(native_launch.os, 'execvpe') as execute:
+                    native_launch.launch('pi', args, bundles=self.plan([]) if bounded else None,
+                                         attended=mode == 'attended')
+                    result = execute.call_args.args[1]
+                    self.assertEqual(execute.call_args.args[2], dict(env, PWD=os.getcwd()))
+                    self.assertEqual(result[-6:], args[-6:])
+                    self.assertEqual(result.count('-e'), len(adapters))
+                    self.assertEqual('--no-mcp' in result, bounded)
+                    for path in adapters:
+                        self.assertEqual(result.count(path), 1)
+                    if mode == 'headless':
+                        self.assertNotIn(calm, result)
+        for attended, hosted, flags in (
+                (False, False, ['-e', calm]), (False, True, ['-e', calm]),
+                (True, False, ['-e', calm + '.spoof']), (True, False, ['--extension', calm]),
+                (True, False, ['-e' + calm]), (True, False, ['-e', calm, '-e', calm]),
+                (False, True, ['-e', crew, '-e', calm + '.spoof'])):
+            env = dict(before, PRIVATEER_HOSTED_CREW='1' if hosted else '0')
+            with self.subTest(flags=flags, attended=attended, hosted=hosted), \
+                    patch.dict(os.environ, env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
+                native_launch.launch('pi', ['pi', *flags, '--', 'brief'], bundles=self.plan([]), attended=attended)
+            probe.assert_not_called()
+
     def test_ambient_packages_and_prompt_files_refuse_before_native_probe(self):
         for directory in (self.agent, self.repo / '.pi'):
             directory.mkdir(exist_ok=True)

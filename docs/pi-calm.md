@@ -3,6 +3,12 @@
 Privateer's Pi sessions load `/calm` explicitly: attended first mates,
 `start --hosted` first mates, and hosted Pi crew. Pi and Pi-signed use it;
 OMP and other harnesses do not. Nothing is installed in personal Pi resources.
+The same launch paths work with omitted legacy bundle selection or an explicit
+`tool_bundles: []` bounded plan. Bounded preflight recognizes only the exact
+runtime-owned Calm path paired with attended mode or the hosted crew adapter;
+no arbitrary `-e`, stale hosted marker, registry approval, or headless inheritance
+can authorize it. Native HOME, agentDir, permission policy and provider/model
+selection are not changed.
 
 Calm is **off by default**. `/calm` toggles it; arguments have no special meaning.
 The choice is stored as `on\n` or `off\n` in
@@ -63,7 +69,11 @@ There is no numeric Pi version gate. Adapters independently probe exported
 methods, then scope changes to mounted interactive transcript components.
 Export tool components are unmounted and retain ordinary rendering. The queue
 adapter additionally checks the current session's methods, receipt reader and
-agent queue shapes before retaining anything. Missing seams emit a bounded,
+agent queue shapes before retaining anything, including boolean `isCompacting`
+and the durable-receipt reader `sessionManager.getBranch`. Tests remove each
+required seam independently and cover Escape/dequeue, order, once-only delivery,
+compaction, refused versus receipted failures, mid-wait arrivals, shutdown and
+rebind epochs. Missing seams emit a bounded,
 named warning and leave that adapter stock. These exported layout/queue members
 are **internals**, not a promised stable global transcript-filter API.
 
@@ -79,8 +89,14 @@ documentation and Privateer's own dashboard boat geometry, not First Mate code.
   deterministic clock/geometry assertions; included in `cargo test`.
 - `python3 tests/pi_calm_native.py /path/to/pi`: isolated installed-Pi entry-point,
   real exported layout methods, a real `AgentSession`'s queue/restore seams and
-  real built-in subprocess execution. Delivery events are simulated; it makes
-  no model or network request. Records the installed version without gating it.
+  real built-in subprocess execution. Also checks actual headless, attended and
+  hosted-crew resource inventories for legacy and explicit-empty bounded plans.
+  Uses a fixed clean environment allowlist and disposable authless HOME/agentDir,
+  offline/no-MCP flags, fixture inference refusal, and Linux libseccomp transport
+  refusal installed before exec (also inherited by descendants). It fails closed
+  when the transport guard is unavailable. Delivery events are simulated; it
+  makes no model or network request. Records the installed version without
+  gating the Calm adapters; the bounded loader still qualifies exactly Pi 1.2.0.
 - `cargo test --test attended --test hosted --test pi_calm -- --test-threads=1`:
   real launch argv/home/custody checks, including hosted crew after #96 and
   non-Pi exclusion.

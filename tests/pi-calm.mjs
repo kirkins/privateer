@@ -114,7 +114,7 @@ export async function policyAndClock() {
 
 export async function queueBehavior(host, session) {
   const home="/fixture/home", warnings=[];
-  const state={home,enabled:true,disposed:false,warn:s=>warnings.push(s)};
+  const state={home,enabled:true,disposed:false,epoch:0,warn:s=>warnings.push(s)};
   const layouts=installLayouts(host,state);
   const mode=Object.create(host.InteractiveMode.prototype);
   Object.defineProperty(mode,"session",{value:session,writable:true});
@@ -161,6 +161,37 @@ export async function queueBehavior(host, session) {
     session.sendCustomMessage=async()=>{throw Error("preparation refused");};
     mode.restoreQueuedMessagesToEditor();await flush();assert.deepEqual(session.agent.followUpQueue.messages,[first]);
     assert(warnings.some(s=>s.includes("continuation failed")),JSON.stringify(warnings));
+    // A failure after the durable custom receipt must never duplicate input.
+    const getBranch=session.sessionManager.getBranch;
+    session.sessionManager.getBranch=()=>[{type:"custom_message",customType:first.customType,details:first.details}];
+    mode.restoreQueuedMessagesToEditor();await flush();assert.deepEqual(session.agent.followUpQueue.messages,[]);
+    session.sessionManager.getBranch=getBranch;
+    // Dequeue (without abort) retains order/priority and one in-flight owner.
+    delivered.length=0;notices.length=0;
+    session.sendCustomMessage=async message=>{delivered.push(message);};
+    session.agent.steeringQueue.enqueue(first);session.agent.followUp(second);
+    let idle;
+    const wait=session.waitForIdle;
+    session.waitForIdle=()=>new Promise(resolve=>{idle=resolve;});
+    mode.restoreQueuedMessagesToEditor();mode.restoreQueuedMessagesToEditor();
+    session.agent.followUp(newer); // Arrival while waiting must stay behind old mail.
+    session.waitForIdle=wait;idle();await flush();
+    assert.deepEqual(delivered,[first]);assert.deepEqual(session.agent.followUpQueue.messages,[second,newer]);
+    assert.equal(notices.length,1);
+    // Session shutdown or rebinding invalidates old idle waits. They cannot
+    // launch on the abandoned branch, even if the old session becomes idle.
+    for(const boundary of ["shutdown","rebind"]) {
+      delivered.length=0;notices.length=0;
+      session.waitForIdle=()=>new Promise(resolve=>{idle=resolve;});
+      mode.restoreQueuedMessagesToEditor();
+      state.epoch++;
+      if(boundary==="shutdown") state.disposed=true;
+      else mode.session={};
+      session.waitForIdle=wait;idle();await flush();
+      assert.deepEqual(delivered,[]);assert.equal(notices.length,0);
+      assert.deepEqual(session.agent.followUpQueue.messages,[second,newer]);
+      state.disposed=false;mode.session=session;
+    }
     session.sendCustomMessage=originalSend;
     state.enabled=false;
     mode.restoreQueuedMessagesToEditor();await flush();assert.equal(session.agent.followUpQueue.messages.length,0,"off stays stock");
@@ -252,6 +283,76 @@ export async function layoutBehavior(host,tui) {
   assert(missing.includes("assistant layout"));assert(missing.includes("queued operational rows"));
 }
 
+export function queueCapabilityBehavior() {
+  // Each exact member used by retention must fail closed independently,
+  // leaving stock listing/restore calls and queue objects untouched.
+  const seams=[
+    ["session","waitForIdle"],["session","isIdle"],["session","isCompacting"],
+    ["session","sendCustomMessage"],["session","clearQueue"],["session","abort"],
+    ["session","sessionManager","getBranch"],["session","agent"],
+    ["session","agent","steeringQueue"],["session","agent","followUpQueue"],
+    ["session","agent","steeringQueue","messages"],["session","agent","steeringQueue","enqueue"],
+    ["session","agent","followUpQueue","messages"],["session","agent","followUpQueue","enqueue"],
+    ["compactionQueuedMessages"],["showStatus"],["clearAllQueues"],
+    ["updatePendingMessagesDisplay"],["restoreQueuedMessagesToEditor"],
+  ];
+  for(const seam of seams) {
+    let listed=0,restored=0;
+    class Stock extends SimulatedMode {
+      updatePendingMessagesDisplay(){listed++;}
+      restoreQueuedMessagesToEditor(){restored++;return "stock";}
+    }
+    const warnings=[],state={home:"/fixture/home",enabled:true,disposed:false,warn:s=>warnings.push(s)};
+    const layouts=installLayouts({InteractiveMode:Stock},state);
+    try {
+      const mode=new Stock();mode.session=simulatedQueueSession();
+      mode.compactionQueuedMessages=[];mode.showStatus=()=>{};
+      const queue=mode.session.agent.followUpQueue,mail=notification(state.home,1);queue.enqueue(mail);
+      assert(queueCapability(mode));
+      const object=seam.slice(0,-1).reduce((o,k)=>o[k],mode),key=seam.at(-1),original=object[key];
+      object[key]=undefined;
+      assert.equal(queueCapability(mode),false,seam.join("."));
+      // Missing native entry methods are load-time adapter degradation; all
+      // other members are probed before first listing/restore for a session.
+      if(key==="updatePendingMessagesDisplay" || key==="restoreQueuedMessagesToEditor") continue;
+      for(let i=0;i<2;i++) {
+        mode.updatePendingMessagesDisplay();
+        assert.equal(mode.restoreQueuedMessagesToEditor(),"stock");
+      }
+      assert.equal(listed,2);assert.equal(restored,2);
+      object[key]=original;
+      assert.deepEqual(queue.messages,[mail]);
+      assert.equal(warnings.filter(s=>s==="queued operational retention (session)").length,1,seam.join("."));
+    } finally {layouts.dispose();}
+  }
+  for(const receipt of [()=>undefined,()=>({}),()=>{throw Error("receipt unavailable");}]) {
+    let restored=0;
+    class Stock extends SimulatedMode { restoreQueuedMessagesToEditor(){restored++;return "stock";} }
+    const warnings=[],state={home:"/fixture/home",enabled:true,disposed:false,warn:s=>warnings.push(s)};
+    const layouts=installLayouts({InteractiveMode:Stock},state);
+    try {
+      const mode=new Stock();mode.session=simulatedQueueSession();
+      mode.compactionQueuedMessages=[];mode.showStatus=()=>{};
+      mode.session.sessionManager.getBranch=receipt;
+      const mail=notification(state.home,1);mode.session.agent.followUp(mail);
+      assert.equal(queueCapability(mode),false);
+      for(let i=0;i<2;i++) assert.equal(mode.restoreQueuedMessagesToEditor(),"stock");
+      assert.equal(restored,2);assert.deepEqual(mode.session.agent.followUpQueue.messages,[mail]);
+      assert.equal(warnings.filter(s=>s==="queued operational retention (session)").length,1);
+    } finally {layouts.dispose();}
+  }
+  for(const seam of ["updatePendingMessagesDisplay","restoreQueuedMessagesToEditor","clearAllQueues"]) {
+    class Missing extends SimulatedMode {}
+    Missing.prototype[seam]=undefined;
+    const warnings=[],original=Missing.prototype.restoreQueuedMessagesToEditor;
+    const layouts=installLayouts({InteractiveMode:Missing},{enabled:true,warn:s=>warnings.push(s)});
+    assert.equal(Missing.prototype.restoreQueuedMessagesToEditor,original);
+    assert.equal(warnings.filter(s=>s==="queued operational rows").length,1);
+    layouts.dispose();
+  }
+  console.log("ok - every queue retention capability degrades stock with one session diagnostic");
+}
+
 // The routine CI path simulates only events/queues. The installed-Pi fixture
 // above runs the same cases over real exported classes and AgentSession queues.
 function simulatedQueueSession() {
@@ -278,5 +379,6 @@ class SimulatedMode {
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
   await policyAndClock();
+  queueCapabilityBehavior();
   await queueBehavior({InteractiveMode:SimulatedMode},simulatedQueueSession());
 }

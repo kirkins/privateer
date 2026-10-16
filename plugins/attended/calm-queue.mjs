@@ -5,14 +5,19 @@ import { operational } from "./calm-policy.mjs";
 // exactly Privateer's custom notifications, never reinterpret human text.
 export function queueCapability(mode) {
   const s = mode.session, agent = s?.agent;
-  return !!s && typeof s.waitForIdle === "function" && typeof s.isIdle === "boolean"
-    && typeof s.isCompacting === "boolean" && typeof mode.showStatus === "function"
-    && typeof s.sendCustomMessage === "function" && typeof s.clearQueue === "function"
-    && typeof s.abort === "function" && typeof s.sessionManager?.getBranch === "function"
-    && Array.isArray(mode.compactionQueuedMessages)
-    && [agent?.steeringQueue, agent?.followUpQueue].every(q =>
-      Array.isArray(q?.messages) && typeof q.enqueue === "function")
-    && typeof mode.clearAllQueues === "function";
+  try {
+    return !!s && typeof mode.updatePendingMessagesDisplay === "function"
+      && typeof mode.restoreQueuedMessagesToEditor === "function"
+      && typeof s.waitForIdle === "function" && typeof s.isIdle === "boolean"
+      && typeof s.isCompacting === "boolean" && typeof mode.showStatus === "function"
+      && typeof s.sendCustomMessage === "function" && typeof s.clearQueue === "function"
+      && typeof s.abort === "function" && typeof s.sessionManager?.getBranch === "function"
+      && Array.isArray(s.sessionManager.getBranch())
+      && Array.isArray(mode.compactionQueuedMessages)
+      && [agent?.steeringQueue, agent?.followUpQueue].every(q =>
+        Array.isArray(q?.messages) && typeof q.enqueue === "function")
+      && typeof mode.clearAllQueues === "function";
+  } catch { return false; }
 }
 
 export function installQueueRetention(prototype, state, patch, touch) {

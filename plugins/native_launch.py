@@ -39,9 +39,18 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         # first-mate selection or arbitrary -e override. Stale hosted markers
         # alone cannot add the extension to a nested/headless run.
         flags = argv[:argv.index("--")] if "--" in argv else argv
-        if os.environ.get("PRIVATEER_HOSTED_CREW") == "1" and any(
-                flags[i:i+2] == ["-e", crew] for i in range(len(flags))):
+        hosted_crew = os.environ.get("PRIVATEER_HOSTED_CREW") == "1" and any(
+            flags[i:i+2] == ["-e", crew] for i in range(len(flags)))
+        if hosted_crew:
             extensions.append(crew)
+        calm = str(directory / "attended/calm.ts")
+        # Calm is a runtime-owned presentation adapter, not an operator
+        # integration. Only the exact attended/hosted injection may survive
+        # bounded preflight; headless runs and stale hosted markers cannot
+        # authorize an arbitrary extension (or add Calm by inheritance).
+        if (attended or hosted_crew) and any(
+                flags[i:i+2] == ["-e", calm] for i in range(len(flags))):
+            extensions.append(calm)
         argv = preflight(bundles, argv, env=native_environment(), runtime_extensions=extensions)
     if harness == "opencode-v2":
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),

@@ -461,6 +461,11 @@ fn bounded_hosted_crew_plan_retains_its_lifecycle_adapter_without_inheriting_sel
             .windows(2)
             .any(|p| p[0] == "-e" && p[1].as_str().unwrap().ends_with("attended/crew.ts"))
     );
+    assert!(
+        command[..at]
+            .windows(2)
+            .any(|p| p[0] == "-e" && p[1].as_str().unwrap().ends_with("attended/calm.ts"))
+    );
     // A deliberately unsupported activation wrapper cannot run a bounded
     // session, even in a real hosted supervisor. The separate native fixture
     // qualifies this same injected argv with the installed Pi 1.2 binary.
