@@ -150,6 +150,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     }
                 }
             }
+            // Codex crew need network and supervised nested jobs, like the Pi
+            // crew. Keep an explicit sandbox choice, including read-only.
+            if args["manifest"] == "bundled:codex" && args["options"].get("sandbox").is_none() {
+                args["options"]["sandbox"] = serde_json::json!("danger-full-access");
+            }
+            let codex_read_only =
+                args["manifest"] == "bundled:codex" && args["options"]["sandbox"] == "read-only";
             // A provider that is throttling this route only fails another run.
             let model_route = args["manifest"]
                 .as_str()
@@ -242,6 +249,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 // through job.start with heavy and wait_for_capacity.
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))
             });
+            if codex_read_only {
+                job["codex_read_only_crew"] = Value::Bool(true);
+            }
             for key in [
                 "id",
                 "estimate",
