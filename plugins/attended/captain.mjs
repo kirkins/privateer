@@ -15,6 +15,14 @@ const COMMANDS = {
     argv: rest => ({ "": ["permissions", "show"], status: ["permissions", "show"],
       on: ["permissions", "yolo"], off: ["permissions", "standard"] })[rest],
   },
+  afk: {
+    description: "Away: hold the fleet's mail except emergencies, /afk [until 8am] [instructions]",
+    argv: rest => (rest === "" ? ["afk"] : ["afk", rest]),
+  },
+  back: {
+    description: "Back from away: a digest now, the liaison's summary next",
+    argv: rest => (rest === "" ? ["back"] : undefined),
+  },
   ships: {
     description: "The fleet's ships and what each handles",
     argv: rest => (rest === "" ? ["ships"] : undefined),

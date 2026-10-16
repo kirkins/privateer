@@ -110,6 +110,22 @@ fn doors() -> Result<Vec<Door>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Every registered front door's name.
+pub(crate) fn names() -> Result<Vec<String>> {
+    Ok(doors()?.into_iter().map(|d| d.name).collect())
+}
+
+/// Move a door's delivery cursor in one home forward to `through`, as if
+/// the captain had been sent everything up to it.
+pub(crate) fn advance(store: &Store, door: &str, through: i64) -> Result<()> {
+    cursor(store, door)?;
+    store.connection().execute(
+        "UPDATE door_cursor SET through_seq=MAX(through_seq, ?2) WHERE door=?1",
+        params![door, through],
+    )?;
+    Ok(())
+}
+
 fn registration(name: &str) -> Result<Option<Door>> {
     Ok(doors()?.into_iter().find(|d| d.name == name))
 }
@@ -292,6 +308,8 @@ struct Session<'a> {
     /// Captain mail sent to the adapter this session, per ship.
     sent: HashMap<String, i64>,
     failing: HashSet<String>,
+    /// When the away period this session last saw began.
+    away_since: Option<i64>,
 }
 
 impl<'a> Session<'a> {
@@ -392,6 +410,7 @@ impl<'a> Session<'a> {
             homes: HashMap::new(),
             sent: HashMap::new(),
             failing: HashSet::new(),
+            away_since: None,
         };
         let members = members()?;
         let hello = json!({"type": "hello", "version": VERSION, "door": door.name,
@@ -479,6 +498,14 @@ impl<'a> Session<'a> {
     /// Send the adapter captain mail it has not yet been sent, oldest first
     /// in each ship's home.
     fn poll(&mut self) -> Result<()> {
+        // An away period that ended elsewhere moved the cursors past the held
+        // mail; start again from them rather than from this session's view.
+        let away = crate::away::active()?;
+        let since = away.as_ref().and_then(|a| a["since_ms"].as_i64());
+        if self.away_since.is_some() && self.away_since != since {
+            self.sent.clear();
+        }
+        self.away_since = since;
         let members = members()?;
         self.homes = members.iter().cloned().collect();
         for (ship, home) in members {
@@ -521,8 +548,17 @@ impl<'a> Session<'a> {
             };
             for message in page["messages"].as_array().into_iter().flatten() {
                 let seq = message["seq"].as_i64().context("mail without sequence")?;
-                let event = json!({"type": "mail", "ref": format!("{ship}:{seq}"),
+                let mut event = json!({"type": "mail", "ref": format!("{ship}:{seq}"),
                     "ship": ship, "mail": message});
+                // While the captain is away, only emergencies reach them; the
+                // rest stays in the mailbox for the return.
+                if away.is_some() {
+                    if !crate::away::breakthrough(message)? {
+                        self.sent.insert(ship.clone(), seq);
+                        continue;
+                    }
+                    event["breakthrough"] = json!(true);
+                }
                 if !self.emit(&event)? {
                     return Ok(());
                 }
@@ -586,6 +622,26 @@ impl<'a> Session<'a> {
             "send" => self.send(args),
             "ships" => self.ships(),
             "status" => self.status(),
+            // Away mode: peeking at status or what is held leaves the captain away.
+            "away" => match args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status")
+            {
+                "start" => {
+                    let text = args.get("words").and_then(Value::as_str).unwrap_or("");
+                    let (until, words) = crate::away::parse(text);
+                    crate::away::enter(&words, until.as_deref())
+                }
+                "back" => {
+                    let returned = crate::away::back()?;
+                    self.sent.clear();
+                    Ok(json!({"returned": returned}))
+                }
+                "status" => crate::away::status(),
+                other => bail!("unknown away action {other:?}"),
+            },
+            "held" => crate::away::held(),
             "waiting" => self.waiting(),
             // Registered front doors carry the captain's explicit commands.
             "permissions" if args.as_object().is_some_and(|a| a.is_empty()) => {
@@ -616,6 +672,12 @@ impl<'a> Session<'a> {
 
     /// The captain speaks: mail a ship in that ship's own home.
     fn send(&mut self, args: &Value) -> Result<Value> {
+        // The captain's first ordinary message while away is their return:
+        // the summary request reaches the liaison before the message itself.
+        let returned = crate::away::back()?;
+        if returned.is_some() {
+            self.sent.clear();
+        }
         let to = match args.get("to").filter(|v| !v.is_null()) {
             Some(to) => to.as_str().context("to must be a ship name")?.to_owned(),
             None => recipient(self.door, &members()?).context(
@@ -652,7 +714,7 @@ impl<'a> Session<'a> {
             "door.send",
             &json!({"door": door, "to": to, "mail": sent["id"], "kind": kind}),
         )?;
-        Ok(json!({"ship": to, "mail": sent}))
+        Ok(json!({"ship": to, "mail": sent, "returned": returned}))
     }
 
     fn ships(&mut self) -> Result<Value> {

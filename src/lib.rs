@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod admission;
 pub mod attention;
+pub mod away;
 mod bundled;
 pub mod captain;
 pub mod cli;
