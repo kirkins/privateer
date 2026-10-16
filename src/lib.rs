@@ -14,7 +14,7 @@ pub mod errand;
 mod executable;
 pub mod fleet;
 pub mod herdr;
-mod host;
+pub mod host;
 pub mod input;
 pub mod jobs;
 pub mod mail;

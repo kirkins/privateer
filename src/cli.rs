@@ -1089,6 +1089,20 @@ fn dashboard_binary() -> Option<PathBuf> {
                 .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
     })
 }
+/// Automatic host work never executes a PATH wrapper. Releases use their
+/// immutable bundle; source/legacy installations must have an executable sibling.
+pub(crate) fn hosted_dashboard_binary() -> Option<PathBuf> {
+    let selected = dashboard_binary()?;
+    let image = crate::releases::running_image().ok()?;
+    if crate::releases::Release::from_executable(&image).is_some()
+        || selected == image.with_file_name("privateer-dashboard")
+    {
+        // Herdr launch quotes an absolute path, with the same cwd as the host.
+        return selected.canonicalize().ok();
+    }
+    None
+}
+
 fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
     use std::os::unix::process::CommandExt;
     // Only the bridge: boarding a first mate would attend its ship and hold
@@ -1106,6 +1120,9 @@ fn open_dashboard(binary: &Path, home: Option<&Path>) -> Result<()> {
 pub fn board(home: Option<PathBuf>, yes: bool, caller: Caller) -> Result<()> {
     caller.require_operator("bare privateer")?;
     use std::io::{IsTerminal, Write};
+    if crate::host::bridge::focus(home.as_deref()).unwrap_or(false) {
+        return Ok(());
+    }
     let dashboard = dashboard_binary();
     if home.is_none() {
         if let Some(binary) = &dashboard {

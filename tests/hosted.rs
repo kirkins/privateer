@@ -30,6 +30,7 @@ struct Place {
     _temp: tempfile::TempDir,
     root: PathBuf,
     folder: PathBuf,
+    binary: PathBuf,
     path: String,
 }
 
@@ -44,6 +45,10 @@ impl Place {
         fs::create_dir(&folder).unwrap();
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
+        // Existing hosted-mate cases deliberately exercise an installation
+        // WITHOUT a dashboard, independent of Cargo's sibling build artifacts.
+        let binary = bin.join("privateer");
+        fs::copy(BIN, &binary).unwrap();
         fs::write(
             bin.join("pi"),
             format!(
@@ -65,6 +70,7 @@ impl Place {
             path: format!("{}:/usr/bin:/bin", bin.display()),
             root,
             folder,
+            binary,
         };
         place.ok(&["init", "--harness", "pi"]);
         let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
@@ -74,7 +80,7 @@ impl Place {
         place
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = support::command(BIN);
+        let mut command = support::command(&self.binary);
         command
             .args(args)
             .current_dir(&self.folder)
@@ -274,6 +280,12 @@ struct Herdr {
     panes: Arc<Mutex<Vec<Value>>>,
     reject_create: Arc<AtomicBool>,
     suppress_input: Arc<AtomicBool>,
+    #[cfg(feature = "dashboard")]
+    dashboards: Arc<Mutex<Vec<DashboardChild>>>,
+    #[cfg(feature = "dashboard")]
+    slow_create: Arc<AtomicBool>,
+    #[cfg(feature = "dashboard")]
+    creating: Arc<AtomicBool>,
 }
 
 impl Herdr {
@@ -293,6 +305,16 @@ impl Herdr {
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
+        #[cfg(feature = "dashboard")]
+        let dashboards = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "dashboard")]
+        let running = Arc::downgrade(&dashboards);
+        #[cfg(feature = "dashboard")]
+        let slow_create = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "dashboard")]
+        let creating = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "dashboard")]
+        let (slow, entered) = (slow_create.clone(), creating.clone());
         std::thread::spawn(move || {
             let mut created: Vec<Value> = vec![];
             for stream in listener.incoming() {
@@ -331,6 +353,13 @@ impl Herdr {
                         json!({"snapshot":{"version":"test","protocol":20,"panes":*live.lock().unwrap()}})
                     }
                     "workspace.create" => {
+                        #[cfg(feature = "dashboard")]
+                        if slow.load(Ordering::SeqCst) {
+                            entered.store(true, Ordering::SeqCst);
+                            // Remain inside the normal 800ms protocol deadline,
+                            // so another HOME really contends with this launch.
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
                         created.push(params["env"].clone());
                         let n = created.len() + 1;
                         order.lock().unwrap().push((format!("w{n}"), json!({})));
@@ -390,8 +419,21 @@ impl Herdr {
                         for (key, value) in created[n - 2].as_object().unwrap() {
                             shell.env(key, value.as_str().unwrap());
                         }
-                        let mut child = shell.spawn().unwrap();
-                        std::thread::spawn(move || child.wait());
+                        #[cfg(feature = "dashboard")]
+                        if created[n - 2].get("PRIVATEER_BRIDGE_TOKEN").is_some() {
+                            let child = DashboardChild::spawn(shell);
+                            if let Some(running) = running.upgrade() {
+                                running.lock().unwrap().push(child);
+                            }
+                        } else {
+                            let mut child = shell.spawn().unwrap();
+                            std::thread::spawn(move || child.wait());
+                        }
+                        #[cfg(not(feature = "dashboard"))]
+                        {
+                            let mut child = shell.spawn().unwrap();
+                            std::thread::spawn(move || child.wait());
+                        }
                         json!({"type":"ok"})
                     }
                     _ => json!({"type":"ok"}),
@@ -406,6 +448,12 @@ impl Herdr {
             panes,
             reject_create,
             suppress_input,
+            #[cfg(feature = "dashboard")]
+            dashboards,
+            #[cfg(feature = "dashboard")]
+            slow_create,
+            #[cfg(feature = "dashboard")]
+            creating,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -426,6 +474,434 @@ impl Herdr {
             .map(|(id, _)| id.clone())
             .collect()
     }
+}
+
+/// The real dashboard runs directly in a disposable PTY. No ANSI transcript
+/// matching: only kernel raw-mode readiness/restoration and normal exit/reap are
+/// asserted. The behavior under test is Herdr launch/custody/focus, not rendering.
+#[cfg(feature = "dashboard")]
+struct DashboardChild {
+    child: std::process::Child,
+    master: fs::File,
+    initial: libc::termios,
+    drain: Option<std::thread::JoinHandle<()>>,
+    reaped: bool,
+}
+#[cfg(feature = "dashboard")]
+impl DashboardChild {
+    fn attributes(file: &fs::File) -> libc::termios {
+        use std::os::fd::AsRawFd;
+        let mut attrs = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(file.as_raw_fd(), &mut attrs) }, 0);
+        attrs
+    }
+    fn spawn(mut command: Command) -> Self {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::process::CommandExt,
+        };
+        let (mut master, mut slave) = (-1, -1);
+        let size = libc::winsize {
+            ws_row: 32,
+            ws_col: 110,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &size,
+                )
+            },
+            0
+        );
+        let master = unsafe { fs::File::from_raw_fd(master) };
+        let slave = unsafe { fs::File::from_raw_fd(slave) };
+        // openpty fds must not leak into any unrelated child or dashboard.
+        for f in [&master, &slave] {
+            assert_eq!(
+                unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        let initial = Self::attributes(&master);
+        command
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave)
+            .env("TERM", "xterm-256color");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        // Drop Command's parent-side copies of the slave before waiting/reaping.
+        drop(command);
+        let mut output = master.try_clone().unwrap();
+        let drain = Some(std::thread::spawn(move || {
+            use std::io::Read;
+            let mut block = [0; 8192];
+            while matches!(output.read(&mut block), Ok(n) if n > 0) {}
+        }));
+        Self {
+            child,
+            master,
+            initial,
+            drain,
+            reaped: false,
+        }
+    }
+    fn stop(&mut self) {
+        until("real dashboard raw-mode readiness", || {
+            Self::attributes(&self.master).c_lflag & libc::ICANON == 0
+        });
+        self.master.write_all(b"q").unwrap();
+        let mut exit = None;
+        until(
+            "dashboard normal exit and reap BEFORE fixture cleanup",
+            || {
+                exit = self.child.try_wait().unwrap();
+                exit.is_some()
+            },
+        );
+        self.reaped = true;
+        assert!(exit.unwrap().success(), "dashboard did not exit normally");
+        let restored = Self::attributes(&self.master);
+        assert_eq!(
+            (
+                restored.c_iflag,
+                restored.c_oflag,
+                restored.c_cflag,
+                restored.c_lflag,
+                restored.c_cc
+            ),
+            (
+                self.initial.c_iflag,
+                self.initial.c_oflag,
+                self.initial.c_cflag,
+                self.initial.c_lflag,
+                self.initial.c_cc
+            )
+        );
+        self.drain.take().unwrap().join().unwrap();
+    }
+}
+#[cfg(feature = "dashboard")]
+impl Drop for DashboardChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // Failure-only cleanup of the DIRECT child; never evidence of pass
+            // or payload death inferred from stopping a supervisor wrapper.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(feature = "dashboard")]
+#[test]
+fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
+    let place = Place::new();
+    let apps = place.root.join("apps/.privateer");
+    fs::create_dir_all(apps.parent().unwrap()).unwrap();
+    let infra = place.folder.join(".privateer");
+    let runtime = place.root.join("runtime ' bridge");
+    fs::create_dir(&runtime).unwrap();
+    let binary = runtime.join("privateer");
+    fs::copy(BIN, &binary).unwrap();
+    // Authless disposable CHILD allowlist. Do not touch the test supervisor's
+    // role/job/actor/control/mail/provider environment or product caller checks.
+    let command = |home: &Path, args: &[&str]| {
+        let mut c = Command::new(&binary);
+        c.env_clear()
+            .args(["--home", home.to_str().unwrap()])
+            .args(args)
+            .current_dir(home.parent().unwrap())
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &place.root)
+            .env("XDG_CONFIG_HOME", place.root.join("config"))
+            .env("XDG_STATE_HOME", place.root.join("state"))
+            .env("PRIVATEER_FLEET", place.root.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", place.root.join("ledger"))
+            .env("PRIVATEER_SERVICE", "none");
+        c
+    };
+    let ok = |home: &Path, args: &[&str]| {
+        let out = command(home, args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let json = |home: &Path, verb: &str, value: Value| -> Value {
+        serde_json::from_str(&ok(home, &[verb, "--json", &value.to_string()])).unwrap()
+    };
+    let tick = |home: &Path| json(home, "serve", json!({"once":true}));
+    ok(&apps, &["init", "--harness", "pi"]);
+    for (home, ship) in [(&infra, "infra"), (&apps, "apps")] {
+        json(
+            home,
+            "ship.attend",
+            json!({"ship":ship,"holder":"captain-fixture","ttl_secs":90}),
+        );
+    }
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+            (
+                "XDG_STATE_HOME".into(),
+                place.root.join("state").display().to_string(),
+            ),
+        ],
+    );
+    // Missing installed dashboard does not use a PATH harness/wrapper.
+    assert!(tick(&infra)["bridge"].is_null());
+    assert!(herdr.calls("workspace.create").is_empty());
+    fs::copy(
+        env!("CARGO_BIN_EXE_privateer-dashboard"),
+        runtime.join("privateer-dashboard"),
+    )
+    .unwrap();
+    let configure = |home: &Path, ship: &str, enabled: bool| {
+        let mut profile = json(home, "ship.show", json!({"name":ship}))["first_mate"].take();
+        if enabled {
+            profile["host"] = json!("herdr");
+        } else {
+            profile.as_object_mut().unwrap().remove("host");
+        }
+        json(home, "ship.put", json!({"name":ship,"first_mate":profile}));
+    };
+    configure(&infra, "infra", false);
+    assert!(tick(&infra)["bridge"].is_null());
+    assert!(tick(&apps)["bridge"].is_null());
+    assert!(!place.root.join("fleet.sqlite.bridge").exists());
+    configure(&infra, "infra", true);
+    configure(&apps, "apps", true);
+    let claim_path = place.root.join("fleet.sqlite.bridge/claim.json");
+    let claim = || -> Value { serde_json::from_slice(&fs::read(&claim_path).unwrap()).unwrap() };
+    let retry = || {
+        let mut c = claim();
+        c["retry_ms"] = json!(0); // deterministic clock jump, not a blind sleep
+        fs::write(&claim_path, c.to_string()).unwrap();
+    };
+    // No socket: bounded durable retry survives fresh dispatcher processes.
+    fs::rename(&socket, socket.with_extension("saved")).unwrap();
+    assert!(tick(&infra)["bridge"]["error"].is_string());
+    let deadline = claim()["retry_ms"].clone();
+    assert_eq!(tick(&apps)["bridge"]["retry_ms"], deadline);
+    assert!(herdr.calls("workspace.create").is_empty());
+    fs::rename(socket.with_extension("saved"), &socket).unwrap();
+    retry();
+
+    // Two genuinely independent homes/processes overlap. The first is inside
+    // fake Herdr create (normal protocol deadline); the second must lose the
+    // SAME machine claim rather than taking a per-home lock and launching too.
+    herdr.slow_create.store(true, Ordering::SeqCst);
+    let mut first = command(&infra, &["serve", "--json", r#"{"once":true}"#]);
+    let first = first
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    until("first dispatcher inside fake Herdr create", || {
+        herdr.creating.load(Ordering::SeqCst)
+    });
+    let second = command(&apps, &["serve", "--json", r#"{"once":true}"#])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(
+        second["bridge"]["error"], "bridge reconciliation busy",
+        "{second}"
+    );
+    let first = first.wait_with_output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["bridge"]["status"], "launched", "{first}");
+    herdr.slow_create.store(false, Ordering::SeqCst);
+    until("direct dashboard claim adoption", || {
+        claim()["adopted"] == true
+    });
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(herdr.calls("pane.send_input").len(), 1);
+    assert_eq!(herdr.panes.lock().unwrap().len(), 2);
+    let create = &herdr.calls("workspace.create")[0]["params"];
+    assert_eq!(create["focus"], false);
+    assert_eq!(create["label"], "bridge");
+    let input = herdr.calls("pane.send_input")[0]["params"]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        input.contains("'\"'\"'"),
+        "launch paths must be shell quoted: {input}"
+    );
+    assert!(
+        !input.contains("--home"),
+        "bridge must observe fleet, not winning home"
+    );
+    let saved = claim();
+    // A different home/restarted dispatcher repairs presentation, not custody.
+    herdr
+        .spaces
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|(id, _)| id == "w2")
+        .unwrap()
+        .1 = json!({});
+    assert_eq!(tick(&apps)["bridge"]["status"], "live");
+    assert_eq!(claim()["owner"], saved["owner"]);
+    assert_eq!(claim()["token"], saved["token"]);
+    assert_eq!(herdr.order(), ["w2", "w1"]); // first under Local, no global pin
+    assert_eq!(herdr.spaces.lock().unwrap()[0].1["privateer"], "bridge");
+    assert!(herdr.calls("pane.focus").is_empty());
+    assert!(herdr.calls("agent.focus").is_empty());
+    // Bare entry reuses exactly once, without execing a dashboard/harness.
+    ok(&apps, &[]);
+    assert_eq!(herdr.calls("pane.focus").len(), 1);
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(herdr.calls("pane.send_input").len(), 1);
+    let original = herdr.panes.lock().unwrap().clone();
+    let no_effects = || {
+        assert_eq!(herdr.calls("workspace.create").len(), 1);
+        assert_eq!(herdr.calls("pane.send_input").len(), 1);
+        assert_eq!(herdr.calls("pane.focus").len(), 1);
+        assert!(herdr.calls("agent.focus").is_empty());
+    };
+    // Same plausible label is never endpoint ownership. Every authoritative
+    // identity change, duplicate/malformed snapshot and changed socket refuses
+    // BOTH automatic adoption/recreation and manual focus.
+    for field in [
+        "terminal_id",
+        "workspace_id",
+        "tab_id",
+        "agent_session",
+        "agent",
+    ] {
+        herdr.panes.lock().unwrap()[1][field] = json!("unexpected-occupant");
+        assert!(tick(&apps)["bridge"]["error"].is_string());
+        assert!(!command(&apps, &[]).output().unwrap().status.success());
+        no_effects();
+        *herdr.panes.lock().unwrap() = original.clone();
+    }
+    for extra in [original[1].clone(), Value::Null] {
+        herdr.panes.lock().unwrap().push(extra);
+        assert!(tick(&apps)["bridge"]["error"].is_string());
+        assert!(!command(&apps, &[]).output().unwrap().status.success());
+        no_effects();
+        *herdr.panes.lock().unwrap() = original.clone();
+    }
+    fs::rename(&socket, socket.with_extension("old")).unwrap();
+    let replacement = Herdr::start(&socket, vec![]);
+    *replacement.panes.lock().unwrap() = original.clone();
+    assert!(
+        tick(&apps)["bridge"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("incarnation")
+    );
+    assert!(!command(&apps, &[]).output().unwrap().status.success());
+    assert!(replacement.calls("workspace.create").is_empty());
+    assert!(replacement.calls("pane.send_input").is_empty());
+    assert!(replacement.calls("pane.focus").is_empty());
+    fs::remove_file(&socket).unwrap();
+    fs::rename(socket.with_extension("old"), &socket).unwrap();
+    configure(&apps, "apps", false);
+    assert!(tick(&apps)["bridge"].is_null());
+    assert!(!command(&apps, &[]).output().unwrap().status.success());
+    no_effects();
+    configure(&apps, "apps", true);
+    // Missing pane is NOT proof the live dashboard exited; no timer guesses.
+    herdr.panes.lock().unwrap().pop();
+    retry();
+    assert_eq!(
+        tick(&apps)["bridge"]["status"],
+        "live dashboard; pane missing"
+    );
+    no_effects();
+    *herdr.panes.lock().unwrap() = original.clone();
+    herdr.dashboards.lock().unwrap()[0].stop(); // exit 0/reap/restoration first
+    herdr.panes.lock().unwrap().pop();
+    herdr.spaces.lock().unwrap().retain(|(id, _)| id != "w2");
+    // Closure recreates in background. An accepted-but-delayed launch survives
+    // dispatcher restart without duplicate creation or replaying launch input.
+    herdr.suppress_input.store(true, Ordering::SeqCst);
+    assert_eq!(tick(&apps)["bridge"]["status"], "launched");
+    let pending = claim();
+    assert_eq!(pending["adopted"], false);
+    assert_eq!(
+        tick(&infra)["bridge"]["status"],
+        "awaiting dashboard or pane exit"
+    );
+    assert_eq!(herdr.calls("workspace.create").len(), 2);
+    assert_eq!(herdr.calls("pane.send_input").len(), 2);
+    herdr.panes.lock().unwrap().pop(); // explicit closure, not elapsed time
+    herdr.spaces.lock().unwrap().retain(|(id, _)| id != "w3");
+    herdr.suppress_input.store(false, Ordering::SeqCst);
+    retry();
+    assert_eq!(tick(&infra)["bridge"]["status"], "launched");
+    until("recreated direct dashboard adoption", || {
+        claim()["adopted"] == true
+    });
+    assert_ne!(claim()["token"], pending["token"]);
+    // A delayed old executable cannot take custody after its token is fenced.
+    let stale = command(&apps, &["--help"])
+        .get_envs()
+        .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+        .collect::<Vec<_>>();
+    let refused = Command::new(runtime.join("privateer-dashboard"))
+        .env_clear()
+        .envs(stale)
+        .env("PRIVATEER_BRIDGE_TOKEN", pending["token"].as_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("stale bridge launch token"));
+    assert_eq!(herdr.calls("workspace.create").len(), 3);
+    assert_eq!(herdr.calls("pane.send_input").len(), 3);
+    assert_eq!(herdr.panes.lock().unwrap().len(), 2);
+    assert_eq!(herdr.calls("pane.focus").len(), 1);
+    assert!(herdr.calls("agent.focus").is_empty());
+    herdr.dashboards.lock().unwrap()[1].stop();
+    use std::os::fd::AsRawFd;
+    let lease = fs::File::open(place.root.join("fleet.sqlite.bridge/live")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "actual dashboard lease must disappear BEFORE fixture cleanup"
+    );
+    assert!(!place.root.join("pi-pid").exists());
+    println!(
+        "bridge behavior: independent HOME contention, one initial pane/input, one manual focus, endpoint/socket ambiguity refusal, pending-token fencing, exit0/reap/terminal restoration and closure recreation; no automatic focus"
+    );
 }
 
 #[test]
@@ -578,7 +1054,7 @@ fn hosting_inherits_only_with_the_native_route_and_explicit_overrides_win() {
     );
     assert_eq!(
         fs::canonicalize(context[1]).unwrap(),
-        fs::canonicalize(BIN).unwrap()
+        fs::canonicalize(&place.binary).unwrap()
     );
     assert_eq!(context[2], place.root.to_str().unwrap());
     assert_eq!(context[3], "native-environment-sentinel-not-a-credential");
