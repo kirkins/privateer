@@ -13,6 +13,20 @@ use std::{
 
 pub(crate) mod sidebar;
 
+/// An explicit, ID-checked refusal is different from an unknown outcome after
+/// disconnect/timeout. Only the former can clear a reserved create intent.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub method: String,
+    error: Value,
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Herdr refused {}: {}", self.method, self.error)
+    }
+}
+impl std::error::Error for Refusal {}
+
 const RESPONSE_LIMIT: usize = 1_048_576;
 const DEADLINE: Duration = Duration::from_millis(800);
 
@@ -212,11 +226,13 @@ impl Client {
         }
         let value: Value = serde_json::from_slice(&response).context("invalid Herdr JSON")?;
         ensure!(value["id"] == id, "Herdr response ID mismatch");
-        ensure!(
-            value.get("error").is_none(),
-            "Herdr refused {method}: {}",
-            value["error"]
-        );
+        if let Some(error) = value.get("error") {
+            return Err(Refusal {
+                method: method.into(),
+                error: error.clone(),
+            }
+            .into());
+        }
         value
             .get("result")
             .cloned()
@@ -239,10 +255,19 @@ impl Client {
             panes.len() <= 1000,
             "Herdr snapshot has more than 1000 panes"
         );
+        let mut ids = std::collections::BTreeSet::new();
+        let mut terminals = std::collections::BTreeSet::new();
         for pane in &panes {
             ensure!(
-                !pane.pane_id.is_empty() && !pane.terminal_id.is_empty(),
+                !pane.pane_id.is_empty()
+                    && !pane.terminal_id.is_empty()
+                    && !pane.workspace_id.is_empty()
+                    && !pane.tab_id.is_empty(),
                 "Herdr snapshot has an incomplete endpoint identity"
+            );
+            ensure!(
+                ids.insert(&pane.pane_id) && terminals.insert(&pane.terminal_id),
+                "Herdr snapshot has ambiguous endpoint identities"
             );
         }
         Ok(View {
@@ -288,6 +313,43 @@ impl Client {
             binary,
             home,
             command,
+        )
+    }
+
+    /// Host-owned bridge launch. Persist the exact new endpoint BEFORE input,
+    /// including when input fails or its acknowledgement is lost. Never replay
+    /// that input into an existing pane after a dispatcher restart.
+    pub(crate) fn bridge_space(
+        &mut self,
+        folder: &Path,
+        binary: &Path,
+        home: &Path,
+        registry: &Path,
+        token: &str,
+        record: impl FnMut(Option<&Pane>) -> Result<()>,
+    ) -> Result<Pane> {
+        let observed = self.snapshot()?;
+        self.spawn_recorded(
+            &observed,
+            "workspace.create",
+            folder,
+            "bridge",
+            false,
+            &[
+                ("PRIVATEER_BRIDGE_TOKEN", token),
+                // Herdr may have a different HOME/XDG environment from its
+                // dispatchers. Pin the resolved registry even without an
+                // explicit PRIVATEER_FLEET override in the launching service.
+                (
+                    "PRIVATEER_FLEET",
+                    registry.to_str().context("fleet path must be UTF-8")?,
+                ),
+            ],
+            binary,
+            home,
+            &[],
+            false,
+            record,
         )
     }
 
@@ -346,6 +408,36 @@ impl Client {
         home: &Path,
         command: &[&str],
     ) -> Result<Pane> {
+        self.spawn_recorded(
+            observed,
+            method,
+            folder,
+            name,
+            focus,
+            extra_env,
+            binary,
+            home,
+            command,
+            true,
+            |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_recorded(
+        &mut self,
+        observed: &View,
+        method: &str,
+        folder: &Path,
+        name: &str,
+        focus: bool,
+        extra_env: &[(&str, &str)],
+        binary: &Path,
+        home: &Path,
+        command: &[&str],
+        home_argument: bool,
+        mut record: impl FnMut(Option<&Pane>) -> Result<()>,
+    ) -> Result<Pane> {
         ensure!(
             observed.socket_identity == self.identity,
             "Herdr server socket changed; refresh"
@@ -377,6 +469,7 @@ impl Client {
         for (key, value) in extra_env {
             env.insert((*key).into(), json!(value));
         }
+        record(None)?; // durable create intent, only after all preflight reads
         let made = self.request(
             method,
             json!({"cwd":folder,"label":name,"focus":focus,"env":env}),
@@ -384,9 +477,20 @@ impl Client {
         let pane: Pane = serde_json::from_value(made["root_pane"].clone())
             .with_context(|| format!("{method} did not return an exact root pane"))?;
         ensure!(
-            !pane.pane_id.is_empty() && !pane.terminal_id.is_empty(),
+            !pane.pane_id.is_empty()
+                && !pane.terminal_id.is_empty()
+                && !pane.workspace_id.is_empty()
+                && !pane.tab_id.is_empty(),
             "incomplete new pane identity"
         );
+        ensure!(
+            !observed
+                .panes
+                .iter()
+                .any(|p| p.pane_id == pane.pane_id || p.terminal_id == pane.terminal_id),
+            "host returned an existing pane; no command sent"
+        );
+        record(Some(&pane))?;
         let fresh = self.snapshot()?;
         ensure!(
             fresh.panes.iter().any(|p| p == &pane && p.agent.is_none()),
@@ -413,12 +517,18 @@ impl Client {
                 Ok(*word)
             })
             .collect::<Result<Vec<_>>>()?;
-        let text = format!(
-            "exec {} --home {} {}",
-            quote(binary)?,
-            quote(home)?,
-            words.join(" ")
-        );
+        let text = if home_argument {
+            format!(
+                "exec {} --home {} {}",
+                quote(binary)?,
+                quote(home)?,
+                words.join(" ")
+            )
+        } else {
+            // The machine bridge observes the fleet, not whichever home won
+            // contention. Its adoption token suppresses PRIVATEER_HOME fallback.
+            format!("exec {}", quote(binary)?)
+        };
         self.request(
             "pane.send_input",
             json!({"pane_id":pane.pane_id,"text":text,"keys":["Enter"]}),
@@ -559,6 +669,23 @@ impl Client {
             "pane.release_agent",
             json!({"pane_id":pane,"source":"privateer","agent":agent}),
         )?;
+        Ok(())
+    }
+
+    /// Navigation to a non-agent bridge, authorized by its separate durable
+    /// launch claim and live dashboard lease. This grants no input authority.
+    pub(crate) fn focus_bridge(&mut self, binding: &Binding) -> Result<()> {
+        ensure!(binding.socket == self.path, "bridge socket scope changed");
+        let fresh = self.snapshot()?;
+        ensure!(
+            fresh.panes.iter().any(|p| {
+                binding.matches(&fresh, p)
+                    && p.agent == binding.pane.agent
+                    && p.agent_session == binding.pane.agent_session
+            }),
+            "bridge terminal occupant changed"
+        );
+        self.request("pane.focus", json!({"pane_id": binding.pane.pane_id}))?;
         Ok(())
     }
 

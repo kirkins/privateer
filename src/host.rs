@@ -12,6 +12,8 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+pub mod bridge;
+
 /// How long a launch may take to adopt its lease before it lapses.
 const LAUNCH_TTL_SECS: u64 = 60;
 

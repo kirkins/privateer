@@ -34,6 +34,7 @@ struct Options {
     once: bool,
     ascii: bool,
     no_herdr: bool,
+    hosted: bool,
 }
 fn options() -> Result<Option<Options>> {
     let mut out = Options::default();
@@ -66,7 +67,11 @@ fn options() -> Result<Option<Options>> {
         !(out.no_herdr && out.socket.is_some()),
         "--no-herdr conflicts with --herdr-socket"
     );
-    if !out.demo && out.home.is_none() {
+    // Only the host's no-argument direct launch adopts. Explicit --once,
+    // --demo, --home, etc. remain the existing observation-only entry points,
+    // even if a terminal happens to inherit a launch token.
+    out.hosted = std::env::args_os().len() == 1 && privateer::host::bridge::requested();
+    if !out.demo && out.home.is_none() && !out.hosted {
         out.home = std::env::var_os("PRIVATEER_HOME").map(PathBuf::from);
     }
     if out.socket.is_none() && std::env::var("HERDR_ENV").as_deref() == Ok("1") {
@@ -296,6 +301,15 @@ impl Drop for MouseCapture {
 }
 fn run(opts: Options) -> Result<()> {
     Caller::from_env(None, None)?.require_operator("dashboard")?;
+    // A direct hosted process holds custody independently of its dispatcher.
+    // Ordinary explicit invocations have no token and acquire nothing. This
+    // startup handshake never creates/reorders/focuses a pane; observation below
+    // remains read-only and observes the same fleet from every launching home.
+    let _hosted_bridge = if opts.hosted {
+        privateer::host::bridge::adopt()?
+    } else {
+        None
+    };
     let registry = if opts.demo {
         PathBuf::new()
     } else {
