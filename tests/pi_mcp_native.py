@@ -308,6 +308,9 @@ class Native(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    boundary.enter()
-    NATIVE = Path(sys.argv.pop(1)).resolve(strict=True) if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
+    # No explicit binary means an opt-in skip, not a namespace or native probe.
+    # With a binary, enter the boundary BEFORE resolving or executing it.
+    if len(sys.argv) > 1 and not sys.argv[1].startswith('-'):
+        boundary.enter()
+        NATIVE = Path(sys.argv.pop(1)).resolve(strict=True)
     unittest.main()

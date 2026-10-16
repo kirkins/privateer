@@ -4,6 +4,8 @@ import errno
 import os
 import socket
 import subprocess
+import sys
+from pathlib import Path
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -90,6 +92,16 @@ class Boundary(unittest.TestCase):
                     guard.child(net, user, ['/never-execute-native'])
                 run.assert_not_called()
                 execute.assert_not_called()
+
+    def test_opt_in_skip_needs_no_namespace_or_home(self):
+        # Missing HOME makes any attempt to launch the boundary refuse before
+        # exec. An ordinary no-binary invocation must still skip successfully.
+        run = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name('pi_mcp_native.py'))],
+            env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn('skipped=1', run.stderr)
+        self.assertNotIn('offline_boundary', run.stdout)
 
     def test_environment_preserves_only_real_home_and_fixed_path(self):
         with patch.dict(os.environ, {'HOME': '/real-home', 'HTTPS_PROXY': 'sentinel',
