@@ -197,7 +197,8 @@ fn observe(
               AND (m.task_id IS NULL OR t.status NOT IN ('done','cancelled'))
           UNION ALL SELECT 'job',j.id FROM jobs j LEFT JOIN tasks t ON t.id=json_extract(j.record,'$.task_id')
             WHERE json_extract(j.record,'$.status')='orphaned' OR
-              (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
+              (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.heavy')=1
+               AND json_extract(j.record,'$.created_ms')<=?1
                AND t.status NOT IN ('done','cancelled'))
           {schedule_union}
         ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
@@ -285,7 +286,7 @@ fn observe(
                 let job: Value = serde_json::from_str(&raw)?;
                 item["kind"] = json!("blocker");
                 item["evidence"] = json!(if job["status"] == "queued" {
-                    "capacity_wait"
+                    "stuck_heavy_capacity"
                 } else {
                     "orphaned_job"
                 });
@@ -304,6 +305,11 @@ fn observe(
                         .collect::<String>()
                 );
                 item["created_ms"] = job["created_ms"].clone();
+                if job["status"] == "queued" {
+                    item["waited_ms"] =
+                        json!(now.saturating_sub(job["created_ms"].as_i64().unwrap_or(now)));
+                    item["heavy"] = json!(true);
+                }
                 item["version"] = json!(crate::core::hash(&json!([
                     job["incarnation"],
                     job["status"],

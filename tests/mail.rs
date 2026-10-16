@@ -2169,8 +2169,12 @@ fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
     )
     .unwrap();
     let now = Store::now_ms();
-    for (id, status) in [("queued", "queued"), ("orphan", "orphaned")] {
-        s.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",rusqlite::params![id,json!({"id":id,"status":status,"task_id":"main","created_ms":now-61_000,"incarnation":"inc","reason":"typed reason"}).to_string()]).unwrap();
+    for (id, status, heavy) in [
+        ("queued", "queued", true),
+        ("normal-queued", "queued", false),
+        ("orphan", "orphaned", false),
+    ] {
+        s.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",rusqlite::params![id,json!({"id":id,"status":status,"heavy":heavy,"task_id":"main","created_ms":now-61_000,"incarnation":"inc","reason":"typed reason"}).to_string()]).unwrap();
     }
     let before: i64 = s
         .connection()
@@ -2190,6 +2194,15 @@ fn needs_uses_typed_blockers_not_mail_text_and_is_read_only() {
             .iter()
             .all(|item| item["source"] == "job")
     );
+    let stuck = result["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["source_id"] == "queued")
+        .unwrap();
+    assert_eq!(stuck["evidence"], "stuck_heavy_capacity");
+    assert_eq!(stuck["heavy"], true);
+    assert!(stuck["waited_ms"].as_i64().unwrap() >= 60_000);
     assert!(
         result["unknown"]
             .as_array()
