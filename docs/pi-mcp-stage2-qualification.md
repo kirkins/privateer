@@ -224,6 +224,34 @@ The stage-one native test now creates disposable roots below the owned repositor
 instead. Production path validation, host permissions, namespace containment and
 provider routes remain unchanged; no unguarded fallback was attempted.
 
+The complete frozen rerun at SHA
+`030bb84013d9c3d8bb5ad74fec19a9b565bae391`, base `2daef25`, **succeeded,
+exit 0**: admitted serial job `f835e4ff-6057-45de-8d60-da1dfb15c832`, incarnation
+`4d0db5b7-7921-4c15-9ba6-ee4db0e2ec32`. No edits occurred while queued/running.
+Its full stdout/stderr logs use the same job/incarnation path pattern above.
+
+| Check | Result |
+| --- | --- |
+| Python syntax (guard/tests/native fixtures) | Pass |
+| Fail-closed boundary unit tests | 8 passed, 0.006s |
+| Stage-one Python regressions | 20 passed, 0.106s |
+| Guarded native MCP | 5 methods / 13 invocations passed, 16.945s |
+| Guarded stage-one native regressions | 3 passed, 5.789s |
+| Base diff whitespace and frozen clean worktree | Pass |
+
+Both guarded native suites logged fresh user/network namespaces distinct from
+the host, only loopback/local routes, real HOME preservation, and all four
+external `ENETUNREACH` proofs. The MCP rerun preserved the complete selection,
+concurrency, error/collision, lazy-exposure, timeout/cancellation and shutdown
+observations above: all thirteen ambient TCP counts zero **after successful
+per-listener positive controls**, all unselected/ambient stdio markers absent,
+and all six selected stdio payload identities gone before fallback cleanup.
+The stage-one native inventory retained selected/empty/attended/hosted-crew/
+concurrent behavior, zero ambient MCP connections and exactly four fake API calls.
+This result qualifies the test boundary, not a production deployment or general
+hostile-code sandbox. The following documentation-only evidence update does not
+change the code tested at the frozen SHA.
+
 ## Important limits and minimal future design
 
 **This API is useful but is not a turnkey fail-closed policy boundary.** Native
