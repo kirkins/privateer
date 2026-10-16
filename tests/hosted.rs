@@ -18,6 +18,23 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use support::BIN;
 
+// Concurrent forks can briefly retain a writable descriptor for a copied
+// fixture executable. Retry only Linux ETXTBSY before the child starts, with
+// the same bounded window used by the other copied-binary fixtures.
+fn retry_fixture_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match exec() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn until(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !done() {
@@ -99,7 +116,7 @@ impl Place {
         command
     }
     fn ok(&self, args: &[&str]) -> String {
-        let output = self.command(args).output().unwrap();
+        let output = retry_fixture_exec(|| self.command(args).output()).unwrap();
         assert!(
             output.status.success(),
             "{args:?}: {}",
@@ -109,12 +126,13 @@ impl Place {
     }
     /// A command as the ship's agent, as its first mate runs them.
     fn agent(&self, command: &str, args: Value) -> Value {
-        let output = self
-            .command(&[command, "--json", &args.to_string()])
-            .env("PRIVATEER_ROLE", "agent")
-            .env("PRIVATEER_ACTOR", "infra")
-            .output()
-            .unwrap();
+        let output = retry_fixture_exec(|| {
+            self.command(&[command, "--json", &args.to_string()])
+                .env("PRIVATEER_ROLE", "agent")
+                .env("PRIVATEER_ACTOR", "infra")
+                .output()
+        })
+        .unwrap();
         assert!(
             output.status.success(),
             "{command}: {}",
@@ -132,8 +150,8 @@ impl Place {
     }
     fn at(&self, name: &str, command: &str, args: Value) -> Value {
         let home = self.folder.parent().unwrap().join(name).join(".privateer");
-        let output = self
-            .command(&[
+        let output = retry_fixture_exec(|| {
+            self.command(&[
                 "--home",
                 home.to_str().unwrap(),
                 command,
@@ -141,7 +159,8 @@ impl Place {
                 &args.to_string(),
             ])
             .output()
-            .unwrap();
+        })
+        .unwrap();
         assert!(
             output.status.success(),
             "{command}: {}",
@@ -640,7 +659,7 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
         c
     };
     let ok = |home: &Path, args: &[&str]| {
-        let out = command(home, args).output().unwrap();
+        let out = retry_fixture_exec(|| command(home, args).output()).unwrap();
         assert!(
             out.status.success(),
             "{args:?}: {}",
@@ -721,17 +740,14 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     // SAME machine claim rather than taking a per-home lock and launching too.
     herdr.slow_create.store(true, Ordering::SeqCst);
     let mut first = command(&infra, &["serve", "--json", r#"{"once":true}"#]);
-    let first = first
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let first =
+        retry_fixture_exec(|| first.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()).unwrap();
     until("first dispatcher inside fake Herdr create", || {
         herdr.creating.load(Ordering::SeqCst)
     });
-    let second = command(&apps, &["serve", "--json", r#"{"once":true}"#])
-        .output()
-        .unwrap();
+    let second =
+        retry_fixture_exec(|| command(&apps, &["serve", "--json", r#"{"once":true}"#]).output())
+            .unwrap();
     assert!(
         second.status.success(),
         "{}",
@@ -811,7 +827,12 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
         fs::rename(&path, &saved_path).unwrap();
         if name == "live" {
             assert!(tick(&apps)["bridge"]["error"].is_string());
-            assert!(!command(&apps, &[]).output().unwrap().status.success());
+            assert!(
+                !retry_fixture_exec(|| command(&apps, &[]).output())
+                    .unwrap()
+                    .status
+                    .success()
+            );
             no_effects();
         }
         fs::OpenOptions::new()
@@ -821,7 +842,12 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
             .open(&path)
             .unwrap();
         assert!(tick(&apps)["bridge"]["error"].is_string());
-        assert!(!command(&apps, &[]).output().unwrap().status.success());
+        assert!(
+            !retry_fixture_exec(|| command(&apps, &[]).output())
+                .unwrap()
+                .status
+                .success()
+        );
         no_effects();
         fs::remove_file(&path).unwrap();
         fs::rename(saved_path, path).unwrap();
@@ -838,14 +864,24 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     ] {
         herdr.panes.lock().unwrap()[1][field] = json!("unexpected-occupant");
         assert!(tick(&apps)["bridge"]["error"].is_string());
-        assert!(!command(&apps, &[]).output().unwrap().status.success());
+        assert!(
+            !retry_fixture_exec(|| command(&apps, &[]).output())
+                .unwrap()
+                .status
+                .success()
+        );
         no_effects();
         *herdr.panes.lock().unwrap() = original.clone();
     }
     for extra in [original[1].clone(), Value::Null] {
         herdr.panes.lock().unwrap().push(extra);
         assert!(tick(&apps)["bridge"]["error"].is_string());
-        assert!(!command(&apps, &[]).output().unwrap().status.success());
+        assert!(
+            !retry_fixture_exec(|| command(&apps, &[]).output())
+                .unwrap()
+                .status
+                .success()
+        );
         no_effects();
         *herdr.panes.lock().unwrap() = original.clone();
     }
@@ -858,7 +894,12 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
             .unwrap()
             .contains("incarnation")
     );
-    assert!(!command(&apps, &[]).output().unwrap().status.success());
+    assert!(
+        !retry_fixture_exec(|| command(&apps, &[]).output())
+            .unwrap()
+            .status
+            .success()
+    );
     assert!(replacement.calls("workspace.create").is_empty());
     assert!(replacement.calls("pane.send_input").is_empty());
     assert!(replacement.calls("pane.focus").is_empty());
@@ -866,7 +907,12 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     fs::rename(socket.with_extension("old"), &socket).unwrap();
     configure(&apps, "apps", false);
     assert!(tick(&apps)["bridge"].is_null());
-    assert!(!command(&apps, &[]).output().unwrap().status.success());
+    assert!(
+        !retry_fixture_exec(|| command(&apps, &[]).output())
+            .unwrap()
+            .status
+            .success()
+    );
     no_effects();
     configure(&apps, "apps", true);
     // Missing pane is NOT proof the live dashboard exited; no timer guesses.
@@ -907,12 +953,14 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
         .get_envs()
         .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
         .collect::<Vec<_>>();
-    let refused = Command::new(runtime.join("privateer-dashboard"))
-        .env_clear()
-        .envs(stale)
-        .env("PRIVATEER_BRIDGE_TOKEN", pending["token"].as_str().unwrap())
-        .output()
-        .unwrap();
+    let refused = retry_fixture_exec(|| {
+        Command::new(runtime.join("privateer-dashboard"))
+            .env_clear()
+            .envs(stale.clone())
+            .env("PRIVATEER_BRIDGE_TOKEN", pending["token"].as_str().unwrap())
+            .output()
+    })
+    .unwrap();
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("stale bridge launch token"));
     assert_eq!(herdr.calls("workspace.create").len(), 3);
@@ -1014,16 +1062,18 @@ fn hosting_inherits_only_with_the_native_route_and_explicit_overrides_win() {
     }
     assert_eq!(place.json("ship.show", json!({"name":"infra"})), original);
     assert_eq!(herdr.calls("workspace.create").len(), 0);
-    let refused = place
-        .command(&[
-            "ship.create",
-            "--json",
-            r#"{"name":"invalid","host":"other-host"}"#,
-        ])
-        .env("PRIVATEER_ROLE", "agent")
-        .env("PRIVATEER_ACTOR", "infra")
-        .output()
-        .unwrap();
+    let refused = retry_fixture_exec(|| {
+        place
+            .command(&[
+                "ship.create",
+                "--json",
+                r#"{"name":"invalid","host":"other-host"}"#,
+            ])
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "infra")
+            .output()
+    })
+    .unwrap();
     assert!(!refused.status.success());
     assert!(!place.root.join("invalid").exists());
     // A custom manifest that merely declares Pi's id is not a native-route
@@ -1225,14 +1275,9 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
     // fresh Store/process; there is no resident-service startup special case.
     let mut passes = vec![];
     for _ in 0..3 {
-        passes.push(
-            place
-                .command(&["serve", "--json", r#"{"once":true}"#])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
+        let mut pass = place.command(&["serve", "--json", r#"{"once":true}"#]);
+        pass.stdout(Stdio::piped()).stderr(Stdio::piped());
+        passes.push(retry_fixture_exec(|| pass.spawn()).unwrap());
     }
     let mut succeeded = 0;
     for pass in passes {
