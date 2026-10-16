@@ -43,6 +43,9 @@ HELP = (
     "/waiting — questions and decisions still waiting on you\n"
     "/yolo on|off|status — tool approval mode for every first mate\n"
     "/stow [status|resume] — checkpoint every ship and hold new jobs, e.g. before an update\n"
+    "/afk [until 8am] [instructions] — away: hold mail, only emergencies 🚨 get through\n"
+    "/back — back from away (any ordinary message also brings you back)\n"
+    "/held — what was held while you were away\n"
     "/voice [on|off] — speak messages as voice notes (needs [tts])\n"
     "/help — this message\n\n"
     "Photos and files are saved and the ship is handed their path. Voice notes are "
@@ -54,6 +57,9 @@ COMMANDS = [
     {"command": "status", "description": "What the fleet is doing"},
     {"command": "yolo", "description": "Fleet tool approvals: on, off or status"},
     {"command": "stow", "description": "Checkpoint the fleet: stow, status or resume"},
+    {"command": "afk", "description": "Away: hold mail, emergencies only"},
+    {"command": "back", "description": "Back from away, with a summary"},
+    {"command": "held", "description": "What was held while you were away"},
     {"command": "ships", "description": "The fleet's ships"},
     {"command": "waiting", "description": "What is waiting on you"},
     {"command": "voice", "description": "Toggle spoken messages"},
@@ -194,7 +200,9 @@ class Door:
             tg.log(f"{event['ref']}: a routine acknowledgement stays out of the chat")
             return ""
         header = f"{ICONS.get(kind, '✉️')} <b>{tg.escape_html(sender)}</b> · {kind}"
-        if mail.get("urgency") == "high":
+        if event.get("breakthrough"):
+            header = "🚨 " + header + " · while you're away"
+        elif mail.get("urgency") == "high":
             header = "🔴 " + header
         if kind in ("request", "decision"):
             header += " · reply to answer"
@@ -260,6 +268,7 @@ class Door:
             else:
                 self.say(f"⚠️ not sent: {e}", reply_to=msg_id)
                 return
+        self.welcome(result.get("returned"))
         ship = result.get("ship", "")
         mail_id = (result.get("mail") or {}).get("id")
         if mail_id and msg_id:
@@ -381,6 +390,12 @@ class Door:
                 self.say(f"Fleet tool mode: {value['mode']}. Applies to every first mate's next launch; running sessions keep their current mode.")
             elif name == "stow":
                 self.cmd_stow(rest, msg_id)
+            elif name == "afk":
+                self.cmd_afk(rest)
+            elif name == "back":
+                self.welcome(self.runtime.call("away", {"action": "back"}).get("returned"), quiet=False)
+            elif name == "held":
+                self.cmd_held()
             elif name == "voice":
                 import tts
                 self.say(tts.voice_reply(self.cfg, rest))
@@ -388,6 +403,43 @@ class Door:
                 self.say(f"❓ unknown command /{name} — try /help", reply_to=msg_id)
         except RuntimeError as e:
             self.say(f"⚠️ {e}", reply_to=msg_id)
+
+    def cmd_afk(self, rest: str) -> None:
+        out = self.runtime.call("away", {"action": "start", "words": rest})
+        away = out.get("away") or {}
+        since = time.strftime("%H:%M", time.localtime((away.get("since_ms") or 0) / 1000))
+        until = f" (back about {away['until']})" if away.get("until") else ""
+        text = (f"🌙 Away from {since}{until}. I'll hold everything except emergencies 🚨, "
+                "at most three an hour. Any message brings you back.")
+        if away.get("words"):
+            text += f"\nYour instructions for the liaison: “{away['words']}”"
+        self.say(text)
+
+    def welcome(self, returned: dict | None, quiet: bool = True) -> None:
+        """The records-only digest on the captain's return; the liaison's summary follows."""
+        if not returned:
+            if not quiet:
+                self.say("You weren't away.")
+            return
+        text = "🌅 " + returned.get("digest", "Welcome back.")
+        if returned.get("summary_requested"):
+            text += "\nThe liaison is writing you a summary."
+        self.say(text)
+
+    def cmd_held(self) -> None:
+        out = self.runtime.call("held", {})
+        held = out.get("held") or []
+        if not held:
+            self.say("Nothing was held.")
+            return
+        lines = [f"{len(held)} held:"]
+        for m in held[:30]:
+            when = time.strftime("%H:%M", time.localtime(m.get("created_ms", 0) / 1000))
+            body = " ".join((m.get("body") or "").split())[:140]
+            lines.append(f"• {m.get('ship')} {m.get('kind')} {when}: {body}")
+        if len(held) > 30:
+            lines.append(f"…and {len(held) - 30} more.")
+        self.say("\n".join(lines))
 
     def cmd_stow(self, rest: str, msg_id) -> None:
         action = {"": "start", "status": "status", "resume": "resume"}.get(rest)

@@ -274,6 +274,38 @@ def main() -> int:
                 for m in fleet.inbox(ship, ship):
                     assert "everything" not in m["body"] and "elsewhere" not in m["body"], m
 
+            # Away: /afk holds routine mail, an emergency breaks through marked,
+            # /held lists the rest, and an ordinary message is the return.
+            telegram.message("/afk until 8am merge #9 if green")
+            wait_for("the away confirmation", lambda: [
+                m for m in telegram.sent()
+                if m["text"].startswith("🌙 Away from") and "merge #9 if green" in m["text"]])
+            before = len(telegram.sent())
+            fleet.call("ops", "mail.send", {"from": "ops", "to": "captain", "kind": "notice",
+                                            "body": "Nightly build done."})
+            fleet.call("ops", "mail.send", {"from": "ops", "to": "captain", "kind": "notice",
+                                            "urgency": "high", "body": "Production is down."})
+            alarm = wait_for("the emergency", lambda: [
+                m for m in telegram.sent()[before:] if "Production is down." in m["text"]])[0]
+            assert alarm["text"].startswith("🚨"), alarm
+            cards = lambda: [m for m in telegram.sent()[before:]
+                             if "<b>ops</b>" in m["text"] and "Nightly build" in m["text"]]
+            time.sleep(2)
+            assert not cards(), "routine mail reached the phone while away"
+            telegram.message("/held")
+            wait_for("the held list", lambda: [
+                m for m in telegram.sent()[before:]
+                if m["text"].startswith("1 held:") and "Nightly build done." in m["text"]])
+            telegram.message("good morning")
+            welcome = wait_for("the return digest", lambda: [
+                m for m in telegram.sent()[before:] if m["text"].startswith("🌅 Welcome back.")])[0]
+            assert "1 emergency sent" in welcome["text"], welcome
+            summary = [m for m in fleet.inbox("liaison", "liaison")
+                       if m["body"].startswith("I'm back after")]
+            assert summary and "Nightly build done." in summary[-1]["body"], summary
+            time.sleep(2)
+            assert not cards(), "held mail was replayed after the return"
+
             # Stopping the supervisor stops the adapter.
             adapter = int((state / "adapter.pid").read_text())
             supervisor.send_signal(signal.SIGTERM)
