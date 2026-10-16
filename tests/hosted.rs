@@ -181,6 +181,23 @@ impl Place {
             fs::remove_file(self.root.join(file)).unwrap();
         }
     }
+    fn stop_wake(&self, wake: &str) {
+        until("headless native payload", || {
+            self.root.join("pi-env").exists()
+        });
+        let pid = self.native_pid();
+        fs::write(self.root.join("release"), "").unwrap();
+        until("headless fallback result", || {
+            self.json("job.status", json!({"id":wake}))["status"] == "succeeded"
+        });
+        until(
+            "actual headless payload exit, before fixture cleanup",
+            || unsafe { libc::kill(pid, 0) } == -1,
+        );
+        for file in ["release", "pi-pid", "pi-env", "pi-context", "pi-argv"] {
+            fs::remove_file(self.root.join(file)).unwrap();
+        }
+    }
     fn wakes(&self) -> i64 {
         rusqlite::Connection::open(self.folder.join(".privateer/privateer.sqlite"))
             .unwrap()
@@ -580,11 +597,32 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
         json!({"id":"infra","provider_plugin":{"manifest":manifest}}),
     );
     place.retry_now();
-    assert!(
-        place.tick()["host_error"]
-            .as_str()
-            .unwrap()
-            .contains("selected provider adapter")
+    let pinned = place.tick();
+    println!("idle native provider-pin refusal: {pinned}");
+    // Native hosting supplies bundled:pi. The existing pinned-provider path
+    // requires an absolute supplied manifest, so it refuses that reference
+    // before comparing adapter identities. Do not change either route to make
+    // this fixture reach the later 'selected provider adapter' diagnostic.
+    assert_eq!(
+        pinned["host_error"], "plugin paths must be absolute",
+        "{pinned}"
+    );
+    assert!(pinned["hosted"].is_null(), "{pinned}");
+    assert!(pinned["wake"].is_null(), "{pinned}");
+    assert_eq!(place.wakes(), 0);
+    assert_eq!(herdr.calls("workspace.create").len(), 0);
+    assert_eq!(herdr.calls("pane.send_input").len(), 0);
+    assert!(!place.root.join("pi-pid").exists());
+    let presence = place.json("ship.presence", json!({"ship":"infra"}));
+    assert_eq!(presence["attended"], false, "{presence}");
+    assert!(presence["lease"].is_null(), "{presence}");
+    assert_eq!(
+        place.json("charter.show", json!({"id":"infra"}))["provider_plugin"],
+        json!({"manifest":manifest})
+    );
+    assert_eq!(
+        place.json("ship.show", json!({"name":"infra"}))["first_mate"],
+        original
     );
     place.json("charter.put", json!({"id":"infra","provider_plugin":null}));
     place.json("charter.revoke", json!({"id":"infra"}));
@@ -702,21 +740,10 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
     until("headless native payload", || {
         place.root.join("pi-env").exists()
     });
-    let pid = place.native_pid();
     place.retry_now();
     assert_eq!(place.tick()["skipped"], "first mate already awake");
     assert_eq!(herdr.calls("workspace.create").len(), calls);
-    fs::write(place.root.join("release"), "").unwrap();
-    until("headless fallback result", || {
-        place.json("job.status", json!({"id":report["wake"]}))["status"] == "succeeded"
-    });
-    until(
-        "headless payload gone",
-        || unsafe { libc::kill(pid, 0) } == -1,
-    );
-    for file in ["release", "pi-pid", "pi-env", "pi-context", "pi-argv"] {
-        fs::remove_file(place.root.join(file)).unwrap();
-    }
+    place.stop_wake(report["wake"].as_str().unwrap());
     herdr.reject_create.store(false, Ordering::SeqCst);
     // A host that accepts input but never runs it leaves an unadopted lease.
     // Even its expiry and dispatcher restart cannot lose the reserved backoff.
@@ -851,21 +878,56 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     assert_eq!(place.wakes(), 0);
 
-    // When the session ends its lease goes; without Herdr, mail still gets a
-    // headless wake.
-    fs::write(place.root.join("release"), "").unwrap();
-    until("the lease to be released", || {
-        place.json("ship.presence", json!({"ship":"infra"}))["attended"] == false
-    });
+    // Adoption resets failures, not the reserved retry deadline. Prove the
+    // native payload and lease are gone before exercising headless fallback.
+    place.stop_native("infra");
+    let state = place.launch_state();
+    assert_eq!(state.0, 0);
+    assert!(state.1 > privateer::store::Store::now_ms(), "{state:?}");
+    assert!(state.2.is_none(), "{state:?}");
     fs::remove_file(&socket).unwrap();
+    let calls = herdr.requests.lock().unwrap().len();
     place.json(
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"still there?"}),
     );
     let report = place.tick();
     assert!(report["wake"].is_string(), "{report}");
-    assert!(report["host_error"].is_string(), "{report}");
+    assert!(report["host_error"].is_null(), "{report}");
+    assert_eq!(report["host_backoff_until_ms"], state.1, "{report}");
+    assert_eq!(place.launch_state(), state);
+    assert_eq!(herdr.requests.lock().unwrap().len(), calls);
     assert_eq!(place.wakes(), 1);
+    place.stop_wake(report["wake"].as_str().unwrap());
+
+    // Only a due attempt reports a new host error. Jump the durable deadline
+    // rather than deleting backoff, then prove missing Herdr still falls back
+    // to a real headless subprocess without leaking the launch lease.
+    place.retry_now();
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"retry after deadline"}),
+    );
+    let report = place.tick();
+    assert!(report["wake"].is_string(), "{report}");
+    assert!(
+        report["host_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Herdr socket unavailable:"),
+        "{report}"
+    );
+    assert!(report["host_backoff_until_ms"].is_null(), "{report}");
+    let state = place.launch_state();
+    assert_eq!(state.0, 1);
+    assert!(state.1 > privateer::store::Store::now_ms(), "{state:?}");
+    assert_eq!(state.2.as_deref(), report["host_error"].as_str());
+    let presence = place.json("ship.presence", json!({"ship":"infra"}));
+    assert_eq!(presence["attended"], false, "{presence}");
+    assert!(presence["lease"].is_null(), "{presence}");
+    assert_eq!(herdr.requests.lock().unwrap().len(), calls);
+    assert_eq!(place.wakes(), 2);
+    place.stop_wake(report["wake"].as_str().unwrap());
 }
 
 #[test]
