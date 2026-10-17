@@ -693,6 +693,13 @@ impl Client {
         Ok(())
     }
 
+    /// The pane as Herdr lists it now, read back to confirm a report or release
+    /// took effect: Herdr answers ok to a report it then drops.
+    pub fn pane_get(&mut self, pane: &str) -> Result<Value> {
+        let result = self.request("pane.get", json!({"pane_id":pane}))?;
+        Ok(result.get("pane").cloned().unwrap_or(result))
+    }
+
     /// Navigation to a non-agent bridge, authorized by its separate durable
     /// launch claim and live dashboard lease. This grants no input authority.
     pub(crate) fn focus_bridge(&mut self, binding: &Binding) -> Result<()> {
