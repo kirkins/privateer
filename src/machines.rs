@@ -457,8 +457,10 @@ fn set_desk(machine: Option<&str>) -> Result<Value> {
 
 /// Host-level problems are checked at most this often.
 const ALERT_EVERY_MS: i64 = 60_000;
-/// A capacity queue whose head has waited this long, or a route backed off
-/// for at least this long, is worth the owner's attention.
+/// A capacity queue whose head has waited this long, and whose holder looks
+/// unhealthy, or a route backed off for at least this long, is worth the
+/// owner's attention. A long wait behind a healthy heavy job is ordinary
+/// serialization: the waiting ship sees it in its own bearings.
 const LONG_WAIT_MS: i64 = 600_000;
 const LONG_BACKOFF_MS: i64 = 1_800_000;
 
@@ -517,14 +519,34 @@ fn host_problems(store: &Store, raised: &[String]) -> Result<Vec<(String, String
             ),
         ));
     }
+    // A capacity queue is only a problem when the job holding capacity looks
+    // unhealthy, or when nothing holds it at all. A queue behind a healthy
+    // heavy job is what the cap is for, and the waiting ship's bearings
+    // already say what it waits behind.
     if let Some(waited) = crate::jobs::oldest_wait_ms(store)?.filter(|w| *w >= LONG_WAIT_MS) {
-        problems.push((
-            "capacity_wait".into(),
-            format!(
-                "A job has waited {} minutes in this machine's capacity queue. Check resource.status for what holds capacity, and runtime.needs for stuck reservations.",
-                waited / 60_000
-            ),
-        ));
+        let holders = crate::jobs::capacity_holders(store)?;
+        let sick: Vec<&str> = holders
+            .iter()
+            .filter_map(|h| h.unhealthy.as_deref())
+            .collect();
+        if !sick.is_empty() {
+            problems.push((
+                "capacity_wait".into(),
+                format!(
+                    "A job has waited {} minutes in this machine's capacity queue behind a job that looks unhealthy: {}. Check resource.status for what holds capacity, and runtime.needs for stuck reservations.",
+                    waited / 60_000,
+                    sick.join("; ")
+                ),
+            ));
+        } else if holders.is_empty() || !holders.iter().any(|h| h.live()) {
+            problems.push((
+                "capacity_wait".into(),
+                format!(
+                    "A job has waited {} minutes in this machine's capacity queue and nothing live holds capacity. Check runtime.needs for stuck reservations, and resource.status for what holds capacity.",
+                    waited / 60_000
+                ),
+            ));
+        }
     }
     for route in crate::routes::list(&ledger)? {
         let until = route["until_ms"].as_i64().unwrap_or(0);
