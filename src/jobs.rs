@@ -1091,6 +1091,9 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         wait_for_capacity || max_wait_secs.is_none(),
         "max_wait_secs requires wait_for_capacity"
     );
+    // Descendants left behind by a finished leader are usually leaks (a test
+    // helper, a stray watcher) that would hold the job's capacity until
+    // someone cancels it. A caller that means to leave them running opts out.
     let cleanup_descendants = args
         .get("cleanup_descendants")
         .map(|value| {
@@ -1099,7 +1102,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                 .context("cleanup_descendants must be boolean")
         })
         .transpose()?
-        .unwrap_or(false);
+        .unwrap_or(true);
     let requested_actor = args
         .get("agent_actor")
         .filter(|v| !v.is_null())

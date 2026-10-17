@@ -100,6 +100,14 @@ fn start(home: &Path, id: &str, command: &[&str]) -> Value {
         json!({"task_id":"task","id":id,"command":command,"heavy":true}),
     )
 }
+/// A heavy job that leaves its leftover descendants running.
+fn start_keeping(home: &Path, id: &str, command: &[&str]) -> Value {
+    ok(
+        home,
+        "job.start",
+        json!({"task_id":"task","id":id,"command":command,"heavy":true,"cleanup_descendants":false}),
+    )
+}
 fn active_pid(pid: i32) -> bool {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
@@ -480,7 +488,7 @@ fn provider_binding_survives_retry_and_changes_cancel_running_work() {
 fn ordinary_leader_exit_preserves_and_can_cancel_recorded_descendants() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
-    start(
+    start_keeping(
         &home,
         "ordinary-orphan",
         &["/bin/sh", "-c", "sleep 30 & echo $! > orphan.pid; exit 0"],
@@ -574,13 +582,13 @@ fn unexpected_supervisor_error_is_private_durable_and_keeps_payload_capacity() {
 }
 
 #[test]
-fn opted_in_completion_cleanup_stops_owned_helpers_and_preserves_success() {
+fn completion_cleanup_stops_leftover_helpers_by_default_and_preserves_success() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
     ok(
         &home,
         "job.start",
-        json!({"task_id":"task","id":"clean-completion","cleanup_descendants":true,
+        json!({"task_id":"task","id":"clean-completion",
         "command":["/bin/sh","-c","sh -c 'trap \"\" TERM; echo $$ > cleanup.pid; while :; do sleep 1; done' & while test ! -f cleanup.pid; do sleep 0.01; done; exit 0"]}),
     );
     let completed = wait(&home, "clean-completion", &["succeeded"]);
@@ -732,7 +740,7 @@ fn fails(home: &Path, command: &str, args: Value) -> String {
 fn orphan_settles_to_its_leader_result_once_descendants_exit() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
-    start(&home, "lingering", &["/bin/sh", "-c", "sleep 1 & exit 0"]);
+    start_keeping(&home, "lingering", &["/bin/sh", "-c", "sleep 1 & exit 0"]);
     let orphan = wait(&home, "lingering", &["orphaned", "succeeded"]);
     assert_eq!(
         orphan["status"], "orphaned",
@@ -745,7 +753,7 @@ fn orphan_settles_to_its_leader_result_once_descendants_exit() {
     assert_eq!(settled["leader_result"], Value::Null);
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
     // A failing leader settles to failure with its exit code.
-    start(
+    start_keeping(
         &home,
         "lingering-failure",
         &["/bin/sh", "-c", "sleep 1 & exit 3"],
