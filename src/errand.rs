@@ -29,6 +29,7 @@ pub fn init(store: &Store) -> Result<()> {
            harness TEXT, session_id TEXT, verdict TEXT, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS errand_ship ON errands(ship, created_ms);",
     )?;
+    crate::herdr::errands::init(store)?;
     Ok(())
 }
 
@@ -190,8 +191,10 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
             "UPDATE errands SET status='failed', finished_ms=?2, error=?3 WHERE id=?1",
             params![id, Store::now_ms(), format!("{error:#}")],
         )?;
+        crate::herdr::errands::reconcile(store);
         return Err(error);
     }
+    crate::herdr::errands::reconcile(store);
     store.audit(
         "errand.start",
         &json!({"errand": id, "ship": ship, "focus": focus}),
@@ -310,6 +313,7 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         )?;
         settled.push(json!({"errand": id, "status": outcome}));
     }
+    crate::herdr::errands::reconcile(store);
     Ok(settled)
 }
 

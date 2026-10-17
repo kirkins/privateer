@@ -2,6 +2,8 @@
 //! session in its own Herdr space. A fake Herdr runs what the dispatcher types
 //! into the new pane, so the real `privateer start --hosted` and its harness
 //! (a fake `pi` on PATH) run as subprocesses.
+#[path = "hosted/errand_labels.rs"]
+mod errand_labels;
 mod support;
 
 use serde_json::{Value, json};
@@ -44,7 +46,7 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 struct Place {
-    _temp: tempfile::TempDir,
+    _temp: Option<tempfile::TempDir>,
     root: PathBuf,
     folder: PathBuf,
     binary: PathBuf,
@@ -69,7 +71,7 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
+                "#!/bin/sh\ncase \"$PRIVATEER_JOB\" in errand-*) printf '%s' \"$$\" > '{root}/'$PRIVATEER_JOB'-pid'; while [ ! -e '{root}/'$PRIVATEER_JOB'-release' ]; do sleep 0.05; done; printf '%s\\n' '{{\"type\":\"session\",\"id\":\"22222222-2222-4222-8222-222222222222\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{{\"type\":\"text\",\"text\":\"Reviewed fixture\"}}]}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'; exit 0;; esac\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
                  printf '%s\\n' \"$$\" > '{root}/pi-pid'\n\
                  printf '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\" > '{root}/pi-context'\n\
@@ -83,7 +85,7 @@ impl Place {
         .unwrap();
         fs::set_permissions(bin.join("pi"), fs::Permissions::from_mode(0o755)).unwrap();
         let place = Self {
-            _temp: temp,
+            _temp: Some(temp),
             path: format!("{}:/usr/bin:/bin", bin.display()),
             root,
             folder,
@@ -290,6 +292,82 @@ impl Place {
     }
 }
 
+// Panic recovery is not a passing lifecycle proof. Preserve original evidence
+// and normally release only this fixture's scripted children BEFORE any removal.
+impl Drop for Place {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        if let Some(temp) = self._temp.take() {
+            let _ = temp.keep();
+        }
+        let mut pids = vec![];
+        if let Ok(files) = fs::read_dir(&self.root) {
+            for entry in files.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "pi-pid" || (name.starts_with("errand-") && name.ends_with("-pid")) {
+                    if let Ok(raw) = fs::read_to_string(entry.path()) {
+                        if let Ok(pid) = raw.trim().parse::<i32>() {
+                            pids.push(pid);
+                        }
+                    }
+                    let release = if name == "pi-pid" {
+                        "release".into()
+                    } else {
+                        format!("{}-release", name.trim_end_matches("-pid"))
+                    };
+                    let _ = fs::write(self.root.join(release), "");
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while pids.iter().any(|pid| unsafe { libc::kill(*pid, 0) } == 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Also allow the hosted wrapper to release its lease after reaping.
+        while Instant::now() < deadline {
+            let live = rusqlite::Connection::open(self.folder.join(".privateer/privateer.sqlite"))
+                .and_then(|db| {
+                    db.query_row("SELECT COUNT(*) FROM presence", [], |r| r.get::<_, i64>(0))
+                })
+                .unwrap_or(0);
+            if live == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let alive: Vec<_> = pids
+            .iter()
+            .filter(|pid| unsafe { libc::kill(**pid, 0) } == 0)
+            .collect();
+        eprintln!(
+            "FAILED fixture preserved at {}; scripted payloads still alive: {alive:?}; not passing lifecycle proof",
+            self.root.display()
+        );
+        if let Some(evidence) = std::env::var_os("ERRAND_LABELS_EVIDENCE") {
+            fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+                fs::create_dir_all(to)?;
+                for entry in fs::read_dir(from)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        copy(&entry.path(), &to.join(entry.file_name()))?;
+                    } else if entry.file_type()?.is_file() {
+                        fs::copy(entry.path(), to.join(entry.file_name()))?;
+                    }
+                }
+                Ok(())
+            }
+            let dest = PathBuf::from(evidence).join(self.root.file_name().unwrap());
+            if let Err(error) = copy(&self.root, &dest) {
+                eprintln!("fixture evidence copy failed: {error}");
+            }
+        }
+    }
+}
+
 /// A Herdr that answers one request per connection, keeps its spaces in
 /// sidebar order (starting with one of the captain's own), and runs the text
 /// sent to a space it created with that pane's Herdr environment.
@@ -305,6 +383,8 @@ struct Herdr {
     slow_create: Arc<AtomicBool>,
     #[cfg(feature = "dashboard")]
     creating: Arc<AtomicBool>,
+    reject_caption: Arc<AtomicBool>,
+    metadata: Arc<Mutex<std::collections::BTreeMap<(String, String), Value>>>,
 }
 
 impl Herdr {
@@ -321,6 +401,12 @@ impl Herdr {
         let panes = Arc::new(Mutex::new(vec![pane(1)]));
         let reject_create = Arc::new(AtomicBool::new(false));
         let suppress_input = Arc::new(AtomicBool::new(false));
+        let reject_caption = Arc::new(AtomicBool::new(false));
+        let metadata = Arc::new(Mutex::new(std::collections::BTreeMap::<
+            (String, String),
+            Value,
+        >::new()));
+        let (reject_label, sources) = (reject_caption.clone(), metadata.clone());
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
@@ -358,6 +444,18 @@ impl Herdr {
                     seen.lock().unwrap().push(request);
                     continue;
                 }
+                if request["method"] == "pane.report_metadata"
+                    && params["source"] == "privateer-errands"
+                    && reject_label.load(Ordering::SeqCst)
+                {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":request["id"],"error":"fixture metadata refusal"})
+                    );
+                    seen.lock().unwrap().push(request);
+                    continue;
+                }
                 if request["method"] == "pane.send_input" && suppress.load(Ordering::SeqCst) {
                     let _ = writeln!(
                         stream,
@@ -384,6 +482,24 @@ impl Herdr {
                         order.lock().unwrap().push((format!("w{n}"), json!({})));
                         live.lock().unwrap().push(pane(n));
                         json!({"type":"workspace_created","root_pane":pane(n)})
+                    }
+                    "pane.report_metadata" => {
+                        let mut sources = sources.lock().unwrap();
+                        let metadata = sources
+                            .entry((
+                                params["pane_id"].as_str().unwrap().into(),
+                                params["source"].as_str().unwrap().into(),
+                            ))
+                            .or_insert(json!({}));
+                        for field in ["title", "display_agent"] {
+                            if let Some(value) = params.get(field) {
+                                metadata[field] = value.clone();
+                            }
+                            if params[format!("clear_{field}")] == true {
+                                metadata.as_object_mut().unwrap().remove(field);
+                            }
+                        }
+                        json!({"type":"ok"})
                     }
                     "workspace.report_metadata" => {
                         let mut order = order.lock().unwrap();
@@ -473,6 +589,8 @@ impl Herdr {
             slow_create,
             #[cfg(feature = "dashboard")]
             creating,
+            reject_caption,
+            metadata,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {

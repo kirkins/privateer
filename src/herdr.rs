@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod errands;
 pub(crate) mod sidebar;
 
 /// An explicit, ID-checked refusal is different from an unknown outcome after
