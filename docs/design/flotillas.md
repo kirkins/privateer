@@ -69,8 +69,9 @@ arbitrates memory and CPU (see [admission](../architecture.md#runtime-boundary))
 first come first served, at no model cost and without any ship commanding
 another.
 
-**Disk first.** A host-wide free-disk floor in the shared admission settings,
-set with `resource.configure {"min_free_disk_bytes": ...}` and shown by
+**Disk first.** A host-wide free-disk floor in the shared admission settings
+(`min_free_disk_bytes`, default 2 GiB), set with
+`resource.configure {"min_free_disk_bytes": ...}` and shown by
 `resource.status`. Jobs that would start below it can wait in the existing
 host-wide capacity queue; `workspace.acquire` can opt into that queue with
 `wait_for_capacity:true`. Long job waits appear in `runtime.needs` as a typed

@@ -75,7 +75,7 @@ impl Default for Settings {
             max_heavy_jobs: None,
             max_load_per_cpu: 1.0,
             min_available_memory_bytes: GIB,
-            min_free_disk_bytes: 0,
+            min_free_disk_bytes: 2 * GIB,
             heavy_estimate: Estimate {
                 cpus: None,
                 memory_bytes: Some(2 * GIB),
@@ -392,6 +392,9 @@ fn memory() -> Result<(u64, u64)> {
 }
 
 #[cfg(unix)]
+// statvfs field widths differ across Unix platforms, so the casts are needed
+// on those where the fields are narrower than u64.
+#[allow(clippy::unnecessary_cast)]
 pub fn disk(path: &std::path::Path) -> Result<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;

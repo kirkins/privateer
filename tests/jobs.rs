@@ -1156,6 +1156,9 @@ fn resource_settings_are_host_wide_open_to_agents_and_validated() {
     let home = fixture.home("mate", 0);
     let other = fixture.home("other", 0);
     let agent = [("PRIVATEER_ROLE", "agent"), ("PRIVATEER_ACTOR", "peer")];
+    // An unconfigured host applies the documented 2 GiB free-disk floor.
+    let fresh = ok(&other, "resource.status", json!({}));
+    assert_eq!(fresh["settings"]["min_free_disk_bytes"], 2_147_483_648_u64);
     let configured = ok_env(
         &home,
         "resource.configure",

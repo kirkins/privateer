@@ -446,6 +446,7 @@ pub(crate) fn is_wake(store: &Store, args: &Value) -> Result<bool> {
     )?;
     Ok(wake || crate::errand::running(store, id)?)
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execution(
     store: &Store,
     task: &str,

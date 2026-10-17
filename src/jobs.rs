@@ -501,12 +501,12 @@ fn reserve(
         }
         {
             let settings = admission::settings(conn)?;
-            if from_queue
-                || reservation.heavy
-                || estimate.is_some()
-                || charter_min_free_bytes > 0
-                || settings.min_free_disk_bytes > 0
-            {
+            // Capacity-queue fairness applies to work that needs capacity or
+            // already holds a queue position. The disk floor is enforced for
+            // every job in `admit` below, so light work with free disk is not
+            // blocked behind unrelated queued jobs; a light job below the floor
+            // joins the queue and returns here as `from_queue`.
+            if from_queue || reservation.heavy || estimate.is_some() {
                 let queue = live_queue(conn)?;
                 let ahead = queue
                     .iter()
