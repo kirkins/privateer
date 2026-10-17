@@ -151,7 +151,7 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         .canonicalize()?;
     ensure!(
         harness != "claude" || claude_trusted(&folder),
-        "Claude has not been trusted in {}; run `privateer start claude` there once and choose \"Yes, I trust this folder\"",
+        "Claude has not been trusted in {}; run `privateer start claude` there once, choose \"Yes, I trust this folder\" and, for permission_mode auto, finish auto mode's setup screen",
         folder.display()
     );
     ensure!(
