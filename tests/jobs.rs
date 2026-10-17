@@ -2045,14 +2045,20 @@ fn escaping_payload(linger: &str) -> Vec<String> {
 fn escaped_pid(fixture: &Fixture) -> i32 {
     let path = fixture.repo.join("escaped.pid");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.exists() {
+    // The file can exist before the payload has written the pid into it.
+    loop {
+        if let Some(pid) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
         assert!(
             Instant::now() < deadline,
             "the payload never started its child"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    fs::read_to_string(path).unwrap().trim().parse().unwrap()
 }
 
 fn gone(pid: i32) -> bool {
