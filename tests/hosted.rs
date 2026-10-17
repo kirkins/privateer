@@ -114,7 +114,8 @@ impl Place {
             .env_remove("HERDR_PANE_ID")
             .env_remove("PRIVATEER_HOME")
             .env_remove("PRIVATEER_ROLE")
-            .env_remove("PRIVATEER_ACTOR");
+            .env_remove("PRIVATEER_ACTOR")
+            .env_remove("CLAUDE_CONFIG_DIR");
         command
     }
     fn ok(&self, args: &[&str]) -> String {

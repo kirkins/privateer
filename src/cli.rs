@@ -1084,6 +1084,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         }
         Ok(command)
     };
+    // Decide before claiming presence, so an error leaves nothing to release.
+    let mut continuation = claude_continuation()?;
     // The child can invoke a startup hook immediately after spawn.
     if hosted {
         crate::presence::adopt(&store, &ship, &holder, 90)?;
@@ -1106,7 +1108,6 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     };
     let terminal = crate::host::sleep::Terminal::save();
     let mut holder = holder;
-    let mut continuation = claude_continuation()?;
     let status = loop {
         let mut child = match build(&holder, continuation).and_then(|mut command| {
             command
