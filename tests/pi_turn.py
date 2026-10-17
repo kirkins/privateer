@@ -79,6 +79,22 @@ raise SystemExit(int(os.environ['PI_TEST_EXIT']))
         self.assertEqual(record['route'], 'unchanged')
         self.assertIsNone(record['foreign'])
 
+    def test_repeated_message_updates_are_thinned_but_final_reply_survives(self):
+        snapshot = {"type": "message_update", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "streaming snapshot " + "x" * 1800}]}}
+        events = [HEADER, *([snapshot] * 800),
+                  {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
+                   "content": [{"type": "text", "text": "final reply survives"}],
+                   "usage": {"input": 42, "output": 7}}}, SETTLED]
+        run = self.run_stream(events)
+        self.assertGreater((self.root / "stream.jsonl").stat().st_size, 1024 * 1024)
+        self.assertLess(len(run.stdout), 1024 * 1024)
+        lines = [json.loads(line) for line in run.stdout.splitlines()]
+        self.assertFalse(any(event.get("type") == "message_update" for event in lines))
+        final = next(event for event in lines if event.get("type") == "message_end")
+        self.assertEqual(final["message"]["content"][0]["text"], "final reply survives")
+        self.assertEqual(lines[-1]["message_updates_omitted"], 800)
+
     def test_partial_aborted_and_unsettled_successes_stay_unconfirmed(self):
         for tail in ([assistant()], [assistant("length"),SETTLED],
                      [assistant("toolUse"),SETTLED], [assistant(),{"type":"agent_settled","aborted":True}],
@@ -118,6 +134,8 @@ raise SystemExit(int(os.environ['PI_TEST_EXIT']))
                 run = self.run_stream([],raw=raw)
                 self.assertNotEqual(run.returncode, 0)
                 self.assertEqual(self.summary(run)["type"], "native.turn.failed")
+                if raw.endswith(b"not-json\n"):
+                    self.assertIn(b"not-json", run.stdout)
 
     def test_unicode_line_separators_are_content_not_frame_boundaries(self):
         event = assistant()

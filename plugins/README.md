@@ -131,10 +131,12 @@ a final assistant `stop`, a non-aborted `agent_settled`, a complete JSONL stream
 and a zero native exit. Error, aborted, truncated and incomplete runs fail the
 job; native retries may recover before the final settled event. Explicit resume
 must match the requested UUID or the existing session file's header. No extra
-model retries or provider fallback are introduced. Native events are preserved;
-one final summary counts only authoritative completed-message and compaction
-usage, excluding repeated streaming snapshots. This confirms native run
-completion, not the task's acceptance criteria, test results or mail delivery.
+model retries or provider fallback are introduced. Repeated `message_update`
+snapshots are parsed by the bridge but omitted from the capped job log; the
+final summary records their count. Other native events are preserved. The
+summary counts only authoritative completed-message and compaction usage,
+excluding repeated streaming snapshots. This confirms native run completion,
+not the task's acceptance criteria, test results or mail delivery.
 
 AGY print runs also use the bounded event-checking bridge. Native 1.3.4 uses
 `event: init` with `conversation_id`, followed by `step_update` and a terminal
