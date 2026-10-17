@@ -426,6 +426,7 @@ impl Snapshot {
         let mut sample = Self {
             recent: Vec::new(),
             presentation_error: None,
+            machines: Vec::new(),
             ships: vec![
                 Ship::demo(
                     "navigator",
