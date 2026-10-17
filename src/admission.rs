@@ -174,9 +174,14 @@ pub fn init(conn: &Connection) -> Result<()> {
         .prepare("SELECT 1 FROM pragma_table_info('disk_samples') WHERE name='trimmed_bytes'")?
         .exists([])?;
     if !has_trimmed {
-        conn.execute_batch(
+        // Another process opening the ledger at the same moment may add it
+        // first; its duplicate is the same outcome.
+        if let Err(error) = conn.execute_batch(
             "ALTER TABLE disk_samples ADD COLUMN trimmed_bytes INTEGER NOT NULL DEFAULT 0",
-        )?;
+        ) && !error.to_string().contains("duplicate column name")
+        {
+            return Err(error.into());
+        }
     }
     Ok(())
 }
