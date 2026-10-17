@@ -133,7 +133,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship"
             if matches!(
                 command,
-                "ship.create" | "ship.retire" | "ship.actions" | "ship.scope"
+                "ship.create"
+                    | "ship.retire"
+                    | "ship.actions"
+                    | "ship.scope"
+                    | "ship.consumes"
+                    | "ship.consumers"
             ) =>
         {
             fleet::dispatch(store, command, args)

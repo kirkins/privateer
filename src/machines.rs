@@ -63,18 +63,19 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     // under the write lock so concurrent opens cannot both add one.
     let migrate =
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    for (column, declaration) in [
-        ("next_contact_ms", "INTEGER"),
-        ("failures", "INTEGER NOT NULL DEFAULT 0"),
+    for (table, column, declaration) in [
+        ("machines", "next_contact_ms", "INTEGER"),
+        ("machines", "failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
     ] {
         let present: bool = migrate.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('machines') WHERE name=?1)",
+            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"),
             [column],
             |r| r.get(0),
         )?;
         if !present {
             migrate.execute_batch(&format!(
-                "ALTER TABLE machines ADD COLUMN {column} {declaration}"
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
             ))?;
         }
     }
@@ -148,12 +149,27 @@ fn machine(conn: &Connection, name: &str) -> Result<Machine> {
         .with_context(|| format!("no linked machine named {name}"))
 }
 
+/// A ship as a directory carries it between machines: its name, its scope
+/// and the ships it consumes.
+type Entry = (String, String, Value);
+
 /// The other machine's ships, as last exchanged.
-fn cached(conn: &Connection, machine: &str) -> Result<Vec<(String, String)>> {
-    let mut statement =
-        conn.prepare("SELECT name, scope FROM machine_ships WHERE machine=?1 ORDER BY name")?;
-    let rows = statement.query_map([machine], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+fn cached(conn: &Connection, machine: &str) -> Result<Vec<Entry>> {
+    let mut statement = conn.prepare(
+        "SELECT name, scope, consumes FROM machine_ships WHERE machine=?1 ORDER BY name",
+    )?;
+    let rows = statement.query_map([machine], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
+    })?;
+    rows.map(|row| {
+        let (name, scope, consumes) = row?;
+        Ok((
+            name,
+            scope,
+            serde_json::from_str(&consumes).unwrap_or_else(|_| json!([])),
+        ))
+    })
+    .collect()
 }
 
 /// Refuse a ship name already taken on a linked machine.
@@ -174,7 +190,7 @@ pub(crate) fn refuse_remote_name(conn: &Connection, name: &str) -> Result<()> {
 }
 
 /// This machine's active ships and their scopes, the directory it offers.
-fn local_ships(conn: &Connection) -> Result<Vec<(String, String)>> {
+fn local_ships(conn: &Connection) -> Result<Vec<Entry>> {
     let mut ships = vec![];
     for member in crate::fleet::members(conn)? {
         // Opening a home creates it; never resurrect a deleted ship folder.
@@ -184,22 +200,22 @@ fn local_ships(conn: &Connection) -> Result<Vec<(String, String)>> {
         let Ok(mut store) = Store::open(&member.home) else {
             continue;
         };
-        let scope = crate::fleet::scope_of(&mut store, &member.name);
-        ships.push((member.name, scope));
+        let (scope, consumes) = crate::fleet::directory_entry(&mut store, &member.name);
+        ships.push((member.name, scope, consumes));
     }
     Ok(ships)
 }
 
-fn directory(ships: &[(String, String)]) -> Value {
+fn directory(ships: &[Entry]) -> Value {
     json!(
         ships
             .iter()
-            .map(|(name, scope)| json!({"name": name, "scope": scope}))
+            .map(|(name, scope, consumes)| json!({"name": name, "scope": scope, "consumes": consumes}))
             .collect::<Vec<_>>()
     )
 }
 
-fn parse_directory(value: &Value) -> Result<Vec<(String, String)>> {
+fn parse_directory(value: &Value) -> Result<Vec<Entry>> {
     value
         .as_array()
         .context("ships must be a list")?
@@ -209,25 +225,30 @@ fn parse_directory(value: &Value) -> Result<Vec<(String, String)>> {
             identifier(name)?;
             crate::mail::unreserved(name)?;
             let scope = ship["scope"].as_str().unwrap_or("");
-            Ok((name.to_owned(), scope.to_owned()))
+            // An earlier peer sends no consumes.
+            let consumes = ship.get("consumes").cloned().unwrap_or_else(|| json!([]));
+            for other in consumes.as_array().context("consumes is a list")? {
+                identifier(other.as_str().context("consumes holds ship names")?)?;
+            }
+            Ok((name.to_owned(), scope.to_owned(), consumes))
         })
         .collect()
 }
 
 /// Names both machines would hold.
-fn clashes(conn: &Connection, theirs: &[(String, String)]) -> Result<Vec<String>> {
+fn clashes(conn: &Connection, theirs: &[Entry]) -> Result<Vec<String>> {
     let ours: Vec<String> = crate::fleet::members(conn)?
         .into_iter()
         .map(|m| m.name)
         .collect();
     Ok(theirs
         .iter()
-        .filter(|(name, _)| ours.contains(name))
-        .map(|(name, _)| name.clone())
+        .filter(|(name, _, _)| ours.contains(name))
+        .map(|(name, _, _)| name.clone())
         .collect())
 }
 
-fn record(conn: &Connection, machine: &Machine, ships: &[(String, String)]) -> Result<()> {
+fn record(conn: &Connection, machine: &Machine, ships: &[Entry]) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO machines(name, role, peer, known_as, added_ms, refreshed_ms)
@@ -245,10 +266,10 @@ fn record(conn: &Connection, machine: &Machine, ships: &[(String, String)]) -> R
         "DELETE FROM machine_ships WHERE machine=?1",
         [&machine.name],
     )?;
-    for (name, scope) in ships {
+    for (name, scope, consumes) in ships {
         tx.execute(
-            "INSERT INTO machine_ships(machine, name, scope) VALUES(?1, ?2, ?3)",
-            params![machine.name, name, scope],
+            "INSERT INTO machine_ships(machine, name, scope, consumes) VALUES(?1, ?2, ?3, ?4)",
+            params![machine.name, name, scope, consumes.to_string()],
         )?;
     }
     tx.commit()?;
@@ -257,11 +278,11 @@ fn record(conn: &Connection, machine: &Machine, ships: &[(String, String)]) -> R
 
 /// Give one home the machine's peer and a directory entry for each of its
 /// ships. Ships the home hosts are never touched.
-fn install(store: &mut Store, machine: &Machine, ships: &[(String, String)]) -> Result<usize> {
+fn install(store: &mut Store, machine: &Machine, ships: &[Entry]) -> Result<usize> {
     crate::peers::dispatch(store, "peer.put", machine.peer.clone())?;
     let peer = peer_name(&machine.name);
     let mut installed = 0;
-    for (name, scope) in ships {
+    for (name, scope, consumes) in ships {
         let current = crate::mail::dispatch(store, "ship.show", json!({"name": name})).ok();
         if current.as_ref().is_some_and(|s| s["location"] == "here") {
             continue;
@@ -269,18 +290,14 @@ fn install(store: &mut Store, machine: &Machine, ships: &[(String, String)]) -> 
         crate::mail::dispatch(
             store,
             "ship.put",
-            json!({"name": name, "scope": scope, "location": {"peer": peer}}),
+            json!({"name": name, "scope": scope, "location": {"peer": peer}, "consumes": consumes}),
         )?;
         installed += 1;
     }
     Ok(installed)
 }
 
-fn install_everywhere(
-    conn: &Connection,
-    machine: &Machine,
-    ships: &[(String, String)],
-) -> Result<usize> {
+fn install_everywhere(conn: &Connection, machine: &Machine, ships: &[Entry]) -> Result<usize> {
     let mut homes = 0;
     for member in crate::fleet::members(conn)? {
         if !member.home.is_dir() {
@@ -529,11 +546,7 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
 
 /// Exchange directories with a machine this one reaches, and install its
 /// ships in every home here. Clashing names are refused on both sides.
-fn exchange(
-    conn: &Connection,
-    machine: &Machine,
-    timeout: Option<Duration>,
-) -> Result<Vec<(String, String)>> {
+fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> Result<Vec<Entry>> {
     let known_as = machine
         .known_as
         .as_deref()
@@ -619,7 +632,7 @@ fn add(args: &Value) -> Result<Value> {
     };
     let theirs = exchange(&conn, &machine, None)?;
     Ok(json!({"machine": name, "known_as": known_as,
-        "ships": theirs.iter().map(|(n, _)| n).collect::<Vec<_>>()}))
+        "ships": theirs.iter().map(|(n, _, _)| n).collect::<Vec<_>>()}))
 }
 
 fn list() -> Result<Value> {
@@ -632,7 +645,7 @@ fn list() -> Result<Value> {
             "target": machine.peer["host"],
             "known_as": machine.known_as,
             "refreshed_ms": machine.refreshed_ms,
-            "ships": cached(&conn, &machine.name)?.into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            "ships": cached(&conn, &machine.name)?.into_iter().map(|(n, _, _)| n).collect::<Vec<_>>(),
         }));
     }
     Ok(json!({"owner": owner(&conn)?, "machines": out}))

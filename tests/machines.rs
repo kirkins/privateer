@@ -474,3 +474,71 @@ fn a_machines_owner_hears_of_its_problems_and_may_stow_it() {
         text(&ended)
     );
 }
+
+#[test]
+fn a_server_ship_finds_its_consumers_on_both_machines() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("runtime");
+    mac.ship("cosmic");
+    let as_agent = |machine: &Machine, ship: &str, args: Value| {
+        machine.run(
+            ship,
+            &[
+                "ship.consumes",
+                "--json",
+                &args.to_string(),
+                "--role",
+                "agent",
+                "--actor",
+                ship,
+            ],
+            None,
+        )
+    };
+    // A ship records what it consumes; the operator may record it for any.
+    let own = as_agent(
+        &mac,
+        "fitforge",
+        json!({"name": "fitforge", "consumes": ["runtime"]}),
+    );
+    assert!(own.status.success(), "{}", text(&own));
+    mac.ok(
+        "cosmic",
+        "ship.consumes",
+        json!({"name": "cosmic", "consumes": ["runtime"]}),
+    );
+    // Not for a ship it did not create, and only ships it knows.
+    let other = as_agent(&mac, "fitforge", json!({"name": "cosmic", "consumes": []}));
+    assert!(!other.status.success(), "{}", text(&other));
+    let unknown = as_agent(
+        &mac,
+        "fitforge",
+        json!({"name": "fitforge", "consumes": ["nobody"]}),
+    );
+    assert!(!unknown.status.success(), "{}", text(&unknown));
+
+    let consumers = |machine: &Machine| -> Vec<String> {
+        machine.ok("runtime", "ship.consumers", json!({"name": "runtime"}))["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(consumers(&mac), ["cosmic", "fitforge"]);
+
+    // A ship on the linked laptop that uses the server is found too, and a
+    // directory refresh keeps what every ship consumes.
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    laptop.ok(
+        "liaison",
+        "ship.consumes",
+        json!({"name": "liaison", "consumes": ["runtime"]}),
+    );
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&ssh));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+    assert_eq!(consumers(&mac), ["cosmic", "fitforge", "liaison"]);
+    let seen = laptop.ok("liaison", "ship.show", json!({"name": "fitforge"}));
+    assert_eq!(seen["consumes"], json!(["runtime"]), "{seen}");
+}

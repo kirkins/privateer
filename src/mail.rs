@@ -140,6 +140,21 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     }
     let mut record =
         json!({"name": name, "scope": scope, "location": location, "accepts": accepts});
+    // What a ship consumes is set with ship.consumes; a ship.put that does
+    // not name it, such as a directory refresh, keeps it.
+    let consumes = match args.get("consumes") {
+        Some(list) => Some(list.clone()),
+        None => ship(store, name)?.and_then(|existing| existing.get("consumes").cloned()),
+    };
+    if let Some(consumes) = consumes.filter(|c| !c.is_null()) {
+        let names = consumes
+            .as_array()
+            .context("consumes is a list of ship names")?;
+        for other in names {
+            identifier(other.as_str().context("consumes holds ship names")?)?;
+        }
+        record["consumes"] = consumes;
+    }
     if let Some(profile) = args.get("first_mate").filter(|v| !v.is_null()) {
         ensure!(
             location == "here",
