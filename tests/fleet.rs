@@ -742,7 +742,7 @@ fn a_stow_asks_every_ship_holds_new_jobs_but_not_wakes_and_resumes() {
     };
 
     let out = machine.ok(&liaison, &["stow"]);
-    assert!(out.starts_with("Stowing the fleet ("), "{out}");
+    assert!(out.starts_with("Stowing this machine ("), "{out}");
     assert!(out.contains("asked apps to stow"), "{out}");
     assert!(out.contains("asked liaison to stow"), "{out}");
     let inbox = machine.json(&apps, "mail.inbox", json!({"address":"apps"}));
@@ -795,7 +795,7 @@ fn a_stow_asks_every_ship_holds_new_jobs_but_not_wakes_and_resumes() {
     assert_eq!(apps_status["reply"], "Stowed; nothing in flight.");
 
     let out = machine.ok(&liaison, &["stow", "resume"]);
-    assert!(out.contains("Resumed"), "{out}");
+    assert!(out.contains("Resumed this machine ("), "{out}");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while machine.json(&apps, "job.status", json!({"id":"queued"}))["status"] == "queued" {
         assert!(
@@ -809,6 +809,51 @@ fn a_stow_asks_every_ship_holds_new_jobs_but_not_wakes_and_resumes() {
     for id in ["queued", "after"] {
         machine.json(&apps, "job.cancel", json!({"id":id}));
     }
+}
+
+/// A stow is one machine's hold, so every word about it names that machine. A
+/// machine with no links says what it knows and nothing more: the notice must
+/// not read as a claim about machines it cannot see.
+#[test]
+fn a_resume_notice_names_this_machine_and_claims_nothing_about_others() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+
+    let asked = machine.json(&liaison, "stow.status", json!({}));
+    let this = asked["this_machine"].as_str().unwrap().to_owned();
+    assert!(!this.is_empty(), "{asked}");
+
+    machine.ok(&liaison, &["stow"]);
+    let request = &machine.json(&apps, "mail.inbox", json!({"address":"apps"}))["messages"][0];
+    let body = request["body"].as_str().unwrap();
+    assert!(
+        body.contains(&format!("stowing this machine ({this})")),
+        "{body}"
+    );
+    assert!(!body.contains("the fleet"), "{body}");
+
+    machine.ok(&liaison, &["stow", "resume"]);
+    let inbox = machine.json(&apps, "mail.inbox", json!({"address":"apps"}));
+    let notice = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["kind"] == "notice")
+        .expect("a resume notice");
+    let body = notice["body"].as_str().unwrap();
+    assert!(
+        body.contains(&format!("resumed this machine ({this})")),
+        "{body}"
+    );
+    assert!(body.contains("new jobs start again here"), "{body}");
+    // No machine is linked here, so no machine is named but this one.
+    assert!(!body.contains("Linked machine"), "{body}");
+    assert!(!body.contains("the fleet"), "{body}");
+    // And the same claim in records, from this machine alone.
+    let status = machine.json(&liaison, "stow.status", json!({}));
+    assert_eq!(status["this_machine"], json!(this), "{status}");
+    assert_eq!(status["machines"], json!([]), "{status}");
 }
 
 #[test]

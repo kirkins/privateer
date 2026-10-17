@@ -8,8 +8,9 @@ let active = false, busy = false, paused = false, seen = 0, generation = 0, stat
 // The captain's fleet commands, as a front door and the Pi session offer them.
 // Only the person at the keyboard runs them, as the captain, not as the ship.
 const CAPTAIN = {
-  stow: { description: "Stow the fleet before an update: /stow, /stow status or /stow resume",
-    argv: rest => ({ "": ["stow"], status: ["stow", "status"], resume: ["stow", "resume"] })[rest] },
+  stow: { description: "Stow this machine before an update: /stow, /stow status, /stow resume, /stow resume all",
+    argv: rest => ({ "": ["stow"], status: ["stow", "status"], resume: ["stow", "resume"],
+      "resume all": ["stow", "resume", "--all"] })[rest] },
   yolo: { description: "Fleet tool approvals for every first mate: /yolo on, off or status",
     argv: rest => ({ "": ["permissions", "show"], status: ["permissions", "show"],
       on: ["permissions", "yolo"], off: ["permissions", "standard"] })[rest] },
