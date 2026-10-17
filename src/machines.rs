@@ -1380,8 +1380,10 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 [&machine.name],
                 |r| r.get(0),
             )?;
-            // The linking machine may keep the captain's desk elsewhere.
-            let wants_captain = args["captain"].as_bool().unwrap_or(true);
+            // The linking machine may keep the captain's desk elsewhere, and a
+            // machine whose desk is elsewhere hands its captain mail only there.
+            let wants_captain = args["captain"].as_bool().unwrap_or(true)
+                && desk(&conn)?.is_none_or(|(desk, _)| desk == machine.name);
             let mut messages = vec![];
             let mut bytes = 0;
             for member in crate::fleet::members(&conn)? {

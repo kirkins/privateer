@@ -1827,3 +1827,50 @@ fn the_captains_desk_can_sit_on_the_machine_this_one_reaches() {
     let request = laptop.ok("scout", "mail.show", json!({"id": asked["id"]}));
     assert_eq!(request["state"], "answered", "{request}");
 }
+
+#[test]
+fn a_machine_whose_desk_is_elsewhere_hands_its_captain_mail_only_there() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let server = Machine {
+        root: laptop.root.parent().unwrap().join("server"),
+    };
+    server.ship("harbor");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    // The Mac also reaches the server, and keeps the captain's desk there.
+    let registry = server.registry();
+    let linked = mac.run(
+        "fitforge",
+        &[
+            "machine",
+            "add",
+            "server",
+            "test-host",
+            "--executable",
+            support::BIN,
+            "--remote-fleet",
+            registry.to_str().unwrap(),
+            "--as",
+            "mac",
+        ],
+        Some(&ssh),
+    );
+    assert!(linked.status.success(), "{}", text(&linked));
+    assert!(
+        mac.run("fitforge", &["machine", "captain", "server"], None)
+            .status
+            .success()
+    );
+    mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "notice", "body": "Build 13 is up"}),
+    );
+
+    // The laptop, which collects from the Mac, gets none of it...
+    assert!(collect(&laptop, &ssh).contains("\"delivered\": 0"));
+    assert!(captain_bodies(&laptop, "liaison").is_empty());
+    // ...and the Mac hands it to the server.
+    let pass = mac.pass("fitforge", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
+    assert_eq!(captain_bodies(&server, "harbor"), ["Build 13 is up"]);
+}
