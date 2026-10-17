@@ -86,7 +86,7 @@ def build(harness, request):
     if harness == "gemini":
         allowed |= {"trust"}
     if harness == "claude":
-        allowed |= {"bare"}
+        allowed |= {"bare", "chrome"}
     if harness == "devin":
         allowed |= {"permission_mode", "sandbox", "trust"}
     if harness == "cursor":
@@ -254,6 +254,10 @@ def build(harness, request):
     elif harness == "claude":
         if boolean(options, "bare"):
             argv += ["--bare"]
+        # Claude in Chrome drives the captain's own signed-in browser, which
+        # Claude may enable for every session by default: only a route that
+        # asks for it gets it.
+        argv += ["--chrome" if boolean(options, "chrome") else "--no-chrome"]
         if headless:
             argv += ["--print", "--verbose", "--output-format", "stream-json"]
         permissions = selector(options, "permission_mode", ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"])

@@ -68,7 +68,7 @@ The runtime chooses whether to resume or start fresh and binds sessions to a
 focus; an adapter does not choose that policy or share sessions across tasks.
 
 Claude and Grok's interactive plans accept native `permission_mode`; Gemini maps it to `approval-mode`.
-No permission override is supplied by default. Claude's optional `bare: true`
+No permission override is supplied by default. Claude's `chrome: true` lets a run use Claude in Chrome, which drives the captain's own signed-in browser. Without it every headless Claude run passes `--no-chrome`, and so does every hosted Claude first mate, because Claude can enable Chrome for all sessions by default; the captain's own `privateer start` session keeps the captain's Claude defaults. Claude's optional `bare: true`
 selects its native minimal launch mode for an isolated pilot. Pi and signed Pi
 also accept `bare: true`: disable extensions, MCP, skills, templates, context
 files and themes for this invocation, keeping native provider/authentication
