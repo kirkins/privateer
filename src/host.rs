@@ -130,12 +130,6 @@ pub(crate) fn repair(store: &Store) -> Vec<(String, String)> {
 pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String)]) -> Result<Value> {
     let now = Store::now_ms();
     let tx = store.write_transaction()?;
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS hosted_block_alerts(
-           ship TEXT PRIMARY KEY, blocked_since_ms INTEGER NOT NULL,
-           alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1))
-         );",
-    )?;
     // Lease expiry ends custody even if Herdr is unavailable this tick.
     tx.execute(
         "DELETE FROM hosted_block_alerts WHERE ship NOT IN
