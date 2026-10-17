@@ -55,7 +55,7 @@ def declared_options(help_text):
 
 def require_flags(binary, env, cwd, label, needed, help_args=("--help",)):
     """Refuse unless the installed CLI declares every needed flag. Asks the
-    binary itself (--version, then --help), never reads its config or
+    binary itself (--version, then its help arguments), never reads its config or
     credentials. Results are cached per executable path and version for the
     run, so a version string alone never decides support. Returns the version."""
     run = {"env": env, "cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,

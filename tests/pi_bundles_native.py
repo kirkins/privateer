@@ -75,7 +75,8 @@ class Native(unittest.TestCase):
         # The version this run actually qualifies: the native binary's own report,
         # after it declares every bounded-loading flag.
         cls.version = bundles.require_flags(str(NATIVE), {'HOME': os.environ['HOME'], 'PATH': os.environ['PATH'],
-                                                          'PI_OFFLINE': '1'}, ROOT, 'Pi', pi_bundles.NEEDED)
+                                                          'PI_OFFLINE': '1'}, ROOT, 'Pi', pi_bundles.NEEDED,
+                                                 help_args=pi_bundles.HELP)
 
     def setUp(self):
         # Keep the fixture below an owned, non-sticky ancestor. In an unprivileged

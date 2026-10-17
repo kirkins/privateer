@@ -397,7 +397,7 @@ class Bundles(unittest.TestCase):
         binary = native_on_path('pi')
         if binary is None:
             self.skipTest('no native Pi on PATH (a #! wrapper is never run)')
-        version = bundles.require_flags(binary, {**os.environ, 'PI_OFFLINE': '1'}, self.repo, 'Pi', pi_bundles.NEEDED)
+        version = bundles.require_flags(binary, {**os.environ, 'PI_OFFLINE': '1'}, self.repo, 'Pi', pi_bundles.NEEDED, help_args=pi_bundles.HELP)
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+$')
         print(f'verified installed Pi {version} at {binary}', file=sys.stderr)
 
