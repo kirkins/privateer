@@ -355,8 +355,9 @@ fn wake_text(
 }
 
 /// Normalize the token usage a harness printed as JSON lines on stdout.
-/// Codex and native guards report per turn (`turn.completed` or a failed
-/// native turn), Claude a cumulative `result`; otherwise use the last object.
+/// Codex and native guards (Pi, Claude, Gemini, Cursor, AGY) report per turn
+/// (`turn.completed` or a failed native turn); an unguarded stream's final
+/// `result` is taken as reported; otherwise use the last object.
 pub(crate) fn usage(log: &str) -> Option<Value> {
     let mut turns: Option<Map<String, Value>> = None;
     let mut result = None;
@@ -786,11 +787,15 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         considered.push(consider(store, &ship)?);
     }
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
+    // Mail other machines hold for ships here, which they cannot send.
+    let machines = crate::machines::tick(store.home(), budget);
+    // This machine's own problems, for the ship that looks after it.
+    let owner_alerts = crate::machines::alert_owner(store);
     // Landed work frees its checkout without waking anyone.
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 

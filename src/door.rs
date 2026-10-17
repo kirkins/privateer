@@ -489,10 +489,20 @@ impl<'a> Session<'a> {
                 self.homes.insert(name, home);
             }
         }
-        self.homes
-            .get(ship)
-            .cloned()
-            .with_context(|| format!("no active ship named {ship} in the fleet"))
+        if let Some(home) = self.homes.get(ship) {
+            return Ok(home.clone());
+        }
+        // The captain writes to a ship on a linked machine from the captain's
+        // home here; the mail goes out through that machine's gateway.
+        if crate::machines::remote_ships()?
+            .iter()
+            .any(|(name, _, _)| name == ship)
+        {
+            if let Some((_, home)) = crate::machines::captain_home(&crate::fleet::registry()?)? {
+                return Ok(home);
+            }
+        }
+        bail!("no active ship named {ship} in the fleet")
     }
 
     /// Send the adapter captain mail it has not yet been sent, oldest first
@@ -732,6 +742,10 @@ impl<'a> Session<'a> {
             let attended = crate::presence::attended(store, &ship).unwrap_or(false);
             ships.push(json!({"name": ship, "scope": scope, "liaison": liaison,
                 "attended": attended, "dispatcher": dispatcher}));
+        }
+        for (ship, machine, scope) in crate::machines::remote_ships()? {
+            ships.push(json!({"name": ship, "scope": scope, "machine": machine,
+                "liaison": false, "attended": null, "dispatcher": null}));
         }
         Ok(json!({"ships": ships, "recipient": default}))
     }

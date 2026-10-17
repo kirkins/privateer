@@ -19,7 +19,24 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+static REGISTRY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Serve another registry than the environment names, for the whole process:
+/// a machine's gateway is told which fleet it answers for.
+pub fn use_registry(path: PathBuf) -> Result<()> {
+    ensure!(
+        path.is_absolute(),
+        "the fleet registry path must be absolute"
+    );
+    REGISTRY
+        .set(path)
+        .map_err(|_| anyhow::anyhow!("the fleet registry is already chosen"))
+}
+
 pub fn registry_path() -> Result<PathBuf> {
+    if let Some(path) = REGISTRY.get() {
+        return Ok(path.clone());
+    }
     if let Some(path) = std::env::var_os("PRIVATEER_FLEET") {
         return Ok(PathBuf::from(path));
     }
@@ -49,6 +66,8 @@ pub(crate) fn registry() -> Result<Connection> {
            created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
     )?;
     crate::releases::init(&conn)?;
+    crate::machines::init(&conn)?;
+    crate::grants::init(&conn)?;
     Ok(conn)
 }
 
@@ -75,6 +94,7 @@ pub(crate) fn members(conn: &Connection) -> Result<Vec<Member>> {
 /// Add a ship to the fleet. A name belongs to one home while it is active.
 pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
     let conn = registry()?;
+    crate::machines::refuse_remote_name(&conn, ship)?;
     let existing: Option<(String, Option<i64>)> = conn
         .query_row(
             "SELECT home, retired_ms FROM ships WHERE name=?1",
@@ -103,7 +123,12 @@ pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
 
 /// Make `other` reachable from `store`: a local-transport peer to its home
 /// and a directory entry behind it. Ships this home hosts are never touched.
-fn reach(store: &mut Store, other: &str, other_home: &Path, scope: &str) -> Result<bool> {
+fn reach(
+    store: &mut Store,
+    other: &str,
+    other_home: &Path,
+    (scope, consumes): &(String, Value),
+) -> Result<bool> {
     let current = crate::mail::dispatch(store, "ship.show", json!({"name": other})).ok();
     if current.as_ref().is_some_and(|s| s["location"] == "here") {
         return Ok(false);
@@ -118,23 +143,29 @@ fn reach(store: &mut Store, other: &str, other_home: &Path, scope: &str) -> Resu
     crate::mail::dispatch(
         store,
         "ship.put",
-        json!({"name": other, "scope": scope, "location": {"peer": peer}}),
+        json!({"name": other, "scope": scope, "location": {"peer": peer}, "consumes": consumes}),
     )?;
     Ok(true)
 }
 
-fn scope_of(store: &mut Store, ship: &str) -> String {
-    crate::mail::dispatch(store, "ship.show", json!({"name": ship}))
-        .ok()
+/// What a ship's own home says it is for and what it consumes.
+pub(crate) fn directory_entry(store: &mut Store, ship: &str) -> (String, Value) {
+    let record = crate::mail::dispatch(store, "ship.show", json!({"name": ship})).ok();
+    let scope = record
+        .as_ref()
         .and_then(|s| s["scope"].as_str().map(str::to_owned))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let consumes = record
+        .and_then(|s| s.get("consumes").cloned())
+        .unwrap_or_else(|| json!([]));
+    (scope, consumes)
 }
 
 /// Link a ship with every other active ship in the fleet, both ways.
 pub fn link(store: &Store, ship: &str) -> Result<usize> {
     let conn = registry()?;
     let mut ours = Store::open(store.home())?;
-    let our_scope = scope_of(&mut ours, ship);
+    let ours_entry = directory_entry(&mut ours, ship);
     let mut linked = 0;
     for member in members(&conn)? {
         // Opening a home creates it; never resurrect a deleted ship folder.
@@ -144,12 +175,13 @@ pub fn link(store: &Store, ship: &str) -> Result<usize> {
         let Ok(mut theirs) = Store::open(&member.home) else {
             continue;
         };
-        let their_scope = scope_of(&mut theirs, &member.name);
-        if reach(&mut ours, &member.name, &member.home, &their_scope)? {
+        let theirs_entry = directory_entry(&mut theirs, &member.name);
+        if reach(&mut ours, &member.name, &member.home, &theirs_entry)? {
             linked += 1;
         }
-        reach(&mut theirs, ship, store.home(), &our_scope)?;
+        reach(&mut theirs, ship, store.home(), &ours_entry)?;
     }
+    linked += crate::machines::reach_remote(&mut ours, &conn)?;
     Ok(linked)
 }
 
@@ -162,17 +194,21 @@ pub(crate) fn caller_ship(store: &Store) -> Option<String> {
 
 /// An active fleet ship the caller may manage: any ship for the captain, only
 /// ships it created for an agent. `verb` completes "can VERB only ships it created".
-pub(crate) fn managed(store: &Store, name: &str, verb: &str) -> Result<Member> {
+pub(crate) fn managed(store: &Store, name: &str, action: &str, verb: &str) -> Result<Member> {
     let member = members(&registry()?)?
         .into_iter()
         .find(|m| m.name == name)
         .with_context(|| format!("no active ship named {name} in the fleet"))?;
     if let Caller::Agent { actor } = store.caller() {
-        ensure!(
-            &member.created_by == actor,
-            "{actor} can {verb} only ships it created; {name} was created by {}",
-            member.created_by
-        );
+        // A ship manages what it created; anything more is the captain's grant.
+        if &member.created_by != actor {
+            crate::grants::require(store, actor, action, name).with_context(|| {
+                format!(
+                    "{actor} can {verb} only ships it created or a grant covers; {name} was created by {}",
+                    member.created_by
+                )
+            })?;
+        }
     }
     Ok(member)
 }
@@ -210,9 +246,17 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
     crate::mail::unreserved(name)?;
-    let creator = caller_ship(store);
+    crate::machines::refuse_remote_name(&registry()?, name)?;
+    // The ship whose home this runs in lends a new ship its harness, model
+    // and hosting. Only an agent creating a ship becomes its creator; when
+    // the operator runs `ship new` in a ship's folder, the captain is.
+    let template = caller_ship(store);
+    let creator = match store.caller() {
+        Caller::Agent { actor } => Some(actor.clone()),
+        Caller::Operator => None,
+    };
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
-    let parent = creator.as_ref().and_then(|c| {
+    let parent = template.as_ref().and_then(|c| {
         let profile =
             crate::mail::dispatch(store, "ship.show", json!({"name": c})).ok()?["first_mate"]
                 .take();
@@ -336,7 +380,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
 fn retire(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     let conn = registry()?;
-    let member = managed(store, name, "retire")?;
+    let member = managed(store, name, "ship.retire", "retire")?;
     if let Some(expected) = args.get("expected_home").and_then(Value::as_str) {
         ensure!(
             member.home == Path::new(expected),
@@ -386,7 +430,7 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
 fn set_actions(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     let requested = args.get("actions").context("actions is required")?;
-    let member = managed(store, name, "change the actions of")?;
+    let member = managed(store, name, "ship.actions", "change the actions of")?;
     // Hold this home's write lock through the grant: a revoke committed
     // first wins, and one committed later cannot interleave with the check.
     let authority = match store.caller() {
@@ -444,7 +488,7 @@ fn set_scope(store: &mut Store, args: &Value) -> Result<Value> {
             .find(|m| m.name == name)
             .with_context(|| format!("no active ship named {name} in the fleet"))?
     } else {
-        managed(store, name, "change the scope of")?
+        managed(store, name, "ship.scope", "change the scope of")?
     };
     ensure!(member.home.is_dir(), "{name}'s folder is gone");
     let set = "UPDATE ships SET record=json_set(record,'$.scope',?2) WHERE name=?1";
@@ -481,6 +525,101 @@ fn set_scope(store: &mut Store, args: &Value) -> Result<Value> {
     Ok(json!({"ship": name, "scope": scope, "by": by}))
 }
 
+/// The most ships one ship may record that it consumes.
+const MAX_CONSUMES: usize = 32;
+
+/// Record which ships a ship consumes, such as an app and the server it
+/// uses, so the server can find its consumers. Like a scope it routes and
+/// grants nothing: a ship may set its own, otherwise its creator or the
+/// operator. It reaches every home on this machine at once, and linked
+/// machines at their next directory exchange.
+fn set_consumes(store: &mut Store, args: &Value) -> Result<Value> {
+    let name = required(args, "name")?;
+    let consumes = args
+        .get("consumes")
+        .and_then(Value::as_array)
+        .context("consumes is a list of ship names")?;
+    ensure!(
+        consumes.len() <= MAX_CONSUMES,
+        "a ship consumes at most {MAX_CONSUMES} ships"
+    );
+    let mut names: Vec<String> = vec![];
+    for other in consumes {
+        let other = other.as_str().context("consumes holds ship names")?;
+        identifier(other)?;
+        ensure!(other != name, "{name} cannot consume itself");
+        if !names.iter().any(|n| n == other) {
+            names.push(other.to_owned());
+        }
+    }
+    let by = match store.caller() {
+        Caller::Agent { actor } => actor.clone(),
+        Caller::Operator => crate::mail::CAPTAIN.into(),
+    };
+    let member = if by == name {
+        members(&registry()?)?
+            .into_iter()
+            .find(|m| m.name == name)
+            .with_context(|| format!("no active ship named {name} in the fleet"))?
+    } else {
+        managed(store, name, "ship.consumes", "change what is consumed by")?
+    };
+    ensure!(member.home.is_dir(), "{name}'s folder is gone");
+    let own = Store::open(&member.home)?;
+    for other in &names {
+        ensure!(
+            crate::mail::dispatch(
+                &mut Store::open(&member.home)?,
+                "ship.show",
+                json!({"name": other})
+            )
+            .is_ok(),
+            "{name} does not know a ship named {other}"
+        );
+    }
+    let list = json!(names).to_string();
+    let set = "UPDATE ships SET record=json_set(record,'$.consumes',json(?2)) WHERE name=?1";
+    ensure!(
+        own.connection().execute(
+            &format!("{set} AND json_extract(record,'$.location')='here'"),
+            params![name, list],
+        )? == 1,
+        "{name} is not hosted in its fleet home"
+    );
+    let peer = format!("fleet-{name}");
+    for other in members(&registry()?)? {
+        if other.name != name && other.home.is_dir() {
+            Store::open(&other.home)?.connection().execute(
+                &format!("{set} AND json_extract(record,'$.location.peer')=?3"),
+                params![name, list, peer],
+            )?;
+        }
+    }
+    store.audit(
+        "ship.consumes",
+        &json!({"ship": name, "consumes": names, "by": by}),
+    )?;
+    Ok(json!({"ship": name, "consumes": names, "by": by}))
+}
+
+/// The ships this home knows to consume `name`, on this machine or a linked
+/// one: who to tell when a contract they rely on changes.
+fn consumers(store: &Store, args: &Value) -> Result<Value> {
+    let name = required(args, "name")?;
+    identifier(name)?;
+    let mut statement = store.connection().prepare(
+        "SELECT s.name, json_extract(s.record,'$.scope') FROM ships s
+         WHERE EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(s.record,'$.consumes'),'[]'))
+                       WHERE value=?1)
+         ORDER BY s.name",
+    )?;
+    let rows = statement.query_map([name], |r| {
+        Ok(json!({"name": r.get::<_, String>(0)?, "scope": r.get::<_, Option<String>>(1)?}))
+    })?;
+    let consumers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(json!({"ship": name, "consumers": consumers}))
+}
+
 fn list() -> Result<Value> {
     let conn = registry()?;
     let mut statement = conn.prepare(
@@ -510,6 +649,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship.retire" => retire(store, &args),
         "ship.actions" => set_actions(store, &args),
         "ship.scope" => set_scope(store, &args),
+        "ship.consumes" => set_consumes(store, &args),
+        "ship.consumers" => consumers(store, &args),
         _ => bail!("unknown fleet command {command}"),
     }
 }

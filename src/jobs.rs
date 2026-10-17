@@ -150,6 +150,19 @@ struct Queued {
     incarnation: String,
     created_ms: i64,
     supervisor: Option<Process>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+}
+pub(crate) struct WorkspaceQueueLease {
+    ledger: PathBuf,
+    key: String,
+}
+impl Drop for WorkspaceQueueLease {
+    fn drop(&mut self) {
+        if let Ok(conn) = ledger(&self.ledger) {
+            let _ = conn.execute("DELETE FROM queue WHERE key=?1", [&self.key]);
+        }
+    }
 }
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -271,6 +284,93 @@ fn ledger(path: &Path) -> Result<Connection> {
     )?;
     Ok(conn)
 }
+pub(crate) fn shared_ledger(store: &Store) -> Result<Connection> {
+    ledger(&ledger_path(store)?)
+}
+/// Keep workspace allocation in the same FIFO as jobs. The guard holds the
+/// queue position across the external Treehouse lease operation.
+pub(crate) fn wait_for_workspace_disk(
+    store: &Store,
+    task: &str,
+    pool: &Path,
+    charter_floor: u64,
+    wait_for_capacity: bool,
+    max_wait_secs: u64,
+) -> Result<WorkspaceQueueLease> {
+    let ledger_path = ledger_path(store)?;
+    let key = format!(
+        "workspace:{}:{task}:{}",
+        store.home().display(),
+        Uuid::new_v4()
+    );
+    let created_ms = Store::now_ms();
+    let entry = Queued {
+        key: key.clone(),
+        home: store.home().to_owned(),
+        job_id: task.to_owned(),
+        incarnation: Uuid::new_v4().to_string(),
+        created_ms,
+        supervisor: identity(std::process::id())?,
+        kind: Some("workspace".into()),
+    };
+    ensure!(
+        entry.supervisor.is_some(),
+        "cannot identify workspace queue owner"
+    );
+    {
+        let conn = ledger(&ledger_path)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result: Result<()> = (|| {
+            live_queue(&conn)?;
+            conn.execute(
+                "INSERT INTO queue(key,record) VALUES(?1,?2)",
+                params![key, serde_json::to_string(&entry)?],
+            )?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT")?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(max_wait_secs);
+    let lease = WorkspaceQueueLease {
+        ledger: ledger_path.clone(),
+        key: key.clone(),
+    };
+    loop {
+        store.authorize(task, "spawn")?;
+        let conn = ledger(&ledger_path)?;
+        let queue = live_queue(&conn)?;
+        let ahead = queue.iter().take_while(|q| q.key != key).count();
+        if ahead > 0 && !wait_for_capacity {
+            bail!(
+                "workspace capacity queue has {ahead} earlier requests; pass wait_for_capacity:true to join it"
+            );
+        }
+        if ahead == 0 {
+            let settings = admission::settings(&conn)?;
+            // Only the filesystem this workspace will use: a full root must
+            // not block a pool on a separate volume.
+            let available = admission::disk(pool)?.0;
+            let required = settings.min_free_disk_bytes.max(charter_floor);
+            if available >= required {
+                return Ok(lease);
+            }
+            if !wait_for_capacity {
+                bail!(
+                    "workspace disk admission refused: {available} bytes available, {required} required"
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("no workspace disk capacity within {max_wait_secs} s");
+        }
+        thread::sleep(QUEUE_POLL);
+    }
+}
 /// The host's resource ledger, where a fleet stow holds new jobs.
 pub(crate) fn host_ledger(store: &Store) -> Result<Connection> {
     ledger(&ledger_path(store)?)
@@ -345,6 +445,13 @@ fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
 }
 /// Queue entries in arrival order, dropping those whose supervisor is gone (or
 /// never appeared within the start grace) so they cannot block the line.
+/// How long the oldest live entry in this host's capacity queue has waited.
+pub(crate) fn oldest_wait_ms(store: &Store) -> Result<Option<i64>> {
+    let conn = host_ledger(store)?;
+    Ok(live_queue(&conn)?
+        .first()
+        .map(|entry| Store::now_ms() - entry.created_ms))
+}
 fn live_queue(conn: &Connection) -> Result<Vec<Queued>> {
     let mut statement = conn.prepare("SELECT record FROM queue")?;
     let mut entries: Vec<Queued> = statement
@@ -373,6 +480,12 @@ fn dequeue(store: &Store, job: &Job) -> Result<()> {
     )?;
     Ok(())
 }
+/// The disk floors for one reservation, measured on the filesystem the work
+/// will use rather than the host root.
+struct DiskFloor<'a> {
+    charter_min_free_bytes: u64,
+    path: &'a Path,
+}
 /// Admit and record a reservation under the ledger's write lock, so homes
 /// sharing the host decide one at a time against the same readings.
 ///
@@ -383,6 +496,7 @@ fn reserve(
     reservation: &mut Reservation,
     estimate: Option<&Estimate>,
     charter_cap: Option<u64>,
+    floor: DiskFloor<'_>,
     from_queue: bool,
 ) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -397,24 +511,31 @@ fn reserve(
                 );
             }
         }
-        if reservation.heavy || estimate.is_some() {
-            let queue = live_queue(conn)?;
-            let ahead = queue
-                .iter()
-                .take_while(|q| q.key != reservation.key)
-                .count();
-            if from_queue {
-                refuse_unless!(ahead == 0, "waiting behind {ahead} earlier jobs");
-            } else {
-                refuse_unless!(
-                    queue.is_empty(),
-                    "{} jobs are waiting for capacity; pass wait_for_capacity:true to join the queue",
-                    queue.len()
-                );
+        {
+            let settings = admission::settings(conn)?;
+            // Capacity-queue fairness applies to work that needs capacity or
+            // already holds a queue position. The disk floor is enforced for
+            // every job in `admit` below, so light work with free disk is not
+            // blocked behind unrelated queued jobs; a light job below the floor
+            // joins the queue and returns here as `from_queue`.
+            if from_queue || reservation.heavy || estimate.is_some() {
+                let queue = live_queue(conn)?;
+                let ahead = queue
+                    .iter()
+                    .take_while(|q| q.key != reservation.key)
+                    .count();
+                if from_queue {
+                    refuse_unless!(ahead == 0, "waiting behind {ahead} earlier jobs");
+                } else {
+                    refuse_unless!(
+                        queue.is_empty(),
+                        "{} jobs are waiting for capacity; pass wait_for_capacity:true to join the queue",
+                        queue.len()
+                    );
+                }
             }
             // Never garbage-collect reservations merely because a wrapper disappeared.
             let held = reservations(conn)?;
-            let settings = admission::settings(conn)?;
             let host = admission::measure()?;
             reservation.demand = admission::demand(&settings, &host, reservation.heavy, estimate);
             let view: Vec<admission::Held> = held
@@ -438,6 +559,8 @@ fn reserve(
                     charter: reservation.charter.as_deref().unwrap_or(""),
                     charter_cap,
                     demand: reservation.demand,
+                    charter_min_free_bytes: floor.charter_min_free_bytes,
+                    disk_path: floor.path,
                 },
             )?;
             if from_queue {
@@ -705,18 +828,6 @@ fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<(
         "cannot signal payload group"
     );
     Ok(())
-}
-#[allow(clippy::unnecessary_cast)] // statvfs field widths differ across supported Unix targets.
-pub(crate) fn free_bytes(path: &Path) -> Result<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    ensure!(
-        unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } == 0,
-        "cannot inspect disk availability"
-    );
-    let stat = unsafe { stat.assume_init() };
-    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 fn terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out")
@@ -1014,6 +1125,10 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         &requested_cwd,
         !(agent && crate::workspace::is_wake(store, &args)?),
         expected_workspace,
+        crate::workspace::WorkspaceWait {
+            wait_for_capacity,
+            max_wait_secs: max_wait_secs.unwrap_or(DEFAULT_MAX_WAIT_SECS),
+        },
     )?;
     let cwd = if requested_cwd.starts_with(&workspace.root) {
         requested_cwd.clone()
@@ -1043,15 +1158,6 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
     ensure!(
         timeout_secs > 0 && timeout_secs <= charter_timeout,
         "job timeout exceeds charter"
-    );
-    let min_free = charter
-        .get("min_free_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(2 * 1024 * 1024 * 1024);
-    let available = free_bytes(&cwd)?;
-    ensure!(
-        available >= min_free,
-        "disk admission refused: {available} available, {min_free} required"
     );
     // An optional per-charter share of the host's heavy work.
     let charter_cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
@@ -1180,6 +1286,13 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             &mut reservation,
             estimate.as_ref(),
             charter_cap,
+            DiskFloor {
+                charter_min_free_bytes: charter
+                    .get("min_free_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(2 * 1024 * 1024 * 1024),
+                path: &job.cwd,
+            },
             false,
         ) {
             Ok(()) => {}
@@ -1192,6 +1305,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                     incarnation: job.incarnation.clone(),
                     created_ms: job.created_ms,
                     supervisor: None,
+                    kind: None,
                 };
                 ledger.execute(
                     "INSERT INTO queue(key,record) VALUES(?1,?2)",
@@ -1394,6 +1508,13 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             &mut reservation,
             job.estimate.as_ref(),
             cap,
+            DiskFloor {
+                charter_min_free_bytes: charter
+                    .get("min_free_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(2 * 1024 * 1024 * 1024),
+                path: &job.cwd,
+            },
             true,
         ) {
             Ok(()) => {
@@ -2487,11 +2608,16 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 );
                 values.push(value);
             }
-            let mut status = admission::report(&settings, &admission::measure()?);
+            let mut host = admission::measure()?;
+            // Report the disk this home's work uses, as admission measures it.
+            (host.disk_available_bytes, host.disk_total_bytes) = admission::disk(store.home())?;
+            let mut status = admission::report(&settings, &host);
             status["ledger"] = json!(path);
             status["heavy_reserved"] = json!(values.iter().filter(|v| v["heavy"] == true).count());
             status["reservations"] = json!(values);
             status["queue"] = json!(live_queue(&conn)?);
+            status["disk_floor_met"] =
+                json!(host.disk_available_bytes >= settings.min_free_disk_bytes);
             status["model_routes"] = json!(crate::routes::list(&conn)?);
             Ok(status)
         }

@@ -16,10 +16,12 @@ pub mod door;
 pub mod errand;
 mod executable;
 pub mod fleet;
+pub mod grants;
 pub mod herdr;
 pub mod host;
 pub mod input;
 pub mod jobs;
+pub mod machines;
 pub mod mail;
 pub mod needs;
 pub mod opencode_mail;
@@ -80,12 +82,24 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "stow.resume",
 ];
 
+/// Whether a command is the operator's alone for this caller. The ship the
+/// captain named as this machine's owner may also stow the machine.
+pub fn operator_only(caller: &Caller, command: &str) -> bool {
+    if !OPERATOR_COMMANDS.contains(&command) {
+        return false;
+    }
+    match caller {
+        Caller::Agent { actor } => !(command.starts_with("stow.") && machines::is_owner(actor)),
+        Caller::Operator => true,
+    }
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     if !args.is_object() {
         bail!("command arguments must be a JSON object");
     }
     if let Caller::Agent { actor } = store.caller() {
-        if OPERATOR_COMMANDS.contains(&command) {
+        if operator_only(store.caller(), command) {
             bail!("{command} is an operator command; agents cannot run it");
         }
         // Agents speak, and read mail, only as themselves.
@@ -113,13 +127,20 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "workspace" => workspace::dispatch(store, command, args),
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
+        "machine" => machines::dispatch(store, command, args),
+        "grant" => grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
         "ship"
             if matches!(
                 command,
-                "ship.create" | "ship.retire" | "ship.actions" | "ship.scope"
+                "ship.create"
+                    | "ship.retire"
+                    | "ship.actions"
+                    | "ship.scope"
+                    | "ship.consumes"
+                    | "ship.consumers"
             ) =>
         {
             fleet::dispatch(store, command, args)
@@ -229,8 +250,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 }
             }
             // Crew of a hosted ship run live in their own space, where the
-            // captain can watch and steer them, when the host answers.
-            let hosted = !workspace::is_wake(store, &args)? && {
+            // captain can watch and steer them, when the host answers. Crew on
+            // a harness that cannot be hosted run headless with a viewer space.
+            let (hosted, viewed) = if workspace::is_wake(store, &args)? {
+                (false, false)
+            } else {
                 let profile = owner
                     .as_str()
                     .and_then(|ship| {
@@ -238,10 +262,15 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     })
                     .map(|ship| ship["first_mate"].clone())
                     .unwrap_or_default();
-                args["manifest"]
-                    .as_str()
-                    .and_then(bundled::harness)
-                    .is_some_and(|harness| host::hosts_crew(&profile, &harness))
+                let harness = args["manifest"].as_str().and_then(bundled::harness);
+                let hosted = harness
+                    .as_deref()
+                    .is_some_and(|harness| host::hosts_crew(&profile, harness));
+                let viewed = !hosted
+                    && harness
+                        .as_deref()
+                        .is_some_and(|harness| host::views_crew(&profile, harness));
+                (hosted, viewed)
             };
             if hosted {
                 if !args["options"].is_object() {
@@ -268,6 +297,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 &selected,
                 !workspace::is_wake(store, &args)?,
                 None,
+                workspace::WorkspaceWait::none(),
             )?;
             if let Some(lease) = &execution.lease_id {
                 args["_workspace_lease_id"] = serde_json::json!(lease);
@@ -337,7 +367,19 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if let Some(route) = model_route {
                 job["model_route"] = serde_json::json!(route);
             }
-            jobs::start_agent(store, job)
+            let mut started = jobs::start_agent(store, job)?;
+            if viewed {
+                // Presentation only: a refused space never stops the crew.
+                let viewer = host::view_crew(
+                    store,
+                    started["id"].as_str().unwrap_or_default(),
+                    &task,
+                    owner.as_str().unwrap_or_default(),
+                    std::path::Path::new(started["cwd"].as_str().unwrap_or_default()),
+                );
+                started["viewer"] = serde_json::json!(viewer.is_ok());
+            }
+            Ok(started)
         }
         "agent" => plugins::dispatch(store, command, args),
         _ => core::dispatch(store, command, args),

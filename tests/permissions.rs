@@ -11,11 +11,15 @@ use std::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 const FAKE: &str = r#"#!/usr/bin/env python3
-import json,os,pathlib,sys
+import json,os,pathlib,sys,time
 if os.getenv('CAPTURE_ARGV'):
  pathlib.Path(os.environ['CAPTURE_ARGV']).write_text(json.dumps(sys.argv[1:]))
 if '--print' in sys.argv:
  print(json.dumps({'type':'system','subtype':'init','session_id':'12345678-1234-4234-8234-123456789abc'}))
+ if 'spent-model' in sys.argv:
+  print(json.dumps({'type':'rate_limit_event','rate_limit_info':{'status':'rejected','rateLimitType':'five_hour','resetsAt':int(time.time())+3*3600}}))
+  print(json.dumps({'type':'result','subtype':'success','is_error':True,'result':"You've hit your limit · resets 3pm",'session_id':'12345678-1234-4234-8234-123456789abc','permission_denials':[]}))
+  sys.exit(0)
  denied=[] if 'bypassPermissions' in sys.argv else [{'tool_name':'Bash','tool_input':{'command':'PRIVATE_DO_NOT_MAIL'}}]
  print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'12345678-1234-4234-8234-123456789abc','permission_denials':denied}))
 "#;
@@ -192,6 +196,9 @@ fn attended_launches_receive_the_same_fleet_policy() {
     assert!(!args.contains(&"plan".into()));
     assert!(args.contains(&"Bash(git *)".into()));
     assert!(args.contains(&"Bash(gh *)".into()));
+    // The attended session is the first mate: it delegates through crew jobs.
+    let blocked = args.iter().position(|a| a == "--disallowedTools").unwrap();
+    assert!(args[blocked..].contains(&"Workflow".into()));
 }
 
 #[test]
@@ -252,4 +259,42 @@ fn native_permission_denial_becomes_one_question_and_pauses_automatic_retries() 
     for j in jobs.as_array().unwrap() {
         f.wait("liaison", j["id"].as_str().unwrap());
     }
+}
+
+#[test]
+fn a_spent_claude_window_backs_off_every_claude_model_until_its_reset() {
+    let f = Fleet::new();
+    let profile = f.json("liaison", "ship.show", json!({"name":"liaison"}));
+    let launch = |id: &str, model: &str| {
+        let mut options = profile["first_mate"]["options"].clone();
+        options["model"] = json!(model);
+        let args = json!({"id":id,"task_id":"liaison-duty","manifest":profile["first_mate"]["manifest"],"options":options});
+        f.command(
+            Some("liaison"),
+            &["agent.start", "--json", &args.to_string()],
+        )
+        .output()
+        .unwrap()
+    };
+    // The first pass only starts the dispatcher's scan of finished runs.
+    f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
+    // Claude exits 0 here; the error result alone must fail the run.
+    assert!(launch("spent", "spent-model").status.success());
+    assert_eq!(f.wait("liaison", "spent")["status"], "failed");
+    f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
+    let routes = f.json("liaison", "resource.status", json!({}))["model_routes"].clone();
+    assert_eq!(routes[0]["route"], "claude/-/*", "{routes}");
+    let wait_ms = routes[0]["until_ms"].as_i64().unwrap()
+        - std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+    assert!((3 * 3_600_000 - wait_ms).abs() < 60_000, "{wait_ms}");
+    let other = launch("other", "claude-haiku-5-5");
+    assert!(!other.status.success());
+    assert!(
+        String::from_utf8_lossy(&other.stderr).contains("Claude five_hour limit reached"),
+        "{}",
+        String::from_utf8_lossy(&other.stderr)
+    );
 }

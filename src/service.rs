@@ -1,11 +1,12 @@
 //! Keeping a ship's dispatcher (`privateer serve`) running in the background.
 //!
 //! Where a systemd user manager is available the dispatcher is installed as a
-//! user service, so it survives logouts and reboots; elsewhere it runs as a
-//! detached process for this login. A dispatcher holding `<home>/serve.lock`
-//! counts as running however it was started, so nothing starts twice.
-//! `PRIVATEER_SERVICE=systemd|detached|none` overrides the choice and
-//! `PRIVATEER_SYSTEMCTL` the systemctl binary (tests use both).
+//! user service, and on macOS with a login session as a launchd agent, so it
+//! survives logouts and reboots; elsewhere it runs as a detached process for
+//! this login. A dispatcher holding `<home>/serve.lock` counts as running
+//! however it was started, so nothing starts twice.
+//! `PRIVATEER_SERVICE=systemd|launchd|detached|none` overrides the choice, and
+//! `PRIVATEER_SYSTEMCTL` and `PRIVATEER_LAUNCHCTL` the binaries (tests use them).
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -101,9 +102,29 @@ fn systemctl() -> String {
     std::env::var("PRIVATEER_SYSTEMCTL").unwrap_or_else(|_| "systemctl".into())
 }
 
+fn launchctl() -> String {
+    std::env::var("PRIVATEER_LAUNCHCTL").unwrap_or_else(|_| "launchctl".into())
+}
+
+/// The launchd domain of this user's login session.
+fn gui_domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
 fn mode() -> String {
     if let Ok(mode) = std::env::var("PRIVATEER_SERVICE") {
         return mode;
+    }
+    // Agents load into the login session's domain, which exists only while
+    // the user is logged in at the Mac, including when reached over SSH.
+    if cfg!(target_os = "macos") {
+        let session = Command::new(launchctl())
+            .args(["print", &gui_domain()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        return if session { "launchd" } else { "detached" }.into();
     }
     let user_manager = std::env::var_os("XDG_RUNTIME_DIR").is_some()
         && Command::new(systemctl())
@@ -128,6 +149,22 @@ fn unit_dir() -> Result<PathBuf> {
         None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".config"),
     };
     Ok(config.join("systemd/user"))
+}
+
+fn agent_dir() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+            .join("Library/LaunchAgents"),
+    )
+}
+
+/// The launchd label shares the systemd unit's stable name.
+fn label(service: &Service) -> &str {
+    service.unit.trim_end_matches(".service")
+}
+
+fn agent_path(service: &Service) -> Result<PathBuf> {
+    Ok(agent_dir()?.join(format!("{}.plist", label(service))))
 }
 
 fn quote(value: &str) -> String {
@@ -171,11 +208,45 @@ fn unit(service: &Service, binary: &Path) -> String {
     )
 }
 
-fn detached(service: &Service, binary: &Path) -> Result<()> {
-    let log = &service.log;
+fn xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// A launchd agent with the same policy as the systemd unit: it records the
+/// current PATH, restarts only after a failure, and for a dispatcher leaves
+/// the rest of its process group alone when it stops (`KillMode=process`).
+fn property_list(service: &Service, binary: &Path) -> String {
+    let string = |value: &str| format!("<string>{}</string>", xml(value));
+    let mut arguments = vec![string(&binary.to_string_lossy())];
+    arguments.extend(service.args.iter().map(|a| string(a)));
+    let mut environment = String::new();
+    for name in service.environment {
+        if let Ok(value) = std::env::var(name) {
+            environment.push_str(&format!("<key>{name}</key>{}", string(&value)));
+        }
+    }
+    let log = string(&service.log.to_string_lossy());
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key>{}\n<key>ProgramArguments</key><array>{}</array>\n<key>EnvironmentVariables</key><dict>{environment}</dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>AbandonProcessGroup</key><{}/>\n<key>StandardOutPath</key>{log}\n<key>StandardErrorPath</key>{log}\n</dict></plist>\n",
+        string(label(service)),
+        arguments.join(""),
+        service.preserve_children,
+    )
+}
+
+fn rotate(log: &Path) -> Result<()> {
     if fs::metadata(log).is_ok_and(|m| m.len() > LOG_LIMIT) {
         fs::rename(log, log.with_extension("log.1"))?;
     }
+    Ok(())
+}
+
+fn detached(service: &Service, binary: &Path) -> Result<()> {
+    let log = &service.log;
+    rotate(log)?;
     let out = fs::OpenOptions::new().create(true).append(true).open(log)?;
     let mut command = Command::new(binary);
     for name in [
@@ -245,6 +316,29 @@ fn start(service: &Service, log: &Path) -> Result<String> {
             }
             Ok(format!("installed as user service {name}"))
         }
+        "launchd" => {
+            let plist = agent_path(service)?;
+            fs::create_dir_all(plist.parent().context("agent directory")?)?;
+            rotate(&service.log)?;
+            fs::write(&plist, property_list(service, &binary))?;
+            let target = format!("{}/{}", gui_domain(), label(service));
+            // An agent still loaded from an earlier run, not holding the lock
+            // (so not running), would refuse the new bootstrap.
+            let _ = Command::new(launchctl())
+                .args(["bootout", &target])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let plist_text = plist.to_string_lossy();
+            for args in [
+                vec!["enable", target.as_str()],
+                vec!["bootstrap", &gui_domain(), &plist_text],
+            ] {
+                let status = Command::new(launchctl()).args(&args).status()?;
+                ensure!(status.success(), "launchctl {} failed", args.join(" "));
+            }
+            Ok(format!("installed as launchd agent {}", label(service)))
+        }
         "detached" => {
             detached(service, &binary)?;
             Ok(format!(
@@ -252,7 +346,7 @@ fn start(service: &Service, log: &Path) -> Result<String> {
                 log.display()
             ))
         }
-        other => bail!("PRIVATEER_SERVICE must be systemd, detached or none, not {other}"),
+        other => bail!("PRIVATEER_SERVICE must be systemd, launchd, detached or none, not {other}"),
     }
 }
 
@@ -272,6 +366,8 @@ pub fn door_status(name: &str) -> Result<String> {
 fn describe(service: &Service) -> Result<String> {
     let how = if unit_dir()?.join(&service.unit).exists() {
         format!("user service {}", service.unit)
+    } else if agent_path(service)?.exists() {
+        format!("launchd agent {}", label(service))
     } else {
         "no user service".into()
     };
@@ -331,6 +427,27 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
             .status();
         return Ok(format!("Stopped and removed user service {name}."));
     }
+    let plist = agent_path(service)?;
+    if plist.exists() {
+        let label = label(service);
+        // bootout sends the agent SIGTERM; a dispatcher's agent abandons its
+        // process group, so job supervisors keep running.
+        let status = Command::new(launchctl())
+            .args(["bootout", &format!("{}/{label}", gui_domain())])
+            .status()?;
+        ensure!(
+            status.success() || !held(&service.lock)?,
+            "launchctl bootout {label} failed; {} is still running",
+            service.what
+        );
+        fs::remove_file(&plist)?;
+        ensure!(
+            released(service)?,
+            "{} did not stop within 10 seconds of launchctl bootout",
+            service.what
+        );
+        return Ok(format!("Stopped and removed launchd agent {label}."));
+    }
     if let Some(pid) = fs::read_to_string(&service.pid)
         .ok()
         .and_then(|p| p.trim().parse::<i32>().ok())
@@ -343,15 +460,10 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
         let line = String::from_utf8_lossy(&command.stdout);
         if held(&service.lock)? && service.marks.iter().all(|m| line.contains(m.as_str())) {
             unsafe { libc::kill(pid, libc::SIGTERM) };
-            for _ in 0..100 {
-                if !held(&service.lock)? {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            let released = released(service)?;
             let _ = fs::remove_file(&service.pid);
             ensure!(
-                !held(&service.lock)?,
+                released,
                 "{} (pid {pid}) did not stop within 10 seconds",
                 service.what
             );
@@ -366,6 +478,18 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
         )
     }
     Ok(format!("{} was not running.", capitalized(&service.what)))
+}
+
+/// Whether a stopped service lets go of its lock within ten seconds: only
+/// then has it ended.
+fn released(service: &Service) -> Result<bool> {
+    for _ in 0..100 {
+        if !held(&service.lock)? {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(false)
 }
 
 /// Upgrade only the stop policy of a previously generated dispatcher unit.

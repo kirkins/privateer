@@ -446,12 +446,59 @@ fn claude_grants_the_privateer_cli_without_relying_on_workspace_trust() {
 }
 
 #[test]
+fn claude_first_mates_delegate_through_the_fleet_and_no_run_schedules_detached_work() {
+    let mut f = Fixture::new();
+    let plan = |f: &mut Fixture, id: &str| {
+        let mut args = f.args(&example("claude"));
+        args["id"] = json!(id);
+        let plan = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+        let argv: Vec<String> = plan["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        let end = argv.iter().position(|a| a == "--").unwrap();
+        let flag = argv.iter().position(|a| a == "--disallowedTools").unwrap();
+        let next = argv[flag + 1..end]
+            .iter()
+            .position(|a| a.starts_with("--"))
+            .map_or(end, |at| flag + 1 + at);
+        (argv[flag + 1..next].to_vec(), argv[..end].to_vec())
+    };
+    let (crew, argv) = plan(&mut f, "crew-job");
+    assert!(crew.contains(&"CronCreate".into()) && crew.contains(&"RemoteTrigger".into()));
+    assert!(
+        !crew.contains(&"Task".into()),
+        "crew may use Claude's own agents"
+    );
+    // The home holds the ship's records; Claude's file tools may read it.
+    let home = f.store.home().canonicalize().unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--add-dir" && w[1] == home.to_str().unwrap())
+    );
+    f.store
+        .connection()
+        .execute(
+            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms)
+             VALUES('wake','department','ship',1,'wake-job','fresh','running',0)",
+            [],
+        )
+        .unwrap();
+    let (first_mate, _) = plan(&mut f, "wake-job");
+    for tool in ["Task", "Agent", "Workflow", "EnterWorktree", "CronCreate"] {
+        assert!(first_mate.contains(&tool.into()), "{tool}: {first_mate:?}");
+    }
+}
+
+#[test]
 fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_identity() {
     let mut f = Fixture::new();
     let fakebin = f.base().join("bin");
     fs::create_dir(&fakebin).unwrap();
     let fake = fakebin.join("claude");
-    fs::write(&fake, "#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps({'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('ANTHROPIC_BASE_URL'),'pi_config':os.getenv('PI_CODING_AGENT_DIR'),'token':os.getenv('SYNTHETIC_TEST_TOKEN'),'foreign':[k for k in ['CLAUDECODE','GEMINI_CLI','PI_CODING_AGENT','CURSOR_AGENT'] if k in os.environ]}))\n").unwrap();
+    fs::write(&fake, "#!/usr/bin/env python3\nimport json,os,sys\nsid='4fa4f4bc-5b2d-4553-8ae1-eb09e501ea63'\nprint(json.dumps({'type':'system','subtype':'init','session_id':sid,'argv':sys.argv[1:],'role':os.getenv('PRIVATEER_ROLE'),'actor':os.getenv('PRIVATEER_ACTOR'),'route':os.getenv('ANTHROPIC_BASE_URL'),'pi_config':os.getenv('PI_CODING_AGENT_DIR'),'token':os.getenv('SYNTHETIC_TEST_TOKEN'),'foreign':[k for k in ['CLAUDECODE','GEMINI_CLI','PI_CODING_AGENT','CURSOR_AGENT'] if k in os.environ]}))\nprint(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':sid}))\n").unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
     let mut args = f.args(&example("claude"));
     args["options"] = json!({"model":"fixture-model","permission_mode":"plan"});
@@ -476,7 +523,8 @@ fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_id
         .output()
         .unwrap();
     assert!(output.status.success());
-    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let actual: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
     assert_eq!(actual["foreign"], json!([]));
     assert_eq!(actual["role"], "agent");
     assert_eq!(actual["actor"], "department");
@@ -556,6 +604,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/omp_rpc.py",
         "tests/agy_turn.py",
         "tests/result_turn.py",
+        "tests/claude_turn.py",
         "tests/tool_permissions.py",
         "tests/opencode_v2.py",
     ] {

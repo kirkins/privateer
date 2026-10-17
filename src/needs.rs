@@ -130,6 +130,59 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     }
 }
 
+fn queued_workspaces(
+    store: &Store,
+    before_ms: i64,
+    after: &str,
+    limit: usize,
+) -> Result<Vec<(String, String, i64)>> {
+    let path = crate::jobs::ledger_dir(store)?.join("resources.sqlite");
+    if !path.is_file() {
+        return Ok(vec![]);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_millis(25))?;
+    let has_queue: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_queue {
+        return Ok(vec![]);
+    }
+    let home = store.home().to_string_lossy().to_string();
+    let oversized: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM queue WHERE json_extract(record,'$.kind')='workspace'
+            AND json_extract(record,'$.home')=?1 AND length(CAST(record AS BLOB))>65536)",
+        [&home],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        !oversized,
+        "workspace queue observation source exceeds byte bound"
+    );
+    let mut statement = conn.prepare(
+        "SELECT json_extract(record,'$.job_id'),json_extract(record,'$.created_ms') FROM queue
+         WHERE json_extract(record,'$.kind')='workspace'
+           AND json_extract(record,'$.home')=?1
+           AND json_extract(record,'$.created_ms')<=?2
+           AND 'workspace:'||json_extract(record,'$.job_id')>?3
+         ORDER BY json_extract(record,'$.job_id') LIMIT ?4",
+    )?;
+    let rows = statement.query_map(params![home, before_ms, after, limit as u64], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    rows.map(|row| {
+        let (id, created_ms) = row?;
+        Ok(("workspace".to_owned(), id, created_ms))
+    })
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(Into::into)
+}
+
 fn observe(
     store: &Store,
     limit: usize,
@@ -201,18 +254,28 @@ fn observe(
                AND t.status NOT IN ('done','cancelled'))
           {schedule_union}
         ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
-    let rows = statement
+    let mut rows = statement
         .query_map(params![now - 60_000, after, limit + 1], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
+        .map(|row| row.map(|(source, id)| (source, id, None)))
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    budget.check()?;
+    rows.extend(
+        queued_workspaces(store, now - 60_000, after, limit + 1)?
+            .into_iter()
+            .map(|(source, id, created)| (source, id, Some(created))),
+    );
+    budget.check()?;
+    rows.sort_by_key(|(source, id, _)| format!("{source}:{id}"));
+    rows.truncate(limit + 1);
     let more = rows.len() > limit;
     let mut items = vec![];
     let mut cursor = None;
     // Read once, and only when a job is waiting: reservations no live process
     // holds, which keep queued work waiting until the captain recovers them.
     let mut stale: Option<Vec<Value>> = None;
-    for (source, id) in rows.into_iter().take(limit) {
+    for (source, id, created_ms) in rows.into_iter().take(limit) {
         budget.check()?;
         let key = format!("{source}:{id}");
         cursor = Some(key.clone());
@@ -296,6 +359,12 @@ fn observe(
                     vec![]
                 };
                 item["evidence"] = json!(match job["status"].as_str() {
+                    Some("queued")
+                        if job["reason"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("disk available") =>
+                        "disk_floor_wait",
                     Some("queued") if !blocking.is_empty() => "stuck_heavy_capacity",
                     Some("queued") => "capacity_wait",
                     _ => "orphaned_job",
@@ -345,6 +414,20 @@ fn observe(
                 ] {
                     item[key] = state[key].clone();
                 }
+                item["actions"] = json!([]);
+            }
+            "workspace" => {
+                let task = store.task(&id)?;
+                item["kind"] = json!("blocker");
+                item["evidence"] = json!("workspace_disk_wait");
+                item["task_id"] = json!(id);
+                item["ship"] = task["owner"].clone();
+                item["status"] = json!("queued");
+                item["created_ms"] = json!(created_ms.unwrap_or(now));
+                item["waited_ms"] = json!(now.saturating_sub(created_ms.unwrap_or(now)));
+                item["summary"] =
+                    json!("Workspace allocation is waiting in the host disk capacity queue.");
+                item["version"] = json!(crate::core::hash(&json!([id, "workspace_disk_wait"])));
                 item["actions"] = json!([]);
             }
             _ => unreachable!(),

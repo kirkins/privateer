@@ -144,7 +144,11 @@ fn a_ship_creates_a_linked_sibling_ship() {
         .find(|s| s["name"] == "infra")
         .cloned()
         .unwrap();
-    assert_eq!(entry["created_by"], "liaison");
+    // The operator made it from the liaison's folder: the liaison lent its
+    // settings, but the captain is its creator, so the liaison cannot retire it.
+    assert_eq!(entry["created_by"], "captain");
+    let retire = machine.as_agent(&liaison, "liaison", "ship.retire", json!({"name": "infra"}));
+    assert!(!retire.status.success(), "the liaison did not create infra");
     // A folder that is not empty is never taken over.
     fs::create_dir_all(machine.ships.join("busy")).unwrap();
     fs::write(machine.ships.join("busy/notes.txt"), "mine").unwrap();
@@ -965,4 +969,78 @@ fn the_liaison_sees_what_waits_on_the_captain_and_relays_the_captains_answers() 
     let waiting = machine.json(&liaison, "captain.waiting", json!({}));
     assert_eq!(waiting["waiting"].as_array().unwrap().len(), 1);
     assert_eq!(waiting["waiting"][0]["mail"]["id"], production["id"]);
+}
+
+#[test]
+fn a_standing_grant_lets_a_ship_act_on_another_until_paused_or_revoked() {
+    let machine = Machine::new();
+    let liaison = machine.ship("liaison");
+    let apps = machine.ship("apps");
+    let rescope = |scope: &str| {
+        machine
+            .as_agent(
+                &liaison,
+                "liaison",
+                "ship.scope",
+                json!({"name": "apps", "scope": scope}),
+            )
+            .status
+            .success()
+    };
+    // The captain made apps, so the liaison cannot touch it, nor grant
+    // itself the right.
+    assert!(!rescope("Apps"));
+    let own = machine.as_agent(
+        &liaison,
+        "liaison",
+        "grant.put",
+        json!({"grantee": "liaison", "actions": ["ship.scope"], "ships": ["apps"]}),
+    );
+    assert!(!own.status.success());
+
+    let made = machine.ok(
+        &liaison,
+        &[
+            "grant",
+            "add",
+            "liaison",
+            "--actions",
+            "ship.scope",
+            "--ships",
+            "apps",
+            "--notify",
+        ],
+    );
+    let id = serde_json::from_str::<Value>(&made).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(rescope("Apps and their releases"));
+    assert_eq!(
+        machine.json(&apps, "ship.show", json!({"name": "apps"}))["scope"],
+        "Apps and their releases"
+    );
+    // Only the actions it names, and the captain hears of each use.
+    let retire = machine.as_agent(&liaison, "liaison", "ship.retire", json!({"name": "apps"}));
+    assert!(!retire.status.success());
+    let told = machine.json(&liaison, "mail.inbox", json!({"address": "captain"}));
+    assert!(
+        told.to_string().contains(&format!("used your grant {id}")),
+        "{told}"
+    );
+    // A ship sees the grants it holds.
+    let held: Value = serde_json::from_slice(
+        &machine
+            .as_agent(&liaison, "liaison", "grant.list", json!({}))
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(held["grants"][0]["id"], id.as_str());
+
+    machine.ok(&liaison, &["grant", "pause", &id]);
+    assert!(!rescope("Paused"));
+    machine.ok(&liaison, &["grant", "resume", &id]);
+    assert!(rescope("Resumed"));
+    machine.ok(&liaison, &["grant", "revoke", &id]);
+    assert!(!rescope("Revoked"));
 }

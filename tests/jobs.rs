@@ -1156,10 +1156,13 @@ fn resource_settings_are_host_wide_open_to_agents_and_validated() {
     let home = fixture.home("mate", 0);
     let other = fixture.home("other", 0);
     let agent = [("PRIVATEER_ROLE", "agent"), ("PRIVATEER_ACTOR", "peer")];
+    // An unconfigured host applies the documented 2 GiB free-disk floor.
+    let fresh = ok(&other, "resource.status", json!({}));
+    assert_eq!(fresh["settings"]["min_free_disk_bytes"], 2_147_483_648_u64);
     let configured = ok_env(
         &home,
         "resource.configure",
-        json!({"max_load_per_cpu":0.7,"min_available_memory_bytes":4_294_967_296_u64}),
+        json!({"max_load_per_cpu":0.7,"min_available_memory_bytes":4_294_967_296_u64,"min_free_disk_bytes":123}),
         &agent,
     );
     assert_eq!(configured["settings"]["max_load_per_cpu"], 0.7);
@@ -1170,11 +1173,17 @@ fn resource_settings_are_host_wide_open_to_agents_and_validated() {
         status["settings"]["min_available_memory_bytes"],
         4_294_967_296_u64
     );
+    assert_eq!(status["settings"]["min_free_disk_bytes"], 123);
     let host = &status["host"];
     assert!(host["cpus"].as_f64().unwrap() >= 1.0);
     assert!(host["load"].as_f64().unwrap() >= 0.0);
     let available = host["memory_available_bytes"].as_u64().unwrap();
     assert!(available > 0 && available <= host["memory_total_bytes"].as_u64().unwrap());
+    assert!(host["disk_available_bytes"].as_u64().unwrap() > 0);
+    assert!(
+        host["disk_total_bytes"].as_u64().unwrap()
+            >= host["disk_available_bytes"].as_u64().unwrap()
+    );
     // null restores a default.
     let reset = ok(
         &other,
@@ -1204,6 +1213,72 @@ fn resource_settings_are_host_wide_open_to_agents_and_validated() {
         .iter()
         .any(|e| e["kind"] == "resource.configured" && e["payload"]["by"]["agent"] == "peer");
     assert!(by_agent, "{audit}");
+}
+
+#[test]
+fn disk_floor_refusal_queues_jobs_and_resource_status_reports_it() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let total = ok(&home, "resource.status", json!({}))["host"]["disk_total_bytes"]
+        .as_u64()
+        .unwrap();
+    ok(
+        &home,
+        "resource.configure",
+        json!({"min_free_disk_bytes":total.saturating_mul(2)}),
+    );
+    let refused = run(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"disk-refused","command":["true"],"heavy":false}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("disk available"));
+
+    let queued = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"disk-queued","command":["true"],"heavy":false,"wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued");
+    assert!(
+        queued["reason"]
+            .as_str()
+            .unwrap()
+            .contains("disk available")
+    );
+    let status = ok(&home, "resource.status", json!({}));
+    assert_eq!(status["disk_floor_met"], false);
+    assert_eq!(status["queue"][0]["job_id"], "disk-queued");
+
+    let store = Store::open(&home).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.created_ms',?2) WHERE id=?1",
+            params!["disk-queued", privateer::store::Store::now_ms() - 61_000],
+        )
+        .unwrap();
+    let needs =
+        privateer::dispatch(&mut Store::open(&home).unwrap(), "runtime.needs", json!({})).unwrap();
+    let blocker = needs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["source_id"] == "disk-queued")
+        .unwrap();
+    assert_eq!(blocker["evidence"], "disk_floor_wait");
+
+    ok(
+        &home,
+        "resource.configure",
+        json!({"min_free_disk_bytes":0}),
+    );
+    assert_eq!(
+        wait(&home, "disk-queued", &["succeeded"])["status"],
+        "succeeded"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["queue"], json!([]));
 }
 
 #[test]
@@ -1356,6 +1431,29 @@ fn start_light(home: &Path, id: &str, command: &[&str]) {
         json!({"task_id":"task","id":id,"command":command,"heavy":false}),
     );
     wait(home, id, &["succeeded"]);
+}
+
+#[test]
+fn a_light_job_starts_while_a_heavy_job_waits_in_the_queue() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // The fixture allows one heavy job; fill it and queue a second.
+    start(&home, "running", &["sleep", "1"]);
+    let queued = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"heavy-wait","command":["true"],"wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    // Light work needs no capacity, so it starts now instead of queueing.
+    let light = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"light-now","command":["true"],"heavy":false}),
+    );
+    assert_ne!(light["status"], "queued", "{light}");
+    wait(&home, "light-now", &["succeeded"]);
+    wait(&home, "heavy-wait", &["succeeded"]);
 }
 
 #[test]

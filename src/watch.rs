@@ -3,6 +3,12 @@
 //! Lines typed into it are mailed to the ship as the captain. Inside Herdr
 //! the pane reports itself as that ship's agent (working, idle or blocked),
 //! so first mates appear in Herdr's agent list.
+//!
+//! `privateer watch --job ID` follows one headless crew job the same way, in
+//! the space a hosted ship opens for crew whose harness cannot be hosted.
+//! A headless crew takes no input mid-run, so typed lines go to its ship's
+//! first mate on the job's task. The view ends shortly after the job does,
+//! which closes its space.
 use crate::store::Store;
 use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, params};
@@ -22,6 +28,8 @@ const POLL: Duration = Duration::from_millis(1000);
 const REPORT_EVERY: Duration = Duration::from_secs(20);
 /// Rendered lines shown when attaching to a wake already under way.
 const ATTACH_LINES: usize = 15;
+/// How long a crew view stays up after its job ends, so its outcome is seen.
+const CREW_LINGER: Duration = Duration::from_secs(30);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop(_: libc::c_int) {
@@ -59,7 +67,7 @@ pub fn run(store: &mut Store, ship: &str) -> Result<()> {
             );
         }
     }
-    let mut herdr = Herdr::from_env(ship, &harness);
+    let mut herdr = Herdr::from_env(ship, &harness, &format!("{ship} first mate"));
     let input = read_input();
     println!(
         "Watching {ship} ({harness}). Type a message and press Enter to mail it; Ctrl-C to stop."
@@ -93,6 +101,116 @@ pub fn run(store: &mut Store, ship: &str) -> Result<()> {
             follow(store, &mut followed, wake)?;
         }
         let (state, message) = state(store, ship, latest.as_ref())?;
+        let due = reported
+            .as_ref()
+            .is_none_or(|(last, at)| last.as_str() != state || at.elapsed() >= REPORT_EVERY);
+        if due {
+            if let Some(herdr) = herdr.as_mut() {
+                herdr.report(state, &message);
+            }
+            reported = Some((state.to_owned(), Instant::now()));
+        }
+        let until = Instant::now() + POLL;
+        while Instant::now() < until && !STOP.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if let Some(herdr) = herdr.as_mut() {
+        herdr.release();
+    }
+    Ok(())
+}
+
+/// Follow one crew job until shortly after it ends.
+pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
+    let load = |store: &Store| -> Result<Value> {
+        let raw: String = store
+            .connection()
+            .query_row("SELECT record FROM jobs WHERE id=?1", [job_id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .with_context(|| format!("no job {job_id} in this home"))?;
+        Ok(serde_json::from_str(&raw)?)
+    };
+    let job = load(store)?;
+    let task = job["task_id"].as_str().unwrap_or_default().to_owned();
+    let ship = job["agent_actor"].as_str().unwrap_or_default().to_owned();
+    let harness = job["model_route"]
+        .as_str()
+        .and_then(|route| route.split('/').next())
+        .unwrap_or("agent")
+        .to_owned();
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(
+                signal,
+                stop as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
+        }
+    }
+    let mut herdr = Herdr::from_env(&task, &harness, &format!("{ship} crew on {task}"));
+    let input = read_input();
+    println!(
+        "Crew {} of {ship} on {task} ({}). Type a message and press Enter to send it to {ship}'s first mate.",
+        short(job_id),
+        job["model_route"].as_str().unwrap_or(&harness)
+    );
+    let mut anchor = None;
+    let mut attached = false;
+    let mut ended: Option<Instant> = None;
+    let mut reported: Option<(String, Instant)> = None;
+    while !STOP.load(Ordering::Relaxed) && ended.is_none_or(|at| at.elapsed() < CREW_LINGER) {
+        while let Ok(line) = input.try_recv() {
+            let body = line.trim();
+            if body.is_empty() {
+                continue;
+            }
+            let body = format!("About crew job {job_id} on {task}: {body}");
+            match crate::dispatch(
+                store,
+                "mail.send",
+                json!({"from": "captain", "to": ship, "kind": "notice", "task_id": task, "body": body}),
+            ) {
+                Ok(_) => println!("→ {ship}: {}", clip(&body, 300)),
+                Err(error) => println!("✗ not sent: {error:#}"),
+            }
+        }
+        let job = load(store)?;
+        let status = job["status"].as_str().unwrap_or("unknown").to_owned();
+        if let Some(incarnation) = job["incarnation"].as_str() {
+            let dir = store.home().join("jobs").join(job_id).join(incarnation);
+            let mut rendered: Vec<String> = new_lines(&dir, &mut anchor)
+                .iter()
+                .filter_map(|l| render(l))
+                .collect();
+            if !attached && rendered.len() > ATTACH_LINES {
+                rendered.drain(..rendered.len() - ATTACH_LINES);
+            }
+            attached = true;
+            for line in rendered {
+                println!("{line}");
+            }
+        }
+        let terminal = !matches!(
+            status.as_str(),
+            "queued" | "starting" | "launching" | "running"
+        );
+        if terminal && ended.is_none() {
+            let reason = job["reason"]
+                .as_str()
+                .map(|r| format!(": {}", clip(r, 200)))
+                .unwrap_or_default();
+            println!("⚓ crew {} {status}{reason}", short(job_id));
+            ended = Some(Instant::now());
+        }
+        let state = match status.as_str() {
+            "running" | "starting" | "launching" => "working",
+            "queued" => "idle",
+            "succeeded" => "done",
+            _ => "blocked",
+        };
+        let message = format!("{task}: crew {status}");
         let due = reported
             .as_ref()
             .is_none_or(|(last, at)| last.as_str() != state || at.elapsed() >= REPORT_EVERY);
@@ -509,10 +627,11 @@ struct Herdr {
     pane: String,
     agent: String,
     ship: String,
+    title: String,
 }
 
 impl Herdr {
-    fn from_env(ship: &str, harness: &str) -> Option<Self> {
+    fn from_env(ship: &str, harness: &str, title: &str) -> Option<Self> {
         if std::env::var("HERDR_ENV").ok().as_deref() != Some("1") {
             return None;
         }
@@ -524,6 +643,7 @@ impl Herdr {
                 .filter(|p| !p.is_empty())?,
             agent: harness.to_owned(),
             ship: ship.to_owned(),
+            title: title.to_owned(),
         })
     }
 
@@ -534,7 +654,14 @@ impl Herdr {
                 self.client = Some(crate::herdr::Client::connect(&self.socket)?);
             }
             let client = self.client.as_mut().context("connected above")?;
-            client.report_agent(&self.pane, &self.agent, &self.ship, state, message)
+            client.report_agent(
+                &self.pane,
+                &self.agent,
+                &self.ship,
+                &self.title,
+                state,
+                message,
+            )
         })();
         if result.is_err() {
             self.client = None;

@@ -140,6 +140,21 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     }
     let mut record =
         json!({"name": name, "scope": scope, "location": location, "accepts": accepts});
+    // What a ship consumes is set with ship.consumes; a ship.put that does
+    // not name it, such as a directory refresh, keeps it.
+    let consumes = match args.get("consumes") {
+        Some(list) => Some(list.clone()),
+        None => ship(store, name)?.and_then(|existing| existing.get("consumes").cloned()),
+    };
+    if let Some(consumes) = consumes.filter(|c| !c.is_null()) {
+        let names = consumes
+            .as_array()
+            .context("consumes is a list of ship names")?;
+        for other in names {
+            identifier(other.as_str().context("consumes holds ship names")?)?;
+        }
+        record["consumes"] = consumes;
+    }
     if let Some(profile) = args.get("first_mate").filter(|v| !v.is_null()) {
         ensure!(
             location == "here",
@@ -459,10 +474,11 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     );
     ensure!(from != to, "a mailbox cannot write to itself");
     let peer = recipient.as_ref().and_then(remote_peer).map(str::to_owned);
-    if peer.is_some() {
-        // The captain's mailbox is per home until the captain's front door.
+    if let Some(peer) = &peer {
+        // The captain's mailbox is per home; only a link between machines
+        // carries the captain's mail to another home.
         ensure!(
-            from != CAPTAIN,
+            from != CAPTAIN || crate::peers::machine(store, peer)?,
             "the captain's mail stays in this home for now"
         );
     }
@@ -699,6 +715,20 @@ fn quarantine(store: &Store, id: &str, wire_bytes: usize) -> Result<()> {
     Ok(())
 }
 
+/// The request-closure state a receiving home reports having applied for
+/// this message. Only a receipt for this exact closure proves application;
+/// legacy peers accept the notice too, but do not return this evidence.
+pub(crate) fn applied_end(message: &Value, result: &Value) -> Option<String> {
+    let receipt = &result["request_end"];
+    let end = &message["payload"]["request_end"];
+    (end.is_object()
+        && receipt["id"] == message["correlation"]
+        && receipt["ended_by"] == message["id"]
+        && receipt["state"] == end["state"])
+        .then(|| receipt["state"].as_str().map(str::to_owned))
+        .flatten()
+}
+
 /// Try once to deliver a pending outgoing message; record the outcome.
 fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -> Result<Delivery> {
     let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
@@ -717,19 +747,7 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         timeout,
     )
     .and_then(|response| match response["ok"].as_bool() {
-        Some(true) => {
-            let receipt = &response["result"]["request_end"];
-            let end = &message["payload"]["request_end"];
-            // Only a receipt for this exact closure proves application. Legacy
-            // peers accept the notice too, but do not return this evidence.
-            let applied = (end.is_object()
-                && receipt["id"] == message["correlation"]
-                && receipt["ended_by"] == message["id"]
-                && receipt["state"] == end["state"])
-                .then(|| receipt["state"].as_str().map(str::to_owned))
-                .flatten();
-            Ok(applied)
-        }
+        Some(true) => Ok(applied_end(&message, &response["result"])),
         _ => bail!(
             "{}",
             response["error"]
@@ -803,6 +821,8 @@ fn flush_pending(
         Caller::Operator => None,
     };
     let deadline = budget.map(|budget| Instant::now() + budget);
+    // Mail behind a collected peer waits for its machine to take it.
+    let collected = json!(crate::peers::collected(store)?).to_string();
     let mut failed = vec![];
     let (mut delivered, mut attempted, mut examined) = (0, 0, 0);
     while attempted < max_attempts && examined < max_attempts + EXTRA_CLASSIFICATIONS {
@@ -819,12 +839,13 @@ fn flush_pending(
                AND (?2 OR COALESCE(r.next_attempt_ms, 0)<=?3)
                AND (?4 IS NULL OR json_extract(s.record, '$.location.peer')=?4)
                AND json_extract(s.record, '$.location.peer') NOT IN (SELECT value FROM json_each(?5))
+               AND json_extract(s.record, '$.location.peer') NOT IN (SELECT value FROM json_each(?6))
                AND NOT EXISTS (
                  SELECT 1 FROM mail older JOIN ships os ON os.name=older.recipient
                  WHERE older.delivery='pending' AND older.seq<m.seq
                    AND json_extract(os.record, '$.location.peer')=json_extract(s.record, '$.location.peer'))
              ORDER BY COALESCE(r.last_attempt_ms, 0), m.seq LIMIT 1",
-            params![sender, manual, Store::now_ms(), only_peer, json!(failed).to_string()],
+            params![sender, manual, Store::now_ms(), only_peer, json!(failed).to_string(), collected],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional()?;
         let Some((id, peer)) = next else { break };
@@ -854,6 +875,133 @@ fn flush_pending(
     Ok(
         json!({"delivered": delivered, "pending": pending, "attempted": attempted, "quarantined":quarantined}),
     )
+}
+
+/// Pending mail for ships behind a collected peer, oldest first, as the
+/// envelopes another machine collects: at most `limit` messages and about
+/// `max_bytes` of them.
+pub(crate) fn awaiting(
+    store: &Store,
+    peer: &str,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<Vec<Value>> {
+    let mut statement = store.connection().prepare(
+        "SELECT m.id FROM mail m JOIN ships s ON s.name=m.recipient
+         WHERE m.delivery='pending' AND json_extract(s.record, '$.location.peer')=?1
+         ORDER BY m.seq LIMIT ?2",
+    )?;
+    let ids: Vec<String> = statement
+        .query_map(params![peer, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut envelopes = vec![];
+    let mut bytes = 0;
+    for id in ids {
+        let envelope = envelope(&by_id(store, &id)?.context("message vanished")?);
+        bytes += envelope.to_string().len();
+        if bytes > max_bytes && !envelopes.is_empty() {
+            break;
+        }
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+/// Record what another machine collected from `peer`: delivered messages,
+/// with the request-closure state it applied, and messages it refused, which
+/// are quarantined with the reason rather than offered again.
+pub(crate) fn collected(
+    store: &Store,
+    peer: &str,
+    delivered: &[(String, Option<String>)],
+    refused: &[(String, String)],
+) -> Result<usize> {
+    let tx = store.write_transaction()?;
+    let now = Store::now_ms();
+    let behind = "AND recipient IN (SELECT name FROM ships WHERE json_extract(record, '$.location.peer')=?2)";
+    let mut changed = 0;
+    for (id, end_state) in delivered {
+        changed += tx.execute(
+            &format!(
+                "UPDATE mail SET delivery='delivered', delivered_ms=?3, delivery_attempts=delivery_attempts+1,
+                   delivery_error=NULL, remote_end_state=?4 WHERE id=?1 AND delivery='pending' {behind}"
+            ),
+            params![id, peer, now, end_state],
+        )?;
+    }
+    for (id, error) in refused {
+        changed += tx.execute(
+            &format!(
+                "UPDATE mail SET delivery='quarantined', delivery_attempts=delivery_attempts+1,
+                   delivery_error=?3 WHERE id=?1 AND delivery='pending' {behind}"
+            ),
+            params![id, peer, error.chars().take(4096).collect::<String>()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+fn collected_table(store: &Store) -> Result<()> {
+    store.connection().execute_batch(
+        "CREATE TABLE IF NOT EXISTS machine_collected(peer TEXT NOT NULL, id TEXT NOT NULL,
+           collected_ms INTEGER NOT NULL, error TEXT, PRIMARY KEY(peer, id));",
+    )?;
+    Ok(())
+}
+
+/// Mail from ships here to the captain, written since `since_ms`, that the
+/// machine behind `peer` has not collected yet: the captain reads it there.
+/// It stays in this home's captain mailbox as well.
+pub(crate) fn awaiting_captain(
+    store: &Store,
+    peer: &str,
+    since_ms: i64,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<Vec<Value>> {
+    collected_table(store)?;
+    let mut statement = store.connection().prepare(
+        "SELECT m.id FROM mail m JOIN ships s ON s.name=m.sender
+         WHERE m.recipient=?1 AND json_extract(s.record, '$.location')='here' AND m.created_ms>=?2
+           AND NOT EXISTS (SELECT 1 FROM machine_collected c WHERE c.peer=?3 AND c.id=m.id)
+         ORDER BY m.seq LIMIT ?4",
+    )?;
+    let ids: Vec<String> = statement
+        .query_map(params![CAPTAIN, since_ms, peer, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut envelopes = vec![];
+    let mut bytes = 0;
+    for id in ids {
+        let envelope = envelope(&by_id(store, &id)?.context("message vanished")?);
+        bytes += envelope.to_string().len();
+        if bytes > max_bytes && !envelopes.is_empty() {
+            break;
+        }
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+/// Record captain mail the machine behind `peer` collected, delivered or
+/// refused (with the reason), so it is not offered again.
+pub(crate) fn collected_captain(
+    store: &Store,
+    peer: &str,
+    ids: &[(String, Option<String>)],
+) -> Result<usize> {
+    collected_table(store)?;
+    let tx = store.write_transaction()?;
+    let mut changed = 0;
+    for (id, error) in ids {
+        changed += tx.execute(
+            "INSERT OR IGNORE INTO machine_collected(peer, id, collected_ms, error)
+             SELECT ?1, id, ?3, ?4 FROM mail WHERE id=?2 AND recipient=?5",
+            params![peer, id, Store::now_ms(), error, CAPTAIN],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
 }
 
 fn flush(store: &Store, args: &Value) -> Result<Value> {
@@ -900,18 +1048,32 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     let kind = required(args, "kind")?;
     ensure!(KINDS.contains(&kind), "unknown message kind {kind}");
     ensure!(
-        kind != "decision" && from != CAPTAIN && to != CAPTAIN,
-        "the captain's mail stays in its own home for now"
-    );
-    ensure!(
         from != CREW && to != CREW,
         "crew reports stay in their own home"
     );
-    let sender = ship(store, from)?.with_context(|| format!("unknown ship {from}"))?;
     ensure!(
-        remote_peer(&sender).is_some(),
-        "{from} is hosted here; local mail is sent with mail.send"
+        kind != "decision" || to == CAPTAIN,
+        "decisions are addressed to the captain"
     );
+    // The captain's mail crosses only a link between machines, which the
+    // operator made, and arrives only from the operator's side of it: the
+    // captain's own words from the door, or a ship's mail to the captain
+    // collected from the other machine.
+    if from == CAPTAIN || to == CAPTAIN {
+        ensure!(
+            matches!(store.caller(), Caller::Operator),
+            "the captain's mail stays in its own home unless the operator carries it across machines"
+        );
+    }
+    if from != CAPTAIN {
+        let sender = ship(store, from)?.with_context(|| format!("unknown ship {from}"))?;
+        let peer = remote_peer(&sender)
+            .with_context(|| format!("{from} is hosted here; local mail is sent with mail.send"))?;
+        ensure!(
+            to != CAPTAIN || crate::peers::machine(store, peer)?,
+            "the captain's mail stays in its own home for now"
+        );
+    }
     local_address(store, to)?;
     let correlation = optional_str(args, "correlation")?;
     let request_kind = optional_str(args, "request_kind")?;
@@ -964,7 +1126,7 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             urgency,
             deadline_ms,
             now,
-            (kind == "request").then_some("open")
+            matches!(kind, "request" | "decision").then_some("open")
         ],
     )?;
     if kind == "reply" {

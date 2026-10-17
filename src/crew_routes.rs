@@ -279,7 +279,8 @@ pub(crate) fn check(
     Ok(())
 }
 
-/// The bearings line: each list in order, with routes backing off marked.
+/// The bearings line: each list in order with the captain's notes, and
+/// routes backing off marked.
 pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
     let Some(policy) = for_store(store)? else {
         return Ok(None);
@@ -293,7 +294,12 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         let mut shown = vec![];
         for name in names {
             let route = &policy["routes"][name.as_str()];
-            let mut label = format!("{name} ({})", route["cost"].as_str().unwrap_or("?"));
+            let cost = route["cost"].as_str().unwrap_or("?");
+            let note = route["note"].as_str().filter(|note| !note.is_empty());
+            let mut label = match note {
+                Some(note) => format!("{name} ({cost}; {note})"),
+                None => format!("{name} ({cost})"),
+            };
             if identity(route)
                 .map(|id| crate::routes::refusal(store, &id))
                 .transpose()?

@@ -29,6 +29,8 @@ pub const VERBS: &[&str] = &[
     "service",
     "ship",
     "door",
+    "machine",
+    "grant",
     "permissions",
     "routes",
     "watch",
@@ -535,7 +537,7 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     if store.charter(&ship).is_err() {
         let mut charter = json!({"id": ship,
             "objective": setup.objective.clone().unwrap_or_else(|| if liaison {"Act for the captain: onboard them, set up and staff ships, relay mail and delegate work to peers".into()} else {format!("Work as the ship {ship}")}),
-            "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600});
+            "repo": folder, "job_timeout_secs": 3600});
         if let Some(actions) = &setup.actions {
             charter["actions"] = actions.clone();
         }
@@ -882,6 +884,20 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             route.extend(["--model".to_owned(), model.to_owned()]);
         }
     }
+    // A Claude ship's permission mode and effort, such as `auto` for a first
+    // mate nobody is watching. Fleet YOLO still replaces the mode.
+    if own_harness && harness == "claude" {
+        for (key, flag) in [
+            ("permission_mode", "--permission-mode"),
+            ("effort", "--effort"),
+        ] {
+            if let Some(value) = options[key].as_str()
+                && !chooses(flag)
+            {
+                route.extend([flag.to_owned(), value.to_owned()]);
+            }
+        }
+    }
     let binary = if harness == "opencode-v2" {
         "opencode".to_owned()
     } else {
@@ -932,6 +948,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         && bundle_plan.is_none()
         && matches!(harness.as_str(), "pi" | "pi-signed")
         && !chooses("--session")
+    {
+        route.push("--continue".to_owned());
+    }
+    if hosted
+        && harness == "claude"
+        && !["--continue", "-c", "--resume", "-r", "--session-id"]
+            .iter()
+            .any(|flag| chooses(flag))
+        && crate::host::claude_has_conversation(
+            &home.parent().context("ship folder")?.canonicalize()?,
+        )
     {
         route.push("--continue".to_owned());
     }
@@ -1261,6 +1288,11 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         return Ok(());
     }
     if verb == "watch" {
+        if let [flag, job] = args
+            && flag == "--job"
+        {
+            return crate::watch::crew(&mut store, job);
+        }
         let ship = match args.first() {
             Some(ship) => ship.clone(),
             None => crate::presence::folder_ship(&store)

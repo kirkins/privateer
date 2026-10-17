@@ -18,7 +18,71 @@ pub mod bridge;
 const LAUNCH_TTL_SECS: u64 = 60;
 
 /// Harnesses whose attended adapter starts a turn when mail arrives.
-const LIVE_HARNESSES: &[&str] = &["pi", "pi-signed"];
+const LIVE_HARNESSES: &[&str] = &["pi", "pi-signed", "claude"];
+/// Harnesses whose hosted crew end their session when the work settles.
+const CREW_HARNESSES: &[&str] = &["pi", "pi-signed"];
+
+/// Claude's own state directory and user config file, as Claude finds them.
+fn claude_config() -> Option<(PathBuf, PathBuf)> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {
+        let file = dir.join(".claude.json");
+        return Some((dir, file));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some((home.join(".claude"), home.join(".claude.json")))
+}
+
+/// Whether Claude's folder-trust dialog was accepted for this very folder.
+/// An interactive Claude in an untrusted folder stops at that dialog, whose
+/// default declines, with nobody at a hosted pane to answer. Trust on a folder
+/// above does not do: a ship folder carries `init`'s permission rules in
+/// `.claude/settings.json`, and Claude asks again for a folder with its own
+/// rules (seen on 2.1.300 under an already trusted parent).
+/// Read only: Claude rewrites this file itself, so Privateer never writes it.
+fn claude_trusted(folder: &Path) -> bool {
+    let Some(config) = claude_config()
+        .and_then(|(_, file)| std::fs::read(file).ok())
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+    else {
+        return false;
+    };
+    folder
+        .to_str()
+        .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
+}
+
+/// Whether Claude holds an interactive conversation for this folder, which
+/// `--continue` needs: without one, an interactive `--continue` exits. Claude
+/// keeps a folder's transcripts under its path with every other character a
+/// dash, and `--continue` passes over headless (`claude -p`, entrypoint
+/// `sdk-cli`) ones, which a ship's wakes and errands leave there; only a
+/// transcript whose opening records name the `cli` entrypoint counts.
+pub(crate) fn claude_has_conversation(folder: &Path) -> bool {
+    use std::io::Read;
+    let Some((dir, _)) = claude_config() else {
+        return false;
+    };
+    let name: String = folder
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let interactive = |path: &Path| {
+        let mut head = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(64 * 1024).read_to_end(&mut head))
+            .is_ok_and(|_| {
+                let mark = br#""entrypoint":"cli""#;
+                head.windows(mark.len()).any(|w| w == mark)
+            })
+    };
+    std::fs::read_dir(dir.join("projects").join(name)).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let path = e.path();
+            path.extension().is_some_and(|x| x == "jsonl") && interactive(&path)
+        })
+    })
+}
 
 pub(crate) fn validate(host: &Value) -> Result<Value> {
     ensure!(
@@ -80,6 +144,16 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         LIVE_HARNESSES.contains(&harness.as_str()),
         "{harness} cannot be hosted: its attended adapter does not start turns on mail"
     );
+    let folder = store
+        .home()
+        .parent()
+        .context("ship folder")?
+        .canonicalize()?;
+    ensure!(
+        harness != "claude" || claude_trusted(&folder),
+        "Claude has not been trusted in {}; run `privateer start claude` there once, choose \"Yes, I trust this folder\" and, for permission_mode auto, finish auto mode's setup screen",
+        folder.display()
+    );
     ensure!(
         crate::presence::folder_ship(store).as_deref() == Some(ship),
         "hosted start must use this folder's ship"
@@ -96,11 +170,6 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         "first mate duty owner changed"
     );
     let charter = store.authorize(duty, "spawn")?;
-    let folder = store
-        .home()
-        .parent()
-        .context("ship folder")?
-        .canonicalize()?;
     let repo = Path::new(charter["repo"].as_str().context("charter repo")?).canonicalize()?;
     ensure!(
         folder.is_dir() && folder.starts_with(repo),
@@ -236,14 +305,23 @@ impl Drop for Lease<'_> {
     }
 }
 
+fn answers() -> bool {
+    socket()
+        .and_then(|s| crate::herdr::Client::connect(&s).ok())
+        .is_some_and(|mut c| c.snapshot().is_ok())
+}
+
 /// Whether a ship's crew run live: its first mate is hosted, its harness can
 /// end a crew when the work settles, and the terminal host answers.
 pub(crate) fn hosts_crew(profile: &Value, harness: &str) -> bool {
-    hosted(profile)
-        && LIVE_HARNESSES.contains(&harness)
-        && socket()
-            .and_then(|s| crate::herdr::Client::connect(&s).ok())
-            .is_some_and(|mut c| c.snapshot().is_ok())
+    hosted(profile) && CREW_HARNESSES.contains(&harness) && answers()
+}
+
+/// Whether a hosted ship's crew on another harness get a viewer space. They
+/// run headless, which no folder-trust or setup dialog can stall and whose
+/// end is confirmed from their event stream, and the space follows their log.
+pub(crate) fn views_crew(profile: &Value, harness: &str) -> bool {
+    hosted(profile) && !CREW_HARNESSES.contains(&harness) && answers()
 }
 
 /// Run a crew job's supervisor in its own background space, labelled under
@@ -256,6 +334,41 @@ pub(crate) fn supervise(
     ship: &str,
     cwd: &Path,
 ) -> Result<()> {
+    crew_space(store, job, task, ship, cwd, &[], &["_job-supervise", job])
+}
+
+/// Follow a headless crew job in its own background space under its task:
+/// `privateer watch --job`, which closes the space when the job ends.
+pub(crate) fn view_crew(
+    store: &Store,
+    job: &str,
+    task: &str,
+    ship: &str,
+    cwd: &Path,
+) -> Result<()> {
+    // A first mate starts its crew, but the view belongs to the captain's
+    // terminal: its fixed command only reads records and mails what the
+    // captain types there, so it runs as the operator, not the ship.
+    crew_space(
+        store,
+        job,
+        task,
+        ship,
+        cwd,
+        &[("PRIVATEER_ROLE", "operator")],
+        &["watch", "--job", job],
+    )
+}
+
+fn crew_space(
+    store: &Store,
+    job: &str,
+    task: &str,
+    ship: &str,
+    cwd: &Path,
+    env: &[(&str, &str)],
+    command: &[&str],
+) -> Result<()> {
     let socket = socket().context("no Herdr socket configured")?;
     let mut client = crate::herdr::Client::connect(&socket)?;
     let binary = crate::executable::installed()?;
@@ -264,13 +377,14 @@ pub(crate) fn supervise(
         &format!("└ {task}"),
         &binary,
         store.home(),
-        &[],
-        &["_job-supervise", job],
+        env,
+        command,
     )?;
     settle(store, &mut client, &pane.workspace_id, "crew", ship);
     store.audit(
         "host.crew",
-        &json!({"job_id": job, "task_id": task, "pane": pane.pane_id, "workspace": pane.workspace_id}),
+        &json!({"job_id": job, "task_id": task, "pane": pane.pane_id,
+            "workspace": pane.workspace_id, "viewer": command[0] == "watch"}),
     )?;
     Ok(())
 }

@@ -1,6 +1,15 @@
 # Proposal: one fleet across machines
 
-Status: proposal for review; nothing here is implemented. Today's fleet,
+Status: steps 1 to 3 are implemented for one-way links (see [Linked
+machines](../architecture.md#linked-machines)); the rest is a proposal.
+Step 3 differs from the text below: rather than the door reading captain
+mail across the link, the linking machine collects it into the captain's
+home there, where the door already reads.
+Links are one-way by default, as the first open question recommends, and
+two-way links are not built yet. Mail waiting for collection stays
+`pending` behind a `collected` peer rather than taking a new delivery state,
+and collection is acknowledged by message id rather than by sequence, since
+each home on the other machine has its own sequence. Today's fleet,
 peer and mail rules are in [the architecture](../architecture.md#the-fleet).
 
 ## What a new captain runs into

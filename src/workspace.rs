@@ -251,9 +251,13 @@ fn acquire_locked(
     charter_repo: &Path,
     repo: &Path,
     lock: &Lock,
+    wait_for_capacity: bool,
+    max_wait_secs: u64,
 ) -> Result<Workspace> {
     owner(store, task)?;
+    let task_record = store.task(task)?;
     let old = load(store, task)?;
+    let mut disk_queue = None;
     let mut w = if let Some(w) = old.filter(|w| w.state != "released") {
         ensure!(
             w.charter_repo == charter_repo && w.repo == repo,
@@ -296,6 +300,19 @@ fn acquire_locked(
         crate::store::reject_symlinks(&pool)?;
         fs::create_dir_all(&pool)?;
         fs::set_permissions(&pool, fs::Permissions::from_mode(0o700))?;
+        let charter_floor = store
+            .charter(required(&task_record, "charter_id")?)?
+            .get("min_free_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(2 * 1024 * 1024 * 1024);
+        disk_queue = Some(crate::jobs::wait_for_workspace_disk(
+            store,
+            task,
+            &pool,
+            charter_floor,
+            wait_for_capacity,
+            max_wait_secs,
+        )?);
         disk_admission(store, task, &pool)?;
         let generation = uuid::Uuid::new_v4().simple().to_string();
         let w = Workspace {
@@ -331,6 +348,24 @@ fn acquire_locked(
         let lease = match held.into_iter().next() {
             Some(v) => v,
             None => {
+                let _queue = if disk_queue.is_none() {
+                    let task_record = store.task(task)?;
+                    let charter_floor = store
+                        .charter(required(&task_record, "charter_id")?)?
+                        .get("min_free_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(2 * 1024 * 1024 * 1024);
+                    Some(crate::jobs::wait_for_workspace_disk(
+                        store,
+                        task,
+                        &w.pool,
+                        charter_floor,
+                        wait_for_capacity,
+                        max_wait_secs,
+                    )?)
+                } else {
+                    None
+                };
                 disk_admission(store, task, &w.pool)?;
                 serde_json::from_slice(&treehouse(
                     lock,
@@ -378,10 +413,14 @@ fn disk_admission(store: &Store, task: &str, pool: &Path) -> Result<()> {
         .get("min_free_bytes")
         .and_then(Value::as_u64)
         .unwrap_or(2 * 1024 * 1024 * 1024);
-    let available = crate::jobs::free_bytes(pool)?;
+    let host_floor =
+        crate::admission::settings(&crate::jobs::shared_ledger(store)?)?.min_free_disk_bytes;
+    let host_available = crate::admission::disk(Path::new("/"))?.0;
+    let available = host_available.min(crate::admission::disk(pool)?.0);
+    let required = minimum.max(host_floor);
     ensure!(
-        available >= minimum,
-        "workspace disk admission refused: {available} available, {minimum} required"
+        available >= required,
+        "workspace disk admission refused: {available} available, {required} required (host floor {host_floor}, charter floor {minimum})"
     );
     Ok(())
 }
@@ -407,6 +446,19 @@ pub(crate) fn is_wake(store: &Store, args: &Value) -> Result<bool> {
     )?;
     Ok(wake || crate::errand::running(store, id)?)
 }
+/// Whether and how long a workspace acquisition waits in the host disk queue.
+pub(crate) struct WorkspaceWait {
+    pub wait_for_capacity: bool,
+    pub max_wait_secs: u64,
+}
+impl WorkspaceWait {
+    pub(crate) fn none() -> Self {
+        Self {
+            wait_for_capacity: false,
+            max_wait_secs: 0,
+        }
+    }
+}
 pub(crate) fn execution(
     store: &Store,
     task: &str,
@@ -414,6 +466,7 @@ pub(crate) fn execution(
     selected: &Path,
     isolate: bool,
     expected: Option<&str>,
+    wait: WorkspaceWait,
 ) -> Result<Execution> {
     owner(store, task)?;
     ensure!(selected.is_dir(), "cwd must be an existing directory");
@@ -475,7 +528,15 @@ pub(crate) fn execution(
             _lock: Some(lock),
         });
     }
-    let w = acquire_locked(store, task, repo, &selected, &lock)?;
+    let w = acquire_locked(
+        store,
+        task,
+        repo,
+        &selected,
+        &lock,
+        wait.wait_for_capacity,
+        wait.max_wait_secs,
+    )?;
     crate::jobs::workspace_previous_owner_idle(
         store,
         task,
@@ -494,7 +555,15 @@ pub(crate) fn planning_root(
     repo: &Path,
     lease: &str,
 ) -> Result<PathBuf> {
-    let exec = execution(store, task, repo, repo, true, Some(lease))?;
+    let exec = execution(
+        store,
+        task,
+        repo,
+        repo,
+        true,
+        Some(lease),
+        WorkspaceWait::none(),
+    )?;
     Ok(exec.root)
 }
 pub(crate) fn validate_job(
