@@ -289,7 +289,10 @@ fn ledger(path: &Path) -> Result<Connection> {
 pub(crate) fn shared_ledger(store: &Store) -> Result<Connection> {
     ledger(&ledger_path(store)?)
 }
-/// Keep workspace allocation in the same FIFO as jobs. The guard holds the
+/// A workspace needs only disk. When the floor is met it is allocated at
+/// once, whatever jobs wait in the capacity queue for CPU or memory; only a
+/// workspace below the floor joins the queue, and it waits there behind
+/// earlier workspaces that are waiting for disk too. The guard holds the
 /// queue position across the external Treehouse lease operation.
 pub(crate) fn wait_for_workspace_disk(
     store: &Store,
@@ -305,13 +308,33 @@ pub(crate) fn wait_for_workspace_disk(
         store.home().display(),
         Uuid::new_v4()
     );
-    let created_ms = Store::now_ms();
+    let lease = WorkspaceQueueLease {
+        ledger: ledger_path.clone(),
+        key: key.clone(),
+    };
+    // Only the filesystem this workspace will use: a full root must not
+    // block a pool on a separate volume.
+    let fits = |conn: &Connection| -> Result<(bool, u64, u64)> {
+        let settings = admission::settings(conn)?;
+        let available = admission::disk(pool)?.0;
+        let required = settings.min_free_disk_bytes.max(charter_floor);
+        Ok((available >= required, available, required))
+    };
+    let (enough, available, required) = fits(&ledger(&ledger_path)?)?;
+    if enough {
+        return Ok(lease);
+    }
+    if !wait_for_capacity {
+        bail!(
+            "workspace disk admission refused: {available} bytes available, {required} required; pass wait_for_capacity:true to wait for disk"
+        );
+    }
     let entry = Queued {
         key: key.clone(),
         home: store.home().to_owned(),
         job_id: task.to_owned(),
         incarnation: Uuid::new_v4().to_string(),
-        created_ms,
+        created_ms: Store::now_ms(),
         supervisor: identity(std::process::id())?,
         kind: Some("workspace".into()),
     };
@@ -338,34 +361,17 @@ pub(crate) fn wait_for_workspace_disk(
         result?;
     }
     let deadline = Instant::now() + Duration::from_secs(max_wait_secs);
-    let lease = WorkspaceQueueLease {
-        ledger: ledger_path.clone(),
-        key: key.clone(),
-    };
     loop {
         store.authorize(task, "spawn")?;
         let conn = ledger(&ledger_path)?;
         let queue = live_queue(&conn)?;
-        let ahead = queue.iter().take_while(|q| q.key != key).count();
-        if ahead > 0 && !wait_for_capacity {
-            bail!(
-                "workspace capacity queue has {ahead} earlier requests; pass wait_for_capacity:true to join it"
-            );
-        }
-        if ahead == 0 {
-            let settings = admission::settings(&conn)?;
-            // Only the filesystem this workspace will use: a full root must
-            // not block a pool on a separate volume.
-            let available = admission::disk(pool)?.0;
-            let required = settings.min_free_disk_bytes.max(charter_floor);
-            if available >= required {
-                return Ok(lease);
-            }
-            if !wait_for_capacity {
-                bail!(
-                    "workspace disk admission refused: {available} bytes available, {required} required"
-                );
-            }
+        let earlier_workspaces = queue
+            .iter()
+            .take_while(|q| q.key != key)
+            .filter(|q| q.kind.as_deref() == Some("workspace"))
+            .count();
+        if earlier_workspaces == 0 && fits(&conn)?.0 {
+            return Ok(lease);
         }
         if Instant::now() >= deadline {
             bail!("no workspace disk capacity within {max_wait_secs} s");
