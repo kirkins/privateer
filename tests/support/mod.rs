@@ -45,7 +45,7 @@ pub fn python() -> PathBuf {
 const ADAPTER: &str = r#"import json, sys
 r = json.loads(sys.stdin.readline())
 c, o = r["context"], r["options"]
-argv = [sys.executable, o["mate"], json.dumps(c["control"]["cli_argv"]), c["owner"], c["brief"], o["mode"], o["log"], o.get("resume", "")]
+argv = [sys.executable, o["mate"], json.dumps(c["control"]["cli_argv"]), c["owner"], c["brief"], o["mode"], o["log"], o.get("resume", ""), o.get("model", "")]
 print(json.dumps({"id": r["id"], "version": 1, "ok": True, "result": {"argv": argv, "cwd": c["repo"], "env_names": []}}))
 "#;
 

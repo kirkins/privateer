@@ -19,7 +19,17 @@ pub(super) fn profile(store: &Store, ship: &str) -> Result<Value> {
     Ok(record["first_mate"].clone())
 }
 
-fn blocked(store: &Store, ship: &str, profile: &Value, now: i64) -> Result<Option<String>> {
+/// Why ready work cannot be offered now. A headless launch may use the
+/// first-mate fallback in place of a backed-off own route; a hosted session
+/// keeps its own route, so its work waits as before.
+fn blocked(
+    store: &Store,
+    ship: &str,
+    task: &str,
+    profile: &Value,
+    headless: bool,
+    now: i64,
+) -> Result<Option<String>> {
     if crate::permissions::paused(store, ship)? {
         return Ok(Some("Waiting for tool permission resolution".into()));
     }
@@ -32,7 +42,15 @@ fn blocked(store: &Store, ship: &str, profile: &Value, now: i64) -> Result<Optio
         .and_then(|m| crate::routes::route_of(m, &profile["options"]))
     {
         if let Some((until, _)) = crate::routes::blocked(&ledger, &route)? {
-            return Ok(Some(format!("Waiting for model route until {until}")));
+            // A hand-edited routes file must not stop the dispatcher: no fallback.
+            let fallback = headless
+                && matches!(
+                    crate::crew_routes::first_mate_fallback(store, ship, task, profile),
+                    Ok(Some(_))
+                );
+            if !fallback {
+                return Ok(Some(format!("Waiting for model route until {until}")));
+            }
         }
     }
     let wakes: i64 = store.connection().query_row(
@@ -92,16 +110,10 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
             return Ok(None);
         }
     };
-    let refusal = blocked(store, ship, &profile, now)?;
     for id in ready_ids(store, ship)? {
         let mut work = load(store, &id)?.context("schedule vanished")?;
         check(store, &mut work, now)?;
         if work.state != "ready" || now < work.not_before_ms || live_jobs(store, &id)? {
-            save(store, &work)?;
-            continue;
-        }
-        if let Some(reason) = &refusal {
-            work.reason = Some(reason.clone());
             save(store, &work)?;
             continue;
         }
@@ -112,6 +124,11 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
                 "Scheduling delivery retry budget exhausted",
                 now,
             )?;
+            save(store, &work)?;
+            continue;
+        }
+        if let Some(reason) = blocked(store, ship, &id, &profile, mode == "fresh", now)? {
+            work.reason = Some(reason);
             save(store, &work)?;
             continue;
         }
@@ -301,7 +318,7 @@ pub(super) fn native_event(store: &Store, command: &str, args: &Value) -> Result
 
 fn start_headless(store: &mut Store, work: &mut Scheduled) -> Result<()> {
     let id = work.offer_id.clone().context("offer id missing")?;
-    let profile = work.profile.clone().context("offer profile missing")?;
+    let mut profile = work.profile.clone().context("offer profile missing")?;
     let existing: Option<String> = store
         .connection()
         .query_row("SELECT record FROM jobs WHERE id=?1", [&id], |r| r.get(0))
@@ -329,6 +346,14 @@ fn start_headless(store: &mut Store, work: &mut Scheduled) -> Result<()> {
                 presence["attended"] != true,
                 "a hosted session acquired the ship before launch"
             );
+        }
+        if let Some(fallback) =
+            crate::crew_routes::first_mate_fallback(store, &work.owner, &work.task_id, &profile)?
+        {
+            profile["manifest"] = fallback.manifest;
+            profile["options"] = fallback.options;
+            profile.as_object_mut().unwrap().remove("config");
+            profile.as_object_mut().unwrap().remove("tool_bundles");
         }
         let mut args = json!({"id":id,"work_offer":id,"task_id":work.task_id,"manifest":profile["manifest"],"options":profile["options"],"wake":prompt(work, &Value::Null)});
         for key in ["tool_bundles", "config"] {

@@ -26,6 +26,112 @@ fn poll(fleet: &mut Fleet, idle: bool) -> Value {
 }
 
 #[test]
+fn a_scheduled_wake_uses_the_same_first_mate_fallback_as_mail_wakes() {
+    let mut fleet = Fleet::new(json!({}));
+    std::fs::write(
+        fleet.home.join("config.json"),
+        json!({"resource_home":fleet.root.join("ledger"),"ship":"infra"}).to_string(),
+    )
+    .unwrap();
+    let own_manifest = fleet.root.join("own/manifest.json");
+    let fallback_manifest = fleet.root.join("fallback.json");
+    std::fs::create_dir_all(own_manifest.parent().unwrap()).unwrap();
+    std::fs::write(
+        &own_manifest,
+        json!({"schema_version":1,"id":"own","executable":[support::python(),fleet.root.join("adapter.py")],"timeout_ms":5000,"max_output_bytes":1_048_576}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        &fallback_manifest,
+        json!({"schema_version":1,"id":"fallback","executable":[support::python(),fleet.root.join("adapter.py")],"timeout_ms":5000,"max_output_bytes":1_048_576}).to_string(),
+    )
+    .unwrap();
+    let mut profile = call(&mut fleet, "ship.show", json!({"name":"infra"}))["first_mate"].clone();
+    profile["manifest"] = json!(own_manifest);
+    profile["options"]["model"] = json!("own-model");
+    let fallback_options = json!({
+        "mate":fleet.root.join("mate.py"),
+        "mode":fleet.root.join("mode"),
+        "log":fleet.root.join("prompts.log"),
+        "model":"fallback-model"
+    });
+    call(
+        &mut fleet,
+        "ship.put",
+        json!({"name":"infra","first_mate":profile}),
+    );
+    // Routes live beside the fleet registry, so write them through the
+    // isolated CLI rather than in this process, which has no registry set.
+    fleet.ok(
+        "routes.set",
+        json!({"routes":{"fallback":{"manifest":fallback_manifest,"options":fallback_options,"cost":"plan"}},"first_mate":["fallback"]}),
+        None,
+    );
+    assert_eq!(
+        privateer::presence::folder_ship(&fleet.store).as_deref(),
+        Some("infra")
+    );
+    assert_eq!(
+        fleet.ok("routes.show", json!({}), None)["first_mate"],
+        json!(["fallback"])
+    );
+    assert!(fleet.store.authorize("infra-repair", "spawn").unwrap()["provider_plugin"].is_null());
+    assert_eq!(
+        privateer::routes::route_of(own_manifest.to_str().unwrap(), &profile["options"]).as_deref(),
+        Some("own/-/own-model")
+    );
+    std::fs::create_dir_all(fleet.root.join("ledger")).unwrap();
+    let ledger = rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
+    ledger.execute_batch("CREATE TABLE model_routes(route TEXT PRIMARY KEY,failures INTEGER NOT NULL,until_ms INTEGER NOT NULL,last_error TEXT,updated_ms INTEGER NOT NULL)").unwrap();
+    ledger
+        .execute(
+            "INSERT INTO model_routes VALUES('own/-/own-model',1,9223372036854770000,'429',0)",
+            [],
+        )
+        .unwrap();
+    assert!(
+        privateer::routes::blocked(&ledger, "own/-/own-model")
+            .unwrap()
+            .is_some()
+    );
+    let fallback_route =
+        privateer::routes::route_of(fallback_manifest.to_str().unwrap(), &fallback_options)
+            .unwrap();
+    assert!(
+        privateer::routes::blocked(&ledger, &fallback_route)
+            .unwrap()
+            .is_none()
+    );
+    call(
+        &mut fleet,
+        "task.enqueue",
+        json!({"id":"infra-repair","brief":"Run through the configured fallback route."}),
+    );
+    let report = fleet.tick();
+    let scheduled = status(&mut fleet, "infra-repair");
+    assert_eq!(scheduled["state"], "claimed", "{report} {scheduled}");
+    let offer = report["work"][0]["offer_id"].as_str().unwrap();
+    let job = call(&mut fleet, "job.status", json!({"id":offer}));
+    assert!(
+        job["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "fallback-model"),
+        "{job}"
+    );
+    assert!(
+        !job["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "own-model"),
+        "{job}"
+    );
+    assert_ne!(own_manifest, fallback_manifest);
+}
+
+#[test]
 fn an_idle_hosted_session_claims_prepared_work_without_new_mail() {
     let mut fleet = Fleet::new(json!({}));
     attend(&mut fleet);

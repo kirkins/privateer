@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const KINDS: [&str; 2] = ["crew", "errand"];
+const KINDS: [&str; 3] = ["crew", "errand", "first_mate"];
 const COSTS: [&str; 3] = ["free", "plan", "credits"];
 
 fn path() -> Result<PathBuf> {
@@ -41,7 +41,10 @@ fn validate(value: &Value) -> Result<()> {
     let object = value.as_object().context("routes must be an object")?;
     for key in object.keys() {
         ensure!(
-            matches!(key.as_str(), "routes" | "crew" | "errand" | "ships"),
+            matches!(
+                key.as_str(),
+                "routes" | "crew" | "errand" | "first_mate" | "ships"
+            ),
             "unknown routes setting {key}"
         );
     }
@@ -188,6 +191,47 @@ fn identity(route: &Value) -> Option<String> {
 pub(crate) struct Choice {
     pub manifest: Value,
     pub options: Value,
+}
+
+/// First listed available route for a ship, when a fleet policy provides one.
+/// An empty list preserves callers' existing route defaults. A charter-pinned
+/// provider adapter always wins over a first-mate route list.
+pub(crate) fn first_mate_fallback(
+    store: &Store,
+    ship: &str,
+    task: &str,
+    profile: &Value,
+) -> Result<Option<Choice>> {
+    let Some(own_route) = identity(&json!({
+        "manifest": profile["manifest"],
+        "options": profile["options"]
+    })) else {
+        return Ok(None);
+    };
+    let ledger = crate::jobs::host_ledger(store)?;
+    if crate::routes::blocked(&ledger, &own_route)?.is_none()
+        || store.authorize(task, "spawn")?["provider_plugin"]
+            .as_object()
+            .is_some()
+    {
+        return Ok(None);
+    }
+    let Some(policy) = for_store(store)? else {
+        return Ok(None);
+    };
+    let names = order(&policy, ship, "first_mate");
+    for name in names {
+        let route = &policy["routes"][name.as_str()];
+        if let Some(route_id) = identity(route)
+            && crate::routes::blocked(&ledger, &route_id)?.is_none()
+        {
+            return Ok(Some(Choice {
+                manifest: route["manifest"].clone(),
+                options: route.get("options").cloned().unwrap_or(json!({})),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// The route a ship's crew or errand launch should use: the one it names, or

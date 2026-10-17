@@ -122,8 +122,8 @@ fn launches_take_the_first_available_listed_route_and_errands_their_own_list() {
     f.routes(json!({
         "routes": {"cheap": cheap, "steady": codex("model-steady", "credits"),
                    "review": codex("model-review", "plan")},
-        "crew": ["steady"], "errand": ["review"],
-        "ships": {"engineering": {"crew": ["cheap", "steady"]}}
+        "crew": ["steady"], "errand": ["review"], "first_mate": ["review"],
+        "ships": {"engineering": {"crew": ["cheap", "steady"], "first_mate": ["steady"]}}
     }));
     let start = || f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
     // The ship's own order wins over the fleet's.
@@ -157,6 +157,30 @@ fn launches_take_the_first_available_listed_route_and_errands_their_own_list() {
             .iter()
             .any(|a| a == "model-review"),
         "{errand}"
+    );
+}
+
+#[test]
+fn first_mate_route_lists_use_ship_override_and_reject_unknown_routes() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"steady": codex("model-steady", "credits"), "spare": codex("model-spare", "plan")},
+        "first_mate": ["steady"],
+        "ships": {"engineering": {"first_mate": ["spare"]}}
+    }));
+    let policy = f.json(None, "routes.show", json!({}));
+    assert_eq!(
+        policy["ships"]["engineering"]["first_mate"],
+        json!(["spare"])
+    );
+    let error = f.refused(
+        None,
+        "routes.set",
+        json!({"routes":{"steady":codex("model-steady", "credits")},"first_mate":["missing"]}),
+    );
+    assert!(
+        error.contains("first_mate names unknown route missing"),
+        "{error}"
     );
 }
 

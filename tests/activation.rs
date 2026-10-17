@@ -10,6 +10,181 @@ use std::{
 };
 use support::{Fleet, now_settings};
 
+fn native_routes(fleet: &Fleet, hosted: bool) {
+    fs::write(
+        fleet.home.join("config.json"),
+        json!({"resource_home":fleet.root.join("ledger"),"ship":"infra"}).to_string(),
+    )
+    .unwrap();
+    let mut manifests = Vec::new();
+    for harness in ["own", "fallback"] {
+        let directory = fleet.root.join(harness);
+        fs::create_dir_all(&directory).unwrap();
+        let manifest = directory.join("manifest.json");
+        fs::write(
+            &manifest,
+            json!({"schema_version":1,"id":harness,"executable":[std::env::var("PYTHON").unwrap_or_else(|_|"python3".into()),fleet.root.join("adapter.py")]}).to_string(),
+        ).unwrap();
+        manifests.push(manifest);
+    }
+    let base_options = json!({"mate":fleet.root.join("mate.py"),"mode":fleet.root.join("mode"),"log":fleet.root.join("prompts.log")});
+    let mut profile = fleet.ok("ship.show", json!({"name":"infra"}), None)["first_mate"].clone();
+    profile["manifest"] = json!(manifests[0]);
+    profile["options"] = base_options.clone();
+    profile["options"]["model"] = json!("own-model");
+    let mut spent_options = base_options.clone();
+    spent_options["model"] = json!("spent-model");
+    let mut fallback_options = base_options;
+    fallback_options["model"] = json!("fallback-model");
+    if hosted {
+        profile["host"] = json!("herdr");
+    }
+    fleet.ok(
+        "ship.put",
+        json!({"name":"infra","first_mate":profile}),
+        None,
+    );
+    fleet.ok(
+        "routes.set",
+        json!({
+            "routes": {
+                "spent": {"manifest":manifests[1],"options":spent_options,"cost":"plan"},
+                "fallback": {"manifest":manifests[1],"options":fallback_options,"cost":"plan"}
+            },
+            "first_mate": ["spent", "fallback"]
+        }),
+        None,
+    );
+}
+
+fn back_off(fleet: &Fleet, route: &str) {
+    fs::create_dir_all(fleet.root.join("ledger")).unwrap();
+    let ledger = rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
+    ledger.execute_batch(
+        "CREATE TABLE IF NOT EXISTS model_routes(route TEXT PRIMARY KEY,failures INTEGER NOT NULL,until_ms INTEGER NOT NULL,last_error TEXT,updated_ms INTEGER NOT NULL)",
+    ).unwrap();
+    ledger.execute(
+        "INSERT INTO model_routes(route,failures,until_ms,last_error,updated_ms) VALUES(?1,1,?2,'429',0)",
+        rusqlite::params![route, i64::MAX / 2],
+    ).unwrap();
+}
+
+fn wake_model(fleet: &mut Fleet) -> String {
+    let wake = fleet.wakes()[0].clone();
+    let job = dispatch(&mut fleet.store, "job.status", json!({"id":wake["job_id"]})).unwrap();
+    let argv = job["command"].as_array().unwrap();
+    argv.iter()
+        .filter_map(Value::as_str)
+        .find(|arg| ["own-model", "spent-model", "fallback-model"].contains(arg))
+        .expect("selected model in plugin argv")
+        .to_owned()
+}
+
+#[test]
+fn a_backed_off_first_mate_uses_its_first_clear_fallback_for_a_headless_wake() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    back_off(&fleet, "own/-/own-model");
+    back_off(&fleet, "fallback/-/spent-model");
+    fleet.send(json!({"id":"fallback","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    assert_eq!(wake_model(&mut fleet), "fallback-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
+#[test]
+fn a_cleared_first_mate_route_is_used_again_for_the_next_wake() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    back_off(&fleet, "own/-/own-model");
+    fleet.send(json!({"id":"fallback-first","from":"apps","to":"infra","kind":"request","body":"Run while own route is backed off."}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE model_routes SET until_ms=0 WHERE route='own/-/own-model'",
+            [],
+        )
+        .unwrap();
+    fleet.send(json!({"id":"own-route","from":"apps","to":"infra","kind":"request","body":"Use the configured route again."}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    assert_eq!(wake_model(&mut fleet), "own-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
+#[test]
+fn a_provider_pinned_charter_waits_instead_of_changing_first_mate_route() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","objective":"Answer mail","repo":fleet.root.join("repo"),
+            "min_free_bytes":0,"job_timeout_secs":60,
+            "provider_plugin":{"manifest":fleet.root.join("own/manifest.json")}}),
+        None,
+    );
+    back_off(&fleet, "own/-/own-model");
+    fleet.send(json!({"id":"pinned","from":"apps","to":"infra","kind":"request","body":"Keep the pinned provider."}));
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["skipped"], "model route backing off", "{report}");
+    assert!(fleet.wakes().is_empty());
+}
+
+#[test]
+fn a_hosted_first_mate_on_a_backed_off_route_falls_back_headlessly_without_relaunch() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, true);
+    back_off(&fleet, "own/-/own-model");
+    fleet.send(json!({"id":"host-fallback","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["status"], "running", "{report}");
+    assert!(report.get("hosted").is_none(), "{report}");
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+    let launches: i64 = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM host_launches WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        launches, 0,
+        "hosted route must not be relaunched while backed off"
+    );
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    let launches_after_settle: i64 = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM host_launches WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        launches_after_settle, 0,
+        "hosting stays off while backed off"
+    );
+    rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE model_routes SET until_ms=0 WHERE route='own/-/own-model'",
+            [],
+        )
+        .unwrap();
+    fleet.send(json!({"id":"host-again","from":"apps","to":"infra","kind":"request","body":"Host again on the own route."}));
+    // This fixture's adapter cannot host, so the relaunch is refused, but it
+    // is attempted: the own route is clear again and the wake uses it.
+    let report = Fleet::infra(&fleet.tick());
+    assert!(report["host_error"].is_string(), "{report}");
+    assert_eq!(wake_model(&mut fleet), "own-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
 #[test]
 fn mail_wakes_the_first_mate_which_answers_and_its_usage_is_recorded() {
     let mut fleet = Fleet::new(now_settings());
