@@ -1,9 +1,9 @@
 # Proposal: flotillas
 
-Status: steps 1 to 3 of the [order of work](#order-of-work) are
-implemented (the disk floor, launchd agents and machine links, and machine
-owners; see the [architecture](../architecture.md#linked-machines)); the rest
-is a proposal. It expands the short
+Status: steps 1 to 3 and 5 of the [order of work](#order-of-work) are
+implemented (the disk floor, launchd agents and machine links, machine
+owners, and consumers; see the [architecture](../architecture.md#the-fleet));
+named leases wait until two app ships compete, and the rest is a proposal. It expands the short
 flotilla section of the [conversation and activation design](conversation-and-activation.md#flotillas-later-version)
 and builds on the [cross-machine fleet proposal](cross-machine-fleet.md). It
 was revised after running the first app ship on the Mac (see
