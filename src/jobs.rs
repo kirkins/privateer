@@ -2144,10 +2144,11 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     }
     // No job inherits its starter's credential paths. A bounded launch adds
     // only its own selected bundles' paths, after checking their files.
+    // Bytes, not str: a non-UTF-8 name must be scrubbed too.
     for (name, _) in std::env::vars_os() {
         if name
-            .to_str()
-            .is_some_and(|n| n.starts_with("PRIVATEER_CREDENTIAL_"))
+            .as_encoded_bytes()
+            .starts_with(b"PRIVATEER_CREDENTIAL_")
         {
             cmd.env_remove(name);
         }

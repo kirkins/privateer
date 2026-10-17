@@ -160,7 +160,7 @@ fn run() -> Result<()> {
             positional.is_empty(),
             "a credential is read from stdin, never argv"
         );
-        let result = privateer::credentials::cli(&command, &args, &mut io::stdin().lock())?;
+        let result = privateer::credentials::cli_from_stdin(&command, &args)?;
         println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }

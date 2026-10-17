@@ -134,13 +134,16 @@ give one name two refs.
 The captain stores the secret, from the CLI only:
 
 ```sh
-privateer credential.set --json '{"ref":"brave-search"}' < key.txt
+privateer credential.set --json '{"ref":"brave-search"}'   # at a terminal: prompts, input hidden
+printf '%s' "$BRAVE_API_KEY" | privateer credential.set --json '{"ref":"brave-search"}'
 privateer credential.list --json '{}'
 privateer credential.remove --json '{"ref":"brave-search"}'
 ```
 
 `credential.set` reads the value from stdin (one trailing newline dropped, at
-most 16 KiB), never from argv or JSON arguments, and refuses any argument but
+most 16 KiB), never from argv or JSON arguments. At a terminal it prompts with
+echo off, so the secret stays out of scrollback and no key file is needed. It
+refuses any argument but
 `ref`. It writes `<ref>` as a 0600 file, through a same-directory rename, in a
 0700 directory beside the fleet registry: `fleet.credentials` next to
 `PRIVATEER_FLEET`, else under `$XDG_STATE_HOME/privateer/`, else

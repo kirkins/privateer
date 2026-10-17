@@ -6,8 +6,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_SECRET: usize = 16 * 1024;
@@ -69,6 +69,8 @@ fn checked(create: bool) -> Result<Option<PathBuf>> {
         Err(error) if error.kind() == ErrorKind::NotFound && create => {
             fs::create_dir_all(dir.parent().context("credential directory parent")?)?;
             fs::DirBuilder::new().mode(0o700).create(&dir)?;
+            // The umask trims the mode a builder asks for; set it exactly.
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         }
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -81,6 +83,52 @@ fn checked(create: bool) -> Result<Option<PathBuf>> {
         "the credential directory must be a 0700 directory this user owns; inspect it locally"
     );
     Ok(Some(dir))
+}
+
+/// The CLI's entry point: a terminal gets a no-echo prompt for `credential.set`
+/// so the secret never reaches scrollback; a pipe is read as it always was.
+pub fn cli_from_stdin(command: &str, args: &Value) -> Result<Value> {
+    if command == "credential.set" && unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        let line = terminal_line()?;
+        return cli(command, args, &mut line.as_slice());
+    }
+    cli(command, args, &mut io::stdin().lock())
+}
+
+/// One line typed at the terminal, read with echo off. The terminal's settings
+/// go back on every return path that follows the change.
+fn terminal_line() -> Result<Vec<u8>> {
+    struct Restore(libc::termios);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
+        }
+    }
+    let mut before: libc::termios = unsafe { std::mem::zeroed() };
+    ensure!(
+        unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut before) } == 0,
+        "could not read the terminal settings"
+    );
+    let mut quiet = before;
+    quiet.c_lflag &= !libc::ECHO;
+    ensure!(
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &quiet) } == 0,
+        "could not hide the terminal input"
+    );
+    let _restore = Restore(before);
+    eprint!("Secret (input hidden): ");
+    let mut line = Vec::new();
+    let mut stdin = io::stdin().lock();
+    let mut byte = [0u8];
+    // Bounded: one byte past the limit is enough for `set` to refuse it.
+    while line.len() <= MAX_SECRET + 1 && stdin.read(&mut byte)? == 1 {
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    eprintln!();
+    Ok(line)
 }
 
 fn set(args: &Value, input: &mut dyn Read) -> Result<Value> {
@@ -111,6 +159,7 @@ fn set(args: &Value, input: &mut dyn Read) -> Result<Value> {
             .create_new(true)
             .mode(0o600)
             .open(&temp)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(&secret)?;
         file.sync_all()?;
         fs::rename(&temp, &target)?;

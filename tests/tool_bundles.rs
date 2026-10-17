@@ -605,6 +605,7 @@ int main(int argc, char **argv) {{
 fn credentials_are_the_captains_from_stdin_and_plans_carry_only_refs() {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let (temp, mut store, mut config) = fixture();
     let root = temp.path().canonicalize().unwrap();
@@ -618,6 +619,13 @@ fn credentials_are_the_captains_from_stdin_and_plans_carry_only_refs() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A restrictive umask must not change the 0700 directory or 0600 file.
+        unsafe {
+            cli.pre_exec(|| {
+                libc::umask(0o277);
+                Ok(())
+            })
+        };
         if agent {
             cli.env("PRIVATEER_ROLE", "agent")
                 .env("PRIVATEER_ACTOR", "ship");
