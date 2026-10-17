@@ -37,8 +37,12 @@ fn retry_fixture_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::i
     }
 }
 
-fn until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+fn until(what: &str, done: impl FnMut() -> bool) {
+    until_secs(what, 20, done);
+}
+
+fn until_secs(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(50));
@@ -292,9 +296,64 @@ impl Place {
     }
 }
 
+/// Each pane's process terminal master, and whether that process still runs.
+type PaneTerminals = Arc<Mutex<std::collections::HashMap<String, (fs::File, Arc<AtomicBool>)>>>;
+
+/// A pane's process terminal: its stdin is the slave, as a Herdr pane's is,
+/// and the master is what Herdr types into.
+fn pane_terminal() -> (fs::File, fs::File) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    for f in [&master, &slave] {
+        assert_eq!(
+            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    (master, slave)
+}
+
+/// Run a pane's command with the pane's terminal as its stdin, and record the
+/// terminal so text sent to the pane while the command runs is typed into it.
+fn spawn_in_pane(terminals: &PaneTerminals, pane: &str, mut shell: Command) {
+    let (master, slave) = pane_terminal();
+    let alive = Arc::new(AtomicBool::new(true));
+    let mut child = shell.stdin(slave).spawn().unwrap();
+    let mut output = master.try_clone().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut block = [0; 1024];
+        while matches!(output.read(&mut block), Ok(n) if n > 0) {}
+    });
+    terminals
+        .lock()
+        .unwrap()
+        .insert(pane.to_owned(), (master, alive.clone()));
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        alive.store(false, Ordering::SeqCst);
+    });
+}
+
 /// A Herdr that answers one request per connection, keeps its spaces in
 /// sidebar order (starting with one of the captain's own), and runs the text
-/// sent to a space it created with that pane's Herdr environment.
+/// sent to a space it created with that pane's Herdr environment. Text sent
+/// to a pane whose process is still running is typed into that process's
+/// terminal instead, as Herdr types into a pane.
 struct Herdr {
     requests: Arc<Mutex<Vec<Value>>>,
     spaces: Arc<Mutex<Vec<(String, Value)>>>,
@@ -333,6 +392,8 @@ impl Herdr {
         let focused = focus.clone();
         let drop_reports = Arc::new(AtomicBool::new(false));
         let dropping = drop_reports.clone();
+        // Each pane's process terminal master, and whether that process still runs.
+        let terminals: PaneTerminals = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let reject_label = reject_caption.clone();
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
@@ -448,6 +509,19 @@ impl Herdr {
                     "pane.send_input" => {
                         let id = params["pane_id"].as_str().unwrap();
                         let n: usize = id[1..id.find(':').unwrap()].parse().unwrap();
+                        let text = params["text"].as_str().unwrap();
+                        if let Some((master, alive)) = terminals.lock().unwrap().get_mut(id) {
+                            if alive.load(Ordering::SeqCst) {
+                                writeln!(master, "{text}").unwrap();
+                                let _ = writeln!(
+                                    stream,
+                                    "{}",
+                                    json!({"id":request["id"],"result":{"type":"ok"}})
+                                );
+                                seen.lock().unwrap().push(request);
+                                continue;
+                            }
+                        }
                         let mut shell = Command::new("sh");
                         shell
                             .args(["-c", params["text"].as_str().unwrap()])
@@ -471,14 +545,10 @@ impl Herdr {
                                 running.lock().unwrap().push(child);
                             }
                         } else {
-                            let mut child = shell.spawn().unwrap();
-                            std::thread::spawn(move || child.wait());
+                            spawn_in_pane(&terminals, id, shell);
                         }
                         #[cfg(not(feature = "dashboard"))]
-                        {
-                            let mut child = shell.spawn().unwrap();
-                            std::thread::spawn(move || child.wait());
-                        }
+                        spawn_in_pane(&terminals, id, shell);
                         json!({"type":"ok"})
                     }
                     "pane.report_agent" => {
@@ -1797,6 +1867,12 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
     assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
     assert!(!herdr.calls("pane.release_agent").is_empty());
+    // Released before the harness started: the pane no longer carries the label.
+    let pane = herdr.pane_state("w2:p1");
+    assert!(
+        pane["agent"].is_null() && pane["display_agent"].is_null(),
+        "{pane}"
+    );
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     assert_eq!(place.wakes(), 0);
 
@@ -1814,6 +1890,50 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
     place.stop_native("infra");
 }
 
+/// Type `text` into a pane, as Herdr does for a captain typing in it.
+fn type_into_pane(place: &Place, pane: &str, text: &str) {
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(place.root.join("config/herdr/herdr.sock")).unwrap();
+    let request = json!({"id":1,"method":"pane.send_input","params":{"pane_id":pane,"text":text}});
+    writeln!(stream, "{request}").unwrap();
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&reply).unwrap()["result"]["type"],
+        "ok"
+    );
+}
+
+#[test]
+fn text_typed_into_a_sleeping_hosted_first_mate_wakes_it_as_mail_from_the_captain() {
+    let (place, herdr) = hosted_sleeper();
+    sleep_hosted(&place, &herdr);
+    until("the pane listed as asleep", || {
+        herdr.pane_state("w2:p1")["display_agent"] == "infra"
+    });
+
+    type_into_pane(&place, "w2:p1", "typed wake");
+    until("the harness woken by typing", || {
+        place.root.join("pi-env").exists()
+    });
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(place.wakes(), 0);
+    // The text reached the mailbox as the captain's own mail, not a shell command.
+    let mail = place.json(
+        "mail.inbox",
+        json!({"address":"infra","all":true,"limit":100}),
+    )["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["from"] == "captain" && m["body"] == "typed wake")
+        .count();
+    assert_eq!(mail, 1);
+    place.stop_native("infra");
+}
+
 #[test]
 fn a_sleep_report_herdr_drops_is_warned_about_and_audited_once() {
     let (place, herdr) = hosted_sleeper();
@@ -1822,8 +1942,18 @@ fn a_sleep_report_herdr_drops_is_warned_about_and_audited_once() {
     until("the audit of the dropped report", || {
         !ignored_reports(&place).is_empty()
     });
-    // Herdr keeps answering ok; later reports and the release are not audited again.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Herdr keeps answering ok: a second sleep report cycle, and its read-back,
+    // come and go without another row.
+    let reports = |herdr: &Herdr| {
+        herdr
+            .calls("pane.report_agent")
+            .iter()
+            .filter(|call| call["params"]["state"] == "idle")
+            .count()
+    };
+    let before = reports(&herdr);
+    until_secs("a second sleep report", 40, || reports(&herdr) > before);
+    std::thread::sleep(Duration::from_secs(6));
     let rows = ignored_reports(&place);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["ship"], "infra");
