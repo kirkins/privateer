@@ -97,6 +97,12 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
             flags[i:i+2] == ["--output-format", "stream-json"] for i in range(len(flags)))):
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("native_turn.py")),
                                   harness, *argv], env)
+    # OpenCode V1 waits silently after a provider error instead of failing the
+    # run, so a headless turn runs under a watch that ends it.
+    if harness == "opencode" and argv[1:2] == ["run"] and any(
+            flags[i:i+2] == ["--format", "json"] for i in range(len(flags))):
+        os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_watch.py")),
+                                  *argv], env)
     # Keep PRIVATEER_ROLE/ACTOR and all native auth/provider configuration.
     # exec preserves the job's process identity, group and cancellation path.
     os.execvpe(argv[0], argv, env)
