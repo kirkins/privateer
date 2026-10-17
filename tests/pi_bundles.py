@@ -37,8 +37,10 @@ def native_on_path(name):
     """The CLI on PATH, unless it is a #! wrapper: a wrapper can run a state-changing
     activation (for example `mise use -g`), so the installed-CLI checks never run one."""
     found = shutil.which(name)
+    if found is None:
+        return None
     with open(found, 'rb') as stream:
-        return None if found is None or stream.read(2) == b'#!' else found
+        return None if stream.read(2) == b'#!' else found
 
 
 def pi_help(omit=(), extra=()):
