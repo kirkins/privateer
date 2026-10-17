@@ -85,6 +85,12 @@ if mode == "throttle":
     print(json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": "error",
         "errorMessage": "429: {\"type\":\"upstream_unavailable\"}", "content": []}}), flush=True)
     sys.exit(1)
+if mode == "window":
+    # How Gemini ends a run a plan window refused: its own error event, naming
+    # the window's reset rather than a short retry.
+    print(json.dumps({"type": "error", "timestamp": 1, "severity": "error",
+        "message": "429 Too Many Requests. RESOURCE_EXHAUSTED: rate limit exceeded; resets in 5 hours"}), flush=True)
+    sys.exit(1)
 if mode.startswith("sleep"):
     time.sleep(float(mode.split()[1]))
 def call(command, args):
