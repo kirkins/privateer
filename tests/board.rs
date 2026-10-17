@@ -246,6 +246,96 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
 }
 
 #[test]
+fn a_launchd_agent_runs_the_dispatcher_until_bootout_stops_it() {
+    let place = Place::new();
+    assert!(place.run(&place.folder, &["init"], "none").status.success());
+    // A stand-in for launchd: bootstrap runs the agent's program with its
+    // recorded environment, bootout sends it SIGTERM.
+    let calls = place.root.join("launchctl.log");
+    let fake = place.root.join("bin/fake-launchctl");
+    fs::write(
+        &fake,
+        format!(
+            r#"#!{python}
+import os, pathlib, plistlib, signal, subprocess, sys
+pathlib.Path({calls:?}).open('a').write(' '.join(sys.argv[1:]) + '\n')
+pid = pathlib.Path({calls:?} + '.pid')
+if sys.argv[1] == 'bootstrap':
+    agent = plistlib.load(open(sys.argv[3], 'rb'))
+    log = open(agent['StandardOutPath'], 'a')
+    env = dict(agent['EnvironmentVariables'], HOME=os.environ['HOME'])
+    child = subprocess.Popen(agent['ProgramArguments'], env=env, stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, start_new_session=True)
+    pid.write_text(str(child.pid))
+elif sys.argv[1] == 'bootout':
+    if not pid.exists():
+        sys.exit(3)
+    os.kill(int(pid.read_text()), signal.SIGTERM)
+    pid.unlink()
+"#,
+            python = support::python().display(),
+            calls = calls.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |args: &[&str]| {
+        let mut command = support::command(&place.binary);
+        command
+            .args(args)
+            .current_dir(&place.folder)
+            .env("PATH", &place.path)
+            .env("HOME", &place.root)
+            .env("PRIVATEER_SERVICE", "launchd")
+            .env("PRIVATEER_LAUNCHCTL", &fake)
+            .env("PRIVATEER_RESOURCE_HOME", place.root.join("ledger"))
+            .env("PRIVATEER_FLEET", place.root.join("fleet.sqlite"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("PRIVATEER_HOME");
+        fixture_output(&mut command)
+    };
+    let started = run(&["service", "start"]);
+    assert!(started.status.success(), "{}", text(&started));
+    let agents: Vec<_> = fs::read_dir(place.root.join("Library/LaunchAgents"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(agents.len(), 1);
+    let label = agents[0].file_stem().unwrap().to_str().unwrap().to_owned();
+    assert!(label.starts_with("privateer-infra-"), "{label}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        let status = text(&run(&["service", "status"]));
+        if status.contains(": running") || std::time::Instant::now() > deadline {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(
+        status.contains(&format!("running (launchd agent {label})")),
+        "{status}"
+    );
+    // Stopping the dispatcher must leave job supervisors in its group alone.
+    let agent = fs::read_to_string(&agents[0]).unwrap();
+    assert!(
+        agent.contains("<key>AbandonProcessGroup</key><true/>"),
+        "{agent}"
+    );
+    let again = run(&["service", "start"]);
+    assert!(text(&again).contains("already running"), "{}", text(&again));
+
+    let stopped = run(&["service", "stop"]);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    assert!(!agents[0].exists());
+    let status = text(&run(&["service", "status"]));
+    assert!(status.contains("not running (no user service)"), "{status}");
+    let log = fs::read_to_string(&calls).unwrap();
+    let uid = unsafe { libc::getuid() };
+    assert!(log.contains(&format!("bootstrap gui/{uid} {}", agents[0].display())));
+    assert!(log.contains(&format!("bootout gui/{uid}/{label}")));
+}
+
+#[test]
 fn dashboard_entry_uses_installed_sibling_or_path_in_both_environments() {
     let place = Place::new();
     let path_binary = place.root.join("runtime/privateer");
