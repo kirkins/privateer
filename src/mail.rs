@@ -459,10 +459,11 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     );
     ensure!(from != to, "a mailbox cannot write to itself");
     let peer = recipient.as_ref().and_then(remote_peer).map(str::to_owned);
-    if peer.is_some() {
-        // The captain's mailbox is per home until the captain's front door.
+    if let Some(peer) = &peer {
+        // The captain's mailbox is per home; only a link between machines
+        // carries the captain's mail to another home.
         ensure!(
-            from != CAPTAIN,
+            from != CAPTAIN || crate::peers::machine(store, peer)?,
             "the captain's mail stays in this home for now"
         );
     }
@@ -926,6 +927,68 @@ pub(crate) fn collected(
     Ok(changed)
 }
 
+fn collected_table(store: &Store) -> Result<()> {
+    store.connection().execute_batch(
+        "CREATE TABLE IF NOT EXISTS machine_collected(peer TEXT NOT NULL, id TEXT NOT NULL,
+           collected_ms INTEGER NOT NULL, error TEXT, PRIMARY KEY(peer, id));",
+    )?;
+    Ok(())
+}
+
+/// Mail from ships here to the captain, written since `since_ms`, that the
+/// machine behind `peer` has not collected yet: the captain reads it there.
+/// It stays in this home's captain mailbox as well.
+pub(crate) fn awaiting_captain(
+    store: &Store,
+    peer: &str,
+    since_ms: i64,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<Vec<Value>> {
+    collected_table(store)?;
+    let mut statement = store.connection().prepare(
+        "SELECT m.id FROM mail m JOIN ships s ON s.name=m.sender
+         WHERE m.recipient=?1 AND json_extract(s.record, '$.location')='here' AND m.created_ms>=?2
+           AND NOT EXISTS (SELECT 1 FROM machine_collected c WHERE c.peer=?3 AND c.id=m.id)
+         ORDER BY m.seq LIMIT ?4",
+    )?;
+    let ids: Vec<String> = statement
+        .query_map(params![CAPTAIN, since_ms, peer, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut envelopes = vec![];
+    let mut bytes = 0;
+    for id in ids {
+        let envelope = envelope(&by_id(store, &id)?.context("message vanished")?);
+        bytes += envelope.to_string().len();
+        if bytes > max_bytes && !envelopes.is_empty() {
+            break;
+        }
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+/// Record captain mail the machine behind `peer` collected, delivered or
+/// refused (with the reason), so it is not offered again.
+pub(crate) fn collected_captain(
+    store: &Store,
+    peer: &str,
+    ids: &[(String, Option<String>)],
+) -> Result<usize> {
+    collected_table(store)?;
+    let tx = store.write_transaction()?;
+    let mut changed = 0;
+    for (id, error) in ids {
+        changed += tx.execute(
+            "INSERT OR IGNORE INTO machine_collected(peer, id, collected_ms, error)
+             SELECT ?1, id, ?3, ?4 FROM mail WHERE id=?2 AND recipient=?5",
+            params![peer, id, Store::now_ms(), error, CAPTAIN],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
 fn flush(store: &Store, args: &Value) -> Result<Value> {
     flush_pending(store, limit(args, 50), true, None, None)
 }
@@ -970,18 +1033,32 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     let kind = required(args, "kind")?;
     ensure!(KINDS.contains(&kind), "unknown message kind {kind}");
     ensure!(
-        kind != "decision" && from != CAPTAIN && to != CAPTAIN,
-        "the captain's mail stays in its own home for now"
-    );
-    ensure!(
         from != CREW && to != CREW,
         "crew reports stay in their own home"
     );
-    let sender = ship(store, from)?.with_context(|| format!("unknown ship {from}"))?;
     ensure!(
-        remote_peer(&sender).is_some(),
-        "{from} is hosted here; local mail is sent with mail.send"
+        kind != "decision" || to == CAPTAIN,
+        "decisions are addressed to the captain"
     );
+    // The captain's mail crosses only a link between machines, which the
+    // operator made, and arrives only from the operator's side of it: the
+    // captain's own words from the door, or a ship's mail to the captain
+    // collected from the other machine.
+    if from == CAPTAIN || to == CAPTAIN {
+        ensure!(
+            matches!(store.caller(), Caller::Operator),
+            "the captain's mail stays in its own home unless the operator carries it across machines"
+        );
+    }
+    if from != CAPTAIN {
+        let sender = ship(store, from)?.with_context(|| format!("unknown ship {from}"))?;
+        let peer = remote_peer(&sender)
+            .with_context(|| format!("{from} is hosted here; local mail is sent with mail.send"))?;
+        ensure!(
+            to != CAPTAIN || crate::peers::machine(store, peer)?,
+            "the captain's mail stays in its own home for now"
+        );
+    }
     local_address(store, to)?;
     let correlation = optional_str(args, "correlation")?;
     let request_kind = optional_str(args, "request_kind")?;
@@ -1034,7 +1111,7 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             urgency,
             deadline_ms,
             now,
-            (kind == "request").then_some("open")
+            matches!(kind, "request" | "decision").then_some("open")
         ],
     )?;
     if kind == "reply" {
