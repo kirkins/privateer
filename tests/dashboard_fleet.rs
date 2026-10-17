@@ -2103,9 +2103,10 @@ fn retirement_cannot_mark_a_replacement_home_retired_after_dispatcher_stop() {
     fs::write(
         &blocked,
         format!(
-            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n",
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.02; done\n",
             barrier.display(),
-            release.display()
+            release.display(),
+            m.root.display()
         ),
     )
     .unwrap();
