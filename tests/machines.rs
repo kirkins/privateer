@@ -2563,7 +2563,7 @@ fn a_refresh_whose_directory_cannot_be_read_drops_nothing() {
 
 /// Make a ship's home unreadable by putting a folder where its database is.
 fn make_unreadable(machine: &Machine, ship: &str) {
-    let database = machine.folder(ship).join("privateer.sqlite");
+    let database = machine.folder(ship).join(".privateer/privateer.sqlite");
     let _ = fs::remove_file(&database);
     fs::create_dir_all(&database).unwrap();
 }

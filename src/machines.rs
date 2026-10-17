@@ -352,7 +352,11 @@ fn install_everywhere(
         if !member.home.is_dir() {
             continue;
         }
-        let mut store = Store::open(&member.home)?;
+        // One home that cannot be opened must not stop every other home's
+        // refresh; it catches up on a later exchange.
+        let Ok(mut store) = Store::open(&member.home) else {
+            continue;
+        };
         install(&mut store, machine, ships, prune)?;
         homes += 1;
     }
