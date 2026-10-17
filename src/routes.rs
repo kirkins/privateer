@@ -26,14 +26,14 @@
 //! like any other error.
 //!
 //! A stated reset is honored wherever it appears, not only for a free
-//! allowance. Gemini's five-hour and weekly limits say when they reopen; so do
-//! an HTTP `retry-after` and an ISO deadline in a throttle's text. A throttle
-//! that states one holds its route until then, and the short doubling window
-//! only ever raises that floor, so a stated reset can lengthen the backoff but
-//! never shorten it. A free allowance that says nothing still parks a route for
-//! about a day. A hint read out of free text can be misread, so one longer
-//! than any real window is refused rather than clamped, and the failure falls
-//! back to its own schedule instead of parking a route for days.
+//! allowance. A provider's own limit that says when it reopens, an HTTP
+//! `retry-after` and an ISO deadline in a throttle's text all hold the route
+//! until then. A throttle that states one holds its route until then, and the
+//! short doubling window only ever raises that floor, so a stated reset can
+//! lengthen the backoff but never shorten it. A free allowance that says
+//! nothing still parks a route for about a day. A hint read out of free text
+//! can be misread, so it is capped at two days; a structured reset (Claude's
+//! `resetsAt`) is trusted up to eight.
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -45,8 +45,11 @@ const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const FREE_ALLOWANCE_BACKOFF_MS: i64 = 24 * 60 * 60_000;
 /// The longest reset a route is ever parked for: a weekly window, plus slack.
 /// A structured reset (Claude's `resetsAt`) is clamped to it, because the
-/// harness stated it; a reset read out of free text is refused past it.
+/// harness stated it.
 const MAX_STATED_RESET_MS: i64 = 8 * FREE_ALLOWANCE_BACKOFF_MS;
+/// The longest a reset read out of free text parks a route for. Text can be
+/// misread, so a hint past two days is capped rather than trusted further.
+const MAX_TEXT_RESET_MS: i64 = 2 * FREE_ALLOWANCE_BACKOFF_MS;
 /// Claude windows that cover the whole account rather than one model.
 const ACCOUNT_WINDOWS: [&str; 2] = ["five_hour", "seven_day"];
 const CURSOR: &str = "routes_scanned_ms";
@@ -125,31 +128,20 @@ fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
     for marker in [
         "retry-after",
         "retry_after",
+        "retry after",
         "reset_at",
         "reset-at",
         "resets at",
     ] {
-        let Some(at) = lower.find(marker) else {
-            continue;
-        };
-        let tail = &lower[at + marker.len()..];
-        if let Some(absolute) = iso_timestamp_ms(tail)
-            && absolute > now
-        {
-            return Some(absolute - now);
-        }
-        let digits = tail.trim_start_matches(|c: char| !c.is_ascii_digit());
-        let end = digits
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(digits.len());
-        if let Ok(value) = digits[..end].parse::<i64>() {
-            let absolute = if value > 1_000_000_000 {
-                value.saturating_mul(1000)
-            } else {
-                now.saturating_add(value.saturating_mul(1000))
-            };
-            if absolute > now {
+        for (at, _) in lower.match_indices(marker) {
+            let tail = &lower[at + marker.len()..];
+            if let Some(absolute) = iso_timestamp_ms(tail)
+                && absolute > now
+            {
                 return Some(absolute - now);
+            }
+            if let Some(delay) = stated_delay_ms(tail, now) {
+                return Some(delay);
             }
         }
     }
@@ -179,6 +171,46 @@ fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
         }
     }
     None
+}
+
+/// The delay a retry marker states, read only from the number that directly
+/// follows it (`: 120`, `=120`, ` 3h`). A `_ms` or `-ms` suffix makes the
+/// number milliseconds; a unit word scales it; a bare number is seconds, as an
+/// HTTP `retry-after` is, unless it is an epoch. Anything else reads as nothing.
+fn stated_delay_ms(tail: &str, now: i64) -> Option<i64> {
+    let (milliseconds, rest) = match tail
+        .strip_prefix("_ms")
+        .or_else(|| tail.strip_prefix("-ms"))
+    {
+        Some(rest) => (true, rest),
+        None => (false, tail),
+    };
+    let rest = rest.trim_start_matches([':', '=', ' ', '"']);
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let value = rest[..end].parse::<i64>().ok().filter(|value| *value > 0)?;
+    if milliseconds {
+        return Some(value);
+    }
+    let word: String = rest[end..]
+        .trim_start_matches(' ')
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    let ms = match word.as_str() {
+        "" if value > 1_000_000_000 => {
+            // An epoch in seconds, as a retry-after date is stated.
+            return Some(value.saturating_mul(1000) - now).filter(|ms| *ms > 0);
+        }
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => value.saturating_mul(1000),
+        "ms" => value,
+        "m" | "min" | "mins" | "minute" | "minutes" => value.saturating_mul(60_000),
+        "h" | "hr" | "hrs" | "hour" | "hours" => value.saturating_mul(3_600_000),
+        "d" | "day" | "days" => value.saturating_mul(86_400_000),
+        _ => return None,
+    };
+    Some(ms)
 }
 
 fn iso_timestamp_ms(value: &str) -> Option<i64> {
@@ -328,10 +360,9 @@ fn classify(log: &str) -> Option<RouteFailure> {
         .any(|sign| lower.contains(sign));
     throttled.then(|| RouteFailure {
         error: error.chars().take(200).collect(),
-        // A hint read out of free text can be misread, so one past any real
-        // window is refused rather than clamped: the failure then falls back to
-        // its own schedule instead of parking its route for days.
-        reset_ms: reset_delay_ms(&error, Store::now_ms()).filter(|ms| *ms <= MAX_STATED_RESET_MS),
+        // A hint read out of free text can be misread, so it is capped at two
+        // days: a misread never parks its route for longer than that.
+        reset_ms: reset_delay_ms(&error, Store::now_ms()).map(|ms| ms.min(MAX_TEXT_RESET_MS)),
         allowance: free_allowance,
         account: false,
     })
@@ -527,18 +558,15 @@ mod tests {
             .unwrap();
         assert!((until - Store::now_ms() - FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
 
-        // A misread hint (here, seconds for what reads like an epoch) is refused
-        // rather than trusted, so the route falls back to a full allowance window.
+        // A misread hint (here, seconds for what reads like an epoch) is capped
+        // at two days rather than trusted, so it never parks the route longer.
         let misread = classify(&error_log(
             "Free usage limit exceeded; retry-after: 99999999999",
         ))
         .unwrap();
-        assert_eq!(misread.reset_ms, None);
+        assert_eq!(misread.reset_ms, Some(MAX_TEXT_RESET_MS));
         record(&conn, "opencode/-/space-bunny-free", Some(&misread)).unwrap();
-        let until: i64 = conn
-            .query_row("SELECT until_ms FROM model_routes", [], |r| r.get(0))
-            .unwrap();
-        assert!((until - Store::now_ms() - FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
+        assert!((parked_ms(&conn) - MAX_TEXT_RESET_MS).abs() < 100);
     }
 
     #[test]
@@ -677,17 +705,69 @@ mod tests {
     fn agy_result_quota_error_throttles_its_own_model_until_its_stated_reset() {
         let failure = classify(&agy_result_log(
             "ERROR",
-            "429 quota exceeded; retry-after: 120",
+            "429 quota exceeded; retry-after: 7200",
         ))
         .unwrap();
         // Not a stated free allowance and not an account window, so it covers only
-        // its own model; the two minutes it states hold the route past the first step.
+        // its own model; the two hours it states hold the route past the first step.
         assert!(!failure.allowance && !failure.account);
-        assert_eq!(failure.reset_ms, Some(120_000));
+        assert_eq!(failure.reset_ms, Some(7_200_000));
 
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         record(&conn, "agy/-/muse-max", Some(&failure)).unwrap();
+        assert!((parked_ms(&conn) - 7_200_000).abs() < 100);
+    }
+
+    #[test]
+    fn retry_markers_read_only_the_number_that_follows_them() {
+        let now = 1_792_190_000_000;
+        // `_ms` and `-ms` suffixes state milliseconds, never seconds.
+        assert_eq!(reset_delay_ms("retry-after-ms: 30000", now), Some(30_000));
+        assert_eq!(reset_delay_ms("retry_after_ms: 600000", now), Some(600_000));
+        // A marker with no number directly after it reads nothing, rather than
+        // the 429 further along the text.
+        assert_eq!(reset_delay_ms("retry-after missing ... 429", now), None);
+        // The space form and unit words are read too.
+        assert_eq!(reset_delay_ms("retry after 3h", now), Some(10_800_000));
+        assert_eq!(reset_delay_ms("retry-after: 2 minutes", now), Some(120_000));
+        assert_eq!(reset_delay_ms("retry-after: 2 requests", now), None);
+    }
+
+    #[test]
+    fn free_text_resets_are_capped_at_two_days_and_structured_ones_are_not() {
+        let week = classify(&error_log("429 quota exceeded; resets in 1 week")).unwrap();
+        assert_eq!(week.reset_ms, Some(MAX_TEXT_RESET_MS));
+        let days = classify(&error_log("429 try again in 7 days")).unwrap();
+        assert_eq!(days.reset_ms, Some(MAX_TEXT_RESET_MS));
+        let ms = classify(&error_log("429 retry-after-ms: 30000")).unwrap();
+        assert_eq!(ms.reset_ms, Some(30_000));
+
+        // Claude's structured resetsAt keeps the eight-day ceiling.
+        let claude = claude_limit(
+            &json!({"rateLimitType":"seven_day","resetsAt": Store::now_ms() / 1000 + 7 * 86_400}),
+            Store::now_ms(),
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        record(&conn, "claude/-/opus", Some(&claude)).unwrap();
+        assert!((parked_ms(&conn) - 7 * 86_400_000).abs() < 2000);
+    }
+
+    #[test]
+    fn a_short_stated_reset_keeps_the_doubling_window() {
+        let failure = classify(&error_log("429 quota exceeded; retry-after: 60")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        // Three failures have doubled the window to two minutes; a one-minute
+        // stated reset is below it, so the window stands.
+        conn.execute(
+            "INSERT INTO model_routes(route, failures, until_ms, last_error, updated_ms)
+             VALUES('gemini/-/gemini-flash', 2, 0, '', 0)",
+            [],
+        )
+        .unwrap();
+        record(&conn, "gemini/-/gemini-flash", Some(&failure)).unwrap();
         assert!((parked_ms(&conn) - 120_000).abs() < 100);
     }
 
@@ -720,7 +800,8 @@ mod tests {
         ))
         .unwrap();
         assert!(!weekly.allowance);
-        assert_eq!(weekly.reset_ms, Some(7 * 86_400_000));
+        // A week stated in free text is capped at two days.
+        assert_eq!(weekly.reset_ms, Some(MAX_TEXT_RESET_MS));
 
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
@@ -728,19 +809,19 @@ mod tests {
         record(&conn, route, Some(&five_hour)).unwrap();
         assert!((parked_ms(&conn) - 5 * 3_600_000).abs() < 2000);
         record(&conn, route, Some(&weekly)).unwrap();
-        assert!((parked_ms(&conn) - 7 * 86_400_000).abs() < 2000);
+        assert!((parked_ms(&conn) - MAX_TEXT_RESET_MS).abs() < 2000);
 
-        // An absolute deadline past a real window is refused, so the route keeps
-        // the short schedule instead of being parked for years.
+        // An absolute deadline far past any real window is capped at two days
+        // rather than trusted, so the route is never parked for years.
         let absurd = classify(&error_log(
             "429 rate limit exceeded; resets at 2100-01-01T00:00:00Z",
         ))
         .unwrap();
-        assert_eq!(absurd.reset_ms, None);
+        assert_eq!(absurd.reset_ms, Some(MAX_TEXT_RESET_MS));
         conn.execute("UPDATE model_routes SET failures=0", [])
             .unwrap();
         record(&conn, route, Some(&absurd)).unwrap();
-        assert!((parked_ms(&conn) - FIRST_BACKOFF_MS).abs() < 100);
+        assert!((parked_ms(&conn) - MAX_TEXT_RESET_MS).abs() < 2000);
 
         // A later success on the route clears it, as for any throttle.
         record(&conn, route, None).unwrap();
