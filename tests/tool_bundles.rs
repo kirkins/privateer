@@ -405,3 +405,198 @@ fn claude_plan_carries_allowlist_and_resumes_only_under_its_digest() {
     assert!(launch("wake-3", Some(session)).is_err());
     assert!(launch("wake-3", None).is_ok());
 }
+
+#[test]
+fn a_bounded_claude_first_mate_resumes_its_session_until_the_plan_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let (temp, mut store, mut config) = fixture();
+    config["claude_version"] = json!("2.1.300");
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let home = store.home().to_owned();
+    let claude = root.join("claude-config");
+    fs::create_dir(&claude).unwrap();
+    let settings = |model: &str| {
+        fs::write(
+            claude.join("settings.json"),
+            json!({"model":model,"theme":"dark"}).to_string(),
+        )
+        .unwrap();
+    };
+    settings("exact");
+    // The loader refuses a #! wrapper, so the fake claude is a compiled exec
+    // shim into a scripted turn: it acknowledges its wake's mail and reports
+    // the session it was given, or a new one, as Claude's stream-json does.
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let python = support::python();
+    let log = root.join("claude-argv.jsonl");
+    let cli = json!([support::BIN, "--home", home]);
+    let script = root.join("claude.py");
+    fs::write(&script, format!(r#"import json, re, subprocess, sys, uuid
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("2.1.300 (Claude Code)")
+    sys.exit(0)
+with open({}, "a") as f:
+    f.write(json.dumps(args) + "\n")
+flags = args[:args.index("--")]
+session = flags[flags.index("--resume") + 1] if "--resume" in flags else str(uuid.uuid4())
+print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}), flush=True)
+through = int(re.search(r"through seq (\d+)", args[-1]).group(1))
+subprocess.run({} + ["mail.ack", "--json", json.dumps({{"address": "ship", "through_seq": through}})],
+               check=True, capture_output=True)
+print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "session_id": session}}), flush=True)
+"#, json!(log), cli)).unwrap();
+    let shim = root.join("claude.c");
+    fs::write(
+        &shim,
+        format!(
+            r#"#include <unistd.h>
+int main(int argc, char **argv) {{
+    char *args[argc + 2];
+    args[0] = {python:?};
+    args[1] = {script:?};
+    for (int i = 1; i <= argc; i++) args[i + 1] = argv[i];
+    execv(args[0], args);
+    return 127;
+}}
+"#,
+            python = python.display().to_string(),
+            script = script.display().to_string()
+        ),
+    )
+    .unwrap();
+    let built = Command::new("cc")
+        .arg("-o")
+        .arg(bin.join("claude"))
+        .arg(&shim)
+        .status()
+        .unwrap();
+    assert!(built.success());
+    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        bin.display(),
+        python.parent().unwrap().display()
+    );
+    let run = |command: &str, args: Value| -> Value {
+        let output = support::command(support::BIN)
+            .args(["--home", home.to_str().unwrap(), command, "--json"])
+            .arg(args.to_string())
+            .env("HOME", &root)
+            .env("PATH", &path)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"))
+            .env("PRIVATEER_SERVICE", "none")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    run(
+        "ship.put",
+        json!({"name":"ship","first_mate":{"manifest":"bundled:claude","duty_task":"task",
+            "tool_bundles":["fixture@1"],"options":{},
+            "batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":0}}),
+    );
+    run("ship.put", json!({"name":"apps","scope":"apps"}));
+    let tick = || -> Value {
+        let report = run("serve", json!({"once":true}));
+        report["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["ship"] == "ship")
+            .cloned()
+            .unwrap()
+    };
+    let wake = |body: &str| -> Value {
+        let before = run("wake.list", json!({"ship":"ship"}))["wakes"]
+            .as_array()
+            .unwrap()
+            .len();
+        run(
+            "mail.send",
+            json!({"from":"apps","to":"ship","kind":"notice","task_id":"task","body":body}),
+        );
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            tick();
+            let wakes = run("wake.list", json!({"ship":"ship"}))["wakes"].clone();
+            let latest = wakes[0].clone();
+            if wakes.as_array().unwrap().len() > before && latest["status"] != "running" {
+                // A failed wake shows its job's output, not just "failed".
+                let job = home
+                    .join("jobs")
+                    .join(latest["job_id"].as_str().unwrap_or(""));
+                let output: String = fs::read_dir(&job)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .flat_map(|run| fs::read_dir(run.path()).into_iter().flatten().flatten())
+                    .map(|log| fs::read_to_string(log.path()).unwrap_or_default())
+                    .collect();
+                assert_eq!(latest["status"], "succeeded", "{latest}\n{output}");
+                return latest;
+            }
+            assert!(Instant::now() < until, "wake never finished: {latest}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let digests = |id: &Value| -> (String, String) {
+        store
+            .connection()
+            .query_row(
+                "SELECT w.plan_digest, s.plan_digest FROM wakes w, sessions s
+                 WHERE w.id=?1 AND s.ship='ship' AND s.focus=w.focus",
+                [id.as_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    let resumed = |line: usize| -> Option<String> {
+        let argv: Vec<String> =
+            serde_json::from_str(fs::read_to_string(&log).unwrap().lines().nth(line).unwrap())
+                .unwrap();
+        let index = argv.iter().position(|a| a == "--resume")?;
+        Some(argv[index + 1].clone())
+    };
+
+    // The first bounded wake starts fresh, and its session takes the digest
+    // the wake recorded at launch.
+    let first = wake("first");
+    assert_eq!(first["mode"], "fresh", "{first}");
+    let session = first["session_id"].as_str().unwrap().to_owned();
+    let (wake_digest, session_digest) = digests(&first["id"]);
+    assert_eq!(wake_digest.len(), 64);
+    assert_eq!(session_digest, wake_digest);
+    assert_eq!(resumed(0), None);
+
+    // Same plan: the next wake resumes that exact session.
+    let second = wake("second");
+    assert_eq!(second["mode"], "resume", "{second}");
+    assert_eq!(second["session_id"], session.as_str());
+    assert_eq!(resumed(1).as_deref(), Some(session.as_str()));
+    assert_eq!(digests(&second["id"]).0, wake_digest);
+
+    // A changed carried setting is another plan: a fresh session under it.
+    settings("other");
+    let third = wake("third");
+    assert_eq!(third["mode"], "fresh", "{third}");
+    assert_ne!(third["session_id"], session.as_str());
+    assert_eq!(resumed(2), None);
+    let (changed, recorded) = digests(&third["id"]);
+    assert_ne!(changed, wake_digest);
+    assert_eq!(recorded, changed);
+}
