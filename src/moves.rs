@@ -853,6 +853,38 @@ fn activate(args: &Value) -> Result<Value> {
             "{forgotten} ships it knew are not reachable from this machine"
         )));
     }
+    // Captain mail it carried that the captain already has, taken by a
+    // machine link or shown by a front door where it was written, is not
+    // offered again from here; the rest still reaches the captain.
+    let shown = if has_table(store.connection(), "door_cursor")? {
+        "OR seq <= (SELECT COALESCE(MAX(through_seq), 0) FROM door_cursor)"
+    } else {
+        ""
+    };
+    let handed = if has_table(store.connection(), "machine_collected")? {
+        "EXISTS(SELECT 1 FROM machine_collected c WHERE c.id=mail.id AND c.error IS NULL)"
+    } else {
+        "0"
+    };
+    let carried: Vec<(String, Option<String>)> = store
+        .connection()
+        .prepare(&format!(
+            "SELECT id FROM mail WHERE recipient=?1 AND ({handed} {shown})"
+        ))?
+        .query_map([crate::mail::CAPTAIN], |r| {
+            Ok((r.get::<_, String>(0)?, None))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let peers: Vec<String> = store
+        .connection()
+        .prepare("SELECT name FROM peer_endpoints")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for peer in peers {
+        if crate::peers::machine(&store, &peer)? {
+            crate::mail::collected_captain(&store, &peer, &carried)?;
+        }
+    }
     store.audit("ship.arrived", &json!({"ship": ship, "move": id}))?;
     let dispatcher =
         crate::service::ensure_with_path(&home, &ship, detail["path"].as_str().unwrap_or(""))
