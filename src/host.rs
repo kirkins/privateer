@@ -18,7 +18,55 @@ pub mod bridge;
 const LAUNCH_TTL_SECS: u64 = 60;
 
 /// Harnesses whose attended adapter starts a turn when mail arrives.
-const LIVE_HARNESSES: &[&str] = &["pi", "pi-signed"];
+const LIVE_HARNESSES: &[&str] = &["pi", "pi-signed", "claude"];
+/// Harnesses whose hosted crew end their session when the work settles.
+const CREW_HARNESSES: &[&str] = &["pi", "pi-signed"];
+
+/// Claude's own state directory and user config file, as Claude finds them.
+fn claude_config() -> Option<(PathBuf, PathBuf)> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {
+        let file = dir.join(".claude.json");
+        return Some((dir, file));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some((home.join(".claude"), home.join(".claude.json")))
+}
+
+/// Whether Claude's folder-trust dialog was accepted for this folder or one
+/// above it. An interactive Claude in an untrusted folder stops at that
+/// dialog, whose default is to exit, with nobody at a hosted pane to answer.
+/// Read only: Claude rewrites this file itself, so Privateer never writes it.
+fn claude_trusted(folder: &Path) -> bool {
+    let Some(config) = claude_config()
+        .and_then(|(_, file)| std::fs::read(file).ok())
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+    else {
+        return false;
+    };
+    folder.ancestors().any(|dir| {
+        dir.to_str()
+            .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
+    })
+}
+
+/// Whether Claude holds a conversation for this folder, which `--continue`
+/// needs: without one, an interactive `--continue` exits. Claude keeps a
+/// folder's transcripts under its path with every other character a dash.
+pub(crate) fn claude_has_conversation(folder: &Path) -> bool {
+    let Some((dir, _)) = claude_config() else {
+        return false;
+    };
+    let name: String = folder
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    std::fs::read_dir(dir.join("projects").join(name)).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+    })
+}
 
 pub(crate) fn validate(host: &Value) -> Result<Value> {
     ensure!(
@@ -80,6 +128,16 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         LIVE_HARNESSES.contains(&harness.as_str()),
         "{harness} cannot be hosted: its attended adapter does not start turns on mail"
     );
+    let folder = store
+        .home()
+        .parent()
+        .context("ship folder")?
+        .canonicalize()?;
+    ensure!(
+        harness != "claude" || claude_trusted(&folder),
+        "Claude has not been trusted in {}; run `privateer start claude` there once and choose \"Yes, I trust this folder\"",
+        folder.display()
+    );
     ensure!(
         crate::presence::folder_ship(store).as_deref() == Some(ship),
         "hosted start must use this folder's ship"
@@ -96,11 +154,6 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         "first mate duty owner changed"
     );
     let charter = store.authorize(duty, "spawn")?;
-    let folder = store
-        .home()
-        .parent()
-        .context("ship folder")?
-        .canonicalize()?;
     let repo = Path::new(charter["repo"].as_str().context("charter repo")?).canonicalize()?;
     ensure!(
         folder.is_dir() && folder.starts_with(repo),
@@ -240,7 +293,7 @@ impl Drop for Lease<'_> {
 /// end a crew when the work settles, and the terminal host answers.
 pub(crate) fn hosts_crew(profile: &Value, harness: &str) -> bool {
     hosted(profile)
-        && LIVE_HARNESSES.contains(&harness)
+        && CREW_HARNESSES.contains(&harness)
         && socket()
             .and_then(|s| crate::herdr::Client::connect(&s).ok())
             .is_some_and(|mut c| c.snapshot().is_ok())
