@@ -60,6 +60,10 @@ struct Job {
     agent_request_hash: Option<String>,
     action: String,
     heavy: bool,
+    /// Whether the caller asked for heavy work by name. Only then does the
+    /// heavy disk default apply; an unlabelled job is heavy for CPU and memory.
+    #[serde(default)]
+    heavy_declared: bool,
     timeout_secs: u64,
     ledger: PathBuf,
     status: String,
@@ -144,6 +148,13 @@ struct Reservation {
     /// Resolved estimate counted by admission while recently admitted.
     #[serde(default)]
     demand: Option<Demand>,
+    /// The filesystem the declared space is on, as `disk_key`, and its free
+    /// space when the reservation was admitted. Free space lost since then is
+    /// what the job has already written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk_free_bytes: Option<u64>,
     /// The job's recorded descendants outside its payload group.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     escaped: Vec<Process>,
@@ -516,6 +527,7 @@ fn reserve(
     conn: &Connection,
     reservation: &mut Reservation,
     estimate: Option<&Estimate>,
+    heavy_declared: bool,
     charter_cap: Option<u64>,
     floor: DiskFloor<'_>,
     from_queue: bool,
@@ -558,7 +570,20 @@ fn reserve(
             // Never garbage-collect reservations merely because a wrapper disappeared.
             let held = reservations(conn)?;
             let host = admission::measure()?;
-            reservation.demand = admission::demand(&settings, &host, reservation.heavy, estimate);
+            reservation.demand = admission::demand(
+                &settings,
+                &host,
+                reservation.heavy,
+                heavy_declared,
+                estimate,
+            );
+            // Only the filesystem this job will use: a full root must not
+            // block work on a separate volume. The same reading decides
+            // admission and feeds the falling-space trend the owner sees.
+            let disk_key = admission::disk_key(floor.path)?;
+            let (disk_available_bytes, disk_total_bytes) = admission::disk(floor.path)?;
+            let now = Store::now_ms();
+            admission::note_disk(conn, &disk_key, disk_available_bytes, now)?;
             let view: Vec<admission::Held> = held
                 .iter()
                 .map(|r| admission::Held {
@@ -567,15 +592,10 @@ fn reserve(
                     charter: r.charter.as_deref(),
                     created_ms: r.created_ms,
                     demand: r.demand,
+                    disk_key: r.disk_key.as_deref(),
+                    disk_free_at_admit: r.disk_free_bytes,
                 })
                 .collect();
-            // Only the filesystem this job will use: a full root must not
-            // block work on a separate volume. The same reading decides
-            // admission and feeds the falling-space trend the owner sees.
-            let disk_key = admission::disk_key(floor.path)?;
-            let disk_available_bytes = admission::disk(floor.path)?.0;
-            let now = Store::now_ms();
-            admission::note_disk(conn, &disk_key, disk_available_bytes, now)?;
             admission::admit(
                 &settings,
                 &host,
@@ -588,10 +608,14 @@ fn reserve(
                     charter_cap,
                     demand: reservation.demand,
                     charter_min_free_bytes: floor.charter_min_free_bytes,
+                    disk_key: &disk_key,
                     disk_available_bytes,
+                    disk_total_bytes,
                     released_load: released_load(conn, now)?,
                 },
             )?;
+            reservation.disk_key = Some(disk_key);
+            reservation.disk_free_bytes = Some(disk_available_bytes);
             if from_queue {
                 conn.execute("DELETE FROM queue WHERE key=?1", [&reservation.key])?;
                 // Its ramp starts now, not when it joined the queue.
@@ -1270,6 +1294,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .map(PathBuf::from)
             .unwrap_or_else(|| repo.clone()),
     )?;
+    let heavy_declared = args.get("heavy").and_then(Value::as_bool).is_some();
     let heavy = args.get("heavy").and_then(Value::as_bool).unwrap_or(true);
     let estimate = args
         .get("estimate")
@@ -1433,6 +1458,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         agent_request_hash,
         action: action.to_owned(),
         heavy,
+        heavy_declared,
         timeout_secs,
         ledger: ledger_path.clone(),
         status: "starting".to_owned(),
@@ -1484,6 +1510,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         payload: None,
         charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
         demand: None,
+        disk_key: None,
+        disk_free_bytes: None,
         escaped: vec![],
         wake: is_wake(store, &id)?,
     };
@@ -1546,6 +1574,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             &ledger,
             &mut reservation,
             estimate.as_ref(),
+            heavy_declared,
             charter_cap,
             DiskFloor {
                 charter_min_free_bytes: charter
@@ -1761,6 +1790,8 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             payload: None,
             charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
             demand: None,
+            disk_key: None,
+            disk_free_bytes: None,
             escaped: vec![],
             wake: is_wake(store, &job.id)?,
         };
@@ -1769,6 +1800,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             &ledger(&job.ledger)?,
             &mut reservation,
             job.estimate.as_ref(),
+            job.heavy_declared,
             cap,
             DiskFloor {
                 charter_min_free_bytes: charter

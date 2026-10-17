@@ -116,6 +116,10 @@ pub struct Held<'a> {
     pub charter: Option<&'a str>,
     pub created_ms: i64,
     pub demand: Option<Demand>,
+    /// The filesystem its declared space is on, as `disk_key`, and the free
+    /// space measured when it was admitted.
+    pub disk_key: Option<&'a str>,
+    pub disk_free_at_admit: Option<u64>,
 }
 
 /// What a new job asks for.
@@ -127,9 +131,12 @@ pub struct Request<'a> {
     pub charter_cap: Option<u64>,
     pub demand: Option<Demand>,
     pub charter_min_free_bytes: u64,
-    /// Free space on the filesystem the job will use, as the caller measured
-    /// it; the same reading is kept as a sample for the falling-space trend.
+    /// The filesystem the job will use, as `disk_key`, with its free and
+    /// total space as the caller measured them; the free reading is kept as a
+    /// sample for the falling-space trend.
+    pub disk_key: &'a str,
     pub disk_available_bytes: u64,
+    pub disk_total_bytes: u64,
     /// Load the one-minute average still carries from jobs that just ended,
     /// which no longer run (see `released_load`).
     pub released_load: f64,
@@ -281,11 +288,15 @@ pub fn configure(conn: &Connection, changes: &Value) -> Result<Settings> {
 }
 
 /// The demand to record for a job, or None when it is neither heavy nor
-/// estimated (such jobs are not subject to admission).
+/// estimated (such jobs are not subject to admission). The heavy default for
+/// disk applies only when the caller asked for heavy work by name
+/// (`heavy_declared`): an unlabelled job defaults to heavy for CPU and memory
+/// but must not hold gigabytes of disk it never writes.
 pub fn demand(
     settings: &Settings,
     host: &Host,
     heavy: bool,
+    heavy_declared: bool,
     requested: Option<&Estimate>,
 ) -> Option<Demand> {
     if !heavy && requested.is_none() {
@@ -296,7 +307,11 @@ pub fn demand(
         Demand {
             cpus: settings.heavy_estimate.cpus.unwrap_or(host.cpus),
             memory_bytes: settings.heavy_estimate.memory_bytes.unwrap_or(0),
-            disk_bytes: settings.heavy_estimate.disk_bytes.unwrap_or(0),
+            disk_bytes: if heavy_declared {
+                settings.heavy_estimate.disk_bytes.unwrap_or(0)
+            } else {
+                0
+            },
         }
     } else {
         Demand::default()
@@ -306,6 +321,36 @@ pub fn demand(
         memory_bytes: requested.memory_bytes.unwrap_or(fallback.memory_bytes),
         disk_bytes: requested.disk_bytes.unwrap_or(fallback.disk_bytes),
     })
+}
+
+/// Disk the held reservations on one filesystem still have to write. Each
+/// job's declared space less what the filesystem has lost since that job was
+/// admitted, since a reading already shows what was written. The credit is
+/// capped at the loss since the oldest of them was admitted, so concurrent
+/// jobs cannot all claim the same loss.
+fn committed_disk(held: &[Held], disk_key: &str, free_now: u64) -> u64 {
+    let on_disk: Vec<&Held> = held
+        .iter()
+        .filter(|h| h.disk_key == Some(disk_key))
+        .collect();
+    let declared = on_disk
+        .iter()
+        .filter_map(|h| h.demand)
+        .fold(0u64, |sum, d| sum.saturating_add(d.disk_bytes));
+    let lost = |h: &Held| {
+        h.disk_free_at_admit
+            .map_or(0, |free| free.saturating_sub(free_now))
+    };
+    let credit = on_disk
+        .iter()
+        .filter_map(|h| h.demand.map(|d| d.disk_bytes.min(lost(h))))
+        .fold(0u64, |sum, c| sum.saturating_add(c));
+    let oldest_loss = on_disk
+        .iter()
+        .filter(|h| h.disk_free_at_admit.is_some())
+        .min_by_key(|h| h.created_ms)
+        .map_or(0, |h| lost(h));
+    declared.saturating_sub(credit.min(oldest_loss))
 }
 
 fn mib(bytes: impl Into<i128>) -> i128 {
@@ -326,6 +371,18 @@ pub fn admit(
     let required_disk = settings
         .min_free_disk_bytes
         .max(request.charter_min_free_bytes);
+    // A job whose declared space cannot fit even on an empty filesystem would
+    // wait at the head of the host-wide queue for its whole wait limit, so it
+    // is refused now. A floor set above the disk waits as it always has: the
+    // operator may lower it.
+    let own_disk = request.demand.map_or(0, |d| d.disk_bytes);
+    ensure!(
+        own_disk == 0 || required_disk.saturating_add(own_disk) <= request.disk_total_bytes,
+        "job never fits: {} MiB must stay free and this job declares {} MiB, but the filesystem holds {} MiB in all; lower estimate.disk_bytes or tune resource.configure (min_free_disk_bytes, heavy_estimate.disk_bytes)",
+        mib(required_disk),
+        mib(own_disk),
+        mib(request.disk_total_bytes)
+    );
     refuse_unless!(
         available >= required_disk,
         "disk admission refused: {} MiB disk available, {} MiB must stay free (host floor {} MiB, charter floor {} MiB); retry later or tune resource.configure",
@@ -339,13 +396,10 @@ pub fn admit(
     };
     // Disk a job declares is space it will use and keep, unlike load and
     // memory, whose use shows up in live readings. Every reservation still
-    // held counts, not just recent ones: a running build's bytes are still on
-    // the filesystem, and no reading reports them. A job's own demand always
-    // counts, since starting it is what fills the disk.
-    let committed: u64 = held
-        .iter()
-        .filter_map(|h| h.demand)
-        .fold(0u64, |held, d| held.saturating_add(d.disk_bytes));
+    // held on this filesystem counts, not just recent ones: a running build's
+    // bytes stay on the disk. A job's own demand always counts, since starting
+    // it is what fills the disk.
+    let committed = committed_disk(held, request.disk_key, available);
     let needed = (required_disk as i128)
         .saturating_add(committed as i128)
         .saturating_add(demand.disk_bytes as i128);
@@ -539,19 +593,30 @@ const DISK_SAMPLE_EVERY_MS: i64 = 5 * 60_000;
 /// Samples older than this are dropped, bounding the table however long the
 /// ledger lives.
 const DISK_SAMPLE_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-/// A falling rate is believed only once the samples span this long, so one
+/// A rate is read from the readings of this recent window only, so an old
+/// fall or rise cannot stand for what the disk is doing now.
+const DISK_TREND_WINDOW_MS: i64 = 12 * 60 * 60 * 1000;
+/// A falling rate is believed only once the readings span this long, so one
 /// build that wrote a gigabyte cannot read as a machine filling up.
-const DISK_TREND_MIN_SPAN_MS: i64 = 30 * 60_000;
+const DISK_TREND_MIN_SPAN_MS: i64 = 60 * 60_000;
+/// A rise this large between two readings is a cleanup: the rate is read from
+/// the readings after it, so the space freed does not hide a fall that
+/// follows.
+const DISK_CLEANUP_BYTES: u64 = GIB;
 
-/// How free space on one filesystem has moved across the kept samples.
+/// How free space on one filesystem has moved over the recent readings.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DiskTrend {
     /// The filesystem the samples describe, as `disk_key`.
     pub path: String,
+    /// The first and last reading the rate is read from.
     pub from_ms: i64,
     pub from_free_bytes: u64,
     pub to_ms: i64,
     pub to_free_bytes: u64,
+    /// Least-squares slope of free space over those readings, in bytes per
+    /// hour; negative while space falls.
+    pub bytes_per_hour: f64,
 }
 
 /// The key one filesystem's samples are kept under: the device it lives on,
@@ -587,6 +652,7 @@ pub struct DiskForecast {
 /// Keep one reading of free space, at most one every `DISK_SAMPLE_EVERY_MS`,
 /// so a later reading can say how fast space is falling. Callers pass the
 /// reading they just decided against, so the trend and the decision agree.
+/// Readings past the retention window are dropped for every filesystem.
 pub fn note_disk(conn: &Connection, path: &str, free: u64, now_ms: i64) -> Result<()> {
     let last: Option<i64> = conn
         .query_row(
@@ -604,51 +670,76 @@ pub fn note_disk(conn: &Connection, path: &str, free: u64, now_ms: i64) -> Resul
         params![path, now_ms, free.min(i64::MAX as u64) as i64],
     )?;
     conn.execute(
-        "DELETE FROM disk_samples WHERE path=?1 AND sampled_ms < ?2",
-        params![path, now_ms - DISK_SAMPLE_KEEP_MS],
+        "DELETE FROM disk_samples WHERE sampled_ms < ?1",
+        [now_ms - DISK_SAMPLE_KEEP_MS],
     )?;
     Ok(())
 }
 
-/// The oldest and newest kept samples for a filesystem, when they span long
-/// enough to describe a rate. None until readings that far apart exist, so a
-/// caller cannot read a rate out of one build's writing.
+/// The rate at which free space has been moving over the recent readings of
+/// one filesystem. The window ends at the newest reading and starts at the
+/// last cleanup in it, and the slope is a least-squares fit. None until those
+/// readings span `DISK_TREND_MIN_SPAN_MS`, so a caller cannot read a rate out
+/// of one build's writing.
 pub fn disk_trend(conn: &Connection, path: &str) -> Result<Option<DiskTrend>> {
-    let mut statement = conn.prepare(
-        "SELECT sampled_ms, free_bytes FROM disk_samples WHERE path=?1 ORDER BY sampled_ms",
+    let newest: Option<i64> = conn.query_row(
+        "SELECT MAX(sampled_ms) FROM disk_samples WHERE path=?1",
+        [path],
+        |r| r.get(0),
     )?;
-    let samples = statement
-        .query_map([path], |r| {
+    let Some(newest) = newest else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(
+        "SELECT sampled_ms,free_bytes FROM disk_samples WHERE path=?1 AND sampled_ms>=?2
+         ORDER BY sampled_ms",
+    )?;
+    let readings = statement
+        .query_map(params![path, newest - DISK_TREND_WINDOW_MS], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let Some(&(from_ms, from_free_bytes)) = samples.first() else {
+    let after_cleanup = readings
+        .windows(2)
+        .rposition(|w| w[1].1 >= w[0].1.saturating_add(DISK_CLEANUP_BYTES))
+        .map_or(0, |i| i + 1);
+    let readings = &readings[after_cleanup..];
+    let (Some(&(from_ms, from_free_bytes)), Some(&(to_ms, to_free_bytes))) =
+        (readings.first(), readings.last())
+    else {
         return Ok(None);
     };
-    let &(to_ms, to_free_bytes) = samples.last().expect("a first sample implies a last");
-    if to_ms.saturating_sub(from_ms) < DISK_TREND_MIN_SPAN_MS {
+    if to_ms - from_ms < DISK_TREND_MIN_SPAN_MS {
         return Ok(None);
     }
+    let hours = |ms: i64| (ms - from_ms) as f64 / 3_600_000.0;
+    let count = readings.len() as f64;
+    let mean_hours = readings.iter().map(|&(ms, _)| hours(ms)).sum::<f64>() / count;
+    let mean_free = readings.iter().map(|&(_, free)| free as f64).sum::<f64>() / count;
+    let (covariance, variance) = readings.iter().fold((0.0, 0.0), |(c, v), &(ms, free)| {
+        let x = hours(ms) - mean_hours;
+        (c + x * (free as f64 - mean_free), v + x * x)
+    });
     Ok(Some(DiskTrend {
         path: path.to_owned(),
         from_ms,
         from_free_bytes,
         to_ms,
         to_free_bytes,
+        bytes_per_hour: covariance / variance,
     }))
 }
 
 /// Project the observed rate onto the floor. None when space is not falling,
 /// when the floor is already crossed (the floor's own alarm covers that), or
-/// when the samples are too close together to describe a rate.
+/// when the readings are too close together to describe a rate.
 pub fn disk_forecast(floor: u64, trend: &DiskTrend) -> Option<DiskForecast> {
     let span_ms = trend.to_ms.saturating_sub(trend.from_ms);
     if span_ms < DISK_TREND_MIN_SPAN_MS || trend.to_free_bytes <= floor {
         return None;
     }
-    let lost = trend.from_free_bytes.checked_sub(trend.to_free_bytes)? as f64;
-    let per_hour = lost / (span_ms as f64 / 3_600_000.0);
-    if per_hour <= 0.0 {
+    let per_hour = -trend.bytes_per_hour;
+    if per_hour.is_nan() || per_hour <= 0.0 {
         return None;
     }
     Some(DiskForecast {
@@ -659,11 +750,19 @@ pub fn disk_forecast(floor: u64, trend: &DiskTrend) -> Option<DiskForecast> {
 }
 
 /// The forecast worth warning about: the one where the observed rate would
-/// reach the floor within `horizon_secs`. A horizon of 0 warns only once the
-/// floor is crossed, which `disk_forecast` already excludes.
-pub fn disk_warning(floor: u64, horizon_secs: u64, trend: &DiskTrend) -> Option<DiskForecast> {
+/// reach the floor within `horizon_secs`. A warning already `raised` clears
+/// only once the floor is more than twice that horizon away, so a forecast
+/// that hovers at the horizon does not flap. A horizon of 0 warns only once
+/// the floor is crossed, which `disk_forecast` already excludes.
+pub fn disk_warning(
+    floor: u64,
+    horizon_secs: u64,
+    raised: bool,
+    trend: &DiskTrend,
+) -> Option<DiskForecast> {
     let forecast = disk_forecast(floor, trend)?;
-    (forecast.hours_to_floor * 3_600.0 <= horizon_secs as f64).then_some(forecast)
+    let reach = horizon_secs as f64 * if raised { 2.0 } else { 1.0 };
+    (forecast.hours_to_floor * 3_600.0 <= reach).then_some(forecast)
 }
 
 /// Settings and live readings for resource.status.
@@ -698,7 +797,9 @@ mod tests {
                 disk_bytes: 4 * GIB,
             }),
             charter_min_free_bytes: 0,
+            disk_key: "dev:1",
             disk_available_bytes: 100 * GIB,
+            disk_total_bytes: 200 * GIB,
             released_load,
         }
     }
@@ -743,6 +844,7 @@ mod tests {
         assert!(released_load(10.0, 14.0, 600_000) < 0.001);
     }
 
+    /// A job admitted with `disk_bytes` declared, when 36 GiB were free.
     fn held(disk_bytes: u64) -> Held<'static> {
         Held {
             heavy: true,
@@ -754,7 +856,154 @@ mod tests {
                 memory_bytes: 0,
                 disk_bytes,
             }),
+            disk_key: Some("dev:1"),
+            disk_free_at_admit: Some(36 * GIB),
         }
+    }
+
+    /// A held job on `disk_key` that declared `disk_bytes`, admitted when
+    /// `free_at_admit` was free.
+    fn held_on(disk_key: &'static str, disk_bytes: u64, free_at_admit: u64) -> Held<'static> {
+        Held {
+            disk_key: Some(disk_key),
+            disk_free_at_admit: Some(free_at_admit),
+            ..held(disk_bytes)
+        }
+    }
+
+    #[test]
+    fn space_a_running_job_already_wrote_is_not_counted_twice() {
+        let settings = Settings {
+            min_free_disk_bytes: 2 * GIB,
+            max_load_per_cpu: 1024.0,
+            ..Settings::default()
+        };
+        let host = host(0.0);
+        // A build declared 4 GiB at 36 GiB free and has since written it: the
+        // disk now reads 32 GiB free. Its declared space is no longer ahead of
+        // the reading, so a second 4 GiB job still fits.
+        let mut request = heavy(0.0);
+        request.disk_available_bytes = 32 * GIB;
+        assert!(
+            admit(
+                &settings,
+                &host,
+                0,
+                &[held_on("dev:1", 4 * GIB, 36 * GIB)],
+                &request
+            )
+            .is_ok()
+        );
+        // Nothing written yet, the same job is counted in full: at 9 GiB free
+        // a 4 GiB build with a 2 GiB floor and a 4 GiB build held do not fit.
+        request.disk_available_bytes = 9 * GIB;
+        assert!(
+            admit(
+                &settings,
+                &host,
+                0,
+                &[held_on("dev:1", 4 * GIB, 9 * GIB)],
+                &request
+            )
+            .is_err()
+        );
+        // Two builds admitted at 36 GiB, 4 GiB each, and 4 GiB lost since: the
+        // loss is one build's worth, so 4 GiB is still ahead of them, not 8
+        // and not 0. A 28 GiB job then needs 2 + 4 + 28 = 34 GiB, not 32.
+        let two = [
+            held_on("dev:1", 4 * GIB, 36 * GIB),
+            held_on("dev:1", 4 * GIB, 36 * GIB),
+        ];
+        request.demand = Some(Demand {
+            cpus: 1.0,
+            memory_bytes: 0,
+            disk_bytes: 28 * GIB,
+        });
+        request.disk_available_bytes = 32 * GIB;
+        assert!(admit(&settings, &host, 0, &two, &request).is_err());
+        request.demand.as_mut().unwrap().disk_bytes = 26 * GIB;
+        assert!(admit(&settings, &host, 0, &two, &request).is_ok());
+    }
+
+    #[test]
+    fn a_volume_only_counts_the_reservations_on_it() {
+        let settings = Settings {
+            min_free_disk_bytes: 2 * GIB,
+            max_load_per_cpu: 1024.0,
+            ..Settings::default()
+        };
+        let host = host(0.0);
+        let mut request = heavy(0.0);
+        request.disk_available_bytes = 6 * GIB;
+        // A 31 GiB build on another filesystem leaves this one alone.
+        assert!(
+            admit(
+                &settings,
+                &host,
+                0,
+                &[held_on("dev:2", 31 * GIB, 36 * GIB)],
+                &request
+            )
+            .is_ok()
+        );
+        assert!(
+            admit(
+                &settings,
+                &host,
+                0,
+                &[held_on("dev:1", 31 * GIB, 36 * GIB)],
+                &request
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_job_that_can_never_fit_is_refused_rather_than_queued() {
+        let settings = Settings {
+            min_free_disk_bytes: 2 * GIB,
+            max_load_per_cpu: 1024.0,
+            ..Settings::default()
+        };
+        let host = host(0.0);
+        let mut request = heavy(0.0);
+        // A 4 GiB declaration and the 2 GiB floor need 6 GiB; a 5 GiB disk
+        // never has that, however long the job waits.
+        request.disk_total_bytes = 5 * GIB;
+        request.disk_available_bytes = 5 * GIB;
+        let refused = admit(&settings, &host, 0, &[], &request).unwrap_err();
+        assert!(refused.downcast_ref::<Refused>().is_none(), "{refused}");
+        assert!(refused.to_string().contains("never fits"), "{refused}");
+        request.disk_total_bytes = 6 * GIB;
+        request.disk_available_bytes = 6 * GIB;
+        assert!(admit(&settings, &host, 0, &[], &request).is_ok());
+    }
+
+    #[test]
+    fn only_a_job_declared_heavy_takes_the_heavy_disk_default() {
+        let settings = Settings::default();
+        let host = host(0.0);
+        // Unlabelled work is heavy for CPU and memory but declares no disk.
+        assert_eq!(
+            demand(&settings, &host, true, false, None)
+                .unwrap()
+                .disk_bytes,
+            0
+        );
+        assert_eq!(
+            demand(&settings, &host, true, false, None)
+                .unwrap()
+                .memory_bytes,
+            2 * GIB
+        );
+        // A declared demand still counts either way.
+        let declared = estimate(&json!({"disk_bytes": GIB})).unwrap();
+        assert_eq!(
+            demand(&settings, &host, true, false, Some(&declared))
+                .unwrap()
+                .disk_bytes,
+            GIB
+        );
     }
 
     #[test]
@@ -766,7 +1015,9 @@ mod tests {
         };
         let host = host(0.0);
         assert_eq!(
-            demand(&settings, &host, true, None).unwrap().disk_bytes,
+            demand(&settings, &host, true, true, None)
+                .unwrap()
+                .disk_bytes,
             4 * GIB
         );
         // 36 GiB free, a 2 GiB floor and the 4 GiB heavy default: it fits.
@@ -798,6 +1049,7 @@ mod tests {
             &settings,
             &host,
             false,
+            false,
             Some(&estimate(&json!({"disk_bytes": 4 * GIB})).unwrap()),
         );
         declared.disk_available_bytes = 6 * GIB;
@@ -807,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn free_space_samples_are_bounded_and_say_how_fast_space_is_falling() {
+    fn free_space_samples_are_bounded_and_need_a_spread_to_read_a_rate() {
         let conn = ledger();
         // One reading, or two minutes apart, is not a rate.
         note_disk(&conn, "/data", 36 * GIB, 0).unwrap();
@@ -823,41 +1075,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(samples(&conn, "/data"), 2);
-        // The Mac's day: 36 GiB down to 8.6 GiB in nineteen hours.
+        // Half an hour of readings still describes no rate.
+        note_disk(&conn, "/data", 33 * GIB, 30 * 60_000).unwrap();
+        assert!(disk_trend(&conn, "/data").unwrap().is_none());
+        // Samples older than the retention window are dropped, for every
+        // filesystem, so the table stays bounded however long the ledger lives.
+        note_disk(&conn, "/other", 30 * GIB, 0).unwrap();
+        let later = DISK_SAMPLE_KEEP_MS + 30 * 60_000 + 1;
+        note_disk(&conn, "/data", 30 * GIB, later).unwrap();
+        assert_eq!(samples(&conn, "/data"), 1);
+        assert_eq!(samples(&conn, "/other"), 0);
+    }
+
+    /// Free space in GiB at `ms` for a day's readings: 36 GiB falling 1 GiB an
+    /// hour, and after `cleanup_ms` a 20 GiB cleanup and a fall of 4 GiB an hour.
+    fn falling_day(ms: i64, cleanup_ms: Option<i64>) -> u64 {
+        let hours = ms as f64 / 3_600_000.0;
+        let gib = match cleanup_ms {
+            Some(at) if ms >= at => {
+                let since = (ms - at) as f64 / 3_600_000.0;
+                26.0 + 20.0 - 4.0 * since
+            }
+            _ => 36.0 - hours,
+        };
+        (gib * GIB as f64) as u64
+    }
+
+    #[test]
+    fn the_rate_comes_from_the_recent_window_only() {
+        let conn = ledger();
         let end = 19 * 3_600_000;
-        let last = 8_600 * 1024 * 1024;
-        note_disk(&conn, "/data", last, end).unwrap();
+        for ms in (0..=end).step_by(DISK_SAMPLE_EVERY_MS as usize) {
+            note_disk(&conn, "/data", falling_day(ms, None), ms).unwrap();
+        }
         let trend = disk_trend(&conn, "/data").unwrap().expect("a rate");
         assert_eq!(trend.path, "/data");
-        assert_eq!(trend.from_ms, 0);
-        assert_eq!(trend.from_free_bytes, 36 * GIB);
+        // The last twelve hours: the readings before the window do not count.
+        assert_eq!(trend.from_ms, end - 12 * 3_600_000);
         assert_eq!(trend.to_ms, end);
-        assert_eq!(trend.to_free_bytes, last);
+        assert_eq!(trend.to_free_bytes, falling_day(end, None));
+        // A straight fall of one GiB an hour fits exactly.
+        assert!((trend.bytes_per_hour + GIB as f64).abs() < 1.0, "{trend:?}");
         let forecast = disk_forecast(2 * GIB, &trend).expect("a falling rate is read");
-        let lost_per_hour = (36 * GIB - last) as f64 / GIB as f64 / (end as f64 / 3_600_000.0);
+        assert!((forecast.gib_per_hour - 1.0).abs() < 1e-6, "{forecast:?}");
+        assert_eq!(forecast.span_ms, 12 * 3_600_000);
+    }
+
+    #[test]
+    fn a_fall_after_a_cleanup_is_still_seen() {
+        let conn = ledger();
+        let cleanup = 10 * 3_600_000;
+        let end = 12 * 3_600_000;
+        for ms in (0..=end).step_by(DISK_SAMPLE_EVERY_MS as usize) {
+            note_disk(&conn, "/data", falling_day(ms, Some(cleanup)), ms).unwrap();
+        }
+        // The 20 GiB freed at ten hours would flatten a fit across the window,
+        // but the rate is read from the readings after it: four GiB an hour.
+        let trend = disk_trend(&conn, "/data").unwrap().expect("a rate");
+        assert_eq!(trend.from_ms, cleanup);
         assert!(
-            (forecast.gib_per_hour - lost_per_hour).abs() < 1e-9,
-            "{forecast:?}"
+            (trend.bytes_per_hour + 4.0 * GIB as f64).abs() < 1.0,
+            "{trend:?}"
         );
-        assert_eq!(forecast.span_ms, end);
-        // Samples older than the retention window are dropped, so the table
-        // stays bounded however long the ledger lives.
-        note_disk(&conn, "/data", 30 * GIB, end + DISK_SAMPLE_KEEP_MS + 1).unwrap();
-        assert_eq!(samples(&conn, "/data"), 1);
+        assert!(disk_warning(GIB, 86_400, false, &trend).is_some());
+    }
+
+    #[test]
+    fn a_warning_clears_only_once_the_floor_is_well_beyond_the_horizon() {
+        let hour = 3_600_000;
+        // Thirty hours to the floor: outside a day's horizon, so no warning
+        // yet, but a raised warning holds until forty-eight hours.
+        let thirty = trend_of(0, 21 * GIB, 6 * hour, 20 * GIB);
+        assert!(disk_warning(15 * GIB, 86_400, false, &thirty).is_none());
+        assert!(disk_warning(15 * GIB, 86_400, true, &thirty).is_some());
+        let sixty = trend_of(0, 21 * GIB, 12 * hour, 20 * GIB);
+        assert!(disk_warning(15 * GIB, 86_400, true, &sixty).is_none());
     }
 
     #[test]
     fn a_falling_rate_warns_before_the_floor_but_not_after_it() {
         let hour = 3_600_000;
-        // The Mac a day earlier: 36 GiB free at dawn, on the way to 8.6 GiB,
-        // with a 15 GiB floor for its iOS workload. Under the floor already,
-        // which is the floor's own alarm rather than a forecast.
+        // A day's fall from 36 GiB free to 8.6 GiB against a 15 GiB floor.
+        // Under the floor already, which is the floor's own alarm rather than
+        // a forecast.
         let yesterday = trend_of(0, 36 * GIB, 19 * hour, 8_600 * 1024 * 1024);
-        assert!(disk_warning(15 * GIB, 86_400, &yesterday).is_none());
+        assert!(disk_warning(15 * GIB, 86_400, false, &yesterday).is_none());
         // Half a day in, still above the floor with hours to spare: the owner
         // hears about it while there is still time to act.
         let midday = trend_of(0, 36 * GIB, 6 * hour, 20 * GIB);
-        let forecast = disk_warning(15 * GIB, 86_400, &midday).expect("a warning worth sending");
+        let forecast =
+            disk_warning(15 * GIB, 86_400, false, &midday).expect("a warning worth sending");
         assert!(
             (forecast.gib_per_hour - 16.0 / 6.0).abs() < 0.01,
             "{forecast:?}"
@@ -868,29 +1175,32 @@ mod tests {
         );
         // A week at the same rate is not this afternoon's problem.
         let week = trend_of(0, 36 * GIB, 7 * 24 * hour, 20 * GIB);
-        assert!(disk_warning(15 * GIB, 86_400, &week).is_none());
+        assert!(disk_warning(15 * GIB, 86_400, false, &week).is_none());
         // Space recovered, so nothing is falling.
         let recovered = trend_of(0, 36 * GIB, 20 * hour, 40 * GIB);
-        assert!(disk_warning(15 * GIB, 86_400, &recovered).is_none());
+        assert!(disk_warning(15 * GIB, 86_400, false, &recovered).is_none());
         // Falling, but too slowly to reach the floor within the horizon.
         let slow = trend_of(0, 36 * GIB, 20 * hour, 35 * GIB);
-        assert!(disk_warning(15 * GIB, 86_400, &slow).is_none());
-        assert!(disk_warning(15 * GIB, 86_400 * 30, &slow).is_some());
+        assert!(disk_warning(15 * GIB, 86_400, false, &slow).is_none());
+        assert!(disk_warning(15 * GIB, 86_400 * 30, false, &slow).is_some());
         // A horizon of zero warns only once the floor is crossed, which the
         // forecast itself excludes.
-        assert!(disk_warning(15 * GIB, 0, &midday).is_none());
+        assert!(disk_warning(15 * GIB, 0, false, &midday).is_none());
         // Two readings minutes apart do not describe a rate.
         let brief = trend_of(0, 36 * GIB, 60_000, 20 * GIB);
-        assert!(disk_warning(15 * GIB, 86_400 * 30, &brief).is_none());
+        assert!(disk_warning(15 * GIB, 86_400 * 30, false, &brief).is_none());
     }
 
+    /// A two-reading trend, slope taken between the two.
     fn trend_of(from_ms: i64, from: u64, to_ms: i64, to: u64) -> DiskTrend {
+        let hours = (to_ms - from_ms) as f64 / 3_600_000.0;
         DiskTrend {
             path: "/data".into(),
             from_ms,
             from_free_bytes: from,
             to_ms,
             to_free_bytes: to,
+            bytes_per_hour: (to as f64 - from as f64) / hours,
         }
     }
 

@@ -1405,52 +1405,76 @@ fn a_job_declares_disk_demand_and_admission_counts_it() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
     let other = fixture.home("other", 0);
-    let free = ok(&home, "resource.status", json!({}))["host"]["disk_available_bytes"]
-        .as_u64()
-        .unwrap();
-    // Whatever this machine has free, give the floor all but a gigabyte, so
-    // every admitted job here leaves half that headroom spare.
-    let gib = 1024 * 1024 * 1024;
-    let headroom = gib.min(free / 4);
-    let floor = free - headroom;
+    let status = ok(&home, "resource.status", json!({}));
+    let free = status["host"]["disk_available_bytes"].as_u64().unwrap();
+    let total = status["host"]["disk_total_bytes"].as_u64().unwrap();
+    // Margins are fractions of what is free now, so the ordinary writes of
+    // other work on the machine move them little: a holding job takes half,
+    // and a job that wants three quarters more than what is left is refused.
+    let default_disk = free / 2;
     ok(
         &home,
         "resource.configure",
-        json!({"min_free_disk_bytes":floor,"heavy_estimate":{"disk_bytes":8*gib,"memory_bytes":0},
-            "max_heavy_jobs":null}),
+        json!({"min_free_disk_bytes":0,"heavy_estimate":{"disk_bytes":default_disk,"memory_bytes":0},
+            "max_heavy_jobs":null,"max_load_per_cpu":1024.0}),
     );
-    // A heavy job declares the heavy default by default, so it does not fit
-    // in a gigabyte of headroom, and the refusal says what it wanted.
-    let refused = heavy_job(&home, "heavy-hungry", json!({}));
-    assert!(!refused.status.success());
-    let error = String::from_utf8_lossy(&refused.stderr);
-    assert!(error.contains("disk available"), "{error}");
-    assert!(error.contains("declared by running jobs"), "{error}");
-    assert!(error.contains("this one declares 8192 MiB"), "{error}");
-    // A light job without an estimate needs only the floor, and runs.
+    // A light job without an estimate needs no disk, and runs.
     start_light(&home, "light", &["true"]);
-    // A job may declare what it will really write, in either direction.
-    let modest = heavy_job(
-        &other,
-        "modest",
-        json!({"estimate":{"disk_bytes":headroom/4}}),
+    // A job that never says whether it is heavy is heavy for CPU and memory
+    // but declares no disk, so it reserves none.
+    let plain = run(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"plain","command":["sleep","30"]}),
     );
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    wait(&home, "plain", &["running"]);
+    let plain_held = ok(&home, "resource.status", json!({}))["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"] == "plain")
+        .cloned()
+        .unwrap();
+    assert_eq!(plain_held["demand"]["disk_bytes"], 0);
+    ok(&home, "job.cancel", json!({"id":"plain"}));
+    let freed = Instant::now() + Duration::from_secs(10);
+    while ok(&home, "resource.status", json!({}))["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["job_id"] == "plain")
+    {
+        assert!(
+            Instant::now() < freed,
+            "the cancelled job kept its reservation"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    // A job may declare what it will really write, in either direction.
+    let modest = heavy_job(&other, "modest", json!({"estimate":{"disk_bytes":free/4}}));
     assert!(
         modest.status.success(),
         "{}",
         String::from_utf8_lossy(&modest.stderr)
     );
     ok(&other, "job.cancel", json!({"id":"modest"}));
-    let greedy = heavy_job(&other, "greedy", json!({"estimate":{"disk_bytes":free*2}}));
-    assert!(!greedy.status.success());
-    assert!(String::from_utf8_lossy(&greedy.stderr).contains("this one declares"));
+    // More than the whole disk can never fit, so it is refused at once with
+    // a reason that says so, not queued behind the others.
+    let never = heavy_job(&other, "never", json!({"estimate":{"disk_bytes":total+1}}));
+    assert!(!never.status.success());
+    assert!(String::from_utf8_lossy(&never.stderr).contains("never fits"));
     // Disk a running job holds counts against the next one, in another home,
     // for as long as that job runs.
     let holding = run(
         &home,
         "job.start",
         json!({"task_id":"task","id":"holding","command":["sleep","30"],"heavy":true,
-            "estimate":{"disk_bytes":headroom/2}}),
+            "estimate":{"disk_bytes":free/2}}),
     );
     assert!(
         holding.status.success(),
@@ -1467,11 +1491,11 @@ fn a_job_declares_disk_demand_and_admission_counts_it() {
         .iter()
         .find(|r| r["job_id"] == "holding")
         .unwrap();
-    assert_eq!(held["demand"]["disk_bytes"], headroom / 2);
+    assert_eq!(held["demand"]["disk_bytes"], free / 2);
     let behind = heavy_job(
         &other,
         "behind",
-        json!({"estimate":{"disk_bytes":headroom*3/4}}),
+        json!({"estimate":{"disk_bytes":free*3/4}}),
     );
     assert!(!behind.status.success());
     assert!(String::from_utf8_lossy(&behind.stderr).contains("declared by running jobs"));
@@ -1491,11 +1515,7 @@ fn a_job_declares_disk_demand_and_admission_counts_it() {
         );
         thread::sleep(Duration::from_millis(100));
     }
-    let after = heavy_job(
-        &other,
-        "after",
-        json!({"estimate":{"disk_bytes":headroom/2}}),
-    );
+    let after = heavy_job(&other, "after", json!({"estimate":{"disk_bytes":free/2}}));
     assert!(
         after.status.success(),
         "{}",
@@ -1506,11 +1526,11 @@ fn a_job_declares_disk_demand_and_admission_counts_it() {
     ok(
         &home,
         "resource.configure",
-        json!({"heavy_estimate":{"disk_bytes":8*gib,"memory_bytes":0},"disk_warn_horizon_secs":0}),
+        json!({"heavy_estimate":{"disk_bytes":default_disk,"memory_bytes":0},"disk_warn_horizon_secs":0}),
     );
     assert_eq!(
         ok(&home, "resource.status", json!({}))["settings"]["heavy_estimate"]["disk_bytes"],
-        8 * gib
+        default_disk
     );
     assert_eq!(
         ok(&home, "resource.status", json!({}))["settings"]["disk_warn_horizon_secs"],

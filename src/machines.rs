@@ -424,7 +424,9 @@ const LONG_WAIT_MS: i64 = 600_000;
 const LONG_BACKOFF_MS: i64 = 1_800_000;
 
 /// The machine's problems right now, each with a stable key and a sentence.
-fn host_problems(store: &Store) -> Result<Vec<(String, String)>> {
+/// `raised` holds the keys already raised, which the falling-space warning
+/// reads its hysteresis from.
+fn host_problems(store: &Store, raised: &[String]) -> Result<Vec<(String, String)>> {
     let mut problems = vec![];
     let ledger = crate::jobs::host_ledger(store)?;
     let settings = crate::admission::settings(&ledger)?;
@@ -432,6 +434,7 @@ fn host_problems(store: &Store) -> Result<Vec<(String, String)>> {
     let free = crate::admission::disk(store.home())?.0;
     let now = Store::now_ms();
     crate::admission::note_disk(&ledger, &disk_key, free, now)?;
+    let trend_raised = raised.iter().any(|key| key == "disk_trend");
     if free < settings.min_free_disk_bytes {
         problems.push((
             "disk_floor".into(),
@@ -441,12 +444,22 @@ fn host_problems(store: &Store) -> Result<Vec<(String, String)>> {
                 settings.min_free_disk_bytes / (1024 * 1024)
             ),
         ));
+        // The falling-space warning outlives the floor's arrival: it stays
+        // raised until the rate clears, so the floor alarm never comes with a
+        // "Cleared" for the warning in the same pass.
+        if trend_raised {
+            problems.push((
+                "disk_trend".into(),
+                "Free disk is still falling, under the floor alarm.".into(),
+            ));
+        }
     } else if let Some(forecast) = crate::admission::disk_trend(&ledger, &disk_key)?
         .as_ref()
         .and_then(|trend| {
             crate::admission::disk_warning(
                 settings.min_free_disk_bytes,
                 settings.disk_warn_horizon_secs,
+                trend_raised,
                 trend,
             )
         })
@@ -456,11 +469,11 @@ fn host_problems(store: &Store) -> Result<Vec<(String, String)>> {
         problems.push((
             "disk_trend".into(),
             format!(
-                "Free disk is falling: {} MiB now, {} MiB must stay free, and at the last {:.1} GiB per hour over the last {} hours the floor arrives in about {} hours. Propose a cleanup to the captain.",
+                "Free disk is falling: {} MiB now, {} MiB must stay free, and free space has fallen {:.1} GiB per hour over the last {:.1} hours, so the floor arrives in about {} hours. Propose a cleanup to the captain.",
                 free / (1024 * 1024),
                 settings.min_free_disk_bytes / (1024 * 1024),
                 forecast.gib_per_hour,
-                forecast.span_ms / 3_600_000,
+                forecast.span_ms as f64 / 3_600_000.0,
                 forecast.hours_to_floor.ceil().max(1.0) as i64
             ),
         ));
@@ -529,7 +542,11 @@ pub(crate) fn alert_owner(store: &Store) -> Value {
             json!({"name": ship}),
         )?;
         let duty = profile["first_mate"]["duty_task"].as_str().unwrap_or("");
-        let problems = host_problems(store)?;
+        let raised_before: Vec<String> = db
+            .prepare("SELECT key FROM machine_alerts")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let problems = host_problems(store, &raised_before)?;
         let tx = store.write_transaction()?;
         let mut statement = tx.prepare("SELECT key FROM machine_alerts")?;
         let raised: Vec<String> = statement
