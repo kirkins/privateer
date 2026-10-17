@@ -18,7 +18,7 @@ The version 1 manifest names an executable argv, bounded timeout and combined st
 
 Native adapters plan argv without shell interpolation. They use the user's installed harness and its existing authentication. Validation checks the command plan, not account login or model availability. No model is hardcoded. A plugin is trusted executable code, not a sandbox, and a native harness retains the privileges of its user.
 
-For opt-in Pi 1.2.0 **skills and supporting-script bundles**, see
+For opt-in Pi **skills and supporting-script bundles**, see
 [explicit tool bundles](../docs/tool-bundles.md). `tool_bundles` is a top-level
 first-mate/agent-start selection, never an inherited harness option. Omission
 keeps legacy ambient loading; explicit `[]` requests the limited fail-closed
