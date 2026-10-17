@@ -843,8 +843,17 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     );
     let errand = errand_settled(&mut fleet, &id);
     assert_eq!(errand["status"], "succeeded", "{errand}");
-    // It started from the focus's records, not the first mate's thread.
-    let prompt = fleet.prompts().pop().unwrap();
+    // It started from the focus's records, not the first mate's thread. The
+    // verdict mail may already have woken the first mate, so find the errand's.
+    let errand_prompt = |fleet: &Fleet, id: &str| {
+        let mark = format!("Errand {id}");
+        fleet
+            .prompts()
+            .into_iter()
+            .rfind(|p| p.contains(&mark))
+            .unwrap()
+    };
+    let prompt = errand_prompt(&fleet, &id);
     assert!(
         prompt.contains(&format!("Errand {id} for the ship infra")),
         "{prompt}"
@@ -870,7 +879,7 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     assert_eq!(again["mode"], "resume");
     let next = again["errand"].as_str().unwrap().to_owned();
     assert_eq!(errand_settled(&mut fleet, &next)["status"], "succeeded");
-    let prompt = fleet.prompts().pop().unwrap();
+    let prompt = errand_prompt(&fleet, &next);
     assert!(
         prompt.starts_with(&format!("Errand {next}, continuing on task:infra-repair")),
         "{prompt}"
