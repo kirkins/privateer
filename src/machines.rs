@@ -49,7 +49,42 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS machine_ships(machine TEXT NOT NULL, name TEXT NOT NULL,
            scope TEXT NOT NULL, PRIMARY KEY(machine, name));",
     )?;
+    // Columns added after the table was first created. Check and add them
+    // under the write lock so concurrent opens cannot both add one.
+    let migrate =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for (column, declaration) in [
+        ("next_contact_ms", "INTEGER"),
+        ("failures", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let present: bool = migrate.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('machines') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            migrate.execute_batch(&format!(
+                "ALTER TABLE machines ADD COLUMN {column} {declaration}"
+            ))?;
+        }
+    }
+    migrate.commit()?;
     Ok(())
+}
+
+/// Whether this registry has ever been linked with another machine, read
+/// without opening it for writing: a dispatcher pass in a fleet with no
+/// links never touches the registry.
+fn ever_linked(path: &std::path::Path) -> bool {
+    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='machines')",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// One linked machine as this registry records it. `collects`: this machine
@@ -509,7 +544,7 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
 pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
     let work = || -> Result<Vec<Value>> {
         let path = crate::fleet::registry_path()?;
-        if !path.is_file() {
+        if !path.is_file() || !ever_linked(&path) {
             return Ok(vec![]);
         }
         let conn = crate::fleet::registry()?;
@@ -763,5 +798,27 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "machine.collect" => collect_now(args.get("name").and_then(Value::as_str)),
         "machine.remove" => remove(required(&args, "name")?),
         _ => bail!("unknown machine command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_machines_table_from_an_earlier_build_gains_its_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE machines(name TEXT PRIMARY KEY,
+               role TEXT NOT NULL CHECK(role IN ('collects','collected')),
+               peer TEXT NOT NULL, known_as TEXT, added_ms INTEGER NOT NULL, refreshed_ms INTEGER);
+             INSERT INTO machines(name, role, peer, added_ms) VALUES('mac', 'collects', '{}', 1);",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        let listed = machines(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].next_contact_ms, listed[0].failures), (None, 0));
     }
 }
