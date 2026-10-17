@@ -60,7 +60,8 @@ pub struct Settings {
     pub max_load_per_cpu: f64,
     /// Keep at least this much memory available after admission.
     pub min_available_memory_bytes: u64,
-    /// Keep at least this much space free on the host root filesystem.
+    /// Keep at least this much space free on the filesystem a job or
+    /// workspace uses.
     pub min_free_disk_bytes: u64,
     /// Default estimate for heavy jobs; `cpus` absent means every CPU.
     pub heavy_estimate: Estimate,
