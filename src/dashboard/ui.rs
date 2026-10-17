@@ -3,7 +3,7 @@ use super::{
     captain::{Composer, Exchange, HistoryBinding, Mail},
     herdr,
     model::{Snapshot, Task, clean, count},
-    overview,
+    overview, voyage,
 };
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -87,7 +87,11 @@ pub struct App {
     pub focus_content: bool,
     pub compact: bool,
     pub ascii: bool,
+    /// Still voyage scene: water and sprites hold their first frame.
+    pub reduced: bool,
     pub demo: bool,
+    /// The voyage sea replaces the bridge body while open; `Some` since it opened.
+    pub voyage: Option<Instant>,
     pub notice: String,
     pub notice_shown: String,
     pub notice_at: Option<Instant>,
@@ -510,6 +514,12 @@ impl App {
     /// Actual bridge input path, also exercised by disposable-store behavior tests.
     /// Returns true only for an explicit focus request (the worker validates again).
     pub fn bridge_key(&mut self, key: KeyCode) -> bool {
+        if self.voyage.is_some() {
+            if matches!(key, KeyCode::Char('v') | KeyCode::Esc) {
+                self.voyage = None;
+            }
+            return false;
+        }
         if self.answer.is_some() {
             if self.mail_pending {
                 return false;
@@ -547,6 +557,11 @@ impl App {
         }
         match key {
             KeyCode::Char('i') => self.open_inbox(),
+            KeyCode::Char('v')
+                if !self.inbox_open && self.composer.is_none() && self.form.is_none() =>
+            {
+                self.voyage = Some(Instant::now());
+            }
             KeyCode::Esc | KeyCode::Home => self.select_ship(None),
             KeyCode::Tab if !self.inbox_open => {
                 self.needs_focus = !self.needs_focus;
@@ -573,7 +588,7 @@ impl App {
         false
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        if self.composer.is_some() || self.answer.is_some() {
+        if self.voyage.is_some() || self.composer.is_some() || self.answer.is_some() {
             return;
         }
         let point = Position::new(event.column, event.row);
@@ -876,7 +891,11 @@ impl App {
         ])
         .split(area);
         frame.render_widget(
-            Paragraph::new(if self.demo {
+            Paragraph::new(if self.voyage.is_some() && self.demo {
+                " PRIVATEER · voyage · DEMO / sample only · sea drawn from recorded state"
+            } else if self.voyage.is_some() {
+                " PRIVATEER · voyage · sea drawn from recorded state, not live health"
+            } else if self.demo {
                 " PRIVATEER · bridge · DEMO / sample only"
             } else {
                 " PRIVATEER · bridge · recorded facts, not live health"
@@ -887,7 +906,16 @@ impl App {
         let list_style = Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD);
-        if self.inbox_open {
+        if let Some(started) = self.voyage {
+            voyage::draw(
+                frame,
+                rows[1],
+                &self.snapshot,
+                started.elapsed(),
+                self.reduced,
+                self.ascii,
+            );
+        } else if self.inbox_open {
             let parts = Layout::vertical([
                 Constraint::Length((rows[1].height / 3).max(3)),
                 Constraint::Min(1),
@@ -1059,10 +1087,12 @@ impl App {
         .collect();
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(if self.inbox_open {
+                Line::from(if self.voyage.is_some() {
+                    "v / Esc: back to bridge · q quit"
+                } else if self.inbox_open {
                     "i history · Enter mark read · PgUp/PgDn scroll · Esc bridge · q quit"
                 } else {
-                    "↑↓ select · Tab Fleet/Needs · Enter focus/answer · i history · q quit"
+                    "↑↓ select · Tab Fleet/Needs · Enter focus/answer · i history · v voyage · q quit"
                 }),
                 Line::styled(
                     if self.mail_pending {

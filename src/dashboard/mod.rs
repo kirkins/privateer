@@ -9,6 +9,7 @@ pub use crate::herdr;
 pub mod model;
 pub mod overview;
 pub mod ui;
+pub mod voyage;
 
 pub mod command;
 pub mod mailbox;

@@ -1230,3 +1230,71 @@ fn short_terminals_keep_a_fleet_row_and_ascii_marks_empty_cells_and_long_names()
     assert!(!row.contains('·') && !row.contains('—'), "{row}");
     assert!(row.contains(" - "), "{row}");
 }
+
+#[test]
+fn v_opens_the_voyage_sea_and_esc_or_v_returns_to_the_bridge() {
+    use crossterm::event::KeyCode;
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        home_age: Some(0),
+        ..App::default()
+    };
+    let bridge = render(&mut app, 100, 30);
+    assert!(bridge.contains("v voyage"), "{bridge}");
+    assert!(app.voyage.is_none());
+
+    assert!(!app.bridge_key(KeyCode::Char('v')));
+    assert!(app.voyage.is_some());
+    let sea = render(&mut app, 100, 30);
+    assert!(sea.contains("PRIVATEER · voyage"), "{sea}");
+    assert!(sea.contains("v / Esc: back to bridge"), "{sea}");
+    assert!(!sea.contains("Needs you"), "{sea}");
+    // Keys do not reach the hidden bridge while the sea is open.
+    app.bridge_key(KeyCode::Down);
+    assert_eq!(app.selected, 0);
+
+    app.bridge_key(KeyCode::Esc);
+    assert!(app.voyage.is_none());
+    assert!(render(&mut app, 100, 30).contains("Needs you"));
+
+    app.bridge_key(KeyCode::Char('v'));
+    app.bridge_key(KeyCode::Char('v'));
+    assert!(app.voyage.is_none());
+}
+
+#[test]
+fn demo_voyage_keeps_the_sample_label() {
+    use crossterm::event::KeyCode;
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        demo: true,
+        home_age: Some(0),
+        ..App::default()
+    };
+    app.bridge_key(KeyCode::Char('v'));
+    let sea = render(&mut app, 100, 30);
+    assert!(sea.contains("voyage · DEMO / sample only"), "{sea}");
+}
+
+#[test]
+fn mouse_is_ignored_while_the_sea_is_open() {
+    use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        home_age: Some(0),
+        ..App::default()
+    };
+    render(&mut app, 100, 30);
+    app.bridge_key(KeyCode::Char('v'));
+    render(&mut app, 100, 30);
+    for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    assert_eq!(app.selected, 0);
+    assert!(app.voyage.is_some());
+}
