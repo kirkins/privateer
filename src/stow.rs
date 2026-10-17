@@ -311,7 +311,8 @@ fn resume(store: &Store) -> Result<Value> {
     let ledger = crate::jobs::host_ledger(store)?;
     ensure!(
         crate::jobs::stowed(&ledger)?.is_some(),
-        "this machine is not stowed; see `privateer stow status`"
+        "this machine is not stowed; if a linked machine is the one stowed, \
+         `privateer stow resume --all` lifts it first; see `privateer stow status`"
     );
     let holds = crate::machines::elsewhere("stow.status")?;
     resume_here(store, &holds)
@@ -332,8 +333,12 @@ fn resume_all(store: &Store) -> Result<Value> {
         hold.held = match crate::machines::stow_linked(&hold.name, "stow.resume") {
             Ok(_) => Some(false),
             Err(error) => {
+                // A resume that could not be asked lifts nothing, and a
+                // timeout can arrive after the other machine really lifted
+                // its hold. So the hold is unknown, never still stowed: the
+                // notice says so and the error travels with it.
                 hold.error = Some(format!("{error:#}"));
-                Some(true)
+                None
             }
         };
     }
@@ -366,6 +371,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         store.caller().require_operator(command)?;
         let name = name.as_str().context("machine must be a name")?;
         let mut out = crate::machines::stow_linked(name, command)?;
+        // That answer is the other machine's: its `this_machine` and its own
+        // linked machines describe that machine's fleet. Dropped rather than
+        // passed through, so no surface here can read the other machine's view
+        // as this one's. Ask for this machine's machines without naming one.
+        if let Some(answer) = out.as_object_mut() {
+            answer.remove("machines");
+            answer.remove("this_machine");
+        }
         out["machine"] = json!(name);
         return Ok(out);
     }

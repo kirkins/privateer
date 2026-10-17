@@ -716,7 +716,9 @@ pub(crate) fn elsewhere(command: &str) -> Result<Vec<Stow>> {
                 Ok(result) => Stow {
                     name: machine.name,
                     asked: true,
-                    held: Some(result["held"].as_bool().unwrap_or(false)),
+                    // A machine that answers without saying whether it is
+                    // stowed has not said it is running: keep it unknown.
+                    held: result["held"].as_bool(),
                     error: None,
                 },
                 Err(error) => Stow {

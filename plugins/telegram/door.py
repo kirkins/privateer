@@ -56,7 +56,7 @@ COMMANDS = [
     {"command": "to", "description": "Send to a ship, or pick one"},
     {"command": "status", "description": "What the fleet is doing"},
     {"command": "yolo", "description": "Fleet tool approvals: on, off or status"},
-    {"command": "stow", "description": "Checkpoint the fleet: stow, status or resume"},
+    {"command": "stow", "description": "Checkpoint this machine: stow, status or resume"},
     {"command": "afk", "description": "Away: hold mail, emergencies only"},
     {"command": "back", "description": "Back from away, with a summary"},
     {"command": "held", "description": "What was held while you were away"},
@@ -462,17 +462,20 @@ class Door:
             args["all"] = True
         out = self.runtime.call("stow", args)
         # A stow is one machine's: say which one, and which linked machines
-        # are still holding theirs.
+        # are still holding theirs. A named machine's answer carries no machines
+        # of its own, so this never shows another machine's view as ours.
         this = out.get("this_machine")
         subject = (f"the fleet on {words[0]}" if words
                    else f"this machine ({this})" if this else "this machine")
         held = [m["machine"] for m in out.get("machines") or [] if m.get("held") is True]
         unknown = [m["machine"] for m in out.get("machines") or [] if "held" in m and m.get("held") is None]
+        errors = {m["machine"]: m["error"] for m in out.get("machines") or [] if m.get("error")}
         machines = ""
         if held:
             machines += " Still stowed: " + ", ".join(held) + "."
         if unknown:
-            machines += " Unknown here: " + ", ".join(unknown) + "."
+            machines += (" Unknown here: " + ", ".join(unknown) + "."
+                         + self.why(errors, unknown))
         if action == "start":
             names = ", ".join(s["ship"] for s in out["ships"])
             self.say(f"🧳 Stowing {subject}: new jobs are held. Asked {names} to checkpoint.{machines} /stow status{' ' + words[0] if words else ''} shows who is done.")
@@ -483,7 +486,11 @@ class Door:
         elif not out.get("stow"):
             self.say(f"{subject[0].upper() + subject[1:]} has never been stowed.{machines}")
         else:
-            lines = [f"Stow on {words[0]}:"] if words else ([f"Stow on {this}:"] if this else [])
+            # The header names the machine asked about, and says when its hold
+            # is still on.
+            name = words[0] if words else this
+            held_here = " (held)" if out.get("held") else ""
+            lines = [f"Stow on {name}{held_here}:"] if name else []
             for ship in out["ships"]:
                 if ship.get("error"):
                     lines.append(f"{ship['ship']}: {ship['error']}")
@@ -494,12 +501,21 @@ class Door:
             if out.get("held"):
                 lines.append("Ready to update." if out.get("ready") else "Not ready yet.")
             else:
-                lines.append("This machine has resumed.")
+                # Name the machine: a hold is one machine's, and this sentence
+                # is about the one that was asked.
+                lines.append(f"{subject[0].upper() + subject[1:]} has resumed.")
             if held or unknown:
                 lines.append(f"Still stowed: {', '.join(held)}." if held else "")
-                lines.append(f"Unknown here: {', '.join(unknown)}." if unknown else "")
-                lines.append("/stow resume all lifts every linked machine, then this one.")
+                lines.append(f"Unknown here: {', '.join(unknown)}.{self.why(errors, unknown)}" if unknown else "")
+                if held and not everywhere:
+                    lines.append("/stow resume all lifts every linked machine, then this one.")
             self.say("\n".join(line for line in lines if line))
+
+    @staticmethod
+    def why(errors: dict, names: list) -> str:
+        """Why a hold is unknown, when the link said why."""
+        told = [f"{name}: {errors[name]}" for name in names if errors.get(name)]
+        return (" " + "; ".join(told)) if told else ""
 
     def cmd_to(self, rest: str, msg_id) -> None:
         if not rest:

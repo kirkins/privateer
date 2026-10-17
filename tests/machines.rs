@@ -768,6 +768,128 @@ fn a_resume_of_all_lifts_the_linked_machines_first() {
     );
 }
 
+/// `--machine NAME` speaks for that machine and no other: its answer names it
+/// and carries none of that machine's own view of the fleet, which here would
+/// be read as this machine's.
+#[test]
+fn a_named_machine_carries_only_that_machines_answer() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let mac_ssh = remote_ssh(&mac);
+    laptop.ship("upkeep");
+
+    let named = |command: &str| -> Value {
+        let args = json!({"machine": "mac"}).to_string();
+        let out = laptop.run("liaison", &[command, "--json", &args], Some(&mac_ssh));
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let status = named("stow.status");
+    assert_eq!(status["machine"], "mac", "{status}");
+    assert!(status.get("machines").is_none(), "{status}");
+    assert!(status.get("this_machine").is_none(), "{status}");
+
+    // The captain's terminal names the machine it is about, and lists no other
+    // machine's hold as this one's.
+    let shown = text(&laptop.run(
+        "liaison",
+        &["stow", "status", "--machine", "mac"],
+        Some(&mac_ssh),
+    ));
+    assert!(shown.contains("fleet on mac"), "{shown}");
+    for other in [
+        "still stowed",
+        "running again",
+        "unknown here",
+        "reaches this machine",
+    ] {
+        assert!(!shown.contains(other), "{shown} says {other}");
+    }
+
+    // Asked about itself, this machine still names both.
+    let ours = laptop.ok_over("liaison", "stow.status", json!({}), &mac_ssh);
+    assert_eq!(ours["this_machine"], json!("laptop"), "{ours}");
+    assert_eq!(
+        ours["machines"],
+        json!([{"machine": "mac", "asked": true, "held": false}]),
+        "{ours}"
+    );
+}
+
+/// A resume of every machine lifts what it can and says what it could not: a
+/// linked machine whose resume never came back is unknown here, never still
+/// stowed and never resumed, and the run does not report itself finished.
+#[test]
+fn a_resume_of_all_that_cannot_lift_a_linked_machine_does_not_claim_it_did() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    laptop.ship("upkeep");
+
+    // The Mac answers about its own hold, then drops the resume itself: a link
+    // that fails halfway is the case a notice must not turn into a claim.
+    let flaky = mac.root.join("flaky-ssh");
+    fs::write(
+        &flaky,
+        format!(
+            "#!/bin/sh\nfor argument do remote=$argument; done\ninput=$(cat)\n\
+             case \"$input\" in *stow.resume*) exit 255 ;; esac\n\
+             printf '%s\\n' \"$input\" | env HOME={root} PATH={root}/bin:/usr/bin:/bin \
+             PRIVATEER_FLEET={root}/fleet.sqlite PRIVATEER_RESOURCE_HOME={root}/ledger \
+             /bin/sh -c \"$remote\"\n",
+            root = mac.root.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&flaky, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        laptop
+            .run("liaison", &["stow", "--machine", "mac"], Some(&flaky))
+            .status
+            .success()
+    );
+    laptop.ok("liaison", "stow.start", json!({}));
+
+    let all = laptop.run("liaison", &["stow", "resume", "--all"], Some(&flaky));
+    assert!(
+        !all.status.success(),
+        "the run lifted no machine: {}",
+        text(&all)
+    );
+    let shown = text(&all);
+    assert!(shown.contains("mac: could not be reached"), "{shown}");
+    assert!(shown.contains("hold unknown here: mac"), "{shown}");
+    assert!(!shown.contains("mac: still stowed"), "{shown}");
+
+    // This machine's own hold did end; its ships hear that, and the Mac is
+    // named unknown rather than resumed or left holding.
+    let body = messages(&laptop, "upkeep", "notice")
+        .into_iter()
+        .last()
+        .map(|m| m["body"].as_str().unwrap_or("").to_owned())
+        .unwrap_or_default();
+    assert!(body.contains("resumed this machine (laptop)"), "{body}");
+    assert!(
+        body.contains("Linked machine mac could not be reached from here"),
+        "{body}"
+    );
+    assert!(!body.contains("is still stowed, so new jobs"), "{body}");
+
+    // A resume it never heard cannot have lifted the Mac's hold.
+    assert_eq!(
+        mac.ok("fitforge", "stow.status", json!({}))["held"],
+        true,
+        "the Mac is still stowed"
+    );
+    assert!(messages(&mac, "fitforge", "notice").is_empty());
+    // And the claim is checkable in the records before anyone repeats it.
+    let ours = laptop.ok_over("liaison", "stow.status", json!({}), &flaky);
+    let theirs = &ours["machines"][0];
+    assert_eq!(theirs["machine"], "mac", "{ours}");
+    assert_eq!(theirs["held"], true, "{ours}");
+    assert!(theirs.get("error").is_none(), "{ours}");
+}
+
 /// A machine that cannot be reached is named unknown, never resumed, and
 /// `--all` leaves its hold alone rather than claiming to have lifted it.
 #[test]
@@ -807,10 +929,15 @@ fn a_resume_that_cannot_reach_a_linked_machine_says_so() {
     );
     assert!(!body.contains("is still stowed, so new jobs"), "{body}");
 
-    // `--all` cannot lift what it cannot ask, and says what it did not.
+    // `--all` cannot lift what it cannot ask, and says it did not finish.
     laptop.ok("liaison", "stow.start", json!({}));
     let all = laptop.run("liaison", &["stow", "resume", "--all"], Some(&dead));
-    assert!(all.status.success(), "{}", text(&all));
+    assert!(!all.status.success(), "{}", text(&all));
+    assert!(
+        text(&all).contains("hold unknown here: mac"),
+        "{}",
+        text(&all)
+    );
     assert_eq!(
         mac.ok("fitforge", "stow.status", json!({}))["held"],
         true,

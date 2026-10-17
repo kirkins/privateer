@@ -744,7 +744,7 @@ onboarding happened until the conversation and runtime records support it.
     )
 }
 
-fn print_stow(action: &str, out: &Value) {
+fn print_stow(action: &str, out: &Value) -> Result<()> {
     let ships = out["ships"].as_array().cloned().unwrap_or_default();
     let name = |s: &Value| s["ship"].as_str().unwrap_or("").to_owned();
     // A linked machine's stow says which machine it describes; a plain one
@@ -761,7 +761,9 @@ fn print_stow(action: &str, out: &Value) {
     let flag = machine
         .map(|m| format!(" --machine {m}"))
         .unwrap_or_default();
-    // What each linked machine this one reaches says about its own hold.
+    // What each linked machine this one reaches says about its own hold. With
+    // no machine named these are this machine's own answers; a named machine's
+    // answer carries none, so one surface cannot show the other's fleet.
     let machines: Vec<Value> = out["machines"].as_array().cloned().unwrap_or_default();
     let print_machines = |hint: &str| {
         for one in &machines {
@@ -779,6 +781,24 @@ fn print_stow(action: &str, out: &Value) {
             println!("{hint}");
         }
     };
+    // A machine asked to lift its hold and not heard from again is left
+    // unknown: `resume --all` did not finish what it was asked to do.
+    let unknown_after_all: Vec<&str> = if out["all"] == true {
+        machines
+            .iter()
+            .filter(|m| m["held"] != Value::Bool(false))
+            .filter_map(|m| m["machine"].as_str())
+            .collect()
+    } else {
+        vec![]
+    };
+    let named_or_this = |s: &str| {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    };
     match action {
         "start" => {
             println!(
@@ -794,7 +814,7 @@ fn print_stow(action: &str, out: &Value) {
             println!("Follow it with `privateer stow status{flag}`.");
         }
         "resume" if out["stow"].is_null() => {
-            println!("{on} was not stowed.");
+            println!("{} was not stowed.", named_or_this(&on));
             print_machines(
                 "`privateer stow resume --all` lifts a linked machine's hold first, so no notice has to leave one still stowed.",
             );
@@ -809,7 +829,7 @@ fn print_stow(action: &str, out: &Value) {
             );
         }
         _ if out["stow"].is_null() => {
-            println!("{on} has never been stowed.");
+            println!("{} has never been stowed.", named_or_this(&on));
             print_machines("Resume a linked machine with `privateer stow resume --machine NAME`.");
         }
         _ => {
@@ -872,7 +892,18 @@ fn print_stow(action: &str, out: &Value) {
                 );
             }
         }
+    };
+    // An unknown hold after `--all` is a machine the operator asked to lift and
+    // never heard from again, so the run says it did not finish rather than
+    // reporting a fleet resumed.
+    if !unknown_after_all.is_empty() {
+        bail!(
+            "`privateer stow resume --all` could not lift every machine it reaches; \
+             hold unknown here: {}",
+            unknown_after_all.join(", ")
+        );
     }
+    Ok(())
 }
 
 fn print_mail(message: &Value) {
@@ -1618,7 +1649,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                 request["all"] = json!(true);
             }
             let out = crate::dispatch(&mut store, command, request)?;
-            print_stow(action, &out);
+            print_stow(action, &out)?;
         }
         "wakes" => {
             let wakes = crate::dispatch(&mut store, "wake.list", json!({"limit": 10}))?;

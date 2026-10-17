@@ -151,8 +151,8 @@ class Fleet:
         })
         self.homes = {}
 
-    def run(self, args, cwd=None, check=True):
-        out = subprocess.run([self.binary, *args], cwd=cwd or self.root, env=self.env,
+    def run(self, args, cwd=None, check=True, env=None):
+        out = subprocess.run([self.binary, *args], cwd=cwd or self.root, env=env or self.env,
                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
         if check and out.returncode != 0:
             raise AssertionError(f"{args}: {out.stderr}")
@@ -164,6 +164,35 @@ class Fleet:
         self.run(["init", "--ship", name, "--harness", "codex"] + (["--liaison"] if liaison else []),
                  cwd=folder)
         self.homes[name] = folder / ".privateer"
+
+    def other_machine(self, ship: str) -> str:
+        """A second machine holding one ship, linked over a local fake ssh."""
+        root = self.root / "mac"
+        (root / "bin").mkdir(parents=True)
+        codex = root / "bin" / "codex"
+        codex.write_text("#!/bin/sh\nexit 0\n")
+        codex.chmod(0o755)
+        folder = root / ship
+        folder.mkdir()
+        self.run(["init", "--ship", ship, "--harness", "codex"], cwd=folder,
+                 env={"HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                      "PRIVATEER_FLEET": str(root / "fleet.sqlite"), "PRIVATEER_SERVICE": "none",
+                      "PRIVATEER_RESOURCE_HOME": str(root / "ledger"),
+                      "PRIVATEER_PLUGINS": str(ROOT / "plugins")})
+        # Like OpenSSH, run the last argument as a shell command line, on the
+        # other machine's own home, fleet and PATH.
+        ssh = self.root / "mac-ssh"
+        ssh.write_text(f"#!/bin/sh\nfor argument do remote=$argument; done\n"
+                       f"exec env HOME={root} PATH={root / 'bin'}:/usr/bin:/bin"
+                       f" PRIVATEER_FLEET={root / 'fleet.sqlite'}"
+                       f" PRIVATEER_RESOURCE_HOME={root / 'ledger'} PRIVATEER_SERVICE=none"
+                       f" PRIVATEER_PLUGINS={ROOT / 'plugins'} /bin/sh -c \"$remote\"\n")
+        ssh.chmod(0o755)
+        self.env["PRIVATEER_SSH_EXECUTABLE"] = str(ssh)
+        self.run(["machine", "add", "mac", "test-host", "--executable", self.binary,
+                  "--remote-fleet", str(root / "fleet.sqlite"), "--as", "laptop"],
+                 cwd=self.homes["liaison"].parent)
+        return str(root)
 
     def call(self, ship: str, command: str, args: dict):
         out = self.run(["--home", str(self.homes[ship]), command, "--json", json.dumps(args)])
@@ -182,6 +211,9 @@ def main() -> int:
         fleet = Fleet(binary, root)
         fleet.ship("liaison", liaison=True)
         fleet.ship("ops")
+        # A linked machine, before the door starts: its stow is its own, and the
+        # door reaches it over the same link the captain does.
+        fleet.other_machine("macops")
 
         config = root / "telegram.toml"
         config.write_text(f'bot_token = "{TOKEN}"\nchat_id = "{CHAT}"\n'
@@ -271,6 +303,44 @@ def main() -> int:
                 if "Is the Mac still stowed?" in m["text"] and "· asked" in m["text"]])
             assert re.search(r"asked (just now|\d+ [smhd] ago)", reread[0]["text"]), reread[0]
             assert "reply to answer" in reread[0]["text"], reread[0]
+
+            # A stow names its machine. The Mac is linked (before the door
+            # starts, so its calls can reach it), and its hold is its own: this
+            # machine's status names it, a resume of one machine never speaks
+            # for the other, and each names the machine it is about.
+            def stow(command: str, marker: str) -> str:
+                # Only what arrives after this command counts, so an earlier
+                # reply that still says the same thing cannot answer for it.
+                before = len(telegram.sent())
+                telegram.message(command)
+                return wait_for(f"{command}: {marker}", lambda: [
+                    m for m in telegram.sent()[before:] if marker in m["text"]])[0]["text"]
+
+            never = stow("/stow status", "has never been stowed")
+            assert never.startswith("This machine (laptop) has never been stowed."), never
+            assert "Still stowed" not in never and "Unknown here" not in never, never
+            stowing = stow("/stow mac", "Stowing the fleet on mac")
+            assert "new jobs are held" in stowing and "macops to checkpoint" in stowing, stowing
+            stowed = stow("/stow", "Stowing this machine (laptop)")
+            assert "ops to checkpoint" in stowed, stowed
+            held = stow("/stow status", "(held)")
+            assert "Stow on laptop (held)" in held and "Still stowed: mac." in held, held
+            remote = stow("/stow status mac", "(held)")
+            assert remote.startswith("Stow on mac (held)") and "Not ready yet" in remote, remote
+            assert "Still stowed" not in remote and "laptop" not in remote, remote
+            resumed = stow("/stow resume", "Resumed this machine (laptop)")
+            assert "Still stowed: mac." in resumed, resumed
+            # Resuming this machine does not speak for the Mac: it is still held.
+            said = stow("/stow status mac", "(held)")
+            assert "Stow on mac (held)" in said and "has resumed" not in said, said
+            alone = stow("/stow status", "has resumed")
+            assert "This machine (laptop) has resumed." in alone, alone
+            assert "Still stowed: mac." in alone and "Stow on laptop:" in alone, alone
+            # `--all` lifts the linked machine first, so the notice leaves no
+            # machine named stowed, and it leaves nothing held behind it.
+            stow("/stow", "Stowing this machine (laptop)")
+            every = stow("/stow resume all", "Resumed this machine (laptop)")
+            assert "Still stowed" not in every and "Unknown here" not in every, every
 
             # Captain commands configure all ships without inference or settings edits.
             telegram.message("/yolo on", user=999)
