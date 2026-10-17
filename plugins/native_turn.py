@@ -333,16 +333,27 @@ def run(harness, argv):
                              env=native_environment(), bufsize=0)
     try:
         pending = bytearray()
+        omitted_updates = 0
         while chunk := child.stdout.read(65536):
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
             pending.extend(chunk)
             while b"\n" in pending:
                 line, _, pending = pending.partition(b"\n")
                 if len(line) > MAX_LINE:
                     raise ValueError("event-size")
                 if line.strip():
-                    turn.observe(json.loads(line))
+                    value = json.loads(line)
+                    turn.observe(value)
+                    if harness in ("pi", "pi-signed") and value.get("type") == "message_update":
+                        # Pi's snapshot repeats the full, growing assistant message.
+                        # It is useful to neither completion checks nor usage; omit
+                        # it from the capped job log, but keep parsing all native
+                        # terminal events and report how many snapshots were thinned.
+                        omitted_updates += 1
+                    else:
+                        sys.stdout.buffer.write(line + b"\n")
+                else:
+                    sys.stdout.buffer.write(line + b"\n")
+                sys.stdout.buffer.flush()
             if len(pending) > MAX_LINE:
                 raise ValueError("event-size")
         # A missing final LF is a truncated stream, not a completion fact.
@@ -362,10 +373,12 @@ def run(harness, argv):
                 projection_failed = True
         success = native_status == 0 and not pending and not projection_failed and turn.complete()
         if pending:
-            sys.stdout.buffer.write(b"\n")
+            sys.stdout.buffer.write(pending + b"\n")
             sys.stdout.buffer.flush()
         summary = {"type": "turn.completed" if success else "native.turn.failed",
                    "harness": harness, "session_id": turn.session, "native_exit_code": native_status}
+        if harness in ("pi", "pi-signed"):
+            summary["message_updates_omitted"] = omitted_updates
         if reconciled:
             summary["completion_source"] = "native-session-projection"
         if projection_failed:

@@ -79,6 +79,28 @@ raise SystemExit(int(os.environ['PI_TEST_EXIT']))
         self.assertEqual(record['route'], 'unchanged')
         self.assertIsNone(record['foreign'])
 
+    def test_repeated_message_updates_are_thinned_but_final_reply_and_usage_survive(self):
+        snapshot = {"type": "message_update", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "streaming snapshot " + "x" * 1800}]}}
+        events = [HEADER, *([snapshot] * 800),
+                  {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
+                   "content": [{"type": "text", "text": "final reply survives"}],
+                   "usage": {"input": 42, "output": 7}}}, SETTLED]
+        run = self.run_stream(events)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        stream_bytes = (self.root / "stream.jsonl").stat().st_size
+        self.assertGreater(stream_bytes, 1024 * 1024)
+        self.assertLess(len(run.stdout), 1024 * 1024)
+        lines = [json.loads(line) for line in run.stdout.splitlines()]
+        self.assertFalse(any(event.get("type") == "message_update" for event in lines))
+        final = next(event for event in lines if event.get("type") == "message_end")
+        self.assertEqual(final["message"]["content"][0]["text"], "final reply survives")
+        self.assertIn({"type": "agent_settled", "aborted": False}, lines)
+        summary = lines[-1]
+        self.assertEqual(summary["session_id"], HEADER["id"])
+        self.assertEqual(summary["usage"], {"input": 42, "output": 7})
+        self.assertEqual(summary["message_updates_omitted"], 800)
+
     def test_partial_aborted_and_unsettled_successes_stay_unconfirmed(self):
         for tail in ([assistant()], [assistant("length"),SETTLED],
                      [assistant("toolUse"),SETTLED], [assistant(),{"type":"agent_settled","aborted":True}],
