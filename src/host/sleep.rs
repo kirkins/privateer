@@ -2,10 +2,11 @@
 //! reported it idle for `first_mate.sleep_after_secs` (default 30 minutes; 0
 //! keeps it running) has its native harness stopped to free memory, while
 //! `start --hosted` keeps the pane, the ship's presence lease and its place in
-//! Herdr. New actionable
-//! mail, ready scheduled work or Enter in the pane starts the harness again on
-//! the same conversation. The dispatcher sees an attended, hosted ship
-//! throughout, so it neither opens another space nor starts a headless wake.
+//! Herdr, where the pane stays listed as the ship's agent, asleep. New
+//! actionable mail, ready scheduled work, Enter in the pane or the captain
+//! moving to it in Herdr starts the harness again on the same conversation.
+//! The dispatcher sees an attended, hosted ship throughout, so it neither
+//! opens another space nor starts a headless wake.
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
@@ -199,16 +200,44 @@ impl Terminal {
 pub(crate) fn rest(
     store: &Store,
     ship: &str,
+    harness: &str,
     asleep: &Asleep,
     terminal: &Terminal,
 ) -> Result<Option<&'static str>> {
-    use std::time::{Duration, Instant};
     terminal.restore();
     println!(
         "⚓ {ship}'s first mate is asleep to free memory. New mail or scheduled work wakes it.\n  Type a message and press Enter to mail it and wake the first mate, or just press Enter."
     );
+    // Herdr lists only panes it sees an agent in, so the sleeping pane keeps
+    // the ship in its agent list itself, where `herdr agent prompt` reaches
+    // the line reader below. Herdr's own detection takes over once woken.
+    let mut herdr =
+        crate::watch::Herdr::from_env(ship, harness, &format!("{ship} first mate · asleep"));
+    let woke = wait(store, ship, asleep, terminal, herdr.as_mut());
+    if let Some(herdr) = herdr.as_mut() {
+        herdr.release();
+    }
+    woke
+}
+
+fn wait(
+    store: &Store,
+    ship: &str,
+    asleep: &Asleep,
+    terminal: &Terminal,
+    mut herdr: Option<&mut crate::watch::Herdr>,
+) -> Result<Option<&'static str>> {
+    use std::time::{Duration, Instant};
     let mut keyboard = terminal.0.is_some();
     let mut refreshed = Instant::now();
+    let mut reported: Option<Instant> = None;
+    // Focus wakes it only when the captain moves to the pane: a pane that
+    // was focused as it fell asleep, or whose focus Herdr cannot report,
+    // waits for Enter.
+    let mut focused = herdr
+        .as_deref_mut()
+        .and_then(crate::watch::Herdr::focused)
+        .unwrap_or(true);
     loop {
         if refreshed.elapsed() >= Duration::from_secs(30) {
             refreshed = Instant::now();
@@ -219,6 +248,17 @@ pub(crate) fn rest(
         if let Some(reason) = alarm(store, ship, asleep)? {
             return Ok(Some(reason));
         }
+        if let Some(herdr) = herdr.as_deref_mut() {
+            if reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(20)) {
+                herdr.report("idle", &format!("{ship}: asleep · focus or Enter wakes it"));
+                reported = Some(Instant::now());
+            }
+            match herdr.focused() {
+                Some(true) if !focused => return Ok(Some("focus")),
+                Some(now) => focused = now,
+                None => {}
+            }
+        }
         // Poll rather than read on a thread, so no reader is left behind to
         // take the captain's first keys from the woken harness.
         let mut fd = libc::pollfd {
@@ -226,7 +266,7 @@ pub(crate) fn rest(
             events: libc::POLLIN,
             revents: 0,
         };
-        let wait_ms = if keyboard { 2_000 } else { 0 };
+        let wait_ms = if keyboard { 1_000 } else { 0 };
         if keyboard && unsafe { libc::poll(&mut fd, 1, wait_ms) } > 0 {
             let mut line = [0u8; 8192];
             let read = unsafe { libc::read(0, line.as_mut_ptr().cast(), line.len()) };
@@ -236,10 +276,10 @@ pub(crate) fn rest(
                 say(store, ship, typed.trim());
                 return Ok(Some("captain"));
             }
-            keyboard = false; // closed input: only mail and work wake it
+            keyboard = false; // closed input: only mail, work and focus wake it
         }
         if !keyboard {
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 }

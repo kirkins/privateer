@@ -1097,7 +1097,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 if let Some(lease) = hosted_lease.as_mut() {
                     lease.holder.clone_from(&holder);
                 }
-                let Some(reason) = crate::host::sleep::rest(&store, &ship, &asleep, &terminal)?
+                let Some(reason) =
+                    crate::host::sleep::rest(&store, &ship, &harness, &asleep, &terminal)?
                 else {
                     std::process::exit(0);
                 };

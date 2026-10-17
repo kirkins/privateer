@@ -308,6 +308,8 @@ struct Herdr {
     #[cfg(feature = "dashboard")]
     creating: Arc<AtomicBool>,
     reject_caption: Arc<AtomicBool>,
+    /// The pane the captain's client has focused.
+    focus: Arc<Mutex<Option<String>>>,
 }
 
 impl Herdr {
@@ -325,6 +327,8 @@ impl Herdr {
         let reject_create = Arc::new(AtomicBool::new(false));
         let suppress_input = Arc::new(AtomicBool::new(false));
         let reject_caption = Arc::new(AtomicBool::new(false));
+        let focus = Arc::new(Mutex::new(None::<String>));
+        let focused = focus.clone();
         let reject_label = reject_caption.clone();
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
@@ -386,7 +390,8 @@ impl Herdr {
                 }
                 let result = match request["method"].as_str().unwrap_or("") {
                     "session.snapshot" => {
-                        json!({"snapshot":{"version":"test","protocol":20,"panes":*live.lock().unwrap()}})
+                        json!({"snapshot":{"version":"test","protocol":20,"panes":*live.lock().unwrap(),
+                            "focused_pane_id":*focused.lock().unwrap()}})
                     }
                     "workspace.create" => {
                         #[cfg(feature = "dashboard")]
@@ -491,6 +496,7 @@ impl Herdr {
             #[cfg(feature = "dashboard")]
             creating,
             reject_caption,
+            focus,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -1617,40 +1623,54 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
 }
 
 #[test]
-fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_wakes_it() {
+fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
     let place = Place::new();
     let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
     first_mate["sleep_after_secs"] = json!(1);
     place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
     let (place, herdr) = hosted(place);
-    let pid = place.native_pid();
-    let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
-    let holder = env.trim().split_once(' ').unwrap().1.to_owned();
-
-    // Its mail adapter reports it idle for longer than sleep_after_secs.
-    let idle = json!({"ship":"infra","holder":holder,"idle":true});
-    place.agent("work.poll", idle.clone());
-    std::thread::sleep(Duration::from_millis(1100));
-    place.agent("work.poll", idle);
-    until(
-        "the idle native payload to exit",
-        || unsafe { libc::kill(pid, 0) } == -1,
-    );
-    for file in ["pi-pid", "pi-env", "pi-argv"] {
-        fs::remove_file(place.root.join(file)).unwrap();
-    }
+    // Its adapter reports it idle for longer than sleep_after_secs; the
+    // native payload itself exits.
+    let sleep = |place: &Place| -> String {
+        let pid = place.native_pid();
+        let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
+        let holder = env.trim().split_once(' ').unwrap().1.to_owned();
+        let idle = json!({"ship":"infra","holder":holder,"idle":true});
+        place.agent("work.poll", idle.clone());
+        std::thread::sleep(Duration::from_millis(1100));
+        place.agent("work.poll", idle);
+        until(
+            "the idle native payload to exit",
+            || unsafe { libc::kill(pid, 0) } == -1,
+        );
+        for file in ["pi-pid", "pi-env", "pi-argv"] {
+            fs::remove_file(place.root.join(file)).unwrap();
+        }
+        holder
+    };
+    let holder = sleep(&place);
 
     // Asleep, the pane keeps the ship's hosted lease under a new holder, so
-    // the dispatcher neither opens another space nor wakes it headless.
+    // the dispatcher neither opens another space nor wakes it headless, and
+    // it keeps the ship in Herdr's agent list, asleep.
     let lease = place.json("ship.presence", json!({"ship":"infra"}));
     let asleep = lease["lease"]["holder"].as_str().unwrap().to_owned();
     assert!(asleep.starts_with("host:") && asleep != holder, "{lease}");
     assert_eq!(place.tick()["skipped"], "its live first mate has the mail");
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     assert_eq!(place.wakes(), 0);
+    until("the asleep report", || {
+        herdr.calls("pane.report_agent").iter().any(|call| {
+            call["params"]["pane_id"] == "w2:p1"
+                && call["params"]["state"] == "idle"
+                && call["params"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("asleep"))
+        })
+    });
 
     // Mail wakes it in the same pane, on the same conversation, as the
-    // session the lease now names.
+    // session the lease now names, and hands the pane back to detection.
     place.json(
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
@@ -1660,8 +1680,21 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_wakes_it() {
     assert_eq!(env.trim(), format!("1 {asleep}"));
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
     assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert!(!herdr.calls("pane.release_agent").is_empty());
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     assert_eq!(place.wakes(), 0);
+
+    // Asleep again, the captain moving to its pane wakes it.
+    *herdr.focus.lock().unwrap() = Some("w1:p1".into());
+    sleep(&place);
+    until("the asleep report", || {
+        herdr.calls("pane.report_agent").len() >= 2
+    });
+    *herdr.focus.lock().unwrap() = Some("w2:p1".into());
+    until("the harness woken by focus", || {
+        place.root.join("pi-env").exists()
+    });
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
     place.stop_native("infra");
 }
 

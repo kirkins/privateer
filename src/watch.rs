@@ -621,7 +621,7 @@ fn state(store: &Store, ship: &str, latest: Option<&WakeRow>) -> Result<(&'stati
 }
 
 /// This pane's Herdr identity, when running inside Herdr.
-struct Herdr {
+pub(crate) struct Herdr {
     socket: PathBuf,
     client: Option<crate::herdr::Client>,
     pane: String,
@@ -631,7 +631,7 @@ struct Herdr {
 }
 
 impl Herdr {
-    fn from_env(ship: &str, harness: &str, title: &str) -> Option<Self> {
+    pub(crate) fn from_env(ship: &str, harness: &str, title: &str) -> Option<Self> {
         if std::env::var("HERDR_ENV").ok().as_deref() != Some("1") {
             return None;
         }
@@ -648,7 +648,7 @@ impl Herdr {
     }
 
     /// Best effort: a Herdr restart or refusal never stops the watch.
-    fn report(&mut self, state: &str, message: &str) {
+    pub(crate) fn report(&mut self, state: &str, message: &str) {
         let result = (|| -> Result<()> {
             if self.client.is_none() {
                 self.client = Some(crate::herdr::Client::connect(&self.socket)?);
@@ -668,7 +668,22 @@ impl Herdr {
         }
     }
 
-    fn release(&mut self) {
+    /// Whether the captain has this pane focused; None when Herdr cannot say.
+    pub(crate) fn focused(&mut self) -> Option<bool> {
+        if self.client.is_none() {
+            self.client = crate::herdr::Client::connect(&self.socket).ok();
+        }
+        let result = self.client.as_mut()?.focused_pane();
+        match result {
+            Ok(pane) => pane.map(|pane| pane == self.pane),
+            Err(_) => {
+                self.client = None;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn release(&mut self) {
         if let Some(client) = self.client.as_mut() {
             let _ = client.release_agent(&self.pane, &self.agent);
         }
