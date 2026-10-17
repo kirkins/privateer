@@ -1593,7 +1593,14 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
     assert!(!args.contains(&"--continue"), "{argv}");
     place.stop_native("infra");
 
-    let folder = place.folder.to_str().unwrap().replace(['/', '.'], "-");
+    // Claude's own naming: every character but a letter or digit is a dash.
+    let folder: String = place
+        .folder
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     let transcripts = place.root.join(".claude/projects").join(folder);
     fs::create_dir_all(&transcripts).unwrap();
     fs::write(transcripts.join("session.jsonl"), "{}\n").unwrap();
