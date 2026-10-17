@@ -12,10 +12,10 @@
 //!
 //! Native adapters do not all use Pi's `message_end` shape. OpenCode V1
 //! reports a failed turn as a final `type:"error"` event (`error.data.message`)
-//! rather than an assistant `message_end`, so those errors are read too. A
-//! free-allowance exhaustion backs the route off until the reset it states
-//! (or about a day when it says nothing); an ordinary throttle keeps the short
-//! doubling window.
+//! rather than an assistant `message_end`, so those errors are read too, as is
+//! Gemini's `type:"error"`, which carries its text in a top-level `message` and
+//! marks a non-fatal notice `severity:"warning"`, and its terminal
+//! `type:"result"`, whose `status` and `error` say how the run ended.
 //!
 //! Claude Code states its own limits: every stream carries a
 //! `rate_limit_event` whose `status` is `rejected` once a plan window is
@@ -24,6 +24,16 @@
 //! account, so they back off every route on that harness and provider, not
 //! just the model that ran. A failed `result` (`is_error`) is read as text
 //! like any other error.
+//!
+//! A stated reset is honored wherever it appears, not only for a free
+//! allowance. Gemini's five-hour and weekly limits say when they reopen; so do
+//! an HTTP `retry-after` and an ISO deadline in a throttle's text. A throttle
+//! that states one holds its route until then, and the short doubling window
+//! only ever raises that floor, so a stated reset can lengthen the backoff but
+//! never shorten it. A free allowance that says nothing still parks a route for
+//! about a day. A hint read out of free text can be misread, so one longer
+//! than any real window is refused rather than clamped, and the failure falls
+//! back to its own schedule instead of parking a route for days.
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -31,11 +41,11 @@ use serde_json::{Value, json};
 
 const FIRST_BACKOFF_MS: i64 = 30_000;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
+/// A free allowance that states no reset lasts about a day.
 const FREE_ALLOWANCE_BACKOFF_MS: i64 = 24 * 60 * 60_000;
-/// A stated reset is read from free text; never trust one past two days, so a
-/// misread hint cannot park a route for longer than an allowance can last.
-const MAX_FREE_ALLOWANCE_BACKOFF_MS: i64 = 2 * FREE_ALLOWANCE_BACKOFF_MS;
-/// A structured reset (Claude's `resetsAt`) may be a weekly window away.
+/// The longest reset a route is ever parked for: a weekly window, plus slack.
+/// A structured reset (Claude's `resetsAt`) is clamped to it, because the
+/// harness stated it; a reset read out of free text is refused past it.
 const MAX_STATED_RESET_MS: i64 = 8 * FREE_ALLOWANCE_BACKOFF_MS;
 /// Claude windows that cover the whole account rather than one model.
 const ACCOUNT_WINDOWS: [&str; 2] = ["five_hour", "seven_day"];
@@ -147,6 +157,7 @@ fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
         ("hour", 3_600_000_i64),
         ("hr", 3_600_000),
         ("day", 86_400_000),
+        ("week", 604_800_000),
         ("minute", 60_000),
         ("min", 60_000),
         ("second", 1000),
@@ -232,15 +243,32 @@ fn classify(log: &str) -> Option<RouteFailure> {
             if let Some(text) = event["result"].as_str().filter(|text| !text.is_empty()) {
                 native_error = Some(text.to_owned());
             }
+        } else if event["type"] == "result"
+            && event["status"].is_string()
+            && (event["status"] != "success" || !event["error"].is_null())
+        {
+            // Gemini ends a run with a result event whose status and error say
+            // how it went; a successful one is never a throttle.
+            let text = event["error"]["message"]
+                .as_str()
+                .or_else(|| event["error"].as_str())
+                .or_else(|| event["result"].as_str())
+                .filter(|text| !text.is_empty());
+            if let Some(text) = text {
+                native_error = Some(text.to_owned());
+            }
         } else if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
             last = Some(event["message"].clone());
-        } else if event["type"] == "error" {
-            // Native adapters (OpenCode V1) report a failed turn as a final
-            // error event instead of Pi's assistant message_end.
+        } else if event["type"] == "error" && event["severity"] != "warning" {
+            // Native adapters (OpenCode V1, Gemini) report a failed turn as a
+            // final error event instead of Pi's assistant message_end. Gemini
+            // keeps the text in a top-level message, and a notice it marks as a
+            // warning did not end the run, so it says nothing about the route.
             let text = event["error"]["data"]["message"]
                 .as_str()
                 .or_else(|| event["error"]["message"].as_str())
                 .or_else(|| event["error"].as_str())
+                .or_else(|| event["message"].as_str())
                 .map(str::to_owned);
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 native_error = Some(text);
@@ -300,8 +328,10 @@ fn classify(log: &str) -> Option<RouteFailure> {
         .any(|sign| lower.contains(sign));
     throttled.then(|| RouteFailure {
         error: error.chars().take(200).collect(),
-        reset_ms: reset_delay_ms(&error, Store::now_ms())
-            .map(|ms| ms.min(MAX_FREE_ALLOWANCE_BACKOFF_MS)),
+        // A hint read out of free text can be misread, so one past any real
+        // window is refused rather than clamped: the failure then falls back to
+        // its own schedule instead of parking its route for days.
+        reset_ms: reset_delay_ms(&error, Store::now_ms()).filter(|ms| *ms <= MAX_STATED_RESET_MS),
         allowance: free_allowance,
         account: false,
     })
@@ -352,16 +382,20 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
                 .optional()?
                 .unwrap_or(0)
                 + 1;
-            let backoff = if failure.allowance {
-                failure
-                    .reset_ms
-                    .unwrap_or(FREE_ALLOWANCE_BACKOFF_MS)
-                    .min(MAX_STATED_RESET_MS)
-            } else {
-                FIRST_BACKOFF_MS
-                    .saturating_mul(1i64 << (failures - 1).min(10))
-                    .min(MAX_BACKOFF_MS)
-            };
+            let short = FIRST_BACKOFF_MS
+                .saturating_mul(1i64 << (failures - 1).min(10))
+                .min(MAX_BACKOFF_MS);
+            // A stated reset is the provider's own word on when to try again, so
+            // it holds the route until then however plain the throttle looks;
+            // the doubling only ever raises that floor, never lowers it. With no
+            // stated reset a spent free allowance still lasts a full window and
+            // an ordinary throttle keeps doubling.
+            let backoff = match (failure.reset_ms, failure.allowance) {
+                (Some(reset), _) => reset.max(short),
+                (None, true) => FREE_ALLOWANCE_BACKOFF_MS,
+                (None, false) => short,
+            }
+            .min(MAX_STATED_RESET_MS);
             conn.execute(
                 "INSERT INTO model_routes(route, failures, until_ms, last_error, updated_ms)
                  VALUES(?1, ?2, ?3, ?4, ?5)
@@ -493,17 +527,18 @@ mod tests {
             .unwrap();
         assert!((until - Store::now_ms() - FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
 
-        // A misread hint (here, an epoch years away) parks the route two days at most.
+        // A misread hint (here, seconds for what reads like an epoch) is refused
+        // rather than trusted, so the route falls back to a full allowance window.
         let misread = classify(&error_log(
             "Free usage limit exceeded; retry-after: 99999999999",
         ))
         .unwrap();
-        assert_eq!(misread.reset_ms, Some(MAX_FREE_ALLOWANCE_BACKOFF_MS));
+        assert_eq!(misread.reset_ms, None);
         record(&conn, "opencode/-/space-bunny-free", Some(&misread)).unwrap();
         let until: i64 = conn
             .query_row("SELECT until_ms FROM model_routes", [], |r| r.get(0))
             .unwrap();
-        assert!((until - Store::now_ms() - MAX_FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
+        assert!((until - Store::now_ms() - FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
     }
 
     #[test]
@@ -639,21 +674,145 @@ mod tests {
     }
 
     #[test]
-    fn agy_result_quota_error_is_a_short_throttle() {
+    fn agy_result_quota_error_throttles_its_own_model_until_its_stated_reset() {
         let failure = classify(&agy_result_log(
             "ERROR",
             "429 quota exceeded; retry-after: 120",
         ))
         .unwrap();
-        // Not a stated free allowance, so it keeps the doubling schedule (record ignores
-        // the reset hint unless the failure is an allowance) and covers only its model.
+        // Not a stated free allowance and not an account window, so it covers only
+        // its own model; the two minutes it states hold the route past the first step.
         assert!(!failure.allowance && !failure.account);
         assert_eq!(failure.reset_ms, Some(120_000));
+
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        record(&conn, "agy/-/muse-max", Some(&failure)).unwrap();
+        assert!((parked_ms(&conn) - 120_000).abs() < 100);
     }
 
     #[test]
     fn agy_result_non_throttle_errors_and_successes_are_ignored() {
         assert!(classify(&agy_result_log("ERROR", "permission denied")).is_none());
         assert!(classify(&agy_result_log("SUCCESS", "429 quota in the reply text")).is_none());
+    }
+
+    /// A pause of this many milliseconds, read back from the ledger.
+    fn parked_ms(conn: &Connection) -> i64 {
+        let until: i64 = conn
+            .query_row("SELECT until_ms FROM model_routes", [], |r| r.get(0))
+            .unwrap();
+        until - Store::now_ms()
+    }
+
+    #[test]
+    fn a_stated_reset_holds_a_plain_throttle_until_the_provider_reopens() {
+        // Gemini's five-hour and weekly limits are not phrased as a free
+        // allowance, and they say when they reopen. That stated reset, not the
+        // fifteen-minute cap, is what holds the route.
+        let five_hour = classify(&error_log(
+            "429 RESOURCE_EXHAUSTED: rate limit exceeded; resets in 5 hours",
+        ))
+        .unwrap();
+        assert!(!five_hour.allowance && !five_hour.account);
+        let weekly = classify(&error_log(
+            "429 RESOURCE_EXHAUSTED: weekly quota exceeded; resets in 1 week",
+        ))
+        .unwrap();
+        assert!(!weekly.allowance);
+        assert_eq!(weekly.reset_ms, Some(7 * 86_400_000));
+
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let route = "gemini/-/gemini-flash";
+        record(&conn, route, Some(&five_hour)).unwrap();
+        assert!((parked_ms(&conn) - 5 * 3_600_000).abs() < 2000);
+        record(&conn, route, Some(&weekly)).unwrap();
+        assert!((parked_ms(&conn) - 7 * 86_400_000).abs() < 2000);
+
+        // An absolute deadline past a real window is refused, so the route keeps
+        // the short schedule instead of being parked for years.
+        let absurd = classify(&error_log(
+            "429 rate limit exceeded; resets at 2100-01-01T00:00:00Z",
+        ))
+        .unwrap();
+        assert_eq!(absurd.reset_ms, None);
+        conn.execute("UPDATE model_routes SET failures=0", [])
+            .unwrap();
+        record(&conn, route, Some(&absurd)).unwrap();
+        assert!((parked_ms(&conn) - FIRST_BACKOFF_MS).abs() < 100);
+
+        // A later success on the route clears it, as for any throttle.
+        record(&conn, route, None).unwrap();
+        assert!(blocked(&conn, route).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_stated_reset_never_shortens_a_backoff_that_already_grew() {
+        let failure = classify(&error_log("429 quota exceeded; retry-after: 60")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        record(&conn, "gemini/-/gemini-flash", Some(&failure)).unwrap();
+        // Repeated failures have already reached the cap; a minute the provider
+        // stated must not hand the route back earlier than the cap does.
+        conn.execute("UPDATE model_routes SET failures=20", [])
+            .unwrap();
+        record(&conn, "gemini/-/gemini-flash", Some(&failure)).unwrap();
+        assert!((parked_ms(&conn) - MAX_BACKOFF_MS).abs() < 100);
+    }
+
+    fn gemini_error_log(severity: &str, message: &str) -> String {
+        serde_json::to_string(&json!({
+            "type":"error","timestamp":1,"severity":severity,"message":message
+        }))
+        .unwrap()
+    }
+
+    fn gemini_result_log(status: &str, error: Option<Value>) -> String {
+        serde_json::to_string(&json!({
+            "type":"result","session_id":"4fa4f4bc-5b2d-4553-8ae1-eb09e501ea63",
+            "status":status,"error":error
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn gemini_errors_are_read_from_their_own_event_shape() {
+        // Gemini keeps the text in a top-level message, so a rate limit there
+        // backs the route off instead of passing as an ordinary failure.
+        let throttle = classify(&gemini_error_log(
+            "error",
+            "429 Too Many Requests. Gemini Flash quota exceeded; resets in 5 hours",
+        ))
+        .unwrap();
+        assert_eq!(throttle.reset_ms, Some(5 * 3_600_000));
+        assert!(!throttle.allowance && !throttle.account);
+
+        // A notice Gemini marks as a warning did not end the run.
+        assert!(
+            classify(&gemini_error_log(
+                "warning",
+                "429 quota exceeded; resets in 5 hours"
+            ))
+            .is_none()
+        );
+
+        // Its terminal result says how the run ended, and a success is not one.
+        let result = classify(&gemini_result_log(
+            "error",
+            Some(json!({"type":"ApiError","message":"429 rate limit exceeded; resets in 2 hours"})),
+        ))
+        .unwrap();
+        assert_eq!(result.reset_ms, Some(2 * 3_600_000));
+        assert!(classify(&gemini_result_log("success", None)).is_none());
+        assert!(classify(&gemini_result_log("error", None)).is_none());
+        // An error alongside a success status still failed the run.
+        assert!(
+            classify(&gemini_result_log(
+                "success",
+                Some(json!("429 quota exceeded"))
+            ))
+            .is_some()
+        );
     }
 }

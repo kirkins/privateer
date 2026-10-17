@@ -1184,6 +1184,62 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
 }
 
 #[test]
+fn a_stated_reset_holds_a_throttled_route_past_the_short_window() {
+    let fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    let crew = |fleet: &Fleet, id: &str| {
+        fleet.run(
+            "agent.start",
+            json!({"id":id,"task_id":"infra-repair"}),
+            Some("infra"),
+        )
+    };
+    let wait_job = |fleet: &Fleet, id: &str| {
+        let until = Instant::now() + Duration::from_secs(20);
+        while !matches!(
+            fleet.ok("job.status", json!({"id":id}), None)["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled" | "timed_out")
+        ) {
+            assert!(Instant::now() < until, "job {id} never ended");
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // The first pass has nothing to read yet and leaves the scan cursor behind.
+    fleet.tick();
+    // A throttle that states when the window reopens holds its route until then,
+    // rather than for the fifteen minutes an unstated one doubles up to.
+    fleet.mode("window");
+    assert!(crew(&fleet, "windowed").status.success());
+    wait_job(&fleet, "windowed");
+    fleet.tick();
+    let backed = fleet.ok("resource.status", json!({}), None)["model_routes"].clone();
+    assert!(!backed.as_array().unwrap().is_empty(), "{backed}");
+    let until = backed[0]["until_ms"].as_i64().unwrap();
+    assert!(
+        until - privateer::store::Store::now_ms() > 4 * 3_600_000,
+        "the stated five-hour reset was not held: {backed}"
+    );
+    assert!(
+        backed[0]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("resets in 5 hours"),
+        "{backed}"
+    );
+
+    // So new crew on that route are refused while it waits.
+    let refused = crew(&fleet, "later");
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("backing off"), "{stderr}");
+}
+
+#[test]
 fn codex_crew_sandbox_defaults_and_flags_read_only() {
     let fleet = Fleet::new(now_settings());
     // An isolated bundled:codex manifest so the test never runs real Codex.
