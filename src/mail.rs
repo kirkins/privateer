@@ -598,6 +598,12 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             );
         }
     }
+    // Only a gateway link delivers now. Over a collected link the reply waits
+    // for the other machine to collect it, so it cannot be judged here.
+    let direct = match &peer {
+        Some(peer) => crate::peers::direct_machine(store, peer)?,
+        None => false,
+    };
     if let Some(correlation) = correlation {
         match by_id(store, correlation)? {
             Some(thread) => {
@@ -620,7 +626,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             // this one; a reply to a linked ship is checked where that request
             // is, and a refusal there is surfaced to the captain.
             None => ensure!(
-                from == CAPTAIN && kind == "reply" && peer.is_some(),
+                from == CAPTAIN && kind == "reply" && direct,
                 "unknown correlated message {correlation}"
             ),
         }
@@ -838,6 +844,7 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
             message["to"].as_str().unwrap_or(peer),
             &reason,
         )?;
+        return Ok(Delivery::Quarantined);
     }
     Ok(if delivered {
         Delivery::Delivered

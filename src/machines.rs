@@ -56,6 +56,8 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            next_contact_ms INTEGER, failures INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE IF NOT EXISTS machine_ships(machine TEXT NOT NULL, name TEXT NOT NULL,
            scope TEXT NOT NULL, PRIMARY KEY(machine, name));
+         CREATE TABLE IF NOT EXISTS collect_waits(machine TEXT NOT NULL, id TEXT NOT NULL,
+           passes INTEGER NOT NULL, PRIMARY KEY(machine, id));
          CREATE TABLE IF NOT EXISTS machine_owner(only INTEGER PRIMARY KEY CHECK(only=1),
            ship TEXT NOT NULL, set_ms INTEGER NOT NULL);",
     )?;
@@ -975,11 +977,21 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
         let id = required(envelope, "id")?.to_owned();
         let to = envelope["to"].as_str().unwrap_or("");
         let home = if to == crate::mail::CAPTAIN {
-            // A home that cannot be read now is retried on the next pass.
-            let Ok(home) = captain_destination(conn, envelope) else {
-                continue;
-            };
-            home
+            // A home that cannot be read now may hold the request; it is retried
+            // on the next passes, then refused.
+            match captain_destination(conn, envelope) {
+                Ok(home) => home,
+                Err(error) => {
+                    refused.extend(hold_or_refuse(
+                        conn,
+                        machine,
+                        &id,
+                        envelope,
+                        &format!("{error:#}"),
+                    )?);
+                    continue;
+                }
+            }
         } else {
             homes
                 .iter()
@@ -990,16 +1002,29 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
             refused.push(json!({"id": id, "error": format!("no ship named {to} on this machine")}));
             continue;
         };
-        // A home that cannot be opened now is retried on the next pass.
-        let Ok(mut store) = Store::open(&home) else {
-            continue;
+        // A home that cannot be opened now is retried on the next passes too.
+        let mut store = match Store::open(&home) {
+            Ok(store) => store,
+            Err(error) => {
+                if to == crate::mail::CAPTAIN {
+                    refused.extend(hold_or_refuse(
+                        conn,
+                        machine,
+                        &id,
+                        envelope,
+                        &format!("{error:#}"),
+                    )?);
+                }
+                continue;
+            }
         };
+        forget_wait(conn, machine, &id)?;
         match crate::dispatch(&mut store, "mail.deliver", envelope.clone()) {
             Ok(result) => delivered
                 .push(json!({"id": id, "end_state": crate::mail::applied_end(envelope, &result)})),
             Err(error) => {
                 let reason = format!("{error:#}");
-                if to == crate::mail::CAPTAIN {
+                if to == crate::mail::CAPTAIN || envelope["from"] == crate::mail::CAPTAIN {
                     surface_captain_refusal(conn, &id, envelope, &reason)?;
                 }
                 refused.push(json!({"id": id, "error": reason}));
@@ -1060,7 +1085,49 @@ fn surface_captain_refusal(
         return Ok(());
     };
     let from = envelope["from"].as_str().unwrap_or("unknown");
-    crate::mail::surface_refusal(&Store::open(&home)?, id, from, from, "captain", reason)
+    let to = envelope["to"].as_str().unwrap_or("unknown");
+    crate::mail::surface_refusal(&Store::open(&home)?, id, "runtime", from, to, reason)
+}
+
+/// Collect passes a captain's message may wait for the home it needs to be
+/// readable before it is refused.
+const WAIT_PASSES: i64 = 10;
+
+/// A captain's message this pass cannot place. It waits for the next passes
+/// until `WAIT_PASSES` have gone by, then is refused and put before the
+/// captain. Returns the refusal, if it was made now.
+fn hold_or_refuse(
+    conn: &Connection,
+    machine: &Machine,
+    id: &str,
+    envelope: &Value,
+    reason: &str,
+) -> Result<Option<Value>> {
+    conn.execute(
+        "INSERT INTO collect_waits(machine, id, passes) VALUES(?1, ?2, 1)
+         ON CONFLICT(machine, id) DO UPDATE SET passes=passes+1",
+        params![machine.name, id],
+    )?;
+    let passes: i64 = conn.query_row(
+        "SELECT passes FROM collect_waits WHERE machine=?1 AND id=?2",
+        params![machine.name, id],
+        |r| r.get(0),
+    )?;
+    if passes < WAIT_PASSES {
+        return Ok(None);
+    }
+    forget_wait(conn, machine, id)?;
+    surface_captain_refusal(conn, id, envelope, reason)?;
+    Ok(Some(json!({"id": id, "error": reason})))
+}
+
+/// Forget a captain's message's waiting once it has been placed or refused.
+fn forget_wait(conn: &Connection, machine: &Machine, id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM collect_waits WHERE machine=?1 AND id=?2",
+        params![machine.name, id],
+    )?;
+    Ok(())
 }
 
 /// One dispatcher pass: for each machine this one reaches, refresh the

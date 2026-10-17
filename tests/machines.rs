@@ -1416,6 +1416,38 @@ fn an_idle_ship_moves_to_the_other_machine_and_back() {
         scout["location"],
         json!({"peer": "machine-laptop"}),
         "{scout}"
+    );
+}
+
+#[test]
+fn a_ship_with_unpushed_work_stays_where_it_is() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    let project = ship_with_project(&laptop, &mac, "scout");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    fs::write(project.join("route.txt"), "north\n").unwrap();
+    git(&project, &["add", "route.txt"]);
+    git(&project, &["commit", "--quiet", "-m", "Plot the route"]);
+
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&mac_ssh),
+    );
+    assert!(!moved.status.success());
+    assert!(
+        text(&moved).contains("commits not pushed"),
+        "{}",
+        text(&moved)
+    );
+    // Nothing changed: the ship still runs on the laptop and the Mac never
+    // heard of a new ship.
+    assert!(laptop.run("scout", &["status"], None).status.success());
+    assert!(!mac.folder("scout").exists());
+    let scout = laptop.ok("liaison", "ship.show", json!({"name": "scout"}));
+    assert_eq!(scout["location"], json!({"peer": "fleet-scout"}), "{scout}");
+}
+
 /// The captain's own mail written in a home on this machine, sent over the link.
 fn captain_sends(machine: &Machine, ship: &str, ssh: &Path, mail: Value) -> Output {
     let mut mail = mail;
@@ -1522,32 +1554,6 @@ fn a_captain_reply_refused_across_the_link_is_put_before_the_captain() {
 }
 
 #[test]
-fn a_ship_with_unpushed_work_stays_where_it_is() {
-    let (_temp, laptop, mac, _ssh) = fixture();
-    let mac_ssh = remote_ssh(&mac);
-    let project = ship_with_project(&laptop, &mac, "scout");
-    assert!(link(&laptop, &mac, &mac_ssh).status.success());
-    fs::write(project.join("route.txt"), "north\n").unwrap();
-    git(&project, &["add", "route.txt"]);
-    git(&project, &["commit", "--quiet", "-m", "Plot the route"]);
-
-    let moved = laptop.run(
-        "liaison",
-        &["ship", "move", "scout", "--to", "mac"],
-        Some(&mac_ssh),
-    );
-    assert!(!moved.status.success());
-    assert!(
-        text(&moved).contains("commits not pushed"),
-        "{}",
-        text(&moved)
-    );
-    // Nothing changed: the ship still runs on the laptop and the Mac never
-    // heard of a new ship.
-    assert!(laptop.run("scout", &["status"], None).status.success());
-    assert!(!mac.folder("scout").exists());
-    let scout = laptop.ok("liaison", "ship.show", json!({"name": "scout"}));
-    assert_eq!(scout["location"], json!({"peer": "fleet-scout"}), "{scout}");
 fn a_captain_reply_to_a_request_asked_before_the_link_reaches_the_other_machine() {
     let (_temp, laptop, mac, ssh) = fixture();
     let asked = mac.ok(
@@ -1613,5 +1619,156 @@ fn a_captain_message_the_other_machine_refuses_is_put_before_the_captain() {
     assert!(
         inbox.iter().any(|m| m["body"] == "Still reaching you"),
         "{inbox:?}"
+    );
+}
+
+/// Makes this machine's next collection due now, rather than after its contact interval.
+fn collect_now(machine: &Machine) {
+    rusqlite::Connection::open(machine.registry())
+        .unwrap()
+        .execute("UPDATE machines SET next_contact_ms=0", [])
+        .unwrap();
+}
+
+/// The captain's notices in the captain's mailbox here.
+fn captain_notices(machine: &Machine, ship: &str) -> Vec<Value> {
+    captain_mail(machine, ship)
+        .into_iter()
+        .filter(|m| m["kind"] == "notice")
+        .collect()
+}
+
+#[test]
+fn a_captain_reply_the_collected_side_cannot_judge_is_refused_at_once() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("rig");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+
+    // The captain answers from the machine that is collected from, a request
+    // this machine does not hold. The collecting machine would refuse it
+    // later, so it is refused here, where nothing waits to be collected.
+    let answer = captain_sends(
+        &mac,
+        "fitforge",
+        &ssh,
+        json!({"to": "rig", "kind": "reply", "correlation": "no-such-request", "body": "Yes"}),
+    );
+    assert!(!answer.status.success(), "{}", text(&answer));
+    assert!(
+        text(&answer).contains("unknown correlated message"),
+        "{}",
+        text(&answer)
+    );
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["delivered"], 0, "{pass}");
+    assert_eq!(pass["machines"][0]["refused"], 0, "{pass}");
+    assert!(captain_notices(&laptop, "liaison").is_empty());
+}
+
+#[test]
+fn a_captain_reply_the_collecting_machine_refuses_is_put_before_the_captain() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("rig");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+
+    // This machine holds a request from rig to the captain that rig's home
+    // does not, so the reply is accepted here and refused where it is collected.
+    let home: String = rusqlite::Connection::open(mac.registry())
+        .unwrap()
+        .query_row("SELECT home FROM ships WHERE name='fitforge'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    rusqlite::Connection::open(PathBuf::from(home).join("privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state)
+             VALUES('rig-request','rig','captain','request','Upload build 12?','{}','normal',0,'open')",
+            [],
+        )
+        .unwrap();
+
+    let answer = captain_sends(
+        &mac,
+        "fitforge",
+        &ssh,
+        json!({"to": "rig", "kind": "reply", "correlation": "rig-request", "body": "Yes"}),
+    );
+    assert!(answer.status.success(), "{}", text(&answer));
+    let answer: Value = serde_json::from_slice(&answer.stdout).unwrap();
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["refused"], 1, "{pass}");
+    let notices = captain_notices(&laptop, "liaison");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["from"], "runtime", "{notices:?}");
+    assert_eq!(notices[0]["payload"]["refused"]["id"], answer["id"]);
+    assert_eq!(notices[0]["payload"]["refused"]["from"], "captain");
+    assert_eq!(notices[0]["payload"]["refused"]["to"], "rig");
+    assert!(
+        notices[0]["payload"]["refused"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unknown request"),
+        "{notices:?}"
+    );
+}
+
+#[test]
+fn a_captain_reply_whose_request_home_stays_unreadable_is_refused_after_waiting() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("rig");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let asked = captain_sends(
+        &laptop,
+        "rig",
+        &ssh,
+        json!({"to": "fitforge", "kind": "request", "body": "Upload build 12?"}),
+    );
+    assert!(asked.status.success(), "{}", text(&asked));
+    let asked: Value = serde_json::from_slice(&asked.stdout).unwrap();
+    let answered = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "reply",
+            "correlation": asked["id"], "body": "Yes, ship it"}),
+    );
+
+    // The home that holds the request cannot be read for now.
+    let home: String = rusqlite::Connection::open(laptop.registry())
+        .unwrap()
+        .query_row("SELECT home FROM ships WHERE name='rig'", [], |r| r.get(0))
+        .unwrap();
+    let database = PathBuf::from(home).join("privateer.sqlite");
+    fs::write(&database, b"not a database").unwrap();
+
+    // It waits for the next passes, and is refused on the last of them.
+    for pass in 1..10 {
+        collect_now(&laptop);
+        let result = laptop.pass("liaison", &ssh);
+        assert_eq!(result["machines"][0]["refused"], 0, "pass {pass}: {result}");
+        assert!(
+            captain_notices(&laptop, "liaison").is_empty(),
+            "pass {pass}"
+        );
+    }
+    collect_now(&laptop);
+    let result = laptop.pass("liaison", &ssh);
+    assert_eq!(result["machines"][0]["refused"], 1, "{result}");
+    let notices = captain_notices(&laptop, "liaison");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["payload"]["refused"]["id"], answered["id"]);
+    assert!(
+        notices[0]["payload"]["refused"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not yet located"),
+        "{notices:?}"
     );
 }
