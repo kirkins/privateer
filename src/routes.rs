@@ -16,6 +16,14 @@
 //! free-allowance exhaustion backs the route off until the reset it states
 //! (or about a day when it says nothing); an ordinary throttle keeps the short
 //! doubling window.
+//!
+//! Claude Code states its own limits: every stream carries a
+//! `rate_limit_event` whose `status` is `rejected` once a plan window is
+//! spent, with the window's type and its `resetsAt` epoch. That backs the
+//! route off until the reset. The five-hour and weekly windows cover the whole
+//! account, so they back off every route on that harness and provider, not
+//! just the model that ran. A failed `result` (`is_error`) is read as text
+//! like any other error.
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -27,6 +35,10 @@ const FREE_ALLOWANCE_BACKOFF_MS: i64 = 24 * 60 * 60_000;
 /// A stated reset is read from free text; never trust one past two days, so a
 /// misread hint cannot park a route for longer than an allowance can last.
 const MAX_FREE_ALLOWANCE_BACKOFF_MS: i64 = 2 * FREE_ALLOWANCE_BACKOFF_MS;
+/// A structured reset (Claude's `resetsAt`) may be a weekly window away.
+const MAX_STATED_RESET_MS: i64 = 8 * FREE_ALLOWANCE_BACKOFF_MS;
+/// Claude windows that cover the whole account rather than one model.
+const ACCOUNT_WINDOWS: [&str; 2] = ["five_hour", "seven_day"];
 const CURSOR: &str = "routes_scanned_ms";
 
 pub fn init(conn: &Connection) -> Result<()> {
@@ -71,7 +83,31 @@ fn route_of_argv(command: &[Value]) -> Option<String> {
 struct RouteFailure {
     error: String,
     reset_ms: Option<i64>,
-    free_allowance: bool,
+    /// A spent allowance: back off until its reset, not on the short doubling.
+    allowance: bool,
+    /// The limit covers every model on this harness and provider.
+    account: bool,
+}
+
+/// The ledger key that stands for every model on a route's harness and provider.
+fn account_key(route: &str) -> Option<String> {
+    route
+        .rsplit_once('/')
+        .map(|(account, _)| format!("{account}/*"))
+}
+
+/// A Claude plan window the stream reports as spent.
+fn claude_limit(info: &Value, now: i64) -> RouteFailure {
+    let window = info["rateLimitType"].as_str().unwrap_or("usage");
+    RouteFailure {
+        error: format!("Claude {window} limit reached"),
+        reset_ms: info["resetsAt"]
+            .as_i64()
+            .map(|at| at * 1000 - now)
+            .filter(|ms| *ms > 0),
+        allowance: true,
+        account: ACCOUNT_WINDOWS.contains(&window),
+    }
 }
 
 fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
@@ -186,8 +222,17 @@ fn iso_timestamp_ms(value: &str) -> Option<i64> {
 fn classify(log: &str) -> Option<RouteFailure> {
     let mut last = None;
     let mut native_error = None;
+    let mut rejected = None;
     for event in crate::reply::events(log) {
-        if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
+        if event["type"] == "rate_limit_event" {
+            let info = &event["rate_limit_info"];
+            rejected = (info["status"] == "rejected").then(|| info.clone());
+        } else if event["type"] == "result" && event["is_error"] == true {
+            // Claude Code ends a failed run with an error result.
+            if let Some(text) = event["result"].as_str().filter(|text| !text.is_empty()) {
+                native_error = Some(text.to_owned());
+            }
+        } else if event["type"] == "message_end" && event["message"]["role"] == "assistant" {
             last = Some(event["message"].clone());
         } else if event["type"] == "error" {
             // Native adapters (OpenCode V1) report a failed turn as a final
@@ -201,6 +246,9 @@ fn classify(log: &str) -> Option<RouteFailure> {
                 native_error = Some(text);
             }
         }
+    }
+    if let Some(info) = rejected {
+        return Some(claude_limit(&info, Store::now_ms()));
     }
     let error = if let Some(native) = native_error {
         native
@@ -235,13 +283,17 @@ fn classify(log: &str) -> Option<RouteFailure> {
             "upstream_unavailable",
             "quota",
             "timed out",
+            "usage limit",
+            "hit your limit",
         ]
         .iter()
         .any(|sign| lower.contains(sign));
     throttled.then(|| RouteFailure {
         error: error.chars().take(200).collect(),
-        reset_ms: reset_delay_ms(&error, Store::now_ms()),
-        free_allowance,
+        reset_ms: reset_delay_ms(&error, Store::now_ms())
+            .map(|ms| ms.min(MAX_FREE_ALLOWANCE_BACKOFF_MS)),
+        allowance: free_allowance,
+        account: false,
     })
 }
 
@@ -254,8 +306,9 @@ pub fn throttle(log: &str) -> Option<String> {
 pub fn blocked(conn: &Connection, route: &str) -> Result<Option<(i64, String)>> {
     Ok(conn
         .query_row(
-            "SELECT until_ms, COALESCE(last_error,'') FROM model_routes WHERE route=?1 AND until_ms > ?2",
-            params![route, Store::now_ms()],
+            "SELECT until_ms, COALESCE(last_error,'') FROM model_routes
+             WHERE route IN (?1, ?3) AND until_ms > ?2 ORDER BY until_ms DESC LIMIT 1",
+            params![route, Store::now_ms(), account_key(route)],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
@@ -278,6 +331,8 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
     let now = Store::now_ms();
     match failure {
         Some(failure) => {
+            let account = failure.account.then(|| account_key(route)).flatten();
+            let route = account.as_deref().unwrap_or(route);
             let failures: i64 = conn
                 .query_row(
                     "SELECT failures FROM model_routes WHERE route=?1",
@@ -287,11 +342,11 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
                 .optional()?
                 .unwrap_or(0)
                 + 1;
-            let backoff = if failure.free_allowance {
+            let backoff = if failure.allowance {
                 failure
                     .reset_ms
                     .unwrap_or(FREE_ALLOWANCE_BACKOFF_MS)
-                    .min(MAX_FREE_ALLOWANCE_BACKOFF_MS)
+                    .min(MAX_STATED_RESET_MS)
             } else {
                 FIRST_BACKOFF_MS
                     .saturating_mul(1i64 << (failures - 1).min(10))
@@ -307,7 +362,11 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
             )?;
         }
         None => {
-            conn.execute("DELETE FROM model_routes WHERE route=?1", [route])?;
+            // A success shows the whole account is usable again.
+            conn.execute(
+                "DELETE FROM model_routes WHERE route IN (?1, ?2)",
+                params![route, account_key(route)],
+            )?;
         }
     }
     Ok(())
@@ -404,10 +463,10 @@ mod tests {
     #[test]
     fn free_allowance_uses_reset_hint_or_full_allowance_window() {
         let reset = classify(&error_log("Free usage limit exceeded; retry-after: 7200")).unwrap();
-        assert!(reset.free_allowance);
+        assert!(reset.allowance);
         assert_eq!(reset.reset_ms, Some(7_200_000));
         let fallback = classify(&error_log("Free allowance exhausted")).unwrap();
-        assert!(fallback.free_allowance);
+        assert!(fallback.allowance);
         assert_eq!(fallback.reset_ms, None);
 
         let conn = Connection::open_in_memory().unwrap();
@@ -429,7 +488,7 @@ mod tests {
             "Free usage limit exceeded; retry-after: 99999999999",
         ))
         .unwrap();
-        assert!(misread.reset_ms.unwrap() > MAX_FREE_ALLOWANCE_BACKOFF_MS);
+        assert_eq!(misread.reset_ms, Some(MAX_FREE_ALLOWANCE_BACKOFF_MS));
         record(&conn, "opencode/-/space-bunny-free", Some(&misread)).unwrap();
         let until: i64 = conn
             .query_row("SELECT until_ms FROM model_routes", [], |r| r.get(0))
@@ -440,7 +499,7 @@ mod tests {
     #[test]
     fn ordinary_throttle_keeps_doubling_and_fifteen_minute_cap() {
         let failure = classify(&error_log("429 upstream_unavailable")).unwrap();
-        assert!(!failure.free_allowance);
+        assert!(!failure.allowance);
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         record(&conn, "opencode-go/deepseek-v4.1-flash", Some(&failure)).unwrap();
@@ -464,14 +523,14 @@ mod tests {
             "HTTP 429 free quota exhausted; resets in 2 hours",
         ))
         .unwrap();
-        assert!(free.free_allowance);
+        assert!(free.allowance);
         assert_eq!(free.reset_ms, Some(7_200_000));
         // A bare paid quota error still throttles, but on the short schedule.
         let paid = classify(&error_log("429 quota exhausted")).unwrap();
-        assert!(!paid.free_allowance);
+        assert!(!paid.allowance);
         assert_eq!(paid.reset_ms, None);
         let rate = classify(&error_log("429 rate limit exceeded")).unwrap();
-        assert!(!rate.free_allowance);
+        assert!(!rate.allowance);
         assert_eq!(rate.reset_ms, None);
     }
 
@@ -501,15 +560,15 @@ mod tests {
             "Free usage limit exceeded; resets in 5 hours",
         ))
         .unwrap();
-        assert!(free.free_allowance);
+        assert!(free.allowance);
         assert_eq!(free.reset_ms, Some(5 * 3_600_000));
 
         let paid = classify(&native_error_log("429 quota exceeded")).unwrap();
-        assert!(!paid.free_allowance);
+        assert!(!paid.allowance);
         assert_eq!(paid.reset_ms, None);
 
         let rate = classify(&native_error_log("429 rate limit exceeded")).unwrap();
-        assert!(!rate.free_allowance);
+        assert!(!rate.allowance);
 
         // The route's real, non-throttle upstream failure is not a backoff.
         assert!(
@@ -518,6 +577,37 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn claude_windows_back_off_the_account_or_one_model_until_reset() {
+        let spent = |window: &str| {
+            let reset = Store::now_ms() / 1000 + 4 * 24 * 3600;
+            serde_json::to_string(&json!({"type":"rate_limit_event","rate_limit_info":
+                {"status":"rejected","rateLimitType":window,"resetsAt":reset}}))
+            .unwrap()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let (opus, haiku) = ("claude/-/claude-opus-5-5", "claude/-/claude-haiku-5-5");
+
+        // A model's own weekly window leaves the account's other models alone.
+        let model = classify(&spent("seven_day_opus")).unwrap();
+        assert!(model.allowance && !model.account);
+        record(&conn, opus, Some(&model)).unwrap();
+        assert!(blocked(&conn, haiku).unwrap().is_none());
+        let (until, _) = blocked(&conn, opus).unwrap().unwrap();
+        assert!((until - Store::now_ms() - 4 * FREE_ALLOWANCE_BACKOFF_MS).abs() < 2000);
+
+        // The weekly window stops every Claude model; a later success clears it.
+        record(&conn, opus, Some(&classify(&spent("seven_day")).unwrap())).unwrap();
+        assert!(blocked(&conn, haiku).unwrap().is_some());
+        record(&conn, haiku, None).unwrap();
+        assert!(blocked(&conn, haiku).unwrap().is_none());
+
+        // A window still open says nothing about the route.
+        let open = spent("five_hour").replace("rejected", "allowed");
+        assert!(classify(&open).is_none());
     }
 
     #[test]
