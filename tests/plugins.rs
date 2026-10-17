@@ -446,6 +446,53 @@ fn claude_grants_the_privateer_cli_without_relying_on_workspace_trust() {
 }
 
 #[test]
+fn claude_first_mates_delegate_through_the_fleet_and_no_run_schedules_detached_work() {
+    let mut f = Fixture::new();
+    let plan = |f: &mut Fixture, id: &str| {
+        let mut args = f.args(&example("claude"));
+        args["id"] = json!(id);
+        let plan = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap();
+        let argv: Vec<String> = plan["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        let end = argv.iter().position(|a| a == "--").unwrap();
+        let flag = argv.iter().position(|a| a == "--disallowedTools").unwrap();
+        let next = argv[flag + 1..end]
+            .iter()
+            .position(|a| a.starts_with("--"))
+            .map_or(end, |at| flag + 1 + at);
+        (argv[flag + 1..next].to_vec(), argv[..end].to_vec())
+    };
+    let (crew, argv) = plan(&mut f, "crew-job");
+    assert!(crew.contains(&"CronCreate".into()) && crew.contains(&"RemoteTrigger".into()));
+    assert!(
+        !crew.contains(&"Task".into()),
+        "crew may use Claude's own agents"
+    );
+    // The home holds the ship's records; Claude's file tools may read it.
+    let home = f.store.home().canonicalize().unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--add-dir" && w[1] == home.to_str().unwrap())
+    );
+    f.store
+        .connection()
+        .execute(
+            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms)
+             VALUES('wake','department','ship',1,'wake-job','fresh','running',0)",
+            [],
+        )
+        .unwrap();
+    let (first_mate, _) = plan(&mut f, "wake-job");
+    for tool in ["Task", "Agent", "Workflow", "EnterWorktree", "CronCreate"] {
+        assert!(first_mate.contains(&tool.into()), "{tool}: {first_mate:?}");
+    }
+}
+
+#[test]
 fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_identity() {
     let mut f = Fixture::new();
     let fakebin = f.base().join("bin");

@@ -76,16 +76,18 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "validate"
             };
             let mut request = json!({"id": id, "version": 1, "method": method, "context": context, "options": options});
+            // Wakes and errands run as the ship's first mate; anything else is crew.
+            let role = if crate::workspace::is_wake(store, &args)? {
+                "first_mate"
+            } else {
+                "crew"
+            };
+            request["context"]["role"] = json!(role);
             if let Some(selected) = args.get("tool_bundles") {
                 ensure!(
                     manifest_path == fs::canonicalize(crate::bundled::resolve("bundled:pi")?)?,
                     "bounded tool bundles support only the bundled Pi adapter"
                 );
-                let role = if crate::workspace::is_wake(store, &args)? {
-                    "first_mate"
-                } else {
-                    "crew"
-                };
                 request["context"]["tool_bundles"] =
                     crate::tool_bundles::resolve(store, selected, role)?;
             }
