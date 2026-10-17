@@ -1541,6 +1541,80 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
 }
 
 #[test]
+fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conversation() {
+    let place = Place::new();
+    // The fake records its argv like the Pi fake, so stop_native applies.
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:claude");
+    first_mate["options"] = json!({"model":"claude-opus-5-5","permission_mode":"auto"});
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+
+    // An untrusted folder would stop at Claude's trust dialog: refuse instead.
+    let error = place.tick()["host_error"].as_str().unwrap().to_owned();
+    assert!(error.contains("Yes, I trust this folder"), "{error}");
+    assert!(!place.root.join("pi-argv").exists());
+
+    // Trust on a parent folder counts, as it does for Claude.
+    let trust =
+        json!({"projects": {place.root.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
+    fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
+    place.retry_now();
+    place.tick();
+    until("the hosted Claude", || place.root.join("pi-env").exists());
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    let args: Vec<&str> = argv.lines().collect();
+    assert!(
+        args.windows(2).any(|w| w == ["--permission-mode", "auto"]),
+        "{argv}"
+    );
+    assert!(
+        args.windows(2).any(|w| w == ["--model", "claude-opus-5-5"]),
+        "{argv}"
+    );
+    assert!(
+        args.iter().any(|a| a.ends_with("attended-claude")),
+        "{argv}"
+    );
+    // With no conversation in the folder, --continue would exit at once.
+    assert!(!args.contains(&"--continue"), "{argv}");
+    place.stop_native("infra");
+
+    // Claude's own naming: every character but a letter or digit is a dash.
+    let folder: String = place
+        .folder
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = place.root.join(".claude/projects").join(folder);
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::write(transcripts.join("session.jsonl"), "{}\n").unwrap();
+    place.retry_now();
+    place.tick();
+    until("the resumed hosted Claude", || {
+        place.root.join("pi-env").exists()
+    });
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    place.stop_native("infra");
+}
+
+#[test]
 fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
     let place = Place::new();
     let socket = place.root.join("config/herdr/herdr.sock");
