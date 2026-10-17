@@ -42,8 +42,12 @@ fn blocked(
         .and_then(|m| crate::routes::route_of(m, &profile["options"]))
     {
         if let Some((until, _)) = crate::routes::blocked(&ledger, &route)? {
+            // A hand-edited routes file must not stop the dispatcher: no fallback.
             let fallback = headless
-                && crate::crew_routes::first_mate_fallback(store, ship, task, profile)?.is_some();
+                && matches!(
+                    crate::crew_routes::first_mate_fallback(store, ship, task, profile),
+                    Ok(Some(_))
+                );
             if !fallback {
                 return Ok(Some(format!("Waiting for model route until {until}")));
             }
