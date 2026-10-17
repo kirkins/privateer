@@ -519,6 +519,35 @@ impl Snapshot {
             // Synthetic scope only; all live actions still refuse demo mode.
             discovery: Discovery::Complete,
         };
+        // Sample states, so the demo shows a working, an idle, a waiting and a
+        // stopped ship. No home is read: these paths do not exist.
+        for ship in &mut sample.ships {
+            let (dispatcher, wake, requests) = match ship.id.as_str() {
+                "navigator" => (true, Some("running"), 0),
+                "apps" => (true, None, 0),
+                "infrastructure" => (true, None, 1),
+                _ => (false, None, 0),
+            };
+            ship.live = Some(super::fleet::ShipState {
+                home: PathBuf::from(format!("/demo/{}", ship.id)),
+                identity: None,
+                liaison: ship.liaison,
+                binding: None,
+                harness: "demo".into(),
+                attended: !ship.terminals.is_empty(),
+                dispatcher,
+                requests,
+                unread: 0,
+                wakes: wake
+                    .map(|status| super::fleet::Wake {
+                        mode: "mail".into(),
+                        status: status.into(),
+                    })
+                    .into_iter()
+                    .collect(),
+                error: None,
+            });
+        }
         sample.include_observed_ships();
         sample
     }

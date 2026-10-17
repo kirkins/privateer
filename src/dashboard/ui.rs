@@ -214,6 +214,31 @@ impl App {
             .iter()
             .any(|b| b.pane_id == pane.pane_id && b.terminal_id == pane.terminal_id)
     }
+    /// Ships whose own validated Herdr pane reports its agent working, from a
+    /// fresh view only. A pane two ships claim counts for neither.
+    pub fn working_ships(&self) -> std::collections::BTreeSet<String> {
+        let fresh = self.herdr_error.is_none() && self.herdr_age.is_some_and(|a| a < 10);
+        let Some(view) = self.herdr.as_ref().filter(|_| fresh) else {
+            return Default::default();
+        };
+        if self.snapshot.presentation_error.is_some() {
+            return Default::default();
+        }
+        let ships = &self.snapshot.ships;
+        ships
+            .iter()
+            .filter(|ship| {
+                view.panes.iter().any(|p| {
+                    p.agent_status == "working"
+                        && Self::binds(ship, view, p)
+                        && !ships
+                            .iter()
+                            .any(|other| other.id != ship.id && Self::claims_pane(other, view, p))
+                })
+            })
+            .map(|ship| ship.id.clone())
+            .collect()
+    }
     pub fn binding_ambiguous(&self) -> bool {
         if self.snapshot.presentation_error.is_some() {
             return true;
@@ -962,6 +987,7 @@ impl App {
                 frame,
                 rows[1],
                 &self.snapshot,
+                &self.working_ships(),
                 started.elapsed(),
                 self.reduced,
                 self.ascii,
