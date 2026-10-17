@@ -6,7 +6,7 @@ use privateer::{dispatch, store::Store};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,25 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
             command.env_remove(name);
         }
     }
+    command
+}
+
+/// A privateer command whose user state (HOME, configuration, resource
+/// ledger, fleet registry, Herdr socket, service manager) all lies under
+/// `root`, as a dispatcher pass needs.
+pub fn isolated(root: &Path) -> Command {
+    let user = root.join("user");
+    fs::create_dir_all(&user).unwrap();
+    let mut command = command(BIN);
+    command
+        .env("HOME", user)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_SOCKET_PATH")
+        .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"))
+        .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+        .env("PRIVATEER_SERVICE", "none")
+        .env_remove("XDG_STATE_HOME");
     command
 }
 
@@ -172,20 +191,8 @@ impl Fleet {
     /// A privateer command on this fleet's home, isolated from the user's
     /// state, as the operator.
     pub fn command(&self) -> Command {
-        let user = self.root.join("user");
-        fs::create_dir_all(&user).unwrap();
-        let mut command = command(BIN);
-        command
-            .arg("--home")
-            .arg(&self.home)
-            .env("HOME", user)
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env_remove("HERDR_ENV")
-            .env_remove("HERDR_SOCKET_PATH")
-            .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
-            .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
-            .env("PRIVATEER_SERVICE", "none")
-            .env_remove("XDG_STATE_HOME");
+        let mut command = isolated(&self.root);
+        command.arg("--home").arg(&self.home);
         command
     }
     /// Run a JSON command, as the agent `as_agent` when given.

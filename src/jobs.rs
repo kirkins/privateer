@@ -36,6 +36,10 @@ const QUEUE_POLL: Duration = Duration::from_secs(1);
 struct Process {
     pid: u32,
     started: String,
+    /// The PID namespace the recorder saw this PID in. PID numbers and process
+    /// groups are namespace-local, so another namespace cannot inspect them.
+    #[serde(default)]
+    pid_namespace: Option<String>,
     #[serde(default)]
     zombie: bool,
 }
@@ -310,6 +314,7 @@ pub(crate) fn wait_for_workspace_disk(
     wait_for_capacity: bool,
     max_wait_secs: u64,
 ) -> Result<WorkspaceQueueLease> {
+    ensure_dispatcher_namespace(store)?;
     let ledger_path = ledger_path(store)?;
     let key = format!(
         "workspace:{}:{task}:{}",
@@ -733,6 +738,7 @@ fn identity(pid: u32) -> Result<Option<Process>> {
     Ok(Some(Process {
         pid,
         started: format!("linux:{boot}:{ticks}"),
+        pid_namespace: pid_namespace().map(str::to_owned),
         zombie: matches!(*state, "Z" | "X"),
     }))
 }
@@ -764,8 +770,49 @@ fn identity(pid: u32) -> Result<Option<Process>> {
     Ok(Some(Process {
         pid,
         started,
+        pid_namespace: None,
         zombie,
     }))
+}
+/// The PID namespace this process sees PID numbers in; constant for its life.
+#[cfg(target_os = "linux")]
+fn pid_namespace() -> Option<&'static str> {
+    static NAMESPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAMESPACE
+        .get_or_init(|| {
+            fs::read_link("/proc/self/ns/pid")
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .as_deref()
+}
+#[cfg(not(target_os = "linux"))]
+fn pid_namespace() -> Option<&'static str> {
+    None
+}
+/// Whether a recorded PID can be inspected here. Records without a namespace
+/// (legacy, or not Linux) are probed as before.
+fn addressable(process: &Process) -> bool {
+    process.pid_namespace.is_none() || process.pid_namespace.as_deref() == pid_namespace()
+}
+/// Work is recorded only in the PID namespace of this home's dispatcher, which
+/// settles it: a record made inside a PID sandbox could never be inspected,
+/// settled or cancelled from outside it. Until a dispatcher has run, any
+/// namespace may record.
+fn ensure_dispatcher_namespace(store: &Store) -> Result<()> {
+    let dispatcher: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT value FROM metadata WHERE key='pid_namespace'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ensure!(
+        dispatcher.is_none() || dispatcher.as_deref() == pid_namespace(),
+        "this caller is in another PID namespace than the home's dispatcher; run job and workspace commands outside the PID sandbox"
+    );
+    Ok(())
 }
 /// Compare a recorded start identity with a freshly observed one.
 fn same_start(recorded: &str, current: &str) -> bool {
@@ -811,6 +858,11 @@ fn leader_exited(pid: u32) -> Result<bool> {
     Ok(exited_unreaped(pid)?.is_some())
 }
 fn same_process(process: &Process) -> Result<bool> {
+    // Probing the same number here could find an unrelated process, or none,
+    // and falsely prove the recorded one gone: treat it as alive.
+    if !addressable(process) {
+        return Ok(true);
+    }
     Ok(identity(process.pid)?
         .is_some_and(|p| !p.zombie && same_start(&process.started, &p.started)))
 }
@@ -832,6 +884,9 @@ fn group_members(group: u32) -> Result<Vec<u32>> {
     Ok(members)
 }
 fn group_alive(process: &Process) -> Result<bool> {
+    if !addressable(process) {
+        return Ok(true);
+    }
     // A live original leader anchors identity. If it vanished, an orphaned
     // group still occupies this PGID; conservatively preserve that capacity.
     if let Some(current) = identity(process.pid)? {
@@ -964,6 +1019,9 @@ const UNPROVEN_LEADER: &str = "payload leader missing or changed; cannot discove
 /// child (observed with waitid), which by itself keeps the PID and process
 /// group id from being reused, so the leader's identity is not re-inspected.
 fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Process>>> {
+    if !addressable(process) {
+        return Ok(None);
+    }
     if !reserved {
         // macOS getpgid reports ESRCH for zombies. An unreaped original PID
         // with matching start identity still prevents PGID reuse here.
@@ -987,6 +1045,10 @@ fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Proce
     Ok(Some(anchors))
 }
 fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<()> {
+    ensure!(
+        addressable(process),
+        "payload process group belongs to another PID namespace; refusing signal"
+    );
     // A still-live recorded member anchors this exact group even if its
     // leader exits during TERM grace. Never signal solely by stale PGID.
     let mut anchored = false;
@@ -1142,6 +1204,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         args.get("production").and_then(Value::as_bool) != Some(true),
         "production execution is not supported by the ordinary job runner"
     );
+    ensure_dispatcher_namespace(store)?;
     let task_id = args
         .get("task_id")
         .and_then(Value::as_str)
@@ -2303,34 +2366,43 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             reason = Some("Codex read-only crew exited without a durable crew report".into());
         }
     }
-    job = alter(store, id, |j| {
-        j.status = if group_remains {
-            "orphaned".into()
-        } else {
-            outcome.into()
-        };
-        j.exit_code = status.code();
-        j.finished_ms = Some(Store::now_ms());
-        j.stdout_dropped_bytes = stdout_dropped;
-        j.stderr_dropped_bytes = stderr_dropped;
-        if group_remains {
+    if group_remains {
+        job = alter(store, id, |j| {
+            j.status = "orphaned".into();
+            j.exit_code = status.code();
+            j.finished_ms = Some(Store::now_ms());
+            j.stdout_dropped_bytes = stdout_dropped;
+            j.stderr_dropped_bytes = stderr_dropped;
             j.leader_result = Some(LeaderResult {
                 status: outcome.into(),
                 reason: reason.clone(),
             });
-        }
-        j.reason = if group_remains {
-            Some(reason.unwrap_or_else(|| {
+            j.reason = Some(reason.unwrap_or_else(|| {
                 "payload group or a descendant that left it is still running; reservation preserved".into()
-            }))
-        } else {
-            reason
-        };
-    })?;
-    if group_remains {
+            }));
+        })?;
         update_reservation(store, &job)?;
     } else {
+        // Release before the terminal status commits, so a reader who sees the
+        // job finished also sees its capacity given back. The outcome is
+        // recorded as the leader's result first: if the supervisor dies between
+        // the two writes, reconcile settles to that outcome, not "disappeared".
+        job = alter(store, id, |j| {
+            j.leader_result = Some(LeaderResult {
+                status: outcome.into(),
+                reason: reason.clone(),
+            });
+        })?;
         release(store, &job)?;
+        job = alter(store, id, |j| {
+            j.status = outcome.into();
+            j.leader_result = None;
+            j.exit_code = status.code();
+            j.finished_ms = Some(Store::now_ms());
+            j.stdout_dropped_bytes = stdout_dropped;
+            j.stderr_dropped_bytes = stderr_dropped;
+            j.reason = reason;
+        })?;
     }
     store.audit(
         "job.finished",
@@ -2469,14 +2541,19 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
     }
     Ok(job)
 }
-/// Reconcile unfinished jobs whose supervisor is gone, so their outcome is
-/// recorded without anyone asking for their status. A live supervisor is
-/// checked cheaply and left to finish its own job.
+/// Reconcile jobs whose supervisor is gone, so their outcome is recorded
+/// without anyone asking for their status, and release finished jobs' capacity
+/// a crash left reserved. Only the dispatcher runs this, and it records its
+/// PID namespace as the one work must be recorded in.
 pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
-    let mut statement = store.connection().prepare(
-        "SELECT record FROM jobs WHERE json_extract(record, '$.status')
-         IN ('starting', 'queued', 'launching', 'running')",
-    )?;
+    if let Some(namespace) = pid_namespace() {
+        store.connection().execute(
+            "INSERT INTO metadata(key, value) VALUES('pid_namespace', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [namespace],
+        )?;
+    }
+    let mut statement = store.connection().prepare("SELECT record FROM jobs")?;
     let jobs: Vec<Job> = statement
         .query_map([], |r| r.get::<_, String>(0))?
         .map(|raw| Ok(serde_json::from_str(&raw?)?))
@@ -2489,7 +2566,10 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         let id = job.id.clone();
         let before = job.status.clone();
         let result = (|| -> Result<Option<Job>> {
-            if job.supervisor.as_ref().map(same_process).transpose()? == Some(true) {
+            // A live supervisor is checked cheaply and left to finish its job.
+            let supervised = !terminal(&job.status)
+                && job.supervisor.as_ref().map(same_process).transpose()? == Some(true);
+            if supervised {
                 return Ok(None);
             }
             Ok(Some(reconcile(store, job, &mut reserved)?))
@@ -2505,7 +2585,7 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
     Ok(settled)
 }
 
-/// A job's current record, for crew reports.
+/// A job's current durable record, for crew reports.
 pub(crate) fn record(store: &Store, id: &str) -> Result<Value> {
     Ok(public_job(&load(store, id)?))
 }
@@ -2743,11 +2823,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .get("id")
                 .and_then(Value::as_str)
                 .context("id required")?;
-            Ok(public_job(&reconcile(
-                store,
-                load(store, id)?,
-                &mut Reserved::default(),
-            )?))
+            Ok(public_job(&load(store, id)?))
         }
         "job.list" => {
             // Pages in id order: pass the last id seen as after_id.
@@ -2769,11 +2845,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let all: Vec<Job> = rows
                 .map(|r| Ok(serde_json::from_str(&r?)?))
                 .collect::<Result<_>>()?;
-            let mut reserved = Reserved::default();
             Ok(json!(
-                all.into_iter()
-                    .map(|j| reconcile(store, j, &mut reserved).map(|j| public_job(&j)))
-                    .collect::<Result<Vec<_>>>()?
+                all.into_iter().map(|j| public_job(&j)).collect::<Vec<_>>()
             ))
         }
         "job.cancel" => cancel(
@@ -2787,7 +2860,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .get("id")
                 .and_then(Value::as_str)
                 .context("id required")?;
-            let old = reconcile(store, load(store, old_id)?, &mut Reserved::default())?;
+            // Retry decisions use the durable status. Reconciliation belongs
+            // to the owning home's dispatcher, where process visibility is
+            // known; a caller must not settle another namespace by reading.
+            let old = load(store, old_id)?;
             ensure!(
                 matches!(old.status.as_str(), "failed" | "cancelled" | "timed_out"),
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"

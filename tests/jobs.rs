@@ -62,6 +62,35 @@ impl Fixture {
         store.connection().execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('task','mission','peer','fixture','open',0)", []).unwrap();
         home
     }
+    /// One dispatcher pass, which alone settles a job whose supervisor is
+    /// gone. It touches the fleet registry and Herdr, so user state is
+    /// pointed into the fixture.
+    fn serve(&self, home: &Path) {
+        let output = support::isolated(&self.root)
+            .arg("--home")
+            .arg(home)
+            .args(["serve", "--json", r#"{"once":true}"#])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "serve: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    /// Wait for a status only a dispatcher pass records.
+    fn settle(&self, home: &Path, id: &str, accepted: &[&str]) -> Value {
+        let until = Instant::now() + Duration::from_secs(12);
+        loop {
+            self.serve(home);
+            let job = ok(home, "job.status", json!({"id":id}));
+            if accepted.contains(&job["status"].as_str().unwrap()) {
+                return job;
+            }
+            assert!(Instant::now() < until, "job did not settle: {job}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 fn run(home: &Path, command: &str, args: Value) -> std::process::Output {
     support::command(BIN)
@@ -181,8 +210,7 @@ fn shared_admission_preserves_orphan_payload_until_explicit_cancellation() {
     while active_pid(supervisor) && Instant::now() < until {
         thread::sleep(Duration::from_millis(20));
     }
-    let orphan = ok(&a, "job.status", json!({"id":"hold"}));
-    assert_eq!(orphan["status"], "orphaned");
+    fixture.settle(&a, "hold", &["orphaned"]);
     let resource = ok(&b, "resource.status", json!({}));
     assert_eq!(resource["heavy_reserved"], 1);
     assert_eq!(resource["reservations"][0]["payload_group_alive"], true);
@@ -696,7 +724,7 @@ fn records_from_the_previous_identity_format_remain_recoverable() {
     );
     // Without its supervisor, cancellation must still prove and stop the payload.
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
-    let orphaned = wait(&home, "legacy", &["orphaned"]);
+    let orphaned = fixture.settle(&home, "legacy", &["orphaned"]);
     assert_eq!(
         orphaned["reason"],
         "supervisor disappeared; payload capacity preserved"
@@ -747,7 +775,7 @@ fn orphan_settles_to_its_leader_result_once_descendants_exit() {
         "descendant should outlive leader"
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
-    let settled = wait(&home, "lingering", &["succeeded"]);
+    let settled = fixture.settle(&home, "lingering", &["succeeded"]);
     assert_eq!(settled["exit_code"], 0);
     assert_eq!(settled["reason"], Value::Null);
     assert_eq!(settled["leader_result"], Value::Null);
@@ -758,7 +786,7 @@ fn orphan_settles_to_its_leader_result_once_descendants_exit() {
         "lingering-failure",
         &["/bin/sh", "-c", "sleep 1 & exit 3"],
     );
-    let failed = wait(&home, "lingering-failure", &["failed"]);
+    let failed = fixture.settle(&home, "lingering-failure", &["failed"]);
     assert_eq!(failed["exit_code"], 3);
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
     let audit = ok(&home, "audit.list", json!({"limit":1000}));
@@ -821,7 +849,7 @@ fn recovery_never_releases_live_supervisors_or_payload_groups() {
     assert!(error.contains("supervisor is still running"), "{error}");
     let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
-    wait(&home, "live", &["orphaned"]);
+    fixture.settle(&home, "live", &["orphaned"]);
     let error = fails(&home, "resource.recover", json!({"key":key,"force":true}));
     assert!(error.contains("payload group is still running"), "{error}");
     ok(&home, "job.cancel", json!({"id":"live"}));
@@ -865,11 +893,85 @@ fn vanished_supervisor_with_ended_payload_settles_as_failed() {
     let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
     assert_eq!(unsafe { libc::kill(-payload, libc::SIGKILL) }, 0);
-    let job = wait(&home, "abandoned", &["failed"]);
+    let job = fixture.settle(&home, "abandoned", &["failed"]);
     assert_eq!(
         job["reason"],
         "supervisor disappeared; payload ended without a recorded result"
     );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
+fn job_reads_leave_a_lost_supervisor_to_the_dispatcher() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "lost", &["sleep", "30"]);
+    let running = wait(&home, "lost", &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    let until = Instant::now() + Duration::from_secs(3);
+    while active_pid(supervisor) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
+    // A reader may be in a PID sandbox where the supervisor looks gone.
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"lost"}))["status"],
+        "running"
+    );
+    assert_eq!(ok(&home, "job.list", json!({}))[0]["status"], "running");
+    let orphan = fixture.settle(&home, "lost", &["orphaned"]);
+    assert_eq!(
+        orphan["reason"],
+        "supervisor disappeared; payload capacity preserved"
+    );
+    ok(&home, "job.cancel", json!({"id":"lost"}));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn work_recorded_in_another_pid_namespace_is_never_settled_or_started() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "foreign", &["sleep", "30"]);
+    let running = wait(&home, "foreign", &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let store = Store::open(&home).unwrap();
+    let edit = |namespace: &str| {
+        store
+            .connection()
+            .execute(
+                "UPDATE jobs SET record=json_set(record, '$.supervisor.pid_namespace', ?1)
+                 WHERE id='foreign'",
+                [namespace],
+            )
+            .unwrap();
+    };
+    // Its PID number means nothing here, so a gone supervisor proves nothing.
+    edit("pid:[foreign]");
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    fixture.serve(&home);
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"foreign"}))["status"],
+        "running"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    // So new work is refused outside the dispatcher's namespace.
+    store
+        .connection()
+        .execute(
+            "UPDATE metadata SET value='pid:[foreign]' WHERE key='pid_namespace'",
+            [],
+        )
+        .unwrap();
+    let error = fails(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"sandboxed","command":["true"]}),
+    );
+    assert!(error.contains("outside the PID sandbox"), "{error}");
+    edit(running["supervisor"]["pid_namespace"].as_str().unwrap());
+    fixture.serve(&home);
+    ok(&home, "job.cancel", json!({"id":"foreign"}));
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 
@@ -1113,7 +1215,7 @@ fn history_prune_keeps_pending_facts_and_reserved_capacity() {
 }
 
 #[test]
-fn job_list_pages_and_still_repairs_a_leftover_reservation() {
+fn job_list_is_read_only_and_dispatcher_repairs_a_leftover_reservation() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
     for id in ["a", "b", "c"] {
@@ -1137,7 +1239,7 @@ fn job_list_pages_and_still_repairs_a_leftover_reservation() {
             .success()
     );
     // A finished job whose release was interrupted still holds capacity;
-    // listing repairs it once its process group is provably gone.
+    // listing is read-only and the owning dispatcher repairs it.
     let job = ok(&home, "job.status", json!({"id":"b"}));
     let key = format!(
         "{}:b:{}",
@@ -1154,6 +1256,8 @@ fn job_list_pages_and_still_repairs_a_leftover_reservation() {
         .unwrap();
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
     ok(&home, "job.list", json!({}));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    fixture.serve(&home);
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 
@@ -1572,7 +1676,7 @@ fn waiting_jobs_end_on_cancel_timeout_or_a_vanished_supervisor() {
         thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
-    let failed = wait(&home, "abandoned", &["failed"]);
+    let failed = fixture.settle(&home, "abandoned", &["failed"]);
     assert_eq!(
         failed["reason"],
         "supervisor disappeared while waiting for capacity"
