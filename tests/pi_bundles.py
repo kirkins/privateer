@@ -217,6 +217,9 @@ class Bundles(unittest.TestCase):
         self.assertIn('--skill', argv)
         self.assertNotIn('--skill', empty)
         self.assertEqual(probe.call_count, 3)  # --version twice, --help once (cached)
+        # Help is asked with extensions off: Pi loads them to print help otherwise.
+        helps = [call.args[0] for call in probe.call_args_list if call.args[0][-1] == '--help']
+        self.assertEqual([argv[1:] for argv in helps], [['--no-extensions', '--help']])
 
     def test_only_explicit_approved_integrations_and_privateer_mail_load(self):
         ext = self.base / 'approved.mjs'

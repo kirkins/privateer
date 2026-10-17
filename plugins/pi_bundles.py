@@ -70,7 +70,7 @@ def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
         require(not arg.startswith(('-e', '-c', '-r', '-a')))
         clean.append(arg)
         i += 1
-    require_flags(binary, env, cwd, 'Pi', NEEDED)
+    require_flags(binary, env, cwd, 'Pi', NEEDED, help_args=('--no-extensions', '--help'))
     loaded = [argv[0], *FLAGS]
     for item in value['integrations']['extensions']:
         loaded.extend(['-e', item['path']])

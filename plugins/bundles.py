@@ -53,7 +53,7 @@ def declared_options(help_text):
     return names
 
 
-def require_flags(binary, env, cwd, label, needed):
+def require_flags(binary, env, cwd, label, needed, help_args=("--help",)):
     """Refuse unless the installed CLI declares every needed flag. Asks the
     binary itself (--version, then --help), never reads its config or
     credentials. Results are cached per executable path and version for the
@@ -66,7 +66,9 @@ def require_flags(binary, env, cwd, label, needed):
     version = words[0]
     key = (str(binary), version)
     if key not in _OPTIONS:
-        helped = subprocess.run([binary, "--help"], **run)
+        # A CLI may load ambient code to print help (Pi loads its extensions),
+        # so the caller passes the flags that keep the probe itself bounded.
+        helped = subprocess.run([binary, *help_args], **run)
         require(helped.returncode == 0)
         _OPTIONS[key] = declared_options(helped.stdout.decode("utf-8", "replace"))
     missing = [flag for flag in needed if flag not in _OPTIONS[key]]
