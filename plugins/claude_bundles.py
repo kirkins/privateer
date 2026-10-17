@@ -2,14 +2,13 @@
 
 Exposure hygiene, not an OS/credential sandbox. Personal hooks, skills,
 plugins and claude.ai connectors are dropped; a few harmless personal settings
-are carried. A user settings file holding a provider route or credentials
-refuses, since dropping it would change the route. Registry, selection and
-pins live in bundles.py.
+are carried. A user settings key outside the carried and dropped lists
+refuses, since dropping a route, credential or restriction would change the
+route or widen the launch. Registry, selection and pins live in bundles.py.
 """
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import uuid
@@ -20,7 +19,22 @@ from bundles import file_bytes, present, require, safe_path, validate_plan
 # drop the user source; no MCP servers unless --mcp-config names them.
 FLAGS = ["--setting-sources", "project,local", "--strict-mcp-config"]
 CARRIED = ("model", "modelSettings", "effort", "autoMode", "skipDangerousModePermissionPrompt")
-ROUTE = re.compile(r"env|key|auth|credential|token|secret|login|helper|provider|bedrock|vertex|foundry|url|proxy", re.I)
+# User settings dropped without refusal: cosmetic or housekeeping keys that
+# select no route or account, and the personal exposure a bounded launch drops.
+DROPPED = (
+    "$schema",              # editor validation hint only
+    "theme",                # terminal colours
+    "statusLine",           # interactive status bar; headless never shows it
+    "includeCoAuthoredBy",  # commit attribution text, not authority
+    "cleanupPeriodDays",    # local transcript retention
+    "disableLoginPrompt",   # suppresses a prompt; never selects an account
+    "enabledPlugins",       # personal plugins: what a bounded launch exists to drop
+    "hooks",                # personal hooks, likewise; the project's own hooks still load
+)
+# Anything else refuses, notably permissions, sandbox and
+# disableBypassPermissionsMode: dropping a restriction would give a bounded
+# launch more freedom than an unbounded one, and env/apiKeyHelper/auth keys
+# would change the route.
 # --plugin-dir loads a skill root as a plugin; stage one is skills only.
 PLUGIN_PARTS = ("hooks", ".mcp.json", ".lsp.json", "agents", "commands", "skills", "bin", "settings.json",
                 "monitors", "output-styles", ".claude-plugin")
@@ -39,7 +53,7 @@ def settings(env):
     if not present(path):
         return {}
     config = json.loads(file_bytes(safe_path(str(path))))
-    require(isinstance(config, dict) and not any(ROUTE.search(key) for key in config if key not in CARRIED))
+    require(isinstance(config, dict) and all(key in CARRIED or key in DROPPED for key in config))
     carried = {key: config[key] for key in CARRIED if key in config}
     require(len(json.dumps(carried)) <= 4096)
     return carried
@@ -97,6 +111,8 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
             require(not (arg.startswith("-") and not arg.startswith("--") and set(arg[1:]) & set("cr")))
             i += 1
     for folder in folders:
+        # A relative folder resolves against Claude's cwd, not this process's.
+        require(Path(folder).is_absolute())
         require(not any(present(Path(folder) / part) for part in FOLDER_PARTS))
     binary = shutil.which(argv[0], path=env.get("PATH"))
     require(binary is not None)

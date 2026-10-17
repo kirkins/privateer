@@ -200,14 +200,20 @@ Attended runs keep Privateer's `attended-claude` mail plugin.
 Only `model`, `modelSettings`, `effort`, `autoMode` and
 `skipDangerousModePermissionPrompt` carry over from the user settings file
 (`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`), through
-`--settings`. They are part of the plan. The loader refuses before launch when:
+`--settings`. They are part of the plan. `$schema`, `theme`, `statusLine`,
+`includeCoAuthoredBy`, `cleanupPeriodDays` and `disableLoginPrompt` are
+cosmetic or local housekeeping and are dropped, as are `enabledPlugins` and
+`hooks`, the personal exposure a bounded launch exists to drop (the project's
+own hooks still load). The loader refuses before launch when:
 
-- the user settings hold `env`, `apiKeyHelper` or any other provider, auth or
-  credential key (dropping it would change the route), are malformed, a
-  symlink or unsafe, or no longer match the planned carried settings;
-- an `--add-dir` folder (ship home, resource ledger) holds `.claude/skills`,
-  `.claude/commands`, `.claude/agents` or `.mcp.json`, which Claude would load
-  although they are not the project;
+- the user settings hold any other key: `env`, `apiKeyHelper` and other
+  provider or auth keys would change the route, and `permissions`, `sandbox`
+  or `disableBypassPermissionsMode` would leave a bounded launch freer than an
+  unbounded one; or they are malformed, a symlink or unsafe, or no longer
+  match the planned carried settings;
+- an `--add-dir` folder (ship home, resource ledger) is relative, or holds
+  `.claude/skills`, `.claude/commands`, `.claude/agents` or `.mcp.json`, which
+  Claude would load although they are not the project;
 - a selected skill root holds plugin parts (`hooks`, `.mcp.json`, `.lsp.json`,
   `agents`, `commands`, `skills`, `bin`, `settings.json`, `monitors`,
   `output-styles`, `.claude-plugin`): stage one is skills only;

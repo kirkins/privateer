@@ -101,6 +101,19 @@ class ClaudeBundles(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.plan()
                 self.refuses(lambda: self.preflight(plan))
+        # Known-harmless keys drop; restrictions refuse rather than drop, so a
+        # bounded launch never gets more freedom than an unbounded one.
+        self.settings({'model': 'exact', 'includeCoAuthoredBy': False, 'theme': 'dark'})
+        with self.probe():
+            argv = self.preflight(self.plan())
+        self.assertEqual(json.loads(argv[argv.index('--settings') + 1]), {'model': 'exact'})
+        for key, value in (('permissions', {'deny': ['Bash(rm:*)']}), ('sandbox', {'enabled': True}),
+                           ('disableBypassPermissionsMode', 'disable'), ('unknownFutureKey', 1)):
+            self.settings({'model': 'exact', key: value})
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    self.plan()
+                self.refuses(lambda: self.preflight(plan))
         # Carried settings that changed since planning refuse, not drift.
         self.settings({'model': 'other'})
         self.refuses(lambda: self.preflight(plan))
@@ -118,6 +131,10 @@ class ClaudeBundles(unittest.TestCase):
                 with self.subTest(part=part, args=args):
                     self.refuses(lambda: self.preflight(args=[*args, '--', 'brief']))
             path.rmdir()
+        # Relative folders would resolve against Claude's cwd, not the check's.
+        for args in (['--add-dir', 'ledger'], ['--add-dir=ledger'], ['--add-dir', str(self.repo), 'ledger']):
+            with self.subTest(args=args):
+                self.refuses(lambda: self.preflight(args=[*args, '--', 'brief']))
         root = Path(self.skill['root'])
         for part in ('hooks/hooks.json', '.mcp.json', 'bin/tool', 'commands/x.md', '.claude-plugin/plugin.json'):
             path = root / part
