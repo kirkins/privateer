@@ -674,7 +674,12 @@ impl<'a> Session<'a> {
                     .into_iter()
                     .next()
                     .context("the fleet has no ships")?;
-                crate::dispatch(self.store(&home)?, command, json!({}))
+                // `/stow mac` names a linked machine to stow over its link.
+                let mut request = json!({});
+                if let Some(machine) = args.get("machine").filter(|v| !v.is_null()) {
+                    request["machine"] = machine.clone();
+                }
+                crate::dispatch(self.store(&home)?, command, request)
             }
             _ => bail!("unknown door command {command:?}"),
         }

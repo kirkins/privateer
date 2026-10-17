@@ -729,10 +729,16 @@ onboarding happened until the conversation and runtime records support it.
 fn print_stow(action: &str, out: &Value) {
     let ships = out["ships"].as_array().cloned().unwrap_or_default();
     let name = |s: &Value| s["ship"].as_str().unwrap_or("").to_owned();
+    // A linked machine's stow says which machine it describes.
+    let machine = out["machine"].as_str();
+    let on = machine.map(|m| format!(" on {m}")).unwrap_or_default();
+    let flag = machine
+        .map(|m| format!(" --machine {m}"))
+        .unwrap_or_default();
     match action {
         "start" => {
             println!(
-                "Stowing the fleet ({}): new jobs are held until `privateer stow resume`.",
+                "Stowing the fleet{on} ({}): new jobs are held until `privateer stow resume{flag}`.",
                 out["stow"].as_str().unwrap_or("")
             );
             for ship in &ships {
@@ -741,22 +747,22 @@ fn print_stow(action: &str, out: &Value) {
                     Some(error) => println!("  could not ask {}: {error}", name(ship)),
                 }
             }
-            println!("Follow it with `privateer stow status`.");
+            println!("Follow it with `privateer stow status{flag}`.");
         }
         "resume" => {
             println!(
-                "Resumed the fleet ({}): new jobs start again.",
+                "Resumed the fleet{on} ({}): new jobs start again.",
                 out["stow"].as_str().unwrap_or("")
             );
         }
-        _ if out["stow"].is_null() => println!("The fleet has never been stowed."),
+        _ if out["stow"].is_null() => println!("The fleet{on} has never been stowed."),
         _ => {
             let state = if out["held"] == true {
                 "held"
             } else {
                 "resumed"
             };
-            println!("Stow {} ({state}):", out["stow"].as_str().unwrap_or(""));
+            println!("Stow {}{on} ({state}):", out["stow"].as_str().unwrap_or(""));
             for ship in &ships {
                 if let Some(error) = ship["error"].as_str() {
                     println!("  {}: {error}", name(ship));
@@ -1317,7 +1323,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         Caller::Operator => "captain".to_owned(),
         Caller::Agent { actor } => actor.clone(),
     };
-    let flags = flags(args, &[])?;
+    let flags = flags(args, &["machine"])?;
     let p = &flags.positional;
     match verb {
         "status" => {
@@ -1508,9 +1514,13 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                 "start" => "stow.start",
                 "status" => "stow.status",
                 "resume" => "stow.resume",
-                _ => bail!("usage: privateer stow [status|resume]"),
+                _ => bail!("usage: privateer stow [status|resume] [--machine NAME]"),
             };
-            let out = crate::dispatch(&mut store, command, json!({}))?;
+            let mut request = json!({});
+            if let Some(machine) = flags.values.get("machine") {
+                request["machine"] = json!(machine);
+            }
+            let out = crate::dispatch(&mut store, command, request)?;
             print_stow(action, &out);
         }
         "wakes" => {

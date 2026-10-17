@@ -42,7 +42,7 @@ HELP = (
     "/ships — the fleet's ships and what they handle\n"
     "/waiting — questions and decisions still waiting on you\n"
     "/yolo on|off|status — tool approval mode for every first mate\n"
-    "/stow [status|resume] — checkpoint every ship and hold new jobs, e.g. before an update\n"
+    "/stow [status|resume] [machine] — checkpoint every ship and hold new jobs, e.g. before an update; a linked machine's name stows that machine\n"
     "/afk [until 8am] [instructions] — away: hold mail, only emergencies 🚨 get through\n"
     "/back — back from away (any ordinary message also brings you back)\n"
     "/held — what was held while you were away\n"
@@ -442,20 +442,26 @@ class Door:
         self.say("\n".join(lines))
 
     def cmd_stow(self, rest: str, msg_id) -> None:
-        action = {"": "start", "status": "status", "resume": "resume"}.get(rest)
-        if action is None:
-            self.say("Usage: /stow [status|resume]", reply_to=msg_id)
+        words = rest.split()
+        verb = words.pop(0) if words and words[0] in ("status", "resume") else ""
+        action = {"": "start", "status": "status", "resume": "resume"}[verb]
+        if len(words) > 1:
+            self.say("Usage: /stow [status|resume] [machine]", reply_to=msg_id)
             return
-        out = self.runtime.call("stow", {"action": action})
+        args = {"action": action}
+        if words:
+            args["machine"] = words[0]
+        where = f" on {words[0]}" if words else ""
+        out = self.runtime.call("stow", args)
         if action == "start":
             names = ", ".join(s["ship"] for s in out["ships"])
-            self.say(f"🧳 Stowing the fleet: new jobs are held. Asked {names} to checkpoint. /stow status shows who is done.")
+            self.say(f"🧳 Stowing the fleet{where}: new jobs are held. Asked {names} to checkpoint. /stow status{' ' + words[0] if words else ''} shows who is done.")
         elif action == "resume":
-            self.say("⚓ Fleet resumed: new jobs start again.")
+            self.say(f"⚓ Fleet{where} resumed: new jobs start again.")
         elif not out.get("stow"):
-            self.say("The fleet has never been stowed.")
+            self.say(f"The fleet{where} has never been stowed.")
         else:
-            lines = []
+            lines = [f"Stow{where}:"] if words else []
             for ship in out["ships"]:
                 if ship.get("error"):
                     lines.append(f"{ship['ship']}: {ship['error']}")

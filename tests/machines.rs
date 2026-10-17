@@ -476,6 +476,89 @@ fn a_machines_owner_hears_of_its_problems_and_may_stow_it() {
 }
 
 #[test]
+fn a_stow_of_a_linked_machine_reaches_only_that_machines_ships() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    // The gateway on mac keeps mac's own ledger, as a real remote host does;
+    // the fake ssh above would otherwise pass the laptop's environment through.
+    let mac_ssh = mac.root.join("ssh");
+    fs::write(
+        &mac_ssh,
+        format!(
+            "#!/bin/sh\nfor argument do remote=$argument; done\nexec env PRIVATEER_RESOURCE_HOME={} /bin/sh -c \"$remote\"\n",
+            mac.root.join("ledger").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&mac_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    laptop.ship("upkeep");
+    let named = laptop.run("liaison", &["machine", "owner", "upkeep"], None);
+    assert!(named.status.success(), "{}", text(&named));
+
+    // Only the captain stows a linked machine; the owner stows only its own.
+    let owner = laptop.run(
+        "upkeep",
+        &[
+            "stow.start",
+            "--json",
+            r#"{"machine":"mac"}"#,
+            "--role",
+            "agent",
+            "--actor",
+            "upkeep",
+        ],
+        Some(&mac_ssh),
+    );
+    assert!(!owner.status.success(), "{}", text(&owner));
+    let unknown = laptop.run("liaison", &["stow", "--machine", "nowhere"], Some(&mac_ssh));
+    assert!(!unknown.status.success());
+    assert!(
+        text(&unknown).contains("no linked machine named nowhere"),
+        "{}",
+        text(&unknown)
+    );
+
+    // The captain's stow asks the machine's own ships, in the machine's ledger.
+    let stowed = laptop.run("liaison", &["stow", "--machine", "mac"], Some(&mac_ssh));
+    assert!(stowed.status.success(), "{}", text(&stowed));
+    assert!(
+        text(&stowed).contains("Stowing the fleet on mac"),
+        "{}",
+        text(&stowed)
+    );
+    let asked = messages(&mac, "fitforge", "request");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0]["from"], "captain");
+    assert!(messages(&laptop, "liaison", "request").is_empty());
+    let local = laptop.ok("liaison", "stow.status", json!({}));
+    assert_eq!(local["stow"], Value::Null, "{local}");
+
+    // Status names the machine it describes, and resume lifts the remote hold.
+    let status = laptop.run(
+        "liaison",
+        &["stow", "status", "--machine", "mac"],
+        Some(&mac_ssh),
+    );
+    assert!(
+        text(&status).contains(" on mac (held)"),
+        "{}",
+        text(&status)
+    );
+    let resumed = laptop.run(
+        "liaison",
+        &["stow", "resume", "--machine", "mac"],
+        Some(&mac_ssh),
+    );
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    assert!(
+        text(&resumed).contains("Resumed the fleet on mac"),
+        "{}",
+        text(&resumed)
+    );
+    assert_eq!(messages(&mac, "fitforge", "notice").len(), 1);
+}
+
+#[test]
 fn a_server_ship_finds_its_consumers_on_both_machines() {
     let (_temp, laptop, mac, ssh) = fixture();
     mac.ship("runtime");
