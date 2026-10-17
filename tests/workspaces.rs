@@ -1269,7 +1269,9 @@ fn a_trim_error_does_not_fail_the_acquire() {
     // the unreadable slot, trims the spare, and the acquire goes ahead.
     f.ok(
         "resource.configure",
-        json!({"min_free_disk_bytes": free + 8 * MIB}),
+        // Far above live free space, so the disk is short however other
+        // writers move it; the call may then be refused for disk.
+        json!({"min_free_disk_bytes": free + 512 * MIB}),
     );
     let again = f.run("workspace.acquire", json!({"task_id":"three"}));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1316,7 +1318,9 @@ fn a_trim_error_does_not_fail_the_job_start() {
     // the unreadable slot, trims the spare, and the job starts.
     f.ok(
         "resource.configure",
-        json!({"min_free_disk_bytes": free + 8 * MIB}),
+        // Far above live free space, so the disk is short however other
+        // writers move it; the call may then be refused for disk.
+        json!({"min_free_disk_bytes": free + 512 * MIB}),
     );
     let started = f.run(
         "job.start",
