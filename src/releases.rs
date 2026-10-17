@@ -179,22 +179,25 @@ pub fn record_upgrade(conn: &Connection, record: &UpgradeRecord) -> Result<()> {
     Ok(())
 }
 
-/// Read-only status works outside a ship and never creates a fleet registry.
-/// `current_commit` is the selected release; `running_commit` may be older.
-pub fn status() -> Result<Value> {
-    let executable = running_image()?;
-    let running = Release::from_executable(&executable);
-    let data = match &running {
-        Some(release) => release
+/// The installation a process belongs to: its own release's, or the default
+/// data directory for an unversioned executable.
+fn installation(running: Option<&Release>) -> Result<PathBuf> {
+    match running {
+        Some(release) => Ok(release
             .root
             .parent()
             .and_then(Path::parent)
             .context("release data directory")?
-            .to_path_buf(),
-        None => data_dir()?,
-    };
+            .to_path_buf()),
+        None => data_dir(),
+    }
+}
+
+/// The release `current` selects in an installation, or None if it is unset.
+/// A dangling or foreign `current` is an error; nothing here repairs it.
+fn selected(data: &Path) -> Result<Option<Release>> {
     let current = data.join("current");
-    let selected = match fs::canonicalize(&current) {
+    match fs::canonicalize(&current) {
         Ok(root) => {
             let release = Release::from_executable(&root.join("bin/privateer"))
                 .context("current does not point to a versioned release")?;
@@ -202,16 +205,38 @@ pub fn status() -> Result<Value> {
                 release.root.parent() == Some(fs::canonicalize(data.join("releases"))?.as_path()),
                 "current points outside this installation's releases directory"
             );
-            Some(release)
+            Ok(Some(release))
         }
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 && fs::symlink_metadata(&current).is_err() =>
         {
-            None
+            Ok(None)
         }
-        Err(error) => return Err(error).context("cannot resolve the current release"),
-    };
+        Err(error) => Err(error).context("cannot resolve the current release"),
+    }
+}
+
+/// The release `current` selects for the installation this process belongs to.
+pub fn current() -> Result<Option<Release>> {
+    current_for(&running_image()?)
+}
+
+/// The release `current` selects for the installation `executable` belongs
+/// to, so a process reports drift against its own install, not the caller's.
+pub fn current_for(executable: &Path) -> Result<Option<Release>> {
+    let running = Release::from_executable(executable);
+    selected(&installation(running.as_ref())?)
+}
+
+/// Read-only status works outside a ship and never creates a fleet registry.
+/// `current_commit` is the selected release; `running_commit` may be older.
+pub fn status() -> Result<Value> {
+    let executable = running_image()?;
+    let running = Release::from_executable(&executable);
+    let data = installation(running.as_ref())?;
+    let current = data.join("current");
+    let selected = selected(&data)?;
     let registry = crate::fleet::registry_path()?;
     ensure!(
         registry.is_absolute(),

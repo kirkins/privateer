@@ -75,10 +75,15 @@ impl Place {
                  printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
                  printf '%s\\n' \"$$\" > '{root}/pi-pid'\n\
                  printf '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\" > '{root}/pi-context'\n\
+                 case \" $* \" in *\" --continue \"*) sid=$(cat '{root}/pi-session' 2>/dev/null) ;; *) sid= ;; esac\n\
+                 prev=; for arg in \"$@\"; do [ \"$prev\" = --session ] && sid=$arg; prev=$arg; done\n\
+                 [ -n \"$sid\" ] || sid=$(printf '%08x-0000-4000-8000-%012x' $$ $$)\n\
+                 printf '%s' \"$sid\" > '{root}/pi-session'\n\
+                 printf '%s\\n' \"$sid\" >> '{root}/pi-sessions'\n\
                  printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
                  if [ -e '{root}/native-fail' ]; then exit 17; fi\n\
                  while [ ! -e '{root}/release' ]; do [ -d '{root}' ] || exit 1; sleep 0.05; done\n\
-                 printf '%s\\n' '{{\"type\":\"session\",\"id\":\"11111111-1111-4111-8111-111111111111\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
+                 printf '%s\\n' '{{\"type\":\"session\",\"id\":\"'\"$sid\"'\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
                 root = root.display()
             ),
         )
@@ -2619,4 +2624,371 @@ fn an_untagged_live_first_mate_is_repaired_before_its_crew_in_the_sidebar() {
     until("the hosted first mate to release its lease", || {
         place.json("ship.presence", json!({"ship":"infra"}))["attended"] == false
     });
+}
+
+/// A 40-digit commit, the shape a release directory is named by.
+fn commit(digit: char) -> String {
+    std::iter::repeat_n(digit, 40).collect()
+}
+
+fn holder_of(place: &Place) -> String {
+    let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
+    env.trim().split_once(' ').unwrap().1.to_owned()
+}
+
+impl Place {
+    fn release_dir(&self, commit: &str) -> PathBuf {
+        self.root.join("data/releases").join(commit)
+    }
+
+    /// Install a release holding this build, as an upgrade leaves it on disk.
+    fn install_release(&self, commit: &str) {
+        let release = self.release_dir(commit);
+        let bin = release.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::copy(BIN, bin.join("privateer")).unwrap();
+        fs::set_permissions(bin.join("privateer"), fs::Permissions::from_mode(0o755)).unwrap();
+        // A release carries its bundled plugins; these are the repository's.
+        let share = release.join("share/privateer");
+        fs::create_dir_all(&share).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"),
+            share.join("plugins"),
+        )
+        .unwrap();
+    }
+
+    /// Switch `current`, as an upgrade does.
+    fn select(&self, commit: &str) {
+        let current = self.root.join("data/current");
+        let _ = fs::remove_file(&current);
+        std::os::unix::fs::symlink(self.release_dir(commit), &current).unwrap();
+    }
+
+    /// Run this installation from `current`, so each pane records its release.
+    fn on_release(&mut self, commit: &str) {
+        self.install_release(commit);
+        self.select(commit);
+        self.binary = self.root.join("data/current/bin/privateer");
+    }
+
+    /// `privateer host relaunch infra` with extra flags, as the operator.
+    fn relaunch_cmd(&self, extra: &[&str]) -> std::process::Output {
+        let mut args = vec!["host", "relaunch", "infra"];
+        args.extend_from_slice(extra);
+        retry_fixture_exec(|| self.command(&args).output()).unwrap()
+    }
+}
+
+#[test]
+fn a_hosted_pane_reports_drift_and_host_relaunch_moves_it_onto_the_current_release() {
+    let (a, b) = (commit('a'), commit('b'));
+    let mut place = Place::new();
+    place.on_release(&a);
+    let (mut place, herdr) = hosted(place);
+
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["commit"], a.as_str(), "{bearings}");
+    assert_eq!(bearings["hosted_pane"]["drift"], false, "{bearings}");
+
+    // An upgrade moves `current`: the running pane is now behind it, and
+    // upgrade status reports the same pane.
+    place.install_release(&b);
+    place.select(&b);
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["drift"], true, "{bearings}");
+    assert_eq!(bearings["hosted_pane"]["current_commit"], b.as_str());
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("host relaunch infra"),
+        "{bearings}"
+    );
+    let status = place.json("upgrade.status", json!({}));
+    assert_eq!(status["hosted_panes"][0]["ship"], "infra", "{status}");
+    assert_eq!(status["hosted_panes"][0]["drift"], true, "{status}");
+    let human: Value = serde_json::from_str(&place.ok(&["upgrade", "status"])).unwrap();
+    assert_eq!(human["hosted_panes"][0]["drift"], true, "{human}");
+    // Asked from a binary outside any installation, the pane still reports
+    // drift against the release it runs from, not against the caller's.
+    let installed = std::mem::replace(&mut place.binary, PathBuf::from(BIN));
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    place.binary = installed;
+    assert_eq!(bearings["hosted_pane"]["drift"], true, "{bearings}");
+    assert_eq!(
+        bearings["hosted_pane"]["current_commit"],
+        b.as_str(),
+        "{bearings}"
+    );
+
+    // A running turn is refused without --force, and an agent cannot relaunch
+    // even its own ship.
+    let holder = holder_of(&place);
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    let refused = place.relaunch_cmd(&[]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("in a turn"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let agent = place
+        .command(&["host", "relaunch", "infra", "--force"])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(!agent.status.success());
+    assert!(
+        String::from_utf8_lossy(&agent.stderr).contains("agents cannot run it"),
+        "{}",
+        String::from_utf8_lossy(&agent.stderr)
+    );
+    assert_eq!(
+        place.json("ship.presence", json!({"ship":"infra"}))["attended"],
+        true
+    );
+
+    // Forced, the pane stops its harness, verifies it exited and releases its
+    // lease; a fresh pane on the current release continues the conversation.
+    let native = place.native_pid();
+    for file in ["pi-env", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    let relaunch = place.relaunch_cmd(&["--force"]);
+    assert!(
+        relaunch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relaunch.stderr)
+    );
+    let report: Value = serde_json::from_slice(&relaunch.stdout).unwrap();
+    assert_eq!(report["from_commit"], a.as_str(), "{report}");
+    assert_eq!(report["to_commit"], b.as_str(), "{report}");
+    assert_eq!(report["harness_exited"], true, "{report}");
+    assert!(report["launch"]["launched"]["pane"].is_string(), "{report}");
+    assert_eq!(
+        unsafe { libc::kill(native, 0) },
+        -1,
+        "the old harness outlived its pane"
+    );
+    until("the relaunched harness", || {
+        place.root.join("pi-env").exists()
+    });
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    // The first harness and its replacement are one conversation.
+    let sessions = fs::read_to_string(place.root.join("pi-sessions")).unwrap();
+    let ids: Vec<&str> = sessions.lines().collect();
+    assert_eq!(ids.len(), 2, "{sessions}");
+    assert_eq!(ids[0], ids[1], "{sessions}");
+    assert_eq!(herdr.calls("workspace.create").len(), 2);
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["commit"], b.as_str(), "{bearings}");
+    assert_eq!(bearings["hosted_pane"]["drift"], false, "{bearings}");
+
+    // A binary replaced in place (renamed over the old file, as an atomic
+    // install does) is drift even while its release is still current. Only
+    // Linux reports the running image, so only there can the replacement show.
+    #[cfg(target_os = "linux")]
+    {
+        let installed = place.release_dir(&b).join("bin/privateer");
+        let staged = installed.with_extension("next");
+        fs::copy(BIN, &staged).unwrap();
+        fs::rename(&staged, &installed).unwrap();
+        let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+        assert_eq!(bearings["hosted_pane"]["drift"], true, "{bearings}");
+        assert_eq!(bearings["hosted_pane"]["commit"], b.as_str(), "{bearings}");
+    }
+    place.stop_native("infra");
+}
+
+#[test]
+fn an_idle_pane_behind_the_current_release_catches_up_at_its_sleep_point_and_a_busy_one_waits() {
+    let (a, b) = (commit('a'), commit('b'));
+    let mut place = Place::new();
+    place.on_release(&a);
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["sleep_after_secs"] = json!(1);
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let (place, _herdr) = hosted(place);
+    place.install_release(&b);
+    place.select(&b);
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+
+    // A turn in progress is never interrupted, however long it runs.
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(
+        unsafe { libc::kill(native, 0) },
+        0,
+        "a busy first mate was interrupted"
+    );
+
+    // Once idle past its sleep point, the behind pane ends at a safe point,
+    // having stopped its harness, and the next dispatcher pass starts it again
+    // on the current release.
+    let idle = json!({"ship":"infra","holder":holder,"idle":true});
+    place.agent("work.poll", idle.clone());
+    std::thread::sleep(Duration::from_millis(1100));
+    place.agent("work.poll", idle);
+    until("the behind pane to catch up and leave", || {
+        (unsafe { libc::kill(native, 0) }) == -1
+            && place.json("ship.presence", json!({"ship":"infra"}))["attended"] == false
+    });
+    for file in ["pi-env", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    let report = place.tick();
+    assert!(report["hosted"]["pane"].is_string(), "{report}");
+    // A catch-up does not wake the ship: the new pane starts asleep, current,
+    // and runs no harness until mail wakes it.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !place.root.join("pi-env").exists(),
+        "the catch-up woke the ship"
+    );
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["commit"], b.as_str(), "{bearings}");
+    assert_eq!(bearings["hosted_pane"]["drift"], false, "{bearings}");
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
+    );
+    until("the woken harness", || place.root.join("pi-env").exists());
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    let sessions = fs::read_to_string(place.root.join("pi-sessions")).unwrap();
+    let ids: Vec<&str> = sessions.lines().collect();
+    assert_eq!(ids.len(), 2, "{sessions}");
+    assert_eq!(ids[0], ids[1], "{sessions}");
+    place.stop_native("infra");
+}
+
+#[test]
+fn mail_that_lands_between_a_catch_up_and_its_replacement_wakes_the_asleep_pane() {
+    let (a, b) = (commit('a'), commit('b'));
+    let mut place = Place::new();
+    place.on_release(&a);
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["sleep_after_secs"] = json!(1);
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let (place, _herdr) = hosted(place);
+    place.install_release(&b);
+    place.select(&b);
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+
+    // The catch-up fences the old pane at its sleep point and it leaves.
+    let idle = json!({"ship":"infra","holder":holder,"idle":true});
+    place.agent("work.poll", idle.clone());
+    std::thread::sleep(Duration::from_millis(1100));
+    place.agent("work.poll", idle);
+    until("the behind pane to catch up and leave", || {
+        (unsafe { libc::kill(native, 0) }) == -1
+            && place.json("ship.presence", json!({"ship":"infra"}))["attended"] == false
+    });
+    for file in ["pi-env", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    // Mail after the fence, before the replacement pane is up: it must wake
+    // that pane, not be taken as mail it had already seen.
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
+    );
+    let report = place.tick();
+    assert!(report["hosted"]["pane"].is_string(), "{report}");
+    until("the replacement pane woken by the mail", || {
+        place.root.join("pi-env").exists()
+    });
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["commit"], b.as_str(), "{bearings}");
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_pane_predating_relaunch_support_fails_at_once_and_says_how_to_restart() {
+    let a = commit('a');
+    let mut place = Place::new();
+    place.on_release(&a);
+    let (place, _herdr) = hosted(place);
+    // Its lease is held, but it never recorded a release, as before relaunch existed.
+    place
+        .database()
+        .execute("DELETE FROM hosted_panes WHERE ship='infra'", [])
+        .unwrap();
+    let started = Instant::now();
+    let relaunch = place.relaunch_cmd(&["--force"]);
+    assert!(!relaunch.status.success());
+    let stderr = String::from_utf8_lossy(&relaunch.stderr);
+    assert!(stderr.contains("predates relaunch support"), "{stderr}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    let requests: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM hosted_relaunches", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(requests, 0);
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_relaunch_refuses_a_second_harness_while_the_first_still_runs() {
+    let a = commit('a');
+    let mut place = Place::new();
+    place.on_release(&a);
+    let (place, herdr) = hosted(place);
+    let native = place.native_pid();
+    let relaunch = place
+        .command(&["host", "relaunch", "infra", "--force"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Once the request is in, the pane's lease passes to another holder while
+    // its harness still runs, so the request's pane has left without exiting.
+    until("the relaunch request", || {
+        place
+            .database()
+            .query_row("SELECT COUNT(*) FROM hosted_relaunches", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+            == 1
+    });
+    place
+        .database()
+        .execute(
+            "UPDATE presence SET holder='host:someone-else' WHERE ship='infra'",
+            [],
+        )
+        .unwrap();
+    let output = relaunch.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("still running"), "{stderr}");
+    assert_eq!(
+        unsafe { libc::kill(native, 0) },
+        0,
+        "the harness was stopped"
+    );
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    // The lease this test handed to someone else never heartbeats, so drop it
+    // before stopping the harness; otherwise teardown waits on it forever.
+    place
+        .database()
+        .execute("DELETE FROM presence WHERE ship='infra'", [])
+        .unwrap();
+    place.stop_native("infra");
 }

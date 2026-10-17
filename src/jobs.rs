@@ -774,6 +774,12 @@ fn identity(pid: u32) -> Result<Option<Process>> {
         zombie,
     }))
 }
+/// The start identity of a live process, or None once it has exited. A PID
+/// that was reused for another process has a different identity.
+pub(crate) fn process_identity(pid: u32) -> Result<Option<String>> {
+    Ok(identity(pid)?.filter(|p| !p.zombie).map(|p| p.started))
+}
+
 /// The PID namespace this process sees PID numbers in; constant for its life.
 #[cfg(target_os = "linux")]
 fn pid_namespace() -> Option<&'static str> {

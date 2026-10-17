@@ -35,6 +35,7 @@ pub const VERBS: &[&str] = &[
     "routes",
     "watch",
     "upgrade",
+    "host",
     "stow",
     "backlog",
     // Fleet-wide, handled before a home is needed.
@@ -1041,6 +1042,10 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         ship: &ship,
         holder: holder.clone(),
     });
+    // This pane's release, so bearings and upgrade status can report drift.
+    if hosted {
+        let _ = crate::host::upgrade::record(&store, &ship);
+    }
     // Bounded live starts are fresh: old history can retain facts from
     // resources no longer selected, and --continue cannot name the exact
     // session a plan digest was recorded for. Omitted selection keeps resumes.
@@ -1197,25 +1202,47 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     };
     let terminal = crate::host::sleep::Terminal::save();
     let mut holder = holder;
+    // A pane an upgrade relaunched while asleep, or catching up while idle,
+    // starts asleep: the upgrade does not wake the ship.
+    let mut start_asleep =
+        hosted && std::env::var("PRIVATEER_HOSTED_START_ASLEEP").as_deref() == Ok("1");
     let status = loop {
-        let mut child = match build(&holder, continuation).and_then(|mut command| {
-            command
-                .spawn()
-                .with_context(|| format!("cannot start {binary}; is it installed?"))
-        }) {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = crate::presence::leave(&store, &ship, &holder);
-                return Err(error);
+        let ended = if std::mem::take(&mut start_asleep) {
+            crate::host::started(&store, &ship, &holder)?;
+            crate::host::sleep::Ended::Asleep(crate::host::sleep::asleep_at_start(
+                &store, &ship, &holder,
+            )?)
+        } else {
+            let mut child = match build(&holder, continuation).and_then(|mut command| {
+                command
+                    .spawn()
+                    .with_context(|| format!("cannot start {binary}; is it installed?"))
+            }) {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = crate::presence::leave(&store, &ship, &holder);
+                    return Err(error);
+                }
+            };
+            if hosted {
+                // A failure to record readiness leaves the conservative reserved retry
+                // in place; never abandon an already spawned native process over it.
+                let _ = crate::host::started(&store, &ship, &holder);
+                let _ = crate::host::upgrade::harness(&store, &ship, child.id());
             }
+            crate::host::sleep::supervise(&store, &ship, &holder, &mut child, sleep_after)?
         };
-        if hosted {
-            // A failure to record readiness leaves the conservative reserved retry
-            // in place; never abandon an already spawned native process over it.
-            let _ = crate::host::started(&store, &ship, &holder);
-        }
-        match crate::host::sleep::supervise(&store, &ship, &holder, &mut child, sleep_after)? {
+        match ended {
             crate::host::sleep::Ended::Exited(status) => break status,
+            crate::host::sleep::Ended::Relaunch(reason, fenced, through) => {
+                // The harness has exited; leave its release behind for a fresh pane.
+                // Only a catch-up leaves that pane asleep, and only a ship that sleeps
+                // at all; a requested relaunch wakes it.
+                terminal.restore();
+                let start = crate::host::upgrade::start_point(reason, sleep_after, through);
+                crate::host::upgrade::retire(&store, &ship, &fenced, reason, start);
+                std::process::exit(0);
+            }
             crate::host::sleep::Ended::Asleep(asleep) => {
                 holder.clone_from(&asleep.holder);
                 if let Some(lease) = hosted_lease.as_mut() {
@@ -1225,6 +1252,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 else {
                     std::process::exit(0);
                 };
+                if matches!(reason, "relaunch" | "upgrade") {
+                    // Asleep before, asleep after: a sleeping pane stays asleep.
+                    crate::host::upgrade::retire(
+                        &store,
+                        &ship,
+                        &holder,
+                        reason,
+                        Some(asleep.through_seq),
+                    );
+                    std::process::exit(0);
+                }
                 continuation = claude_continuation()?;
                 // What admitted the first launch may have been revoked since.
                 let mut check = Store::open(home)?;

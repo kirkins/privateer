@@ -13,7 +13,7 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// Idle reports arrive every five seconds; an older one says nothing about now.
-const FRESH_MS: i64 = 15_000;
+pub(crate) const FRESH_MS: i64 = 15_000;
 
 /// Past the prompt cache's life and quiet compaction, so a first mate the
 /// captain is talking to never sleeps, and waking it costs little extra.
@@ -33,6 +33,12 @@ pub(crate) fn due(store: &Store, ship: &str, holder: &str, after_secs: u64) -> R
     if after_secs == 0 {
         return Ok(false);
     }
+    idle_for(store, ship, holder, after_secs)
+}
+
+/// Whether this session's adapter has been idle for `secs` without a break,
+/// with nothing ready for it.
+pub(crate) fn idle_for(store: &Store, ship: &str, holder: &str, secs: u64) -> Result<bool> {
     let now = Store::now_ms();
     let idle_since: Option<i64> = store
         .connection()
@@ -45,7 +51,7 @@ pub(crate) fn due(store: &Store, ship: &str, holder: &str, after_secs: u64) -> R
         .optional()?
         .flatten();
     Ok(
-        idle_since.is_some_and(|since| now - since >= (after_secs as i64).saturating_mul(1000))
+        idle_since.is_some_and(|since| now - since >= (secs as i64).saturating_mul(1000))
             && !crate::scheduling::has_ready(store, ship)?,
     )
 }
@@ -110,6 +116,38 @@ pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option
     Ok(crate::scheduling::has_ready(store, ship)?.then_some("scheduled work"))
 }
 
+/// A pane that starts asleep has no harness to stop: the mail already there
+/// wakes nothing, as it would have before a sleep. That is the mail through
+/// the sequence the retired pane recorded, so mail that arrived after it left
+/// but before this pane started still wakes it.
+pub(crate) fn asleep_at_start(store: &Store, ship: &str, holder: &str) -> Result<Asleep> {
+    let carried: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT start_through FROM host_launches WHERE ship=?1 AND holder=?2",
+            params![ship, holder],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let through_seq = match carried {
+        Some(through) => through,
+        None => store.connection().query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
+            [ship],
+            |r| r.get(0),
+        )?,
+    };
+    store.audit(
+        "host.slept",
+        &json!({"ship": ship, "idle_secs": 0, "through_seq": through_seq}),
+    )?;
+    Ok(Asleep {
+        holder: holder.to_owned(),
+        through_seq,
+    })
+}
+
 pub(crate) fn woke(
     store: &Store,
     ship: &str,
@@ -128,6 +166,9 @@ pub(crate) fn woke(
 pub(crate) enum Ended {
     Exited(std::process::ExitStatus),
     Asleep(Asleep),
+    /// Stopped at a safe point to move onto the current release, under the
+    /// holder its fence moved the lease to, and the mail sequence it had seen.
+    Relaunch(&'static str, String, i64),
 }
 
 /// Wait for a hosted harness, refreshing the lease, and stop it once the ship
@@ -153,9 +194,19 @@ pub(crate) fn supervise(
             // A replaced lease is never reclaimed; the session just runs on.
             leased = crate::presence::refresh(store, ship, holder, 90).unwrap_or(false);
         }
-        if leased && after_secs > 0 && checked.elapsed() >= Duration::from_secs(5) {
+        if leased && checked.elapsed() >= Duration::from_secs(5) {
             checked = Instant::now();
-            if let Ok(Some(asleep)) = sleep(store, ship, holder, after_secs) {
+            // Relaunch only when idle: a turn in progress is never interrupted
+            // unless its operator forced it.
+            if let Ok(Some((reason, fenced, through))) =
+                super::upgrade::fence(store, ship, holder, after_secs)
+            {
+                stop(child)?;
+                return Ok(Ended::Relaunch(reason, fenced, through));
+            }
+            if after_secs > 0
+                && let Ok(Some(asleep)) = sleep(store, ship, holder, after_secs)
+            {
                 stop(child)?;
                 return Ok(Ended::Asleep(asleep));
             }
@@ -192,7 +243,7 @@ impl Terminal {
 
     /// Undo what a stopped full-screen harness may have left behind: its
     /// raw mode, alternate screen, hidden cursor, mouse and key reporting.
-    fn restore(&self) {
+    pub(crate) fn restore(&self) {
         use std::io::Write;
         if let Some(mode) = &self.0 {
             unsafe { libc::tcsetattr(0, libc::TCSANOW, mode) };
@@ -308,6 +359,11 @@ fn wait(
             if !crate::presence::refresh(store, ship, &asleep.holder, 90)? {
                 return Ok(None);
             }
+        }
+        // Checked before mail: a pane behind the current release ends rather
+        // than start its harness here, and the dispatcher launches the new one.
+        if let Ok(Some(reason)) = super::upgrade::wanted_asleep(store, ship, &asleep.holder) {
+            return Ok(Some(reason));
         }
         if let Some(reason) = alarm(store, ship, asleep)? {
             return Ok(Some(reason));
