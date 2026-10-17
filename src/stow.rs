@@ -331,7 +331,15 @@ fn resume_here(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> 
     let reason = format!("stow {id} on {this} resumed at {resumed_ms}");
     let mut ended = 0;
     let mut skipped = vec![];
-    for member in crate::fleet::members(&crate::fleet::registry()?)? {
+    // The hold has already lifted, so nothing here may abort the resume: an
+    // error is recorded and the ships are still told.
+    let members = crate::fleet::registry()
+        .and_then(|registry| crate::fleet::members(&registry))
+        .unwrap_or_else(|error| {
+            skipped.push(format!("fleet registry: {error:#}"));
+            vec![]
+        });
+    for member in members {
         if !member.home.is_dir() {
             continue;
         }
@@ -339,9 +347,12 @@ fn resume_here(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> 
             skipped.push(member.home.display().to_string());
             continue;
         };
-        ended += crate::mail::end_stow_bound(&home, None, |stow| {
+        match crate::mail::end_stow_bound(&home, None, |stow| {
             (stow == id.as_str()).then(|| reason.clone())
-        })?;
+        }) {
+            Ok(count) => ended += count,
+            Err(error) => skipped.push(format!("{}: {error:#}", member.home.display())),
+        }
     }
     let body = resume_text(started_by.as_deref(), &this, holds);
     let mut told = vec![];

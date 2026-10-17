@@ -725,6 +725,43 @@ fn a_resume_of_all_from_the_reached_side_succeeds() {
 }
 
 #[test]
+fn a_resume_of_all_ends_requests_bound_to_each_machines_stow() {
+    // `--all` reaches each machine's own resume, so a request bound to either
+    // machine's stow ends when that stow lifts.
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    let stow_of = |machine: &Machine, ship: &str| -> String {
+        machine.ok(ship, "stow.start", json!({}));
+        machine.ok(ship, "stow.status", json!({}))["stow"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let ours = stow_of(&laptop, "liaison");
+    let theirs = stow_of(&mac, "fitforge");
+    let bind = |machine: &Machine, ship: &str, id: &str, stow: &str| {
+        let sent = machine.ok(
+            ship,
+            "mail.send",
+            json!({"id": id, "from": ship, "to": "captain", "kind": "request",
+                "body": "Resume the stow?", "payload": {"depends_on": {"stow": stow}}}),
+        );
+        assert_eq!(sent["state"], "open", "{sent}");
+    };
+    bind(&laptop, "liaison", "laptop-bound", &ours);
+    bind(&mac, "fitforge", "mac-bound", &theirs);
+
+    let all = laptop.run("liaison", &["stow", "resume", "--all"], Some(&mac_ssh));
+    assert!(all.status.success(), "{}", text(&all));
+    let state = |machine: &Machine, ship: &str, id: &str| {
+        machine.ok(ship, "mail.show", json!({"id": id}))["state"].clone()
+    };
+    assert_eq!(state(&laptop, "liaison", "laptop-bound"), "withdrawn");
+    assert_eq!(state(&mac, "fitforge", "mac-bound"), "withdrawn");
+}
+
+#[test]
 fn a_resume_of_all_lifts_the_linked_machines_first() {
     let (_temp, laptop, mac, ssh) = fixture();
     assert!(link(&laptop, &mac, &ssh).status.success());

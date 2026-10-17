@@ -480,9 +480,13 @@ where
     // A received copy is the sender's request: the sender's home closes it and
     // the closing notice carries the end here. So only rows this home sent, or
     // that a ship hosted here sent, are ended by this home.
+    // One write covers the scan and the ends: a sender that passed its stow
+    // check either committed before this scan or reads the resumed ledger.
+    let tx = store.write_transaction()?;
     let ids = {
         let mut statement = store.connection().prepare(
             "SELECT id FROM mail WHERE state='open'
+             AND json_extract(payload,'$.depends_on.stow') IS NOT NULL
              AND json_extract(payload,'$.depends_on.machine') IS ?1
              AND (delivery IS NOT 'received' OR sender IN
                (SELECT name FROM ships WHERE json_extract(record,'$.location')='here'))",
@@ -493,8 +497,6 @@ where
     };
     let mut ended = 0;
     for id in ids {
-        let tx = store.write_transaction()?;
-        // Read again inside the write: an answer or closure since the scan wins.
         if let Some(request) = by_id(store, &id)?.filter(|r| r["state"] == "open") {
             let stow = request["payload"]["depends_on"]["stow"]
                 .as_str()
@@ -504,8 +506,8 @@ where
                 ended += 1;
             }
         }
-        tx.commit()?;
     }
+    tx.commit()?;
     Ok(ended)
 }
 
