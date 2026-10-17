@@ -28,13 +28,15 @@ pub fn presence(ship: &Ship, ascii: bool) -> Span<'static> {
     Span::styled(glyph, Style::default().fg(style))
 }
 
-struct Work {
+struct Work<'a> {
     owned: usize,
     incoming: usize,
     pending: usize,
+    /// Task ids of jobs recorded as launching or running for this ship.
+    crew: Vec<&'a str>,
 }
 
-fn work(ship: &Ship, snapshot: &Snapshot) -> Work {
+fn work<'a>(ship: &Ship, snapshot: &'a Snapshot) -> Work<'a> {
     Work {
         owned: snapshot.tasks.iter().filter(|t| t.owner == ship.id).count(),
         incoming: snapshot
@@ -47,6 +49,12 @@ fn work(ship: &Ship, snapshot: &Snapshot) -> Work {
             .iter()
             .filter(|n| n.owner == ship.id)
             .count(),
+        crew: snapshot
+            .jobs
+            .iter()
+            .filter(|j| j.owner == ship.id && matches!(j.status.as_str(), "launching" | "running"))
+            .map(|j| j.task_id.as_str())
+            .collect(),
     }
 }
 
@@ -109,13 +117,14 @@ pub fn inbox(mail: &[Mail], errors: usize) -> String {
 
 /// Columns in the order they are dropped from the right on narrow screens,
 /// and whether each needs a live home observation.
-const COLUMNS: [(&str, u16, bool); 8] = [
+const COLUMNS: [(&str, u16, bool); 9] = [
     ("Ship", 0, false),
     ("Aboard", 13, true),
     ("Requests", 8, true),
     ("Unread", 6, true),
     ("Pending", 7, false),
     ("Tasks", 6, false),
+    ("Running crew", 16, false),
     ("Dispatcher", 10, true),
     ("Last wake", 14, true),
 ];
@@ -195,6 +204,16 @@ pub fn table(
                     format!("{} +{}", work.owned, work.incoming)
                 } else {
                     work.owned.to_string()
+                }),
+                Cell::from(match work.crew.as_slice() {
+                    [] => "·".to_owned(),
+                    [task] => format!("1 {}", clean(task, 40)),
+                    crew => format!("{} running", crew.len()),
+                })
+                .style(if work.crew.is_empty() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    attention()
                 }),
                 Cell::from(live.map_or("—", |l| if l.dispatcher { "running" } else { "stopped" }))
                     .style(Style::default().fg(if live.is_some_and(|l| !l.dispatcher) {

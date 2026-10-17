@@ -1028,8 +1028,8 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
         2
     );
     app.select_tab(0);
-    // Keep the complete origin visible even when the test root is a long
-    // isolated worktree path. Normal-width rendering is covered separately.
+    // Lists name ships rather than showing home paths; a path appears only in the
+    // details of the selected ship (here infra, not the delegating home).
     let bridge = screen_width(&mut app, 240);
     assert!(
         app.snapshot
@@ -1043,7 +1043,7 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
             .iter()
             .any(|j| j.id == "job-delegated" && j.home.as_ref() == Some(&home))
     );
-    assert!(bridge.contains(&home.display().to_string()));
+    assert!(!bridge.contains(&home.display().to_string()), "{bridge}");
     app.select_tab(3);
     assert!(
         app.snapshot
@@ -2246,16 +2246,18 @@ fn fleet_home_tabulates_live_ships_liaison_first_and_rows_open_their_workspace()
         .iter()
         .position(|l| l.contains("Fleet · recorded work"))
         .unwrap();
-    assert!(lines[header + 1].contains("zeta ·"), "{view}");
-    assert!(lines[header + 2].contains("apps ·"), "{view}");
-    assert!(lines[header + 3].contains("UNAVAILABLE"), "{view}");
-    assert!(view.contains("origin/home"));
+    // Line header+1 is the table header; ship rows follow in registry order.
+    assert!(lines[header + 1].contains("Running crew"), "{view}");
+    assert!(lines[header + 2].contains("zeta"), "{view}");
+    assert!(lines[header + 3].contains("apps"), "{view}");
+    assert!(lines[header + 4].contains("unavailable"), "{view}");
+    assert!(!view.contains("origin/home"), "{view}");
     // Clicking a Fleet row selects; it never creates/focuses a pane.
     let column = 1;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column,
-        row: header as u16 + 2,
+        row: header as u16 + 3,
         modifiers: KeyModifiers::NONE,
     });
     assert_eq!(app.ship.as_deref(), Some("apps"));
@@ -2264,6 +2266,6 @@ fn fleet_home_tabulates_live_ships_liaison_first_and_rows_open_their_workspace()
     assert!(!app.board_requested && !app.watch_requested);
     app.select_ship(None);
     let narrow = rows(&mut app, 80).join("\n");
-    assert!(narrow.contains("zeta ·") && narrow.contains("apps ·"));
+    assert!(narrow.contains("zeta") && narrow.contains("apps"));
     assert!(!narrow.contains("Last wake") && !narrow.contains("Dispatcher"));
 }

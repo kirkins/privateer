@@ -196,7 +196,7 @@ fn mouse_fleet_selection_and_scroll_never_open_agents_and_resize_clears_hit_map(
         ..App::default()
     };
     let screen = render(&mut app, 140, 40);
-    click_text(&mut app, &screen, "apps ·");
+    click_text(&mut app, &screen, "Apps");
     assert_eq!(app.ship.as_deref(), Some("apps"));
     assert!(!app.board_requested && !app.watch_requested);
     app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 80, 18));
@@ -544,7 +544,7 @@ fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
     };
     let home = render(&mut app, 120, 34);
     assert!(home.contains("Fleet"));
-    assert!(home.contains("research"));
+    assert!(home.contains("Research"));
     app.select_ship(Some("navigator".into()));
     let view = render(&mut app, 120, 34);
     assert!(view.contains("DEMO / sample only"));
@@ -708,9 +708,10 @@ fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
     app.select_ship(Some("apps".into()));
     let bridge = render(&mut app, 140, 40);
     assert!(!bridge.contains("Repeated connection facts"));
-    assert!(bridge.contains("Investigate the failing build"));
+    // The fleet table shows the running crew for apps (demo job build-1 on app-build).
+    assert!(bridge.contains("1 app-build"));
     app.select_tab(1);
-    assert!(render(&mut app, 140, 40).contains("Investigate the failing build"));
+    assert!(render(&mut app, 140, 40).contains("1 app-build"));
     assert_eq!(app.assignment_indices().len(), 1);
     app.select_tab(2);
     assert_eq!(app.scoped_panes().len(), 1);
@@ -723,7 +724,7 @@ fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
     app.select_ship(None);
     let home = render(&mut app, 140, 40);
     assert!(home.contains("Fleet"));
-    assert!(home.contains("research"));
+    assert!(home.contains("Research"));
 }
 
 #[test]
@@ -1088,12 +1089,63 @@ fn fleet_overview_says_how_to_talk_to_the_liaison() {
         ..App::default()
     };
     let screen = render(&mut app, 160, 34);
-    assert!(screen.contains("contact · origin/home /isolated/it's/.privateer"));
+    assert!(screen.contains("contact ★"));
+    assert!(!screen.contains("/isolated/it's"));
     assert!(!screen.contains("[l Talk to liaison]"));
     app.herdr_configured = true;
     let screen = render(&mut app, 160, 34);
     assert!(!screen.contains("opens its first mate"));
     assert!(!app.board_requested);
+}
+
+#[test]
+fn fleet_table_counts_running_crew_and_recent_completions_by_name_and_age() {
+    use privateer::dashboard::model::{Job, Recent, Ship};
+    let now = Store::now_ms();
+    let mut app = App {
+        snapshot: Snapshot {
+            ships: vec![Ship {
+                id: "apps".into(),
+                name: "Apps".into(),
+                ..Ship::default()
+            }],
+            jobs: vec![
+                Job {
+                    home: None,
+                    owner: "apps".into(),
+                    id: "job-1".into(),
+                    task_id: "build".into(),
+                    status: "running".into(),
+                },
+                Job {
+                    home: None,
+                    owner: "apps".into(),
+                    id: "job-2".into(),
+                    task_id: "old".into(),
+                    status: "succeeded".into(),
+                },
+            ],
+            recent: vec![Recent {
+                home: "/isolated/apps/.privateer".into(),
+                owner: "apps".into(),
+                task_id: "ship-fix".into(),
+                title: "Fix the ship".into(),
+                completed_ms: now - 12 * 60_000,
+            }],
+            ..Snapshot::default()
+        },
+        ..App::default()
+    };
+    let screen = render(&mut app, 120, 34);
+    assert!(screen.contains("Running crew"), "{screen}");
+    // Only jobs recorded as launching or running count as crew: the succeeded job
+    // would turn this into "2 running".
+    assert!(screen.contains("1 build"), "{screen}");
+    assert!(
+        screen.contains("Apps · ship-fix · Fix the ship · recorded completion 12 min ago"),
+        "{screen}"
+    );
+    assert!(!screen.contains("/isolated/apps"), "{screen}");
 }
 
 #[test]

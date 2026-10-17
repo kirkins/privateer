@@ -3,6 +3,7 @@ use super::{
     captain::{Composer, Exchange, HistoryBinding, Mail},
     herdr,
     model::{Snapshot, Task, clean},
+    overview,
 };
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -10,10 +11,10 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, List, ListItem, ListState, Paragraph, Table, TableState, Wrap},
 };
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -611,65 +612,26 @@ impl App {
             _ => {}
         }
     }
-    fn fleet_rows(&self) -> Vec<ListItem<'static>> {
+    /// A ship's display name from the registry; unregistered ids show as their id.
+    fn ship_name(&self, id: &str) -> String {
         self.snapshot
             .ships
             .iter()
-            .map(|s| {
-                let home = s.live.as_ref().map(|l| &l.home);
-                let tasks: Vec<_> = self
-                    .snapshot
-                    .tasks
-                    .iter()
-                    .filter(|t| {
-                        (t.owner == s.id || t.handoff_to.as_ref() == Some(&s.id))
-                            && !matches!(t.status.as_str(), "done" | "cancelled")
-                    })
-                    .collect();
-                let work = tasks
-                    .iter()
-                    .take(3)
-                    .map(|t| {
-                        format!(
-                            "{} {} [{}{}; owner {}{}; origin/home {}]",
-                            clean(&t.id, 160),
-                            clean(&t.title, 512),
-                            clean(&t.status, 40),
-                            t.scheduling
-                                .as_ref()
-                                .map_or(String::new(), |s| format!("; schedule {}", clean(s, 180))),
-                            clean(&t.owner, 160),
-                            t.handoff_to.as_ref().map_or(String::new(), |to| format!(
-                                "; offered to {} (not accepted)",
-                                clean(to, 160)
-                            )),
-                            clean(
-                                &t.home
-                                    .as_ref()
-                                    .map_or("sample".into(), |h| h.display().to_string()),
-                                512
-                            )
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                let location = home.map_or("origin/home unobserved".into(), |h| {
-                    format!("origin/home {}", clean(&h.display().to_string(), 512))
-                });
-                let state = s.live.as_ref().and_then(|l| l.error.as_ref()).map_or_else(
-                    || {
-                        if tasks.is_empty() {
-                            "no active work in bounded record".into()
-                        } else {
-                            work
-                        }
-                    },
-                    |e| format!("UNAVAILABLE {}", clean(e, 256)),
-                );
-                ListItem::new(format!("{} · {} · {}", clean(&s.id, 160), location, state))
-            })
-            .collect()
+            .find(|s| s.id == id)
+            .map_or_else(|| clean(id, 160), |s| clean(&s.name, 160))
     }
+    /// Names a home by the ship observed at it; never shows the home path in lists.
+    fn home_label(&self, home: Option<&Path>) -> String {
+        let Some(home) = home else {
+            return "sample".into();
+        };
+        self.snapshot
+            .ships
+            .iter()
+            .find(|s| s.live.as_ref().is_some_and(|l| l.home.as_path() == home))
+            .map_or_else(|| "unlisted home".into(), |s| clean(&s.name, 160))
+    }
+
     fn need_details(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if !self.notice.is_empty() {
@@ -735,6 +697,14 @@ impl App {
                 clean(&ship.name, 160),
                 clean(&ship.id, 160)
             )));
+            // The home path stays in this details pane (not the lists) so a
+            // same-named ship in another home can still be told apart.
+            if let Some(live) = &ship.live {
+                lines.push(Line::from(format!(
+                    "origin/home {}",
+                    clean(&live.home.display().to_string(), 512)
+                )));
+            }
             lines.push(Line::from(format!(
                 "{} scope: {}",
                 if self.demo { "Sample" } else { "Recorded" },
@@ -774,15 +744,23 @@ impl App {
             if let Some(error) = &source.error {
                 lines.push(Line::from(clean(error, 512)));
             }
-            lines.push(Line::from(format!(
-                "Unknown: {}",
-                source
-                    .unknown
-                    .iter()
-                    .map(|s| clean(s, 80))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            // One dim line: the first few names, then how many are left.
+            let unknown: Vec<_> = source.unknown.iter().map(|s| clean(s, 80)).collect();
+            let text = if unknown.is_empty() {
+                "Unknown: none listed".into()
+            } else {
+                let more = unknown.len().saturating_sub(3);
+                format!(
+                    "Unknown: {}{}",
+                    unknown[..unknown.len() - more].join(", "),
+                    if more > 0 {
+                        format!(" +{more} more")
+                    } else {
+                        String::new()
+                    }
+                )
+            };
+            lines.push(Line::styled(text, Style::default().fg(Color::DarkGray)));
         }
         if let Some(n) = self
             .attention
@@ -872,12 +850,7 @@ impl App {
                         "{} · {} · {} · {}",
                         clean(&m.from, 160),
                         clean(&m.status, 80),
-                        clean(
-                            &m.home
-                                .as_ref()
-                                .map_or("sample".into(), |h| h.display().to_string()),
-                            512
-                        ),
+                        self.home_label(m.home.as_deref()),
                         clean(&m.subject, 160)
                     ))
                 })
@@ -904,7 +877,7 @@ impl App {
         } else {
             let parts = Layout::vertical([
                 Constraint::Length(
-                    (self.snapshot.ships.len() as u16 + 2).min((rows[1].height / 3).max(3)),
+                    (self.snapshot.ships.len() as u16 + 3).min((rows[1].height / 3).max(3)),
                 ),
                 Constraint::Length(4),
                 Constraint::Min(3),
@@ -913,13 +886,21 @@ impl App {
             .split(rows[1]);
             let block =
                 Block::bordered().title("Fleet · recorded work · Enter: focus existing mate space");
-            self.mouse.fleet = block.inner(parts[0]);
+            let inner = block.inner(parts[0]);
+            // The table's header row sits above the ship rows; clicks map to rows only.
+            self.mouse.fleet = Rect {
+                y: inner.y + 1,
+                height: inner.height.saturating_sub(1),
+                ..inner
+            };
+            let (header, rows, widths) = overview::table(&self.snapshot, inner.width, self.ascii);
             let mut state =
-                ListState::default().with_selected(self.ship.as_ref().map(|_| self.ship_index()));
+                TableState::default().with_selected(self.ship.as_ref().map(|_| self.ship_index()));
             frame.render_stateful_widget(
-                List::new(self.fleet_rows())
+                Table::new(rows, widths)
+                    .header(header)
                     .block(block)
-                    .highlight_style(list_style),
+                    .row_highlight_style(list_style),
                 parts[0],
                 &mut state,
             );
@@ -973,12 +954,11 @@ impl App {
                 .map(|r| {
                     Line::styled(
                         format!(
-                            "{} · {} · {} · {} · recorded task completion {}ms",
-                            clean(&r.owner, 160),
+                            "{} · {} · {} · recorded completion {}",
+                            self.ship_name(&r.owner),
                             clean(&r.task_id, 160),
                             clean(&r.title, 512),
-                            clean(&r.home.display().to_string(), 512),
-                            r.completed_ms
+                            ago(r.completed_ms, now)
                         ),
                         Style::default().fg(if now - r.completed_ms > RECENT_MS / 2 {
                             Color::DarkGray
@@ -1056,4 +1036,30 @@ impl App {
 }
 fn age(value: Option<u64>) -> String {
     value.map_or("not connected".into(), |s| format!("{s}s ago"))
+}
+
+/// Coarse age of a recorded event, e.g. "just now", "12 min ago", "3 h ago".
+fn ago(then_ms: i64, now_ms: i64) -> String {
+    let minutes = (now_ms - then_ms).max(0) / 60_000;
+    match minutes {
+        0 => "just now".into(),
+        1..=59 => format!("{minutes} min ago"),
+        _ => format!("{} h ago", minutes / 60),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorded_completions_read_as_relative_ages() {
+        let now = 10_000_000_000;
+        assert_eq!(ago(now, now), "just now");
+        assert_eq!(ago(now - 59_999, now), "just now");
+        assert_eq!(ago(now - 12 * 60_000, now), "12 min ago");
+        assert_eq!(ago(now - 3 * 3_600_000 - 5 * 60_000, now), "3 h ago");
+        // A future timestamp (clock skew) never shows a negative age.
+        assert_eq!(ago(now + 60_000, now), "just now");
+    }
 }
