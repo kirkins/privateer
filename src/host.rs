@@ -32,9 +32,12 @@ fn claude_config() -> Option<(PathBuf, PathBuf)> {
     Some((home.join(".claude"), home.join(".claude.json")))
 }
 
-/// Whether Claude's folder-trust dialog was accepted for this folder or one
-/// above it. An interactive Claude in an untrusted folder stops at that
-/// dialog, whose default is to exit, with nobody at a hosted pane to answer.
+/// Whether Claude's folder-trust dialog was accepted for this very folder.
+/// An interactive Claude in an untrusted folder stops at that dialog, whose
+/// default declines, with nobody at a hosted pane to answer. Trust on a folder
+/// above does not do: a ship folder carries `init`'s permission rules in
+/// `.claude/settings.json`, and Claude asks again for a folder with its own
+/// rules (seen on 2.1.300 under an already trusted parent).
 /// Read only: Claude rewrites this file itself, so Privateer never writes it.
 fn claude_trusted(folder: &Path) -> bool {
     let Some(config) = claude_config()
@@ -43,10 +46,9 @@ fn claude_trusted(folder: &Path) -> bool {
     else {
         return false;
     };
-    folder.ancestors().any(|dir| {
-        dir.to_str()
-            .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
-    })
+    folder
+        .to_str()
+        .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
 }
 
 /// Whether Claude holds a conversation for this folder, which `--continue`
