@@ -36,8 +36,8 @@ const QUEUE_POLL: Duration = Duration::from_secs(1);
 struct Process {
     pid: u32,
     started: String,
-    /// PID namespaces have separate PID number spaces. A PID recorded inside
-    /// a nested namespace cannot be inspected or signalled by host PID.
+    /// The PID namespace the recorder saw this PID in. PID numbers and process
+    /// groups are namespace-local, so another namespace cannot inspect them.
     #[serde(default)]
     pid_namespace: Option<String>,
     #[serde(default)]
@@ -314,6 +314,7 @@ pub(crate) fn wait_for_workspace_disk(
     wait_for_capacity: bool,
     max_wait_secs: u64,
 ) -> Result<WorkspaceQueueLease> {
+    ensure_dispatcher_namespace(store)?;
     let ledger_path = ledger_path(store)?;
     let key = format!(
         "workspace:{}:{task}:{}",
@@ -737,11 +738,7 @@ fn identity(pid: u32) -> Result<Option<Process>> {
     Ok(Some(Process {
         pid,
         started: format!("linux:{boot}:{ticks}"),
-        pid_namespace: Some(
-            fs::read_link(format!("/proc/{pid}/ns/pid"))?
-                .to_string_lossy()
-                .into_owned(),
-        ),
+        pid_namespace: pid_namespace().map(str::to_owned),
         zombie: matches!(*state, "Z" | "X"),
     }))
 }
@@ -777,17 +774,45 @@ fn identity(pid: u32) -> Result<Option<Process>> {
         zombie,
     }))
 }
+/// The PID namespace this process sees PID numbers in; constant for its life.
 #[cfg(target_os = "linux")]
-fn current_pid_namespace() -> Result<Option<String>> {
-    Ok(Some(
-        fs::read_link("/proc/self/ns/pid")?
-            .to_string_lossy()
-            .into_owned(),
-    ))
+fn pid_namespace() -> Option<&'static str> {
+    static NAMESPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAMESPACE
+        .get_or_init(|| {
+            fs::read_link("/proc/self/ns/pid")
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .as_deref()
 }
 #[cfg(not(target_os = "linux"))]
-fn current_pid_namespace() -> Result<Option<String>> {
-    Ok(None)
+fn pid_namespace() -> Option<&'static str> {
+    None
+}
+/// Whether a recorded PID can be inspected here. Records without a namespace
+/// (legacy, or not Linux) are probed as before.
+fn addressable(process: &Process) -> bool {
+    process.pid_namespace.is_none() || process.pid_namespace.as_deref() == pid_namespace()
+}
+/// Work is recorded only in the PID namespace of this home's dispatcher, which
+/// settles it: a record made inside a PID sandbox could never be inspected,
+/// settled or cancelled from outside it. Until a dispatcher has run, any
+/// namespace may record.
+fn ensure_dispatcher_namespace(store: &Store) -> Result<()> {
+    let dispatcher: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT value FROM metadata WHERE key='pid_namespace'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ensure!(
+        dispatcher.is_none() || dispatcher.as_deref() == pid_namespace(),
+        "this caller is in another PID namespace than the home's dispatcher; run job and workspace commands outside the PID sandbox"
+    );
+    Ok(())
 }
 /// Compare a recorded start identity with a freshly observed one.
 fn same_start(recorded: &str, current: &str) -> bool {
@@ -833,10 +858,9 @@ fn leader_exited(pid: u32) -> Result<bool> {
     Ok(exited_unreaped(pid)?.is_some())
 }
 fn same_process(process: &Process) -> Result<bool> {
-    // A PID from another namespace is not addressable in this namespace.
-    // In particular, probing the same numeric PID can find an unrelated host
-    // process and falsely prove the recorded supervisor is gone.
-    if process.pid_namespace.is_some() && process.pid_namespace != current_pid_namespace()? {
+    // Probing the same number here could find an unrelated process, or none,
+    // and falsely prove the recorded one gone: treat it as alive.
+    if !addressable(process) {
         return Ok(true);
     }
     Ok(identity(process.pid)?
@@ -860,9 +884,7 @@ fn group_members(group: u32) -> Result<Vec<u32>> {
     Ok(members)
 }
 fn group_alive(process: &Process) -> Result<bool> {
-    // Process-group IDs are also namespace-local. Preserve the reservation
-    // when this observer cannot address the namespace that recorded the PID.
-    if process.pid_namespace.is_some() && process.pid_namespace != current_pid_namespace()? {
+    if !addressable(process) {
         return Ok(true);
     }
     // A live original leader anchors identity. If it vanished, an orphaned
@@ -997,7 +1019,7 @@ const UNPROVEN_LEADER: &str = "payload leader missing or changed; cannot discove
 /// child (observed with waitid), which by itself keeps the PID and process
 /// group id from being reused, so the leader's identity is not re-inspected.
 fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Process>>> {
-    if process.pid_namespace.is_some() && process.pid_namespace != current_pid_namespace()? {
+    if !addressable(process) {
         return Ok(None);
     }
     if !reserved {
@@ -1024,7 +1046,7 @@ fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Proce
 }
 fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<()> {
     ensure!(
-        process.pid_namespace.is_none() || process.pid_namespace == current_pid_namespace()?,
+        addressable(process),
         "payload process group belongs to another PID namespace; refusing signal"
     );
     // A still-live recorded member anchors this exact group even if its
@@ -1182,6 +1204,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         args.get("production").and_then(Value::as_bool) != Some(true),
         "production execution is not supported by the ordinary job runner"
     );
+    ensure_dispatcher_namespace(store)?;
     let task_id = args
         .get("task_id")
         .and_then(Value::as_str)
@@ -2509,10 +2532,18 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
     }
     Ok(job)
 }
-/// Reconcile jobs whose supervisor is gone, and repair the narrow completion
-/// before reservation-release crash window. This runs only in the owning
-/// home's dispatcher; reads never make process-visibility decisions.
+/// Reconcile jobs whose supervisor is gone, so their outcome is recorded
+/// without anyone asking for their status, and release finished jobs' capacity
+/// a crash left reserved. Only the dispatcher runs this, and it records its
+/// PID namespace as the one work must be recorded in.
 pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
+    if let Some(namespace) = pid_namespace() {
+        store.connection().execute(
+            "INSERT INTO metadata(key, value) VALUES('pid_namespace', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [namespace],
+        )?;
+    }
     let mut statement = store.connection().prepare("SELECT record FROM jobs")?;
     let jobs: Vec<Job> = statement
         .query_map([], |r| r.get::<_, String>(0))?
@@ -2526,9 +2557,10 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         let id = job.id.clone();
         let before = job.status.clone();
         let result = (|| -> Result<Option<Job>> {
-            if !terminal(&job.status)
-                && job.supervisor.as_ref().map(same_process).transpose()? == Some(true)
-            {
+            // A live supervisor is checked cheaply and left to finish its job.
+            let supervised = !terminal(&job.status)
+                && job.supervisor.as_ref().map(same_process).transpose()? == Some(true);
+            if supervised {
                 return Ok(None);
             }
             Ok(Some(reconcile(store, job, &mut reserved)?))
