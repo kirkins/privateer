@@ -146,11 +146,25 @@ try {
   assert(refused.text.includes("captain's keyboard"));assert.equal(call("permissions.show").mode,"standard");
   assert((await fire("command.run",{command:"back",args:"now",origin:{kind:"composer"}})).text.startsWith("Usage:"));
   // A hosted session has nobody to resume mail after a native error: it retries a minute later.
-  await fire("session.end",{});nativeEnv.PRIVATEER_HOSTED="1";await load();
+  await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"start:test"});
+  call("ship.attend",{ship:"ship",holder:"host:test",ttl_secs:90});
+  Object.assign(nativeEnv,{PRIVATEER_HOSTED:"1",PRIVATEER_PRESENCE_HOLDER:"host:test"});await load();
   const hostedStart=queue.length;send();await tick();assert.equal(queue.length,hostedStart+1);
   await begin(queue.at(-1).text);await end({reason:"error"});send();await tick();assert.equal(queue.length,hostedStart+1);
   later=61000;await tick();assert.equal(queue.length,hostedStart+2,"hosted mail retries after a minute");
   await begin(queue.at(-1).text);await end();later=0;
+  // Ready scheduled work reaches an idle hosted session as one turn, claimed at its start and settled at its end.
+  call("task.create",{id:"repair",parent:"ship-duty",owner:"ship",title:"Repair"});
+  call("task.enqueue",{id:"repair",brief:"Complete the prepared fixture task with evidence."});
+  const beforeWork=queue.length;await tick();assert.equal(queue.length,beforeWork+1,"an empty inbox still delivers ready work");
+  await tick();assert.equal(queue.length,beforeWork+1,"a pending offer does not repeat");
+  await begin(queue.at(-1).text);await flush();
+  assert.equal(call("work.status",{ship:"ship"}).tasks.find(t=>t.task_id==="repair").state,"claimed");
+  call("task.update",{id:"repair",actor:"ship",status:"done"});await end();await flush();
+  assert(call("wake.list",{ship:"ship"}).wakes.some(w=>w.status==="succeeded"),"the settled offer is recorded");
+  await tick();assert.equal(queue.length,beforeWork+1,"completed work leaves the session idle");
+  await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"host:test"});
+  call("ship.attend",{ship:"ship",holder:"start:test",ttl_secs:90});nativeEnv.PRIVATEER_PRESENCE_HOLDER="start:test";
   await fire("session.end",{});delete nativeEnv.PRIVATEER_HOSTED;await load();
   // Live hooks stay silent only while the mod heartbeat is fresh.
   send();
