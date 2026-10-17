@@ -273,7 +273,9 @@ fn ledger(path: &Path) -> Result<Connection> {
     conn.busy_timeout(Duration::from_secs(5))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);",
+        "CREATE TABLE IF NOT EXISTS reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS released (key TEXT PRIMARY KEY, cpus REAL NOT NULL,
+           load REAL NOT NULL, released_ms INTEGER NOT NULL);",
     )?;
     admission::init(&conn)?;
     crate::routes::init(&conn)?;
@@ -561,6 +563,7 @@ fn reserve(
                     demand: reservation.demand,
                     charter_min_free_bytes: floor.charter_min_free_bytes,
                     disk_path: floor.path,
+                    released_load: released_load(conn, Store::now_ms())?,
                 },
             )?;
             if from_queue {
@@ -615,13 +618,63 @@ fn update_reservation(store: &Store, job: &Job) -> Result<()> {
     }
     result
 }
+/// How long a finished job's load is credited back: by then the one-minute
+/// average has forgotten all but a fraction of a percent of it.
+const RELEASED_WINDOW_MS: i64 = 600_000;
+
 fn release(store: &Store, job: &Job) -> Result<()> {
     let conn = ledger(&job.ledger)?;
-    conn.execute(
-        "DELETE FROM reservations WHERE key=?1",
-        [reservation_key(store.home(), &job.id, &job.incarnation)],
-    )?;
+    let key = reservation_key(store.home(), &job.id, &job.incarnation);
+    let held: Option<String> = conn
+        .query_row(
+            "SELECT record FROM reservations WHERE key=?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let cpus = held
+        .and_then(|raw| serde_json::from_str::<Reservation>(&raw).ok())
+        .and_then(|r| r.demand)
+        .map(|d| d.cpus)
+        .filter(|cpus| *cpus > 0.0);
+    // Remember what an ended job adds to the load average, so admission
+    // does not wait for the average to forget it.
+    if let Some(cpus) = cpus {
+        let load = admission::measure().map(|host| host.load).unwrap_or(cpus);
+        let now = Store::now_ms();
+        conn.execute(
+            "INSERT OR REPLACE INTO released(key, cpus, load, released_ms) VALUES(?1, ?2, ?3, ?4)",
+            params![key, cpus, load, now],
+        )?;
+        conn.execute(
+            "DELETE FROM released WHERE released_ms < ?1",
+            [now - RELEASED_WINDOW_MS],
+        )?;
+    }
+    conn.execute("DELETE FROM reservations WHERE key=?1", [key])?;
     Ok(())
+}
+
+/// The load the average still carries from jobs that ended recently.
+fn released_load(conn: &Connection, now_ms: i64) -> Result<f64> {
+    let mut statement =
+        conn.prepare("SELECT cpus, load, released_ms FROM released WHERE released_ms >= ?1")?;
+    let rows = statement.query_map([now_ms - RELEASED_WINDOW_MS], |r| {
+        Ok((
+            r.get::<_, f64>(0)?,
+            r.get::<_, f64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    // Jobs that ended together each count, but together never more than the
+    // load there was when the latest of them ended.
+    let (mut total, mut cap) = (0.0_f64, 0.0_f64);
+    for row in rows {
+        let (cpus, load, at) = row?;
+        total += admission::released_load(cpus, load, now_ms - at);
+        cap = cap.max(admission::released_load(load, load, now_ms - at));
+    }
+    Ok(total.min(cap))
 }
 /// Start identity must not depend on the caller's environment: status, cancel
 /// and recovery may run from a shell, SSH session or service with another
@@ -2619,6 +2672,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             status["disk_floor_met"] =
                 json!(host.disk_available_bytes >= settings.min_free_disk_bytes);
             status["model_routes"] = json!(crate::routes::list(&conn)?);
+            let now = Store::now_ms();
+            status["released_load"] = json!(released_load(&conn, now)?);
+            status["recently_ended"] = json!(conn.query_row(
+                "SELECT COUNT(*) FROM released WHERE released_ms >= ?1",
+                [now - RELEASED_WINDOW_MS],
+                |r| r.get::<_, i64>(0)
+            )?);
             Ok(status)
         }
         _ => bail!("unknown jobs command {command}"),
