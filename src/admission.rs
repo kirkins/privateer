@@ -114,6 +114,18 @@ pub struct Request<'a> {
     pub demand: Option<Demand>,
     pub charter_min_free_bytes: u64,
     pub disk_path: &'a std::path::Path,
+    /// Load the one-minute average still carries from jobs that just ended,
+    /// which no longer run (see `released_load`).
+    pub released_load: f64,
+}
+
+/// What the one-minute load average still holds of a job that ended
+/// `ago_ms` ago: the average forgets with a one-minute time constant. The
+/// job's share is its estimated CPUs, but never more than the whole load
+/// when it ended.
+pub fn released_load(cpus: f64, load_at_release: f64, ago_ms: i64) -> f64 {
+    let share = cpus.min(load_at_release).max(0.0);
+    share * (-(ago_ms.max(0) as f64) / 60_000.0).exp()
 }
 
 pub fn init(conn: &Connection) -> Result<()> {
@@ -322,12 +334,16 @@ pub fn admit(
     // CPU: there must be headroom now, counting jobs that just started. The
     // job's own estimate then counts against the next request during its
     // ramp, so one job is never refused for its own size alone.
-    let per_cpu = (host.load + recent_cpus) / host.cpus;
+    // A job that just ended still shows in the load average for minutes;
+    // it no longer runs, so it does not hold the next one back.
+    let load = (host.load - request.released_load).max(0.0);
+    let per_cpu = (load + recent_cpus) / host.cpus;
     refuse_unless!(
         per_cpu < settings.max_load_per_cpu,
-        "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
+        "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {:.1} of it from jobs that just ended, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
         settings.max_load_per_cpu,
         host.load,
+        request.released_load.min(host.load),
         host.cpus
     );
     // Memory: running out is worse than waiting, so the job's own estimate
@@ -466,4 +482,62 @@ fn memory() -> Result<(u64, u64)> {
 /// Settings and live readings for resource.status.
 pub fn report(settings: &Settings, host: &Host) -> Value {
     json!({"settings": settings, "host": host})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(load: f64) -> Host {
+        Host {
+            cpus: 10.0,
+            load,
+            memory_available_bytes: 8 * GIB,
+            memory_total_bytes: 16 * GIB,
+            disk_available_bytes: 0,
+            disk_total_bytes: 0,
+        }
+    }
+
+    fn heavy(released_load: f64) -> Request<'static> {
+        Request {
+            heavy: true,
+            home: std::path::Path::new("/"),
+            charter: "app",
+            charter_cap: None,
+            demand: Some(Demand {
+                cpus: 10.0,
+                memory_bytes: 2 * GIB,
+            }),
+            charter_min_free_bytes: 0,
+            disk_path: std::path::Path::new("/"),
+            released_load,
+        }
+    }
+
+    #[test]
+    fn a_build_that_just_ended_does_not_hold_back_the_next_one() {
+        let settings = Settings {
+            min_free_disk_bytes: 0,
+            ..Settings::default()
+        };
+        // The average still shows the last build: 14 on 10 CPUs.
+        let lingering = host(14.0);
+        assert!(admit(&settings, &lingering, 0, &[], &heavy(0.0)).is_err());
+        let credit = released_load(10.0, 14.0, 5_000);
+        assert!(admit(&settings, &lingering, 0, &[], &heavy(credit)).is_ok());
+        // Other load still counts: credit only covers what the job could
+        // have caused.
+        let busy = host(25.0);
+        assert!(admit(&settings, &busy, 0, &[], &heavy(credit)).is_err());
+    }
+
+    #[test]
+    fn released_load_fades_with_the_one_minute_average_and_never_exceeds_it() {
+        assert_eq!(released_load(10.0, 14.0, 0), 10.0);
+        assert_eq!(released_load(10.0, 4.0, 0), 4.0);
+        let minute = released_load(10.0, 14.0, 60_000);
+        assert!((minute - 10.0 / std::f64::consts::E).abs() < 1e-9);
+        assert!(released_load(10.0, 14.0, 600_000) < 0.001);
+    }
 }
