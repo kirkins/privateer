@@ -57,37 +57,127 @@ fn claude_trusted(folder: &Path) -> bool {
         .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
 }
 
-/// Whether Claude holds an interactive conversation for this folder, which
-/// `--continue` needs: without one, an interactive `--continue` exits. Claude
-/// keeps a folder's transcripts under its path with every other character a
-/// dash, and `--continue` passes over headless (`claude -p`, entrypoint
-/// `sdk-cli`) ones, which a ship's wakes and errands leave there; only a
-/// transcript whose opening records name the `cli` entrypoint counts.
-pub(crate) fn claude_has_conversation(folder: &Path) -> bool {
-    use std::io::Read;
+/// Bytes read from one transcript while looking for its first entrypoint
+/// record. Current Claude Code writes about 105 KB of other records before it.
+const TRANSCRIPT_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// What a folder's Claude transcripts say about `--continue`, which needs an
+/// interactive conversation: without one, an interactive `--continue` exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Conversation {
+    /// A transcript's first entrypoint record is `cli`: `--continue` resumes it.
+    Interactive,
+    /// The folder has no transcript at all.
+    NoTranscript,
+    /// Transcripts exist, but none holds an interactive conversation: headless
+    /// (`sdk-cli`) wakes and errands leave them, and `--continue` passes over.
+    HeadlessOnly,
+    /// A transcript had no entrypoint record within the scan bound, so it may
+    /// still hold an interactive conversation.
+    BoundReached,
+}
+
+impl Conversation {
+    pub(crate) fn continues(self) -> bool {
+        self == Self::Interactive
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::NoTranscript => "no transcript",
+            Self::HeadlessOnly => "headless only",
+            Self::BoundReached => "bound reached",
+        }
+    }
+}
+
+/// One transcript's verdict, decided by its first record with an `entrypoint`.
+enum Scan {
+    Interactive,
+    Headless,
+    /// Read to the end of the file without an entrypoint record.
+    Unmarked,
+    /// The scan bound ended before any entrypoint record.
+    Undecided,
+}
+
+/// Reads records in order, stopping at the first with an `entrypoint` field,
+/// so the decision never depends on a byte window a long preamble can overrun.
+/// A line that does not parse, such as one cut at the bound, is skipped.
+fn scan_transcript(path: &Path) -> std::io::Result<Scan> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut reader = BufReader::new(std::fs::File::open(path)?.take(TRANSCRIPT_SCAN_BYTES));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(if reader.get_ref().limit() == 0 {
+                Scan::Undecided
+            } else {
+                Scan::Unmarked
+            });
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if let Some(entrypoint) = record["entrypoint"].as_str() {
+            return Ok(if entrypoint == "cli" {
+                Scan::Interactive
+            } else {
+                Scan::Headless
+            });
+        }
+    }
+}
+
+/// Claude keeps a folder's transcripts under its path with every other
+/// character a dash. Only a transcript whose first entrypoint record names the
+/// `cli` entrypoint counts as a conversation `--continue` can resume.
+pub(crate) fn claude_conversation(folder: &Path) -> Conversation {
     let Some((dir, _)) = claude_config() else {
-        return false;
+        return Conversation::NoTranscript;
     };
     let name: String = folder
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let interactive = |path: &Path| {
-        let mut head = Vec::new();
-        std::fs::File::open(path)
-            .and_then(|file| file.take(64 * 1024).read_to_end(&mut head))
-            .is_ok_and(|_| {
-                let mark = br#""entrypoint":"cli""#;
-                head.windows(mark.len()).any(|w| w == mark)
-            })
+    let Ok(entries) = std::fs::read_dir(dir.join("projects").join(name)) else {
+        return Conversation::NoTranscript;
     };
-    std::fs::read_dir(dir.join("projects").join(name)).is_ok_and(|entries| {
-        entries.flatten().any(|e| {
-            let path = e.path();
-            path.extension().is_some_and(|x| x == "jsonl") && interactive(&path)
-        })
-    })
+    let mut found = false;
+    let mut undecided = false;
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_none_or(|x| x != "jsonl") {
+            continue;
+        }
+        match scan_transcript(&path) {
+            Ok(Scan::Interactive) => return Conversation::Interactive,
+            Ok(Scan::Headless | Scan::Unmarked) => found = true,
+            Ok(Scan::Undecided) => undecided = true,
+            Err(_) => {}
+        }
+    }
+    if undecided {
+        Conversation::BoundReached
+    } else if found {
+        Conversation::HeadlessOnly
+    } else {
+        Conversation::NoTranscript
+    }
+}
+
+/// What a hosted first mate's launch would resume, for a Claude first mate
+/// without a bounded tool plan (`None` where no `--continue` applies at all).
+pub(crate) fn continuation(folder: &Path, first_mate: &Value) -> Option<Conversation> {
+    (first_mate["manifest"]
+        .as_str()
+        .and_then(crate::bundled::harness)
+        .as_deref()
+        == Some("claude")
+        && first_mate.get("tool_bundles").is_none())
+    .then(|| claude_conversation(folder))
 }
 
 pub(crate) fn validate(host: &Value) -> Result<Value> {
@@ -334,9 +424,14 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         settle(store, &mut client, &pane.workspace_id, "mate", ship);
         let launched =
             json!({"holder": holder, "pane": pane.pane_id, "workspace": pane.workspace_id});
+        // The pane decides the same from this folder moments later; the
+        // dispatcher records what that decision will be.
+        let continuation = continuation(folder, profile);
         store.audit(
             "host.launched",
-            &json!({"ship": ship, "launched": launched}),
+            &json!({"ship": ship, "launched": launched,
+                "continued": continuation.map(Conversation::continues),
+                "continuation": continuation.map(Conversation::label)}),
         )?;
         Ok(launched)
     })();

@@ -974,14 +974,19 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     }
     // Rechecked at every launch: a session that slept has a conversation to
     // continue even if its first launch had none.
-    let claude_continues = || -> Result<bool> {
-        Ok(hosted
+    let claude_continuation = || -> Result<Option<crate::host::Conversation>> {
+        let applies = hosted
             && harness == "claude"
             && bundle_plan.is_none()
             && !["--continue", "-c", "--resume", "-r", "--session-id"]
                 .iter()
-                .any(|flag| chooses(flag))
-            && crate::host::claude_has_conversation(&folder.canonicalize()?))
+                .any(|flag| chooses(flag));
+        if !applies {
+            return Ok(None);
+        }
+        Ok(Some(crate::host::claude_conversation(
+            &folder.canonicalize()?,
+        )))
     };
     let control = crate::executable::installed()?;
     let plugins = fs::canonicalize(plugins_dir()?)?;
@@ -1014,7 +1019,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     } else if harness == "cursor" {
         cursor_settings(folder, &control)?;
     }
-    let build = |holder: &str| -> Result<std::process::Command> {
+    let build = |holder: &str,
+                 continuation: Option<crate::host::Conversation>|
+     -> Result<std::process::Command> {
         let mut command = std::process::Command::new("python3");
         command.arg(plugins.join("native_launch.py"));
         if let Some(plan) = &bundle_plan {
@@ -1039,8 +1046,20 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             command.arg("--standalone");
         }
         command.args(&route);
-        if claude_continues()? {
-            command.arg("--continue");
+        match continuation {
+            Some(conversation) if conversation.continues() => {
+                command.arg("--continue");
+            }
+            // Transcripts exist yet none can be resumed: say so on the pane
+            // rather than let a fresh session pass for the old one.
+            Some(
+                conversation @ (crate::host::Conversation::HeadlessOnly
+                | crate::host::Conversation::BoundReached),
+            ) => eprintln!(
+                "warning: this ship's Claude folder has transcripts ({}), none to continue; starting a fresh session",
+                conversation.label()
+            ),
+            _ => {}
         }
         command
             .args(passthrough)
@@ -1086,8 +1105,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     };
     let terminal = crate::host::sleep::Terminal::save();
     let mut holder = holder;
+    let mut continuation = claude_continuation()?;
     let status = loop {
-        let mut child = match build(&holder).and_then(|mut command| {
+        let mut child = match build(&holder, continuation).and_then(|mut command| {
             command
                 .spawn()
                 .with_context(|| format!("cannot start {binary}; is it installed?"))
@@ -1115,7 +1135,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 else {
                     std::process::exit(0);
                 };
-                crate::host::sleep::woke(&store, &ship, reason);
+                continuation = claude_continuation()?;
+                crate::host::sleep::woke(&store, &ship, reason, continuation);
                 // What admitted the first launch may have been revoked since.
                 let mut check = Store::open(home)?;
                 let profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;

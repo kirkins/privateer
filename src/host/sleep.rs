@@ -110,8 +110,18 @@ pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option
     Ok(crate::scheduling::has_ready(store, ship)?.then_some("scheduled work"))
 }
 
-pub(crate) fn woke(store: &Store, ship: &str, reason: &str) {
-    let _ = store.audit("host.woke", &json!({"ship": ship, "reason": reason}));
+pub(crate) fn woke(
+    store: &Store,
+    ship: &str,
+    reason: &str,
+    continuation: Option<crate::host::Conversation>,
+) {
+    let _ = store.audit(
+        "host.woke",
+        &json!({"ship": ship, "reason": reason,
+            "continued": continuation.map(crate::host::Conversation::continues),
+            "continuation": continuation.map(crate::host::Conversation::label)}),
+    );
 }
 
 /// How the native harness ended under `supervise`.
