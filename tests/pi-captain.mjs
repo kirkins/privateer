@@ -25,12 +25,18 @@ said = await run("stow", "sideways");
 assert.equal(said.level, "warning");
 assert.match(said.text, /Usage/);
 said = await run("stow", "");
-assert.match(said.text, /Stowing the fleet/);
+assert.match(said.text, /Stowing this machine/);
 assert.match(said.text, /asked fixture to stow/);
 said = await run("stow", " status ");
 assert.match(said.text, /\(held\)/);
 said = await run("stow", "resume");
-assert.match(said.text, /Resumed the fleet/);
+assert.match(said.text, /Resumed this machine/);
+// `/stow resume all` lifts every linked machine this one reaches first. This
+// fixture has no linked machine, and this one resumed above, so there is
+// nothing left for it to lift: say that, not that it resumed.
+said = await run("stow", "resume all");
+assert.equal(said.level, "info", said.text);
+assert.match(said.text, /was not stowed/);
 said = await run("ships", "");
 assert.match(said.text, /fixture/);
 said = await run("yolo", "status");

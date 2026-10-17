@@ -674,10 +674,17 @@ impl<'a> Session<'a> {
                     .into_iter()
                     .next()
                     .context("the fleet has no ships")?;
-                // `/stow mac` names a linked machine to stow over its link.
+                // `/stow mac` names a linked machine to stow over its link, and
+                // `/stow resume all` lifts every machine this one reaches.
                 let mut request = json!({});
                 if let Some(machine) = args.get("machine").filter(|v| !v.is_null()) {
                     request["machine"] = machine.clone();
+                }
+                if args
+                    .get("all")
+                    .is_some_and(|all| all.as_bool() == Some(true))
+                {
+                    request["all"] = json!(true);
                 }
                 crate::dispatch(self.store(&home)?, command, request)
             }

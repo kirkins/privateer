@@ -7,8 +7,9 @@ import { dirname, isAbsolute } from "node:path";
 // the captain rather than under the ship's agent identity.
 const COMMANDS = {
   stow: {
-    description: "Stow the fleet before an update: /stow, /stow status or /stow resume",
-    argv: rest => ({ "": ["stow"], status: ["stow", "status"], resume: ["stow", "resume"] })[rest],
+    description: "Stow this machine before an update: /stow, /stow status, /stow resume, /stow resume all",
+    argv: rest => ({ "": ["stow"], status: ["stow", "status"], resume: ["stow", "resume"],
+      "resume all": ["stow", "resume", "--all"] })[rest],
   },
   yolo: {
     description: "Fleet tool approvals for every first mate: /yolo on, off or status",

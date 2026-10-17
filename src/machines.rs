@@ -635,6 +635,104 @@ pub(crate) fn stow_linked(name: &str, command: &str) -> Result<Value> {
     call(&machine, command, json!({}), None)
 }
 
+/// Asking a linked machine about its own stow, when it may be asleep.
+const STOW_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The name this machine is known by: what it chose when it made a link, or
+/// the host's own name in a fleet that has never been linked. A stow is one
+/// machine's hold, so a notice about it must say which machine.
+pub(crate) fn this_machine() -> String {
+    let names = || -> Vec<String> {
+        let Ok(path) = crate::fleet::registry_path() else {
+            return vec![];
+        };
+        if !path.is_file() || !ever_linked(&path) {
+            return vec![];
+        }
+        let Ok(conn) = crate::fleet::registry() else {
+            return vec![];
+        };
+        let Ok(rows) = machines(&conn) else {
+            return vec![];
+        };
+        let mut names: Vec<String> = rows
+            .into_iter()
+            // Only a machine this one reaches carries the name this side chose.
+            .filter(|m| m.role == "collects")
+            .filter_map(|m| m.known_as)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let host = || match hostname() {
+        name if name.is_empty() => "unknown".to_owned(),
+        name => name,
+    };
+    // Links that disagree about this machine's name leave it to the host.
+    match names().as_slice() {
+        [one] => one.clone(),
+        _ => host(),
+    }
+}
+
+/// A machine's hold, as that machine reports it. `held` is null where nothing
+/// here can know it, never false.
+pub(crate) struct Stow {
+    pub(crate) name: String,
+    /// Whether this machine reached the other one to ask it.
+    pub(crate) asked: bool,
+    pub(crate) held: Option<bool>,
+    pub(crate) error: Option<String>,
+}
+
+/// What each machine linked to this one says about its own stow. A machine
+/// this one reaches is asked over its link, and a machine that reaches this
+/// one is named and left unknown: a link is one-way, so nothing here can ask
+/// it, and an unknown hold is never read as a lifted one.
+pub(crate) fn elsewhere(command: &str) -> Result<Vec<Stow>> {
+    let Ok(path) = crate::fleet::registry_path() else {
+        return Ok(vec![]);
+    };
+    if !path.is_file() || !ever_linked(&path) {
+        return Ok(vec![]);
+    }
+    let conn = crate::fleet::registry()?;
+    let mut holds = vec![];
+    for machine in machines(&conn)? {
+        if machine.role != "collects" {
+            holds.push(Stow {
+                name: machine.name,
+                asked: false,
+                held: None,
+                error: None,
+            });
+            continue;
+        }
+        // A sleeping machine must not hold the captain behind the link's full
+        // timeout: an unknown answer is reported, not waited out.
+        holds.push(
+            match call(&machine, command, json!({}), Some(STOW_TIMEOUT)) {
+                Ok(result) => Stow {
+                    name: machine.name,
+                    asked: true,
+                    // A machine that answers without saying whether it is
+                    // stowed has not said it is running: keep it unknown.
+                    held: result["held"].as_bool(),
+                    error: None,
+                },
+                Err(error) => Stow {
+                    name: machine.name,
+                    asked: true,
+                    held: None,
+                    error: Some(format!("{error:#}")),
+                },
+            },
+        );
+    }
+    Ok(holds)
+}
+
 /// The linked machine other than `except` whose directory lists `name`.
 pub(crate) fn ship_elsewhere(
     conn: &Connection,
