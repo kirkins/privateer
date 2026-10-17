@@ -224,7 +224,34 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .unwrap_or(repo.to_str().context("repository path is not UTF-8")?);
             ensure!(Path::new(selected).is_absolute(), "cwd must be absolute");
             let selected = fs::canonicalize(selected)?;
-            let exec = execution(store, task, &repo, &selected, true, None)?;
+            let wait_for_capacity = args
+                .get("wait_for_capacity")
+                .map(|v| v.as_bool().context("wait_for_capacity must be boolean"))
+                .transpose()?
+                .unwrap_or(false);
+            let max_wait_secs = match args.get("max_wait_secs") {
+                Some(value) => value
+                    .as_u64()
+                    .filter(|seconds| (1..=86_400).contains(seconds))
+                    .context("max_wait_secs must be 1..86400")?,
+                None => 3600,
+            };
+            ensure!(
+                wait_for_capacity || args.get("max_wait_secs").is_none(),
+                "max_wait_secs requires wait_for_capacity"
+            );
+            let exec = execution(
+                store,
+                task,
+                &repo,
+                &selected,
+                true,
+                None,
+                WorkspaceWait {
+                    wait_for_capacity,
+                    max_wait_secs,
+                },
+            )?;
             ensure!(
                 exec.lease_id.is_some(),
                 "workspace.acquire requires a Git repository"

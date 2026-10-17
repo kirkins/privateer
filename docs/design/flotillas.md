@@ -69,13 +69,14 @@ arbitrates memory and CPU (see [admission](../architecture.md#runtime-boundary))
 first come first served, at no model cost and without any ship commanding
 another.
 
-**Disk first.** A host-wide free-disk floor in the shared admission settings,
-set with `resource.configure` like the memory floor and shown by
-`resource.status`. A job or workspace that would start below it waits in the
-capacity queue instead of failing, and a floor that stays unmet for long is
-surfaced to the captain and to the machine's owner (below), the way stuck
-heavy capacity is today. The per-charter floor stays as a stricter share, and
-`init` should stop writing a zero floor into new charters.
+**Disk first.** A host-wide free-disk floor in the shared admission settings
+(`min_free_disk_bytes`, default 2 GiB), set with
+`resource.configure {"min_free_disk_bytes": ...}` and shown by
+`resource.status`. Jobs that would start below it can wait in the existing
+host-wide capacity queue; `workspace.acquire` can opt into that queue with
+`wait_for_capacity:true`. Long job waits appear in `runtime.needs` as a typed
+disk floor blocker. The per-charter `min_free_bytes` floor remains in force, and
+`init` leaves it at the charter default instead of writing zero.
 
 **Named exclusive resources later, when contention appears.** A job declares
 `"resources": ["simulator:iphone-17", "xcode-build"]` with `job.start`. A

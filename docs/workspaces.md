@@ -67,6 +67,10 @@ privateer --home /absolute/home workspace.status --json '{"task_id":"repair"}'
 `workspace.list` is bounded (100 records by default, at most 1,000); use
 `after_id` for pagination. `workspace.acquire {task_id}` explicitly allocates or
 recovers a checkout before starting jobs. Ordinary launches do this themselves.
+Both the host `min_free_disk_bytes` and charter `min_free_bytes` floors apply to
+the worktree pool's filesystem. Pass `wait_for_capacity:true` and optionally
+`max_wait_secs` to keep the request in the same host FIFO as jobs while disk is
+below either floor; `resource.status` includes the workspace queue entry.
 
 Job completion, failure, cancellation and task completion retain the lease.
 After jobs stop, commit any outstanding edits and finish the PR/merge, then use

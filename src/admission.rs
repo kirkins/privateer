@@ -60,6 +60,8 @@ pub struct Settings {
     pub max_load_per_cpu: f64,
     /// Keep at least this much memory available after admission.
     pub min_available_memory_bytes: u64,
+    /// Keep at least this much space free on the host root filesystem.
+    pub min_free_disk_bytes: u64,
     /// Default estimate for heavy jobs; `cpus` absent means every CPU.
     pub heavy_estimate: Estimate,
     /// How long an admitted job's estimate counts before its use is assumed
@@ -73,6 +75,7 @@ impl Default for Settings {
             max_heavy_jobs: None,
             max_load_per_cpu: 1.0,
             min_available_memory_bytes: GIB,
+            min_free_disk_bytes: 2 * GIB,
             heavy_estimate: Estimate {
                 cpus: None,
                 memory_bytes: Some(2 * GIB),
@@ -88,6 +91,8 @@ pub struct Host {
     pub load: f64,
     pub memory_available_bytes: u64,
     pub memory_total_bytes: u64,
+    pub disk_available_bytes: u64,
+    pub disk_total_bytes: u64,
 }
 
 /// A live reservation as admission sees it.
@@ -106,6 +111,8 @@ pub struct Request<'a> {
     pub charter: &'a str,
     pub charter_cap: Option<u64>,
     pub demand: Option<Demand>,
+    pub charter_min_free_bytes: u64,
+    pub disk_path: &'a std::path::Path,
 }
 
 pub fn init(conn: &Connection) -> Result<()> {
@@ -177,6 +184,7 @@ fn effective(raw: &Map<String, Value>) -> Result<Settings> {
             "min_available_memory_bytes" => {
                 settings.min_available_memory_bytes = bytes(value, key)?;
             }
+            "min_free_disk_bytes" => settings.min_free_disk_bytes = bytes(value, key)?,
             "heavy_estimate" => {
                 let requested = estimate(value)?;
                 settings.heavy_estimate = Estimate {
@@ -268,6 +276,20 @@ pub fn admit(
     held: &[Held],
     request: &Request,
 ) -> Result<()> {
+    // Measure the filesystem the job will use; a full root must not block
+    // work on a separate volume.
+    let available = disk(request.disk_path)?.0;
+    let required_disk = settings
+        .min_free_disk_bytes
+        .max(request.charter_min_free_bytes);
+    refuse_unless!(
+        available >= required_disk,
+        "disk admission refused: {} MiB disk available, {} MiB must stay free (host floor {} MiB, charter floor {} MiB); retry later or tune resource.configure",
+        mib(available),
+        mib(required_disk),
+        mib(settings.min_free_disk_bytes),
+        mib(request.charter_min_free_bytes)
+    );
     let Some(demand) = request.demand else {
         return Ok(());
     };
@@ -341,11 +363,14 @@ pub fn measure() -> Result<Host> {
         "cannot read load average"
     );
     let (memory_available_bytes, memory_total_bytes) = memory()?;
+    let (disk_available_bytes, disk_total_bytes) = disk(std::path::Path::new("/"))?;
     Ok(Host {
         cpus,
         load: loads[0],
         memory_available_bytes,
         memory_total_bytes,
+        disk_available_bytes,
+        disk_total_bytes,
     })
 }
 
@@ -365,6 +390,34 @@ fn memory() -> Result<(u64, u64)> {
         Ok(kib * 1024)
     };
     Ok((field("MemAvailable:")?, field("MemTotal:")?))
+}
+
+#[cfg(unix)]
+// statvfs field widths differ across Unix platforms, so the casts are needed
+// on those where the fields are narrower than u64.
+#[allow(clippy::unnecessary_cast)]
+pub fn disk(path: &std::path::Path) -> Result<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).context("disk path contains NUL")?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    ensure!(
+        unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } == 0,
+        "cannot read free disk space for {}: {}",
+        path.to_string_lossy(),
+        std::io::Error::last_os_error()
+    );
+    let stats = unsafe { stats.assume_init() };
+    let unit = stats.f_frsize as u64;
+    Ok((
+        (stats.f_bavail as u64).saturating_mul(unit),
+        (stats.f_blocks as u64).saturating_mul(unit),
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn disk(_path: &std::path::Path) -> Result<(u64, u64)> {
+    bail!("disk admission is supported on Unix")
 }
 
 #[cfg(target_os = "macos")]

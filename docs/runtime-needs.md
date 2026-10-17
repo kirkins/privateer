@@ -85,6 +85,10 @@ Supported typed facts:
 * **blocker**: jobs queued for >=60 seconds on nonterminal
   tasks; recorded orphaned jobs (even on terminal tasks, since payloads may remain).
   Includes typed `evidence`, task/ship, version, and job incarnation where relevant.
+  A queued job whose latest refusal names a disk floor uses
+  `evidence:"disk_floor_wait"`; other capacity waits use `capacity_wait` unless
+  a stale reservation is blocking them. Workspace allocations waiting for disk
+  capacity appear as `evidence:"workspace_disk_wait"` with the task as source.
   These are last recorded runtime facts, not a live process observation. No generic
   unblock/cancel/"ok" mutation is offered: use existing guarded runtime commands
   after inspecting current evidence. Resolved facts disappear on refresh.
