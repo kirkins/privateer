@@ -291,7 +291,9 @@ fn record(conn: &Connection, machine: &Machine, ships: &[Entry]) -> Result<()> {
 }
 
 /// Give one home the machine's peer and a directory entry for each of its
-/// ships. Ships the home hosts are never touched.
+/// ships. Ships the home hosts are never touched. Entries behind this
+/// machine's peer that its directory no longer lists have left it (retired
+/// or moved), so they are dropped; entries behind other peers stay.
 fn install(store: &mut Store, machine: &Machine, ships: &[Entry]) -> Result<usize> {
     crate::peers::dispatch(store, "peer.put", machine.peer.clone())?;
     let peer = peer_name(&machine.name);
@@ -308,6 +310,12 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry]) -> Result<usiz
         )?;
         installed += 1;
     }
+    let listed: Vec<&str> = ships.iter().map(|(name, _, _)| name.as_str()).collect();
+    store.connection().execute(
+        "DELETE FROM ships WHERE json_extract(record,'$.location.peer')=?1
+           AND name NOT IN (SELECT value FROM json_each(?2))",
+        params![peer, json!(listed).to_string()],
+    )?;
     Ok(installed)
 }
 

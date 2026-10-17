@@ -2380,3 +2380,109 @@ fn a_machine_whose_desk_is_elsewhere_hands_its_captain_mail_only_there() {
     assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
     assert_eq!(captain_bodies(&server, "harbor"), ["Build 13 is up"]);
 }
+
+fn listed_ships(machine: &Machine, ship: &str) -> Vec<String> {
+    machine.ok(ship, "ship.list", json!({}))["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_ship_retired_on_the_linked_machine_leaves_the_list_at_the_next_refresh() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    mac.ship("server");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    assert!(listed_ships(&laptop, "liaison").contains(&"server".to_owned()));
+
+    mac.ok("fitforge", "ship.retire", json!({"name": "server"}));
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+
+    assert!(!listed_ships(&laptop, "liaison").contains(&"server".to_owned()));
+    let gone = laptop.run(
+        "liaison",
+        &["ship.show", "--json", r#"{"name":"server"}"#],
+        None,
+    );
+    assert!(!gone.status.success(), "{}", text(&gone));
+    // The ship that is still there keeps its entry.
+    let fitforge = laptop.ok("liaison", "ship.show", json!({"name": "fitforge"}));
+    assert_eq!(
+        fitforge["location"],
+        json!({"peer": "machine-mac"}),
+        "{fitforge}"
+    );
+}
+
+#[test]
+fn a_ship_moved_from_the_linked_machine_here_stays_here() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    ship_with_project(&mac, &laptop, "scout");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+
+    let to_here = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--here"],
+        Some(&mac_ssh),
+    );
+    assert!(to_here.status.success(), "{}", text(&to_here));
+
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+    // The ship is hosted here: its own home says so, and the list still has it.
+    let scout = laptop.ok("scout", "ship.show", json!({"name": "scout"}));
+    assert_eq!(scout["location"], "here", "{scout}");
+    assert!(listed_ships(&laptop, "liaison").contains(&"scout".to_owned()));
+}
+
+#[test]
+fn a_ship_behind_another_peer_is_untouched_by_a_refresh() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    laptop.ok(
+        "liaison",
+        "peer.put",
+        json!({"name": "far-away", "transport": "ssh", "host": "far-host", "executable": "/usr/bin/privateer", "home": "/srv/far"}),
+    );
+    laptop.ok(
+        "liaison",
+        "ship.put",
+        json!({"name": "cloudy", "location": {"peer": "far-away"}}),
+    );
+
+    mac.ship("server");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    mac.ok("fitforge", "ship.retire", json!({"name": "server"}));
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+
+    let cloudy = laptop.ok("liaison", "ship.show", json!({"name": "cloudy"}));
+    assert_eq!(cloudy["location"], json!({"peer": "far-away"}), "{cloudy}");
+    assert!(!listed_ships(&laptop, "liaison").contains(&"server".to_owned()));
+}
+
+#[test]
+fn a_refresh_whose_directory_cannot_be_read_drops_nothing() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    mac.ship("server");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+
+    // The peer answers with a truncated reply, so its directory is unreadable.
+    let truncated = remote_ssh_with(&mac, "truncated-ssh", "| head -c 12");
+    let failed = laptop.run("liaison", &["machine", "refresh"], Some(&truncated));
+    assert!(!failed.status.success(), "{}", text(&failed));
+
+    let server = laptop.ok("liaison", "ship.show", json!({"name": "server"}));
+    assert_eq!(
+        server["location"],
+        json!({"peer": "machine-mac"}),
+        "{server}"
+    );
+    assert!(listed_ships(&laptop, "liaison").contains(&"server".to_owned()));
+}
