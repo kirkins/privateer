@@ -255,7 +255,6 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
         || out.tasks.len() > ROW_LIMIT
         || out.pending.len() > ROW_LIMIT
         || out.activity.len() > ROW_LIMIT
-        || out.jobs.len() > ROW_LIMIT
         || out.custody.len() > ROW_LIMIT;
     out.recent
         .sort_by_key(|r| std::cmp::Reverse(r.completed_ms));
@@ -263,8 +262,17 @@ pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     out.tasks.truncate(ROW_LIMIT);
     out.pending.truncate(ROW_LIMIT);
     out.activity.truncate(ROW_LIMIT);
-    out.jobs.truncate(ROW_LIMIT);
     out.custody.truncate(ROW_LIMIT);
+    // Active jobs are exempt from the display bound: a busy home's finished
+    // history must not hide another home's running crew. Only finished jobs
+    // are clipped, and each home already bounds its own active jobs.
+    let (mut active, mut finished): (Vec<_>, Vec<_>) = std::mem::take(&mut out.jobs)
+        .into_iter()
+        .partition(|j| j.is_active());
+    out.truncated |= finished.len() > ROW_LIMIT;
+    finished.truncate(ROW_LIMIT);
+    active.extend(finished);
+    out.jobs = active;
     // Bound the identity/presentation mapping before adding display-only work
     // owners: clipped historical owners are not undiscovered runtime homes.
     if out.ships.len() > ROW_LIMIT {
