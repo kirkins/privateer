@@ -14,7 +14,7 @@
 //! resumes the hold it started; the owner cannot end the captain's.
 use crate::fleet::{members, registry};
 use crate::store::Store;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
@@ -234,7 +234,16 @@ fn resume(store: &Store) -> Result<Value> {
     Ok(json!({"stow": id, "held": false, "ships": told}))
 }
 
-pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value> {
+pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+    // A linked machine is stowed over its gateway, by the captain alone: even
+    // the machine's owner stows only this machine.
+    if let Some(name) = args.get("machine").filter(|v| !v.is_null()) {
+        store.caller().require_operator(command)?;
+        let name = name.as_str().context("machine must be a name")?;
+        let mut out = crate::machines::stow_linked(name, command)?;
+        out["machine"] = json!(name);
+        return Ok(out);
+    }
     match command {
         "stow.start" => start(store),
         "stow.status" => status(store),
