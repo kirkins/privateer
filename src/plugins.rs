@@ -84,12 +84,28 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             };
             request["context"]["role"] = json!(role);
             if let Some(selected) = args.get("tool_bundles") {
-                ensure!(
-                    manifest_path == fs::canonicalize(crate::bundled::resolve("bundled:pi")?)?,
-                    "bounded tool bundles support only the bundled Pi adapter"
-                );
-                request["context"]["tool_bundles"] =
-                    crate::tool_bundles::resolve(store, selected, role)?;
+                let mut harness = None;
+                for name in ["pi", "claude"] {
+                    let bundled = crate::bundled::resolve(&format!("bundled:{name}"))?;
+                    if manifest_path == fs::canonicalize(bundled)? {
+                        harness = Some(name);
+                    }
+                }
+                let harness = harness.context(
+                    "bounded tool bundles support only the bundled Pi and Claude adapters",
+                )?;
+                let plan = crate::tool_bundles::resolve(store, selected, role, harness)?;
+                if harness == "claude" && method == "command" {
+                    let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+                    crate::tool_bundles::record_plan(
+                        store,
+                        id,
+                        role,
+                        &plan,
+                        options.get("resume"),
+                    )?;
+                }
+                request["context"]["tool_bundles"] = plan;
             }
             request["context"]["tool_permissions"] = crate::permissions::for_store(store)?;
             if let Some(path) = config {
@@ -141,21 +157,22 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
 pub(crate) fn bundle_request(
     directory: &Path,
     registry: &Value,
-    selected: Option<(&Value, &str)>,
+    selected: Option<(&Value, &str, &str)>,
 ) -> Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
     let mut request = json!({"id":id,"version":1,"method":"validate","registry":registry});
-    if let Some((selection, role)) = selected {
+    if let Some((selection, role, harness)) = selected {
         request["selection"] = selection.clone();
         request["role"] = json!(role);
+        request["harness"] = json!(harness);
     }
     let manifest = Manifest {
         schema_version: 1,
-        id: "pi-bundles".into(),
+        id: "bundles".into(),
         kind: None,
         executable: vec![
             "python3".into(),
-            directory.join("pi_bundles.py").to_string_lossy().into(),
+            directory.join("bundles.py").to_string_lossy().into(),
         ],
         timeout_ms: 5_000,
         max_output_bytes: 32_768,
@@ -166,7 +183,7 @@ pub(crate) fn bundle_request(
             && response["version"] == 1
             && response["ok"] == true
             && response["result"]["valid"] == true,
-        "bounded Pi resource validation failed; inspect approved registry locally"
+        "bounded resource validation failed; inspect approved registry locally"
     );
     Ok(response["result"].clone())
 }

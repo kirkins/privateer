@@ -1,6 +1,7 @@
-# Explicit Pi resource bundles (first stage)
+# Explicit Pi and Claude resource bundles (first stage)
 
-This is an **opt-in, limited Pi 1.2.0 resource-loading path**, not a sandbox,
+This is an **opt-in, limited Pi 1.2.0 and Claude Code resource-loading path**
+(see [Bounded Claude launches](#bounded-claude-launches)), not a sandbox,
 provider router, permission grant, or replacement harness. The runtime does not
 install packages, edit native configuration, replace `HOME`/the agent directory,
 search credential stores, or infer which personal extensions are required.
@@ -58,6 +59,7 @@ No registry is installed/enabled by shipping this code.
 {
   "schema_version": 1,
   "pi_version": "1.2.0",
+  "claude_version": "<exact Claude Code version, optional>",
   "integrations": {
     "reviewed": true,
     "extensions": []
@@ -112,7 +114,7 @@ to context; Pi advertises the skill descriptor and loads its instructions on use
 Compute a tree pin from this checkout:
 
 ```sh
-python3 plugins/pi_bundles.py --digest /absolute/operator-reviewed/local-lookup
+python3 plugins/bundles.py --digest /absolute/operator-reviewed/local-lookup
 ```
 
 The tree hash is SHA-256 of all files in relative POSIX-path order, each encoded
@@ -171,6 +173,62 @@ credential resolution, or full real-profile/hosted production qualification is
 claimed. Bounded resume is intentionally unsupported rather than pretending old
 session context can be erased by changing today's inventory.
 
+## Bounded Claude launches
+
+A `bundled:claude` first mate or crew request takes the same `tool_bundles`
+field and registry. Omitting it keeps today's launch exactly; `[]` is bounded
+with no skills. The registry must pin `claude_version`, the exact version
+`claude --version` reports; registries without it still serve Pi. Pi extension
+integrations cannot load into Claude, so a Claude plan needs `extensions:[]`.
+
+`plugins/claude_bundles.py` adds Claude's supported flags:
+
+```text
+--setting-sources project,local --strict-mcp-config
+--settings <carried JSON> --plugin-dir <selected skill root>...
+```
+
+Dropping the user setting source drops personal hooks, skills and plugins;
+`--strict-mcp-config` without `--mcp-config` drops personal and claude.ai MCP
+connectors. The working folder's `.claude` settings (Privateer's own hooks and
+permissions), its project instructions and its own `.claude/skills` still
+load. Each selected skill root is passed straight to `--plugin-dir`, where
+Claude loads it as `<name>:<name>`. Claude's built-in skills and plugins load in
+every mode; no flag removes them without also removing selected skills.
+Attended runs keep Privateer's `attended-claude` mail plugin.
+
+Only `model`, `modelSettings`, `effort`, `autoMode` and
+`skipDangerousModePermissionPrompt` carry over from the user settings file
+(`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`), through
+`--settings`. They are part of the plan. The loader refuses before launch when:
+
+- the user settings hold `env`, `apiKeyHelper` or any other provider, auth or
+  credential key (dropping it would change the route), are malformed, a
+  symlink or unsafe, or no longer match the planned carried settings;
+- an `--add-dir` folder (ship home, resource ledger) holds `.claude/skills`,
+  `.claude/commands`, `.claude/agents` or `.mcp.json`, which Claude would load
+  although they are not the project;
+- a selected skill root holds plugin parts (`hooks`, `.mcp.json`, `.lsp.json`,
+  `agents`, `commands`, `skills`, `bin`, `settings.json`, `monitors`,
+  `output-styles`, `.claude-plugin`): stage one is skills only;
+- the caller passes `--plugin-dir` (other than the attended adapter),
+  `--plugin-url`, `--settings`, `--setting-sources`, `--mcp-config`, `--bare`,
+  `--safe-mode`, `--agents`, or a continue/fork/session flag;
+- `claude` on PATH is an activation-script wrapper, or reports another version.
+
+**Resume.** The plan digest (selected refs, pins, Claude version and carried
+settings) is recorded with the wake or errand and the session it starts. A
+bounded first mate resumes only a session recorded under the same digest, as
+the runtime's exact `--resume`; any change starts fresh. Crew never resume a
+bounded session. Live and hosted starts are always fresh, since `--continue`
+cannot name the session a digest was recorded for.
+
+`--bare` and `--safe-mode` are not used: `--bare` accepts only an API key, which
+would change the auth route, and `--safe-mode` drops `--plugin-dir` skills.
+This is exposure hygiene, not credential isolation; whether a personal
+`~/.claude/CLAUDE.md` or auto-memory follows the setting sources is not yet
+qualified.
+
 ## Test evidence and reproduction
 
 Always capacity-admit heavy suites through `job.start` in an active charter.
@@ -179,7 +237,18 @@ Always capacity-admit heavy suites through `job.start` in an active charter.
 cargo test -j1 --test tool_bundles --test plugins
 python3 tests/pi_bundles.py
 python3 tests/pi_bundles_native.py /absolute/installed/native/pi
+python3 tests/claude_bundles.py
+python3 tests/claude_bundles_native.py /absolute/installed/native/claude
 ```
+
+The Claude suites run in a temporary HOME, `CLAUDE_CONFIG_DIR` and XDG. The
+deterministic one uses a fake `claude` for argv plans and each refusal; the
+Rust suite checks planning and digest-gated resume. The opt-in native probe
+points `ANTHROPIC_BASE_URL` at a dead loopback port with a fixture API key,
+reads `system/init` and kills the process: no model call. It seeds a personal
+skill, hook and MCP server, and checks that only the selected skill, the
+project's own skill and Claude's built-ins load, no MCP server or hook starts,
+and the carried model applies. Without an explicit binary it skips.
 
 The deterministic suite checks registry validation, path safety/pins, malformed
 settings, source-qualified preflight refusal before native probes, redacted

@@ -48,11 +48,13 @@ fn selected_plan(value: &Value) -> Value {
 
 #[test]
 fn deterministic_python_bundle_validation() {
-    let status = Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pi_bundles.py"))
-        .status()
-        .unwrap();
-    assert!(status.success());
+    for suite in ["tests/pi_bundles.py", "tests/claude_bundles.py"] {
+        let status = Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(suite))
+            .status()
+            .unwrap();
+        assert!(status.success(), "{suite}");
+    }
 }
 
 #[test]
@@ -288,4 +290,118 @@ fn first_mate_selection_is_not_an_inherited_harness_option() {
     );
     let explicit = selected_plan(&plan(&mut store, Some(json!([]))).unwrap());
     assert_eq!(explicit["skills"], json!([]));
+}
+
+#[test]
+fn claude_plan_carries_allowlist_and_resumes_only_under_its_digest() {
+    let (temp, mut store, mut config) = fixture();
+    config["claude_version"] = json!("2.1.300");
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    // Planning reads the user Claude settings: never the real ones.
+    let root = temp.path().canonicalize().unwrap();
+    let claude = root.join("claude-config");
+    fs::create_dir(&claude).unwrap();
+    let settings = |model: &str| {
+        let value =
+            json!({"model":model,"hooks":{"SessionStart":[]},"enabledPlugins":{"p@m":true}});
+        fs::write(claude.join("settings.json"), value.to_string()).unwrap();
+    };
+    settings("exact");
+    let home = store.home().to_owned();
+    // The bundle adapter runs python3 from PATH: resolve it before HOME moves.
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        support::python().parent().unwrap().display()
+    );
+    let run = |command: &str, args: Value| -> Result<Value, String> {
+        let output = support::command(support::BIN)
+            .args(["--home", home.to_str().unwrap(), command, "--json"])
+            .arg(args.to_string())
+            .env("HOME", &root)
+            .env("PATH", &path)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"))
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(serde_json::from_slice(&output.stdout).unwrap())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    };
+    run(
+        "ship.put",
+        json!({"name":"ship","first_mate":{"manifest":"bundled:claude","duty_task":"task",
+            "tool_bundles":["fixture@1"],"options":{}}}),
+    )
+    .unwrap();
+    let wake = |id: &str, session: Option<&str>| {
+        store.connection().execute(
+            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms,session_id)
+             VALUES(?1,'ship','duty',0,?1,'fresh','running',0,?2)",
+            rusqlite::params![id, session],
+        )
+        .unwrap();
+    };
+    let launch = |id: &str, resume: Option<&str>| {
+        let mut args = json!({"id":id,"task_id":"task","manifest":"bundled:claude",
+            "tool_bundles":["fixture@1"],"options":{"model":"exact"}});
+        if let Some(session) = resume {
+            args["options"]["resume"] = json!(session);
+        }
+        run("plugin.command", args)
+    };
+    let legacy = run(
+        "plugin.command",
+        json!({"task_id":"task","manifest":"bundled:claude","options":{"model":"exact"}}),
+    )
+    .unwrap();
+    assert!(
+        !legacy["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--tool-bundles")
+    );
+    wake("wake-1", None);
+    let plan = selected_plan(&launch("wake-1", None).unwrap());
+    assert_eq!(plan["claude_version"], "2.1.300");
+    assert_eq!(plan["skills"][0]["name"], "fixture");
+    assert_eq!(plan["settings"], json!({"model":"exact"}));
+    let digest: String = store
+        .connection()
+        .query_row("SELECT plan_digest FROM wakes WHERE id='wake-1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(digest.len(), 64);
+    // The session wake-1 started, as recorded when it succeeded.
+    let session = "00000000-0000-4000-8000-000000000001";
+    store.connection().execute(
+        "INSERT INTO sessions(ship,focus,harness,session_id,wakes,started_ms,last_turn_ms,plan_digest)
+         VALUES('ship','duty','claude',?1,1,0,0,?2)",
+        rusqlite::params![session, digest],
+    )
+    .unwrap();
+    wake("wake-2", Some(session));
+    let resumed = launch("wake-2", Some(session)).unwrap();
+    assert!(
+        resumed["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == session)
+    );
+    assert!(
+        launch("crew-job", Some(session)).is_err(),
+        "crew never resume a bounded session"
+    );
+    // A changed carried setting is a different plan: start fresh instead.
+    settings("other");
+    wake("wake-3", Some(session));
+    assert!(launch("wake-3", Some(session)).is_err());
+    assert!(launch("wake-3", None).is_ok());
 }

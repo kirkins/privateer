@@ -29,6 +29,16 @@ pub fn init(store: &Store) -> Result<()> {
            harness TEXT, session_id TEXT, verdict TEXT, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS errand_ship ON errands(ship, created_ms);",
     )?;
+    let has_digest: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('errands') WHERE name='plan_digest')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_digest {
+        store
+            .connection()
+            .execute_batch("ALTER TABLE errands ADD COLUMN plan_digest TEXT;")?;
+    }
     crate::herdr::errands::init(store)?;
     Ok(())
 }
@@ -153,8 +163,11 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     let own = manifest == profile["manifest"];
     let harness = crate::activation::harness_id(&json!({"manifest": manifest}));
     let key = session_key(focus);
-    let resume = if !own || profile.get("tool_bundles").is_none() {
-        crate::activation::warm_session(store, &ship, &key, &harness, &profile)?
+    let digest = own
+        .then(|| crate::tool_bundles::session_digest(store, &profile))
+        .flatten();
+    let resume = if !own || profile.get("tool_bundles").is_none() || digest.is_some() {
+        crate::activation::warm_session(store, &ship, &key, &harness, &profile, digest.as_deref())?
     } else {
         None
     };
@@ -349,12 +362,12 @@ fn bind(
         )?;
     } else {
         store.connection().execute(
-            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms)
-             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5)
+            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms, plan_digest)
+             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5, (SELECT plan_digest FROM errands WHERE id=?6))
              ON CONFLICT(ship, focus) DO UPDATE SET harness=excluded.harness,
                session_id=excluded.session_id, wakes=1, started_ms=excluded.started_ms,
-               last_turn_ms=excluded.last_turn_ms",
-            params![ship, key, harness, session, now],
+               last_turn_ms=excluded.last_turn_ms, plan_digest=excluded.plan_digest",
+            params![ship, key, harness, session, now, id],
         )?;
     }
     store.connection().execute(

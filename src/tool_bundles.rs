@@ -1,9 +1,11 @@
-//! Optional captain-approved Pi resources. Selection is deliberately NOT a
-//! harness option: first-mate resources never become crew defaults.
+//! Optional captain-approved Pi and Claude resources. Selection is
+//! deliberately NOT a harness option: first-mate resources never become crew
+//! defaults.
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const KEY: &str = "pi_tool_bundle_registry_v1";
 
@@ -35,14 +37,14 @@ fn load(store: &Store) -> Result<Value> {
         })
         .optional()?;
     serde_json::from_str(
-        &raw.context("bounded Pi resources need an operator-approved bundle registry")?,
+        &raw.context("bounded resources need an operator-approved bundle registry")?,
     )
     .context("invalid tool bundle registry")
 }
 
 /// Use the same bounded, redacting adapter protocol as harness planning. This
-/// does not run Pi or read any native credential store.
-fn qualify(registry: &Value, selected: Option<(&Value, &str)>) -> Result<Value> {
+/// does not run a harness or read any native credential store.
+fn qualify(registry: &Value, selected: Option<(&Value, &str, &str)>) -> Result<Value> {
     let manifest = crate::bundled::resolve("bundled:pi")?;
     let directory = manifest
         .parent()
@@ -52,13 +54,63 @@ fn qualify(registry: &Value, selected: Option<(&Value, &str)>) -> Result<Value> 
     crate::plugins::bundle_request(directory, registry, selected)
 }
 
-pub(crate) fn resolve(store: &Store, selected: &Value, role: &str) -> Result<Value> {
+pub(crate) fn resolve(store: &Store, selected: &Value, role: &str, harness: &str) -> Result<Value> {
     selection(selected)?;
-    let result = qualify(&load(store)?, Some((selected, role)))?;
+    let result = qualify(&load(store)?, Some((selected, role, harness)))?;
     result
         .get("plan")
         .cloned()
         .context("bundle adapter omitted plan")
+}
+
+/// A bounded launch plan's identity: selected refs, pins and, for Claude, its
+/// version and carried personal settings.
+fn digest(plan: &Value) -> String {
+    format!("{:x}", Sha256::digest(plan.to_string()))
+}
+
+/// The digest a bounded Claude first mate would launch under, to pick only a
+/// session started under it. None when unbounded, for Pi (whose bounded runs
+/// never resume), or when planning fails: the launch then refuses and says why.
+pub(crate) fn session_digest(store: &Store, profile: &Value) -> Option<String> {
+    let selected = profile.get("tool_bundles")?;
+    (crate::activation::harness_id(profile) == "claude").then_some(())?;
+    resolve(store, selected, "first_mate", "claude")
+        .ok()
+        .map(|plan| digest(&plan))
+}
+
+/// Record a bounded Claude launch's plan digest with its wake or errand, so
+/// the session it starts carries it. A bounded resume continues only a
+/// recorded first-mate session started under this same digest.
+pub(crate) fn record_plan(
+    store: &Store,
+    id: &str,
+    role: &str,
+    plan: &Value,
+    resume: Option<&Value>,
+) -> Result<()> {
+    let digest = digest(plan);
+    if let Some(session) = resume {
+        let started: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1 AND plan_digest=?2)",
+            params![session.as_str(), digest],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            role == "first_mate" && started,
+            "a bounded session resumes only under the plan it started with"
+        );
+    }
+    store.connection().execute(
+        "UPDATE wakes SET plan_digest=?2 WHERE job_id=?1 AND status='running'",
+        params![id, digest],
+    )?;
+    store.connection().execute(
+        "UPDATE errands SET plan_digest=?2 WHERE id=?1 AND status='running'",
+        params![id, digest],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn configure(store: &mut Store, args: Value) -> Result<Value> {

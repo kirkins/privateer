@@ -44,7 +44,13 @@ pub fn init(store: &Store) -> Result<()> {
            ship TEXT PRIMARY KEY, blocked_since_ms INTEGER NOT NULL,
            alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1)));",
     )?;
-    for column in ["focuses", "harness", "session_id", "dispatcher_generation"] {
+    for column in [
+        "focuses",
+        "harness",
+        "session_id",
+        "dispatcher_generation",
+        "plan_digest",
+    ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
             [column],
@@ -69,6 +75,15 @@ pub fn init(store: &Store) -> Result<()> {
            session_id TEXT NOT NULL, wakes INTEGER NOT NULL, started_ms INTEGER NOT NULL,
            last_turn_ms INTEGER NOT NULL, PRIMARY KEY(ship, focus));",
     )?;
+    // A bounded session's launch plan digest; NULL for an unbounded one.
+    let has_digest: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name='plan_digest')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_digest {
+        tx.execute_batch("ALTER TABLE sessions ADD COLUMN plan_digest TEXT;")?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -167,11 +182,12 @@ pub fn profile(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
     out.insert("options".into(), options);
     if let Some(selected) = object.get("tool_bundles") {
         crate::tool_bundles::selection(selected)?;
-        ensure!(
-            out["manifest"] == "bundled:pi",
-            "bounded tool bundles require bundled:pi"
-        );
-        crate::tool_bundles::resolve(store, selected, "first_mate")?;
+        let harness = match out["manifest"].as_str() {
+            Some("bundled:pi") => "pi",
+            Some("bundled:claude") => "claude",
+            _ => bail!("bounded tool bundles require bundled:pi or bundled:claude"),
+        };
+        crate::tool_bundles::resolve(store, selected, "first_mate", harness)?;
         out.insert("tool_bundles".into(), selected.clone());
     }
     if let Some(host) = object.get("host").filter(|v| !v.is_null()) {
@@ -524,12 +540,12 @@ fn bind_session(store: &Store, wake: &str, outcome: &str, log: &str) -> Result<(
         )?;
     } else {
         store.connection().execute(
-            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms)
-             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5)
+            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms, plan_digest)
+             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5, (SELECT plan_digest FROM wakes WHERE id=?6))
              ON CONFLICT(ship, focus) DO UPDATE SET harness=excluded.harness,
                session_id=excluded.session_id, wakes=1, started_ms=excluded.started_ms,
-               last_turn_ms=excluded.last_turn_ms",
-            params![ship, focus, harness, session, now],
+               last_turn_ms=excluded.last_turn_ms, plan_digest=excluded.plan_digest",
+            params![ship, focus, harness, session, now, wake],
         )?;
     }
     store.connection().execute(
@@ -539,14 +555,16 @@ fn bind_session(store: &Store, wake: &str, outcome: &str, log: &str) -> Result<(
     Ok(())
 }
 
-/// A focus session worth resuming: same harness, last turn inside the cache
-/// window, and below the rotation limit.
+/// A focus session worth resuming: same harness and launch plan digest (none
+/// when unbounded), last turn inside the cache window, and below the rotation
+/// limit.
 pub(crate) fn warm_session(
     store: &Store,
     ship: &str,
     focus: &str,
     harness: &str,
     profile: &Value,
+    digest: Option<&str>,
 ) -> Result<Option<String>> {
     let window = setting(profile, "cache_window_secs") * 1000;
     if window == 0 {
@@ -556,13 +574,14 @@ pub(crate) fn warm_session(
         .connection()
         .query_row(
             "SELECT session_id FROM sessions WHERE ship=?1 AND focus=?2 AND harness=?3
-             AND last_turn_ms >= ?4 AND wakes < ?5",
+             AND last_turn_ms >= ?4 AND wakes < ?5 AND plan_digest IS ?6",
             params![
                 ship,
                 focus,
                 harness,
                 Store::now_ms() - window,
-                setting(profile, "session_max_wakes")
+                setting(profile, "session_max_wakes"),
+                digest
             ],
             |r| r.get(0),
         )
@@ -714,9 +733,10 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // Resume only a single focus's warm session: mixing topics in one
     // conversation is what makes long sessions costly and confused.
     let mut harness = harness_id(&profile);
+    let digest = crate::tool_bundles::session_digest(store, &profile);
     let mut resume = match foci.as_slice() {
-        [focus] if profile.get("tool_bundles").is_none() => {
-            warm_session(store, &name, focus, &harness, &profile)?
+        [focus] if profile.get("tool_bundles").is_none() || digest.is_some() => {
+            warm_session(store, &name, focus, &harness, &profile, digest.as_deref())?
         }
         _ => None,
     };

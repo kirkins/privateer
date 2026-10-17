@@ -27,9 +27,14 @@ def native_environment():
 def launch(harness, argv, control=None, bundles=None, attended=False):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
-    if bundles is not None:
+    if bundles is not None and harness == "claude":
+        from claude_bundles import preflight
+        # Privateer's attended mail adapter is the one runtime-owned plugin.
+        plugins = [Path(__file__).resolve().parent / "attended-claude"] if attended else []
+        argv = preflight(bundles, argv, env=native_environment(), runtime_plugins=plugins, attended=attended)
+    elif bundles is not None:
         if harness != "pi":
-            raise ValueError("bounded resources support only Pi")
+            raise ValueError("bounded resources support only Pi and Claude")
         from pi_bundles import preflight
         directory = Path(__file__).resolve().parent
         extensions = [directory / "attended/mail.ts"] if attended else []
