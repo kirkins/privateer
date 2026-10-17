@@ -17,13 +17,20 @@
 //! Directories are exchanged when the link is made and refreshed at a bounded
 //! interval.
 //!
-//! The captain reads mail on the linking machine, where the front door runs.
-//! Mail the other machine's ships write to the captain after the link is
-//! made is collected with the rest and delivered into the captain's home
-//! here, the fleet's liaison (or its first ship); it stays in the writing
-//! home's captain mailbox too. The captain's own mail to a ship on the other
-//! machine is written in that same home and goes out through the gateway, so
-//! requests and replies close on both machines.
+//! The captain's mail gathers on one machine, the captain's desk, where the
+//! front door runs. By default that is the linking machine: mail the other
+//! machine's ships write to the captain after the link is made is collected
+//! with the rest and delivered into the captain's home here, the fleet's
+//! liaison (or its first ship); it stays in the writing home's captain
+//! mailbox too. The captain's own mail to a ship on the other machine is
+//! written in that same home and goes out through the gateway, so requests
+//! and replies close on both machines.
+//!
+//! `privateer machine captain NAME` moves the desk to a machine this one
+//! reaches, such as an always-on server while this one sleeps: each pass then
+//! pushes this machine's captain mail into the captain's home there instead,
+//! and leaves the other machine's captain mail where it is. The captain's
+//! answers come back as ordinary collected mail.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -59,7 +66,9 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS collect_waits(machine TEXT NOT NULL, id TEXT NOT NULL,
            passes INTEGER NOT NULL, PRIMARY KEY(machine, id));
          CREATE TABLE IF NOT EXISTS machine_owner(only INTEGER PRIMARY KEY CHECK(only=1),
-           ship TEXT NOT NULL, set_ms INTEGER NOT NULL);",
+           ship TEXT NOT NULL, set_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS captain_desk(only INTEGER PRIMARY KEY CHECK(only=1),
+           machine TEXT NOT NULL, set_ms INTEGER NOT NULL);",
     )?;
     // Columns added after the table was first created. Check and add them
     // under the write lock so concurrent opens cannot both add one.
@@ -368,6 +377,40 @@ fn set_owner(ship: Option<&str>) -> Result<Value> {
         }
     }
     Ok(json!({"owner": owner(&conn)?}))
+}
+
+/// The linked machine holding the captain's desk, and since when, if not
+/// this one.
+fn desk(conn: &Connection) -> Result<Option<(String, i64)>> {
+    Ok(conn
+        .query_row("SELECT machine, set_ms FROM captain_desk", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?)
+}
+
+/// Keep the captain's mail on a machine this one reaches, or here again.
+/// Captain mail written before the change stays where it is.
+fn set_desk(machine: Option<&str>) -> Result<Value> {
+    let conn = crate::fleet::registry()?;
+    match machine {
+        Some(name) => {
+            identifier(name)?;
+            ensure!(
+                self::machine(&conn, name)?.role == "collects",
+                "{name} reaches this machine; the captain's desk can move only to a machine this one reaches"
+            );
+            conn.execute(
+                "INSERT INTO captain_desk(only, machine, set_ms) VALUES(1, ?1, ?2)
+                 ON CONFLICT(only) DO UPDATE SET machine=excluded.machine, set_ms=excluded.set_ms",
+                params![name, Store::now_ms()],
+            )?;
+        }
+        None => {
+            conn.execute("DELETE FROM captain_desk", [])?;
+        }
+    }
+    Ok(json!({"captain": desk(&conn)?.map(|(m, _)| m).unwrap_or_else(|| "here".into())}))
 }
 
 /// Host-level problems are checked at most this often.
@@ -962,10 +1005,12 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
         .known_as
         .as_deref()
         .context("link has no local name")?;
+    // The machine holding the captain's desk keeps its own captain mail.
+    let captain = desk(conn)?.is_none_or(|(desk, _)| desk != machine.name);
     let result = call(
         machine,
         "fleet.collect",
-        json!({"machine": known_as}),
+        json!({"machine": known_as, "captain": captain}),
         Some(timeout),
     )?;
     let messages = result["messages"]
@@ -1130,6 +1175,68 @@ fn forget_wait(conn: &Connection, machine: &Machine, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Hand this machine's captain mail written since the desk moved to the
+/// machine holding it, and record what it took or refused, so nothing is
+/// sent twice and a refusal is not retried.
+fn push_captain(
+    conn: &Connection,
+    machine: &Machine,
+    since_ms: i64,
+    timeout: Duration,
+) -> Result<Value> {
+    let known_as = machine
+        .known_as
+        .as_deref()
+        .context("link has no local name")?;
+    let peer = peer_name(&machine.name);
+    let mut messages = vec![];
+    let mut bytes = 0;
+    for member in crate::fleet::members(conn)? {
+        if !member.home.is_dir() || messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
+            continue;
+        }
+        let store = Store::open(&member.home)?;
+        let (limit, room) = (COLLECT_LIMIT - messages.len(), COLLECT_BYTES - bytes);
+        for envelope in crate::mail::awaiting_captain(&store, &peer, since_ms, limit, room)? {
+            bytes += envelope.to_string().len();
+            messages.push(envelope);
+        }
+    }
+    if messages.is_empty() {
+        return Ok(json!({"machine": machine.name, "captain_pushed": 0}));
+    }
+    let result = call(
+        machine,
+        "fleet.captain",
+        json!({"machine": known_as, "messages": messages}),
+        Some(timeout),
+    )?;
+    let taken: Vec<(String, Option<String>)> = result["delivered"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| Some((id.as_str()?.to_owned(), None)))
+        .chain(
+            result["refused"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| {
+                    Some((
+                        r["id"].as_str()?.to_owned(),
+                        Some(r["error"].as_str().unwrap_or("refused").to_owned()),
+                    ))
+                }),
+        )
+        .collect();
+    for member in crate::fleet::members(conn)? {
+        if member.home.is_dir() {
+            crate::mail::collected_captain(&Store::open(&member.home)?, &peer, &taken)?;
+        }
+    }
+    Ok(json!({"machine": machine.name, "captain_pushed": taken.len()}))
+}
+
 /// One dispatcher pass: for each machine this one reaches, refresh the
 /// directories when due and collect waiting mail. One dispatcher on this
 /// machine does each link's work at a time, and only a dispatcher of a home
@@ -1177,7 +1284,15 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             } else {
                 Ok(())
             }
-            .and_then(|()| collect(&conn, &machine, timeout));
+            .and_then(|()| collect(&conn, &machine, timeout))
+            .and_then(|collected| match desk(&conn)? {
+                Some((name, since)) if name == machine.name => {
+                    let pushed = push_captain(&conn, &machine, since, timeout)?;
+                    Ok(json!({"machine": machine.name, "delivered": collected["delivered"],
+                        "refused": collected["refused"], "captain_pushed": pushed["captain_pushed"]}))
+                }
+                _ => Ok(collected),
+            });
             schedule(&conn, &machine, outcome.is_ok())?;
             out.push(outcome.unwrap_or_else(
                 |error| json!({"machine": machine.name, "error": format!("{error:#}")}),
@@ -1265,6 +1380,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 [&machine.name],
                 |r| r.get(0),
             )?;
+            // The linking machine may keep the captain's desk elsewhere.
+            let wants_captain = args["captain"].as_bool().unwrap_or(true);
             let mut messages = vec![];
             let mut bytes = 0;
             for member in crate::fleet::members(&conn)? {
@@ -1273,6 +1390,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 }
                 let store = Store::open(&member.home)?;
                 for captain in [false, true] {
+                    if captain && !wants_captain {
+                        continue;
+                    }
                     if messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
                         break;
                     }
@@ -1324,6 +1444,36 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 }
             }
             Ok(json!({"recorded": recorded}))
+        }
+        // Captain mail from the linking machine, whose captain's desk is here.
+        "fleet.captain" => {
+            reaching_here(&conn, required(args, "machine")?)?;
+            let (mut delivered, mut refused) = (vec![], vec![]);
+            for envelope in args["messages"].as_array().into_iter().flatten() {
+                let id = required(envelope, "id")?;
+                ensure!(
+                    envelope["to"] == crate::mail::CAPTAIN,
+                    "only the captain's mail is handed over this way"
+                );
+                // Into the home holding the request it answers, as collected
+                // captain mail is; a home that cannot be read now is offered
+                // again on the next pass.
+                let Ok(Some(home)) = captain_destination(&conn, envelope) else {
+                    continue;
+                };
+                let outcome = Store::open(&home).and_then(|mut store| {
+                    crate::dispatch(&mut store, "mail.deliver", envelope.clone())
+                });
+                match outcome {
+                    Ok(_) => delivered.push(json!(id)),
+                    Err(error) => {
+                        let reason = format!("{error:#}");
+                        surface_captain_refusal(&conn, id, envelope, &reason)?;
+                        refused.push(json!({"id": id, "error": reason}));
+                    }
+                }
+            }
+            Ok(json!({"delivered": delivered, "refused": refused}))
         }
         // A ship the linking machine asked for, in this machine's fleet. Only
         // ship.create crosses this way; managing that ship stays here.
@@ -1386,9 +1536,9 @@ pub fn gateway(caller: Caller) -> Result<()> {
 
 /// `privateer machine add NAME SSH_TARGET --executable PATH [--remote-fleet
 /// PATH] [--as NAME] | list | refresh [NAME] | collect [NAME] | remove NAME |
-/// owner [SHIP|--clear]`
+/// owner [SHIP|--clear] | captain [MACHINE|--here]`
 pub fn cli(args: &[String]) -> Result<()> {
-    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] | list | refresh [NAME] | collect [NAME] | remove NAME | owner [SHIP|--clear]";
+    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] | list | refresh [NAME] | collect [NAME] | remove NAME | owner [SHIP|--clear] | captain [MACHINE|--here]";
     let flags = crate::cli::flags(args, &["executable", "remote-fleet", "as"])?;
     let result = match flags.positional.first().map(String::as_str) {
         Some("add") => {
@@ -1409,6 +1559,14 @@ pub fn cli(args: &[String]) -> Result<()> {
         Some("refresh") => refresh(flags.positional.get(1).map(String::as_str))?,
         Some("collect") => collect_now(flags.positional.get(1).map(String::as_str))?,
         Some("remove") => remove(flags.positional.get(1).context(usage)?)?,
+        Some("captain") if flags.switches.iter().any(|s| s == "here") => set_desk(None)?,
+        Some("captain") => match flags.positional.get(1) {
+            Some(machine) => set_desk(Some(machine))?,
+            None => {
+                let conn = crate::fleet::registry()?;
+                json!({"captain": desk(&conn)?.map(|(m, _)| m).unwrap_or_else(|| "here".into())})
+            }
+        },
         Some("owner") if flags.switches.iter().any(|s| s == "clear") => set_owner(None)?,
         Some("owner") => match flags.positional.get(1) {
             Some(ship) => set_owner(Some(ship))?,
@@ -1429,6 +1587,16 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "machine.refresh" => refresh(args.get("name").and_then(Value::as_str)),
         "machine.collect" => collect_now(args.get("name").and_then(Value::as_str)),
         "machine.remove" => remove(required(&args, "name")?),
+        "machine.captain" => match args.get("machine") {
+            None => {
+                let conn = crate::fleet::registry()?;
+                Ok(
+                    json!({"captain": desk(&conn)?.map(|(m, _)| m).unwrap_or_else(|| "here".into())}),
+                )
+            }
+            Some(Value::Null) => set_desk(None),
+            Some(machine) => set_desk(Some(machine.as_str().context("machine must be a name")?)),
+        },
         "machine.owner" => match args.get("ship") {
             None => Ok(json!({"owner": owner(&crate::fleet::registry()?)?})),
             Some(Value::Null) => set_owner(None),

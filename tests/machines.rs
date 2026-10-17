@@ -1772,3 +1772,58 @@ fn a_captain_reply_whose_request_home_stays_unreadable_is_refused_after_waiting(
         "{notices:?}"
     );
 }
+
+fn captain_bodies(machine: &Machine, ship: &str) -> Vec<String> {
+    machine.ok(ship, "mail.inbox", json!({"address": "captain"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["body"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn collect(laptop: &Machine, ssh: &Path) -> String {
+    let collected = laptop.run("liaison", &["machine", "collect"], Some(ssh));
+    assert!(collected.status.success(), "{}", text(&collected));
+    text(&collected)
+}
+
+#[test]
+fn the_captains_desk_can_sit_on_the_machine_this_one_reaches() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    // Every laptop home's mail to the captain goes to the Mac's captain home.
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
+    assert_eq!(captain_bodies(&mac, "fitforge"), ["Rotate the deploy key?"]);
+
+    // The Mac's own captain mail stays there.
+    mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "notice", "body": "Build 12 is up"}),
+    );
+    assert!(collect(&laptop, &ssh).contains("\"delivered\": 0"));
+    assert!(captain_bodies(&laptop, "liaison").is_empty());
+
+    // The captain answers at the Mac; the answer comes back with the next
+    // collection and closes the request where it was asked.
+    mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    assert!(collect(&laptop, &ssh).contains("\"delivered\": 1"));
+    let request = laptop.ok("scout", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(request["state"], "answered", "{request}");
+}
