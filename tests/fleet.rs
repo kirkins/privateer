@@ -953,6 +953,129 @@ fn now_ms() -> i64 {
 }
 
 #[test]
+fn hands_on_asks_are_listed_apart_with_their_step_and_malformed_marks_are_refused() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    let ordinary = machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"apps","to":"captain","kind":"request","body":"Which project first?"}),
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    // The report reads first, and the ask the captain must act on comes last.
+    let step = "Run `sudo privateer-unlock apps` on the Mac";
+    let hands = machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"apps","to":"captain","kind":"request",
+            "body":"The build finished. One thing needs you.",
+            "payload":{"needs_hands":{"step":step}}}),
+    );
+
+    let read = |machine: &Machine| -> Value {
+        let out = machine.as_agent(&liaison, "liaison", "captain.waiting", json!({}));
+        assert!(out.status.success(), "{}", stderr(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let listed = read(&machine);
+    let hands_on = listed["hands_on"].as_array().unwrap();
+    assert_eq!(hands_on.len(), 1, "{listed}");
+    assert_eq!(hands_on[0]["mail"]["id"], hands["id"], "{listed}");
+    assert_eq!(hands_on[0]["step"], step, "{listed}");
+    assert_eq!(hands_on[0]["ship"], "apps", "{listed}");
+    // Both stay in the full list, and only the hands-on ask carries a step.
+    let waiting = listed["waiting"].as_array().unwrap();
+    assert_eq!(waiting.len(), 2, "{listed}");
+    let plain = waiting
+        .iter()
+        .find(|w| w["mail"]["id"] == ordinary["id"])
+        .expect("the ordinary request is still waiting");
+    assert!(plain["step"].is_null(), "{plain}");
+    assert!(plain["age_ms"].as_i64().is_some(), "{plain}");
+
+    // A marker that is not a bounded, non-empty step is refused, and nothing is sent.
+    let refused = [
+        json!({"step":"   "}),
+        json!({"step":"x".repeat(1_025)}),
+        json!({}),
+        json!("sudo privateer-unlock"),
+    ];
+    for marks in refused {
+        let out = machine.run(
+            &apps,
+            &[
+                "mail.send",
+                "--json",
+                &json!({"from":"apps","to":"captain","kind":"request",
+                "body":"Unlock please.","payload":{"needs_hands":marks}})
+                .to_string(),
+            ],
+        );
+        assert!(!out.status.success(), "accepted {marks}");
+    }
+    // A hands-on mark belongs on a request to the captain, not on a ship's mail.
+    let out = machine.run(
+        &apps,
+        &[
+            "mail.send",
+            "--json",
+            &json!({"from":"apps","to":"liaison","kind":"request",
+            "body":"Unlock please.","payload":{"needs_hands":{"step":step}}})
+            .to_string(),
+        ],
+    );
+    assert!(!out.status.success(), "a hands-on mark reached a ship");
+    assert_eq!(read(&machine)["waiting"].as_array().unwrap().len(), 2);
+
+    // Answering the hands-on ask clears it from the hands-on list.
+    machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"captain","to":"apps","kind":"reply","correlation":hands["id"],"body":"Done."}),
+    );
+    let listed = read(&machine);
+    assert!(
+        listed["hands_on"].as_array().unwrap().is_empty(),
+        "{listed}"
+    );
+    assert_eq!(listed["waiting"].as_array().unwrap().len(), 1, "{listed}");
+}
+
+#[test]
+fn a_full_waiting_list_still_lists_every_hands_on_ask_in_both_lists() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    // One more open ask than the list shows, and the newest one needs hands.
+    for n in 0..100 {
+        machine.json(
+            &apps,
+            "mail.send",
+            json!({"from":"apps","to":"captain","kind":"request","body":format!("Ordinary {n}")}),
+        );
+    }
+    let hands = machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"apps","to":"captain","kind":"request","body":"Unlock the Mac",
+            "payload":{"needs_hands":{"step":"Run `sudo privateer-unlock apps`"}}}),
+    );
+    let out = machine.as_agent(&liaison, "liaison", "captain.waiting", json!({}));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let read: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let waiting = read["waiting"].as_array().unwrap();
+    let hands_on = read["hands_on"].as_array().unwrap();
+    assert_eq!(waiting.len(), 100, "the list stays bounded");
+    assert_eq!(hands_on.len(), 1, "{read}");
+    assert_eq!(hands_on[0]["mail"]["id"], hands["id"], "{read}");
+    assert!(
+        waiting.iter().any(|w| w["mail"]["id"] == hands["id"]),
+        "a hands-on ask is missing from the full list"
+    );
+}
+
+#[test]
 fn the_liaison_sees_what_waits_on_the_captain_and_relays_the_captains_answers() {
     let machine = Machine::new();
     let liaison = liaison(&machine);
