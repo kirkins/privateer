@@ -227,12 +227,12 @@ class Pilot:
             if not (self.homes[ship] / "privateer.sqlite").exists():
                 continue
             try:
-                observed = self.call(ship, "job.list", {"limit": 1000})
+                observed = self.call(ship, "job.list", {"limit": 1000})["jobs"]
                 for job in observed:
                     if job["status"] not in TERMINAL:
                         self.call(ship, "job.cancel", {"id": job["id"]})
                 def stopped():
-                    current = self.call(ship, "job.list", {"limit": 1000})
+                    current = self.call(ship, "job.list", {"limit": 1000})["jobs"]
                     return current if all(j["status"] in TERMINAL for j in current) else None
                 finished = wait_for(self.commands, f"{ship} job cleanup", stopped) if observed else []
                 jobs[ship] = [{key: job[key] for key in ("id", "status", "incarnation", "payload", "supervisor")}

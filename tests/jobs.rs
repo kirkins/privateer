@@ -289,7 +289,10 @@ fn deadline_is_durable_and_retry_is_explicit_with_a_fresh_incarnation() {
     let expired = wait(&home, "deadline", &["timed_out"]);
     assert_eq!(expired["reason"], "job deadline reached");
     assert_eq!(
-        ok(&home, "job.list", json!({})).as_array().unwrap().len(),
+        ok(&home, "job.list", json!({}))["jobs"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
     let retry = ok(
@@ -331,7 +334,7 @@ fn disk_and_repository_limits_refuse_before_any_process_starts() {
         .status
         .success()
     );
-    assert_eq!(ok(&normal, "job.list", json!({})), json!([]));
+    assert_eq!(ok(&normal, "job.list", json!({}))["jobs"], json!([]));
     assert_eq!(
         ok(&normal, "resource.status", json!({}))["heavy_reserved"],
         0
@@ -429,7 +432,10 @@ fn concurrent_same_id_has_one_incarnation_and_one_payload() {
         "x"
     );
     assert_eq!(
-        ok(&home, "job.list", json!({})).as_array().unwrap().len(),
+        ok(&home, "job.list", json!({}))["jobs"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
@@ -506,7 +512,10 @@ fn provider_binding_survives_retry_and_changes_cancel_running_work() {
     assert!(!retry.status.success());
     assert!(String::from_utf8_lossy(&retry.stderr).contains("binding changed"));
     assert_eq!(
-        ok(&home, "job.list", json!({})).as_array().unwrap().len(),
+        ok(&home, "job.list", json!({}))["jobs"]
+            .as_array()
+            .unwrap()
+            .len(),
         2
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
@@ -671,7 +680,7 @@ fn process_identity_does_not_depend_on_caller_timezone_or_locale() {
     let job = ok_env(&home, "job.status", json!({"id":"zoned"}), &elsewhere);
     assert_eq!(job["status"], "running", "{job}");
     assert_eq!(job["reason"], Value::Null);
-    let listed = ok_env(&home, "job.list", json!({}), &elsewhere);
+    let listed = ok_env(&home, "job.list", json!({}), &elsewhere)["jobs"].clone();
     assert_eq!(listed[0]["status"], "running");
     let resources = ok_env(&home, "resource.status", json!({}), &elsewhere);
     assert_eq!(resources["reservations"][0]["supervisor_alive"], true);
@@ -902,6 +911,63 @@ fn vanished_supervisor_with_ended_payload_settles_as_failed() {
 }
 
 #[test]
+fn job_list_puts_live_work_first_and_pages_every_job_once() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // The live job is the oldest, so only its status can put it first.
+    start(&home, "live", &["sleep", "30"]);
+    wait(&home, "live", &["running"]);
+    for n in 0..5 {
+        start_light(&home, &format!("done-{n}"), &["true"]);
+    }
+    let ids = |page: &Value| -> Vec<String> {
+        page["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let default = ok(&home, "job.list", json!({}));
+    assert_eq!(ids(&default)[0], "live");
+    assert_eq!(default["jobs"][0]["status"], "running");
+    assert_eq!(default["more"], false);
+    let small = ok(&home, "job.list", json!({"limit":2}));
+    assert_eq!(ids(&small)[0], "live");
+    assert_eq!(small["more"], true);
+    assert!(small["next_cursor"].is_string());
+    // Following the cursor reaches every job exactly once.
+    let mut listed = Vec::new();
+    let mut page = small;
+    loop {
+        listed.extend(ids(&page));
+        if page["more"] == false {
+            break;
+        }
+        let cursor = page["next_cursor"].clone();
+        page = ok(&home, "job.list", json!({"limit":2,"cursor":cursor}));
+    }
+    let mut unique = listed.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(listed.len(), 6, "{listed:?}");
+    assert_eq!(unique.len(), 6, "{listed:?}");
+    assert_eq!(listed[0], "live");
+    // Finished jobs follow, newest first.
+    let finished = ok(&home, "job.list", json!({}));
+    let created: Vec<i64> = finished["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|j| j["created_ms"].as_i64().unwrap())
+        .collect();
+    assert!(created.windows(2).all(|w| w[0] >= w[1]), "{created:?}");
+    ok(&home, "job.cancel", json!({"id":"live"}));
+    wait(&home, "live", &["cancelled"]);
+}
+
+#[test]
 fn job_reads_leave_a_lost_supervisor_to_the_dispatcher() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
@@ -918,7 +984,10 @@ fn job_reads_leave_a_lost_supervisor_to_the_dispatcher() {
         ok(&home, "job.status", json!({"id":"lost"}))["status"],
         "running"
     );
-    assert_eq!(ok(&home, "job.list", json!({}))[0]["status"], "running");
+    assert_eq!(
+        ok(&home, "job.list", json!({}))["jobs"][0]["status"],
+        "running"
+    );
     let orphan = fixture.settle(&home, "lost", &["orphaned"]);
     assert_eq!(
         orphan["reason"],
@@ -1223,16 +1292,25 @@ fn job_list_is_read_only_and_dispatcher_repairs_a_leftover_reservation() {
         wait(&home, id, &["succeeded"]);
     }
     let ids = |page: &Value| -> Vec<String> {
-        page.as_array()
+        page["jobs"]
+            .as_array()
             .unwrap()
             .iter()
             .map(|j| j["id"].as_str().unwrap().to_owned())
             .collect()
     };
     let first = ok(&home, "job.list", json!({"limit":2}));
-    assert_eq!(ids(&first), ["a", "b"]);
-    let rest = ok(&home, "job.list", json!({"limit":2,"after_id":"b"}));
-    assert_eq!(ids(&rest), ["c"]);
+    assert_eq!(ids(&first), ["c", "b"]);
+    assert_eq!(first["more"], true);
+    let rest = ok(
+        &home,
+        "job.list",
+        json!({"limit":2,"cursor":first["next_cursor"]}),
+    );
+    assert_eq!(ids(&rest), ["a"]);
+    assert_eq!(rest["more"], false);
+    let after = ok(&home, "job.list", json!({"limit":2,"after_id":"b"}));
+    assert_eq!(ids(&after), ["a"]);
     assert!(
         !run(&home, "job.list", json!({"limit":"all"}))
             .status

@@ -591,7 +591,7 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
             ] {
                 assert_eq!(env[key], json!(path), "{key}");
             }
-            let jobs = call("job.list", json!({}));
+            let jobs = call("job.list", json!({}))["jobs"].clone();
             assert_eq!(jobs.as_array().unwrap().len(), 1);
             assert_eq!(jobs[0]["status"], "succeeded");
             assert_eq!(jobs[0]["action"], "spawn");
@@ -621,7 +621,7 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
                 &["--home", home.to_str().unwrap(), "job.list", "--json", "{}"],
             );
             if let Ok(jobs) = serde_json::from_slice::<Value>(&jobs.stdout) {
-                for job in jobs.as_array().into_iter().flatten() {
+                for job in jobs["jobs"].as_array().into_iter().flatten() {
                     folder.run_in(
                         &folder.root,
                         &[
