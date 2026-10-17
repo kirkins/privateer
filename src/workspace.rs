@@ -446,7 +446,19 @@ pub(crate) fn is_wake(store: &Store, args: &Value) -> Result<bool> {
     )?;
     Ok(wake || crate::errand::running(store, id)?)
 }
-#[allow(clippy::too_many_arguments)]
+/// Whether and how long a workspace acquisition waits in the host disk queue.
+pub(crate) struct WorkspaceWait {
+    pub wait_for_capacity: bool,
+    pub max_wait_secs: u64,
+}
+impl WorkspaceWait {
+    pub(crate) fn none() -> Self {
+        Self {
+            wait_for_capacity: false,
+            max_wait_secs: 0,
+        }
+    }
+}
 pub(crate) fn execution(
     store: &Store,
     task: &str,
@@ -454,8 +466,7 @@ pub(crate) fn execution(
     selected: &Path,
     isolate: bool,
     expected: Option<&str>,
-    wait_for_capacity: bool,
-    max_wait_secs: u64,
+    wait: WorkspaceWait,
 ) -> Result<Execution> {
     owner(store, task)?;
     ensure!(selected.is_dir(), "cwd must be an existing directory");
@@ -523,8 +534,8 @@ pub(crate) fn execution(
         repo,
         &selected,
         &lock,
-        wait_for_capacity,
-        max_wait_secs,
+        wait.wait_for_capacity,
+        wait.max_wait_secs,
     )?;
     crate::jobs::workspace_previous_owner_idle(
         store,
@@ -544,7 +555,15 @@ pub(crate) fn planning_root(
     repo: &Path,
     lease: &str,
 ) -> Result<PathBuf> {
-    let exec = execution(store, task, repo, repo, true, Some(lease), false, 0)?;
+    let exec = execution(
+        store,
+        task,
+        repo,
+        repo,
+        true,
+        Some(lease),
+        WorkspaceWait::none(),
+    )?;
     Ok(exec.root)
 }
 pub(crate) fn validate_job(

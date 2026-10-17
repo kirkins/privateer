@@ -352,9 +352,9 @@ pub(crate) fn wait_for_workspace_disk(
         }
         if ahead == 0 {
             let settings = admission::settings(&conn)?;
-            let host_free = admission::disk(Path::new("/"))?.0;
-            let local_free = admission::disk(pool)?.0;
-            let available = host_free.min(local_free);
+            // Only the filesystem this workspace will use: a full root must
+            // not block a pool on a separate volume.
+            let available = admission::disk(pool)?.0;
             let required = settings.min_free_disk_bytes.max(charter_floor);
             if available >= required {
                 return Ok(lease);
@@ -478,13 +478,18 @@ fn dequeue(store: &Store, job: &Job) -> Result<()> {
 ///
 /// A request from the queue must be at its head; a direct request may not
 /// jump a non-empty queue. Either way an unfitting request is `Refused`.
+/// The disk floors for one reservation, measured on the filesystem the work
+/// will use rather than the host root.
+struct DiskFloor<'a> {
+    charter_min_free_bytes: u64,
+    path: &'a Path,
+}
 fn reserve(
     conn: &Connection,
     reservation: &mut Reservation,
     estimate: Option<&Estimate>,
     charter_cap: Option<u64>,
-    charter_min_free_bytes: u64,
-    disk_path: &Path,
+    floor: DiskFloor<'_>,
     from_queue: bool,
 ) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -547,8 +552,8 @@ fn reserve(
                     charter: reservation.charter.as_deref().unwrap_or(""),
                     charter_cap,
                     demand: reservation.demand,
-                    charter_min_free_bytes,
-                    disk_path,
+                    charter_min_free_bytes: floor.charter_min_free_bytes,
+                    disk_path: floor.path,
                 },
             )?;
             if from_queue {
@@ -1113,8 +1118,10 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         &requested_cwd,
         !(agent && crate::workspace::is_wake(store, &args)?),
         expected_workspace,
-        wait_for_capacity,
-        max_wait_secs.unwrap_or(DEFAULT_MAX_WAIT_SECS),
+        crate::workspace::WorkspaceWait {
+            wait_for_capacity,
+            max_wait_secs: max_wait_secs.unwrap_or(DEFAULT_MAX_WAIT_SECS),
+        },
     )?;
     let cwd = if requested_cwd.starts_with(&workspace.root) {
         requested_cwd.clone()
@@ -1272,11 +1279,13 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             &mut reservation,
             estimate.as_ref(),
             charter_cap,
-            charter
-                .get("min_free_bytes")
-                .and_then(Value::as_u64)
-                .unwrap_or(2 * 1024 * 1024 * 1024),
-            &job.cwd,
+            DiskFloor {
+                charter_min_free_bytes: charter
+                    .get("min_free_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(2 * 1024 * 1024 * 1024),
+                path: &job.cwd,
+            },
             false,
         ) {
             Ok(()) => {}
@@ -1492,11 +1501,13 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             &mut reservation,
             job.estimate.as_ref(),
             cap,
-            charter
-                .get("min_free_bytes")
-                .and_then(Value::as_u64)
-                .unwrap_or(2 * 1024 * 1024 * 1024),
-            &job.cwd,
+            DiskFloor {
+                charter_min_free_bytes: charter
+                    .get("min_free_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(2 * 1024 * 1024 * 1024),
+                path: &job.cwd,
+            },
             true,
         ) {
             Ok(()) => {

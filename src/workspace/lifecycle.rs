@@ -247,8 +247,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 &selected,
                 true,
                 None,
-                wait_for_capacity,
-                max_wait_secs,
+                WorkspaceWait {
+                    wait_for_capacity,
+                    max_wait_secs,
+                },
             )?;
             ensure!(
                 exec.lease_id.is_some(),

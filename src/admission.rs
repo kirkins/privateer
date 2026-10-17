@@ -276,8 +276,9 @@ pub fn admit(
     held: &[Held],
     request: &Request,
 ) -> Result<()> {
-    let local_disk = disk(request.disk_path)?.0;
-    let available = host.disk_available_bytes.min(local_disk);
+    // Measure the filesystem the job will use; a full root must not block
+    // work on a separate volume.
+    let available = disk(request.disk_path)?.0;
     let required_disk = settings
         .min_free_disk_bytes
         .max(request.charter_min_free_bytes);

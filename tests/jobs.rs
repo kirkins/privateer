@@ -1434,6 +1434,29 @@ fn start_light(home: &Path, id: &str, command: &[&str]) {
 }
 
 #[test]
+fn a_light_job_starts_while_a_heavy_job_waits_in_the_queue() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // The fixture allows one heavy job; fill it and queue a second.
+    start(&home, "running", &["sleep", "1"]);
+    let queued = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"heavy-wait","command":["true"],"wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    // Light work needs no capacity, so it starts now instead of queueing.
+    let light = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"light-now","command":["true"],"heavy":false}),
+    );
+    assert_ne!(light["status"], "queued", "{light}");
+    wait(&home, "light-now", &["succeeded"]);
+    wait(&home, "heavy-wait", &["succeeded"]);
+}
+
+#[test]
 fn waiting_jobs_start_in_arrival_order_and_others_cannot_jump_the_queue() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
