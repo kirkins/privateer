@@ -1328,7 +1328,19 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         tx.commit()?;
         return Ok(json!({"id": id, "duplicate": true, "request_end": receipt}));
     }
-    if kind == "reply" {
+    // A ship's reply or closure collected for the captain may answer a
+    // request asked on the sending machine, which closes it there; no home on
+    // the collecting machine holds it. The captain still reads the message.
+    let elsewhere = |request: Option<&str>| -> Result<bool> {
+        Ok(to == CAPTAIN
+            && args["unmatched"] == true
+            && match request {
+                Some(request) => by_id(store, request)?.is_none(),
+                None => false,
+            })
+    };
+    let answers_here = kind == "reply" && !elsewhere(correlation)?;
+    if answers_here {
         let correlation = correlation.context("a reply names the request it answers")?;
         let request =
             by_id(store, correlation)?.with_context(|| format!("unknown request {correlation}"))?;
@@ -1363,13 +1375,15 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             matches!(kind, "request" | "decision").then_some("open")
         ],
     )?;
-    if kind == "reply" {
+    if answers_here {
         tx.execute(
             "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3 WHERE id=?1",
             params![correlation, id, now],
         )?;
     }
-    if let Some(end) = payload.get("request_end") {
+    if let Some(end) = payload.get("request_end")
+        && !elsewhere(correlation)?
+    {
         ensure!(
             kind == "notice" && end["version"] == 1,
             "invalid request closure"
