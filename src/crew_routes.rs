@@ -194,19 +194,36 @@ pub(crate) struct Choice {
 }
 
 /// First listed available route for a ship, when a fleet policy provides one.
-/// An empty list preserves callers' existing route defaults.
-pub(crate) fn first_mate_fallback(store: &Store, ship: &str) -> Result<Option<Choice>> {
+/// An empty list preserves callers' existing route defaults. A charter-pinned
+/// provider adapter always wins over a first-mate route list.
+pub(crate) fn first_mate_fallback(
+    store: &Store,
+    ship: &str,
+    task: &str,
+    profile: &Value,
+) -> Result<Option<Choice>> {
+    let Some(own_route) = identity(&json!({
+        "manifest": profile["manifest"],
+        "options": profile["options"]
+    })) else {
+        return Ok(None);
+    };
+    let ledger = crate::jobs::host_ledger(store)?;
+    if crate::routes::blocked(&ledger, &own_route)?.is_none()
+        || store.authorize(task, "spawn")?["provider_plugin"]
+            .as_object()
+            .is_some()
+    {
+        return Ok(None);
+    }
     let Some(policy) = for_store(store)? else {
         return Ok(None);
     };
     let names = order(&policy, ship, "first_mate");
     for name in names {
         let route = &policy["routes"][name.as_str()];
-        if identity(route)
-            .map(|id| crate::routes::refusal(store, &id))
-            .transpose()?
-            .flatten()
-            .is_none()
+        if let Some(route_id) = identity(route)
+            && crate::routes::blocked(&ledger, &route_id)?.is_none()
         {
             return Ok(Some(Choice {
                 manifest: route["manifest"].clone(),
