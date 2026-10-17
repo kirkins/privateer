@@ -1,0 +1,259 @@
+//! Sleeping hosted first mates. With `first_mate.sleep_after_secs` set, a
+//! hosted session whose mail adapter has reported it idle for that long has
+//! its native harness stopped to free memory, while `start --hosted` keeps the
+//! pane, the ship's presence lease and its place in Herdr. New actionable
+//! mail, ready scheduled work or Enter in the pane starts the harness again on
+//! the same conversation. The dispatcher sees an attended, hosted ship
+//! throughout, so it neither opens another space nor starts a headless wake.
+use crate::store::Store;
+use anyhow::Result;
+use rusqlite::{OptionalExtension, params};
+use serde_json::json;
+
+/// Idle reports arrive every five seconds; an older one says nothing about now.
+const FRESH_MS: i64 = 15_000;
+
+/// A stopped harness, held under a new holder so its mail adapter, if it is
+/// somehow still running, no longer owns the ship.
+pub(crate) struct Asleep {
+    pub holder: String,
+    /// Mail through this sequence was there before sleeping and wakes nothing.
+    pub through_seq: i64,
+}
+
+/// Whether this session's adapter has reported it idle, without a break, for
+/// `after_secs`, with nothing ready for it. Read only; `sleep` decides.
+pub(crate) fn due(store: &Store, ship: &str, holder: &str, after_secs: u64) -> Result<bool> {
+    if after_secs == 0 {
+        return Ok(false);
+    }
+    let now = Store::now_ms();
+    let idle_since: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT idle_since_ms FROM work_sessions
+             WHERE ship=?1 AND holder=?2 AND idle=1 AND checked_ms>?3",
+            params![ship, holder, now - FRESH_MS],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(
+        idle_since.is_some_and(|since| now - since >= (after_secs as i64).saturating_mul(1000))
+            && !crate::scheduling::has_ready(store, ship)?,
+    )
+}
+
+/// Take the ship's lease for a sleeping session, in one transaction with the
+/// last check, before the harness is stopped. The adapter checks ownership
+/// before each delivery, so once this commits it starts no new turn.
+pub(crate) fn sleep(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    after_secs: u64,
+) -> Result<Option<Asleep>> {
+    let tx = store.write_transaction()?;
+    let presence = crate::presence::presence(store, ship)?;
+    if presence["attended"] != true
+        || presence["lease"]["holder"] != holder
+        || crate::permissions::paused(store, ship)?
+        || !due(store, ship, holder, after_secs)?
+    {
+        return Ok(None);
+    }
+    let asleep = format!("{}{}", crate::presence::HOSTED, uuid::Uuid::new_v4());
+    tx.execute(
+        "UPDATE presence SET holder=?3 WHERE ship=?1 AND holder=?2",
+        params![ship, holder, asleep],
+    )?;
+    // Launch backoff follows the session from one holder to the next.
+    tx.execute(
+        "UPDATE host_launches SET holder=?3 WHERE ship=?1 AND holder=?2",
+        params![ship, holder, asleep],
+    )?;
+    tx.execute("DELETE FROM work_sessions WHERE ship=?1", [ship])?;
+    let through_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
+        [ship],
+        |r| r.get(0),
+    )?;
+    store.audit(
+        "host.slept",
+        &json!({"ship": ship, "idle_secs": after_secs, "through_seq": through_seq}),
+    )?;
+    tx.commit()?;
+    Ok(Some(Asleep {
+        holder: asleep,
+        through_seq,
+    }))
+}
+
+/// What wakes a sleeping first mate, other than the captain at its pane:
+/// actionable mail that arrived after it slept, or scheduled work now ready.
+pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option<&'static str>> {
+    let mail: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2
+           AND COALESCE(delivery,'received')='received' AND (kind<>'notice' OR urgency<>'low'))",
+        params![ship, asleep.through_seq],
+        |r| r.get(0),
+    )?;
+    if mail {
+        return Ok(Some("mail"));
+    }
+    Ok(crate::scheduling::has_ready(store, ship)?.then_some("scheduled work"))
+}
+
+pub(crate) fn woke(store: &Store, ship: &str, reason: &str) {
+    let _ = store.audit("host.woke", &json!({"ship": ship, "reason": reason}));
+}
+
+/// How the native harness ended under `supervise`.
+pub(crate) enum Ended {
+    Exited(std::process::ExitStatus),
+    Asleep(Asleep),
+}
+
+/// Wait for a hosted harness, refreshing the lease, and stop it once the ship
+/// may sleep. Exec keeps the harness's own process identity, so the wait
+/// below is evidence the payload stopped, not just a wrapper.
+pub(crate) fn supervise(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    child: &mut std::process::Child,
+    after_secs: u64,
+) -> Result<Ended> {
+    use std::time::{Duration, Instant};
+    let mut refreshed = Instant::now();
+    let mut checked = Instant::now();
+    let mut leased = true;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Ended::Exited(status));
+        }
+        if leased && refreshed.elapsed() >= Duration::from_secs(30) {
+            refreshed = Instant::now();
+            // A replaced lease is never reclaimed; the session just runs on.
+            leased = crate::presence::refresh(store, ship, holder, 90).unwrap_or(false);
+        }
+        if leased && after_secs > 0 && checked.elapsed() >= Duration::from_secs(5) {
+            checked = Instant::now();
+            if let Ok(Some(asleep)) = sleep(store, ship, holder, after_secs) {
+                stop(child)?;
+                return Ok(Ended::Asleep(asleep));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Ask the harness to end as on logout, then insist; return once it has.
+fn stop(child: &mut std::process::Child) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let pid = child.id() as libc::pid_t;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// The pane's terminal as it was before any harness changed it.
+pub(crate) struct Terminal(Option<libc::termios>);
+
+impl Terminal {
+    pub(crate) fn save() -> Self {
+        let mut mode = unsafe { std::mem::zeroed::<libc::termios>() };
+        Self((unsafe { libc::tcgetattr(0, &mut mode) } == 0).then_some(mode))
+    }
+
+    /// Undo what a stopped full-screen harness may have left behind: its
+    /// raw mode, alternate screen, hidden cursor, mouse and key reporting.
+    fn restore(&self) {
+        use std::io::Write;
+        if let Some(mode) = &self.0 {
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, mode) };
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(
+            b"\x1b[?1049l\x1b[?25h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\n",
+        );
+        let _ = out.flush();
+    }
+}
+
+/// Hold a sleeping ship's lease in its pane until something wakes it. Return
+/// why it woke, or None once the lease is gone, so the pane can close.
+pub(crate) fn rest(
+    store: &Store,
+    ship: &str,
+    asleep: &Asleep,
+    terminal: &Terminal,
+) -> Result<Option<&'static str>> {
+    use std::time::{Duration, Instant};
+    terminal.restore();
+    println!(
+        "⚓ {ship}'s first mate is asleep to free memory. New mail or scheduled work wakes it.\n  Type a message and press Enter to mail it and wake the first mate, or just press Enter."
+    );
+    let mut keyboard = terminal.0.is_some();
+    let mut refreshed = Instant::now();
+    loop {
+        if refreshed.elapsed() >= Duration::from_secs(30) {
+            refreshed = Instant::now();
+            if !crate::presence::refresh(store, ship, &asleep.holder, 90)? {
+                return Ok(None);
+            }
+        }
+        if let Some(reason) = alarm(store, ship, asleep)? {
+            return Ok(Some(reason));
+        }
+        // Poll rather than read on a thread, so no reader is left behind to
+        // take the captain's first keys from the woken harness.
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait_ms = if keyboard { 2_000 } else { 0 };
+        if keyboard && unsafe { libc::poll(&mut fd, 1, wait_ms) } > 0 {
+            let mut line = [0u8; 8192];
+            let read = unsafe { libc::read(0, line.as_mut_ptr().cast(), line.len()) };
+            if read > 0 {
+                unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+                let typed = String::from_utf8_lossy(&line[..read as usize]);
+                say(store, ship, typed.trim());
+                return Ok(Some("captain"));
+            }
+            keyboard = false; // closed input: only mail and work wake it
+        }
+        if !keyboard {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
+
+/// What the captain typed to a sleeping first mate reaches it as their mail,
+/// as `privateer watch` sends it, so the woken session reads it first.
+fn say(store: &Store, ship: &str, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    let sent = Store::open(store.home()).and_then(|mut store| {
+        crate::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"from": "captain", "to": ship, "kind": "notice", "body": body}),
+        )
+    });
+    match sent {
+        Ok(_) => println!("→ you: {body}"),
+        Err(error) => println!("✗ not sent: {error:#}"),
+    }
+}

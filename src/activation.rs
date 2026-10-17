@@ -27,6 +27,9 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
     // with its context at least this full (0 seconds turns it off).
     ("quiet_compact_secs", 600, 0, 86_400),
     ("quiet_compact_percent", 40, 1, 100),
+    // A hosted first mate's harness stops after this long idle and starts
+    // again on the same conversation when needed (0 keeps it running).
+    ("sleep_after_secs", 0, 0, 86_400),
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;
