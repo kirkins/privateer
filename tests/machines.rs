@@ -593,10 +593,12 @@ fn a_falling_warning_is_not_cleared_while_the_floor_alarm_is_up() {
     );
     // The floor is crossed while the space is still falling: the floor alarm
     // arrives, and the warning is not cleared in the same pass.
+    // Well above live free space, so other writers on a shared runner cannot
+    // free enough in between to keep this machine above it.
     laptop.ok(
         "liaison",
         "resource.configure",
-        json!({"min_free_disk_bytes":free + 1}),
+        json!({"min_free_disk_bytes":free + free / 8}),
     );
     laptop.pass("upkeep", &ssh);
     let all = notices();
