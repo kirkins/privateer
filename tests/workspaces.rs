@@ -1150,3 +1150,34 @@ fn the_dispatcher_releases_only_workspaces_whose_work_has_landed() {
     assert!(path(&pending).join("pending.txt").exists());
     assert!(path(&fresh).is_dir());
 }
+
+#[test]
+fn a_workspace_needs_only_disk_and_does_not_wait_behind_heavy_jobs() {
+    let f = Fixture::new();
+    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0}}));
+    f.ok(
+        "job.start",
+        json!({"task_id":"one","id":"building","command":["/bin/sleep","3"],"heavy":true}),
+    );
+    let waiting = f.ok("job.start", json!({"task_id":"one","id":"waiting","command":["/bin/sh","-c","true"],"heavy":true,"wait_for_capacity":true}));
+    assert_eq!(waiting["status"], "queued");
+    // Disk is fine, so another task's workspace comes at once, without
+    // joining the queue the second build waits in.
+    let w = f.acquire("two");
+    assert!(w["lease_id"].is_string(), "{w}");
+    // Below the floor it is refused unless it chooses to wait for disk.
+    let total = f.ok("resource.status", json!({}))["host"]["disk_total_bytes"]
+        .as_u64()
+        .unwrap();
+    f.release(&w, false);
+    f.ok(
+        "resource.configure",
+        json!({"min_free_disk_bytes":total.saturating_mul(2)}),
+    );
+    let refused = f.run("workspace.acquire", json!({"task_id":"two"}));
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("workspace disk admission refused"));
+    f.ok("resource.configure", json!({"min_free_disk_bytes":0}));
+    f.wait("building");
+    f.wait("waiting");
+}
