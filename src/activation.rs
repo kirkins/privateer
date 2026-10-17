@@ -39,7 +39,10 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, finished_ms INTEGER, error TEXT, usage TEXT);
          CREATE INDEX IF NOT EXISTS wake_ship ON wakes(ship, created_ms);
          CREATE TABLE IF NOT EXISTS host_launches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
-           failures INTEGER NOT NULL, retry_ms INTEGER NOT NULL, error TEXT);",
+           failures INTEGER NOT NULL, retry_ms INTEGER NOT NULL, error TEXT);
+         CREATE TABLE IF NOT EXISTS hosted_block_alerts(
+           ship TEXT PRIMARY KEY, blocked_since_ms INTEGER NOT NULL,
+           alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1)));",
     )?;
     for column in ["focuses", "harness", "session_id", "dispatcher_generation"] {
         let present: bool = tx.query_row(
@@ -776,7 +779,10 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let bridge = crate::host::bridge::maintain(store).unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
-    crate::host::repair(store);
+    let hosted_observations = crate::host::repair(store);
+    let hosted_blocked = crate::host::alert_blocked(store, &hosted_observations).unwrap_or_else(
+        |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
+    );
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
@@ -795,7 +801,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 

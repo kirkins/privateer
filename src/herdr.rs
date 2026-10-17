@@ -581,6 +581,13 @@ impl Client {
     }
 
     pub(crate) fn arrange_with_mates(&mut self, local: &[(String, Binding)]) -> Result<()> {
+        self.arrange_observed_with_mates(local).map(|_| ())
+    }
+
+    pub(crate) fn arrange_observed_with_mates(
+        &mut self,
+        local: &[(String, Binding)],
+    ) -> Result<Option<View>> {
         let listed = self.request("workspace.list", json!({}))?;
         let mut spaces: Vec<(String, String, String)> = listed["workspaces"]
             .as_array()
@@ -599,11 +606,15 @@ impl Client {
         // exists on this socket incarnation. Never guess from a space's label.
         let mut mates = sidebar::fleet_mates();
         mates.extend_from_slice(local);
-        if !mates.is_empty() {
-            let view = self.snapshot()?;
+        let view = if !mates.is_empty() {
+            Some(self.snapshot()?)
+        } else {
+            None
+        };
+        if let Some(view) = &view {
             for (ship, binding) in mates {
                 if binding.socket != self.path
-                    || !view.panes.iter().any(|p| binding.matches(&view, p))
+                    || !view.panes.iter().any(|p| binding.matches(view, p))
                 {
                     continue;
                 }
@@ -653,7 +664,7 @@ impl Client {
             .take(wanted.len())
             .collect();
         if wanted.is_empty() || current.iter().copied().eq(wanted.iter()) {
-            return Ok(());
+            return Ok(view);
         }
         let before = spaces
             .iter()
@@ -663,7 +674,7 @@ impl Client {
             "workspace.move_block",
             json!({"workspace_ids":wanted,"before_workspace_id":before}),
         )?;
-        Ok(())
+        Ok(view)
     }
 
     pub fn release_agent(&mut self, pane: &str, agent: &str) -> Result<()> {

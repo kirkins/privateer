@@ -135,6 +135,13 @@ fn detached_job_survives_cli_exit_and_idempotency_does_not_duplicate_work() {
         "diagnostic"
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+    // The ended job is remembered, so the load it leaves in the average does
+    // not hold back the next one.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ok(&home, "resource.status", json!({}))["recently_ended"] != 1 {
+        assert!(Instant::now() < deadline, "the ended job was not recorded");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(
         !run(
             &home,
