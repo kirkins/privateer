@@ -3,9 +3,10 @@
 //!
 //! A peer usually names one remote home. A machine peer (`gateway`) reaches
 //! another machine's gateway instead, which hands mail to the right home
-//! there; `fleet` names that machine's registry when it is not the default. A `collected` peer has
-//! no transport at all: the other machine cannot be reached from here, so
-//! mail for ships behind it waits until that machine collects it.
+//! there; `fleet` names that machine's registry when it is not the default.
+//! A `collected` peer has no transport at all: the other machine cannot be
+//! reached from here, so mail for ships behind it waits until that machine
+//! collects it.
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};

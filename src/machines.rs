@@ -278,7 +278,11 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
 
 /// Exchange directories with a machine this one reaches, and install its
 /// ships in every home here. Clashing names are refused on both sides.
-fn exchange(conn: &Connection, machine: &Machine) -> Result<Vec<(String, String)>> {
+fn exchange(
+    conn: &Connection,
+    machine: &Machine,
+    timeout: Option<Duration>,
+) -> Result<Vec<(String, String)>> {
     let known_as = machine
         .known_as
         .as_deref()
@@ -288,7 +292,7 @@ fn exchange(conn: &Connection, machine: &Machine) -> Result<Vec<(String, String)
         machine,
         "fleet.link",
         json!({"machine": known_as, "ships": directory(&ours)}),
-        None,
+        timeout,
     )?;
     let theirs = parse_directory(&result["ships"])?;
     let clashing = clashes(conn, &theirs)?;
@@ -362,7 +366,7 @@ fn add(args: &Value) -> Result<Value> {
         next_contact_ms: None,
         failures: 0,
     };
-    let theirs = exchange(&conn, &machine)?;
+    let theirs = exchange(&conn, &machine, None)?;
     Ok(json!({"machine": name, "known_as": known_as,
         "ships": theirs.iter().map(|(n, _)| n).collect::<Vec<_>>()}))
 }
@@ -446,7 +450,7 @@ fn refresh(name: Option<&str>) -> Result<Value> {
         .into_iter()
         .filter(|m| m.role == "collects" && name.is_none_or(|n| n == m.name))
     {
-        let ships = exchange(&conn, &machine)?;
+        let ships = exchange(&conn, &machine, None)?;
         out.push(json!({"machine": machine.name, "ships": ships.len()}));
     }
     Ok(json!({"refreshed": out}))
@@ -538,20 +542,18 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             let due = machine
                 .refreshed_ms
                 .is_none_or(|at| Store::now_ms() - at >= REFRESH_MS);
-            let refreshed = if due {
-                exchange(&conn, &machine).err().map(|e| format!("{e:#}"))
+            // A machine that cannot be refreshed is not collected from in the
+            // same pass, so an unreachable one stalls a pass only once.
+            let outcome = if due {
+                exchange(&conn, &machine, Some(timeout)).map(|_| ())
             } else {
-                None
-            };
-            let collected = collect(&conn, &machine, timeout);
-            schedule(&conn, &machine, collected.is_ok() && refreshed.is_none())?;
-            let mut outcome = collected.unwrap_or_else(
-                |error| json!({"machine": machine.name, "error": format!("{error:#}")}),
-            );
-            if let Some(error) = refreshed {
-                outcome["refresh_error"] = json!(error);
+                Ok(())
             }
-            out.push(outcome);
+            .and_then(|()| collect(&conn, &machine, timeout));
+            schedule(&conn, &machine, outcome.is_ok())?;
+            out.push(outcome.unwrap_or_else(
+                |error| json!({"machine": machine.name, "error": format!("{error:#}")}),
+            ));
         }
         Ok(out)
     };
