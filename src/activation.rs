@@ -50,8 +50,25 @@ pub fn init(store: &Store) -> Result<()> {
            failures INTEGER NOT NULL, retry_ms INTEGER NOT NULL, error TEXT);
          CREATE TABLE IF NOT EXISTS hosted_block_alerts(
            ship TEXT PRIMARY KEY, blocked_since_ms INTEGER NOT NULL,
-           alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1)));",
+           alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1)));
+         CREATE TABLE IF NOT EXISTS hosted_panes(ship TEXT PRIMARY KEY, pid INTEGER NOT NULL,
+           started TEXT NOT NULL, executable TEXT NOT NULL, harness_pid INTEGER,
+           harness_started TEXT, recorded_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS hosted_relaunches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
+           force INTEGER NOT NULL CHECK(force IN (0,1)), requested_ms INTEGER NOT NULL,
+           expires_ms INTEGER NOT NULL);",
     )?;
+    // A pane relaunched by an upgrade, or from sleep, starts asleep.
+    let asleep_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='start_asleep')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !asleep_column {
+        tx.execute_batch(
+            "ALTER TABLE host_launches ADD COLUMN start_asleep INTEGER NOT NULL DEFAULT 0 CHECK(start_asleep IN (0,1));",
+        )?;
+    }
     for column in [
         "focuses",
         "harness",

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 pub mod bridge;
 pub(crate) mod sleep;
+pub mod upgrade;
 
 /// How long a launch may take to adopt its lease before it lapses.
 const LAUNCH_TTL_SECS: u64 = 60;
@@ -384,6 +385,7 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
 /// The one row per ship and bounded error also bound persistent state.
 pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<Attempt> {
     let holder = format!("{}{}", crate::presence::HOSTED, uuid::Uuid::new_v4());
+    let asleep: bool;
     {
         let tx = store.write_transaction()?;
         let running: bool = tx.query_row(
@@ -394,23 +396,25 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         if running || crate::presence::attended(store, ship)? {
             return Ok(Attempt::Busy);
         }
-        let previous: Option<(i64, i64)> = tx
+        let previous: Option<(i64, i64, bool)> = tx
             .query_row(
-                "SELECT failures, retry_ms FROM host_launches WHERE ship=?1",
+                "SELECT failures, retry_ms, start_asleep FROM host_launches WHERE ship=?1",
                 [ship],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         let now = Store::now_ms();
-        if let Some((_, until)) = previous.filter(|(_, until)| *until > now) {
+        if let Some((_, until, _)) = previous.filter(|(_, until, _)| *until > now) {
             return Ok(Attempt::Backoff(until));
         }
-        let failures = previous.map_or(1, |(n, _)| n.saturating_add(1).clamp(1, 7));
+        let failures = previous.map_or(1, |(n, _, _)| n.saturating_add(1).clamp(1, 7));
+        // The flag a retired pane left stays until a pane starts on it.
+        asleep = previous.is_some_and(|(_, _, flag)| flag);
         tx.execute(
-            "INSERT INTO host_launches(ship,holder,failures,retry_ms,error) VALUES(?1,?2,?3,?4,'awaiting hosted startup')
+            "INSERT INTO host_launches(ship,holder,failures,retry_ms,error,start_asleep) VALUES(?1,?2,?3,?4,'awaiting hosted startup',?5)
              ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, failures=excluded.failures,
-               retry_ms=excluded.retry_ms, error=excluded.error",
-            params![ship, holder, failures, now + delay(failures)])?;
+               retry_ms=excluded.retry_ms, error=excluded.error, start_asleep=excluded.start_asleep",
+            params![ship, holder, failures, now + delay(failures), asleep])?;
         // Under the same lock as the attended check; no nested claim transaction.
         let harness = profile["manifest"]
             .as_str()
@@ -427,12 +431,16 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         // entrypoint record that would make a fresh launch look resumed.
         let continuation = continuation(folder, profile);
         let binary = crate::executable::installed()?;
+        let mut env = vec![("PRIVATEER_HOSTED_HOLDER", holder.as_str())];
+        if asleep {
+            env.push(("PRIVATEER_HOSTED_START_ASLEEP", "1"));
+        }
         let pane = client.space(
             folder,
             ship,
             &binary,
             store.home(),
-            &[("PRIVATEER_HOSTED_HOLDER", &holder)],
+            &env,
             &["start", "--hosted"],
         )?;
         settle(store, &mut client, &pane.workspace_id, "mate", ship);
@@ -462,7 +470,7 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
 pub(crate) fn started(store: &Store, ship: &str, holder: &str) -> Result<()> {
     let tx = store.write_transaction()?;
     tx.execute(
-        "UPDATE host_launches SET failures=0,error=NULL WHERE ship=?1 AND holder=?2",
+        "UPDATE host_launches SET failures=0,error=NULL,start_asleep=0 WHERE ship=?1 AND holder=?2",
         params![ship, holder],
     )?;
     tx.execute("DELETE FROM hosted_block_alerts WHERE ship=?1", [ship])?;

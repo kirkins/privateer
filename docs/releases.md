@@ -51,6 +51,7 @@ Fields include:
 - `current`, `running_executable`: paths that make that distinction inspectable.
 - `history`: newest 100 upgrade outcomes from the fleet registry (`history_limit: 100`). Existing registries without an upgrades table report an empty history.
 - `keep_releases`: the future retention default, 3; not a claim that pruning ran.
+- `hosted_panes`: each live hosted first mate in this home (listed for the operator when a ship home is at hand). Each reports the release its process runs (`commit`, null for an unversioned build), its `executable`, the `current_commit`, and `drift`: true when the pane runs a different release than `current`, or its binary was replaced on disk. Drift is reported, not repaired, here: hosted panes relaunch at their next idle point or through `privateer host relaunch SHIP`, as the [architecture notes](architecture.md#hosted-first-mates) describe.
 
 A dangling, invalid, or foreign `current` target is reported as an error, not repaired. The fleet registry gains an additive `upgrades` table, independent of per-ship home schemas. `UpgradeRecord` holds an id, exact from/to commits, actor, start/completion timestamps, and each ship's outcome. The persistence API is idempotent for identical records and refuses a conflicting record with the same id. There is deliberately no command to fabricate history: the later guarded orchestrator will record its results here. Status does not imply that the live fleet has restarted or that an upgrade has been approved.
 

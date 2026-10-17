@@ -422,11 +422,24 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             note["body"].as_str().unwrap_or("")
         ));
     }
+    // Only a hosted first mate has a pane; its release is reported, not judged.
+    let hosted_pane = match crate::host::upgrade::view(store, ship) {
+        Ok(pane) => pane,
+        Err(error) => Some(json!({"error": format!("{error:#}")})),
+    };
+    if let Some(pane) = hosted_pane.as_ref().filter(|pane| pane["drift"] == true) {
+        text.push_str(&format!(
+            "Hosted first mate runs release {} while {} is current; it relaunches at its next idle point, or `privateer host relaunch {ship}` moves it now.\n",
+            pane["commit"].as_str().unwrap_or("an unversioned build"),
+            pane["current_commit"].as_str().unwrap_or("")
+        ));
+    }
     Ok(json!({
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
         "idle_tasks": idle, "attention": attention, "scheduling": scheduling, "text": text,
+        "hosted_pane": hosted_pane,
     }))
 }
 
