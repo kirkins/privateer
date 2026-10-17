@@ -2103,6 +2103,10 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
         args.iter().any(|a| a.ends_with("attended-claude")),
         "{argv}"
     );
+    // A hosted first mate stays out of the captain's browser unless its
+    // options ask for it.
+    assert!(args.contains(&"--no-chrome"), "{argv}");
+    assert!(!args.contains(&"--chrome"), "{argv}");
     // With no conversation in the folder, --continue would exit at once.
     assert!(!args.contains(&"--continue"), "{argv}");
     place.stop_native("infra");

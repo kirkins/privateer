@@ -65,6 +65,12 @@ class Permissions(unittest.TestCase):
         _, argv=build("claude",self.request(permission_mode="plan"))
         self.assertIn("plan",argv)
 
+    def test_claude_reaches_the_captains_browser_only_when_its_route_asks(self):
+        _, argv=build("claude",self.request())
+        self.assertIn("--no-chrome",argv); self.assertNotIn("--chrome",argv)
+        _, argv=build("claude",self.request(chrome=True))
+        self.assertIn("--chrome",argv); self.assertNotIn("--no-chrome",argv)
+
     def test_attended_yolo_overrides_only_permission_selectors_before_prompt(self):
         argv=attended_argv("claude",["claude","--model","chosen","--permission-mode=plan","--","--permission-mode=manual"],self.policy)
         self.assertIn("bypassPermissions",argv)
