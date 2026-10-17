@@ -85,6 +85,12 @@ fn ok(home: &Path, command: &str, args: Value) -> Value {
 fn wait(home: &Path, id: &str, accepted: &[&str]) -> Value {
     let until = Instant::now() + Duration::from_secs(12);
     loop {
+        let dispatched = run(home, "serve", json!({"once":true}));
+        assert!(
+            dispatched.status.success(),
+            "serve: {}",
+            String::from_utf8_lossy(&dispatched.stderr)
+        );
         let job = ok(home, "job.status", json!({"id":id}));
         if accepted.contains(&job["status"].as_str().unwrap()) {
             return job;
@@ -181,6 +187,7 @@ fn shared_admission_preserves_orphan_payload_until_explicit_cancellation() {
     while active_pid(supervisor) && Instant::now() < until {
         thread::sleep(Duration::from_millis(20));
     }
+    ok(&a, "serve", json!({"once":true}));
     let orphan = ok(&a, "job.status", json!({"id":"hold"}));
     assert_eq!(orphan["status"], "orphaned");
     let resource = ok(&b, "resource.status", json!({}));
@@ -873,6 +880,89 @@ fn vanished_supervisor_with_ended_payload_settles_as_failed() {
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn foreign_pid_namespace_reconciliation_preserves_live_host_job_and_reads_are_read_only() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "foreign-namespace", &["sleep", "30"]);
+    let running = wait(&home, "foreign-namespace", &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+
+    // Keep the payload live while removing its supervisor. A job status/list
+    // read must not turn this into an orphan or emit its outcome.
+    let store = Store::open(&home).unwrap();
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    assert!(active_pid(payload));
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"foreign-namespace"}))["status"],
+        "running"
+    );
+    assert_eq!(ok(&home, "job.list", json!({}))[0]["status"], "running");
+    assert!(
+        !run(&home, "job.retry", json!({"id":"foreign-namespace"}))
+            .status
+            .success()
+    );
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"foreign-namespace"}))["status"],
+        "running"
+    );
+    let outcomes: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM mail WHERE sender='crew'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(outcomes, 0);
+
+    // Now model the durable supervisor identity as belonging to a foreign
+    // namespace. The owning dispatcher must treat it as unknown/alive.
+    let raw: String = store
+        .connection()
+        .query_row(
+            "SELECT record FROM jobs WHERE id='foreign-namespace'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut record: Value = serde_json::from_str(&raw).unwrap();
+    record["supervisor"]["pid_namespace"] = json!("pid:[foreign-test-namespace]");
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=?1 WHERE id='foreign-namespace'",
+            params![record.to_string()],
+        )
+        .unwrap();
+    // The owning home's dispatcher is the authoritative reconciliation path.
+    ok(&home, "serve", json!({"once":true}));
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"foreign-namespace"}))["status"],
+        "running"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    let outcomes: i64 = store
+        .connection()
+        .query_row("SELECT count(*) FROM mail WHERE sender='crew'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(outcomes, 0);
+
+    record["supervisor"]["pid_namespace"] = running["supervisor"]["pid_namespace"].clone();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=?1 WHERE id='foreign-namespace'",
+            params![record.to_string()],
+        )
+        .unwrap();
+    ok(&home, "job.cancel", json!({"id":"foreign-namespace"}));
+    assert!(!active_pid(payload));
+}
+
 #[test]
 fn a_read_only_codex_crew_that_reports_nothing_is_recorded_failed() {
     let fixture = Fixture::new();
@@ -1113,7 +1203,7 @@ fn history_prune_keeps_pending_facts_and_reserved_capacity() {
 }
 
 #[test]
-fn job_list_pages_and_still_repairs_a_leftover_reservation() {
+fn job_list_is_read_only_and_dispatcher_repairs_a_leftover_reservation() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
     for id in ["a", "b", "c"] {
@@ -1137,7 +1227,7 @@ fn job_list_pages_and_still_repairs_a_leftover_reservation() {
             .success()
     );
     // A finished job whose release was interrupted still holds capacity;
-    // listing repairs it once its process group is provably gone.
+    // listing is read-only and the owning dispatcher repairs it.
     let job = ok(&home, "job.status", json!({"id":"b"}));
     let key = format!(
         "{}:b:{}",
@@ -1154,6 +1244,8 @@ fn job_list_pages_and_still_repairs_a_leftover_reservation() {
         .unwrap();
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
     ok(&home, "job.list", json!({}));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    ok(&home, "serve", json!({"once":true}));
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 

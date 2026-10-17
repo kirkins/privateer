@@ -36,6 +36,10 @@ const QUEUE_POLL: Duration = Duration::from_secs(1);
 struct Process {
     pid: u32,
     started: String,
+    /// PID namespaces have separate PID number spaces. A PID recorded inside
+    /// a nested namespace cannot be inspected or signalled by host PID.
+    #[serde(default)]
+    pid_namespace: Option<String>,
     #[serde(default)]
     zombie: bool,
 }
@@ -733,6 +737,11 @@ fn identity(pid: u32) -> Result<Option<Process>> {
     Ok(Some(Process {
         pid,
         started: format!("linux:{boot}:{ticks}"),
+        pid_namespace: Some(
+            fs::read_link(format!("/proc/{pid}/ns/pid"))?
+                .to_string_lossy()
+                .into_owned(),
+        ),
         zombie: matches!(*state, "Z" | "X"),
     }))
 }
@@ -764,8 +773,21 @@ fn identity(pid: u32) -> Result<Option<Process>> {
     Ok(Some(Process {
         pid,
         started,
+        pid_namespace: None,
         zombie,
     }))
+}
+#[cfg(target_os = "linux")]
+fn current_pid_namespace() -> Result<Option<String>> {
+    Ok(Some(
+        fs::read_link("/proc/self/ns/pid")?
+            .to_string_lossy()
+            .into_owned(),
+    ))
+}
+#[cfg(not(target_os = "linux"))]
+fn current_pid_namespace() -> Result<Option<String>> {
+    Ok(None)
 }
 /// Compare a recorded start identity with a freshly observed one.
 fn same_start(recorded: &str, current: &str) -> bool {
@@ -811,6 +833,12 @@ fn leader_exited(pid: u32) -> Result<bool> {
     Ok(exited_unreaped(pid)?.is_some())
 }
 fn same_process(process: &Process) -> Result<bool> {
+    // A PID from another namespace is not addressable in this namespace.
+    // In particular, probing the same numeric PID can find an unrelated host
+    // process and falsely prove the recorded supervisor is gone.
+    if process.pid_namespace.is_some() && process.pid_namespace != current_pid_namespace()? {
+        return Ok(true);
+    }
     Ok(identity(process.pid)?
         .is_some_and(|p| !p.zombie && same_start(&process.started, &p.started)))
 }
@@ -832,6 +860,11 @@ fn group_members(group: u32) -> Result<Vec<u32>> {
     Ok(members)
 }
 fn group_alive(process: &Process) -> Result<bool> {
+    // Process-group IDs are also namespace-local. Preserve the reservation
+    // when this observer cannot address the namespace that recorded the PID.
+    if process.pid_namespace.is_some() && process.pid_namespace != current_pid_namespace()? {
+        return Ok(true);
+    }
     // A live original leader anchors identity. If it vanished, an orphaned
     // group still occupies this PGID; conservatively preserve that capacity.
     if let Some(current) = identity(process.pid)? {
@@ -964,6 +997,9 @@ const UNPROVEN_LEADER: &str = "payload leader missing or changed; cannot discove
 /// child (observed with waitid), which by itself keeps the PID and process
 /// group id from being reused, so the leader's identity is not re-inspected.
 fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Process>>> {
+    if process.pid_namespace.is_some() && process.pid_namespace != current_pid_namespace()? {
+        return Ok(None);
+    }
     if !reserved {
         // macOS getpgid reports ESRCH for zombies. An unreaped original PID
         // with matching start identity still prevents PGID reuse here.
@@ -987,6 +1023,10 @@ fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Proce
     Ok(Some(anchors))
 }
 fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<()> {
+    ensure!(
+        process.pid_namespace.is_none() || process.pid_namespace == current_pid_namespace()?,
+        "payload process group belongs to another PID namespace; refusing signal"
+    );
     // A still-live recorded member anchors this exact group even if its
     // leader exits during TERM grace. Never signal solely by stale PGID.
     let mut anchored = false;
@@ -2469,14 +2509,11 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
     }
     Ok(job)
 }
-/// Reconcile unfinished jobs whose supervisor is gone, so their outcome is
-/// recorded without anyone asking for their status. A live supervisor is
-/// checked cheaply and left to finish its own job.
+/// Reconcile jobs whose supervisor is gone, and repair the narrow completion
+/// before reservation-release crash window. This runs only in the owning
+/// home's dispatcher; reads never make process-visibility decisions.
 pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
-    let mut statement = store.connection().prepare(
-        "SELECT record FROM jobs WHERE json_extract(record, '$.status')
-         IN ('starting', 'queued', 'launching', 'running')",
-    )?;
+    let mut statement = store.connection().prepare("SELECT record FROM jobs")?;
     let jobs: Vec<Job> = statement
         .query_map([], |r| r.get::<_, String>(0))?
         .map(|raw| Ok(serde_json::from_str(&raw?)?))
@@ -2489,7 +2526,9 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         let id = job.id.clone();
         let before = job.status.clone();
         let result = (|| -> Result<Option<Job>> {
-            if job.supervisor.as_ref().map(same_process).transpose()? == Some(true) {
+            if !terminal(&job.status)
+                && job.supervisor.as_ref().map(same_process).transpose()? == Some(true)
+            {
                 return Ok(None);
             }
             Ok(Some(reconcile(store, job, &mut reserved)?))
@@ -2505,7 +2544,7 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
     Ok(settled)
 }
 
-/// A job's current record, for crew reports.
+/// A job's current durable record, for crew reports.
 pub(crate) fn record(store: &Store, id: &str) -> Result<Value> {
     Ok(public_job(&load(store, id)?))
 }
@@ -2743,11 +2782,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .get("id")
                 .and_then(Value::as_str)
                 .context("id required")?;
-            Ok(public_job(&reconcile(
-                store,
-                load(store, id)?,
-                &mut Reserved::default(),
-            )?))
+            Ok(public_job(&load(store, id)?))
         }
         "job.list" => {
             // Pages in id order: pass the last id seen as after_id.
@@ -2769,11 +2804,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let all: Vec<Job> = rows
                 .map(|r| Ok(serde_json::from_str(&r?)?))
                 .collect::<Result<_>>()?;
-            let mut reserved = Reserved::default();
             Ok(json!(
-                all.into_iter()
-                    .map(|j| reconcile(store, j, &mut reserved).map(|j| public_job(&j)))
-                    .collect::<Result<Vec<_>>>()?
+                all.into_iter().map(|j| public_job(&j)).collect::<Vec<_>>()
             ))
         }
         "job.cancel" => cancel(
@@ -2787,7 +2819,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .get("id")
                 .and_then(Value::as_str)
                 .context("id required")?;
-            let old = reconcile(store, load(store, old_id)?, &mut Reserved::default())?;
+            // Retry decisions use the durable status. Reconciliation belongs
+            // to the owning home's dispatcher, where process visibility is
+            // known; a caller must not settle another namespace by reading.
+            let old = load(store, old_id)?;
             ensure!(
                 matches!(old.status.as_str(), "failed" | "cancelled" | "timed_out"),
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
