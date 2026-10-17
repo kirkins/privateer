@@ -812,6 +812,102 @@ fn a_stow_asks_every_ship_holds_new_jobs_but_not_wakes_and_resumes() {
 }
 
 #[test]
+fn waiting_requests_say_when_each_was_asked_and_how_old_it_is_now() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    let before = now_ms();
+    let asked = machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"apps","to":"captain","kind":"request","body":"Is the Mac still stowed?"}),
+    );
+    // Another ship asks a moment later; the list stays oldest first.
+    std::thread::sleep(Duration::from_millis(20));
+    let later = machine.json(
+        &liaison,
+        "mail.send",
+        json!({"from":"liaison","to":"captain","kind":"request","body":"Which project first?"}),
+    );
+
+    let out = machine
+        .command(&liaison, &["captain.waiting", "--json", "{}"])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    // The list's own clock must be this test's wall clock: it was asked while
+    // these requests were being written and read.
+    let after = now_ms();
+    let read: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<&Value> = read["waiting"].as_array().unwrap().iter().collect();
+    let ids: Vec<&str> = listed
+        .iter()
+        .map(|w| w["mail"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [asked["id"].as_str().unwrap(), later["id"].as_str().unwrap()]
+    );
+
+    let now = read["now_ms"]
+        .as_i64()
+        .expect("the list says which clock it used");
+    assert!(
+        (before..=after).contains(&now),
+        "now_ms {now} is not this test's own wall clock {before}..{after}"
+    );
+    for item in &listed {
+        // The age is derived from when the request was asked, not stored.
+        assert_eq!(item["asked_ms"], item["mail"]["created_ms"], "{item}");
+        let age = item["age_ms"]
+            .as_i64()
+            .expect("every waiting request has an age");
+        assert!(age >= 0, "{item}");
+        assert!(
+            (now - item["asked_ms"].as_i64().unwrap() - age).abs() < 1_000,
+            "{item} claims to be {age} ms old against now_ms {now}"
+        );
+        assert!(
+            age < 3_600_000,
+            "{item} is an hour old after being asked now"
+        );
+    }
+    // Both requests were asked within this test, so the older one is not younger.
+    assert!(
+        listed[0]["age_ms"].as_i64().unwrap() >= listed[1]["age_ms"].as_i64().unwrap(),
+        "{listed:?}"
+    );
+
+    // Answering one closes it, and what is left carries the remaining age.
+    machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"captain","to":"apps","kind":"reply","correlation":asked["id"],"body":"No, it resumed."}),
+    );
+    let out = machine
+        .command(&liaison, &["captain.waiting", "--json", "{}"])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let read: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<&Value> = read["waiting"].as_array().unwrap().iter().collect();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["mail"]["id"], later["id"]);
+    assert!(listed[0]["age_ms"].as_i64().unwrap() > 0, "{listed:?}");
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[test]
 fn the_liaison_sees_what_waits_on_the_captain_and_relays_the_captains_answers() {
     let machine = Machine::new();
     let liaison = liaison(&machine);

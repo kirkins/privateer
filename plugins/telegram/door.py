@@ -204,6 +204,9 @@ class Door:
             header = "🚨 " + header + " · while you're away"
         elif mail.get("urgency") == "high":
             header = "🔴 " + header
+        # /waiting shows what is already outstanding, so say how old it is.
+        if event.get("note"):
+            header += f" · {event['note']}"
         if kind in ("request", "decision"):
             header += " · reply to answer"
         # A reply threads under the captain's message it answers.
@@ -535,8 +538,11 @@ class Door:
             return
         self.say(f"{len(waiting)} waiting on you; reply to each to answer:")
         for item in waiting[:20]:
-            # Shown again as replyable messages, without re-acknowledging anything.
-            err = self.push({"ref": "", "ship": item["ship"], "mail": item["mail"]})
+            # Shown again as replyable messages, without re-acknowledging
+            # anything, and carrying the age so an old request reads as old.
+            age = item.get("age_ms")
+            note = f"asked {age_phrase(age)}" if isinstance(age, int) else ""
+            err = self.push({"ref": "", "ship": item["ship"], "mail": item["mail"], "note": note})
             if err:
                 self.say(f"⚠️ could not show one: {err}")
                 return
@@ -636,6 +642,18 @@ def suppress_noop_ack(cfg: dict, body: str) -> bool:
         return False
     import tts
     return tts.is_noop_acknowledgement(body)
+
+
+def age_phrase(age_ms: int) -> str:
+    """How long ago, in the words a person would use: "12 min ago", "2 d ago"."""
+    seconds = max(0, int(age_ms)) // 1000
+    if seconds < 90:
+        return "just now" if seconds < 10 else f"{seconds} s ago"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min ago"
+    if seconds < 172800:
+        return f"{round(seconds / 3600)} h ago"
+    return f"{round(seconds / 86400)} d ago"
 
 
 def _plain(html: str) -> str:
