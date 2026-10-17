@@ -13,7 +13,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'plugins'))
-import pi_bundles as bundles
+import bundles
+import pi_bundles
 from native import handle
 
 
@@ -49,11 +50,11 @@ class Bundles(unittest.TestCase):
         return bundles.plan(self.registry, ['selected@1'] if selected is None else selected, 'crew')
 
     def preflight(self, plan=None, args=None, **kwargs):
-        return bundles.preflight(plan or self.plan(), args or ['pi', '--print', '--mode', 'json', '--', 'brief'],
+        return pi_bundles.preflight(plan or self.plan(), args or ['pi', '--print', '--mode', 'json', '--', 'brief'],
                                  cwd=self.repo, env=self.env, **kwargs)
 
     def probe(self):
-        return patch.object(bundles.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'1.2.0\n', b''))
+        return patch.object(pi_bundles.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'1.2.0\n', b''))
 
     def test_selected_only_plan_and_explicit_empty(self):
         plan = self.plan()
@@ -301,7 +302,7 @@ class Bundles(unittest.TestCase):
             probe.assert_not_called()
 
     def test_wrong_version_and_activation_wrapper_refuse(self):
-        with patch.object(bundles.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'1.3.0\n', b'')):
+        with patch.object(pi_bundles.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'1.3.0\n', b'')):
             with self.assertRaises(ValueError):
                 self.preflight()
         self.binary.write_text('#!/bin/sh\nmise use pi\n')
@@ -328,7 +329,7 @@ class Bundles(unittest.TestCase):
     def test_protocol_redacts_malformed_registry_and_native_preflight_errors(self):
         sentinel = 'BUNDLE_SECRET_SENTINEL_9d0c'
         request = {'id': 'test', 'version': 1, 'method': 'validate', 'registry': {sentinel: sentinel}}
-        run = subprocess.run([sys.executable, str(ROOT / 'plugins/pi_bundles.py')], input=json.dumps(request),
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/bundles.py')], input=json.dumps(request),
                              text=True, capture_output=True, timeout=5)
         self.assertFalse(json.loads(run.stdout)['ok'])
         self.assertNotIn(sentinel, run.stdout + run.stderr)

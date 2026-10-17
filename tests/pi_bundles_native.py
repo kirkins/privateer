@@ -21,7 +21,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'plugins'))
-import pi_bundles as bundles
+import bundles
 
 NATIVE = Path(sys.argv.pop(1)).absolute() if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
 SENTINEL = 'UNSELECTED_SECRET_SENTINEL_82d9'

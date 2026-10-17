@@ -595,15 +595,20 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     // Re-running init must not silently turn a bounded ship into a legacy
     // ambient-resource launch. A different harness needs an explicit profile
     // update by the captain, not an implicit downgrade.
-    if let Some(selected) = previous
+    if let Some(mate) = previous
         .as_ref()
-        .and_then(|s| s["first_mate"].get("tool_bundles"))
+        .map(|s| &s["first_mate"])
+        .filter(|mate| mate.get("tool_bundles").is_some())
     {
         ensure!(
-            harness == "pi",
+            mate["manifest"]
+                .as_str()
+                .and_then(crate::bundled::harness)
+                .as_deref()
+                == Some(harness.as_str()),
             "explicitly reconfigure tool_bundles before changing harness"
         );
-        first_mate["tool_bundles"] = selected.clone();
+        first_mate["tool_bundles"] = mate["tool_bundles"].clone();
     }
     // A hosted first mate stays hosted.
     if let Some(host) = previous
@@ -938,16 +943,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     } else {
         None
     };
-    // Bounded resource runs must be fresh: old history can retain facts from
-    // resources no longer selected. Omitted selection keeps legacy resumes.
+    // Bounded live starts are fresh: old history can retain facts from
+    // resources no longer selected, and --continue cannot name the exact
+    // session a plan digest was recorded for. Omitted selection keeps resumes.
     let bundle_plan = profile["first_mate"]
         .get("tool_bundles")
         .map(|selected| -> Result<Value> {
             ensure!(
-                harness == "pi" && own_harness,
-                "bounded tool bundles require the configured Pi harness"
+                matches!(harness.as_str(), "pi" | "claude") && own_harness,
+                "bounded tool bundles require the configured Pi or Claude harness"
             );
-            crate::tool_bundles::resolve(&store, selected, "first_mate")
+            crate::tool_bundles::resolve(&store, selected, "first_mate", &harness)
         })
         .transpose()?;
     if hosted
@@ -959,6 +965,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     }
     if hosted
         && harness == "claude"
+        && bundle_plan.is_none()
         && !["--continue", "-c", "--resume", "-r", "--session-id"]
             .iter()
             .any(|flag| chooses(flag))
