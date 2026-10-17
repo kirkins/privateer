@@ -224,7 +224,9 @@ pub(crate) fn rest(
         match herdr.release() {
             Ok(()) => {
                 let read = read_back(herdr);
-                if read["agent"] == PANE_AGENT || read.get("error").is_some() {
+                // Only a pane still under the label is a dropped release; a pane
+                // Herdr could not be asked about is not audited as one.
+                if read["agent"] == PANE_AGENT {
                     ignored(store, ship, "release", json!({"agent": PANE_AGENT}), read);
                 }
             }
@@ -282,6 +284,7 @@ fn wait(
     let mut refreshed = Instant::now();
     let mut reported: Option<Instant> = None;
     let mut unlisted = false;
+    let mut verify: Option<Instant> = None;
     // Focus wakes it only when the captain moves to the pane: a pane that
     // was focused as it fell asleep, or whose focus Herdr cannot report,
     // waits for Enter.
@@ -304,6 +307,12 @@ fn wait(
                 let message = format!("{ship}: asleep · focus or Enter wakes it");
                 herdr.report("idle", &message);
                 reported = Some(Instant::now());
+                // Read back a little later: Herdr's own exit detection may lag
+                // the harness's exit, and a report it lists only afterwards counts.
+                verify = Some(Instant::now() + Duration::from_secs(5));
+            }
+            if verify.is_some_and(|at| Instant::now() >= at) {
+                verify = None;
                 if !unlisted {
                     let read = read_back(herdr);
                     if !listed(&read, ship) {
