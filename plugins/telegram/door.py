@@ -584,13 +584,16 @@ class Door:
         self.say(f"{len(waiting)} waiting on you; reply to each to answer:")
         # Asks only the captain's hands can clear come first, each with its step.
         hands = listed.get("hands_on") or []
-        hand_ids = {item["mail"].get("id") for item in hands}
-        rest = [item for item in waiting if item["mail"].get("id") not in hand_ids]
+        # Ship ids are chosen per home, so an ask is named by its ship and id.
+        hand_keys = {(item["ship"], item["mail"].get("id")) for item in hands}
+        rest = [item for item in waiting
+                if (item["ship"], item["mail"].get("id")) not in hand_keys]
         shown = 0
         for title, items in (("Needs your hands:", hands), ("Everything else:", rest)):
             if not items or shown >= 20:
                 continue
-            self.say(title)
+            if hands or title != "Everything else:":
+                self.say(title)
             for item in items:
                 if shown == 20:
                     break

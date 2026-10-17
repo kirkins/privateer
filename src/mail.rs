@@ -439,6 +439,29 @@ pub(crate) fn approval_answer(
     by_id(store, &id)?.context("approval answer vanished")
 }
 
+/// The hands-on step a payload marks, if any. Only a request to the captain
+/// may carry the marker, and the step must be a real, bounded instruction: the
+/// captain's list shows it beside the ask. Checked on every path a message
+/// enters this home, so a collected or delivered record cannot skip it.
+pub(crate) fn hands_step(kind: &str, to: &str, payload: &Value) -> Result<Option<String>> {
+    let Some(hands) = payload.get("needs_hands") else {
+        return Ok(None);
+    };
+    ensure!(
+        kind == "request" && to == CAPTAIN,
+        "needs_hands marks a request to the captain"
+    );
+    let step = hands
+        .get("step")
+        .and_then(Value::as_str)
+        .context("needs_hands needs a step: the exact thing the captain must do")?;
+    ensure!(
+        !step.trim().is_empty() && step.len() <= MAX_HANDS_STEP_BYTES,
+        "needs_hands step must be 1 to {MAX_HANDS_STEP_BYTES} bytes"
+    );
+    Ok(Some(step.to_owned()))
+}
+
 fn send(store: &Store, args: &Value) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
@@ -519,22 +542,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             "choices must contain at most 20 bounded strings"
         );
     }
-    if let Some(hands) = payload.get("needs_hands") {
-        // Only the captain's own hands can do these; the list carries the step
-        // beside the ask, so the step must be a real, bounded instruction.
-        ensure!(
-            kind == "request" && to == CAPTAIN,
-            "needs_hands marks a request to the captain"
-        );
-        let step = hands
-            .get("step")
-            .and_then(Value::as_str)
-            .context("needs_hands needs a step: the exact thing the captain must do")?;
-        ensure!(
-            !step.trim().is_empty() && step.len() <= MAX_HANDS_STEP_BYTES,
-            "needs_hands step must be 1 to {MAX_HANDS_STEP_BYTES} bytes"
-        );
-    }
+    hands_step(kind, to, &payload)?;
     ensure!(
         !body.is_empty() || payload.as_object().is_some_and(|p| !p.is_empty()),
         "a message needs a body or a payload"
@@ -1181,6 +1189,7 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     let body = args.get("body").and_then(Value::as_str).unwrap_or("");
     let payload = args.get("payload").cloned().unwrap_or(json!({}));
     ensure!(payload.is_object(), "payload must be an object");
+    hands_step(kind, to, &payload)?;
     let urgency = optional_str(args, "urgency")?.unwrap_or("normal");
     ensure!(URGENCIES.contains(&urgency), "invalid urgency");
     let deadline_ms = args.get("deadline_ms").and_then(Value::as_i64);
@@ -1550,5 +1559,35 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "mail.deliver" => deliver(store, &args),
         "mail.flush" => flush(store, &args),
         _ => bail!("unknown mailbox command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod hands_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_bounded_step_on_a_request_to_the_captain_marks_hands_on() {
+        let marked = |step: Value| json!({"needs_hands": {"step": step}});
+        assert_eq!(
+            hands_step("request", CAPTAIN, &marked(json!("Run it"))).unwrap(),
+            Some("Run it".to_owned())
+        );
+        assert_eq!(hands_step("request", CAPTAIN, &json!({})).unwrap(), None);
+        // Every other kind, recipient, and malformed step is refused.
+        assert!(hands_step("decision", CAPTAIN, &marked(json!("Run it"))).is_err());
+        assert!(hands_step("reply", CAPTAIN, &marked(json!("Run it"))).is_err());
+        assert!(hands_step("notice", CAPTAIN, &marked(json!("Run it"))).is_err());
+        assert!(hands_step("request", "apps", &marked(json!("Run it"))).is_err());
+        for step in [json!(""), json!("   "), json!(null), json!(3), json!(["x"])] {
+            assert!(
+                hands_step("request", CAPTAIN, &marked(step.clone())).is_err(),
+                "{step}"
+            );
+        }
+        let long = "x".repeat(MAX_HANDS_STEP_BYTES + 1);
+        assert!(hands_step("request", CAPTAIN, &marked(json!(long))).is_err());
+        assert!(hands_step("request", CAPTAIN, &json!({"needs_hands": null})).is_err());
+        assert!(hands_step("request", CAPTAIN, &json!({"needs_hands": "run it"})).is_err());
     }
 }

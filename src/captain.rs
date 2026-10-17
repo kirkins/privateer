@@ -65,23 +65,43 @@ pub fn waiting() -> Result<Value> {
         let open = crate::mail::dispatch(
             &mut store,
             "mail.requests",
-            json!({"address": crate::mail::CAPTAIN, "state": "open"}),
+            // The default page is 100, oldest first; a long list would drop the newest asks.
+            json!({"address": crate::mail::CAPTAIN, "state": "open", "limit": 1000}),
         )?;
         for mail in open["requests"].as_array().into_iter().flatten() {
             let asked = mail["created_ms"].as_i64().unwrap_or(now);
-            let step = mail["payload"]["needs_hands"]["step"].as_str();
+            // A record that does not pass the send-side rules is not a hands-on ask.
+            let step = crate::mail::hands_step(
+                mail["kind"].as_str().unwrap_or_default(),
+                crate::mail::CAPTAIN,
+                &mail["payload"],
+            )
+            .ok()
+            .flatten();
             let item = json!({"ship": ship, "asked_ms": asked,
                 "age_ms": (now - asked).max(0), "step": step, "mail": mail});
-            if step.is_some() {
+            if item["step"].is_string() {
                 hands_on.push(item.clone());
             }
             waiting.push(item);
         }
     }
-    waiting.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
-    waiting.truncate(MAX_WAITING);
+    // Every hands-on ask is also in `waiting`, placed before the oldest others
+    // are cut to the cap, so the two lists never disagree about an ask. Ids are
+    // chosen by each ship, so an ask is named by its home and id.
     hands_on.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
     hands_on.truncate(MAX_WAITING);
+    let key = |w: &Value| (w["ship"].clone(), w["mail"]["id"].clone());
+    let hands_keys: Vec<_> = hands_on.iter().map(key).collect();
+    let mut others: Vec<Value> = waiting
+        .into_iter()
+        .filter(|w| !hands_keys.contains(&key(w)))
+        .collect();
+    others.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
+    others.truncate(MAX_WAITING - hands_on.len());
+    let mut waiting = hands_on.clone();
+    waiting.extend(others);
+    waiting.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
     Ok(json!({"now_ms": now, "hands_on": hands_on, "waiting": waiting}))
 }
 

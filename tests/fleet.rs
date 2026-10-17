@@ -1043,6 +1043,39 @@ fn hands_on_asks_are_listed_apart_with_their_step_and_malformed_marks_are_refuse
 }
 
 #[test]
+fn a_full_waiting_list_still_lists_every_hands_on_ask_in_both_lists() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    // One more open ask than the list shows, and the newest one needs hands.
+    for n in 0..100 {
+        machine.json(
+            &apps,
+            "mail.send",
+            json!({"from":"apps","to":"captain","kind":"request","body":format!("Ordinary {n}")}),
+        );
+    }
+    let hands = machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"apps","to":"captain","kind":"request","body":"Unlock the Mac",
+            "payload":{"needs_hands":{"step":"Run `sudo privateer-unlock apps`"}}}),
+    );
+    let out = machine.as_agent(&liaison, "liaison", "captain.waiting", json!({}));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let read: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let waiting = read["waiting"].as_array().unwrap();
+    let hands_on = read["hands_on"].as_array().unwrap();
+    assert_eq!(waiting.len(), 100, "the list stays bounded");
+    assert_eq!(hands_on.len(), 1, "{read}");
+    assert_eq!(hands_on[0]["mail"]["id"], hands["id"], "{read}");
+    assert!(
+        waiting.iter().any(|w| w["mail"]["id"] == hands["id"]),
+        "a hands-on ask is missing from the full list"
+    );
+}
+
+#[test]
 fn the_liaison_sees_what_waits_on_the_captain_and_relays_the_captains_answers() {
     let machine = Machine::new();
     let liaison = liaison(&machine);
