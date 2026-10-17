@@ -1237,18 +1237,31 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
     }
     let mut store = Store::open_as(&home, caller)?;
     if verb == "ship" {
-        let flags = flags(args, &["scope", "folder", "harness", "objective"])?;
-        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] | privateer ship retire NAME";
+        let flags = flags(
+            args,
+            &["scope", "folder", "harness", "objective", "machine"],
+        )?;
+        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME";
         let name = flags.positional.get(1).context(usage)?;
         match flags.positional.first().map(String::as_str) {
             Some("new") => {
                 let mut request = json!({"name": name});
-                for key in ["scope", "folder", "harness", "objective"] {
+                for key in ["scope", "folder", "harness", "objective", "machine"] {
                     if let Some(value) = flags.values.get(key) {
                         request[key] = json!(value);
                     }
                 }
                 let made = crate::dispatch(&mut store, "ship.create", request)?;
+                if let Some(machine) = made["machine"].as_str() {
+                    println!(
+                        "Aye. The ship {} is ready on {machine} at {}, crewed by {}.\n  dispatcher: {}",
+                        made["ship"].as_str().unwrap_or(""),
+                        made["folder"].as_str().unwrap_or(""),
+                        made["harness"].as_str().unwrap_or(""),
+                        made["dispatcher"].as_str().unwrap_or("")
+                    );
+                    return Ok(());
+                }
                 println!(
                     "Aye. The ship {} is ready at {}, crewed by {}.\n  dispatcher: {}\n  talk to it:  cd {} && privateer",
                     made["ship"].as_str().unwrap_or(""),

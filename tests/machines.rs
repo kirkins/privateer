@@ -119,6 +119,30 @@ fn link(laptop: &Machine, mac: &Machine, ssh: &Path) -> Output {
     )
 }
 
+/// A fake ssh into `machine` whose gateway keeps that machine's own home,
+/// ledger and PATH, as a real remote host does; the plain fake ssh would
+/// pass the caller's environment through. Each connection is logged.
+fn remote_ssh(machine: &Machine) -> PathBuf {
+    let ssh = machine.root.join("ssh");
+    fs::create_dir_all(machine.root.join("bin")).unwrap();
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nfor argument do remote=$argument; done\necho connected >> {root}/ssh.log\nexec env HOME={root} PATH={root}/bin:/usr/bin:/bin PRIVATEER_FLEET={root}/fleet.sqlite PRIVATEER_RESOURCE_HOME={root}/ledger /bin/sh -c \"$remote\"\n",
+            root = machine.root.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    ssh
+}
+
+fn connections(machine: &Machine) -> usize {
+    fs::read_to_string(machine.root.join("ssh.log"))
+        .map(|log| log.lines().count())
+        .unwrap_or(0)
+}
+
 fn messages(machine: &Machine, ship: &str, kind: &str) -> Vec<Value> {
     machine.ok(ship, "mail.inbox", json!({"address": ship}))["messages"]
         .as_array()
@@ -479,18 +503,7 @@ fn a_machines_owner_hears_of_its_problems_and_may_stow_it() {
 fn a_stow_of_a_linked_machine_reaches_only_that_machines_ships() {
     let (_temp, laptop, mac, ssh) = fixture();
     assert!(link(&laptop, &mac, &ssh).status.success());
-    // The gateway on mac keeps mac's own ledger, as a real remote host does;
-    // the fake ssh above would otherwise pass the laptop's environment through.
-    let mac_ssh = mac.root.join("ssh");
-    fs::write(
-        &mac_ssh,
-        format!(
-            "#!/bin/sh\nfor argument do remote=$argument; done\nexec env PRIVATEER_RESOURCE_HOME={} /bin/sh -c \"$remote\"\n",
-            mac.root.join("ledger").display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&mac_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mac_ssh = remote_ssh(&mac);
     laptop.ship("upkeep");
     let named = laptop.run("liaison", &["machine", "owner", "upkeep"], None);
     assert!(named.status.success(), "{}", text(&named));
@@ -624,4 +637,161 @@ fn a_server_ship_finds_its_consumers_on_both_machines() {
     assert_eq!(consumers(&mac), ["cosmic", "fitforge", "liaison"]);
     let seen = laptop.ok("liaison", "ship.show", json!({"name": "fitforge"}));
     assert_eq!(seen["consumes"], json!(["runtime"]), "{seen}");
+}
+
+#[test]
+fn a_ship_created_on_a_linked_machine_lives_only_there() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    // The Mac's own default harness is the one on its PATH, not the laptop's.
+    fs::write(mac.root.join("bin/pi"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(mac.root.join("bin/pi"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let made = laptop.run(
+        "liaison",
+        &[
+            "ship.create",
+            "--json",
+            r#"{"name":"bench","machine":"mac","scope":"benchmarks"}"#,
+        ],
+        Some(&mac_ssh),
+    );
+    assert!(made.status.success(), "{}", text(&made));
+    let made: Value = serde_json::from_slice(&made.stdout).unwrap();
+    assert_eq!(made["machine"], "mac", "{made}");
+    assert_eq!(made["created_by"], "captain", "{made}");
+    assert_eq!(made["harness"], "pi", "{made}");
+    // Beside the Mac's own ships, in the Mac's registry only.
+    assert_eq!(made["folder"], json!(mac.folder("bench")), "{made}");
+    assert!(mac.folder("bench").join(".privateer").is_dir());
+    assert!(!laptop.folder("bench").exists());
+    let ships = |machine: &Machine, ship: &str| machine.ok(ship, "fleet.list", json!({}));
+    let on_mac = ships(&mac, "fitforge");
+    let bench = on_mac["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "bench")
+        .unwrap_or_else(|| panic!("{on_mac}"));
+    assert_eq!(bench["created_by"], "captain");
+    assert!(!ships(&laptop, "liaison").to_string().contains("bench"));
+    // Reachable from the laptop at once, behind the Mac's peer.
+    let shown = laptop.ok("liaison", "ship.show", json!({"name": "bench"}));
+    assert_eq!(shown["location"], json!({"peer": "machine-mac"}), "{shown}");
+
+    // A name the other machine holds, an unknown machine and a link made from
+    // the other side are refused, naming the machine.
+    let refusal = |machine: &Machine, ship: &str, args: Value| {
+        let output = machine.run(
+            ship,
+            &["ship.create", "--json", &args.to_string()],
+            Some(&mac_ssh),
+        );
+        assert!(!output.status.success());
+        text(&output)
+    };
+    let taken = refusal(
+        &laptop,
+        "liaison",
+        json!({"name": "fitforge", "machine": "mac"}),
+    );
+    assert!(taken.contains("linked machine mac"), "{taken}");
+    let unknown = refusal(
+        &laptop,
+        "liaison",
+        json!({"name": "x", "machine": "nowhere"}),
+    );
+    assert!(
+        unknown.contains("no linked machine named nowhere"),
+        "{unknown}"
+    );
+    let backwards = refusal(&mac, "fitforge", json!({"name": "x", "machine": "laptop"}));
+    assert!(
+        backwards.contains("laptop reaches this machine"),
+        "{backwards}"
+    );
+    let remote = refusal(
+        &laptop,
+        "liaison",
+        json!({"name": "y", "machine": "mac", "harness": "no-such-harness"}),
+    );
+    assert!(remote.contains("machine mac:"), "{remote}");
+
+    // Without a machine, ship.create still makes the ship here.
+    let local = laptop.ok(
+        "liaison",
+        "ship.create",
+        json!({"name": "nearby", "harness": "codex"}),
+    );
+    assert_eq!(local["folder"], json!(laptop.folder("nearby")), "{local}");
+    assert_eq!(local.get("machine"), None, "{local}");
+    assert!(!ships(&mac, "fitforge").to_string().contains("nearby"));
+}
+
+#[test]
+fn only_an_agent_that_may_spawn_creates_a_ship_on_a_linked_machine() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    let linked = connections(&mac);
+    let agent = |args: Value| {
+        laptop.run(
+            "liaison",
+            &[
+                "ship.create",
+                "--json",
+                &args.to_string(),
+                "--role",
+                "agent",
+                "--actor",
+                "liaison",
+            ],
+            Some(&mac_ssh),
+        )
+    };
+    let request = json!({"name": "bench", "machine": "mac", "harness": "codex"});
+
+    // Without spawn it is refused here, before the Mac is contacted.
+    laptop.ok(
+        "liaison",
+        "charter.put",
+        json!({"id": "liaison", "actions": ["inspect", "message"]}),
+    );
+    let refused = agent(request.clone());
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused).contains("requires spawn"),
+        "{}",
+        text(&refused)
+    );
+    // Nor may it give the new ship an action it lacks.
+    laptop.ok(
+        "liaison",
+        "charter.put",
+        json!({"id": "liaison", "actions": ["inspect", "spawn", "message"]}),
+    );
+    let mut wider = request.clone();
+    wider["actions"] = json!(["inspect", "implement"]);
+    let refused = agent(wider);
+    assert!(!refused.status.success());
+    assert!(text(&refused).contains("implement"), "{}", text(&refused));
+    assert_eq!(connections(&mac), linked, "the Mac was contacted");
+    assert!(!mac.folder("bench").exists());
+
+    // With spawn, the new ship holds the creator's actions and names it.
+    let made = agent(request);
+    assert!(made.status.success(), "{}", text(&made));
+    let made: Value = serde_json::from_slice(&made.stdout).unwrap();
+    assert_eq!(made["created_by"], "liaison", "{made}");
+    assert_eq!(made["actions"], json!(["inspect", "spawn", "message"]));
+    let on_mac = mac.ok("fitforge", "fleet.list", json!({}));
+    assert!(
+        on_mac["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "bench" && s["created_by"] == "liaison"),
+        "{on_mac}"
+    );
 }
