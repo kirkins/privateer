@@ -1589,3 +1589,96 @@ fn waiting_jobs_end_on_cancel_timeout_or_a_vanished_supervisor() {
     );
     ok(&home, "job.cancel", json!({"id":"holder"}));
 }
+
+/// A payload that starts `sleep` in a session of its own, as `xcodebuild`
+/// does, records its pid, then waits `linger` seconds before exiting.
+fn escaping_payload(linger: &str) -> Vec<String> {
+    vec![
+        support::python().display().to_string(),
+        "-c".into(),
+        format!(
+            "import subprocess, sys, time\n\
+             child = subprocess.Popen(['sleep', '60'], start_new_session=True)\n\
+             open('escaped.pid', 'w').write(str(child.pid))\n\
+             time.sleep({linger})"
+        ),
+    ]
+}
+
+fn escaped_pid(fixture: &Fixture) -> i32 {
+    let path = fixture.repo.join("escaped.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the payload never started its child"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fs::read_to_string(path).unwrap().trim().parse().unwrap()
+}
+
+fn gone(pid: i32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while active_pid(pid) {
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+#[test]
+fn a_timed_out_job_also_ends_what_left_its_process_group() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"build","timeout_secs":2,"heavy":true,
+            "command": escaping_payload("60")}),
+    );
+    let child = escaped_pid(&fixture);
+    let ended = wait(&home, "build", &["timed_out", "orphaned"]);
+    assert_eq!(ended["status"], "timed_out", "{ended}");
+    assert!(gone(child), "the escaped child outlived its timed-out job");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
+fn a_finished_job_keeps_its_capacity_while_what_it_left_still_runs() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // Asked to clean up after itself, it ends what it left and succeeds.
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"tidy","heavy":true,"cleanup_descendants":true,
+            "command": escaping_payload("1.5")}),
+    );
+    let child = escaped_pid(&fixture);
+    let tidy = wait(&home, "tidy", &["succeeded", "orphaned"]);
+    assert_eq!(tidy["status"], "succeeded", "{tidy}");
+    assert!(gone(child));
+    fs::remove_file(fixture.repo.join("escaped.pid")).unwrap();
+
+    // Otherwise the wrapper exits cleanly, but the build it started still
+    // runs, so the job is orphaned and keeps its capacity.
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"build","heavy":true,"cleanup_descendants":false,
+            "command": escaping_payload("1.5")}),
+    );
+    let child = escaped_pid(&fixture);
+    let left = wait(&home, "build", &["orphaned", "succeeded"]);
+    assert_eq!(left["status"], "orphaned", "{left}");
+    assert!(active_pid(child));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    // Cancelling it stops what it left and frees the capacity.
+    ok(&home, "job.cancel", json!({"id":"build"}));
+    wait(&home, "build", &["cancelled", "succeeded"]);
+    assert!(gone(child));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}

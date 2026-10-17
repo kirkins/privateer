@@ -69,6 +69,11 @@ struct Job {
     retry_of: Option<String>,
     #[serde(default)]
     group_anchors: Vec<Process>,
+    /// Descendants that left the payload's process group, such as an
+    /// `xcodebuild` that starts a session of its own. A job is not over, and
+    /// its capacity not free, while one of them lives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    escaped: Vec<Process>,
     #[serde(default)]
     plugin_binding: Option<Value>,
     #[serde(default)]
@@ -135,6 +140,9 @@ struct Reservation {
     /// Resolved estimate counted by admission while recently admitted.
     #[serde(default)]
     demand: Option<Demand>,
+    /// The job's recorded descendants outside its payload group.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    escaped: Vec<Process>,
     /// A first mate's wake, which a fleet stow does not hold back: the
     /// first mate must wake to stow.
     #[serde(default)]
@@ -428,8 +436,8 @@ pub(crate) fn stale_reservations(store: &Store) -> Result<Vec<Value>> {
             None => false,
         };
         let payload = match &r.payload {
-            Some(p) => group_alive(p)?,
-            None => false,
+            Some(p) => payload_alive(p, &r.escaped)?,
+            None => escaped_alive(&r.escaped)?,
         };
         if supervisor || payload {
             continue;
@@ -607,6 +615,9 @@ fn update_reservation(store: &Store, job: &Job) -> Result<()> {
             let mut r: Reservation = serde_json::from_str(&raw)?;
             r.supervisor = job.supervisor.clone().or(r.supervisor);
             r.payload = job.payload.clone().or(r.payload);
+            if !job.escaped.is_empty() {
+                r.escaped = job.escaped.clone();
+            }
             if job.status != "starting" || r.state == "starting" {
                 r.state = job.status.clone();
             }
@@ -833,6 +844,116 @@ fn group_alive(process: &Process) -> Result<bool> {
         }
     }
     Ok(!group_members(process.pid)?.is_empty())
+}
+/// Whether a command line is a Privateer process supervised on its own: a
+/// job's supervisor, a dispatcher or a front door. A job started from inside
+/// another job belongs to its own supervisor, never to the job that asked.
+fn independently_supervised(args: &str) -> bool {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    words.contains(&"_job-supervise")
+        || words.last() == Some(&"serve")
+        || words.windows(2).any(|w| w == ["door", "run"])
+}
+/// Live processes as (pid, parent, process group, independently supervised).
+fn process_table() -> Result<Vec<(u32, u32, u32, bool)>> {
+    let output = Command::new("ps")
+        .args(["-eo", "pid=,ppid=,pgid=,stat=,args="])
+        .output()?;
+    ensure!(output.status.success(), "process inspection failed");
+    let mut table = vec![];
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(parent), Some(group), Some(stat)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if stat.starts_with('Z') {
+            continue;
+        }
+        let args = fields.collect::<Vec<_>>().join(" ");
+        table.push((
+            pid.parse()?,
+            parent.parse()?,
+            group.parse()?,
+            independently_supervised(&args),
+        ));
+    }
+    Ok(table)
+}
+/// The payload's descendants outside its process group, with their start
+/// identities: those already recorded that still live, and any new ones
+/// found from the payload or from them. A process that left the group and
+/// whose parent then exited is reparented and can only be found while it
+/// was recorded first, so this runs while the job runs.
+fn escaped_descendants(payload: &Process, known: &[Process]) -> Result<Vec<Process>> {
+    let mut found: Vec<Process> = vec![];
+    let mut roots = vec![];
+    if same_process(payload)? {
+        roots.push(payload.pid);
+    }
+    for process in known {
+        if same_process(process)? {
+            roots.push(process.pid);
+            found.push(process.clone());
+        }
+    }
+    if roots.is_empty() {
+        return Ok(found);
+    }
+    let table = process_table()?;
+    let mut children: std::collections::HashMap<u32, Vec<(u32, u32)>> = Default::default();
+    for (pid, parent, group, independent) in table {
+        // Independently supervised processes and everything under them are
+        // their own jobs' business.
+        if !independent {
+            children.entry(parent).or_default().push((pid, group));
+        }
+    }
+    let mut seen: std::collections::HashSet<u32> = roots.iter().copied().collect();
+    while let Some(parent) = roots.pop() {
+        for &(pid, group) in children.get(&parent).map(Vec::as_slice).unwrap_or(&[]) {
+            if !seen.insert(pid) {
+                continue;
+            }
+            roots.push(pid);
+            if group != payload.pid && found.len() < 256 && !found.iter().any(|f| f.pid == pid) {
+                if let Some(process) = identity(pid)?.filter(|p| !p.zombie) {
+                    found.push(process);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+fn escaped_alive(escaped: &[Process]) -> Result<bool> {
+    for process in escaped {
+        if same_process(process)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+/// Signal recorded escaped descendants that are still the same processes:
+/// a group leader with its whole group, any other alone.
+fn signal_escaped(escaped: &[Process], signal: i32) -> Result<()> {
+    for process in escaped {
+        if same_process(process)? {
+            let pid = process.pid as i32;
+            let target = if unsafe { libc::getpgid(pid) } == pid {
+                -pid
+            } else {
+                pid
+            };
+            unsafe { libc::kill(target, signal) };
+        }
+    }
+    Ok(())
+}
+/// Whether anything the payload started still runs: its group, or a
+/// recorded descendant that left it.
+fn payload_alive(payload: &Process, escaped: &[Process]) -> Result<bool> {
+    Ok(group_alive(payload)? || escaped_alive(escaped)?)
 }
 const UNPROVEN_LEADER: &str = "payload leader missing or changed; cannot discover group ownership";
 /// Snapshot live payload group members. Returns None when the leader cannot
@@ -1248,6 +1369,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         reason: None,
         retry_of,
         group_anchors: vec![],
+        escaped: vec![],
         plugin_binding,
         cleanup_descendants,
         stdout_dropped_bytes: 0,
@@ -1286,6 +1408,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         payload: None,
         charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
         demand: None,
+        escaped: vec![],
         wake: is_wake(store, &id)?,
     };
     let conn = store.connection();
@@ -1562,6 +1685,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             payload: None,
             charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
             demand: None,
+            escaped: vec![],
             wake: is_wake(store, &job.id)?,
         };
         let cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
@@ -1790,7 +1914,11 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
             {
                 // A queued job has no payload; an unspawned one holds nothing.
                 let stopped = job.status == "queued"
-                    || job.payload.as_ref().and_then(|p| group_alive(p).ok()) == Some(false);
+                    || job
+                        .payload
+                        .as_ref()
+                        .and_then(|p| payload_alive(p, &job.escaped).ok())
+                        == Some(false);
                 if let Ok(updated) = alter(store, id, |j| {
                     if !terminal(&j.status) {
                         j.status = if stopped {
@@ -2037,7 +2165,18 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     let mut leader_status = None;
     let mut killed = false;
     let mut last_anchor_snapshot = Instant::now() - Duration::from_secs(1);
+    let mut last_escape_snapshot = Instant::now() - Duration::from_secs(1);
     let status = loop {
+        // Track descendants that leave the payload's group while they can
+        // still be found from it; they keep the job alive until they end.
+        if terminated_at.is_none() && last_escape_snapshot.elapsed() >= Duration::from_millis(500) {
+            let found = escaped_descendants(&payload, &job.escaped)?;
+            if found != job.escaped {
+                job = alter(store, id, |j| j.escaped = found.clone())?;
+                update_reservation(store, &job)?;
+            }
+            last_escape_snapshot = Instant::now();
+        }
         if leader_status.is_none() {
             // Snapshot before reaping: an unreaped original leader (including
             // a zombie) proves group ownership. This records ordinary orphan
@@ -2060,7 +2199,8 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         }
         job = load(store, id)?;
         if let Some(status) = leader_status {
-            if !group_alive(&payload)? {
+            let group = group_alive(&payload)?;
+            if !group && !escaped_alive(&job.escaped)? {
                 break status;
             }
             if terminated_at.is_none() {
@@ -2070,12 +2210,15 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 // Harness-owned helper descendants are optional completion
                 // cleanup, not a cancelled outcome. Only recorded live group
                 // members may anchor TERM/KILL after the leader was reaped.
-                if let Err(error) = signal_group(&payload, libc::SIGTERM, &job.group_anchors) {
-                    if group_alive(&payload)? {
-                        reason = Some(format!("descendant cleanup refused: {error}"));
+                if group {
+                    if let Err(error) = signal_group(&payload, libc::SIGTERM, &job.group_anchors) {
+                        if group_alive(&payload)? {
+                            reason = Some(format!("descendant cleanup refused: {error}"));
+                        }
+                        break status;
                     }
-                    break status;
                 }
+                signal_escaped(&job.escaped, libc::SIGTERM)?;
                 store.audit("job.descendants_cleanup", &json!({"job_id":id}))?;
                 terminated_at = Some(Instant::now());
             }
@@ -2102,13 +2245,23 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             });
             let anchors =
                 capture_anchors(&payload, leader_exited(payload.pid)?)?.context(UNPROVEN_LEADER)?;
-            job = alter(store, id, |j| j.group_anchors = anchors)?;
+            let escaped = escaped_descendants(&payload, &job.escaped)?;
+            job = alter(store, id, |j| {
+                j.group_anchors = anchors;
+                j.escaped = escaped;
+            })?;
+            update_reservation(store, &job)?;
             signal_group(&payload, libc::SIGTERM, &job.group_anchors)?;
+            // Killing the payload's group is not proof its work stopped.
+            signal_escaped(&job.escaped, libc::SIGTERM)?;
             terminated_at = Some(Instant::now());
         }
         if let Some(at) = terminated_at {
-            if !killed && at.elapsed() >= Duration::from_secs(2) && group_alive(&payload)? {
-                signal_group(&payload, libc::SIGKILL, &job.group_anchors)?;
+            if !killed && at.elapsed() >= Duration::from_secs(2) {
+                if group_alive(&payload)? {
+                    signal_group(&payload, libc::SIGKILL, &job.group_anchors)?;
+                }
+                signal_escaped(&job.escaped, libc::SIGKILL)?;
                 killed = true;
             }
             if at.elapsed() >= Duration::from_secs(4) {
@@ -2121,7 +2274,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     };
     // A payload can leave children behind after its leader exits. Do not free
     // capacity or signal a potentially reused PGID; expose it as an orphan.
-    let group_remains = group_alive(&payload)?;
+    let group_remains = payload_alive(&payload, &job.escaped)?;
     stop.store(true, Ordering::Relaxed);
     let stdout_dropped = match out {
         Some(out) => out
@@ -2168,7 +2321,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         }
         j.reason = if group_remains {
             Some(reason.unwrap_or_else(|| {
-                "payload group still has descendants; reservation preserved".into()
+                "payload group or a descendant that left it is still running; reservation preserved".into()
             }))
         } else {
             reason
@@ -2212,7 +2365,7 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
             return Ok(job);
         }
         if match &job.payload {
-            Some(p) => !group_alive(p)?,
+            Some(p) => !payload_alive(p, &job.escaped)?,
             None => true,
         } {
             release(store, &job)?;
@@ -2241,7 +2394,7 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         return Ok(job);
     }
     let payload_alive = match &job.payload {
-        Some(p) => group_alive(p)?,
+        Some(p) => payload_alive(p, &job.escaped)?,
         None => false,
     };
     if !supervisor_alive && job.payload.is_some() && !payload_alive {
@@ -2395,29 +2548,40 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
     }
     if !supervisor_alive && !terminal(&job.status) {
         if let Some(p) = job.payload.clone() {
-            if group_alive(&p)? {
-                let anchors = if same_process(&p)? {
+            let escaped = escaped_descendants(&p, &job.escaped)?;
+            if payload_alive(&p, &escaped)? {
+                let group = group_alive(&p)?;
+                let anchors = if !group {
+                    vec![]
+                } else if same_process(&p)? {
                     capture_anchors(&p, false)?.context(UNPROVEN_LEADER)?
                 } else {
                     job.group_anchors.clone()
                 };
-                let _ = alter(store, id, |j| j.group_anchors = anchors.clone())?;
-                signal_group(&p, libc::SIGTERM, &anchors)?;
+                let _ = alter(store, id, |j| {
+                    j.group_anchors = anchors.clone();
+                    j.escaped = escaped.clone();
+                })?;
+                if group {
+                    signal_group(&p, libc::SIGTERM, &anchors)?;
+                }
+                signal_escaped(&escaped, libc::SIGTERM)?;
                 let until = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < until && group_alive(&p)? {
+                while Instant::now() < until && payload_alive(&p, &escaped)? {
                     thread::sleep(Duration::from_millis(50));
                 }
                 if group_alive(&p)? {
                     signal_group(&p, libc::SIGKILL, &anchors)?;
                 }
+                signal_escaped(&escaped, libc::SIGKILL)?;
                 // Give killed descendants time to leave the group.
                 let until = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < until && group_alive(&p)? {
+                while Instant::now() < until && payload_alive(&p, &escaped)? {
                     thread::sleep(Duration::from_millis(50));
                 }
                 ensure!(
-                    !group_alive(&p)?,
-                    "payload group remains; reservation preserved"
+                    !payload_alive(&p, &escaped)?,
+                    "payload group or a descendant that left it remains; reservation preserved"
                 );
             }
             job = alter(store, id, |j| {
@@ -2526,6 +2690,15 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
             "supervisor is still running; use job.cancel"
         );
     }
+    let escaped = job
+        .as_ref()
+        .map(|j| j.escaped.clone())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| reservation.escaped.clone());
+    ensure!(
+        !escaped_alive(&escaped)?,
+        "a descendant that left the payload group is still running; use job.cancel"
+    );
     match &payload {
         Some(p) => ensure!(
             !group_alive(p)?,
@@ -2661,9 +2834,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     Some(p) => group_alive(p)?,
                     None => false,
                 };
+                let escaped_running = escaped_alive(&r.escaped)?;
                 let mut value = serde_json::to_value(&r)?;
                 value["supervisor_alive"] = json!(supervisor_alive);
                 value["payload_group_alive"] = json!(payload_group_alive);
+                value["escaped_alive"] = json!(escaped_running);
                 value["orphaned"] = json!(
                     !supervisor_alive
                         && (payload_group_alive || Store::now_ms() - r.created_ms > START_GRACE_MS)
@@ -2691,5 +2866,28 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             Ok(status)
         }
         _ => bail!("unknown jobs command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::independently_supervised;
+
+    #[test]
+    fn jobs_dispatchers_and_doors_are_never_another_jobs_descendants() {
+        for args in [
+            "/home/me/.cargo/bin/privateer --home /ships/apps/.privateer _job-supervise 1f2e",
+            "/Users/me/.local/bin/privateer --home /ships/apps/.privateer serve",
+            "/Users/me/.local/bin/privateer door run telegram",
+        ] {
+            assert!(independently_supervised(args), "{args}");
+        }
+        for args in [
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -scheme App test",
+            "/usr/bin/python3 -c print('serve the tests')",
+            "/home/me/.cargo/bin/privateer --home /ships/apps/.privateer job.list --json {}",
+        ] {
+            assert!(!independently_supervised(args), "{args}");
+        }
     }
 }
