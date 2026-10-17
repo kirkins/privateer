@@ -24,14 +24,30 @@ def native_environment():
     return env
 
 
+def launch_environment():
+    """The native environment without any inherited credential paths: a run
+    never inherits a parent's, and gets only its own selected bundles'."""
+    env = native_environment()
+    for name in [name for name in env if name.startswith("PRIVATEER_CREDENTIAL_")]:
+        del env[name]
+    return env
+
+
 def launch(harness, argv, control=None, bundles=None, attended=False):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
+    env = launch_environment()
+    secrets = {}
+    if bundles is not None:
+        from bundles import credential_environment
+        # Check every selected ref's stored file before any native probe.
+        # Paths only, never values: the plan and argv carry names and refs.
+        secrets = credential_environment(bundles, env)
     if bundles is not None and harness == "claude":
         from claude_bundles import preflight
         # Privateer's attended mail adapter is the one runtime-owned plugin.
         plugins = [Path(__file__).resolve().parent / "attended-claude"] if attended else []
-        argv = preflight(bundles, argv, env=native_environment(), runtime_plugins=plugins, attended=attended)
+        argv = preflight(bundles, argv, env=env, runtime_plugins=plugins, attended=attended)
     elif bundles is not None:
         if harness != "pi":
             raise ValueError("bounded resources support only Pi and Claude")
@@ -61,28 +77,29 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         if (attended or hosted_crew) and any(
                 flags[i:i+2] == ["-e", calm] for i in range(len(flags))):
             extensions.append(calm)
-        argv = preflight(bundles, argv, env=native_environment(), runtime_extensions=extensions)
+        argv = preflight(bundles, argv, env=env, runtime_extensions=extensions)
+    env.update(secrets)
     if harness == "opencode-v2":
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),
-                                  *argv], native_environment())
+                                  *argv], env)
     # Pi JSON mode may exit zero after an assistant error. Its event stream,
     # not the process status alone, must confirm a completed unattended run.
     flags = argv[:argv.index("--")] if "--" in argv else argv
     if harness == "claude" and "--print" in flags and "stream-json" in flags:
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("claude_turn.py")),
-                                  "--control", json.dumps(control), *argv], native_environment())
+                                  "--control", json.dumps(control), *argv], env)
     if harness in ("pi", "pi-signed") and "--print" in flags and any(
             flags[i:i+2] == ["--mode", "json"] for i in range(len(flags))):
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("native_turn.py")),
-                                  harness, *argv], native_environment())
+                                  harness, *argv], env)
     if (harness in ("agy", "cursor", "gemini")
             and ("--prompt" if harness == "gemini" else "--print") in flags and any(
             flags[i:i+2] == ["--output-format", "stream-json"] for i in range(len(flags)))):
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("native_turn.py")),
-                                  harness, *argv], native_environment())
+                                  harness, *argv], env)
     # Keep PRIVATEER_ROLE/ACTOR and all native auth/provider configuration.
     # exec preserves the job's process identity, group and cancellation path.
-    os.execvpe(argv[0], argv, native_environment())
+    os.execvpe(argv[0], argv, env)
 
 
 def main():
@@ -97,7 +114,7 @@ def main():
             value, harness = json.loads(args[1]), args[2]
             if bundles is None and harness not in PROFILES and value.get("mode") == "standard":
                 # Preserve the human CLI's existing custom-harness escape hatch.
-                os.execvpe(args[3], args[3:], native_environment())
+                os.execvpe(args[3], args[3:], launch_environment())
             launch(harness, attended_argv(harness, args[3:], value), bundles=bundles, attended=True)
         else:
             if args[0] == "--opencode-yolo":

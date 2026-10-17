@@ -7,6 +7,7 @@ pub mod captain;
 pub mod cli;
 pub mod context;
 pub mod core;
+pub mod credentials;
 pub mod crew;
 pub mod crew_routes;
 pub mod cursor_mail;
@@ -77,6 +78,9 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "ship.put",
     "permissions.set",
     "bundle.configure",
+    "credential.set",
+    "credential.list",
+    "credential.remove",
     "stow.start",
     "stow.status",
     "stow.resume",
@@ -115,6 +119,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "runtime" if command == "runtime.needs" => needs::query(store, &args),
         "upgrade" if command == "upgrade.status" => releases::status(),
         "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
+        // Never over RPC or a peer: the secret is read from the captain's stdin.
+        "credential" => {
+            bail!("credential commands run only from the captain's CLI, with the secret on stdin")
+        }
         "permissions" => permissions::dispatch(store, command, args),
         "routes" => crew_routes::dispatch(store, command, args),
         "work" => scheduling::dispatch(store, command, args),

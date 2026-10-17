@@ -4,6 +4,8 @@ the Pi and Claude loaders. Exposure hygiene, not an OS/credential sandbox.
 
 Only an operator-owned registry may approve resources. Plans contain selected
 references and content pins, never credential values or unselected resources.
+A bundle's credentials are names and stored refs; a launch gets only the path
+of each selected ref's captain-stored file, never its value.
 No installs, config writes, agentDir/HOME changes or provider selection here.
 """
 import hashlib
@@ -20,6 +22,10 @@ NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 REF = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*@[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 SEMVER = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}\Z")
+# Credential env names and stored refs: identifiers, never inline values.
+CREDENTIAL_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+CREDENTIAL_REF = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+CREDENTIAL_ENV = "PRIVATEER_CREDENTIAL_"
 MAX_FILES = 128
 MAX_BYTES = 2 * 1024 * 1024
 
@@ -137,6 +143,52 @@ def skill(value):
     require(fields.get('name') == value['name'] and 0 < len(description) <= 1024)
 
 
+def credentials(value):
+    """A bundle's credentials: env-safe names and stored refs only. Any other
+    field, or a ref too long or shaped unlike a short identifier, refuses."""
+    require(isinstance(value, list) and len(value) <= 8)
+    names = set()
+    for item in value:
+        keys(item, ('name', 'ref'))
+        require(isinstance(item['name'], str) and CREDENTIAL_NAME.fullmatch(item['name'])
+                and isinstance(item['ref'], str) and len(item['ref']) <= 40
+                and CREDENTIAL_REF.fullmatch(item['ref']) and item['name'] not in names)
+        names.add(item['name'])
+
+
+def credential_directory(env):
+    """Beside the fleet registry, resolved as the runtime resolves it:
+    PRIVATEER_FLEET, else $XDG_STATE_HOME/privateer/fleet.sqlite, else
+    ~/.local/state/privateer/fleet.sqlite, with .credentials for its suffix."""
+    fleet = env.get('PRIVATEER_FLEET')
+    if not fleet:
+        state = env.get('XDG_STATE_HOME') or str(Path(env['HOME']) / '.local/state')
+        fleet = str(Path(state) / 'privateer/fleet.sqlite')
+    return Path(fleet).with_suffix('.credentials')
+
+
+def credential_environment(value, env):
+    """PRIVATEER_CREDENTIAL_<NAME>_FILE for each of the plan's own credentials,
+    after checking its stored file: a regular 0600 file this user owns, in a
+    0700 directory, with bundle-path checks on every component. Never reads it."""
+    found = {}
+    require(isinstance(value, dict))
+    credentials(value.get('credentials', []))
+    if not value.get('credentials'):
+        return found
+    directory = credential_directory(env)
+    require(present(directory))
+    safe_path(str(directory), directory=True)
+    require(stat.S_IMODE(directory.lstat().st_mode) == 0o700)
+    for item in value['credentials']:
+        require(present(directory / item['ref']))
+        path = safe_path(str(directory / item['ref']))
+        info = path.lstat()
+        require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1)
+        found[f"{CREDENTIAL_ENV}{item['name']}_FILE"] = str(path)
+    return found
+
+
 def validate_registry(value):
     # claude_version is optional: only bounded Claude launches need the pin.
     require(isinstance(value, dict))
@@ -159,9 +211,9 @@ def validate_registry(value):
     require(isinstance(bundles, list) and len(bundles) <= 32)
     refs = set()
     for bundle in bundles:
-        # MCP, optional executable extensions and credential injection are not
-        # silently discarded: not supported in this first stage.
-        keys(bundle, ('ref', 'roles', 'skills'))
+        # MCP and optional executable extensions are not silently discarded:
+        # not supported in this first stage.
+        keys(bundle, ('ref', 'roles', 'skills', *(('credentials',) if 'credentials' in bundle else ())))
         require(isinstance(bundle['ref'], str) and REF.fullmatch(bundle['ref']) and bundle['ref'] not in refs)
         refs.add(bundle['ref'])
         strings(bundle['roles'], ('first_mate', 'crew'), 2)
@@ -171,6 +223,7 @@ def validate_registry(value):
             skill(item)
             require(item['name'] not in names)
             names.add(item['name'])
+        credentials(bundle.get('credentials', []))
     require(len(json.dumps(value)) <= 48 * 1024)
 
 
@@ -186,10 +239,16 @@ def plan(registry, selected, role, harness='pi'):
     require(role in ('first_mate', 'crew'))
     by_ref = {b['ref']: b for b in registry['bundles']}
     skills = []
+    secrets = []
     for reference in selected:
         require(reference in by_ref and role in by_ref[reference]['roles'])
         skills.extend(by_ref[reference]['skills'])
+        for item in by_ref[reference].get('credentials', []):
+            if item not in secrets:
+                secrets.append(item)
     require(len({s['name'] for s in skills}) == len(skills) and len(skills) <= 16)
+    # One name, one ref: two selected bundles cannot disagree on a variable.
+    credentials(secrets)
     if harness == 'claude':
         from claude_bundles import plan as claude_plan
         result = claude_plan(registry, selected, skills)
@@ -197,6 +256,10 @@ def plan(registry, selected, role, harness='pi'):
         require(harness == 'pi')
         result = {'schema_version': 1, 'pi_version': PI_VERSION, 'selection': selected,
                   'integrations': registry['integrations'], 'skills': skills}
+    # Only selected bundles' names and refs, and only when there are any, so
+    # plans (and digests) without credentials are unchanged.
+    if secrets:
+        result['credentials'] = secrets
     require(len(json.dumps(result)) <= 24 * 1024)
     return result
 
@@ -206,8 +269,10 @@ def validate_plan(value):
     # version and extension integrations.
     claude = isinstance(value, dict) and 'claude_version' in value
     keys(value, ('schema_version', 'selection', 'skills',
-                 *(('claude_version', 'settings') if claude else ('pi_version', 'integrations'))))
+                 *(('claude_version', 'settings') if claude else ('pi_version', 'integrations')),
+                 *(('credentials',) if 'credentials' in value else ())))
     selection(value['selection'])
+    credentials(value.get('credentials', []))
     # Reuse registry qualification without carrying unselected definitions.
     skills = value['skills']
     require(isinstance(skills, list) and len(skills) <= 16)

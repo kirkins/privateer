@@ -2142,6 +2142,17 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 .env_remove("PRIVATEER_ACTOR");
         }
     }
+    // No job inherits its starter's credential paths. A bounded launch adds
+    // only its own selected bundles' paths, after checking their files.
+    // Bytes, not str: a non-UTF-8 name must be scrubbed too.
+    for (name, _) in std::env::vars_os() {
+        if name
+            .as_encoded_bytes()
+            .starts_with(b"PRIVATEER_CREDENTIAL_")
+        {
+            cmd.env_remove(name);
+        }
+    }
     // Crew report through crew.report, which checks this job.
     cmd.env("PRIVATEER_JOB", &job.id)
         .args(&job.command[1..])

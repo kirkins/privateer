@@ -152,6 +152,18 @@ fn run() -> Result<()> {
         caller.require_operator("door")?;
         return privateer::door::cli(&positional);
     }
+    // Credentials belong to the captain's fleet, not to a home; a secret is
+    // read from stdin alone, never from argv or JSON arguments.
+    if command.starts_with("credential.") {
+        caller.require_operator(&command)?;
+        ensure!(
+            positional.is_empty(),
+            "a credential is read from stdin, never argv"
+        );
+        let result = privateer::credentials::cli_from_stdin(&command, &args)?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
     if !json_given && !file_given && privateer::cli::VERBS.contains(&command.as_str()) {
         return privateer::cli::run(home, &command, &positional, caller);
     }

@@ -215,6 +215,24 @@ class Bundles(unittest.TestCase):
                 native_launch.launch('pi', ['pi', *flags, '--', 'brief'], bundles=self.plan([]))
             probe.assert_not_called()
 
+    def test_bounded_pi_launch_gets_only_its_credential_file_path(self):
+        import native_launch
+        self.registry['bundles'][0]['credentials'] = [{'name': 'BRAVE_API_KEY', 'ref': 'brave-search'}]
+        directory = self.base / 'fleet.credentials'
+        directory.mkdir(mode=0o700)
+        (directory / 'brave-search').write_bytes(b'SENTINEL-SECRET')
+        (directory / 'brave-search').chmod(0o600)
+        env = dict(self.env, PRIVATEER_FLEET=str(self.base / 'fleet.sqlite'))
+        with patch.dict(os.environ, env, clear=True), self.probe(), patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan())
+        argv, launched = execute.call_args.args[1:]
+        self.assertEqual(launched['PRIVATEER_CREDENTIAL_BRAVE_API_KEY_FILE'], str(directory / 'brave-search'))
+        self.assertNotIn('SENTINEL-SECRET', json.dumps([argv, launched]))
+        (directory / 'brave-search').unlink()
+        with patch.dict(os.environ, env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
+            native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan())
+        probe.assert_not_called()
+
     def test_calm_exact_runtime_adapter_in_legacy_and_bounded_modes(self):
         import native_launch
         mail = str(ROOT / 'plugins/attended/mail.ts')
