@@ -182,6 +182,19 @@ fn first_mate_route_lists_use_ship_override_and_reject_unknown_routes() {
         error.contains("first_mate names unknown route missing"),
         "{error}"
     );
+    // A free allowance's known daily reset is a UTC time of day, HH:MM.
+    let mut free = codex("model-free", "free");
+    free["allowance_resets_utc"] = json!("00:00");
+    f.routes(json!({"routes": {"free": free.clone()}, "crew": ["free"]}));
+    for wrong in ["+1:30", "24:00", "7:00"] {
+        free["allowance_resets_utc"] = json!(wrong);
+        let error = f.refused(
+            None,
+            "routes.set",
+            json!({"routes": {"free": free.clone()}}),
+        );
+        assert!(error.contains("allowance_resets_utc"), "{error}");
+    }
 }
 
 #[test]

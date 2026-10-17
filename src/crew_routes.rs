@@ -65,7 +65,10 @@ fn validate(value: &Value) -> Result<()> {
             .with_context(|| format!("route {name} must be an object"))?;
         for key in fields.keys() {
             ensure!(
-                matches!(key.as_str(), "manifest" | "options" | "cost" | "note"),
+                matches!(
+                    key.as_str(),
+                    "manifest" | "options" | "cost" | "note" | "allowance_resets_utc"
+                ),
                 "unknown setting {key} on route {name}"
             );
         }
@@ -90,6 +93,12 @@ fn validate(value: &Value) -> Result<()> {
                 .get("note")
                 .is_none_or(|n| n.as_str().is_some_and(|n| n.len() <= 500)),
             "route {name} note must be text of at most 500 bytes"
+        );
+        ensure!(
+            route
+                .get("allowance_resets_utc")
+                .is_none_or(|at| utc_minute(at).is_some()),
+            "route {name} allowance_resets_utc must be a UTC time of day, HH:MM"
         );
     }
     for kind in KINDS {
@@ -181,6 +190,44 @@ fn order(policy: &Value, ship: &str, kind: &str) -> Vec<String> {
         .flatten()
         .filter_map(|n| n.as_str().map(str::to_owned))
         .collect()
+}
+
+/// A time of day, `HH:MM` in UTC, as the minute of the day.
+fn utc_minute(value: &Value) -> Option<u32> {
+    let text = value.as_str()?;
+    let shape = text.len() == 5
+        && text.bytes().enumerate().all(|(i, b)| {
+            if i == 2 {
+                b == b':'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    let (hour, minute) = (
+        text.get(..2)?.parse::<u32>().ok()?,
+        text.get(3..)?.parse::<u32>().ok()?,
+    );
+    (shape && hour < 24 && minute < 60).then_some(hour * 60 + minute)
+}
+
+/// The captain's free routes by route id, each with the minute of the UTC day
+/// its allowance renews, when the captain knows it.
+pub(crate) fn free_allowances(
+    store: &Store,
+) -> Result<std::collections::HashMap<String, Option<u32>>> {
+    let Some(policy) = for_store(store)? else {
+        return Ok(Default::default());
+    };
+    let routes = policy["routes"].as_object().into_iter().flatten();
+    Ok(routes
+        .filter(|(_, route)| route["cost"] == "free")
+        .filter_map(|(_, route)| {
+            Some((
+                identity(route)?,
+                route.get("allowance_resets_utc").and_then(utc_minute),
+            ))
+        })
+        .collect())
 }
 
 fn identity(route: &Value) -> Option<String> {

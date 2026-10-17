@@ -607,6 +607,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/claude_turn.py",
         "tests/tool_permissions.py",
         "tests/opencode_v2.py",
+        "tests/opencode_watch.py",
     ] {
         let output = support::command("python3")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))

@@ -30,10 +30,18 @@
 //! `retry-after` and an ISO deadline in a throttle's text all hold the route
 //! until then. A throttle that states one holds its route until then, and the
 //! short doubling window only ever raises that floor, so a stated reset can
-//! lengthen the backoff but never shorten it. A free allowance that says
-//! nothing still parks a route for about a day. A hint read out of free text
+//! lengthen the backoff but never shorten it. A hint read out of free text
 //! can be misread, so it is capped at two days; a structured reset (Claude's
 //! `resetsAt`) is trusted up to eight.
+//!
+//! A route the captain marks `cost: free` runs on a daily allowance, so a rate
+//! limit or quota on it is that allowance spent, however the provider words it
+//! (OpenCode's free tier says only "Rate limit exceeded"); an outage on it
+//! stays on the short doubling. Without a stated reset it waits for the reset
+//! the captain knows (`allowance_resets_utc`, the UTC time it renews each
+//! day); knowing neither, or throttled just after that time, it probes again
+//! after an hour, then two, doubling to a day, so the allowance is used again
+//! soon after it returns.
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -41,7 +49,9 @@ use serde_json::{Value, json};
 
 const FIRST_BACKOFF_MS: i64 = 30_000;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
-/// A free allowance that states no reset lasts about a day.
+/// A spent allowance that states no reset is probed after an hour, doubling.
+const ALLOWANCE_PROBE_MS: i64 = 60 * 60_000;
+/// The longest an allowance with no stated reset waits: a day.
 const FREE_ALLOWANCE_BACKOFF_MS: i64 = 24 * 60 * 60_000;
 /// The longest reset a route is ever parked for: a weekly window, plus slack.
 /// A structured reset (Claude's `resetsAt`) is clamped to it, because the
@@ -368,6 +378,43 @@ fn classify(log: &str) -> Option<RouteFailure> {
     })
 }
 
+/// A rate limit or quota on a route the captain marks free: its allowance is
+/// spent. An outage on it (503, overloaded, timed out) stays on the short
+/// doubling. A reset the provider stated wins; otherwise the daily reset the
+/// captain knows (minute of the UTC day), unless the throttle came just after
+/// that reset, which shows the knowledge is off and leaves it to the probes.
+fn free_allowance(mut failure: RouteFailure, resets_utc: Option<u32>, now: i64) -> RouteFailure {
+    const DAY_MS: i64 = 86_400_000;
+    const JUST_AFTER_MS: i64 = 15 * 60_000;
+    let lower = failure.error.to_ascii_lowercase();
+    let spent = lower.starts_with("429")
+        || [
+            "rate limit",
+            "rate_limit",
+            "quota",
+            "limit exceeded",
+            "usage limit",
+            "allowance",
+            "credits",
+            "hit your limit",
+        ]
+        .iter()
+        .any(|sign| lower.contains(sign));
+    if !spent {
+        return failure;
+    }
+    failure.allowance = true;
+    if failure.reset_ms.is_none()
+        && let Some(minute) = resets_utc
+    {
+        let delay = (i64::from(minute) * 60_000 - now).rem_euclid(DAY_MS);
+        if delay > 0 && delay < DAY_MS - JUST_AFTER_MS {
+            failure.reset_ms = Some(delay);
+        }
+    }
+    failure
+}
+
 /// A provider throttle in how the run's last reply ended, if any.
 pub fn throttle(log: &str) -> Option<String> {
     classify(log).map(|failure| failure.error)
@@ -419,11 +466,14 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
             // A stated reset is the provider's own word on when to try again, so
             // it holds the route until then however plain the throttle looks;
             // the doubling only ever raises that floor, never lowers it. With no
-            // stated reset a spent free allowance still lasts a full window and
-            // an ordinary throttle keeps doubling.
+            // stated reset a spent allowance is probed hourly, doubling to a
+            // day, and an ordinary throttle keeps doubling on the short window.
+            let probe = ALLOWANCE_PROBE_MS
+                .saturating_mul(1i64 << (failures - 1).min(10))
+                .min(FREE_ALLOWANCE_BACKOFF_MS);
             let backoff = match (failure.reset_ms, failure.allowance) {
                 (Some(reset), _) => reset.max(short),
-                (None, true) => FREE_ALLOWANCE_BACKOFF_MS,
+                (None, true) => probe,
                 (None, false) => short,
             }
             .min(MAX_STATED_RESET_MS);
@@ -470,10 +520,12 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
     drop(statement);
     let mut through = since;
     let mut seen = vec![];
-    let conn = if jobs.is_empty() {
-        None
+    let (conn, free) = if jobs.is_empty() {
+        (None, Default::default())
     } else {
-        Some(crate::jobs::host_ledger(store)?)
+        // A routes file that cannot be read must not stop the backoff itself.
+        let free = crate::crew_routes::free_allowances(store).unwrap_or_default();
+        (Some(crate::jobs::host_ledger(store)?), free)
     };
     for job in jobs {
         through = through.max(job["finished_ms"].as_i64().unwrap_or(through));
@@ -495,7 +547,10 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
                 .join(job["incarnation"].as_str().unwrap_or(""))
                 .join("stdout.log");
             match classify(&std::fs::read_to_string(log).unwrap_or_default()) {
-                Some(error) => Some(error),
+                Some(failure) => Some(match free.get(&route) {
+                    Some(resets) => free_allowance(failure, *resets, Store::now_ms()),
+                    None => failure,
+                }),
                 // A failure for any other reason says nothing about the route.
                 None => continue,
             }
@@ -553,10 +608,9 @@ mod tests {
             .unwrap();
         assert!((until - now - 7_200_000).abs() < 100);
         record(&conn, "opencode/-/space-bunny-free", Some(&fallback)).unwrap();
-        let until: i64 = conn
-            .query_row("SELECT until_ms FROM model_routes", [], |r| r.get(0))
-            .unwrap();
-        assert!((until - Store::now_ms() - FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
+        // The second spent allowance in a row, stating no reset, is probed
+        // again after two hours.
+        assert!((parked_ms(&conn) - 2 * ALLOWANCE_PROBE_MS).abs() < 100);
 
         // A misread hint (here, seconds for what reads like an epoch) is capped
         // at two days rather than trusted, so it never parks the route longer.
@@ -567,6 +621,46 @@ mod tests {
         assert_eq!(misread.reset_ms, Some(MAX_TEXT_RESET_MS));
         record(&conn, "opencode/-/space-bunny-free", Some(&misread)).unwrap();
         assert!((parked_ms(&conn) - MAX_TEXT_RESET_MS).abs() < 100);
+    }
+
+    #[test]
+    fn a_throttle_on_a_free_route_spends_its_allowance_until_the_known_or_probed_reset() {
+        // OpenCode's free tier words its spent allowance as a plain rate limit.
+        let plain =
+            || classify(&error_log("Rate limit exceeded. Please try again later.")).unwrap();
+        assert!(!plain().allowance);
+        // 2026-10-17T19:50:00Z: four hours ten minutes before a midnight reset.
+        let now = 1_792_266_600_000;
+        let known = free_allowance(plain(), Some(0), now);
+        assert!(known.allowance);
+        assert_eq!(known.reset_ms, Some((4 * 60 + 10) * 60_000));
+        // A reset the provider states wins over the captain's knowledge, and a
+        // throttle just after the known reset falls back to probing.
+        let stated = classify(&error_log("Rate limit exceeded; retry-after: 600")).unwrap();
+        assert_eq!(free_allowance(stated, Some(0), now).reset_ms, Some(600_000));
+        assert_eq!(
+            free_allowance(plain(), Some(19 * 60 + 45), now).reset_ms,
+            None
+        );
+        // An outage on a free route is not its allowance.
+        let outage = classify(&error_log("503 upstream_unavailable")).unwrap();
+        assert!(!free_allowance(outage, Some(0), now).allowance);
+
+        // Knowing no reset, the route is probed after an hour, then two, then
+        // four, and never waits more than a day; a success clears it.
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let route = "opencode/-/opencode/space-bunny-free";
+        for hours in [1, 2, 4] {
+            record(&conn, route, Some(&free_allowance(plain(), None, now))).unwrap();
+            assert!((parked_ms(&conn) - hours * ALLOWANCE_PROBE_MS).abs() < 100);
+        }
+        conn.execute("UPDATE model_routes SET failures=20", [])
+            .unwrap();
+        record(&conn, route, Some(&free_allowance(plain(), None, now))).unwrap();
+        assert!((parked_ms(&conn) - FREE_ALLOWANCE_BACKOFF_MS).abs() < 100);
+        record(&conn, route, None).unwrap();
+        assert!(blocked(&conn, route).unwrap().is_none());
     }
 
     #[test]
