@@ -2,6 +2,8 @@
 //! session in its own Herdr space. A fake Herdr runs what the dispatcher types
 //! into the new pane, so the real `privateer start --hosted` and its harness
 //! (a fake `pi` on PATH) run as subprocesses.
+#[path = "hosted/errand_labels.rs"]
+mod errand_labels;
 mod support;
 
 use serde_json::{Value, json};
@@ -69,7 +71,7 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
+                "#!/bin/sh\ncase \"$PRIVATEER_JOB\" in errand-*) printf '%s' \"$$\" > '{root}/'$PRIVATEER_JOB'-pid'; while [ ! -e '{root}/'$PRIVATEER_JOB'-release' ] && [ -d '{root}' ]; do sleep 0.05; done; printf '%s\\n' '{{\"type\":\"session\",\"id\":\"22222222-2222-4222-8222-222222222222\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{{\"type\":\"text\",\"text\":\"Reviewed fixture\"}}]}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'; exit 0;; esac\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
                  printf '%s\\n' \"$$\" > '{root}/pi-pid'\n\
                  printf '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\" > '{root}/pi-context'\n\
@@ -305,6 +307,7 @@ struct Herdr {
     slow_create: Arc<AtomicBool>,
     #[cfg(feature = "dashboard")]
     creating: Arc<AtomicBool>,
+    reject_caption: Arc<AtomicBool>,
 }
 
 impl Herdr {
@@ -321,6 +324,8 @@ impl Herdr {
         let panes = Arc::new(Mutex::new(vec![pane(1)]));
         let reject_create = Arc::new(AtomicBool::new(false));
         let suppress_input = Arc::new(AtomicBool::new(false));
+        let reject_caption = Arc::new(AtomicBool::new(false));
+        let reject_label = reject_caption.clone();
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
@@ -354,6 +359,18 @@ impl Herdr {
                         stream,
                         "{}",
                         json!({"id":request["id"],"error":"fixture host unavailable"})
+                    );
+                    seen.lock().unwrap().push(request);
+                    continue;
+                }
+                if request["method"] == "pane.report_metadata"
+                    && params["source"] == "privateer-errands"
+                    && reject_label.load(Ordering::SeqCst)
+                {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":request["id"],"error":"fixture metadata refusal"})
                     );
                     seen.lock().unwrap().push(request);
                     continue;
@@ -473,6 +490,7 @@ impl Herdr {
             slow_create,
             #[cfg(feature = "dashboard")]
             creating,
+            reject_caption,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
