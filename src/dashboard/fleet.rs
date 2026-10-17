@@ -1,7 +1,8 @@
 //! Bounded fleet observations. Never open a runtime Store: even fleet discovery
 //! must work before the first home exists, without initializing state.
 use super::model::{
-    Discovery, ROW_LIMIT, Ship, Snapshot, read_registry, validate_navigation, validate_registry,
+    Discovery, LinkedMachine, ROW_LIMIT, Ship, Snapshot, read_registry, validate_navigation,
+    validate_registry,
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -112,6 +113,57 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
 /// Registry schema is the read-only equivalent of fleet.list. Missing registry
 /// means an empty fleet, not permission to create a runtime home.
 pub fn read(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
+    let mut snapshot = read_local(registry, fallback)?;
+    attach_linked(registry, &mut snapshot)?;
+    Ok(snapshot)
+}
+
+/// Ships on linked machines, listed read-only from the directories this
+/// registry cached at the last exchange. Nothing is asked of the other machine
+/// and no state of it is read; their live columns stay empty.
+fn attach_linked(registry: &Path, snapshot: &mut Snapshot) -> Result<()> {
+    if !registry.exists() {
+        return Ok(());
+    }
+    let conn = connection(registry)?;
+    for reached in crate::machines::reached_for_dashboard(&conn)? {
+        if snapshot.machines.len() >= ROW_LIMIT {
+            snapshot.truncated = true;
+            break;
+        }
+        snapshot.machines.push(LinkedMachine {
+            name: reached.name.clone(),
+            last_reached_ms: reached.refreshed_ms,
+        });
+        for (name, scope) in reached.ships {
+            // Ship names are unique across linked machines; a clash with a
+            // real local ship (live state present) stays the one shown. A bare
+            // placeholder, named only by local work, is replaced by the remote
+            // entry so the ship is not shown as local.
+            if let Some(index) = snapshot.ships.iter().position(|ship| ship.id == name) {
+                let ship = &snapshot.ships[index];
+                if ship.live.is_some() || ship.remote.is_some() {
+                    continue;
+                }
+                snapshot.ships.remove(index);
+            }
+            if snapshot.ships.len() >= ROW_LIMIT {
+                snapshot.truncated = true;
+                break;
+            }
+            snapshot.ships.push(Ship {
+                id: name.clone(),
+                name,
+                description: scope,
+                remote: Some(reached.name.clone()),
+                ..Ship::default()
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_local(registry: &Path, fallback: Option<&Path>) -> Result<Snapshot> {
     crate::store::reject_symlinks(registry)?;
     ensure!(registry.is_absolute(), "fleet registry must be absolute");
     let members: Vec<(String, PathBuf)> = if registry.exists() {

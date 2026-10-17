@@ -156,19 +156,82 @@ fn empty(ascii: bool) -> &'static str {
     if ascii { "-" } else { "·" }
 }
 
+/// One row of the fleet table: a heading naming a machine, or a ship by its
+/// index in `snapshot.ships`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FleetRow {
+    Heading(String),
+    Ship(usize),
+}
+
+/// This machine's ships first, then one group per linked machine. Headings
+/// appear only when a machine is linked, so an unlinked fleet keeps its plain
+/// table.
+pub fn fleet_rows(snapshot: &Snapshot, now_ms: i64) -> Vec<FleetRow> {
+    let local = snapshot
+        .ships
+        .iter()
+        .enumerate()
+        .filter(|(_, ship)| ship.remote.is_none())
+        .map(|(index, _)| FleetRow::Ship(index));
+    if snapshot.machines.is_empty() {
+        return local.collect();
+    }
+    let host = clean(&crate::machines::hostname(), 160);
+    let mut rows = vec![FleetRow::Heading(format!("This machine · {host}"))];
+    rows.extend(local);
+    for machine in &snapshot.machines {
+        let reached = match machine.last_reached_ms {
+            Some(ms) => format!("last reached {}", super::ui::ago(ms, now_ms)),
+            None => "never reached".into(),
+        };
+        rows.push(FleetRow::Heading(format!(
+            "{} · {reached}",
+            clean(&machine.name, 160)
+        )));
+        rows.extend(
+            snapshot
+                .ships
+                .iter()
+                .enumerate()
+                .filter(|(_, ship)| ship.remote.as_deref() == Some(machine.name.as_str()))
+                .map(|(index, _)| FleetRow::Ship(index)),
+        );
+    }
+    rows
+}
+
+/// The table row showing `ship`, an index into `snapshot.ships`.
+pub fn row_of(rows: &[FleetRow], ship: usize) -> Option<usize> {
+    rows.iter().position(|row| *row == FleetRow::Ship(ship))
+}
+
 /// Header, rows and widths of the fleet table that fit in `width` columns.
 pub fn table(
     snapshot: &Snapshot,
     width: u16,
     ascii: bool,
+    now_ms: i64,
 ) -> (Row<'static>, Vec<Row<'static>>, Vec<Constraint>) {
+    let rows_layout = fleet_rows(snapshot, now_ms);
+    let headings = rows_layout
+        .iter()
+        .filter_map(|row| match row {
+            FleetRow::Heading(text) => Some(Line::from(text.as_str()).width() as u16),
+            FleetRow::Ship(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    // A heading names its machine and when it was reached; it may widen the
+    // name column, up to half the width, so it is not cut short.
     let name = snapshot
         .ships
         .iter()
         .map(|s| Line::from(short_name(&s.name, ascii)).width() as u16 + 2)
         .max()
         .unwrap_or(4)
-        .clamp(6, 24);
+        .clamp(6, 24)
+        .max(headings.min(width / 2));
     let live_columns = observed(snapshot);
     let mut used = name;
     let shown: Vec<usize> = (0..COLUMNS.len())
@@ -192,72 +255,132 @@ pub fn table(
         }
     };
     let dash = if ascii { "-" } else { "—" };
-    let rows = snapshot
-        .ships
-        .iter()
-        .map(|ship| {
-            let work = work(ship, snapshot);
-            let live = ship.live.as_ref().filter(|l| l.error.is_none());
-            let aboard = match &ship.live {
-                Some(l) if l.error.is_some() => "unavailable",
-                Some(l) if l.attended => "aboard",
-                Some(_) if ascii => "-",
-                Some(_) => "—",
-                None => "",
-            };
-            let mut cells = [
-                Cell::from(Line::from(vec![
-                    Span::raw(short_name(&ship.name, ascii)),
-                    Span::styled(
-                        match (ship.liaison, ascii) {
-                            (false, _) => "",
-                            (true, false) => " ★",
-                            (true, true) => " *",
-                        },
-                        Style::default().fg(Color::Cyan),
-                    ),
-                ])),
-                Cell::from(Line::from(vec![
-                    presence(ship, ascii),
-                    Span::raw(format!(" {aboard}")),
-                ])),
-                number(live.map_or(0, |l| l.requests)),
-                number(live.map_or(0, |l| l.unread)),
-                number(work.pending),
-                Cell::from(if work.incoming > 0 {
-                    format!("{} +{}", work.owned, work.incoming)
-                } else {
-                    work.owned.to_string()
-                }),
-                Cell::from(match work.crew.as_slice() {
-                    [] => empty(ascii).to_owned(),
-                    [task] => format!("1 {}", clean(task, 40)),
-                    crew => format!("{} running", crew.len()),
-                })
-                .style(if work.crew.is_empty() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    attention()
-                }),
-                Cell::from(live.map_or(dash, |l| if l.dispatcher { "running" } else { "stopped" }))
-                    .style(Style::default().fg(if live.is_some_and(|l| !l.dispatcher) {
-                        Color::DarkGray
+    let rows = rows_layout
+        .into_iter()
+        .map(|row| match row {
+            FleetRow::Heading(text) => heading(&text, &shown),
+            FleetRow::Ship(index) => {
+                let ship = &snapshot.ships[index];
+                let work = work(ship, snapshot);
+                if ship.remote.is_some() {
+                    return remote_row(ship, &work, &shown, ascii);
+                }
+                let live = ship.live.as_ref().filter(|l| l.error.is_none());
+                let aboard = match &ship.live {
+                    Some(l) if l.error.is_some() => "unavailable",
+                    Some(l) if l.attended => "aboard",
+                    Some(_) if ascii => "-",
+                    Some(_) => "—",
+                    None => "",
+                };
+                let mut cells = [
+                    Cell::from(Line::from(vec![
+                        Span::raw(short_name(&ship.name, ascii)),
+                        Span::styled(
+                            match (ship.liaison, ascii) {
+                                (false, _) => "",
+                                (true, false) => " ★",
+                                (true, true) => " *",
+                            },
+                            Style::default().fg(Color::Cyan),
+                        ),
+                    ])),
+                    Cell::from(Line::from(vec![
+                        presence(ship, ascii),
+                        Span::raw(format!(" {aboard}")),
+                    ])),
+                    number(live.map_or(0, |l| l.requests)),
+                    number(live.map_or(0, |l| l.unread)),
+                    number(work.pending),
+                    Cell::from(if work.incoming > 0 {
+                        format!("{} +{}", work.owned, work.incoming)
                     } else {
-                        Color::Reset
+                        work.owned.to_string()
+                    }),
+                    Cell::from(match work.crew.as_slice() {
+                        [] => empty(ascii).to_owned(),
+                        [task] => format!("1 {}", clean(task, 40)),
+                        crew => format!("{} running", crew.len()),
+                    })
+                    .style(if work.crew.is_empty() {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        attention()
+                    }),
+                    Cell::from(
+                        live.map_or(dash, |l| if l.dispatcher { "running" } else { "stopped" }),
+                    )
+                    .style(Style::default().fg(
+                        if live.is_some_and(|l| !l.dispatcher) {
+                            Color::DarkGray
+                        } else {
+                            Color::Reset
+                        },
+                    )),
+                    Cell::from(live.and_then(|l| l.wakes.first()).map_or(dash.into(), |w| {
+                        format!("{} {}", clean(&w.mode, 40), clean(&w.status, 40))
                     })),
-                Cell::from(live.and_then(|l| l.wakes.first()).map_or(dash.into(), |w| {
-                    format!("{} {}", clean(&w.mode, 40), clean(&w.status, 40))
-                })),
-            ];
-            Row::new(
-                shown
-                    .iter()
-                    .map(|&i| std::mem::take(&mut cells[i]))
-                    .collect::<Vec<_>>(),
-            )
+                ];
+                Row::new(
+                    shown
+                        .iter()
+                        .map(|&i| std::mem::take(&mut cells[i]))
+                        .collect::<Vec<_>>(),
+                )
+            }
         })
         .collect();
     (header, rows, widths)
+}
+
+/// A machine's heading: its text in the first column, the rest empty.
+fn heading(text: &str, shown: &[usize]) -> Row<'static> {
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    Row::new(
+        shown
+            .iter()
+            .map(|&i| {
+                if i == 0 {
+                    Cell::from(Line::from(Span::styled(text.to_owned(), style)))
+                } else {
+                    Cell::default()
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// A ship on a linked machine: marked as remote. Its pending and task counts
+/// come from work recorded on this machine; presence, unread, dispatcher, last
+/// wake and running crew are the remote machine's own state, so they stay dashes.
+/// Its scope is in the details pane.
+fn remote_row(ship: &Ship, work: &Work, shown: &[usize], ascii: bool) -> Row<'static> {
+    let dash = if ascii { "-" } else { "—" };
+    let grey = Style::default().fg(Color::DarkGray);
+    let mut cells: Vec<Cell<'static>> = (0..COLUMNS.len())
+        .map(|_| Cell::from(dash).style(grey))
+        .collect();
+    cells[0] = Cell::from(Line::from(vec![
+        Span::raw(short_name(&ship.name, ascii)),
+        Span::styled(" · remote", grey),
+    ]));
+    cells[1] = Cell::from("not shared").style(grey);
+    cells[4] = if work.pending == 0 {
+        Cell::from(empty(ascii)).style(grey)
+    } else {
+        Cell::from(work.pending.to_string()).style(attention())
+    };
+    cells[5] = Cell::from(if work.incoming > 0 {
+        format!("{} +{}", work.owned, work.incoming)
+    } else {
+        work.owned.to_string()
+    });
+    Row::new(
+        shown
+            .iter()
+            .map(|&i| std::mem::take(&mut cells[i]))
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]
@@ -333,5 +456,54 @@ mod tests {
         ship.live.as_mut().unwrap().error = Some("missing".into());
         assert_eq!(summary(&ship, &Snapshot::default()), "home unavailable");
         assert_eq!(presence(&ship, true).content, "x");
+    }
+
+    #[test]
+    fn fleet_rows_group_remote_ships_under_their_machine() {
+        use crate::dashboard::model::LinkedMachine;
+        let ship = |id: &str, remote: Option<&str>| Ship {
+            id: id.into(),
+            name: id.into(),
+            remote: remote.map(Into::into),
+            ..Ship::default()
+        };
+        let now = 10_000_000;
+        let mut snapshot = Snapshot {
+            ships: vec![
+                ship("apps", None),
+                ship("infra", None),
+                ship("mini-a", Some("mac")),
+                ship("mini-b", Some("mac")),
+            ],
+            ..Snapshot::default()
+        };
+        // No linked machine: plain rows, no headings.
+        snapshot.ships.truncate(2);
+        assert_eq!(
+            fleet_rows(&snapshot, now),
+            vec![FleetRow::Ship(0), FleetRow::Ship(1)]
+        );
+        snapshot
+            .ships
+            .extend([ship("mini-a", Some("mac")), ship("mini-b", Some("mac"))]);
+        snapshot.machines = vec![LinkedMachine {
+            name: "mac".into(),
+            last_reached_ms: Some(now - 12 * 60_000),
+        }];
+        let rows = fleet_rows(&snapshot, now);
+        assert!(matches!(&rows[0], FleetRow::Heading(t) if t.starts_with("This machine · ")));
+        assert_eq!(&rows[1..3], &[FleetRow::Ship(0), FleetRow::Ship(1)]);
+        assert_eq!(
+            rows[3],
+            FleetRow::Heading("mac · last reached 12 min ago".into())
+        );
+        assert_eq!(&rows[4..], &[FleetRow::Ship(2), FleetRow::Ship(3)]);
+        assert_eq!(row_of(&rows, 3), Some(5));
+
+        snapshot.machines[0].last_reached_ms = None;
+        assert_eq!(
+            fleet_rows(&snapshot, now)[3],
+            FleetRow::Heading("mac · never reached".into())
+        );
     }
 }

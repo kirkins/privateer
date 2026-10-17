@@ -449,6 +449,7 @@ mod tests {
             liaison,
             terminals: Vec::new(),
             live: state,
+            remote: None,
         }
     }
 

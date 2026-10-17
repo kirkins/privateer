@@ -516,6 +516,58 @@ pub(crate) fn remote_ships() -> Result<Vec<(String, String, String)>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// A machine this one reaches, with the ships its last directory exchange
+/// listed, as the dashboard shows them.
+pub(crate) struct Reached {
+    pub name: String,
+    pub refreshed_ms: Option<i64>,
+    /// (ship name, scope), in name order.
+    pub ships: Vec<(String, String)>,
+}
+
+/// Machines this one reaches and their cached ship directories, read from a
+/// connection the caller opened read-only. A registry never linked has no
+/// `machines` table and reads as no machines. Machines that only reach this one
+/// have no directory here and are left out.
+pub(crate) fn reached_for_dashboard(conn: &Connection) -> Result<Vec<Reached>> {
+    let linked: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='machines')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !linked {
+        return Ok(vec![]);
+    }
+    let mut machines: Vec<Reached> = conn
+        .prepare("SELECT name, refreshed_ms FROM machines WHERE role='collects' ORDER BY name")?
+        .query_map([], |r| {
+            Ok(Reached {
+                name: r.get(0)?,
+                refreshed_ms: r.get(1)?,
+                ships: vec![],
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let listed = conn
+        .prepare(
+            "SELECT machine, substr(name,1,160), substr(scope,1,512) FROM machine_ships ORDER BY machine, name",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (machine, name, scope) in listed {
+        if let Some(reached) = machines.iter_mut().find(|m| m.name == machine) {
+            reached.ships.push((name, scope));
+        }
+    }
+    Ok(machines)
+}
+
 /// Make every linked machine's ships reachable from a newly linked home.
 pub(crate) fn reach_remote(store: &mut Store, conn: &Connection) -> Result<usize> {
     let mut installed = 0;
@@ -622,7 +674,7 @@ pub(crate) fn refresh_one(name: &str) -> Result<()> {
     refresh(Some(name)).map(|_| ())
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buffer = [0u8; 256];
     let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
     let raw = if ok {
