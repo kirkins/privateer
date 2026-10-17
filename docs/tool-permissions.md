@@ -14,7 +14,10 @@ or `Agent`, `Workflow`, `EnterWorktree`): they hand work to crew jobs, which the
 fleet tracks, rather than to agents it cannot see. A ship whose first mate runs
 unattended on Claude can select `"permission_mode": "auto"` in its profile, so
 Claude's classifier approves routine commands instead of denying every command
-outside the allow list; this depends on the account offering auto mode.
+outside the allow list; this depends on the account offering auto mode. The
+first interactive session in a folder shows auto mode's one-time setup screen;
+before hosting such a ship, run `privateer start claude` in its folder once,
+accept the folder trust dialog and finish that screen.
 
 Configure the whole local fleet from any directory:
 
