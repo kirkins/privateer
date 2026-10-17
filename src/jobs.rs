@@ -1487,6 +1487,41 @@ fn check_workspace_owner(store: &Store, job: &Job) -> Result<()> {
     }
     Ok(())
 }
+/// The estimate a crew launch is admitted under. Its memory is the route's
+/// own figure, else this host's setting for its harness, else the harness
+/// manifest's, else the default. A memory figure the request asks for counts
+/// too, and the larger of the two is kept, so a request cannot admit a crew
+/// its route sized bigger.
+pub(crate) fn crew_estimate(
+    store: &Store,
+    charter: &Value,
+    args: &Value,
+    route_memory: Option<Value>,
+) -> Result<Estimate> {
+    let requested = args
+        .get("estimate")
+        .filter(|v| !v.is_null())
+        .map(admission::estimate)
+        .transpose()?;
+    let (harness, manifest) = crate::plugins::launch_manifest(charter, args)?;
+    let route = route_memory
+        .map(|v| {
+            v.as_u64()
+                .filter(|bytes| *bytes > 0)
+                .context("options.memory_bytes must be a positive number of bytes")
+        })
+        .transpose()?;
+    let settings = admission::settings(&shared_ledger(store)?)?;
+    let memory = admission::crew_memory(&settings, &harness, manifest, route);
+    let mut estimate = requested.unwrap_or_default();
+    estimate.memory_bytes = Some(
+        estimate
+            .memory_bytes
+            .map_or(memory, |asked| asked.max(memory)),
+    );
+    Ok(estimate)
+}
+
 /// Only the validated agent.start path may start a harness under spawn.
 /// Public job.start cannot use this to bypass implementation authority.
 pub(crate) fn start_agent(store: &Store, mut args: Value) -> Result<Value> {

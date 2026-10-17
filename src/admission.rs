@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -83,6 +84,13 @@ pub struct Settings {
     /// pool may keep. Beyond it, the least recently released slots are
     /// trimmed. 0 keeps none.
     pub workspace_cache_budget_bytes: u64,
+    /// Memory a crew launch reserves when neither its route, this host's
+    /// setting for its harness, nor its harness manifest says how much it
+    /// needs.
+    pub crew_default_memory_bytes: u64,
+    /// Per-harness crew memory, by harness id, overriding the harness
+    /// manifest's figure on this host.
+    pub crew_memory_bytes: BTreeMap<String, u64>,
 }
 
 impl Default for Settings {
@@ -100,6 +108,8 @@ impl Default for Settings {
             ramp_secs: 60,
             disk_warn_horizon_secs: 24 * 60 * 60,
             workspace_cache_budget_bytes: 8 * GIB,
+            crew_default_memory_bytes: 2 * GIB,
+            crew_memory_bytes: BTreeMap::new(),
         }
     }
 }
@@ -278,6 +288,28 @@ fn effective(raw: &Map<String, Value>) -> Result<Settings> {
             "workspace_cache_budget_bytes" => {
                 settings.workspace_cache_budget_bytes = bytes(value, key)?;
             }
+            "crew_default_memory_bytes" => {
+                settings.crew_default_memory_bytes = bytes(value, key)?;
+            }
+            "crew_memory_bytes" => {
+                let by_harness = value
+                    .as_object()
+                    .context("crew_memory_bytes must map harness ids to bytes")?;
+                settings.crew_memory_bytes = by_harness
+                    .iter()
+                    .map(|(harness, bytes_value)| {
+                        ensure!(!harness.is_empty(), "crew_memory_bytes needs harness ids");
+                        Ok((
+                            harness.clone(),
+                            bytes_value.as_u64().filter(|b| *b > 0).with_context(|| {
+                                format!(
+                                    "crew_memory_bytes.{harness} must be a positive number of bytes"
+                                )
+                            })?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
+            }
             _ => bail!("unknown admission setting {key}"),
         }
     }
@@ -314,6 +346,21 @@ pub fn configure(conn: &Connection, changes: &Value) -> Result<Settings> {
         let _ = conn.execute_batch("ROLLBACK");
     }
     result
+}
+
+/// The memory a crew launch reserves: its route's own figure, else this
+/// host's setting for its harness, else the harness manifest's, else the
+/// default for a manifest that declares none.
+pub fn crew_memory(
+    settings: &Settings,
+    harness: &str,
+    manifest: Option<u64>,
+    route: Option<u64>,
+) -> u64 {
+    route
+        .or_else(|| settings.crew_memory_bytes.get(harness).copied())
+        .or(manifest)
+        .unwrap_or(settings.crew_default_memory_bytes)
 }
 
 /// The demand to record for a job, or None when it is neither heavy nor

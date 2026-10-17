@@ -64,6 +64,46 @@ it is a host-wide setting in `heavy_estimate.disk_bytes`. Two heavy jobs that ea
 declare the default need twice that plus the floor. Raise it when one heavy
 build really writes more.
 
+## Crew memory
+
+Crew (the jobs a first mate starts through `agent.start`, and the errands it
+starts through `errand.start`) reserve memory like any estimated job. A first
+mate's own wake is not crew, and stays outside admission.
+
+A crew's memory is the first of these that is set:
+
+1. the `memory_bytes` in its route's `options`, which is removed before the
+   harness is launched;
+2. this host's `crew_memory_bytes`, a map from harness id to bytes, set with
+   `resource.configure`;
+3. the `memory_bytes` the harness manifest declares;
+4. this host's `crew_default_memory_bytes`, for a manifest that declares none.
+
+A memory figure the request itself asks for in `estimate` counts too, and the
+larger of the two is kept, so a request cannot admit a crew its route sized
+bigger. The figure is checked like any other estimate: with the host's live
+memory minus the floor (`min_available_memory_bytes`) and what recently admitted
+jobs are estimated to use, a crew that does not fit is refused with the figures
+it refused on, or waits in the capacity queue when it was started with
+`wait_for_capacity:true`. As with any estimated job, a crew running alone needs
+only the floor; its estimate counts against the estimated jobs that start while
+it runs.
+
+```bash
+privateer --home ~/ships/<ship>/.privateer resource.configure --json \
+  '{"crew_default_memory_bytes": 1073741824, "crew_memory_bytes": {"<harness>": 2147483648}}'
+```
+
+The memory a crew reserves shows as `estimate.memory_bytes` in `job.status`,
+and as `demand.memory_bytes` on its reservation in `resource.status`. A
+harness manifest declares its figure as `memory_bytes`, in bytes. The figures
+the bundled manifests declare are generic placeholders, not measurements: tune
+them with `crew_memory_bytes` once you have seen what a harness really uses on
+your machine.
+
+Hosted first mates are outside admission, so their memory is not reserved and
+does not appear in `resource.status`.
+
 ## Choosing the floor for a real workload
 
 The floor is not a cleanup policy. It is the point below which new work stops,

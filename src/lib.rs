@@ -210,11 +210,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                             crew_routes::choose(store, ship, "crew", requested.as_deref())?
                         {
                             // The agent may add settings such as effort; the
-                            // route decides the provider and model.
+                            // route decides the provider, model and memory.
                             let mut options = choice.options;
                             if let Some(extra) = args.get("options").and_then(Value::as_object) {
                                 for (key, value) in extra {
-                                    if !matches!(key.as_str(), "provider" | "model") {
+                                    if !matches!(
+                                        key.as_str(),
+                                        "provider" | "model" | "memory_bytes"
+                                    ) {
                                         options[key] = value.clone();
                                     }
                                 }
@@ -316,6 +319,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 args["_workspace_cwd"] = serde_json::json!(execution.root);
             }
             drop(execution);
+            // A route's memory figure sizes admission; the harness never sees it.
+            let route_memory = args
+                .get_mut("options")
+                .and_then(Value::as_object_mut)
+                .and_then(|options| options.remove("memory_bytes"));
             let mut plan = plugins::dispatch(store, "plugin.command", args.clone())?;
             if hosted {
                 // The crew extension ends the session when its work settles.
@@ -377,6 +385,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             if let Some(route) = model_route {
                 job["model_route"] = serde_json::json!(route);
+            }
+            // Crew reserve memory like any estimated job; a first mate's own
+            // wake is not crew and stays outside admission.
+            if !workspace::is_wake(store, &args)? {
+                let estimate = jobs::crew_estimate(store, &charter, &args, route_memory)?;
+                job["estimate"] = serde_json::to_value(estimate)?;
             }
             let mut started = jobs::start_agent(store, job)?;
             if viewed {

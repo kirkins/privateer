@@ -231,6 +231,12 @@ print(json.dumps({{'type':'agent_settled','aborted':False}}),flush=True)
             std::thread::sleep(Duration::from_millis(25));
         }
     };
+    // The nested crew runs beside the legacy one: its memory is admission's
+    // concern, tested apart, so keep it tiny here.
+    run(
+        "resource.configure",
+        json!({"crew_memory_bytes":{"pi":1u64 << 20}}),
+    );
     let args = json!({"id":"legacy-job","task_id":"task"});
     run("agent.start", args.clone());
     let legacy = wait("legacy-job");
