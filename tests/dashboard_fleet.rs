@@ -2523,8 +2523,25 @@ fn local_work_owned_by_a_linked_ship_still_lists_it_under_its_machine() {
     let heading = text.find("mac · last reached 12 min ago").unwrap();
     assert!(text.find("mini-a · remote").unwrap() > heading, "{text}");
     assert!(text.find("This machine ·").unwrap() < heading, "{text}");
+    // The remote row counts the task recorded here for it, not dashes.
+    let lines: Vec<String> = text
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(120)
+        .map(|row| row.iter().collect())
+        .collect();
+    let remote_row = lines
+        .iter()
+        .find(|l| l.contains("mini-a · remote"))
+        .unwrap();
+    assert!(remote_row.contains(" 1 "), "{remote_row}");
 
     app.select_ship(Some("mini-a".into()));
+    let details = screen(&mut app);
+    assert!(
+        details.contains("Delegated · Assignment delegated"),
+        "{details}"
+    );
     assert!(!app.bridge_key(KeyCode::Enter));
     assert!(app.notice.contains("nothing opens from here"));
 }

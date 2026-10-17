@@ -687,17 +687,19 @@ impl App {
             .collect();
         if open.is_empty() {
             lines.push(Line::from("Open work: none recorded for this ship"));
-            return;
+        } else {
+            lines.push(Line::from(format!(
+                "Open work: {}",
+                count(open.len(), "task", "tasks")
+            )));
         }
-        lines.push(Line::from(format!(
-            "Open work: {}",
-            count(open.len(), "task", "tasks")
-        )));
         for task in open.iter().take(SHOWN) {
-            let delegated = matches!(
-                (own_home, task.home.as_deref()),
-                (Some(own), Some(home)) if own != home
-            );
+            // On a linked machine every task here is delegated to it from this home.
+            let delegated = ship.remote.is_some()
+                || matches!(
+                    (own_home, task.home.as_deref()),
+                    (Some(own), Some(home)) if own != home
+                );
             lines.push(Line::from(format!(
                 "{} · {} · {} · {} · owner {} · origin {}",
                 if delegated { "Delegated" } else { "Own" },
@@ -716,6 +718,25 @@ impl App {
         }
         if open.len() > SHOWN {
             lines.push(Line::from(format!("+{} more open", open.len() - SHOWN)));
+        }
+        if ship.remote.is_some() {
+            let pending = self
+                .snapshot
+                .pending
+                .iter()
+                .filter(|n| n.owner == ship.id)
+                .count();
+            let crew = self
+                .snapshot
+                .jobs
+                .iter()
+                .filter(|j| j.owner == ship.id && j.is_active())
+                .count();
+            lines.push(Line::from(format!(
+                "Recorded here: {} pending · {} active · its own live state is not shared",
+                count(pending, "notice", "notices"),
+                count(crew, "job", "jobs"),
+            )));
         }
     }
 
@@ -810,9 +831,8 @@ impl App {
                     clean(&ship.description, 512)
                 }
             )));
-            if ship.remote.is_none() {
-                self.push_ship_work(&mut lines, ship);
-            }
+            // Work recorded in local homes is shown for a linked-machine ship too.
+            self.push_ship_work(&mut lines, ship);
         }
         if let Some(error) = &self.attention.error {
             lines.push(Line::from(format!("UNAVAILABLE: {}", clean(error, 512))));

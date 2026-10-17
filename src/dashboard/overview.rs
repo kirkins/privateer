@@ -261,10 +261,10 @@ pub fn table(
             FleetRow::Heading(text) => heading(&text, &shown),
             FleetRow::Ship(index) => {
                 let ship = &snapshot.ships[index];
-                if ship.remote.is_some() {
-                    return remote_row(ship, &shown, ascii);
-                }
                 let work = work(ship, snapshot);
+                if ship.remote.is_some() {
+                    return remote_row(ship, &work, &shown, ascii);
+                }
                 let live = ship.live.as_ref().filter(|l| l.error.is_none());
                 let aboard = match &ship.live {
                     Some(l) if l.error.is_some() => "unavailable",
@@ -350,19 +350,31 @@ fn heading(text: &str, shown: &[usize]) -> Row<'static> {
     )
 }
 
-/// A ship on a linked machine: marked as remote, with dashes where its live
-/// state would have to cross the link. Its scope is in the details pane.
-fn remote_row(ship: &Ship, shown: &[usize], ascii: bool) -> Row<'static> {
+/// A ship on a linked machine: marked as remote. Its pending and task counts
+/// come from work recorded on this machine; presence, unread, dispatcher, last
+/// wake and running crew are the remote machine's own state, so they stay dashes.
+/// Its scope is in the details pane.
+fn remote_row(ship: &Ship, work: &Work, shown: &[usize], ascii: bool) -> Row<'static> {
     let dash = if ascii { "-" } else { "—" };
     let grey = Style::default().fg(Color::DarkGray);
-    let mut cells = vec![
-        Cell::from(Line::from(vec![
-            Span::raw(short_name(&ship.name, ascii)),
-            Span::styled(" · remote", grey),
-        ])),
-        Cell::from("not shared").style(grey),
-    ];
-    cells.extend((2..COLUMNS.len()).map(|_| Cell::from(dash).style(grey)));
+    let mut cells: Vec<Cell<'static>> = (0..COLUMNS.len())
+        .map(|_| Cell::from(dash).style(grey))
+        .collect();
+    cells[0] = Cell::from(Line::from(vec![
+        Span::raw(short_name(&ship.name, ascii)),
+        Span::styled(" · remote", grey),
+    ]));
+    cells[1] = Cell::from("not shared").style(grey);
+    cells[4] = if work.pending == 0 {
+        Cell::from(empty(ascii)).style(grey)
+    } else {
+        Cell::from(work.pending.to_string()).style(attention())
+    };
+    cells[5] = Cell::from(if work.incoming > 0 {
+        format!("{} +{}", work.owned, work.incoming)
+    } else {
+        work.owned.to_string()
+    });
     Row::new(
         shown
             .iter()
