@@ -215,14 +215,13 @@ fn native_permission_denial_becomes_one_question_and_pauses_automatic_retries() 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["kind"], "request");
     assert!(!mail.to_string().contains("PRIVATE_DO_NOT_MAIL"));
-    let before = f
-        .json("liaison", "job.list", json!({}))
+    let before = f.json("liaison", "job.list", json!({}))["jobs"]
         .as_array()
         .unwrap()
         .len();
     f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
     assert_eq!(
-        f.json("liaison", "job.list", json!({}))
+        f.json("liaison", "job.list", json!({}))["jobs"]
             .as_array()
             .unwrap()
             .len(),
@@ -232,14 +231,14 @@ fn native_permission_denial_becomes_one_question_and_pauses_automatic_retries() 
     // new attempt, then pauses again rather than repeatedly spending inference.
     f.json("liaison","mail.send",json!({"id":"new-input","from":"captain","to":"liaison","kind":"request","body":"fresh guidance"}));
     f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
-    let fresh = f.json("liaison", "job.list", json!({}));
+    let fresh = f.json("liaison", "job.list", json!({}))["jobs"].clone();
     assert_eq!(fresh.as_array().unwrap().len(), before + 1);
     for j in fresh.as_array().unwrap() {
         f.wait("liaison", j["id"].as_str().unwrap());
     }
     f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
     assert_eq!(
-        f.json("liaison", "job.list", json!({}))
+        f.json("liaison", "job.list", json!({}))["jobs"]
             .as_array()
             .unwrap()
             .len(),
@@ -254,7 +253,7 @@ fn native_permission_denial_becomes_one_question_and_pauses_automatic_retries() 
     );
     f.ok(None, &["permissions", "yolo"]);
     f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
-    let jobs = f.json("liaison", "job.list", json!({}));
+    let jobs = f.json("liaison", "job.list", json!({}))["jobs"].clone();
     assert_eq!(jobs.as_array().unwrap().len(), before + 2);
     for j in jobs.as_array().unwrap() {
         f.wait("liaison", j["id"].as_str().unwrap());

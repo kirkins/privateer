@@ -2924,6 +2924,104 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
     Ok(json!({"released": key, "job_id": reservation.job_id, "forced": payload.is_none()}))
 }
 
+/// Position of a job in `job.list`: non-terminal jobs first (rank 0), then
+/// the rest (rank 1), newest first within each, id as the final tiebreak.
+#[derive(Debug, PartialEq)]
+struct ListKey {
+    rank: i64,
+    created_ms: i64,
+    id: String,
+}
+impl ListKey {
+    fn of(job: &Job) -> Self {
+        Self {
+            rank: i64::from(terminal(&job.status)),
+            created_ms: job.created_ms,
+            id: job.id.clone(),
+        }
+    }
+    /// Before any job: the first page starts here.
+    fn start() -> Self {
+        Self {
+            rank: -1,
+            created_ms: i64::MAX,
+            id: String::new(),
+        }
+    }
+    fn encode(&self) -> String {
+        format!("{}:{}:{}", self.rank, self.created_ms, self.id)
+    }
+    fn decode(raw: &str) -> Result<Self> {
+        let mut parts = raw.splitn(3, ':');
+        let (rank, created_ms, id) = (parts.next(), parts.next(), parts.next());
+        let (Some(rank), Some(created_ms), Some(id)) = (rank, created_ms, id) else {
+            bail!("cursor is not one returned by job.list");
+        };
+        Ok(Self {
+            rank: rank
+                .parse()
+                .context("cursor is not one returned by job.list")?,
+            created_ms: created_ms
+                .parse()
+                .context("cursor is not one returned by job.list")?,
+            id: id.to_owned(),
+        })
+    }
+}
+
+/// `job.list`: a page of jobs in `ListKey` order. Returns `jobs`, `more`
+/// (whether another page exists) and `next_cursor` (pass it back as `cursor`).
+/// `after_id` (a job id) starts after that job's position instead. The order
+/// is a keyset, so a page is not shifted by jobs that finished on an earlier
+/// page, and live work always lands on the first page.
+fn list(store: &Store, args: &Value) -> Result<Value> {
+    let limit = args
+        .get("limit")
+        .map(|v| v.as_u64().context("limit must be a positive integer"))
+        .transpose()?
+        .unwrap_or(200)
+        .clamp(1, 1000) as usize;
+    let after = match (args.get("cursor"), args.get("after_id")) {
+        (Some(cursor), _) => ListKey::decode(cursor.as_str().context("cursor must be a string")?)?,
+        (None, Some(id)) => ListKey::of(&load(
+            store,
+            id.as_str().context("after_id must be a job id")?,
+        )?),
+        (None, None) => ListKey::start(),
+    };
+    // A stopped job's terminal status is what sorts it behind live work; the
+    // SQL below must agree with `terminal` above.
+    let terminal_sql = ["succeeded", "failed", "cancelled", "timed_out"]
+        .map(|s| format!("'{s}'"))
+        .join(",");
+    let sql = format!(
+        "WITH listed AS (
+            SELECT record, id,
+                   CASE WHEN json_extract(record,'$.status') IN ({terminal_sql}) THEN 1 ELSE 0 END AS rank,
+                   json_extract(record,'$.created_ms') AS created
+            FROM jobs)
+         SELECT record FROM listed
+         WHERE rank > ?1 OR (rank = ?1 AND (created < ?2 OR (created = ?2 AND id < ?3)))
+         ORDER BY rank, created DESC, id DESC LIMIT ?4"
+    );
+    let mut stmt = store.connection().prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![after.rank, after.created_ms, after.id, limit as i64 + 1],
+        |r| r.get::<_, String>(0),
+    )?;
+    let mut page: Vec<Job> = rows
+        .map(|r| Ok(serde_json::from_str(&r?)?))
+        .collect::<Result<_>>()?;
+    let more = page.len() > limit;
+    page.truncate(limit);
+    let next_cursor = page.last().map(|j| ListKey::of(j).encode());
+    Ok(json!({
+        "jobs": page.iter().map(public_job).collect::<Vec<_>>(),
+        "more": more,
+        "next_cursor": next_cursor,
+    }))
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "job.start" => start(store, args, None, false),
@@ -2934,30 +3032,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .context("id required")?;
             Ok(public_job(&load(store, id)?))
         }
-        "job.list" => {
-            // Pages in id order: pass the last id seen as after_id.
-            let limit = args
-                .get("limit")
-                .map(|v| v.as_u64().context("limit must be a positive integer"))
-                .transpose()?
-                .unwrap_or(200)
-                .clamp(1, 1000);
-            let after = args
-                .get("after_id")
-                .map(|v| v.as_str().context("after_id must be a job id"))
-                .transpose()?
-                .unwrap_or("");
-            let mut stmt = store
-                .connection()
-                .prepare("SELECT record FROM jobs WHERE id>?1 ORDER BY id LIMIT ?2")?;
-            let rows = stmt.query_map(params![after, limit], |r| r.get::<_, String>(0))?;
-            let all: Vec<Job> = rows
-                .map(|r| Ok(serde_json::from_str(&r?)?))
-                .collect::<Result<_>>()?;
-            Ok(json!(
-                all.into_iter().map(|j| public_job(&j)).collect::<Vec<_>>()
-            ))
-        }
+        "job.list" => list(store, &args),
         "job.cancel" => cancel(
             store,
             args.get("id")
