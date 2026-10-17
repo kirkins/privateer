@@ -104,7 +104,7 @@ documentation and Privateer's own dashboard boat geometry, not First Mate code.
   refusal installed before exec (also inherited by descendants). It fails closed
   when the transport guard is unavailable. Delivery events are simulated; it
   makes no model or network request. Records the installed version without
-  gating the Calm adapters; the bounded loader still qualifies exactly Pi 1.2.0.
+  gating the Calm adapters; the bounded loader checks the installed Pi's flags, not its version.
 - `cargo test --test attended --test hosted --test pi_calm -- --test-threads=1`:
   real launch argv/home/custody checks, including hosted crew after #96 and
   non-Pi exclusion.

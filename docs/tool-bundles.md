@@ -1,6 +1,6 @@
 # Explicit Pi and Claude resource bundles (first stage)
 
-This is an **opt-in, limited Pi 1.2.0 and Claude Code resource-loading path**
+This is an **opt-in, limited Pi and Claude Code resource-loading path**
 (see [Bounded Claude launches](#bounded-claude-launches)), not a sandbox,
 provider router, permission grant, or replacement harness. The runtime does not
 install packages, edit native configuration, replace `HOME`/the agent directory,
@@ -58,8 +58,8 @@ No registry is installed/enabled by shipping this code.
 ```json
 {
   "schema_version": 1,
-  "pi_version": "1.2.0",
-  "claude_version": "<exact Claude Code version, optional>",
+  "pi_version": "<version the registry was made with>",
+  "claude_version": "<version the registry was made with, optional>",
   "integrations": {
     "reviewed": true,
     "extensions": []
@@ -201,17 +201,26 @@ Bounded first-mate wakes use fresh sessions; hosted starts do not automatically
 continue the old session. A repeated `init` preserves explicit bounded mode
 rather than silently switching the ship back to legacy ambient loading.
 
-**Flags alone are insufficient in Pi 1.2.0.** Its exact-version source resolves
-configured packages before resource filtering, and discovers `SYSTEM.md` and
-`APPEND_SYSTEM.md` independently of `--no-context-files`. Therefore the loader:
+Bounded Pi loading depends on the installed Pi's flags, not on its version
+string. Pi's package resolution and `SYSTEM.md`/`APPEND_SYSTEM.md` discovery are
+not all covered by flags, so the loader also checks settings itself:
 
 1. Checks settings only in the original agent directory and cwd's `.pi` directory.
    Nonempty/malformed package settings, malformed/unreadable relevant settings,
    unsafe settings paths and any ambient `SYSTEM.md`/`APPEND_SYSTEM.md` refuse
    before native probing/startup. It never reads auth/models/MCP credential files.
-2. Rejects activation-script wrappers and requires the actual native `pi` on PATH
-   to report exactly `1.2.0`. Other harnesses/versions refuse, not fall back.
+2. Rejects activation-script wrappers, then asks the installed `pi` for `--version`
+   and `--help` (never its config). It must declare every flag the bounded launch
+   passes: `--no-extensions`, `--no-mcp`, `--no-skills`, `--no-prompt-templates`,
+   `--no-context-files`, `--no-themes`, `--skill` and `-e`. Any version declaring
+   them is accepted; a missing flag refuses and the error names it. Flags are read
+   from each option row only, so a description mentioning a flag does not count.
+   The result is cached per executable path and version for the run.
 3. Rechecks selected pins and rejects session/resource overrides before launching.
+
+Claude Code launches get the same capability check: the installed `claude` must
+declare `--setting-sources`, `--strict-mcp-config`, `--settings`, `--plugin-dir`
+and `--print`. Its version is not compared with the registry.
 
 This can refuse a perfectly legitimate personal Pi setup. Use legacy mode until
 the captain explicitly approves a compatible bounded profile; do not remove
@@ -232,8 +241,9 @@ erased by changing today's inventory.
 
 A `bundled:claude` first mate or crew request takes the same `tool_bundles`
 field and registry. Omitting it keeps today's launch exactly; `[]` is bounded
-with no skills. The registry must pin `claude_version`, the exact version
-`claude --version` reports; registries without it still serve Pi. Pi extension
+with no skills. A registry with `claude_version` serves Claude; registries without it still
+serve Pi. The version is a record, not a pin: the installed Claude Code must
+declare the bounded-loading flags (see the capability check below). Pi extension
 integrations cannot load into Claude, so a Claude plan needs `extensions:[]`.
 
 `plugins/claude_bundles.py` adds Claude's supported flags:
@@ -321,7 +331,7 @@ mocked-host tests retain hosted custody/lifecycle injection and refuse an
 unsupported binary without silently running it. Those are not actual Pi
 inventory evidence.
 
-The opt-in native fixture uses **installed Pi 1.2.0**, a disposable auth-less
+The opt-in native fixture uses the exact native Pi binary it is given (its reported version is recorded in the output), a disposable auth-less
 `PI_CODING_AGENT_DIR` and project, a clean credential-free environment allowlist,
 unchanged `HOME`, offline/no-session controls, and a recognized inspection slash
 command. Its inspector exits if an agent turn starts: no inference or real

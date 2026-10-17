@@ -10,10 +10,9 @@ import json
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import uuid
 
-from bundles import file_bytes, present, require, safe_path, validate_plan
+from bundles import file_bytes, present, require, require_flags, safe_path, validate_plan
 
 # Keep the project's .claude settings (Privateer's hooks and permissions) and
 # drop the user source; no MCP servers unless --mcp-config names them.
@@ -40,6 +39,9 @@ PLUGIN_PARTS = ("hooks", ".mcp.json", ".lsp.json", "agents", "commands", "skills
                 "monitors", "output-styles", ".claude-plugin")
 # Claude also loads these from --add-dir folders, which are not the project.
 FOLDER_PARTS = (".claude/skills", ".claude/commands", ".claude/agents", ".mcp.json")
+# Flags a bounded Claude launch passes, plus --print for the headless runs
+# that use it. Any installed Claude declaring these will do.
+NEEDED = ["--setting-sources", "--strict-mcp-config", "--settings", "--plugin-dir", "--print"]
 FORBIDDEN = ("--plugin-dir", "--plugin-url", "--settings", "--setting-sources", "--mcp-config", "--bare",
              "--safe-mode", "--agents", "--resume", "--continue", "--fork-session", "--session-id",
              "--from-pr", "--teleport")
@@ -121,10 +123,7 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
     # Refuse activation wrappers (for example mise) rather than run them.
     with open(binary, "rb") as stream:
         require(stream.read(2) != b"#!")
-    probe = subprocess.run([str(binary), "--version"], env=env, cwd=cwd or os.getcwd(),
-                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=10, check=False)
-    require(probe.returncode == 0 and probe.stdout.split()[:1] == [value["claude_version"].encode()])
+    require_flags(str(binary), env, cwd or os.getcwd(), "Claude Code", NEEDED)
     carried = ["--settings", json.dumps(value["settings"], separators=(",", ":"))] if value["settings"] else []
     plugins = [arg for item in value["skills"] for arg in ("--plugin-dir", item["root"])]
     return [argv[0], *FLAGS, *carried, *plugins, *args]
