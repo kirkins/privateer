@@ -111,6 +111,7 @@ pub struct Placed {
 }
 
 impl Placed {
+    #[cfg(test)]
     fn width(&self) -> usize {
         self.rows
             .iter()
