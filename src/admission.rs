@@ -168,6 +168,21 @@ pub fn init(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS disk_trims (disk_key TEXT PRIMARY KEY,
            total_bytes INTEGER NOT NULL, last_ms INTEGER NOT NULL);",
     )?;
+    // A ledger made before trims were recorded has disk_samples without the
+    // column; CREATE TABLE IF NOT EXISTS leaves it as it was.
+    let has_trimmed = conn
+        .prepare("SELECT 1 FROM pragma_table_info('disk_samples') WHERE name='trimmed_bytes'")?
+        .exists([])?;
+    if !has_trimmed {
+        // Another process opening the ledger at the same moment may add it
+        // first; its duplicate is the same outcome.
+        if let Err(error) = conn.execute_batch(
+            "ALTER TABLE disk_samples ADD COLUMN trimmed_bytes INTEGER NOT NULL DEFAULT 0",
+        ) && !error.to_string().contains("duplicate column name")
+        {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 
@@ -858,6 +873,32 @@ pub fn report(settings: &Settings, host: &Host) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_older_ledger_gains_the_trimmed_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE disk_samples (path TEXT NOT NULL, sampled_ms INTEGER NOT NULL,
+               free_bytes INTEGER NOT NULL, PRIMARY KEY (path, sampled_ms));
+             INSERT INTO disk_samples VALUES('k', 1, 5);",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO disk_samples(path,sampled_ms,free_bytes,trimmed_bytes) VALUES('k',2,4,1)",
+            [],
+        )
+        .unwrap();
+        let old: i64 = conn
+            .query_row(
+                "SELECT trimmed_bytes FROM disk_samples WHERE sampled_ms=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0);
+    }
+
     use super::*;
 
     fn host(load: f64) -> Host {
