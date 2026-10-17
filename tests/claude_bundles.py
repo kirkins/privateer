@@ -185,7 +185,8 @@ class ClaudeBundles(unittest.TestCase):
         request['context']['tool_bundles'] = self.plan()
         request['options']['resume'] = SESSION
         bounded = handle('claude', request)['argv']
-        self.assertIn('--tool-bundles', bounded)
+        # native_launch.main reads the plan only ahead of --control.
+        self.assertEqual([bounded[2], bounded[4], bounded[6]], ['--tool-bundles', '--control', 'claude'])
         self.assertIn(SESSION, bounded)
         with self.assertRaises(ValueError):
             handle('pi', request)

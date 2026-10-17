@@ -467,7 +467,8 @@ def handle(harness, request):
     if harness == "opencode" and policy(request["context"].get("tool_permissions"))["mode"] == "yolo":
         prefix = ["--opencode-yolo"]
     if bundles is not None:
-        prefix += ["--tool-bundles", json.dumps(bundles, separators=(",", ":"))]
+        # native_launch reads the plan first, before --control.
+        prefix = ["--tool-bundles", json.dumps(bundles, separators=(",", ":")), *prefix]
     return {"valid": True} if request["method"] == "validate" else {
         "argv": argv if len(argv) > 1 and argv[0] == sys.executable and argv[1] in [str(Path(__file__).with_name(name)) for name in ("acp.py", "msp.py", "omp_rpc.py")] else [sys.executable, str(Path(__file__).with_name("native_launch.py")), *prefix, harness, *argv],
         "cwd": repo, "env_names": []}
