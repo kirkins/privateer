@@ -29,7 +29,12 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
     ("quiet_compact_percent", 40, 1, 100),
     // A hosted first mate's harness stops after this long idle and starts
     // again on the same conversation when needed (0 keeps it running).
-    ("sleep_after_secs", 0, 0, 86_400),
+    (
+        "sleep_after_secs",
+        crate::host::sleep::DEFAULT_AFTER_SECS,
+        0,
+        86_400,
+    ),
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;

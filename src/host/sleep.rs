@@ -1,7 +1,8 @@
-//! Sleeping hosted first mates. With `first_mate.sleep_after_secs` set, a
-//! hosted session whose mail adapter has reported it idle for that long has
-//! its native harness stopped to free memory, while `start --hosted` keeps the
-//! pane, the ship's presence lease and its place in Herdr. New actionable
+//! Sleeping hosted first mates. A hosted session whose mail adapter has
+//! reported it idle for `first_mate.sleep_after_secs` (default 30 minutes; 0
+//! keeps it running) has its native harness stopped to free memory, while
+//! `start --hosted` keeps the pane, the ship's presence lease and its place in
+//! Herdr. New actionable
 //! mail, ready scheduled work or Enter in the pane starts the harness again on
 //! the same conversation. The dispatcher sees an attended, hosted ship
 //! throughout, so it neither opens another space nor starts a headless wake.
@@ -12,6 +13,10 @@ use serde_json::json;
 
 /// Idle reports arrive every five seconds; an older one says nothing about now.
 const FRESH_MS: i64 = 15_000;
+
+/// Past the prompt cache's life and quiet compaction, so a first mate the
+/// captain is talking to never sleeps, and waking it costs little extra.
+pub(crate) const DEFAULT_AFTER_SECS: u64 = 1_800;
 
 /// A stopped harness, held under a new holder so its mail adapter, if it is
 /// somehow still running, no longer owns the ship.

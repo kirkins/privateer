@@ -1063,10 +1063,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
+    // Ships recorded before the setting existed sleep by default too.
     let sleep_after = if hosted {
         profile["first_mate"]["sleep_after_secs"]
             .as_u64()
-            .unwrap_or(0)
+            .unwrap_or(crate::host::sleep::DEFAULT_AFTER_SECS)
     } else {
         0
     };
