@@ -163,7 +163,8 @@ pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS disk_samples (path TEXT NOT NULL, sampled_ms INTEGER NOT NULL,
-           free_bytes INTEGER NOT NULL, PRIMARY KEY (path, sampled_ms));
+           free_bytes INTEGER NOT NULL, trimmed_bytes INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY (path, sampled_ms));
          CREATE TABLE IF NOT EXISTS disk_trims (disk_key TEXT PRIMARY KEY,
            total_bytes INTEGER NOT NULL, last_ms INTEGER NOT NULL);",
     )?;
@@ -613,9 +614,9 @@ const DISK_TREND_WINDOW_MS: i64 = 12 * 60 * 60 * 1000;
 /// A falling rate is believed only once the readings span this long, so one
 /// build that wrote a gigabyte cannot read as a machine filling up.
 const DISK_TREND_MIN_SPAN_MS: i64 = 60 * 60_000;
-/// A rise this large between two readings is a cleanup: the rate is read from
-/// the readings after it, so the space freed does not hide a fall that
-/// follows.
+/// A rise this large between two readings, beyond what trims explain, is a
+/// cleanup: the rate is read from the readings after it, so the space freed
+/// does not hide a fall that follows.
 const DISK_CLEANUP_BYTES: u64 = GIB;
 
 /// How free space on one filesystem has moved over the recent readings.
@@ -664,9 +665,11 @@ pub struct DiskForecast {
 }
 
 /// Keep one reading of free space, at most one every `DISK_SAMPLE_EVERY_MS`,
-/// so a later reading can say how fast space is falling. Callers pass the
-/// reading they just decided against, so the trend and the decision agree.
-/// Readings past the retention window are dropped for every filesystem.
+/// so a later reading can say how fast space is falling. Each reading keeps
+/// the trim total at the time, so a trim's space can be taken back out of the
+/// readings after it. Callers pass the reading they just decided against, so
+/// the trend and the decision agree. Readings past the retention window are
+/// dropped for every filesystem.
 pub fn note_disk(conn: &Connection, path: &str, free: u64, now_ms: i64) -> Result<()> {
     let last: Option<i64> = conn
         .query_row(
@@ -678,10 +681,17 @@ pub fn note_disk(conn: &Connection, path: &str, free: u64, now_ms: i64) -> Resul
     if last.is_some_and(|at| now_ms.saturating_sub(at) < DISK_SAMPLE_EVERY_MS) {
         return Ok(());
     }
+    let trimmed = trim_total(conn, path)?;
     conn.execute(
-        "INSERT INTO disk_samples(path,sampled_ms,free_bytes) VALUES(?1,?2,?3)
-         ON CONFLICT(path,sampled_ms) DO UPDATE SET free_bytes=excluded.free_bytes",
-        params![path, now_ms, free.min(i64::MAX as u64) as i64],
+        "INSERT INTO disk_samples(path,sampled_ms,free_bytes,trimmed_bytes) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(path,sampled_ms) DO UPDATE SET free_bytes=excluded.free_bytes,
+           trimmed_bytes=excluded.trimmed_bytes",
+        params![
+            path,
+            now_ms,
+            free.min(i64::MAX as u64) as i64,
+            trimmed.min(i64::MAX as u64) as i64
+        ],
     )?;
     conn.execute(
         "DELETE FROM disk_samples WHERE sampled_ms < ?1",
@@ -705,8 +715,10 @@ pub fn trim_total(conn: &Connection, disk_key: &str) -> Result<u64> {
 }
 
 /// Record that `bytes` of build output were trimmed from one filesystem and
-/// read `free` bytes free afterwards. The reading is written even when a
-/// sample was taken moments ago, so the trend restarts from the trimmed disk.
+/// read `free` bytes free afterwards. The reading carries the new trim total.
+/// It is written even when a sample was taken moments ago, so the trend's
+/// readings after the trim are not missing it. A trim is not a reset: the
+/// trend keeps its readings and takes the trimmed bytes back out of them.
 pub fn record_trim(
     conn: &Connection,
     disk_key: &str,
@@ -720,19 +732,28 @@ pub fn record_trim(
            last_ms=excluded.last_ms",
         params![disk_key, bytes.min(i64::MAX as u64) as i64, now_ms],
     )?;
+    let trimmed = trim_total(conn, disk_key)?;
     conn.execute(
-        "INSERT INTO disk_samples(path,sampled_ms,free_bytes) VALUES(?1,?2,?3)
-         ON CONFLICT(path,sampled_ms) DO UPDATE SET free_bytes=excluded.free_bytes",
-        params![disk_key, now_ms, free.min(i64::MAX as u64) as i64],
+        "INSERT INTO disk_samples(path,sampled_ms,free_bytes,trimmed_bytes) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(path,sampled_ms) DO UPDATE SET free_bytes=excluded.free_bytes,
+           trimmed_bytes=excluded.trimmed_bytes",
+        params![
+            disk_key,
+            now_ms,
+            free.min(i64::MAX as u64) as i64,
+            trimmed.min(i64::MAX as u64) as i64
+        ],
     )?;
     Ok(())
 }
 
 /// The rate at which free space has been moving over the recent readings of
 /// one filesystem. The window ends at the newest reading and starts at the
-/// last cleanup in it, and the slope is a least-squares fit. None until those
-/// readings span `DISK_TREND_MIN_SPAN_MS`, so a caller cannot read a rate out
-/// of one build's writing.
+/// last cleanup in it. Trimmed bytes are taken back out of each reading, so a
+/// trim is neither a rise nor a reset: builds still falling under regular
+/// trims keep their rate. The slope is a least-squares fit, and the rate is
+/// None until those readings span `DISK_TREND_MIN_SPAN_MS`, so a caller cannot
+/// read a rate out of one build's writing.
 pub fn disk_trend(conn: &Connection, path: &str) -> Result<Option<DiskTrend>> {
     let newest: Option<i64> = conn.query_row(
         "SELECT MAX(sampled_ms) FROM disk_samples WHERE path=?1",
@@ -742,31 +763,30 @@ pub fn disk_trend(conn: &Connection, path: &str) -> Result<Option<DiskTrend>> {
     let Some(newest) = newest else {
         return Ok(None);
     };
-    // A trim is a reset like a cleanup: readings before it describe a disk
-    // that was not trimmed, so they cannot stand for a rate after it.
-    let last_trim: Option<i64> = conn
-        .query_row(
-            "SELECT last_ms FROM disk_trims WHERE disk_key=?1",
-            [path],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let since = (newest - DISK_TREND_WINDOW_MS).max(last_trim.unwrap_or(i64::MIN));
     let mut statement = conn.prepare(
-        "SELECT sampled_ms,free_bytes FROM disk_samples WHERE path=?1 AND sampled_ms>=?2
-         ORDER BY sampled_ms",
+        "SELECT sampled_ms,free_bytes,trimmed_bytes FROM disk_samples
+         WHERE path=?1 AND sampled_ms>=?2 ORDER BY sampled_ms",
     )?;
-    let readings = statement
-        .query_map(params![path, since], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
+    let samples = statement
+        .query_map(params![path, newest - DISK_TREND_WINDOW_MS], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // (time, free as read, free without the trims behind the reading).
+    let readings: Vec<(i64, i64, i64)> = samples
+        .iter()
+        .map(|&(ms, free, trimmed)| (ms, free, free.saturating_sub(trimmed)))
+        .collect();
     let after_cleanup = readings
         .windows(2)
-        .rposition(|w| w[1].1 >= w[0].1.saturating_add(DISK_CLEANUP_BYTES))
+        .rposition(|w| w[1].2.saturating_sub(w[0].2) >= DISK_CLEANUP_BYTES as i64)
         .map_or(0, |i| i + 1);
     let readings = &readings[after_cleanup..];
-    let (Some(&(from_ms, from_free_bytes)), Some(&(to_ms, to_free_bytes))) =
+    let (Some(&(from_ms, from_free, _)), Some(&(to_ms, to_free, _))) =
         (readings.first(), readings.last())
     else {
         return Ok(None);
@@ -776,18 +796,22 @@ pub fn disk_trend(conn: &Connection, path: &str) -> Result<Option<DiskTrend>> {
     }
     let hours = |ms: i64| (ms - from_ms) as f64 / 3_600_000.0;
     let count = readings.len() as f64;
-    let mean_hours = readings.iter().map(|&(ms, _)| hours(ms)).sum::<f64>() / count;
-    let mean_free = readings.iter().map(|&(_, free)| free as f64).sum::<f64>() / count;
-    let (covariance, variance) = readings.iter().fold((0.0, 0.0), |(c, v), &(ms, free)| {
+    let mean_hours = readings.iter().map(|&(ms, _, _)| hours(ms)).sum::<f64>() / count;
+    let mean_free = readings
+        .iter()
+        .map(|&(_, _, kept)| kept as f64)
+        .sum::<f64>()
+        / count;
+    let (covariance, variance) = readings.iter().fold((0.0, 0.0), |(c, v), &(ms, _, kept)| {
         let x = hours(ms) - mean_hours;
-        (c + x * (free as f64 - mean_free), v + x * x)
+        (c + x * (kept as f64 - mean_free), v + x * x)
     });
     Ok(Some(DiskTrend {
         path: path.to_owned(),
         from_ms,
-        from_free_bytes,
+        from_free_bytes: from_free as u64,
         to_ms,
-        to_free_bytes,
+        to_free_bytes: to_free as u64,
         bytes_per_hour: covariance / variance,
     }))
 }
@@ -989,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trim_restarts_the_trend_so_it_is_not_read_as_a_rise() {
+    fn a_trim_is_neither_a_rise_nor_a_reset_of_the_trend() {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         let hour = 3_600_000;
@@ -1004,11 +1028,48 @@ mod tests {
         note_disk(&conn, "dev:1", 17 * GIB, 3 * hour + hour / 2).unwrap();
         note_disk(&conn, "dev:1", 16 * GIB + GIB / 2, 4 * hour).unwrap();
         let trend = disk_trend(&conn, "dev:1").unwrap().unwrap();
-        // The window starts at the trim, so the trim is not a rise in it.
-        assert_eq!(trend.from_ms, 3 * hour);
-        assert_eq!(trend.from_free_bytes, 17 * GIB + GIB / 2);
-        assert!((trend.bytes_per_hour + GIB as f64).abs() < 1.0);
+        // The window still starts at the first reading: the trim did not reset
+        // it, and the half gibibyte it returned is not a rise.
+        assert_eq!(trend.from_ms, 0);
+        assert_eq!(trend.from_free_bytes, 20 * GIB);
+        assert!((trend.bytes_per_hour + GIB as f64).abs() < 1.0, "{trend:?}");
         assert_eq!(trim_total(&conn, "dev:1").unwrap(), GIB / 2);
+    }
+
+    #[test]
+    fn a_falling_disk_with_regular_trims_still_warns_and_a_trim_does_not_clear_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let hour = 3_600_000;
+        let floor = 2 * GIB;
+        // Builds take two gibibytes an hour. Every hour a trim gives one back,
+        // so the disk reads one gibibyte an hour lower, with a trim each hour.
+        let mut free = 30 * GIB;
+        for step in 0..=72i64 {
+            let ms = step * DISK_SAMPLE_EVERY_MS;
+            if step > 0 {
+                free -= GIB / 6;
+            }
+            if step > 0 && step % 12 == 0 {
+                free += GIB;
+                record_trim(&conn, "dev:1", GIB, free, ms).unwrap();
+            } else {
+                note_disk(&conn, "dev:1", free, ms).unwrap();
+            }
+        }
+        let trend = disk_trend(&conn, "dev:1").unwrap().expect("a rate");
+        // Six hours of readings, none lost to the trims.
+        assert_eq!(trend.from_ms, 0);
+        assert_eq!(trend.to_ms, 6 * hour);
+        assert!(
+            (trend.bytes_per_hour + 2.0 * GIB as f64).abs() < GIB as f64 / 100.0,
+            "{trend:?}"
+        );
+        // Still eleven hours from the floor at the rate that is left after the
+        // trims, so the owner is warned in time, and a raised warning holds.
+        let warning = disk_warning(floor, 24 * 3600, false, &trend).expect("a warning");
+        assert!((warning.hours_to_floor - 11.0).abs() < 0.1, "{warning:?}");
+        assert!(disk_warning(floor, 24 * 3600, true, &trend).is_some());
     }
 
     #[test]

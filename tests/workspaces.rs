@@ -1249,6 +1249,67 @@ fn a_short_disk_trims_released_output_before_it_waits() {
 }
 
 #[test]
+fn a_trim_error_does_not_fail_the_acquire() {
+    let f = Fixture::new();
+    add_task(&f, "three");
+    let stuck = f.acquire("one");
+    let spare = f.acquire("two");
+    build_output(&path(&stuck), MIB as usize);
+    build_output(&path(&spare), 16 * MIB as usize);
+    // A directory in the released output that cannot be read: sizing it fails.
+    let locked = path(&stuck).join("target/locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    f.release(&stuck, false);
+    f.release(&spare, false);
+    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // The floor needs room only the spare's output can give. The trim skips
+    // the unreadable slot, trims the spare, and the acquire goes ahead.
+    f.ok(
+        "resource.configure",
+        json!({"min_free_disk_bytes": free + 8 * MIB}),
+    );
+    let again = f.ok("workspace.acquire", json!({"task_id":"three"}));
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(again["path"].is_string());
+    assert!(!path(&spare).join("target").exists());
+}
+
+#[test]
+fn a_trim_error_does_not_fail_the_job_start() {
+    let f = Fixture::new();
+    add_task(&f, "three");
+    let stuck = f.acquire("one");
+    let spare = f.acquire("two");
+    build_output(&path(&stuck), MIB as usize);
+    build_output(&path(&spare), 16 * MIB as usize);
+    let locked = path(&stuck).join("target/locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    f.release(&stuck, false);
+    f.release(&spare, false);
+    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // The job's declared space does not fit in what is free. The trim skips
+    // the unreadable slot, trims the spare, and the job starts.
+    f.ok(
+        "resource.configure",
+        json!({"min_free_disk_bytes": free + 8 * MIB}),
+    );
+    let started = f.ok(
+        "job.start",
+        json!({"task_id":"three","id":"builds","command":["/bin/true"],"heavy":true,"estimate":{"disk_bytes":MIB}}),
+    );
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_ne!(started["status"], "refused", "{started}");
+    assert!(!path(&spare).join("target").exists());
+    f.wait("builds");
+}
+
+#[test]
 fn trimming_never_touches_a_slot_with_untracked_work() {
     let f = Fixture::new();
     let kept = f.acquire("one");

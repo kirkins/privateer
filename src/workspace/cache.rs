@@ -6,6 +6,7 @@
 //! under `target`, so source, uncommitted and untracked work stay put.
 use super::*;
 use crate::admission;
+use std::{collections::HashSet, os::unix::fs::MetadataExt};
 
 /// The Treehouse pool a trim works on: the helper and repository that list
 /// its slots, and the pool root.
@@ -57,7 +58,8 @@ pub(crate) fn pool_of_home(store: &Store) -> Result<Option<Pool>> {
     }))
 }
 
-/// Slots no task holds, by path.
+/// Slots no task holds and no process is running in, by path. A slot whose
+/// processes cannot be read is not free.
 fn free_slots(lock: &Lock, pool: &Pool) -> Result<Vec<PathBuf>> {
     let mut cmd = Command::new(&pool.binary);
     cmd.current_dir(&pool.git_repo)
@@ -70,21 +72,38 @@ fn free_slots(lock: &Lock, pool: &Pool) -> Result<Vec<PathBuf>> {
     Ok(all
         .iter()
         .filter(|s| s["lease_id"].as_str().is_none_or(str::is_empty))
+        .filter(|s| s["processes"].as_array().is_some_and(Vec::is_empty))
         .filter_map(|s| s["path"].as_str().map(PathBuf::from))
         .collect())
 }
 
-/// Bytes under a path, without following symlinks.
-fn bytes_under(path: &Path) -> Result<u64> {
+/// Disk allocated under a path, without following symlinks. Each file is
+/// counted once however many hard links name it, as the disk counts it: a
+/// build's binaries are hard-linked, and summing their lengths overstates the
+/// space a trim returns.
+fn allocated_under(path: &Path, seen: &mut HashSet<(u64, u64)>) -> Result<u64> {
     let meta = fs::symlink_metadata(path)?;
-    if !meta.is_dir() {
-        return Ok(meta.len());
+    if meta.is_dir() {
+        let mut total = 0;
+        for entry in fs::read_dir(path)? {
+            total += allocated_under(&entry?.path(), seen)?;
+        }
+        return Ok(total);
     }
-    let mut total = 0;
-    for entry in fs::read_dir(path)? {
-        total += bytes_under(&entry?.path())?;
+    if !seen.insert((meta.dev(), meta.ino())) {
+        return Ok(0);
     }
-    Ok(total)
+    Ok(meta.blocks() * 512)
+}
+
+/// A pool's trim failure is audited and the operation that asked for room
+/// goes on: admission decides whether the room is there.
+fn audit_trim_failure(store: &Store, pool: &Pool, error: &anyhow::Error) -> Result<()> {
+    store.audit(
+        "workspace.trim_failed",
+        &json!({"pool": pool.root, "error": format!("{error:#}")}),
+    )?;
+    Ok(())
 }
 
 /// A slot's build output may go only when its worktree is clean and tracks
@@ -97,7 +116,10 @@ fn trimmable(lock: &Lock, slot: &Path) -> bool {
 
 /// Trim released slots of `pool`, least recently released first, until the
 /// pool is within its budget and, when given, `target_free` bytes are free on
-/// its filesystem. Each trim is recorded so no reservation credits it.
+/// its filesystem. A slot that cannot be read or removed is skipped and
+/// audited, so one bad slot does not stop the rest. The trimmed space is
+/// recorded once, as the smaller of what the slots counted and what free
+/// space rose by, so no reservation credits space that was not returned.
 /// Returns the bytes trimmed.
 pub(crate) fn trim(
     store: &Store,
@@ -108,37 +130,64 @@ pub(crate) fn trim(
     let ledger = crate::jobs::shared_ledger(store)?;
     let budget = admission::settings(&ledger)?.workspace_cache_budget_bytes;
     let disk = admission::disk_key(&pool.root)?;
+    let root = fs::canonicalize(&pool.root)?;
     let mut candidates = vec![];
     for slot in free_slots(lock, pool)? {
-        let target = slot.join(TARGET);
+        // The slot must resolve inside the pool, so a link cannot send a
+        // removal elsewhere.
+        let Ok(real) = fs::canonicalize(&slot) else {
+            continue;
+        };
+        if !real.starts_with(&root) {
+            continue;
+        }
+        let target = real.join(TARGET);
         // symlink_metadata: a symlinked target is not a directory to remove.
         if !fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
             continue;
         }
-        let bytes = bytes_under(&target)?;
-        candidates.push((released_ms(store, &slot)?, slot, bytes));
+        match allocated_under(&target, &mut HashSet::new()) {
+            Ok(bytes) => candidates.push((released_ms(store, &slot)?, real, bytes)),
+            Err(error) => audit_skip(store, &slot, &error)?,
+        }
     }
     candidates.sort();
     let mut total: u64 = candidates.iter().map(|c| c.2).sum();
-    let mut freed = 0;
+    let before = admission::disk(&pool.root)?.0;
+    let mut counted = 0;
     for (_, slot, bytes) in candidates {
-        let short = match target_free {
-            Some(want) => admission::disk(&pool.root)?.0 < want,
-            None => false,
-        };
+        // Short is judged on the reading taken before, plus what has been
+        // counted as freed since, not a fresh reading per removal.
+        let short = target_free.is_some_and(|want| before.saturating_add(counted) < want);
         if total <= budget && !short {
             break;
         }
         if !trimmable(lock, &slot) {
             continue;
         }
-        fs::remove_dir_all(slot.join(TARGET))?;
+        if let Err(error) = fs::remove_dir_all(slot.join(TARGET)) {
+            audit_skip(store, &slot, &anyhow::Error::from(error))?;
+            continue;
+        }
         total -= bytes;
-        freed += bytes;
-        let free = admission::disk(&pool.root)?.0;
-        admission::record_trim(&ledger, &disk, bytes, free, Store::now_ms())?;
+        counted += bytes;
     }
+    if counted == 0 {
+        return Ok(0);
+    }
+    let after = admission::disk(&pool.root)?.0;
+    let freed = counted.min(after.saturating_sub(before));
+    admission::record_trim(&ledger, &disk, freed, after, Store::now_ms())?;
     Ok(freed)
+}
+
+/// A slot the trim could not read or clear is left as it is, and audited.
+fn audit_skip(store: &Store, slot: &Path, error: &anyhow::Error) -> Result<()> {
+    store.audit(
+        "workspace.trim_skipped",
+        &json!({"slot": slot, "error": format!("{error:#}")}),
+    )?;
+    Ok(())
 }
 
 /// Before a workspace is allocated: when the pool's filesystem cannot hold
@@ -152,7 +201,9 @@ pub(super) fn make_room(store: &Store, lock: &Lock, pool: &Pool, charter_floor: 
     let available = admission::disk(&pool.root)?.0;
     let needed = floor.saturating_add(crate::jobs::committed_disk_on(&ledger, &key, available)?);
     if available < needed {
-        trim(store, lock, pool, Some(needed))?;
+        if let Err(error) = trim(store, lock, pool, Some(needed)) {
+            audit_trim_failure(store, pool, &error)?;
+        }
     }
     Ok(())
 }
@@ -176,14 +227,6 @@ pub(crate) fn make_room_for_job(
     if admission::disk_key(cwd)? != admission::disk_key(&pool.root)? {
         return Ok(());
     }
-    let own;
-    let lock = match held {
-        Some(lock) => lock,
-        None => {
-            own = Lock::acquire(store)?;
-            &own
-        }
-    };
     let ledger = crate::jobs::shared_ledger(store)?;
     let floor = admission::settings(&ledger)?
         .min_free_disk_bytes
@@ -193,8 +236,35 @@ pub(crate) fn make_room_for_job(
     let needed = floor
         .saturating_add(crate::jobs::committed_disk_on(&ledger, &key, available)?)
         .saturating_add(demand.disk_bytes);
-    if available < needed {
-        trim(store, lock, &pool, Some(needed))?;
+    // The workspace lock is taken only when there is something to trim.
+    if available >= needed {
+        return Ok(());
+    }
+    let trimmed = match held {
+        Some(lock) => trim(store, lock, &pool, Some(needed)),
+        None => Lock::acquire(store).and_then(|own| trim(store, &own, &pool, Some(needed))),
+    };
+    if let Err(error) = trimmed {
+        audit_trim_failure(store, &pool, &error)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hard_linked_file_is_counted_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let one = temp.path().join("one");
+        fs::create_dir(&one).unwrap();
+        fs::write(one.join("binary"), vec![1u8; 256 * 1024]).unwrap();
+        let alone = allocated_under(&one, &mut HashSet::new()).unwrap();
+        // A second name for the same file adds no disk.
+        fs::hard_link(one.join("binary"), one.join("linked")).unwrap();
+        let linked = allocated_under(&one, &mut HashSet::new()).unwrap();
+        assert_eq!(linked, alone);
+        assert!(alone >= 256 * 1024, "{alone}");
+    }
 }

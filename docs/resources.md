@@ -110,10 +110,12 @@ to act. Every job admission and every owner check keeps a free-space reading for
 the filesystem it measured, at most one every five minutes, for seven days, and
 the readings are keyed by filesystem so work anywhere on that disk feeds the same
 series. A falling rate is read from the last twelve hours of readings. The window
-starts at the last cleanup (a rise of a gibibyte or more between two readings)
-or at the last trim of build output (see below), whichever is later. The rate is
-a least-squares fit, and it needs at least an hour of readings after that point,
-so one build's writing cannot read as a machine filling up. When the rate
+starts at the last cleanup: a rise of a gibibyte or more between two readings
+that trims of build output do not explain. Each reading keeps the total trimmed
+so far, and that total is taken back out of it, so a trim is neither a rise nor
+a reset and a build still filling the disk between regular trims keeps its rate.
+The rate is a least-squares fit, and it needs at least an hour of readings after
+that point, so one build's writing cannot read as a machine filling up. When the rate
 would reach the floor within `disk_warn_horizon_secs` (default 24 hours), the
 owner is mailed a notice with the rate and the hours left.
 
@@ -153,13 +155,19 @@ never trimmed, however large its output. Trimming removes only the slot's
 `target` directory, and only from a slot whose worktree is clean and tracks
 nothing under `target`: source, uncommitted work and untracked files stay where
 they are. A slot that does not qualify is skipped, and the next least recently
-released one is tried. A trim that fails is recorded in the audit log and does
-not undo the release.
+released one is tried. Trimming is best effort: a slot that cannot be read or
+cleared, or a Treehouse status that cannot be read, is recorded in the audit log
+and skipped, and the release, workspace allocation or job start that asked for
+room goes on. Admission still decides whether the room is there. A slot is
+trimmed only if its path resolves inside the pool and no process is listed in it.
+Space is sized by the blocks each file occupies, counting a file once however
+many hard links name it, so binaries shared by hard links are not counted twice.
+The trim is recorded as the smaller of that size and the rise in free space.
 
 A trim frees space that the job holding the disk did not write, so the job's
 credit for its declared space is computed as if the trim had not happened. The
-trend the owner sees restarts from the trim, so a trim is not read as a cleanup
-rise or as a fall caused by a job. Setting the budget to 0 keeps no build output
+trend the owner sees takes the trimmed bytes back out of its readings, so a trim
+is not read as a cleanup rise or as a fall caused by a job. Setting the budget to 0 keeps no build output
 in released slots; the next build there starts cold.
 
 ## Limitations
