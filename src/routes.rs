@@ -34,6 +34,12 @@
 //! can be misread, so it is capped at two days; a structured reset (Claude's
 //! `resetsAt`) is trusted up to eight.
 //!
+//! A provider that cannot be reached at all (Pi's `Connection error.`, a
+//! refused or unreachable host, a bad gateway) is an outage like a 503: its
+//! route backs off on the short doubling, so a model served from a machine
+//! that comes and goes, such as a laptop's subscription, is used while it is
+//! up and passed over while it is not.
+//!
 //! A route the captain marks `cost: free` runs on a daily allowance, so a rate
 //! limit or quota on it is that allowance spent, however the provider words it
 //! (OpenCode's free tier says only "Rate limit exceeded"); an outage on it
@@ -353,7 +359,7 @@ fn classify(log: &str) -> Option<RouteFailure> {
         .iter()
         .any(|sign| lower.contains(sign));
     let throttled = free_allowance
-        || ["429", "503", "529"]
+        || ["429", "502", "503", "504", "529"]
             .iter()
             .any(|code| lower.starts_with(code))
         || [
@@ -365,6 +371,15 @@ fn classify(log: &str) -> Option<RouteFailure> {
             "timed out",
             "usage limit",
             "hit your limit",
+            // The provider cannot be reached at all, such as a model served
+            // from a laptop that is asleep: an outage, on the short doubling.
+            "connection error",
+            "connection refused",
+            "econnrefused",
+            "ehostunreach",
+            "enetunreach",
+            "fetch failed",
+            "socket hang up",
         ]
         .iter()
         .any(|sign| lower.contains(sign));
@@ -588,6 +603,16 @@ mod tests {
 
     fn error_log(message: &str) -> String {
         serde_json::to_string(&json!({"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":message}})).unwrap()
+    }
+
+    #[test]
+    fn an_unreachable_provider_backs_its_route_off_as_an_outage() {
+        for text in ["Connection error.", "fetch failed", "502 Bad Gateway"] {
+            let failure = classify(&error_log(text)).unwrap_or_else(|| panic!("{text}"));
+            assert!(!failure.allowance, "{text}");
+            assert_eq!(failure.reset_ms, None, "{text}");
+        }
+        assert!(classify(&error_log("Tool call arguments were invalid")).is_none());
     }
 
     #[test]
