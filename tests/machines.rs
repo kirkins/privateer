@@ -35,7 +35,10 @@ impl Machine {
             .args(args)
             .current_dir(self.folder(ship))
             .env("HOME", &self.root)
-            .env("PATH", "/usr/bin:/bin")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.root.join("bin").display()),
+            )
             .env("PRIVATEER_FLEET", self.registry())
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_SERVICE", "none")
@@ -912,4 +915,171 @@ exec {mac_ssh} \"$@\"
             .any(|s| s["name"] == "bench" && s["created_by"] == "liaison"),
         "{on_mac}"
     );
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Captain",
+            "-c",
+            "user.email=captain@example.com",
+        ])
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", text(&output));
+}
+
+/// A ship with one project cloned from a shared remote, and a harness each
+/// machine has installed.
+fn ship_with_project(laptop: &Machine, mac: &Machine, ship: &str) -> PathBuf {
+    for machine in [laptop, mac] {
+        let bin = machine.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("codex"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let origin = laptop.root.join("charts.git");
+    git(
+        &laptop.root,
+        &[
+            "init",
+            "--quiet",
+            "--bare",
+            "--initial-branch=main",
+            "charts.git",
+        ],
+    );
+    let seed = laptop.root.join("seed");
+    git(
+        &laptop.root,
+        &["clone", "--quiet", origin.to_str().unwrap(), "seed"],
+    );
+    fs::write(seed.join("README"), "charts\n").unwrap();
+    git(&seed, &["add", "README"]);
+    git(&seed, &["commit", "--quiet", "-m", "First chart"]);
+    git(&seed, &["push", "--quiet", "origin", "HEAD:main"]);
+    laptop.ship(ship);
+    let added = laptop.run(ship, &["project", "add", origin.to_str().unwrap()], None);
+    assert!(added.status.success(), "{}", text(&added));
+    laptop.folder(ship).join("projects/charts")
+}
+
+#[test]
+fn an_idle_ship_moves_to_the_other_machine_and_back() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    ship_with_project(&laptop, &mac, "scout");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    laptop.ok(
+        "scout",
+        "note.put",
+        json!({"ship": "scout", "focus": "ship", "body": "Chart the north passage first."}),
+    );
+
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&mac_ssh),
+    );
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    // It lives on the Mac now, beside the Mac's ships, with what it knew, its
+    // charter pointing at its new folder and its project cloned again.
+    let note = mac.ok(
+        "scout",
+        "note.get",
+        json!({"ship": "scout", "focus": "ship"}),
+    );
+    assert!(note.to_string().contains("north passage"), "{note}");
+    let charter = mac.ok("scout", "charter.show", json!({"id": "scout"}));
+    assert_eq!(charter["repo"], json!(mac.folder("scout")), "{charter}");
+    assert_eq!(charter["active"], true, "{charter}");
+    assert!(mac.folder("scout").join("projects/charts/README").is_file());
+    // The laptop's folder is kept but runs nothing, and laptop ships reach
+    // the ship on the Mac.
+    let stale = laptop.run("scout", &["status"], None);
+    assert!(!stale.status.success());
+    assert!(
+        text(&stale).contains("moved to the machine mac"),
+        "{}",
+        text(&stale)
+    );
+    let scout = laptop.ok("liaison", "ship.show", json!({"name": "scout"}));
+    assert_eq!(scout["location"], json!({"peer": "machine-mac"}), "{scout}");
+    let sent = laptop.run(
+        "liaison",
+        &[
+            "mail.send",
+            "--json",
+            &json!({"from": "liaison", "to": "scout", "kind": "notice", "body": "Storm ahead"})
+                .to_string(),
+        ],
+        Some(&mac_ssh),
+    );
+    assert!(sent.status.success(), "{}", text(&sent));
+    assert_eq!(messages(&mac, "scout", "notice").len(), 1);
+
+    // Brought back, it carries the mail it got on the Mac; the laptop's old
+    // folder is set aside, never deleted, and the Mac's copy runs nothing.
+    let back = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--here"],
+        Some(&mac_ssh),
+    );
+    assert!(back.status.success(), "{}", text(&back));
+    let notices = messages(&laptop, "scout", "notice");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["body"], "Storm ahead");
+    let note = laptop.ok(
+        "scout",
+        "note.get",
+        json!({"ship": "scout", "focus": "ship"}),
+    );
+    assert!(note.to_string().contains("north passage"), "{note}");
+    let aside: Vec<_> = fs::read_dir(&laptop.root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("scout.left-"))
+        .collect();
+    assert_eq!(aside.len(), 1);
+    assert!(!mac.run("scout", &["status"], None).status.success());
+    let scout = mac.ok("fitforge", "ship.show", json!({"name": "scout"}));
+    assert_eq!(
+        scout["location"],
+        json!({"peer": "machine-laptop"}),
+        "{scout}"
+    );
+}
+
+#[test]
+fn a_ship_with_unpushed_work_stays_where_it_is() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    let project = ship_with_project(&laptop, &mac, "scout");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    fs::write(project.join("route.txt"), "north\n").unwrap();
+    git(&project, &["add", "route.txt"]);
+    git(&project, &["commit", "--quiet", "-m", "Plot the route"]);
+
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&mac_ssh),
+    );
+    assert!(!moved.status.success());
+    assert!(
+        text(&moved).contains("commits not pushed"),
+        "{}",
+        text(&moved)
+    );
+    // Nothing changed: the ship still runs on the laptop and the Mac never
+    // heard of a new ship.
+    assert!(laptop.run("scout", &["status"], None).status.success());
+    assert!(!mac.folder("scout").exists());
+    let scout = laptop.ok("liaison", "ship.show", json!({"name": "scout"}));
+    assert_eq!(scout["location"], json!({"peer": "fleet-scout"}), "{scout}");
 }
