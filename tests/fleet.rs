@@ -89,6 +89,121 @@ impl Machine {
 }
 
 #[test]
+fn a_request_bound_to_a_stow_ends_when_the_stow_resumes() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    machine.ok(&liaison, &["stow"]);
+    let stow = machine.json(&liaison, "stow.status", json!({}))["stow"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let send = |folder: &Path, id: &str, from: &str, binding: Option<Value>| {
+        let mut payload = json!({});
+        if let Some(depends_on) = binding {
+            payload["depends_on"] = depends_on;
+        }
+        machine.json(
+            folder,
+            "mail.send",
+            json!({"id": id, "from": from, "to": "captain", "kind": "request",
+                "body": "Resume the stow?", "payload": payload}),
+        )
+    };
+    let show = |folder: &Path, id: &str| machine.json(folder, "mail.show", json!({"id": id}));
+    // The captain's mailbox is this home's, so the closing notice is where the
+    // request was written.
+    let notices = |folder: &Path| -> Vec<Value> {
+        machine.json(folder, "mail.inbox", json!({"address": "captain"}))["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["kind"] == "notice")
+            .cloned()
+            .collect()
+    };
+
+    // One request waits for the stow, one is answered, one waits for nothing.
+    let bound = send(&apps, "bound", "apps", Some(json!({"stow": stow})));
+    assert_eq!(bound["state"], "open", "{bound}");
+    assert_eq!(bound["payload"]["depends_on"]["stow"], json!(stow));
+    let answered = send(&apps, "answered", "apps", Some(json!({"stow": stow})));
+    assert_eq!(answered["state"], "open", "{answered}");
+    machine.json(
+        &apps,
+        "mail.send",
+        json!({"id": "answered-by", "from": "captain", "to": "apps", "kind": "reply",
+            "correlation": "answered", "body": "Stow stands."}),
+    );
+    let unbound = send(&apps, "unbound", "apps", None);
+    assert_eq!(unbound["payload"], json!({}), "{unbound}");
+
+    // A binding is explicit: an unknown local stow, or one that has resumed,
+    // is refused rather than guessed at.
+    let unknown = machine.run(
+        &apps,
+        &[
+            "mail.send",
+            "--json",
+            &json!({"id": "unknown-stow", "from": "apps", "to": "captain", "kind": "request",
+            "body": "Which stow?", "payload": {"depends_on": {"stow": "stow-0000000"}}})
+            .to_string(),
+        ],
+    );
+    assert!(!unknown.status.success());
+    assert!(
+        stderr(&unknown).contains("no stow stow-0000000 on this machine"),
+        "{}",
+        stderr(&unknown)
+    );
+    let on_a_notice = machine.run(
+        &apps,
+        &[
+            "mail.send",
+            "--json",
+            &json!({"id": "notice-binding", "from": "apps", "to": "captain", "kind": "notice",
+            "body": "Nothing waits.", "payload": {"depends_on": {"stow": stow}}})
+            .to_string(),
+        ],
+    );
+    assert!(!on_a_notice.status.success());
+    assert!(
+        stderr(&on_a_notice).contains("depends_on applies to requests"),
+        "{}",
+        stderr(&on_a_notice)
+    );
+
+    let out = machine.ok(&liaison, &["stow", "resume"]);
+    assert!(out.contains("ended 1 request(s)"), "{out}");
+
+    // The bound request is withdrawn on the sender's behalf, with its reason.
+    let ended = show(&apps, "bound");
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    let reason = ended["end_reason"].as_str().unwrap();
+    assert!(reason.contains(&format!("stow {stow} on ")), "{ended}");
+    assert!(reason.contains(" resumed at "), "{ended}");
+    let answered = show(&apps, "answered");
+    assert_eq!(answered["state"], "answered", "{answered}");
+    assert_eq!(show(&apps, "unbound")["state"], "open");
+    let closing = notices(&apps);
+    assert_eq!(closing.len(), 1, "{closing:?}");
+    assert_eq!(closing[0]["correlation"], "bound");
+    assert_eq!(closing[0]["body"], reason);
+    assert_eq!(closing[0]["urgency"], "low");
+
+    // A later stow changes nothing about the request that already ended.
+    let resumed = show(&apps, "bound");
+    machine.ok(&liaison, &["stow"]);
+    machine.ok(&liaison, &["stow", "resume"]);
+    assert_eq!(show(&apps, "bound")["ended_ms"], resumed["ended_ms"]);
+    assert_eq!(
+        notices(&apps).len(),
+        1,
+        "a second closing notice was written"
+    );
+}
+
+#[test]
 fn ships_on_one_machine_find_and_mail_each_other() {
     let machine = Machine::new();
     let liaison = machine.ship("liaison");

@@ -39,6 +39,11 @@ Then reply to this request with what you left in flight and what you will do fir
 /// What a resumed ship is told, after the sentence naming this machine.
 const RESUME: &str = "new jobs start again here. Carry on from your notes, and re-queue any checks you cancelled for the stow.";
 
+/// Recently resumed stows one machine reports to another, so a request bound
+/// to a peer's stow learns of its resume on the next exchange. Bounded: the
+/// exchange is a line of JSON in a 1 MiB gateway frame.
+const REPORTED: usize = 20;
+
 /// Who asks: the captain, or the machine's owner, which looks after the
 /// machine and asks in its own words.
 fn asking(store: &Store) -> Option<String> {
@@ -265,6 +270,35 @@ fn send(ship: &Value, by: Option<&str>, mut mail: Value) -> Result<Value> {
     crate::mail::dispatch(&mut home, "mail.send", mail)
 }
 
+/// This machine's stow state, as one exchange carries it to a linked machine:
+/// the stows in force and the ones resumed most recently, bounded. From
+/// records only. `None` when the ledger cannot be read, so the exchange omits
+/// the field rather than claiming no stows.
+pub(crate) fn state(store: &Store) -> Option<Value> {
+    let ledger = crate::jobs::host_ledger(store).ok()?;
+    let read = || -> Result<Value> {
+        let mut active = vec![];
+        let mut statement = ledger
+            .prepare("SELECT id FROM stows WHERE resumed_ms IS NULL ORDER BY started_ms DESC")?;
+        for row in statement.query_map([], |r| r.get::<_, String>(0))? {
+            active.push(json!(row?));
+        }
+        let mut resumed = vec![];
+        let mut statement = ledger.prepare(
+            "SELECT id, resumed_ms FROM stows WHERE resumed_ms IS NOT NULL
+             ORDER BY resumed_ms DESC LIMIT ?1",
+        )?;
+        for row in statement.query_map([REPORTED as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (id, at) = row?;
+            resumed.push(json!({"id": id, "resumed_ms": at}));
+        }
+        Ok(json!({"active": active, "resumed": resumed}))
+    };
+    read().ok()
+}
+
 /// Lift this machine's hold and tell every stowed ship to carry on. The
 /// notice names the machines it can speak for and, for each linked machine it
 /// cannot, says so rather than claiming the whole fleet is running again.
@@ -285,10 +319,30 @@ fn resume_here(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> 
             "only the captain resumes a stow the captain started"
         );
     }
+    let resumed_ms = Store::now_ms();
     ledger.execute(
         "UPDATE stows SET resumed_ms=?2 WHERE id=?1",
-        params![id, Store::now_ms()],
+        params![id, resumed_ms],
     )?;
+    // The hold lifts first, then the requests bound to it end. A request stored
+    // before this point is open and ends here; one stored after is refused,
+    // because the stow is no longer in force. A home that cannot be opened is
+    // skipped and named, as an exchange skips one: its bound requests stay open.
+    let reason = format!("stow {id} on {this} resumed at {resumed_ms}");
+    let mut ended = 0;
+    let mut skipped = vec![];
+    for member in crate::fleet::members(&crate::fleet::registry()?)? {
+        if !member.home.is_dir() {
+            continue;
+        }
+        let Ok(home) = Store::open(&member.home) else {
+            skipped.push(member.home.display().to_string());
+            continue;
+        };
+        ended += crate::mail::end_stow_bound(&home, None, |stow| {
+            (stow == id.as_str()).then(|| reason.clone())
+        })?;
+    }
     let body = resume_text(started_by.as_deref(), &this, holds);
     let mut told = vec![];
     for ship in stow["ships"].as_array().into_iter().flatten() {
@@ -301,8 +355,12 @@ fn resume_here(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> 
         );
         told.push(json!({"ship": name, "told": sent.is_ok()}));
     }
-    store.audit("stow.resume", &json!({"stow": id}))?;
+    store.audit(
+        "stow.resume",
+        &json!({"stow": id, "requests_ended": ended, "homes_skipped": skipped}),
+    )?;
     Ok(json!({"stow": id, "held": false, "this_machine": this,
+        "requests_ended": ended, "homes_skipped": skipped,
         "ships": told, "machines": machines_json(holds)}))
 }
 
