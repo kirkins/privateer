@@ -123,15 +123,15 @@ async function work($, gen) {
   if (!config.hosted || !active || gen !== generation) return;
   const idle = !busy && !paused && !pending && !prepared && !nudge && !offer
     && !(await $.prompt.read()).text.length;
-  let attention = null;
+  let sample = null;
   try {
     const { context } = await $.session.usage();
     if (Number.isFinite(context?.tokens) && context?.window > 0) {
-      attention = { tokens: Math.round(context.tokens), window: context.window };
+      sample = { tokens: Math.round(context.tokens), window: context.window };
     }
   } catch { /* the context reading is optional */ }
   if (!await owned($, gen)) return;
-  const response = await call($, "work.poll", { ship: config.ship, holder: config.holder, idle, attention });
+  const response = await call($, "work.poll", { ship: config.ship, holder: config.holder, idle, attention: sample });
   const next = response?.offer;
   if (!next) return;
   const release = () => call($, "work.release", { ship: config.ship, holder: config.holder, offer_id: next.id });
