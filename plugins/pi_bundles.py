@@ -12,6 +12,8 @@ FLAGS = ["--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
 # Everything the bounded launch passes: the isolation flags, selected skills
 # and the explicit extension paths. Any installed Pi declaring these will do.
 NEEDED = [*FLAGS, "--skill", "-e"]
+# Pi loads its extensions to print plain help, so the probe turns them off.
+HELP = ('--no-extensions', '--help')
 
 
 def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
@@ -70,7 +72,7 @@ def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
         require(not arg.startswith(('-e', '-c', '-r', '-a')))
         clean.append(arg)
         i += 1
-    require_flags(binary, env, cwd, 'Pi', NEEDED)
+    require_flags(binary, env, cwd, 'Pi', NEEDED, help_args=HELP)
     loaded = [argv[0], *FLAGS]
     for item in value['integrations']['extensions']:
         loaded.extend(['-e', item['path']])
