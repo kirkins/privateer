@@ -669,6 +669,37 @@ pub(crate) fn create_linked(name: &str, mut request: Value) -> Result<Value> {
     call(&machine, "ship.create", request, None)
 }
 
+/// The name a machine this one reaches knows this one by.
+pub(crate) fn known_as(conn: &Connection, name: &str) -> Result<String> {
+    identifier(name)?;
+    let machine = machine(conn, name)?;
+    ensure!(
+        machine.role == "collects",
+        "{name} reaches this machine; run this from {name}"
+    );
+    machine.known_as.context("link has no local name")
+}
+
+/// A gateway call to a machine this one reaches. A slow call may take up to
+/// `timeout`, longer than the link's own limit.
+pub(crate) fn call_reached(
+    name: &str,
+    command: &str,
+    args: Value,
+    timeout: Option<Duration>,
+) -> Result<Value> {
+    let conn = crate::fleet::registry()?;
+    known_as(&conn, name)?;
+    let mut machine = machine(&conn, name)?;
+    if let Some(timeout) = timeout {
+        let limit = machine.peer["timeout_ms"]
+            .as_u64()
+            .unwrap_or(LINK_TIMEOUT_MS);
+        machine.peer["timeout_ms"] = json!(limit.max(timeout.as_millis() as u64));
+    }
+    call(&machine, command, args, timeout)
+}
+
 /// Re-exchange directories with one machine this one reaches.
 pub(crate) fn refresh_one(name: &str) -> Result<()> {
     refresh(Some(name)).map(|_| ())
@@ -1079,6 +1110,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let from = reaching_here(&conn, required(args, "from_machine")?)?;
             crate::fleet::create_for_machine(&conn, &from.name, args)
         }
+        // One step of moving a ship to or from this machine.
+        _ if command.starts_with("move.") => crate::moves::serve(command, args),
         // A stow runs under this machine's own ledger, from any home here.
         _ if command.starts_with("stow.") => {
             let home = crate::fleet::members(&conn)?

@@ -69,16 +69,27 @@ pub fn discover_home() -> Option<PathBuf> {
     }
 }
 
+/// The command a harness runs as.
+pub(crate) fn harness_binary(harness: &str) -> Option<&'static str> {
+    HARNESSES
+        .iter()
+        .find(|(_, id)| *id == harness)
+        .map(|(binary, _)| *binary)
+}
+
 fn on_path(binary: &str) -> bool {
+    std::env::var("PATH").is_ok_and(|paths| on_path_in(binary, &paths))
+}
+
+/// Whether `binary` is an executable in one of `paths`' directories.
+pub(crate) fn on_path_in(binary: &str, paths: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            dir.join(binary).is_file()
-                && dir
-                    .join(binary)
-                    .metadata()
-                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-        })
+    std::env::split_paths(paths).any(|dir| {
+        dir.join(binary).is_file()
+            && dir
+                .join(binary)
+                .metadata()
+                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
     })
 }
 
@@ -1273,9 +1284,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
     if verb == "ship" {
         let flags = flags(
             args,
-            &["scope", "folder", "harness", "objective", "machine"],
+            &["scope", "folder", "harness", "objective", "machine", "to"],
         )?;
-        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME";
+        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME | privateer ship move NAME --to MACHINE|--here [--folder PATH]";
         let name = flags.positional.get(1).context(usage)?;
         match flags.positional.first().map(String::as_str) {
             Some("new") => {
@@ -1303,6 +1314,35 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     made["harness"].as_str().unwrap_or(""),
                     made["dispatcher"].as_str().unwrap_or(""),
                     made["folder"].as_str().unwrap_or("")
+                );
+            }
+            Some("move") => {
+                let to = match flags.values.get("to") {
+                    Some(machine) => machine.clone(),
+                    None if flags.switches.iter().any(|s| s == "here") => "here".into(),
+                    None => bail!(usage),
+                };
+                let mut request = json!({"name": name, "to": to});
+                if let Some(folder) = flags.values.get("folder") {
+                    request["folder"] = json!(folder);
+                }
+                let moved = crate::dispatch(&mut store, "ship.move", request)?;
+                println!(
+                    "Aye. {name} moved from {} to {}, now at {}.\n  dispatcher: {}",
+                    moved["from"].as_str().unwrap_or(""),
+                    moved["to"].as_str().unwrap_or(""),
+                    moved["folder"].as_str().unwrap_or(""),
+                    moved["dispatcher"].as_str().unwrap_or("")
+                );
+                for note in moved["notes"].as_array().into_iter().flatten() {
+                    println!("  note: {}", note.as_str().unwrap_or(""));
+                }
+                if let Some(directory) = moved["directory"].as_str() {
+                    println!("  note: {directory}");
+                }
+                println!(
+                    "  its old folder is kept at {}",
+                    moved["folder_kept"].as_str().unwrap_or("")
                 );
             }
             Some("retire") => {

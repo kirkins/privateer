@@ -68,6 +68,7 @@ pub(crate) fn registry() -> Result<Connection> {
     crate::releases::init(&conn)?;
     crate::machines::init(&conn)?;
     crate::grants::init(&conn)?;
+    crate::moves::init(&conn)?;
     Ok(conn)
 }
 

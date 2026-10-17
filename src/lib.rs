@@ -24,6 +24,7 @@ pub mod input;
 pub mod jobs;
 pub mod machines;
 pub mod mail;
+pub mod moves;
 pub mod needs;
 pub mod opencode_mail;
 pub mod peers;
@@ -76,6 +77,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "resource.recover",
     "history.prune",
     "ship.put",
+    "ship.move",
     "permissions.set",
     "bundle.configure",
     "credential.set",
@@ -140,6 +142,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
+        "ship" if command == "ship.move" => moves::dispatch(store, command, args),
         "ship"
             if matches!(
                 command,

@@ -41,6 +41,8 @@ struct Service {
     description: String,
     args: Vec<String>,
     environment: &'static [&'static str],
+    /// A PATH to record instead of this process's own.
+    path: Option<String>,
     log: PathBuf,
     pid: PathBuf,
     /// Text the command line of the detached process must contain.
@@ -65,6 +67,7 @@ fn dispatcher(home: &Path, ship: &str) -> Service {
             "PRIVATEER_FLEET",
             "XDG_STATE_HOME",
         ],
+        path: None,
         log: home.join("serve.log"),
         pid: home.join("serve.pid"),
         marks: vec!["serve".into(), home_text],
@@ -90,6 +93,7 @@ fn door(name: &str) -> Result<Service> {
             "PRIVATEER_PLUGINS",
             "XDG_STATE_HOME",
         ],
+        path: None,
         log: dir.join("supervisor.log"),
         pid: dir.join("supervisor.pid"),
         marks: vec!["door".into(), "run".into(), name.into()],
@@ -171,12 +175,20 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// The value a service records for one environment variable.
+fn recorded(service: &Service, name: &str) -> Option<String> {
+    match (&service.path, name) {
+        (Some(path), "PATH") => Some(path.clone()),
+        _ => std::env::var(name).ok(),
+    }
+}
+
 /// A user service. A service does not see the login shell's PATH, where
 /// harnesses usually live, so it records the current one.
 fn unit(service: &Service, binary: &Path) -> String {
     let mut environment = String::new();
     for name in service.environment {
-        if let Ok(value) = std::env::var(name) {
+        if let Some(value) = recorded(service, name) {
             environment.push_str(&format!(
                 "Environment={}\n",
                 quote(&format!("{name}={value}"))
@@ -224,7 +236,7 @@ fn property_list(service: &Service, binary: &Path) -> String {
     arguments.extend(service.args.iter().map(|a| string(a)));
     let mut environment = String::new();
     for name in service.environment {
-        if let Ok(value) = std::env::var(name) {
+        if let Some(value) = recorded(service, name) {
             environment.push_str(&format!("<key>{name}</key>{}", string(&value)));
         }
     }
@@ -262,6 +274,9 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
     ] {
         command.env_remove(name);
     }
+    if let Some(path) = &service.path {
+        command.env("PATH", path);
+    }
     command
         .args(&service.args)
         .stdin(Stdio::null())
@@ -286,6 +301,14 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
 /// Make sure the ship's dispatcher is running; report how.
 pub fn ensure(home: &Path, ship: &str) -> Result<String> {
     start(&dispatcher(home, ship), &home.join("serve.log"))
+}
+
+/// Start the ship's dispatcher with `path` as its PATH. A process reached
+/// over SSH has a bare PATH that would not find the harness.
+pub(crate) fn ensure_with_path(home: &Path, ship: &str, path: &str) -> Result<String> {
+    let mut service = dispatcher(home, ship);
+    service.path = Some(path.to_owned());
+    start(&service, &home.join("serve.log"))
 }
 
 /// Make sure a front door's supervisor is running; report how.
