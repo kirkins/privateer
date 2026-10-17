@@ -127,6 +127,14 @@ class ClaudeBundles(unittest.TestCase):
         with self.probe():
             self.assertNotIn('--settings', self.preflight(self.plan([])))
 
+    def test_a_large_auto_mode_block_is_carried_and_a_huge_one_refuses(self):
+        rules = {'environment': ['Trusted infrastructure: ' + 'x' * 7000], 'allow': ['git push']}
+        self.settings({'model': 'exact', 'autoMode': rules})
+        self.assertEqual(self.plan()['settings']['autoMode'], rules)
+        self.settings({'model': 'exact', 'autoMode': {'environment': ['x' * 70000]}})
+        with self.assertRaises(ValueError):
+            self.plan()
+
     def test_provider_route_settings_refuse(self):
         plan = self.plan()
         for key in ('env', 'apiKeyHelper', 'awsAuthRefresh', 'forceLoginMethod', 'otelHeadersHelper'):
