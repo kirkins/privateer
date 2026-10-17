@@ -1613,7 +1613,25 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
         .collect();
     let transcripts = place.root.join(".claude/projects").join(folder);
     fs::create_dir_all(&transcripts).unwrap();
-    fs::write(transcripts.join("session.jsonl"), "{}\n").unwrap();
+    // Headless wakes leave transcripts there too; --continue passes over them.
+    fs::write(
+        transcripts.join("wake.jsonl"),
+        "{\"entrypoint\":\"sdk-cli\"}\n",
+    )
+    .unwrap();
+    place.retry_now();
+    place.tick();
+    until("the fresh hosted Claude", || {
+        place.root.join("pi-env").exists()
+    });
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(!argv.lines().any(|a| a == "--continue"), "{argv}");
+    place.stop_native("infra");
+    fs::write(
+        transcripts.join("session.jsonl"),
+        "{\"entrypoint\":\"cli\"}\n",
+    )
+    .unwrap();
     place.retry_now();
     place.tick();
     until("the resumed hosted Claude", || {
