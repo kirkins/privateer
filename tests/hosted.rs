@@ -1702,6 +1702,76 @@ fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
 }
 
 #[test]
+fn a_hosted_ships_crew_on_another_harness_runs_headless_with_a_viewer_space() {
+    let place = Place::new();
+    // A headless Codex crew: one reply, then a completed turn.
+    fs::write(
+        place.root.join("bin/codex"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"t1\"}' \
+         '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"cache fixed\"}}'\n\
+         sleep 1\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        place.root.join("bin/codex"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "task.create",
+        json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
+    );
+    let started = place.agent(
+        "agent.start",
+        json!({"id":"crew-2","task_id":"infra-fix","manifest":"bundled:codex","options":{"model":"m"}}),
+    );
+    // Codex cannot be hosted, so the crew runs headless and a space follows it.
+    assert!(started["hosted"].is_null(), "{started}");
+    assert_eq!(started["viewer"], true, "{started}");
+    let create = &herdr.calls("workspace.create")[0]["params"];
+    assert_eq!(create["label"], "└ infra-fix");
+    assert_eq!(create["focus"], false);
+    assert!(
+        herdr.calls("pane.send_input")[0]["params"]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with(" watch --job crew-2")
+    );
+    until("the crew to finish", || {
+        place.json("job.status", json!({"id":"crew-2"}))["status"] == "succeeded"
+    });
+    // The view reports the crew to Herdr as working, then done.
+    until("the viewer to report the crew done", || {
+        herdr
+            .calls("pane.report_agent")
+            .iter()
+            .any(|r| r["params"]["state"] == "done" && r["params"]["agent"] == "codex")
+    });
+    let titles: Vec<Value> = herdr
+        .calls("pane.report_metadata")
+        .iter()
+        .map(|r| r["params"]["title"].clone())
+        .collect();
+    assert!(
+        titles.contains(&json!("infra crew on infra-fix")),
+        "{titles:?}"
+    );
+}
+
+#[test]
 fn bounded_hosted_crew_plan_retains_its_lifecycle_adapter_without_inheriting_selection() {
     let place = Place::new();
     place.json(

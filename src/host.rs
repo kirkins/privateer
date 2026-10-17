@@ -305,14 +305,23 @@ impl Drop for Lease<'_> {
     }
 }
 
+fn answers() -> bool {
+    socket()
+        .and_then(|s| crate::herdr::Client::connect(&s).ok())
+        .is_some_and(|mut c| c.snapshot().is_ok())
+}
+
 /// Whether a ship's crew run live: its first mate is hosted, its harness can
 /// end a crew when the work settles, and the terminal host answers.
 pub(crate) fn hosts_crew(profile: &Value, harness: &str) -> bool {
-    hosted(profile)
-        && CREW_HARNESSES.contains(&harness)
-        && socket()
-            .and_then(|s| crate::herdr::Client::connect(&s).ok())
-            .is_some_and(|mut c| c.snapshot().is_ok())
+    hosted(profile) && CREW_HARNESSES.contains(&harness) && answers()
+}
+
+/// Whether a hosted ship's crew on another harness get a viewer space. They
+/// run headless, which no folder-trust or setup dialog can stall and whose
+/// end is confirmed from their event stream, and the space follows their log.
+pub(crate) fn views_crew(profile: &Value, harness: &str) -> bool {
+    hosted(profile) && !CREW_HARNESSES.contains(&harness) && answers()
 }
 
 /// Run a crew job's supervisor in its own background space, labelled under
@@ -325,6 +334,41 @@ pub(crate) fn supervise(
     ship: &str,
     cwd: &Path,
 ) -> Result<()> {
+    crew_space(store, job, task, ship, cwd, &[], &["_job-supervise", job])
+}
+
+/// Follow a headless crew job in its own background space under its task:
+/// `privateer watch --job`, which closes the space when the job ends.
+pub(crate) fn view_crew(
+    store: &Store,
+    job: &str,
+    task: &str,
+    ship: &str,
+    cwd: &Path,
+) -> Result<()> {
+    // A first mate starts its crew, but the view belongs to the captain's
+    // terminal: its fixed command only reads records and mails what the
+    // captain types there, so it runs as the operator, not the ship.
+    crew_space(
+        store,
+        job,
+        task,
+        ship,
+        cwd,
+        &[("PRIVATEER_ROLE", "operator")],
+        &["watch", "--job", job],
+    )
+}
+
+fn crew_space(
+    store: &Store,
+    job: &str,
+    task: &str,
+    ship: &str,
+    cwd: &Path,
+    env: &[(&str, &str)],
+    command: &[&str],
+) -> Result<()> {
     let socket = socket().context("no Herdr socket configured")?;
     let mut client = crate::herdr::Client::connect(&socket)?;
     let binary = crate::executable::installed()?;
@@ -333,13 +377,14 @@ pub(crate) fn supervise(
         &format!("└ {task}"),
         &binary,
         store.home(),
-        &[],
-        &["_job-supervise", job],
+        env,
+        command,
     )?;
     settle(store, &mut client, &pane.workspace_id, "crew", ship);
     store.audit(
         "host.crew",
-        &json!({"job_id": job, "task_id": task, "pane": pane.pane_id, "workspace": pane.workspace_id}),
+        &json!({"job_id": job, "task_id": task, "pane": pane.pane_id,
+            "workspace": pane.workspace_id, "viewer": command[0] == "watch"}),
     )?;
     Ok(())
 }
