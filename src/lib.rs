@@ -16,6 +16,7 @@ pub mod door;
 pub mod errand;
 mod executable;
 pub mod fleet;
+pub mod grants;
 pub mod herdr;
 pub mod host;
 pub mod input;
@@ -127,6 +128,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
         "machine" => machines::dispatch(store, command, args),
+        "grant" => grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
