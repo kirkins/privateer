@@ -138,6 +138,8 @@ pub struct Held<'a> {
     /// Bytes trimmed from that filesystem since this job was admitted. A trim
     /// frees space this job did not write, so it is added back to the loss.
     pub disk_trimmed: u64,
+    /// The job this reservation is for.
+    pub job_id: &'a str,
 }
 
 /// What a new job asks for.
@@ -158,6 +160,9 @@ pub struct Request<'a> {
     /// Load the one-minute average still carries from jobs that just ended,
     /// which no longer run (see `released_load`).
     pub released_load: f64,
+    /// The supervised job whose agent started this one, when an agent did.
+    /// That job's reservation is not another job competing for memory.
+    pub started_by: Option<&'a str>,
 }
 
 /// What the one-minute load average still holds of a job that ended
@@ -536,7 +541,12 @@ pub fn admit(
     // estimate keeps big jobs from starting together; it must not keep the
     // only one from starting on a small machine whose person is using it, so
     // a job running alone needs only the floor.
-    let alone = held.iter().all(|h| h.demand.is_none());
+    // The crew that started this job holds its own reservation, which is not
+    // another estimated job competing for memory.
+    let alone = held
+        .iter()
+        .filter(|h| Some(h.job_id) != request.started_by)
+        .all(|h| h.demand.is_none());
     let own = if alone { 0 } else { demand.memory_bytes };
     let left = host.memory_available_bytes as i128 - recent_memory as i128 - own as i128;
     refuse_unless!(
@@ -975,6 +985,7 @@ mod tests {
             disk_available_bytes: 100 * GIB,
             disk_total_bytes: 200 * GIB,
             released_load,
+            started_by: None,
         }
     }
 
@@ -1010,6 +1021,40 @@ mod tests {
     }
 
     #[test]
+    fn a_build_under_its_own_crew_runs_alone_on_the_floor() {
+        let settings = Settings::default();
+        // The crew holds 6 GiB of the 7 GiB free; the build needs 2 GiB more.
+        let host = Host {
+            memory_available_bytes: 7 * GIB,
+            ..host(0.0)
+        };
+        let crew = |job: &'static str| Held {
+            heavy: false,
+            job_id: job,
+            demand: Some(Demand {
+                cpus: 1.0,
+                memory_bytes: 6 * GIB,
+                disk_bytes: 0,
+            }),
+            ..held(0)
+        };
+        let build = Request {
+            started_by: Some("crew-job"),
+            demand: Some(Demand {
+                cpus: 1.0,
+                memory_bytes: 2 * GIB,
+                disk_bytes: 0,
+            }),
+            ..heavy(0.0)
+        };
+        // Its own crew's reservation is not another job: the build runs alone
+        // on the floor, and is admitted.
+        assert!(admit(&settings, &host, 0, &[crew("crew-job")], &build).is_ok());
+        // Another job's crew still counts, so the build waits.
+        assert!(admit(&settings, &host, 0, &[crew("other-job")], &build).is_err());
+    }
+
+    #[test]
     fn released_load_fades_with_the_one_minute_average_and_never_exceeds_it() {
         assert_eq!(released_load(10.0, 14.0, 0), 10.0);
         assert_eq!(released_load(10.0, 4.0, 0), 4.0);
@@ -1033,6 +1078,7 @@ mod tests {
             disk_key: Some("dev:1"),
             disk_free_at_admit: Some(36 * GIB),
             disk_trimmed: 0,
+            job_id: "job",
         }
     }
 

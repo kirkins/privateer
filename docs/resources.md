@@ -66,14 +66,17 @@ build really writes more.
 
 ## Crew memory
 
-Crew (the jobs a first mate starts through `agent.start`, and the errands it
-starts through `errand.start`) reserve memory like any estimated job. A first
-mate's own wake is not crew, and stays outside admission.
+Crew (the jobs a first mate starts through `agent.start`) reserve memory like
+any estimated job. A first mate's own wake, and the errands it starts through
+`errand.start`, are not crew: they stay outside admission. Errands are short
+and the first mate's own, so they do not wait in the capacity queue.
 
 A crew's memory is the first of these that is set:
 
-1. the `memory_bytes` in its route's `options`, which is removed before the
-   harness is launched;
+1. the `memory_bytes` in its chosen route's `options` (or its first mate's
+   profile options), which is removed before the harness is launched. A
+   `memory_bytes` a caller passes in `options` with an explicit manifest, or
+   with no route, is dropped and does not set this figure;
 2. this host's `crew_memory_bytes`, a map from harness id to bytes, set with
    `resource.configure`;
 3. the `memory_bytes` the harness manifest declares;

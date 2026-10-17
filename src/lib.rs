@@ -196,6 +196,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         .ok_or_else(|| anyhow::anyhow!("route must be a route name"))
                 })
                 .transpose()?;
+            // Whether the options are the chosen route's or profile's, so the
+            // memory figure they carry is theirs; caller options never are.
+            let mut route_options = false;
             if charter.get("provider_plugin").is_none_or(Value::is_null)
                 && !workspace::is_wake(store, &args)?
                 && let Some(ship) = owner.as_str()
@@ -224,6 +227,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                             }
                             args["manifest"] = choice.manifest;
                             args["options"] = options;
+                            route_options = true;
                         }
                     }
                 }
@@ -246,6 +250,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     args["manifest"] = profile["manifest"].clone();
                     if args.get("options").is_none() && profile["options"].is_object() {
                         args["options"] = profile["options"].clone();
+                        route_options = true;
                     }
                 }
             }
@@ -320,10 +325,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             drop(execution);
             // A route's memory figure sizes admission; the harness never sees it.
-            let route_memory = args
+            // Only a chosen route or profile may set it: a memory figure the
+            // caller passes with an explicit manifest or no route is dropped,
+            // so a caller cannot shrink its own crew's reservation.
+            let caller_memory = args
                 .get_mut("options")
                 .and_then(Value::as_object_mut)
                 .and_then(|options| options.remove("memory_bytes"));
+            let route_memory = if route_options { caller_memory } else { None };
             let mut plan = plugins::dispatch(store, "plugin.command", args.clone())?;
             if hosted {
                 // The crew extension ends the session when its work settles.
@@ -387,7 +396,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 job["model_route"] = serde_json::json!(route);
             }
             // Crew reserve memory like any estimated job; a first mate's own
-            // wake is not crew and stays outside admission.
+            // wake is not crew and stays outside admission. Errands are wakes
+            // too, so they stay outside admission as well: they are short and
+            // the first mate's own.
             if !workspace::is_wake(store, &args)? {
                 let estimate = jobs::crew_estimate(store, &charter, &args, route_memory)?;
                 job["estimate"] = serde_json::to_value(estimate)?;

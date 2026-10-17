@@ -1950,6 +1950,43 @@ fn bearings_name_the_heavy_job_a_queued_job_waits_behind() {
     ok(&home, "job.cancel", json!({"id":"running"}));
 }
 
+/// A light job that waits for capacity is not called heavy, while bearings
+/// name the holder it waits behind.
+#[test]
+fn a_light_queued_job_is_not_called_heavy_and_waits_behind_any_holder() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    ship(&home, "peer");
+    start(&home, "running", &["sleep", "30"]);
+    wait(&home, "running", &["running"]);
+    // Any load now exceeds the CPU limit, so the estimated light job queues.
+    ok(
+        &home,
+        "resource.configure",
+        json!({"max_load_per_cpu":0.000001}),
+    );
+    let queued = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"light-wait","command":["true"],
+            "heavy":false,"estimate":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0},
+            "wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let bearings = ok(&home, "ship.bearings", json!({"ship":"peer"}));
+    let wait = &bearings["capacity_waits"][0];
+    assert_eq!(wait["id"], "light-wait");
+    assert_eq!(wait["heavy"], false, "{wait}");
+    assert_eq!(wait["behind"]["job_id"], "running");
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("light-wait is waiting behind peer's heavy job running"),
+        "{text}"
+    );
+    ok(&home, "job.cancel", json!({"id":"light-wait"}));
+    ok(&home, "job.cancel", json!({"id":"running"}));
+}
+
 /// A holder that lost its supervisor, kept only escaped descendants, or has
 /// run far past what this work takes here looks unhealthy; ordinary heavy
 /// work does not, however long it has held capacity.

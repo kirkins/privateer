@@ -235,7 +235,7 @@ print(json.dumps({{'type':'agent_settled','aborted':False}}),flush=True)
     // concern, tested apart, so keep it tiny here.
     run(
         "resource.configure",
-        json!({"crew_memory_bytes":{"pi":1u64 << 20}}),
+        json!({"min_available_memory_bytes":0,"crew_memory_bytes":{"pi":1u64 << 20}}),
     );
     let args = json!({"id":"legacy-job","task_id":"task"});
     run("agent.start", args.clone());

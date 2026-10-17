@@ -148,6 +148,9 @@ struct Reservation {
     payload: Option<Process>,
     #[serde(default)]
     charter: Option<String>,
+    /// The supervised job whose agent started this one, when an agent did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_by: Option<String>,
     /// Resolved estimate counted by admission while recently admitted.
     #[serde(default)]
     demand: Option<Demand>,
@@ -753,7 +756,7 @@ pub(crate) fn capacity_waits(store: &Store, ship: &str) -> Result<Vec<Value>> {
                 r.get(0)?,
                 r.get(1)?,
                 r.get(2)?,
-                r.get::<_, Option<i64>>(3)?.is_some(),
+                r.get::<_, Option<bool>>(3)?.unwrap_or(false),
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -762,12 +765,13 @@ pub(crate) fn capacity_waits(store: &Store, ship: &str) -> Result<Vec<Value>> {
     }
     let now = Store::now_ms();
     let holders = capacity_holders(store)?;
-    // The holder a queued job waits behind is the live heavy job that has
-    // held capacity longest; a queue with no live holder is stated as such
-    // rather than blamed on an ordinary job.
+    // The holder a queued job waits behind is the live job, of any kind, that
+    // has held capacity longest: a crew's memory counts as much as a build's.
+    // A queue with no live holder is stated as such rather than blamed on an
+    // ordinary job.
     let waiting_behind = holders
         .iter()
-        .filter(|h| h.live() && h.heavy)
+        .filter(|h| h.live())
         .min_by_key(|h| h.started_ms);
     let mut waits = vec![];
     for (id, task, created_ms, heavy) in queued {
@@ -794,8 +798,9 @@ fn wait_line(id: &str, holder: Option<&Holder>) -> String {
     } else {
         format!("{minutes} minutes")
     };
+    let kind = if holder.heavy { "heavy job" } else { "job" };
     format!(
-        "{id} is waiting behind {ship}'s heavy job {job} (started {age} ago)",
+        "{id} is waiting behind {ship}'s {kind} {job} (started {age} ago)",
         ship = holder.ship,
         job = holder.job_id,
     )
@@ -852,6 +857,7 @@ fn held_view<'a>(conn: &Connection, held: &'a [Reservation]) -> Result<Vec<admis
                 disk_key: r.disk_key.as_deref(),
                 disk_free_at_admit: r.disk_free_bytes,
                 disk_trimmed,
+                job_id: r.job_id.as_str(),
             })
         })
         .collect()
@@ -950,6 +956,7 @@ fn reserve(
                     disk_available_bytes,
                     disk_total_bytes,
                     released_load: released_load(conn, now)?,
+                    started_by: reservation.started_by.as_deref(),
                 },
             )?;
             reservation.disk_trimmed_at_admit = Some(admission::trim_total(conn, &disk_key)?);
@@ -1889,6 +1896,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         supervisor: None,
         payload: None,
         charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
+        started_by: job.started_by.clone(),
         demand: None,
         disk_key: None,
         disk_free_bytes: None,
@@ -2196,6 +2204,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             supervisor: job.supervisor.clone(),
             payload: None,
             charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
+            started_by: job.started_by.clone(),
             demand: None,
             disk_key: None,
             disk_free_bytes: None,

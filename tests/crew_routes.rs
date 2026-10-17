@@ -365,6 +365,42 @@ fn a_crew_manifest_without_a_memory_figure_reserves_the_default() {
     f.json(None, "job.cancel", json!({"id":"crew-holder"}));
 }
 
+/// A memory figure a caller passes with an explicit manifest is not a route's
+/// figure, so it cannot shrink the crew's own reservation.
+#[test]
+fn a_caller_memory_figure_cannot_shrink_an_explicit_manifest_crew() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/codex"), "#!/bin/sh\nsleep 30\n").unwrap();
+    f.json(
+        None,
+        "resource.configure",
+        json!({"crew_memory_bytes":null,"crew_default_memory_bytes":1u64 << 50}),
+    );
+    let dir = f.root.join("custom/codex");
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("manifest.json");
+    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/codex/adapter.py");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"codex","executable":["python3", adapter],
+            "timeout_ms":2000,"max_output_bytes":65536})
+        .to_string(),
+    )
+    .unwrap();
+    // Alone on the host a crew needs only the floor, so it starts; its
+    // reservation is the manifest's default, not the caller's figure.
+    let started = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-explicit","manifest":manifest,
+            "options":{"model":"model-own","memory_bytes":1u64 << 20}}),
+    );
+    assert_eq!(started["id"], "crew-explicit", "{started}");
+    let job = f.json(None, "job.status", json!({"id":"crew-explicit"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 50, "{job}");
+    f.json(None, "job.cancel", json!({"id":"crew-explicit"}));
+}
+
 /// The route's own figure beats this host's setting for its harness, which
 /// beats the manifest's; a request's own memory raises the figure, never
 /// lowers it.

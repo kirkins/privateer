@@ -101,6 +101,12 @@ impl Place {
             binary,
         };
         place.ok(&["init", "--harness", "pi"]);
+        // Crew memory is admission's concern, tested apart: these crews run on
+        // whatever memory the test machine has.
+        place.json(
+            "resource.configure",
+            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
+        );
         let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
         first_mate["host"] = json!("herdr");
         first_mate["batch_secs"] = json!(0);

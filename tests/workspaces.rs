@@ -58,7 +58,7 @@ impl Fixture {
         dispatch(
             &mut store,
             "resource.configure",
-            json!({"crew_default_memory_bytes":1u64 << 20}),
+            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
         )
         .unwrap();
         for task in ["one", "two"] {
