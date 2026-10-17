@@ -928,14 +928,21 @@ impl App {
                 parts[1],
             );
         } else {
+            // Heights are computed explicitly: the fleet box is placed first and keeps
+            // its border, header and at least one ship row even on short terminals,
+            // and the panes below shrink to what remains.
+            let body = rows[1].height;
+            let fleet_h = (self.snapshot.ships.len() as u16 + 3)
+                .min((body / 3).max(4))
+                .min(body);
+            let after_fleet = body - fleet_h;
+            let needs_h = 4.min(after_fleet);
+            let recent_h = (body / 5).max(2).min(after_fleet - needs_h);
             let parts = Layout::vertical([
-                Constraint::Length(
-                    // Border, header and at least one ship row stay visible.
-                    (self.snapshot.ships.len() as u16 + 3).min((rows[1].height / 3).max(4)),
-                ),
-                Constraint::Length(4),
-                Constraint::Min(3),
-                Constraint::Length((rows[1].height / 5).max(2)),
+                Constraint::Length(fleet_h),
+                Constraint::Length(needs_h),
+                Constraint::Min(0),
+                Constraint::Length(recent_h),
             ])
             .split(rows[1]);
             let block =
