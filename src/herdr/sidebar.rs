@@ -76,10 +76,22 @@ pub(super) fn fleet_mates() -> Vec<(String, Binding)> {
     found
 }
 
-pub(crate) fn repair(store: &Store, socket: &Path) -> Result<()> {
+pub(crate) fn repair(store: &Store, socket: &Path) -> Result<Vec<(String, String)>> {
     let mates = mates(store.connection())?;
     if mates.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
-    super::Client::connect(socket)?.arrange_with_mates(&mates)
+    let Some(view) = super::Client::connect(socket)?.arrange_observed_with_mates(&mates)? else {
+        return Ok(vec![]);
+    };
+    Ok(mates
+        .iter()
+        .filter(|(_, binding)| binding.socket == socket)
+        .filter_map(|(ship, binding)| {
+            view.panes
+                .iter()
+                .find(|pane| binding.matches(&view, pane))
+                .map(|pane| (ship.clone(), pane.agent_status.clone()))
+        })
+        .collect())
 }

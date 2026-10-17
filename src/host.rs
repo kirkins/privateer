@@ -17,6 +17,11 @@ pub mod bridge;
 /// How long a launch may take to adopt its lease before it lapses.
 const LAUNCH_TTL_SECS: u64 = 60;
 
+/// Five minutes gives a brief permission/setup prompt or transient status time
+/// to clear without paging, while a pane stuck unable to handle mail is noticed
+/// within one dispatcher cycle plus a short, bounded grace period.
+const BLOCKED_ALERT_AFTER_MS: i64 = 5 * 60 * 1000;
+
 /// Harnesses whose attended adapter starts a turn when mail arrives.
 const LIVE_HARNESSES: &[&str] = &["pi", "pi-signed", "claude"];
 /// Harnesses whose hosted crew end their session when the work settles.
@@ -111,11 +116,85 @@ fn socket() -> Option<PathBuf> {
 }
 
 /// Repair presentation for this dispatcher's live hosted mates, even when
-/// they were opened before workspace metadata existed. Best effort only.
-pub(crate) fn repair(store: &Store) {
+/// they were opened before workspace metadata existed. Return exact-pane
+/// statuses from the same snapshot; presentation and observation are best effort.
+pub(crate) fn repair(store: &Store) -> Vec<(String, String)> {
     if let Some(socket) = socket() {
-        let _ = crate::herdr::sidebar::repair(store, &socket);
+        return crate::herdr::sidebar::repair(store, &socket).unwrap_or_default();
     }
+    vec![]
+}
+
+/// Alert the captain once for each sustained blocked spell. Unknown/missing
+/// observations preserve the current spell; only a known live status clears it.
+pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String)]) -> Result<Value> {
+    let now = Store::now_ms();
+    let tx = store.write_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hosted_block_alerts(
+           ship TEXT PRIMARY KEY, blocked_since_ms INTEGER NOT NULL,
+           alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1))
+         );",
+    )?;
+    // Lease expiry ends custody even if Herdr is unavailable this tick.
+    tx.execute(
+        "DELETE FROM hosted_block_alerts WHERE ship NOT IN
+         (SELECT ship FROM presence WHERE expires_ms>?1 AND holder LIKE 'host:%')",
+        [now],
+    )?;
+    let mut alerts = Vec::new();
+    for (ship, status) in observed {
+        match status.as_str() {
+            "blocked" => {
+                let since: Option<i64> = tx
+                    .query_row(
+                        "SELECT blocked_since_ms FROM hosted_block_alerts WHERE ship=?1",
+                        [ship],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let since = match since {
+                    Some(since) => since,
+                    None => {
+                        tx.execute(
+                            "INSERT INTO hosted_block_alerts(ship,blocked_since_ms,alerted) VALUES(?1,?2,0)",
+                            params![ship, now],
+                        )?;
+                        now
+                    }
+                };
+                let alerted: bool = tx.query_row(
+                    "SELECT alerted FROM hosted_block_alerts WHERE ship=?1",
+                    [ship],
+                    |row| row.get(0),
+                )?;
+                if !alerted && now.saturating_sub(since) >= BLOCKED_ALERT_AFTER_MS {
+                    let id = format!("hosted-blocked-{ship}-{since}");
+                    let body = format!(
+                        "{ship}'s live session is waiting for input in Herdr. Answer the prompt in its pane to resume the first mate."
+                    );
+                    crate::mail::record_captain_notice(
+                        &tx,
+                        ship,
+                        &id,
+                        &body,
+                        json!({"hosted_blocked":ship,"blocked_since_ms":since}),
+                    )?;
+                    tx.execute(
+                        "UPDATE hosted_block_alerts SET alerted=1 WHERE ship=?1",
+                        [ship],
+                    )?;
+                    alerts.push(json!({"ship":ship,"alerted":true}));
+                }
+            }
+            "idle" | "working" | "done" => {
+                tx.execute("DELETE FROM hosted_block_alerts WHERE ship=?1", [ship])?;
+            }
+            _ => {} // unknown status is neither evidence of a block nor a clear
+        }
+    }
+    tx.commit()?;
+    Ok(json!(alerts))
 }
 
 pub(crate) enum Attempt {

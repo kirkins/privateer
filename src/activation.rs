@@ -776,7 +776,9 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let bridge = crate::host::bridge::maintain(store).unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
-    crate::host::repair(store);
+    let hosted_observations = crate::host::repair(store);
+    let hosted_blocked = crate::host::alert_blocked(store, &hosted_observations)
+        .unwrap_or_else(|error| json!({"error": format!("{error:#}")}));
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
@@ -795,7 +797,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 

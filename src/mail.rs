@@ -201,6 +201,29 @@ pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Resul
     Ok(written == 1)
 }
 
+/// Record a bounded runtime alert in the captain's local mailbox, attributed
+/// to the ship whose hosted session needs attention. The caller includes this
+/// write in the same transaction as its one-shot alert state.
+pub(crate) fn record_captain_notice(
+    conn: &rusqlite::Connection,
+    ship: &str,
+    id: &str,
+    body: &str,
+    payload: Value,
+) -> Result<bool> {
+    ensure!(body.len() <= MAX_SCOPE_CHARS, "captain notice is too long");
+    ensure!(
+        payload.is_object(),
+        "captain notice payload must be an object"
+    );
+    let written = conn.execute(
+        "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms)
+         VALUES(?1,?2,'captain','notice',?3,?4,'high',?5) ON CONFLICT(id) DO NOTHING",
+        params![id, ship, body, payload.to_string(), Store::now_ms()],
+    )?;
+    Ok(written == 1)
+}
+
 /// A message by id, for runtime modules that check it against the caller.
 pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
