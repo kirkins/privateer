@@ -1568,11 +1568,21 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
     assert!(error.contains("Yes, I trust this folder"), "{error}");
     assert!(!place.root.join("pi-argv").exists());
 
-    // Trust on a parent folder counts, as it does for Claude.
-    let trust =
-        json!({"projects": {place.root.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
-    fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
-    place.retry_now();
+    // Trust on a folder above is not enough: Claude asks again for a folder
+    // with its own permission rules, which every ship folder has.
+    let trusted = |dir: &Path| {
+        let trust = json!({"projects": {dir.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
+        fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
+        place.retry_now();
+    };
+    trusted(&place.root);
+    assert!(
+        place.tick()["host_error"]
+            .as_str()
+            .unwrap()
+            .contains("Yes, I trust this folder")
+    );
+    trusted(&place.folder);
     place.tick();
     until("the hosted Claude", || place.root.join("pi-env").exists());
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
