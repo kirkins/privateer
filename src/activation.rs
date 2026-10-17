@@ -355,8 +355,9 @@ fn wake_text(
 }
 
 /// Normalize the token usage a harness printed as JSON lines on stdout.
-/// Codex and native guards report per turn (`turn.completed` or a failed
-/// native turn), Claude a cumulative `result`; otherwise use the last object.
+/// Codex and native guards (Pi, Claude, Gemini, Cursor, AGY) report per turn
+/// (`turn.completed` or a failed native turn); an unguarded stream's final
+/// `result` is taken as reported; otherwise use the last object.
 pub(crate) fn usage(log: &str) -> Option<Value> {
     let mut turns: Option<Map<String, Value>> = None;
     let mut result = None;

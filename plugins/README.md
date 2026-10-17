@@ -158,6 +158,16 @@ stream snapshots and Gemini's per-model breakdown do not count twice. These
 checks confirm native invocation completion, not task acceptance or correct
 provider/model routing. Cursor displays model names rather than CLI selectors;
 Gemini may route an `auto` choice. Neither is treated as exact model confirmation.
+
+Claude print runs (`--output-format stream-json`) use the same kind of bridge.
+Hook and rate-limit events may come before or around the turn, so unknown event
+types are passed through. The bridge requires one `system/init` session,
+matching any `--resume` UUID, exactly one `result` for that session with
+`subtype: success` and `is_error: false`, a complete JSONL stream and native exit
+zero; Claude can exit zero after an error result. Its summary converts the
+result's whole-run usage to `input`, `output`, `cacheRead`, `cacheWrite` and
+`totalTokens`. A native permission denial still fails the run and records one
+captain question.
 Interactive launches keep their native terminal behavior.
 
 OMP headless runs use its native RPC interface (`--mode rpc --no-ui`) by
