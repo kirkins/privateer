@@ -667,6 +667,10 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
     assert!(agents.contains("first mate of the Privateer ship **infra-ship**"));
     assert!(agents.contains("Its scope: Deploys and build servers."));
     assert!(agents.contains(&format!("{BIN} --home ")));
+    // Issue 101: a ship that may publish owns its pull requests to merge.
+    assert!(agents.contains("you own your pull requests end to end"));
+    assert!(agents.contains("leave the merge to the captain"));
+    assert!(!agents.contains("You delegate and relay"));
     assert_eq!(
         fs::read_to_string(folder.ship.join("CLAUDE.md")).unwrap(),
         "@AGENTS.md\n"
@@ -925,6 +929,12 @@ fn generated_first_mate_commands_work_from_a_folder_with_shell_metacharacters() 
         "codex",
     ]);
     let text = fs::read_to_string(folder.ship.join("AGENTS.md")).unwrap();
+    // Issue 101: liaison relays; it does not publish or review other ships' code.
+    assert!(
+        text.contains(
+            "You delegate and relay: you do not publish, review or merge other ships' code"
+        )
+    );
     let prefix = text
         .split_once("Run Privateer as `")
         .unwrap()
