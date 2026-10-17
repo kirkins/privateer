@@ -15,7 +15,8 @@ for (const k of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_JOB","PRIVATEER_H
 const run = (args, env = base, input) => execFileSync(cli,args,{cwd:folder,env,input,encoding:"utf8",timeout:10000,maxBuffer:4*1024*1024});
 const call = (name,args={}) => JSON.parse(run(["--home",home,name,"--json",JSON.stringify(args)]));
 let sequence=0, session="native-one", draft="", reject=false, delayed;
-let storeFailure=false;
+let storeFailure=false, later=0;
+const registered=new Set(), reports=[];
 const records=new Map(), rows=new Map(), notices=[], queue=[], timers=new Set();
 const nativeEnv={...base,PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship",PRIVATEER_HOME:home,
   PRIVATEER_CONTROL_CLI:cli,PRIVATEER_PRESENCE_HOLDER:"start:test",PRIVATEER_ATTENDED_HARNESS:"claude"};
@@ -29,14 +30,23 @@ const fire=async(name,e={},bottom=async x=>x)=>{
 };
 const $={
   env:{get:async k=>nativeEnv[k],set:async(k,v)=>{if(v===undefined)delete nativeEnv[k];else nativeEnv[k]=v;}},
-  session:{id:async()=>session,surfaces:async()=>["terminal"],messages:async()=>rows.get(session)??[]},
+  session:{id:async()=>session,surfaces:async()=>["terminal"],messages:async()=>rows.get(session)??[],
+    usage:async()=>({context:{tokens:50000,window:200000}})},
   store:{get:async k=>records.get(k),set:async(k,v)=>{if(storeFailure)throw Error('store unavailable');records.set(k,structuredClone(v));},keys:async()=>[...records.keys()],delete:async k=>records.delete(k)},
   ui:{status:async text=>notices.push(text)},
-  clock:{now:async()=>Date.now(),every:(ms,fn)=>{assert.equal(ms,5000);const t={fn,cancel:()=>timers.delete(t)};timers.add(t);return t;}},
-  command:{register:async spec=>{assert.equal(spec.name,"privateer-mail");assert.equal(spec.immediate,true);}},
+  clock:{now:async()=>Date.now()+later,every:(ms,fn)=>{assert.equal(ms,5000);const t={fn,cancel:()=>timers.delete(t)};timers.add(t);return t;}},
+  command:{register:async spec=>{registered.add(spec.name);if(spec.name==="privateer-mail")assert.equal(spec.immediate,true);}},
   process:{run:async(argv,options)=>{
-    assert.equal(argv[0],cli);assert.equal(options.timeoutMs,3000);
+    assert.equal(argv[0],cli);
+    if(options.env.PRIVATEER_ROLE==="operator"){
+      // A captain command runs as the captain, in the ship folder.
+      assert.equal(options.cwd,folder);
+      try{return {exitCode:0,stdout:run(argv.slice(1),{...nativeEnv,...options.env}),stderr:""};}
+      catch(error){return {exitCode:1,stdout:"",stderr:String(error.stderr)};}
+    }
+    assert.equal(options.timeoutMs,3000);
     assert.deepEqual(options.env,{PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship"});
+    if(argv[3]==="attention.report")reports.push(JSON.parse(argv[5]));
     if(delayed){await delayed;delayed=undefined;}
     return {exitCode:0,stdout:run(argv.slice(1),{...nativeEnv,...options.env}),stderr:""};
   }},
@@ -118,7 +128,30 @@ try {
   await fire("command.run",{command:"privateer-mail",args:"resume"});await flush();assert.equal(queue.length,5);await begin(queue[4].text);await end();
   // New native IDs never borrow another conversation's receipt watermark.
   await fire("session.end",{});session="native-two";await fire("classic.SessionStart",{});await tick();assert.equal(queue.length,6);
-  assert.equal(queue[5].session,"native-two");await begin(queue[5].text);await end();
+  assert.equal(queue[5].session,"native-two");await begin(queue[5].text);await end();await flush();
+  // Each completed turn reports the session's context as the ship's attention.
+  assert.deepEqual(reports.at(-1),{ship:"ship",kind:"turn",tokens:50000,window:200000,holder:"start:test"});
+  // A completed turn that leaves running work unmoved gets one more prompt, once per set.
+  call("task.create",{id:"ship-docs",parent:"ship-duty",owner:"ship",title:"Write the docs"});
+  call("task.update",{id:"ship-docs",actor:"ship",status:"running"});
+  await begin("captain work");await end();await flush();
+  assert.equal(queue.length,7);assert(queue[6].text.startsWith("Before you stop:"));assert(queue[6].text.includes("ship-docs"));
+  await begin(queue[6].text);await end();await flush();assert.equal(queue.length,7,"one nudge per set of idle tasks");
+  call("task.update",{id:"ship-docs",actor:"ship",status:"done"});
+  // The captain's fleet commands run from the keyboard as the captain, never for a plugin or the model.
+  for(const name of ["stow","yolo","afk","back","ships"])assert(registered.has(name),name);
+  const ships=await fire("command.run",{command:"ships",args:"",origin:{kind:"composer"}});
+  assert(ships.text.includes("ship"),ships.text);
+  const refused=await fire("command.run",{command:"yolo",args:"on",origin:{kind:"plugin",name:"other"}});
+  assert(refused.text.includes("captain's keyboard"));assert.equal(call("permissions.show").mode,"standard");
+  assert((await fire("command.run",{command:"back",args:"now",origin:{kind:"composer"}})).text.startsWith("Usage:"));
+  // A hosted session has nobody to resume mail after a native error: it retries a minute later.
+  await fire("session.end",{});nativeEnv.PRIVATEER_HOSTED="1";await load();
+  const hostedStart=queue.length;send();await tick();assert.equal(queue.length,hostedStart+1);
+  await begin(queue.at(-1).text);await end({reason:"error"});send();await tick();assert.equal(queue.length,hostedStart+1);
+  later=61000;await tick();assert.equal(queue.length,hostedStart+2,"hosted mail retries after a minute");
+  await begin(queue.at(-1).text);await end();later=0;
+  await fire("session.end",{});delete nativeEnv.PRIVATEER_HOSTED;await load();
   // Live hooks stay silent only while the mod heartbeat is fresh.
   send();
   assert.equal(run(["hook","claude","Stop"],nativeEnv,'{}'),"");
@@ -126,7 +159,7 @@ try {
   nativeEnv.PRIVATEER_CLAUDE_MAIL_UNTIL=String(Date.now()-1);
   assert(run(["hook","claude","UserPromptSubmit"],nativeEnv,'{}').includes("New mail for ship"));
   // A replaced presence cannot wake, including a probe completing after replace.
-  let release;delayed=new Promise(resolve=>{release=resolve;});
+  await flush();let release;delayed=new Promise(resolve=>{release=resolve;});
   const inFlight=tick();await flush();await fire("session.end",{});release();await inFlight;
   assert.equal(timers.size,0);const count=queue.length;
   call("ship.attend",{ship:"ship",holder:"replacement",ttl_secs:90});
