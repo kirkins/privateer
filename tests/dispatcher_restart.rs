@@ -259,7 +259,12 @@ fn a_lost_supervisor_with_a_live_payload_never_allows_a_duplicate_wake() {
     dispatcher.stop();
     let pid = before["supervisor"]["pid"].as_i64().unwrap() as i32;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    until(|| job(&fleet, &wake)["status"] == "orphaned");
+    // Job reads are read-only now: only the owning home's dispatcher settles a
+    // lost supervisor, so a one-shot maintenance pass observes the orphan.
+    until(|| {
+        fleet.tick();
+        job(&fleet, &wake)["status"] == "orphaned"
+    });
     send(&fleet, "during-outage");
     dispatcher.start();
     thread::sleep(Duration::from_millis(1200));
