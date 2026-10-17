@@ -13,7 +13,6 @@ use std::{
 
 const SOURCE: &str = "privateer-errands";
 const BUDGET: Duration = Duration::from_secs(2);
-const RETRY_MS: i64 = 10_000;
 
 pub(crate) fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -30,15 +29,13 @@ struct Owner {
     binding: String,
 }
 
+/// What this presenter last sent a ship's pane, written before the call, and
+/// whether Herdr confirmed it. An unconfirmed caption is sent again next pass.
 #[derive(Serialize, Deserialize)]
 struct Caption {
     owner: Owner,
-    acknowledged: Option<String>,
-    // Persist uncertainty BEFORE the RPC. If the process dies after delivery but
-    // before acknowledgement, a later settle must still clear the source.
-    dirty: bool,
-    attempted: Option<String>,
-    retry_ms: i64,
+    sent: Option<String>,
+    delivered: bool,
 }
 
 struct Target {
@@ -100,15 +97,13 @@ fn target(store: &Store, ship: &str) -> Result<Option<Target>> {
     // Captions are observational, but they still describe a live first mate.
     // Use the same effective task authority check as a launch: the duty task
     // must be nonterminal, owned by this ship, under open ancestors, and on an
-    // active charter. This read happens under each transaction observation in
-    // reconcile_one; it does not launch or mutate anything.
+    // active charter. This read happens inside plan(); it does not launch or
+    // mutate anything.
     let active = store.task(duty).is_ok_and(|task| task["owner"] == ship)
         && store.active_charter(duty).is_ok();
-    let eligible = expires > Store::now_ms()
-        && active
-        && first["host"] == "herdr"
+    let eligible = active
+        && crate::host::hosted(first)
         && first.get("config").is_none()
-        && matches!(owner.harness.as_str(), "pi" | "pi-signed")
         && native.as_deref() == Some(owner.harness.as_str());
     Ok(Some(Target {
         owner,
@@ -133,21 +128,19 @@ fn text(value: &str, limit: usize) -> String {
 }
 
 fn desired(store: &Store, ship: &str) -> Result<Option<String>> {
-    let first: Option<String> = store.connection().query_row(
-        "SELECT focus FROM errands WHERE ship=?1 AND status='running' ORDER BY created_ms,id LIMIT 1",
-        [ship], |r| r.get(0),
-    ).optional()?;
-    let Some(focus) = first else { return Ok(None) };
-    let count: i64 = store.connection().query_row(
-        "SELECT COUNT(*) FROM errands WHERE ship=?1 AND status='running'",
-        [ship],
-        |r| r.get(0),
+    let mut query = store.connection().prepare(
+        "SELECT focus FROM errands WHERE ship=?1 AND status='running' ORDER BY created_ms,id",
     )?;
+    let focuses = query
+        .query_map([ship], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let Some(focus) = focuses.first() else {
+        return Ok(None);
+    };
     let focus = focus.split_once(':').map_or(focus.as_str(), |(_, id)| id);
-    let more = match count {
-        0 | 1 => String::new(),
-        2..=1000 => format!(" +{}", count - 1),
-        _ => " +999+".into(),
+    let more = match focuses.len() {
+        1 => String::new(),
+        n => format!(" +{}", n - 1),
     };
     Ok(Some(format!(
         "{} · reviewing {}{}",
@@ -175,9 +168,8 @@ fn discard(store: &Store, ship: &str) -> Result<()> {
 
 /// Called after start/settle and on every tick. Refusals never break errands.
 /// A nonblocking per-home lock serializes presenters (including other CLI
-/// processes); short SQLite lock acquisition bounds contention. The write lock
-/// across snapshot/report prevents a concurrent finish/rebind from replaying an
-/// older caption after its newer clear. Each RPC retains Client's 800ms bound.
+/// processes); short SQLite lock acquisition bounds contention. Herdr calls run
+/// outside any transaction, so they never hold the home's write lock.
 pub(crate) fn reconcile(store: &Store) {
     let run = || -> Result<()> {
         let lock = std::fs::OpenOptions::new()
@@ -208,111 +200,110 @@ pub(crate) fn reconcile(store: &Store) {
     };
     // Restore even after failure. This is this Store's private connection, not a
     // fleet connection; no foreign home is opened or repaired.
-    if store
-        .connection()
-        .busy_timeout(Duration::from_millis(25))
-        .is_ok()
-    {
+    let conn = store.connection();
+    let previous = conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0));
+    if conn.busy_timeout(Duration::from_millis(25)).is_ok() {
         let _ = run();
-        let _ = store.connection().busy_timeout(Duration::from_secs(10));
+    }
+    if let Ok(previous) = previous {
+        let _ = conn.busy_timeout(Duration::from_millis(previous as u64));
     }
 }
 
+/// What one pass decided. Only `Publish` sends a caption to Herdr.
+enum Step {
+    Done,
+    Verify(Target),
+    Publish(Target, Option<String>),
+}
+
 fn reconcile_one(store: &Store, ship: &str) -> Result<()> {
-    // Mark delivery uncertainty durably before I/O. The next transaction reads
-    // current lifecycle/lease facts again, never replays a stored desired label.
-    {
-        let tx = store.write_transaction()?;
-        let current = target(store, ship).ok().flatten();
-        let Some(current) = current else {
-            discard(store, ship)?;
-            tx.commit()?;
-            return Ok(());
-        };
-        let raw: Option<String> = tx
-            .query_row(
-                "SELECT record FROM errand_captions WHERE ship=?1",
-                [ship],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let cached = raw
-            .and_then(|raw| serde_json::from_str::<Caption>(&raw).ok())
-            .filter(|cached| cached.owner == current.owner);
-        let want = if current.eligible {
-            desired(store, ship)?
-        } else {
-            None
-        };
-        if cached.is_none() && want.is_none() {
-            discard(store, ship)?;
-            tx.commit()?;
-            return Ok(());
-        }
-        let mut caption = cached.unwrap_or(Caption {
-            owner: current.owner.clone(),
-            acknowledged: None,
-            dirty: false,
-            attempted: None,
-            retry_ms: 0,
-        });
-        if !caption.dirty && caption.acknowledged == want {
+    match plan(store, ship)? {
+        Step::Done => Ok(()),
+        // An unchanged caption only re-checks its endpoint; refusal drops custody.
+        Step::Verify(current) => {
             if matches!(validated_client(store, &current), Err(PublishError::Unsafe)) {
                 discard(store, ship)?;
             }
-            tx.commit()?;
-            return Ok(());
+            Ok(())
         }
-        if caption.attempted == want && caption.retry_ms > Store::now_ms() {
-            if matches!(validated_client(store, &current), Err(PublishError::Unsafe)) {
-                discard(store, ship)?;
-            }
-            tx.commit()?;
-            return Ok(());
+        Step::Publish(current, want) => {
+            let result = publish(store, &current, want.as_deref());
+            record(store, ship, &current.owner, want, result)
         }
-        caption.dirty = true;
-        caption.attempted = want;
-        caption.retry_ms = Store::now_ms() + RETRY_MS;
-        save(store, ship, &caption)?;
-        tx.commit()?;
     }
+}
+
+/// Decide from current lifecycle and lease facts, never a stored label, and
+/// record the caption as sent before the call: a process that dies mid-call
+/// leaves it unconfirmed, so a later pass still clears or resends it.
+fn plan(store: &Store, ship: &str) -> Result<Step> {
     let tx = store.write_transaction()?;
-    let current = target(store, ship).ok().flatten();
-    let Some(current) = current else {
+    let Some(current) = target(store, ship).ok().flatten() else {
         discard(store, ship)?;
         tx.commit()?;
-        return Ok(());
+        return Ok(Step::Done);
     };
-    let raw: String = tx.query_row(
-        "SELECT record FROM errand_captions WHERE ship=?1",
-        [ship],
-        |r| r.get(0),
-    )?;
-    let mut caption: Caption = serde_json::from_str(&raw)?;
-    if caption.owner != current.owner {
-        discard(store, ship)?;
-        tx.commit()?;
-        return Ok(());
-    }
+    let cached = tx
+        .query_row(
+            "SELECT record FROM errand_captions WHERE ship=?1",
+            [ship],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|raw| serde_json::from_str::<Caption>(&raw).ok())
+        .filter(|cached| cached.owner == current.owner);
     let want = if current.eligible {
         desired(store, ship)?
     } else {
         None
     };
-    let result = publish(store, &current, want.as_deref());
+    let step = match cached {
+        None if want.is_none() => {
+            discard(store, ship)?;
+            Step::Done
+        }
+        Some(cached) if cached.delivered && cached.sent == want => Step::Verify(current),
+        _ => {
+            let caption = Caption {
+                owner: current.owner.clone(),
+                sent: want.clone(),
+                delivered: false,
+            };
+            save(store, ship, &caption)?;
+            Step::Publish(current, want)
+        }
+    };
+    tx.commit()?;
+    Ok(step)
+}
+
+/// Confirm a delivered caption only while the endpoint still belongs to the
+/// same owner. A finish during the call is caught by the next pass, which
+/// recomputes the caption; a rebind or refusal drops custody.
+fn record(
+    store: &Store,
+    ship: &str,
+    owner: &Owner,
+    sent: Option<String>,
+    result: std::result::Result<(), PublishError>,
+) -> Result<()> {
+    let tx = store.write_transaction()?;
+    let live = target(store, ship)
+        .ok()
+        .flatten()
+        .is_some_and(|current| current.owner == *owner);
     match result {
-        Ok(()) if want.is_none() => discard(store, ship)?,
-        Ok(()) => {
-            caption.acknowledged = want;
-            caption.dirty = false;
-            caption.retry_ms = 0;
+        Ok(()) if live && sent.is_some() => {
+            let caption = Caption {
+                owner: owner.clone(),
+                sent,
+                delivered: true,
+            };
             save(store, ship, &caption)?;
         }
-        Err(PublishError::Unsafe) => discard(store, ship)?,
-        Err(PublishError::Unavailable) => {
-            caption.attempted = want;
-            save(store, ship, &caption)?;
-        }
+        Err(PublishError::Unavailable) if live => {}
+        _ => discard(store, ship)?,
     }
     tx.commit()?;
     Ok(())
@@ -336,42 +327,21 @@ fn validated_client(store: &Store, target: &Target) -> std::result::Result<Clien
     }
     let view = client.snapshot().map_err(|_| PublishError::Unavailable)?;
     let validate = || -> Result<()> {
-        let panes: Vec<_> = view
+        // The snapshot already refuses duplicate pane and terminal identities.
+        let pane = view
             .panes
             .iter()
-            .filter(|p| p.pane_id == binding.pane.pane_id)
-            .collect();
-        ensure!(panes.len() == 1, "missing or ambiguous pane");
-        let pane = panes[0];
+            .find(|p| p.pane_id == binding.pane.pane_id)
+            .ok_or_else(|| anyhow::anyhow!("missing pane"))?;
         ensure!(binding.matches(&view, pane), "endpoint replaced");
-        ensure!(
-            !pane.workspace_id.is_empty() && !pane.tab_id.is_empty(),
-            "incomplete endpoint"
-        );
         ensure!(
             pane.agent
                 .as_deref()
                 .is_none_or(|a| a == target.owner.harness),
             "incompatible occupant"
         );
-        ensure!(
-            binding
-                .pane
-                .agent
-                .as_deref()
-                .is_none_or(|a| a == target.owner.harness),
-            "incompatible bound occupant"
-        );
-        // Refuse duplicate terminal identities and any second local presence
-        // claiming this endpoint, even if its display labels look convincing.
-        ensure!(
-            view.panes
-                .iter()
-                .filter(|p| p.terminal_id == pane.terminal_id)
-                .count()
-                == 1,
-            "ambiguous terminal"
-        );
+        // Refuse any second local presence claiming this endpoint, even if its
+        // display labels look convincing.
         let mut query = store
             .connection()
             .prepare("SELECT binding FROM presence WHERE binding IS NOT NULL")?;
@@ -401,8 +371,7 @@ fn publish(
 ) -> std::result::Result<(), PublishError> {
     let binding = &target.binding;
     let mut client = validated_client(store, target)?;
-    // A snapshot may consume most of its deadline. Holding the SQLite lock
-    // pins recorded ownership, not the wall clock: do not publish after expiry.
+    // A snapshot may consume most of its deadline: never publish after expiry.
     if target.expires_ms <= Store::now_ms() {
         return Err(PublishError::Unsafe);
     }

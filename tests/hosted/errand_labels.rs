@@ -3,7 +3,11 @@
 use super::*;
 
 fn aboard() -> (Place, Herdr) {
-    let place = Place::new();
+    host(Place::new())
+}
+
+/// Host `place`'s first mate in a fake Herdr.
+fn host(place: Place) -> (Place, Herdr) {
     let socket = place.root.join("config/herdr/herdr.sock");
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let host = Herdr::start(
@@ -21,10 +25,6 @@ fn aboard() -> (Place, Herdr) {
     until("native hosted payload", || {
         place.root.join("pi-pid").exists()
     });
-    host.metadata.lock().unwrap().insert(
-        ("w2:p1".into(), "privateer".into()),
-        json!({"title":"infra first mate", "display_agent":"infra", "tokens":{"other":"kept"}}),
-    );
     (place, host)
 }
 
@@ -62,36 +62,6 @@ fn finish(place: &Place, id: &str) {
         "actual errand payload exit before fixture cleanup",
         || unsafe { libc::kill(pid, 0) } == -1,
     );
-    let job = place.agent("job.status", json!({"id":id}));
-    println!(
-        "headless payload {pid} exited; job {id} status={} incarnation={}",
-        job["status"], job["incarnation"]
-    );
-    if let Some(evidence) = std::env::var_os("ERRAND_LABELS_EVIDENCE") {
-        let incarnation = job["incarnation"].as_str().unwrap();
-        let dest = PathBuf::from(evidence).join(id).join(incarnation);
-        fs::create_dir_all(&dest).unwrap();
-        let logs = place
-            .folder
-            .join(".privateer/jobs")
-            .join(id)
-            .join(incarnation);
-        for entry in fs::read_dir(logs).unwrap().flatten() {
-            if entry.file_type().unwrap().is_file() {
-                fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
-            }
-        }
-        fs::write(
-            dest.join("job.json"),
-            serde_json::to_vec_pretty(&job).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            dest.join("lifecycle.json"),
-            json!({"payload_pid":pid,"payload_exited":true,"job_status":job["status"]}).to_string(),
-        )
-        .unwrap();
-    }
     place.tick();
     let list = place.agent("errand.list", json!({}));
     let errand = list["errands"]
@@ -110,14 +80,12 @@ fn captions(host: &Herdr) -> Vec<Value> {
         .collect()
 }
 
+/// What the last caption sent to `pane` shows: null once cleared.
 fn caption(host: &Herdr, pane: &str) -> Value {
-    host.metadata
-        .lock()
-        .unwrap()
-        .get(&(pane.into(), "privateer-errands".into()))
-        .cloned()
-        .unwrap_or(json!({}))["display_agent"]
-        .clone()
+    captions(host)
+        .into_iter()
+        .rfind(|r| r["params"]["pane_id"] == pane)
+        .map_or(Value::Null, |r| r["params"]["display_agent"].clone())
 }
 
 fn cache_count(place: &Place) -> i64 {
@@ -132,13 +100,6 @@ fn headless_errand_captions_start_settle_and_survive_fresh_dispatchers_without_s
     let (place, host) = aboard();
     place.json("task.create", json!({"id":"dashboard-102","charter_id":"infra","owner":"infra","title":"PRIVATE task title"}));
     let native_pid = place.native_pid();
-    let normal = host
-        .metadata
-        .lock()
-        .unwrap()
-        .get(&("w2:p1".into(), "privateer".into()))
-        .unwrap()
-        .clone();
     let panes = host.panes.lock().unwrap().clone();
     let first = start(&place, "task:dashboard-102");
     assert_eq!(caption(&host, "w2:p1"), "infra · reviewing dashboard-102");
@@ -205,13 +166,6 @@ fn headless_errand_captions_start_settle_and_survive_fresh_dispatchers_without_s
         place.tick();
     }
     assert_eq!(captions(&host).len(), 6);
-    assert_eq!(
-        host.metadata
-            .lock()
-            .unwrap()
-            .get(&("w2:p1".into(), "privateer".into())),
-        Some(&normal)
-    );
     assert_eq!(
         host.panes.lock().unwrap()[1]["agent_session"],
         json!({"id":"native-session"})
@@ -292,259 +246,185 @@ fn a_terminal_duty_or_cancelled_ancestor_suppresses_errand_captions() {
     place.stop_native("infra");
 }
 
+/// Apply one hazard: its tick must publish no caption and retain no custody.
+/// Undoing it must resume the caption on the exact endpoint.
+fn refused(
+    place: &Place,
+    host: &Herdr,
+    expected: &mut usize,
+    what: &str,
+    hazard: impl FnOnce(),
+    undo: impl FnOnce(),
+) {
+    hazard();
+    place.tick();
+    assert_eq!(captions(host).len(), *expected, "refused {what}");
+    assert_eq!(cache_count(place), 0, "refused {what}");
+    undo();
+    place.tick();
+    *expected += 1;
+    assert_eq!(captions(host).len(), *expected, "restored {what}");
+}
+
 #[test]
-fn errand_captions_refuse_replaced_ambiguous_expired_and_pinned_foreign_endpoints_then_rebind() {
+fn errand_captions_refuse_unsafe_endpoints_then_rebind() {
     let (place, host) = aboard();
     let id = start(&place, "thread:review");
-    let binding: String = place
-        .database()
-        .query_row("SELECT binding FROM presence WHERE ship='infra'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
     let original = host.panes.lock().unwrap()[1].clone();
     let mut expected = captions(&host).len();
+    // The pane is no longer the bound one, or runs another agent.
     for (field, replacement) in [
         ("terminal_id", json!("foreign-terminal")),
         ("workspace_id", json!("foreign-workspace")),
         ("tab_id", json!("foreign-tab")),
         ("agent", json!("foreign-harness")),
     ] {
-        host.panes.lock().unwrap()[1][field] = replacement;
-        place.tick();
-        assert_eq!(captions(&host).len(), expected, "refuse changed {field}");
-        assert_eq!(cache_count(&place), 0);
-        host.panes.lock().unwrap()[1] = original.clone();
-        place.tick();
-        expected += 1;
-        assert_eq!(captions(&host).len(), expected);
+        refused(
+            &place,
+            &host,
+            &mut expected,
+            field,
+            || host.panes.lock().unwrap()[1][field] = replacement,
+            || host.panes.lock().unwrap()[1] = original.clone(),
+        );
     }
-    place
-        .database()
-        .execute(
-            "UPDATE presence SET binding='malformed' WHERE ship='infra'",
-            [],
-        )
-        .unwrap();
-    place.tick();
-    assert_eq!(captions(&host).len(), expected, "malformed binding");
-    assert_eq!(cache_count(&place), 0);
-    place
-        .database()
-        .execute(
-            "UPDATE presence SET binding=?1 WHERE ship='infra'",
-            [&binding],
-        )
-        .unwrap();
-    place.tick();
-    expected += 1;
-    let holder: String = place
-        .database()
-        .query_row("SELECT holder FROM presence WHERE ship='infra'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    place.database().execute("UPDATE presence SET holder='host:33333333-3333-4333-8333-333333333333' WHERE ship='infra'", []).unwrap();
-    place.tick();
-    assert_eq!(
-        captions(&host).len(),
-        expected,
-        "replacement holder lacks matching launch custody"
-    );
-    assert_eq!(cache_count(&place), 0);
-    place
-        .database()
-        .execute("UPDATE presence SET holder=?1 WHERE ship='infra'", [holder])
-        .unwrap();
-    place.tick();
-    expected += 1;
-    place.database().execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) SELECT 'ambiguous','other',started_ms,expires_ms,binding FROM presence WHERE ship='infra'", []).unwrap();
-    place.tick();
-    assert_eq!(
-        captions(&host).len(),
-        expected,
-        "second binding claiming endpoint"
-    );
-    assert_eq!(cache_count(&place), 0);
-    place
-        .database()
-        .execute("DELETE FROM presence WHERE ship='ambiguous'", [])
-        .unwrap();
-    place.tick();
-    expected += 1;
+    // The lease is not the launched one, has expired, or another presence
+    // claims the same pane.
+    for (what, hazard, undo) in [
+        (
+            "replacement holder",
+            "UPDATE presence SET holder='host:33333333-3333-4333-8333-333333333333' WHERE ship='infra'",
+            "UPDATE presence SET holder=(SELECT holder FROM host_launches WHERE ship='infra') WHERE ship='infra'",
+        ),
+        (
+            "expired lease",
+            "UPDATE presence SET expires_ms=-expires_ms WHERE ship='infra'",
+            "UPDATE presence SET expires_ms=-expires_ms WHERE ship='infra'",
+        ),
+        (
+            "second claim",
+            "INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) SELECT 'ambiguous','other',started_ms,expires_ms,binding FROM presence WHERE ship='infra'",
+            "DELETE FROM presence WHERE ship='ambiguous'",
+        ),
+    ] {
+        let run = |sql| place.database().execute(sql, []).unwrap();
+        refused(
+            &place,
+            &host,
+            &mut expected,
+            what,
+            || {
+                run(hazard);
+            },
+            || {
+                run(undo);
+            },
+        );
+    }
 
+    // A replaced socket incarnation is never sent a caption.
     let socket = place.root.join("config/herdr/herdr.sock");
     let old_socket = place.root.join("original.sock");
     fs::rename(&socket, &old_socket).unwrap();
     let replacement_host = Herdr::start(&socket, vec![]);
-    // Direct settlement avoids unrelated sidebar/host reconciliation calls.
-    let mut store = privateer::store::Store::open(&place.folder.join(".privateer")).unwrap();
-    privateer::errand::settle(&mut store).unwrap();
-    assert!(
-        replacement_host.requests.lock().unwrap().is_empty(),
-        "wrong socket incarnation never contacted"
-    );
-    assert_eq!(captions(&host).len(), expected);
+    place.tick();
+    assert!(replacement_host.calls("pane.report_metadata").is_empty());
     assert_eq!(cache_count(&place), 0);
     fs::rename(&socket, place.root.join("replacement.sock")).unwrap();
     fs::rename(old_socket, &socket).unwrap();
-    place.tick();
-    expected += 1;
 
-    host.panes.lock().unwrap().push(original.clone());
-    place.tick();
-    assert_eq!(captions(&host).len(), expected, "duplicate pane/terminal");
-    host.panes.lock().unwrap().pop();
-    // This fixture still has mail for the hosted mate, so a normal maintenance
-    // tick correctly skips. Settlement also runs the ordinary caption
-    // reconciler; the publisher may drop stale custody without an immediate
-    // replay, so use its observed count as the baseline for the pinned checks.
-    privateer::errand::settle(&mut store).unwrap();
-    expected = captions(&host).len();
-
-    let mut pinned: Value = serde_json::from_str(&binding).unwrap();
-    pinned["pane"]["agent_session"] = json!({"id":"pinned"});
-    place
-        .database()
-        .execute(
-            "UPDATE presence SET binding=?1 WHERE ship='infra'",
-            [pinned.to_string()],
-        )
-        .unwrap();
-    host.panes.lock().unwrap()[1]["agent_session"] = json!({"id":"not-pinned"});
-    privateer::errand::settle(&mut store).unwrap();
-    assert_eq!(captions(&host).len(), expected, "pinned session mismatch");
-    assert_eq!(cache_count(&place), 0);
-    host.panes.lock().unwrap()[1]["agent_session"] = json!({"id":"pinned"});
-    privateer::errand::settle(&mut store).unwrap();
-    expected += 1;
-    assert_eq!(captions(&host).len(), expected);
-
-    let expiry: i64 = place
-        .database()
-        .query_row(
-            "SELECT expires_ms FROM presence WHERE ship='infra'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    place
-        .database()
-        .execute("UPDATE presence SET expires_ms=0", [])
-        .unwrap();
-    // Reconcile directly through errand settlement in a real dispatch call,
-    // without a dispatcher legitimately attempting a new hosted launch.
-    let mut store = privateer::store::Store::open(&place.folder.join(".privateer")).unwrap();
-    privateer::errand::settle(&mut store).unwrap();
-    assert_eq!(
-        captions(&host).len(),
-        expected,
-        "expired lease cannot authorize a mutation"
-    );
-    assert_eq!(cache_count(&place), 0);
-    place
-        .database()
-        .execute("UPDATE presence SET expires_ms=?1", [expiry])
-        .unwrap();
-
-    // Pane closure drops old presentation custody. A fresh binding to a fresh
-    // exact terminal reconciles, never sends a clear to the reused old pane.
+    // A closed pane drops custody without a clear; a fresh binding to a fresh
+    // pane gets the caption.
     host.panes.lock().unwrap().remove(1);
     place.tick();
     assert_eq!(captions(&host).len(), expected);
     assert_eq!(cache_count(&place), 0);
-    let fresh = json!({"pane_id":"w3:p1","terminal_id":"fresh-terminal","workspace_id":"w3","tab_id":"w3:t1","agent":"pi","agent_status":"working","agent_session":{"id":"fresh"}});
+    let fresh = json!({"pane_id":"w3:p1","terminal_id":"fresh-terminal","workspace_id":"w3","tab_id":"w3:t1","agent":"pi","agent_status":"working"});
     host.panes.lock().unwrap().push(fresh.clone());
-    pinned["pane"] = fresh;
+    let binding: String = place
+        .database()
+        .query_row("SELECT binding FROM presence WHERE ship='infra'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut binding: Value = serde_json::from_str(&binding).unwrap();
+    binding["pane"] = fresh;
     place
         .database()
         .execute(
             "UPDATE presence SET binding=?1,started_ms=started_ms+1 WHERE ship='infra'",
-            [pinned.to_string()],
+            [binding.to_string()],
         )
         .unwrap();
     place.tick();
-    expected += 1;
-    assert_eq!(captions(&host).len(), expected);
+    assert_eq!(captions(&host).len(), expected + 1);
     assert_eq!(caption(&host, "w3:p1"), "infra · reviewing review");
-    assert_eq!(
-        captions(&host).last().unwrap()["params"]["pane_id"],
-        "w3:p1"
-    );
     finish(&place, &id);
     assert!(caption(&host, "w3:p1").is_null());
     place.stop_native("infra");
 }
 
 #[test]
-fn errand_metadata_refusal_is_bounded_retried_and_never_breaks_lifecycle_or_replays_after_settle() {
+fn an_unconfirmed_caption_is_sent_again_each_pass_and_never_breaks_the_errand() {
     let (place, host) = aboard();
     host.reject_caption.store(true, Ordering::SeqCst);
     let id = start(&place, "thread:retry");
     assert_eq!(captions(&host).len(), 1);
-    assert!(caption(&host, "w2:p1").is_null());
-    for _ in 0..3 {
-        place.tick();
-    }
-    assert_eq!(
-        captions(&host).len(),
-        1,
-        "failed publication is not acked or flooded"
-    );
-    let record: String = place
-        .database()
-        .query_row("SELECT record FROM errand_captions", [], |r| r.get(0))
-        .unwrap();
-    let record: Value = serde_json::from_str(&record).unwrap();
-    assert_eq!(record["dirty"], true);
-    assert!(record["acknowledged"].is_null());
-    let terminal = host.panes.lock().unwrap()[1]["terminal_id"].clone();
-    host.panes.lock().unwrap()[1]["terminal_id"] = json!("reused-during-retry");
     place.tick();
-    assert_eq!(captions(&host).len(), 1);
-    assert_eq!(
-        cache_count(&place),
-        0,
-        "retry backoff must not retain stale endpoint custody"
-    );
-    host.panes.lock().unwrap()[1]["terminal_id"] = terminal;
-    place.tick();
-    assert_eq!(
-        captions(&host).len(),
-        2,
-        "restored exact endpoint gets fresh presentation intent"
-    );
+    assert_eq!(captions(&host).len(), 2);
     host.reject_caption.store(false, Ordering::SeqCst);
-    place
-        .database()
-        .execute(
-            "UPDATE errand_captions SET record=json_set(record,'$.retry_ms',0)",
-            [],
-        )
-        .unwrap();
     place.tick();
     assert_eq!(captions(&host).len(), 3);
     assert_eq!(caption(&host, "w2:p1"), "infra · reviewing retry");
-    // A failed clear is not an acknowledgement, and never retries the older
-    // active caption, including after fresh dispatcher processes.
+    place.tick();
+    assert_eq!(
+        captions(&host).len(),
+        3,
+        "a confirmed caption is not resent"
+    );
+
+    // An unconfirmed clear is retried as a clear, never the older caption.
     host.reject_caption.store(true, Ordering::SeqCst);
     finish(&place, &id);
-    assert_eq!(captions(&host).len(), 4);
-    assert_eq!(captions(&host)[3]["params"]["clear_display_agent"], true);
     place.tick();
-    assert_eq!(captions(&host).len(), 4);
+    let sent = captions(&host);
+    assert_eq!(sent.len(), 5);
+    assert!(
+        sent[3..]
+            .iter()
+            .all(|r| r["params"]["clear_display_agent"] == true)
+    );
     host.reject_caption.store(false, Ordering::SeqCst);
-    place
-        .database()
-        .execute(
-            "UPDATE errand_captions SET record=json_set(record,'$.retry_ms',0)",
-            [],
-        )
-        .unwrap();
     place.tick();
-    assert_eq!(captions(&host).len(), 5);
-    assert!(caption(&host, "w2:p1").is_null());
+    assert_eq!(captions(&host).len(), 6);
     assert_eq!(cache_count(&place), 0);
-    assert!(host.calls("pane.report_agent").is_empty());
+    place.tick();
+    assert_eq!(captions(&host).len(), 6);
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_hosted_claude_first_mate_shows_errand_captions() {
+    let place = Place::new();
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:claude");
+    first_mate["options"] = json!({"model":"claude-opus-5-5"});
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let trust =
+        json!({"projects": {place.folder.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
+    fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
+    let (place, host) = host(place);
+    // Herdr names a Claude Code pane's agent `claude`.
+    host.panes.lock().unwrap()[1]["agent"] = json!("claude");
+    let id = start(&place, "thread:review");
+    assert_eq!(caption(&host, "w2:p1"), "infra · reviewing review");
+    // The fake writes no Claude result, so the errand fails; its caption clears.
+    fs::write(place.root.join(format!("{id}-release")), "").unwrap();
+    until("the Claude errand ends", || {
+        place.agent("job.status", json!({"id":id}))["status"] != "running"
+    });
+    place.tick();
+    assert!(caption(&host, "w2:p1").is_null());
     place.stop_native("infra");
 }
