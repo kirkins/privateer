@@ -170,6 +170,24 @@ impl App {
             .map(|(i, _)| i)
             .collect()
     }
+    /// The selected ship when it lives on a linked machine: listed, never opened here.
+    fn selected_remote(&self) -> Option<&super::model::Ship> {
+        self.ship
+            .as_ref()
+            .and_then(|id| self.snapshot.ships.iter().find(|ship| &ship.id == id))
+            .filter(|ship| ship.remote.is_some())
+    }
+    /// Enter or a click on a remote ship opens nothing; this says why.
+    fn explain_remote(&mut self) {
+        let Some(ship) = self.selected_remote() else {
+            return;
+        };
+        self.notice = format!(
+            "{} is on {}; its status is not shared with this machine, so nothing opens from here.",
+            clean(&ship.name, 160),
+            clean(ship.remote.as_deref().unwrap_or(""), 160)
+        );
+    }
     pub fn selected_task(&self) -> Option<&Task> {
         self.assignment_indices()
             .get(self.selected)
@@ -582,6 +600,9 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('r') if self.needs_focus => self.begin_answer(),
+            KeyCode::Enter if !self.inbox_open && self.selected_remote().is_some() => {
+                self.explain_remote()
+            }
             KeyCode::Enter if !self.inbox_open => return true,
             _ => {}
         }
@@ -594,9 +615,11 @@ impl App {
         let point = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if self.mouse.fleet.contains(point) => {
-                let index = self.mouse.fleet_offset + usize::from(event.row - self.mouse.fleet.y);
-                if let Some(ship) = self.snapshot.ships.get(index) {
-                    self.select_ship(Some(ship.id.clone()));
+                let row = self.mouse.fleet_offset + usize::from(event.row - self.mouse.fleet.y);
+                let rows = overview::fleet_rows(&self.snapshot, crate::store::Store::now_ms());
+                if let Some(overview::FleetRow::Ship(index)) = rows.get(row) {
+                    self.select_ship(Some(self.snapshot.ships[*index].id.clone()));
+                    self.explain_remote();
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.mouse.list.contains(point) => {
@@ -772,6 +795,12 @@ impl App {
                     lines.push(Line::from(format!("Unavailable: {}", clean(error, 512))));
                 }
             }
+            if let Some(machine) = &ship.remote {
+                lines.push(Line::from(format!(
+                    "Remote on {}: status not shared here, read-only; open it on that machine",
+                    clean(machine, 160)
+                )));
+            }
             lines.push(Line::from(format!(
                 "{} scope: {}",
                 if self.demo { "Sample" } else { "Recorded" },
@@ -781,7 +810,9 @@ impl App {
                     clean(&ship.description, 512)
                 }
             )));
-            self.push_ship_work(&mut lines, ship);
+            if ship.remote.is_none() {
+                self.push_ship_work(&mut lines, ship);
+            }
         }
         if let Some(error) = &self.attention.error {
             lines.push(Line::from(format!("UNAVAILABLE: {}", clean(error, 512))));
@@ -960,7 +991,9 @@ impl App {
             // its border, header and at least one ship row even on short terminals,
             // and the panes below shrink to what remains.
             let body = rows[1].height;
-            let fleet_h = (self.snapshot.ships.len() as u16 + 3)
+            let now = crate::store::Store::now_ms();
+            let fleet_rows = overview::fleet_rows(&self.snapshot, now);
+            let fleet_h = (fleet_rows.len() as u16 + 3)
                 .min((body / 3).max(4))
                 .min(body);
             let after_fleet = body - fleet_h;
@@ -982,9 +1015,13 @@ impl App {
                 height: inner.height.saturating_sub(1),
                 ..inner
             };
-            let (header, rows, widths) = overview::table(&self.snapshot, inner.width, self.ascii);
-            let mut state =
-                TableState::default().with_selected(self.ship.as_ref().map(|_| self.ship_index()));
+            let (header, rows, widths) =
+                overview::table(&self.snapshot, inner.width, self.ascii, now);
+            let mut state = TableState::default().with_selected(
+                self.ship
+                    .as_ref()
+                    .and_then(|_| overview::row_of(&fleet_rows, self.ship_index())),
+            );
             frame.render_stateful_widget(
                 Table::new(rows, widths)
                     .header(header)
@@ -1130,7 +1167,7 @@ fn age(value: Option<u64>) -> String {
 }
 
 /// Coarse age of a recorded event, e.g. "just now", "12 min ago", "3 h ago".
-fn ago(then_ms: i64, now_ms: i64) -> String {
+pub(super) fn ago(then_ms: i64, now_ms: i64) -> String {
     let minutes = (now_ms - then_ms).max(0) / 60_000;
     match minutes {
         0 => "just now".into(),

@@ -2387,3 +2387,84 @@ fn a_busy_homes_finished_jobs_never_hide_another_homes_running_crew() {
     let screen = screen_width(&mut app, 160);
     assert!(screen.contains("1 crew-task"), "{screen}");
 }
+
+#[test]
+fn linked_machine_ships_are_listed_read_only_and_grouped_by_machine() {
+    use crossterm::event::KeyCode;
+    use privateer::dashboard::{fleet, model::LinkedMachine, ui::App};
+    let m = Machine::new();
+    m.ship("apps");
+    m.ship("infra");
+    let registry = m.root.join("fleet.sqlite");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let conn = rusqlite::Connection::open(&registry).unwrap();
+    conn.execute(
+        "INSERT INTO machines(name, role, peer, known_as, added_ms, refreshed_ms) VALUES('mac','collects','{}','laptop',1,?1)",
+        [now - 12 * 60_000],
+    )
+    .unwrap();
+    for (name, scope) in [("mini-a", "Scope of mini-a"), ("mini-b", "Scope of mini-b")] {
+        conn.execute(
+            "INSERT INTO machine_ships(machine, name, scope, consumes) VALUES('mac', ?1, ?2, '[]')",
+            [name, scope],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let snapshot = fleet::read(&registry, None).unwrap();
+    assert_eq!(
+        snapshot.machines,
+        vec![LinkedMachine {
+            name: "mac".into(),
+            last_reached_ms: Some(now - 12 * 60_000),
+        }]
+    );
+    let remote = snapshot.ships.iter().find(|s| s.id == "mini-a").unwrap();
+    assert_eq!(remote.remote.as_deref(), Some("mac"));
+    assert_eq!(remote.description, "Scope of mini-a");
+    assert!(remote.live.is_none());
+    assert!(snapshot.scope_complete());
+
+    let mut app = App {
+        snapshot,
+        ..App::default()
+    };
+    let text = screen(&mut app);
+    assert!(text.contains("This machine ·"));
+    assert!(text.contains("mac · last reached 12 min ago"));
+    assert!(text.contains("mini-a · remote"));
+    assert!(text.contains("mini-b · remote"));
+    assert!(text.contains("not shared"));
+
+    app.select_ship(Some("mini-a".into()));
+    assert!(!app.bridge_key(KeyCode::Enter));
+    assert!(app.notice.contains("nothing opens from here"));
+    assert!(screen(&mut app).contains("Remote on mac"));
+    assert_eq!(app.ship.as_deref(), Some("mini-a"));
+
+    // Local ships still open as before: Enter asks the caller to focus them.
+    app.select_ship(Some("apps".into()));
+    assert!(app.bridge_key(KeyCode::Enter));
+}
+
+#[test]
+fn fleet_without_linked_machines_has_no_group_headings() {
+    use privateer::dashboard::{fleet, ui::App};
+    let m = Machine::new();
+    m.ship("apps");
+    let snapshot = fleet::read(&m.root.join("fleet.sqlite"), None).unwrap();
+    assert!(snapshot.machines.is_empty());
+    assert!(snapshot.ships.iter().all(|s| s.remote.is_none()));
+    let mut app = App {
+        snapshot,
+        ..App::default()
+    };
+    let text = screen(&mut app);
+    assert!(text.contains("apps"));
+    assert!(!text.contains("This machine"));
+    assert!(!text.contains("reached"));
+}

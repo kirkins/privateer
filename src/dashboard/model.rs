@@ -33,6 +33,16 @@ pub struct Ship {
     pub terminals: Vec<TerminalBinding>,
     #[serde(default)]
     pub live: Option<super::fleet::ShipState>,
+    /// The linked machine this ship lives on, when it is listed read-only.
+    #[serde(default)]
+    pub remote: Option<String>,
+}
+
+/// A machine this one reaches, and when its ship directory was last refreshed.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LinkedMachine {
+    pub name: String,
+    pub last_reached_ms: Option<i64>,
 }
 
 impl Ship {
@@ -43,6 +53,7 @@ impl Ship {
             description: description.into(),
             liaison: id == "navigator",
             live: None,
+            remote: None,
             terminals: agent
                 .map(|_| TerminalBinding {
                     pane_id: format!("demo:{id}"),
@@ -250,6 +261,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub presentation_error: Option<String>,
     pub ships: Vec<Ship>,
+    /// Linked machines, in name order; their ships are listed read-only.
+    #[serde(default)]
+    pub machines: Vec<LinkedMachine>,
     pub custody: Vec<Custody>,
     pub tasks: Vec<Task>,
     pub pending: Vec<Notice>,
