@@ -1203,17 +1203,22 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
     for envelope in messages {
         let id = required(envelope, "id")?.to_owned();
         let to = envelope["to"].as_str().unwrap_or("");
+        let mut envelope = envelope.clone();
         let home = if to == crate::mail::CAPTAIN {
             // A home that cannot be read now may hold the request; it is retried
             // on the next passes, then refused.
-            match captain_destination(conn, envelope) {
-                Ok(home) => home,
+            match captain_destination(conn, &envelope) {
+                Ok((home, held)) => {
+                    // Only this machine says whether it holds the request.
+                    envelope["unmatched"] = json!(!held);
+                    home
+                }
                 Err(error) => {
                     refused.extend(hold_or_refuse(
                         conn,
                         machine,
                         &id,
-                        envelope,
+                        &envelope,
                         &format!("{error:#}"),
                     )?);
                     continue;
@@ -1238,7 +1243,7 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
                         conn,
                         machine,
                         &id,
-                        envelope,
+                        &envelope,
                         &format!("{error:#}"),
                     )?);
                 }
@@ -1248,11 +1253,11 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
         forget_wait(conn, machine, &id)?;
         match crate::dispatch(&mut store, "mail.deliver", envelope.clone()) {
             Ok(result) => delivered
-                .push(json!({"id": id, "end_state": crate::mail::applied_end(envelope, &result)})),
+                .push(json!({"id": id, "end_state": crate::mail::applied_end(&envelope, &result)})),
             Err(error) => {
                 let reason = format!("{error:#}");
                 if to == crate::mail::CAPTAIN || envelope["from"] == crate::mail::CAPTAIN {
-                    surface_captain_refusal(conn, &id, envelope, &reason)?;
+                    surface_captain_refusal(conn, &id, &envelope, &reason)?;
                 }
                 refused.push(json!({"id": id, "error": reason}));
             }
@@ -1275,8 +1280,9 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
 /// Where a captain's message collected here is delivered: the home that
 /// holds the request it answers, so the request closes where it was written
 /// (and the captain's door reads the reply from that home's captain mailbox),
-/// or else the captain's home.
-fn captain_destination(conn: &Connection, envelope: &Value) -> Result<Option<PathBuf>> {
+/// or else the captain's home. Also says whether a home here holds that
+/// request: one asked on the sending machine is closed there, not here.
+fn captain_destination(conn: &Connection, envelope: &Value) -> Result<(Option<PathBuf>, bool)> {
     if let Some(request) = envelope["correlation"].as_str() {
         let captain = captain_home(conn)?.map(|(_, home)| home);
         let members = crate::fleet::members(conn)?
@@ -1292,15 +1298,16 @@ fn captain_destination(conn: &Connection, envelope: &Value) -> Result<Option<Pat
                 continue;
             };
             if crate::mail::find(&store, request)?.is_some() {
-                return Ok(Some(home));
+                return Ok((Some(home), true));
             }
         }
         ensure!(
             !unreadable,
             "a fleet home cannot be read; the request is not yet located"
         );
+        return Ok((captain_home(conn)?.map(|(_, home)| home), false));
     }
-    Ok(captain_home(conn)?.map(|(_, home)| home))
+    Ok((captain_home(conn)?.map(|(_, home)| home), true))
 }
 
 /// A captain's message that this machine refused is put before the captain,
@@ -1660,9 +1667,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 // Into the home holding the request it answers, as collected
                 // captain mail is; a home that cannot be read now is offered
                 // again on the next pass.
-                let Ok(Some(home)) = captain_destination(&conn, envelope) else {
+                let Ok((Some(home), held)) = captain_destination(&conn, envelope) else {
                     continue;
                 };
+                let mut envelope = envelope.clone();
+                envelope["unmatched"] = json!(!held);
                 let outcome = Store::open(&home).and_then(|mut store| {
                     crate::dispatch(&mut store, "mail.deliver", envelope.clone())
                 });
@@ -1670,7 +1679,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     Ok(_) => delivered.push(json!(id)),
                     Err(error) => {
                         let reason = format!("{error:#}");
-                        surface_captain_refusal(&conn, id, envelope, &reason)?;
+                        surface_captain_refusal(&conn, id, &envelope, &reason)?;
                         refused.push(json!({"id": id, "error": reason}));
                     }
                 }

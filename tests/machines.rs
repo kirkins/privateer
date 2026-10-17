@@ -2007,56 +2007,35 @@ fn a_captain_reply_reaches_the_home_that_asked_across_the_link() {
 }
 
 #[test]
-fn a_captain_reply_refused_across_the_link_is_put_before_the_captain() {
+fn a_ship_reply_to_a_request_this_machine_never_held_still_reaches_the_captain() {
     let (_temp, laptop, mac, ssh) = fixture();
-    laptop.ship("rig");
     let linked = link(&laptop, &mac, &ssh);
     assert!(linked.status.success(), "{}", text(&linked));
-    let asked = captain_sends(
-        &laptop,
-        "rig",
-        &ssh,
-        json!({"to": "fitforge", "kind": "request", "body": "Upload build 12?"}),
+    // The captain asks fitforge from the Mac itself, so the request is
+    // written only there; fitforge's answer closes it there.
+    let asked = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "captain", "to": "fitforge", "kind": "request", "body": "Upload build 12?"}),
     );
-    assert!(asked.status.success(), "{}", text(&asked));
-    let asked: Value = serde_json::from_slice(&asked.stdout).unwrap();
     let answered = mac.ok(
         "fitforge",
         "mail.send",
         json!({"from": "fitforge", "to": "captain", "kind": "reply",
-            "correlation": asked["id"], "body": "Yes, ship it"}),
+            "correlation": asked["id"], "body": "Yes, uploaded"}),
     );
+    let request = mac.ok("fitforge", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(request["state"], "answered", "{request}");
 
-    // Nothing here holds the request any more, so the reply cannot close it.
-    let home: String = rusqlite::Connection::open(laptop.registry())
-        .unwrap()
-        .query_row("SELECT home FROM ships WHERE name='rig'", [], |r| r.get(0))
-        .unwrap();
-    let database = PathBuf::from(home).join("privateer.sqlite");
-    rusqlite::Connection::open(&database)
-        .unwrap()
-        .execute(
-            "DELETE FROM mail WHERE id=?1",
-            [asked["id"].as_str().unwrap()],
-        )
-        .unwrap();
+    // The captain's home here reads the answer, not a refusal of it.
     let pass = laptop.pass("liaison", &ssh);
-    assert_eq!(pass["machines"][0]["refused"], 1, "{pass}");
-
-    let notices: Vec<Value> = captain_mail(&laptop, "liaison")
-        .into_iter()
-        .filter(|m| m["kind"] == "notice")
-        .collect();
-    assert_eq!(notices.len(), 1, "{notices:?}");
-    assert_eq!(notices[0]["payload"]["refused"]["id"], answered["id"]);
-    assert_eq!(notices[0]["payload"]["refused"]["from"], "fitforge");
-    assert!(
-        notices[0]["payload"]["refused"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("unknown request"),
-        "{notices:?}"
-    );
+    assert_eq!(pass["machines"][0]["delivered"], 1, "{pass}");
+    assert_eq!(pass["machines"][0]["refused"], 0, "{pass}");
+    let inbox = captain_mail(&laptop, "liaison");
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert_eq!(inbox[0]["id"], answered["id"]);
+    assert_eq!(inbox[0]["kind"], "reply");
+    assert_eq!(inbox[0]["body"], "Yes, uploaded");
 }
 
 #[test]
@@ -2379,4 +2358,52 @@ fn a_machine_whose_desk_is_elsewhere_hands_its_captain_mail_only_there() {
     let pass = mac.pass("fitforge", &ssh);
     assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
     assert_eq!(captain_bodies(&server, "harbor"), ["Build 13 is up"]);
+}
+
+#[test]
+fn mail_closing_requests_the_desk_never_held_reaches_the_captain() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    // scout asks the captain while the desk is still here, then the desk moves.
+    let early = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Merge PR 7?"}),
+    );
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    // The captain asks scout from the laptop, not at the desk; scout answers,
+    // and withdraws its earlier request. Both requests live only here.
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "reply",
+               "correlation": asked["id"], "body": "Rotated"}),
+    );
+    laptop.ok(
+        "scout",
+        "mail.withdraw",
+        json!({"id": early["id"], "reason": "PR 7 merged"}),
+    );
+
+    // The desk takes both and puts neither before the captain as a refusal.
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 2, "{pass}");
+    let inbox = captain_mail(&mac, "fitforge");
+    let kinds: Vec<(&str, &str)> = inbox
+        .iter()
+        .map(|m| (m["kind"].as_str().unwrap(), m["body"].as_str().unwrap()))
+        .collect();
+    assert_eq!(kinds, [("reply", "Rotated"), ("notice", "PR 7 merged")]);
+    for (id, state) in [(&asked["id"], "answered"), (&early["id"], "withdrawn")] {
+        let request = laptop.ok("scout", "mail.show", json!({"id": id}));
+        assert_eq!(request["state"], state, "{request}");
+    }
 }
