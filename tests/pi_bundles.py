@@ -526,7 +526,10 @@ class Bundles(unittest.TestCase):
         with self.assertRaises(ValueError):
             bundles.plan(registry, ['docs@1'], 'crew', harness='claude')
         # A forged Claude plan that carries servers refuses at validation.
-        claude = bundles.plan(dict(self.registry, claude_version='2.1.300'), ['selected@1'], 'crew', harness='claude')
+        # A Claude plan reads user settings; keep the developer's own out of it.
+        (self.base / 'claude-config').mkdir(exist_ok=True)
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.base / 'claude-config')}):
+            claude = bundles.plan(dict(self.registry, claude_version='2.1.300'), ['selected@1'], 'crew', harness='claude')
         bundles.validate_plan(claude)
         with self.assertRaises(ValueError):
             bundles.validate_plan(dict(claude, mcp_servers=[self.mcp_record()]))

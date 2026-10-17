@@ -17,6 +17,9 @@ from bundles import file_bytes, present, require, require_flags, safe_path, vali
 # Keep the project's .claude settings (Privateer's hooks and permissions) and
 # drop the user source; no MCP servers unless --mcp-config names them.
 FLAGS = ["--setting-sources", "project,local", "--strict-mcp-config"]
+# The carried user settings stay bounded, large enough for an autoMode block
+# and within the 24 KiB plan limit with room for the selected skills.
+MAX_CARRIED_BYTES = 16384
 CARRIED = ("model", "modelSettings", "effort", "autoMode", "skipDangerousModePermissionPrompt")
 # User settings dropped without refusal: cosmetic or housekeeping keys that
 # select no route or account, and the personal exposure a bounded launch drops.
@@ -57,7 +60,8 @@ def settings(env):
     config = json.loads(file_bytes(safe_path(str(path))))
     require(isinstance(config, dict) and all(key in CARRIED or key in DROPPED for key in config))
     carried = {key: config[key] for key in CARRIED if key in config}
-    require(len(json.dumps(carried)) <= 4096)
+    # autoMode can hold a whole environment description and its allow rules.
+    require(len(json.dumps(carried)) <= MAX_CARRIED_BYTES)
     return carried
 
 
