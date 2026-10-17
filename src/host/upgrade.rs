@@ -213,13 +213,15 @@ pub(crate) fn wanted(
 /// Take the ship's lease from a running harness before it is stopped, in one
 /// transaction that rechecks the reason. The adapter checks ownership before
 /// each delivery, so once this commits it starts no turn, and stopping the
-/// harness ends nothing a turn was using. None if nothing is due any more.
+/// harness ends nothing a turn was using. None if nothing is due any more. The
+/// mail sequence seen at the fence comes back too: a pane that starts asleep
+/// from it wakes on any mail after it.
 pub(crate) fn fence(
     store: &Store,
     ship: &str,
     holder: &str,
     sleep_after: u64,
-) -> Result<Option<(&'static str, String)>> {
+) -> Result<Option<(&'static str, String, i64)>> {
     let tx = store.write_transaction()?;
     let Some(reason) = wanted(store, ship, holder, sleep_after)? else {
         return Ok(None);
@@ -232,6 +234,11 @@ pub(crate) fn fence(
     if moved != 1 {
         return Ok(None);
     }
+    let through: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
+        [ship],
+        |r| r.get(0),
+    )?;
     tx.execute(
         "UPDATE hosted_relaunches SET holder=?3 WHERE ship=?1 AND holder=?2",
         params![ship, holder, fenced],
@@ -241,7 +248,7 @@ pub(crate) fn fence(
         params![ship, holder, fenced],
     )?;
     tx.commit()?;
-    Ok(Some((reason, fenced)))
+    Ok(Some((reason, fenced, through)))
 }
 
 /// A sleeping pane has no turn to lose, so a request or any drift ends it.
@@ -257,16 +264,26 @@ pub(crate) fn wanted_asleep(
     Ok(upgrade.then_some("upgrade"))
 }
 
+/// Where the pane that replaces a retired one starts. Only a catch-up on a ship
+/// that sleeps starts asleep, from the mail the retired pane had seen; a ship
+/// that never sleeps starts awake, and so does a requested relaunch.
+pub(crate) fn start_point(reason: &str, sleep_after: u64, through: i64) -> Option<i64> {
+    (reason == "upgrade" && sleep_after > 0).then_some(through)
+}
+
 /// The pane is leaving on purpose: release its lease, spend its request, and
 /// drop the launch backoff its launch reserved, since a planned exit is not a
 /// failed launch. Call only after the harness has exited, so the lease never
 /// outlives it. The lease goes first: a relaunch waiting on the request reads
 /// the request's disappearance as the pane having left, and must not launch
-/// while the lease is still held. `start_asleep` is carried to the next pane.
-pub(crate) fn retire(store: &Store, ship: &str, holder: &str, reason: &str, start_asleep: bool) {
+/// while the lease is still held. `start` carries to the next pane: `Some` of
+/// the mail sequence it has seen starts that pane asleep, and `None` starts it
+/// awake.
+pub(crate) fn retire(store: &Store, ship: &str, holder: &str, reason: &str, start: Option<i64>) {
+    let start_asleep = start.is_some();
     let _ = store.connection().execute(
-        "UPDATE host_launches SET retry_ms=0, start_asleep=?3 WHERE ship=?1 AND holder=?2",
-        params![ship, holder, start_asleep],
+        "UPDATE host_launches SET retry_ms=0, start_asleep=?3, start_through=?4 WHERE ship=?1 AND holder=?2",
+        params![ship, holder, start_asleep, start],
     );
     let _ = presence::leave(store, ship, holder);
     let _ = store.connection().execute(
@@ -411,13 +428,10 @@ pub(crate) fn relaunch(store: &mut Store, ship: &str, force: bool) -> Result<Val
     }))
 }
 
-/// Whether a pane has ever recorded its release, which a relaunch needs.
+/// Whether the live pane recorded its release, which a relaunch needs. A row
+/// for an earlier process does not count.
 fn recorded(store: &Store, ship: &str) -> Result<bool> {
-    Ok(store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM hosted_panes WHERE ship=?1)",
-        [ship],
-        |r| r.get(0),
-    )?)
+    Ok(live_pane(store, ship)?.is_some())
 }
 
 /// The native harness a live pane spawned, with its start identity.
@@ -471,7 +485,7 @@ mod tests {
             )
             .unwrap();
 
-        retire(&store, ship, holder, "relaunch", false);
+        retire(&store, ship, holder, "relaunch", None);
 
         let held: Vec<i64> = store
             .connection()
@@ -483,5 +497,15 @@ mod tests {
             .unwrap();
         assert_eq!(held, vec![0]);
         assert!(!crate::presence::attended(&store, ship).unwrap());
+    }
+
+    /// A catch-up on a ship that never sleeps starts awake: only a ship that
+    /// sleeps is left asleep by an upgrade, and a request always wakes it.
+    #[test]
+    fn a_ship_that_never_sleeps_is_not_left_asleep_by_an_upgrade() {
+        assert_eq!(start_point("upgrade", 0, 7), None);
+        assert_eq!(start_point("upgrade", 1800, 7), Some(7));
+        assert_eq!(start_point("relaunch", 1800, 7), None);
+        assert_eq!(start_point("relaunch", 0, 7), None);
     }
 }

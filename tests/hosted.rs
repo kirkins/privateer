@@ -2873,6 +2873,48 @@ fn an_idle_pane_behind_the_current_release_catches_up_at_its_sleep_point_and_a_b
 }
 
 #[test]
+fn mail_that_lands_between_a_catch_up_and_its_replacement_wakes_the_asleep_pane() {
+    let (a, b) = (commit('a'), commit('b'));
+    let mut place = Place::new();
+    place.on_release(&a);
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["sleep_after_secs"] = json!(1);
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let (place, _herdr) = hosted(place);
+    place.install_release(&b);
+    place.select(&b);
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+
+    // The catch-up fences the old pane at its sleep point and it leaves.
+    let idle = json!({"ship":"infra","holder":holder,"idle":true});
+    place.agent("work.poll", idle.clone());
+    std::thread::sleep(Duration::from_millis(1100));
+    place.agent("work.poll", idle);
+    until("the behind pane to catch up and leave", || {
+        (unsafe { libc::kill(native, 0) }) == -1
+            && place.json("ship.presence", json!({"ship":"infra"}))["attended"] == false
+    });
+    for file in ["pi-env", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    // Mail after the fence, before the replacement pane is up: it must wake
+    // that pane, not be taken as mail it had already seen.
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
+    );
+    let report = place.tick();
+    assert!(report["hosted"]["pane"].is_string(), "{report}");
+    until("the replacement pane woken by the mail", || {
+        place.root.join("pi-env").exists()
+    });
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["commit"], b.as_str(), "{bearings}");
+    place.stop_native("infra");
+}
+
+#[test]
 fn a_pane_predating_relaunch_support_fails_at_once_and_says_how_to_restart() {
     let a = commit('a');
     let mut place = Place::new();

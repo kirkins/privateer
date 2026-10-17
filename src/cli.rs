@@ -1234,11 +1234,13 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         };
         match ended {
             crate::host::sleep::Ended::Exited(status) => break status,
-            crate::host::sleep::Ended::Relaunch(reason, fenced) => {
+            crate::host::sleep::Ended::Relaunch(reason, fenced, through) => {
                 // The harness has exited; leave its release behind for a fresh pane.
-                // Only a catch-up leaves that pane asleep; a requested relaunch wakes it.
+                // Only a catch-up leaves that pane asleep, and only a ship that sleeps
+                // at all; a requested relaunch wakes it.
                 terminal.restore();
-                crate::host::upgrade::retire(&store, &ship, &fenced, reason, reason == "upgrade");
+                let start = crate::host::upgrade::start_point(reason, sleep_after, through);
+                crate::host::upgrade::retire(&store, &ship, &fenced, reason, start);
                 std::process::exit(0);
             }
             crate::host::sleep::Ended::Asleep(asleep) => {
@@ -1252,7 +1254,13 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 };
                 if matches!(reason, "relaunch" | "upgrade") {
                     // Asleep before, asleep after: a sleeping pane stays asleep.
-                    crate::host::upgrade::retire(&store, &ship, &holder, reason, true);
+                    crate::host::upgrade::retire(
+                        &store,
+                        &ship,
+                        &holder,
+                        reason,
+                        Some(asleep.through_seq),
+                    );
                     std::process::exit(0);
                 }
                 continuation = claude_continuation()?;

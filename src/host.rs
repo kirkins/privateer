@@ -396,25 +396,28 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         if running || crate::presence::attended(store, ship)? {
             return Ok(Attempt::Busy);
         }
-        let previous: Option<(i64, i64, bool)> = tx
+        let previous: Option<(i64, i64, bool, Option<i64>)> = tx
             .query_row(
-                "SELECT failures, retry_ms, start_asleep FROM host_launches WHERE ship=?1",
+                "SELECT failures, retry_ms, start_asleep, start_through FROM host_launches WHERE ship=?1",
                 [ship],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
         let now = Store::now_ms();
-        if let Some((_, until, _)) = previous.filter(|(_, until, _)| *until > now) {
+        if let Some((_, until, _, _)) = previous.filter(|(_, until, _, _)| *until > now) {
             return Ok(Attempt::Backoff(until));
         }
-        let failures = previous.map_or(1, |(n, _, _)| n.saturating_add(1).clamp(1, 7));
-        // The flag a retired pane left stays until a pane starts on it.
-        asleep = previous.is_some_and(|(_, _, flag)| flag);
+        let failures = previous.map_or(1, |(n, _, _, _)| n.saturating_add(1).clamp(1, 7));
+        // The flag and the mail it has seen stay until a pane starts on them.
+        let carried = previous.filter(|(_, _, flag, _)| *flag);
+        asleep = carried.is_some();
+        let through = carried.and_then(|(_, _, _, through)| through);
         tx.execute(
-            "INSERT INTO host_launches(ship,holder,failures,retry_ms,error,start_asleep) VALUES(?1,?2,?3,?4,'awaiting hosted startup',?5)
+            "INSERT INTO host_launches(ship,holder,failures,retry_ms,error,start_asleep,start_through) VALUES(?1,?2,?3,?4,'awaiting hosted startup',?5,?6)
              ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, failures=excluded.failures,
-               retry_ms=excluded.retry_ms, error=excluded.error, start_asleep=excluded.start_asleep",
-            params![ship, holder, failures, now + delay(failures), asleep])?;
+               retry_ms=excluded.retry_ms, error=excluded.error, start_asleep=excluded.start_asleep,
+               start_through=excluded.start_through",
+            params![ship, holder, failures, now + delay(failures), asleep, through])?;
         // Under the same lock as the attended check; no nested claim transaction.
         let harness = profile["manifest"]
             .as_str()

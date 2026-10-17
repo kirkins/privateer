@@ -69,6 +69,15 @@ pub fn init(store: &Store) -> Result<()> {
             "ALTER TABLE host_launches ADD COLUMN start_asleep INTEGER NOT NULL DEFAULT 0 CHECK(start_asleep IN (0,1));",
         )?;
     }
+    // The mail the retired pane had seen: mail after it wakes the pane that starts asleep.
+    let through_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='start_through')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !through_column {
+        tx.execute_batch("ALTER TABLE host_launches ADD COLUMN start_through INTEGER;")?;
+    }
     for column in [
         "focuses",
         "harness",

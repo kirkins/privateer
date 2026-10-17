@@ -117,13 +117,27 @@ pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option
 }
 
 /// A pane that starts asleep has no harness to stop: the mail already there
-/// wakes nothing, as it would have before a sleep.
+/// wakes nothing, as it would have before a sleep. That is the mail through
+/// the sequence the retired pane recorded, so mail that arrived after it left
+/// but before this pane started still wakes it.
 pub(crate) fn asleep_at_start(store: &Store, ship: &str, holder: &str) -> Result<Asleep> {
-    let through_seq: i64 = store.connection().query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
-        [ship],
-        |r| r.get(0),
-    )?;
+    let carried: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT start_through FROM host_launches WHERE ship=?1 AND holder=?2",
+            params![ship, holder],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let through_seq = match carried {
+        Some(through) => through,
+        None => store.connection().query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient=?1",
+            [ship],
+            |r| r.get(0),
+        )?,
+    };
     store.audit(
         "host.slept",
         &json!({"ship": ship, "idle_secs": 0, "through_seq": through_seq}),
@@ -153,8 +167,8 @@ pub(crate) enum Ended {
     Exited(std::process::ExitStatus),
     Asleep(Asleep),
     /// Stopped at a safe point to move onto the current release, under the
-    /// holder its fence moved the lease to.
-    Relaunch(&'static str, String),
+    /// holder its fence moved the lease to, and the mail sequence it had seen.
+    Relaunch(&'static str, String, i64),
 }
 
 /// Wait for a hosted harness, refreshing the lease, and stop it once the ship
@@ -184,11 +198,11 @@ pub(crate) fn supervise(
             checked = Instant::now();
             // Relaunch only when idle: a turn in progress is never interrupted
             // unless its operator forced it.
-            if let Ok(Some((reason, fenced))) =
+            if let Ok(Some((reason, fenced, through))) =
                 super::upgrade::fence(store, ship, holder, after_secs)
             {
                 stop(child)?;
-                return Ok(Ended::Relaunch(reason, fenced));
+                return Ok(Ended::Relaunch(reason, fenced, through));
             }
             if after_secs > 0
                 && let Ok(Some(asleep)) = sleep(store, ship, holder, after_secs)
