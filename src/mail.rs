@@ -598,22 +598,37 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             );
         }
     }
+    // Only a gateway link delivers now. Over a collected link the reply waits
+    // for the other machine to collect it, so it cannot be judged here.
+    let direct = match &peer {
+        Some(peer) => crate::peers::direct_machine(store, peer)?,
+        None => false,
+    };
     if let Some(correlation) = correlation {
-        let thread = by_id(store, correlation)?
-            .with_context(|| format!("unknown correlated message {correlation}"))?;
-        if kind == "reply" {
-            ensure!(
-                matches!(thread["kind"].as_str(), Some("request" | "decision")),
-                "only requests and decisions take replies"
-            );
-            ensure!(
-                thread["to"] == from && thread["from"] == to,
-                "only the recipient of {correlation} can answer it, to its sender"
-            );
-            ensure!(
-                thread["state"] == "open",
-                "{correlation} was already answered"
-            );
+        match by_id(store, correlation)? {
+            Some(thread) => {
+                if kind == "reply" {
+                    ensure!(
+                        matches!(thread["kind"].as_str(), Some("request" | "decision")),
+                        "only requests and decisions take replies"
+                    );
+                    ensure!(
+                        thread["to"] == from && thread["from"] == to,
+                        "only the recipient of {correlation} can answer it, to its sender"
+                    );
+                    ensure!(
+                        thread["state"] == "open",
+                        "{correlation} was already answered"
+                    );
+                }
+            }
+            // The captain's request may live in the home that asked it, not
+            // this one; a reply to a linked ship is checked where that request
+            // is, and a refusal there is surfaced to the captain.
+            None => ensure!(
+                from == CAPTAIN && kind == "reply" && direct,
+                "unknown correlated message {correlation}"
+            ),
         }
     }
     let now = Store::now_ms();
@@ -738,15 +753,26 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         quarantine(store, id, wire_bytes)?;
         return Ok(Delivery::Quarantined);
     }
-    let outcome = crate::peers::call_peer_with_timeout(
+    let response = crate::peers::call_peer_with_timeout(
         store,
         peer,
         &format!("deliver-{}", uuid::Uuid::new_v4()),
         "mail.deliver",
         envelope,
         timeout,
-    )
-    .and_then(|response| match response["ok"].as_bool() {
+    );
+    // A peer that answered and refused the message, as opposed to one that
+    // could not be reached; only a refusal is the captain's to hear about.
+    let refusal = match &response {
+        Ok(response) if response["ok"] != json!(true) => Some(
+            response["error"]
+                .as_str()
+                .unwrap_or("peer refused delivery")
+                .to_owned(),
+        ),
+        _ => None,
+    };
+    let outcome = response.and_then(|response| match response["ok"].as_bool() {
         Some(true) => Ok(applied_end(&message, &response["result"])),
         _ => bail!(
             "{}",
@@ -798,11 +824,68 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         params![peer, failures, next, now],
     )?;
     tx.commit()?;
+    // A captain's message the peer refused is quarantined: left pending it
+    // would hold back every later message to that peer, and retrying a refusal
+    // would not change it. The peer answered, so it is not backed off for it.
+    // The captain is told, and may send it again.
+    if let Some(reason) = refusal.filter(|_| message["from"] == CAPTAIN) {
+        let tx = store.write_transaction()?;
+        tx.execute(
+            "UPDATE mail SET delivery='quarantined' WHERE id=?1 AND delivery='pending'",
+            [id],
+        )?;
+        tx.execute("DELETE FROM mail_delivery_retry WHERE peer=?1", [peer])?;
+        tx.commit()?;
+        surface_refusal(
+            store,
+            id,
+            "runtime",
+            CAPTAIN,
+            message["to"].as_str().unwrap_or(peer),
+            &reason,
+        )?;
+        return Ok(Delivery::Quarantined);
+    }
     Ok(if delivered {
         Delivery::Delivered
     } else {
         Delivery::Failed
     })
+}
+
+/// Tell the captain that a message was refused, so the refusal is not only
+/// recorded where nobody reads it. The notice goes in this home's captain
+/// mailbox, once per message id, however many times the refusal recurs.
+pub(crate) fn surface_refusal(
+    store: &Store,
+    id: &str,
+    sender: &str,
+    from: &str,
+    to: &str,
+    reason: &str,
+) -> Result<()> {
+    let reason: String = reason.chars().take(2_000).collect();
+    let body = format!("Message {id} from {from} to {to} was refused: {reason}");
+    let payload = json!({"refused": {"id": id, "from": from, "to": to, "reason": reason}});
+    let now = Store::now_ms();
+    let tx = store.write_transaction()?;
+    let written = tx.execute(
+        "INSERT OR IGNORE INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,delivery,delivered_ms)
+         VALUES(?1,?2,?3,'notice',?4,?5,'high',?6,'received',?6)",
+        params![
+            format!("refusal-{id}"),
+            sender,
+            CAPTAIN,
+            body,
+            payload.to_string(),
+            now
+        ],
+    )?;
+    tx.commit()?;
+    if written == 1 {
+        store.audit("captain.refused", &payload)?;
+    }
+    Ok(())
 }
 
 /// Fair delivery across peers, FIFO within each peer. Explicit flushes

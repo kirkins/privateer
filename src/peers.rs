@@ -445,6 +445,19 @@ pub(crate) fn machine(store: &Store, name: &str) -> Result<bool> {
     )?)
 }
 
+/// Whether a peer is another machine's gateway, which takes mail directly. A
+/// collected peer is a machine too, but its mail waits for that machine to
+/// collect it, so a message that only a live answer can judge is not sent
+/// there.
+pub(crate) fn direct_machine(store: &Store, name: &str) -> Result<bool> {
+    init(store)?;
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM peer_endpoints WHERE name=?1 AND json_extract(config_json, '$.gateway')=1)",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
 /// Forget a peer and the ships this home knew to live behind it.
 pub(crate) fn forget(store: &Store, name: &str) -> Result<()> {
     init(store)?;
