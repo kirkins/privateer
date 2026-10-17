@@ -381,7 +381,12 @@ fn wait(
                 verify = None;
                 if !unlisted {
                     let read = read_back(herdr);
-                    if !listed(&read, ship) {
+                    // Herdr unreachable is not a dropped report: warn, and ask again next cycle.
+                    if read.get("error").is_some() {
+                        println!(
+                            "⚠ Herdr could not say whether it lists {ship}'s asleep first mate; will check again."
+                        );
+                    } else if !listed(&read, ship) {
                         unlisted = true;
                         let sent =
                             json!({"agent": PANE_AGENT, "display_agent": ship, "state": "idle"});
