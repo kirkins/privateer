@@ -1054,7 +1054,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             // rather than let a fresh session pass for the old one.
             Some(
                 conversation @ (crate::host::Conversation::HeadlessOnly
-                | crate::host::Conversation::BoundReached),
+                | crate::host::Conversation::BoundReached
+                | crate::host::Conversation::NoEntrypoint),
             ) => eprintln!(
                 "warning: this ship's Claude folder has transcripts ({}), none to continue; starting a fresh session",
                 conversation.label()
@@ -1136,7 +1137,6 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     std::process::exit(0);
                 };
                 continuation = claude_continuation()?;
-                crate::host::sleep::woke(&store, &ship, reason, continuation);
                 // What admitted the first launch may have been revoked since.
                 let mut check = Store::open(home)?;
                 let profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
@@ -1146,6 +1146,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     let _ = crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
                     return Err(error);
                 }
+                // Only a relaunch that is admitted again is a wake.
+                crate::host::sleep::woke(&store, &ship, reason, continuation);
             }
         }
     };

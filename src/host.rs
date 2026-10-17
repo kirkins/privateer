@@ -75,6 +75,9 @@ pub(crate) enum Conversation {
     /// A transcript had no entrypoint record within the scan bound, so it may
     /// still hold an interactive conversation.
     BoundReached,
+    /// Transcripts exist, but none has an entrypoint record: an empty file, or
+    /// a session that stopped before its first record with one.
+    NoEntrypoint,
 }
 
 impl Conversation {
@@ -88,6 +91,7 @@ impl Conversation {
             Self::NoTranscript => "no transcript",
             Self::HeadlessOnly => "headless only",
             Self::BoundReached => "bound reached",
+            Self::NoEntrypoint => "no entrypoint",
         }
     }
 }
@@ -112,7 +116,10 @@ fn scan_transcript(path: &Path) -> std::io::Result<Scan> {
     loop {
         line.clear();
         if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(if reader.get_ref().limit() == 0 {
+            // The bound ended the read only if the file is longer than it.
+            let exhausted = reader.get_ref().limit() == 0;
+            let longer = std::fs::metadata(path)?.len() > TRANSCRIPT_SCAN_BYTES;
+            return Ok(if exhausted && longer {
                 Scan::Undecided
             } else {
                 Scan::Unmarked
@@ -147,6 +154,7 @@ pub(crate) fn claude_conversation(folder: &Path) -> Conversation {
         return Conversation::NoTranscript;
     };
     let mut found = false;
+    let mut unmarked = false;
     let mut undecided = false;
     for path in entries.flatten().map(|e| e.path()) {
         if path.extension().is_none_or(|x| x != "jsonl") {
@@ -154,7 +162,8 @@ pub(crate) fn claude_conversation(folder: &Path) -> Conversation {
         }
         match scan_transcript(&path) {
             Ok(Scan::Interactive) => return Conversation::Interactive,
-            Ok(Scan::Headless | Scan::Unmarked) => found = true,
+            Ok(Scan::Headless) => found = true,
+            Ok(Scan::Unmarked) => unmarked = true,
             Ok(Scan::Undecided) => undecided = true,
             Err(_) => {}
         }
@@ -163,6 +172,8 @@ pub(crate) fn claude_conversation(folder: &Path) -> Conversation {
         Conversation::BoundReached
     } else if found {
         Conversation::HeadlessOnly
+    } else if unmarked {
+        Conversation::NoEntrypoint
     } else {
         Conversation::NoTranscript
     }
@@ -412,6 +423,9 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         let socket = socket().context("no Herdr socket configured")?;
         let mut client = crate::herdr::Client::connect(&socket)?;
         let folder = store.home().parent().context("ship folder")?;
+        // Decided before the pane starts: its own Claude may write a first
+        // entrypoint record that would make a fresh launch look resumed.
+        let continuation = continuation(folder, profile);
         let binary = crate::executable::installed()?;
         let pane = client.space(
             folder,
@@ -424,9 +438,6 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         settle(store, &mut client, &pane.workspace_id, "mate", ship);
         let launched =
             json!({"holder": holder, "pane": pane.pane_id, "workspace": pane.workspace_id});
-        // The pane decides the same from this folder moments later; the
-        // dispatcher records what that decision will be.
-        let continuation = continuation(folder, profile);
         store.audit(
             "host.launched",
             &json!({"ship": ship, "launched": launched,
