@@ -144,7 +144,11 @@ fn a_ship_creates_a_linked_sibling_ship() {
         .find(|s| s["name"] == "infra")
         .cloned()
         .unwrap();
-    assert_eq!(entry["created_by"], "liaison");
+    // The operator made it from the liaison's folder: the liaison lent its
+    // settings, but the captain is its creator, so the liaison cannot retire it.
+    assert_eq!(entry["created_by"], "captain");
+    let retire = machine.as_agent(&liaison, "liaison", "ship.retire", json!({"name": "infra"}));
+    assert!(!retire.status.success(), "the liaison did not create infra");
     // A folder that is not empty is never taken over.
     fs::create_dir_all(machine.ships.join("busy")).unwrap();
     fs::write(machine.ships.join("busy/notes.txt"), "mine").unwrap();

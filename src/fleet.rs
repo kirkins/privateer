@@ -242,9 +242,16 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
     identifier(name)?;
     crate::mail::unreserved(name)?;
     crate::machines::refuse_remote_name(&registry()?, name)?;
-    let creator = caller_ship(store);
+    // The ship whose home this runs in lends a new ship its harness, model
+    // and hosting. Only an agent creating a ship becomes its creator; when
+    // the operator runs `ship new` in a ship's folder, the captain is.
+    let template = caller_ship(store);
+    let creator = match store.caller() {
+        Caller::Agent { actor } => Some(actor.clone()),
+        Caller::Operator => None,
+    };
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
-    let parent = creator.as_ref().and_then(|c| {
+    let parent = template.as_ref().and_then(|c| {
         let profile =
             crate::mail::dispatch(store, "ship.show", json!({"name": c})).ok()?["first_mate"]
                 .take();
