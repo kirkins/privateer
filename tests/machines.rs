@@ -2673,3 +2673,175 @@ fn mail_closing_requests_the_desk_never_held_reaches_the_captain() {
         assert_eq!(request["state"], state, "{request}");
     }
 }
+
+/// A heavy job holding this machine's one heavy slot, and a second one queued
+/// behind it that has waited past the owner's threshold. The holder runs for
+/// real under its own supervisor; the queue's age is set in the shared ledger
+/// so the test does not wait ten minutes.
+fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,
+            "heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}),
+    );
+    let home = laptop.folder("upkeep").join(".privateer");
+    let repo = laptop.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    {
+        let store = privateer::store::Store::open(&home).unwrap();
+        let charter = json!({"id":"mission","objective":"owner alert fixture","repo":repo,
+            "active":true,"actions":["implement","test","recovery","cleanup"],"min_free_bytes":0,
+            "job_timeout_secs":30,"max_heavy_jobs":1});
+        store
+            .connection()
+            .execute(
+                "INSERT INTO charters(id,data) VALUES(?1,?2)",
+                params!["mission", charter.to_string()],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('task','mission','upkeep','fixture','open',0)",
+                [],
+            )
+            .unwrap();
+    }
+    let holder = laptop.ok(
+        "upkeep",
+        "job.start",
+        json!({"task_id":"task","id":"holder","command":["sleep","60"],"heavy":true,"wait_for_capacity":true}),
+    );
+    assert_eq!(holder["status"], "starting", "{holder}");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    let supervisor = loop {
+        let job = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
+        if let Some(pid) = job["supervisor"]["pid"].as_i64() {
+            break pid as i32;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "supervisor never recorded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let queued = laptop.ok(
+        "upkeep",
+        "job.start",
+        json!({"task_id":"task","id":"queued","command":["true"],"heavy":true,"wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    // Age the queue entry, once its own supervisor has recorded itself in it.
+    let ledger = rusqlite::Connection::open(laptop.root.join("ledger/resources.sqlite")).unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    while ledger
+        .query_row(
+            "SELECT COUNT(*) FROM queue WHERE json_extract(record,'$.supervisor.pid') IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "queue never recorded its supervisor"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let eleven_minutes_ago = privateer::store::Store::now_ms() - 11 * 60_000;
+    ledger
+        .execute(
+            "UPDATE queue SET record=json_set(record,'$.created_ms',?1)",
+            [eleven_minutes_ago],
+        )
+        .unwrap();
+    (home, supervisor)
+}
+
+/// Capacity-queue alerts the machine's owner has been sent so far.
+fn capacity_alerts(laptop: &Machine, ship: &str) -> Vec<String> {
+    messages(laptop, ship, "notice")
+        .iter()
+        .filter(|m| m["from"] == "crew")
+        .filter_map(|m| m["body"].as_str().map(str::to_owned))
+        .filter(|body| body.contains("capacity queue"))
+        .collect()
+}
+
+#[test]
+fn a_long_wait_behind_a_healthy_heavy_job_does_not_alert_the_owner() {
+    let (_temp, laptop, _mac, ssh) = fixture();
+    laptop.ship("upkeep");
+    assert!(
+        laptop
+            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .status
+            .success()
+    );
+    let (_home, _supervisor) = queued_behind_a_holder(&laptop);
+    laptop.pass("upkeep", &ssh);
+    assert!(capacity_alerts(&laptop, "upkeep").is_empty());
+    // The waiting ship still sees what it waits behind.
+    let bearings = laptop.ok("upkeep", "ship.bearings", json!({"ship":"upkeep"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("queued is waiting behind upkeep's heavy job holder"),
+        "{text}"
+    );
+    assert!(bearings["capacity_waits"][0]["behind"]["unhealthy"].is_null());
+    laptop.ok("upkeep", "job.cancel", json!({"id":"queued"}));
+    laptop.ok("upkeep", "job.cancel", json!({"id":"holder"}));
+}
+
+#[test]
+fn a_long_wait_behind_an_orphaned_heavy_job_alerts_the_owner() {
+    let (_temp, laptop, _mac, ssh) = fixture();
+    laptop.ship("upkeep");
+    assert!(
+        laptop
+            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .status
+            .success()
+    );
+    let (_home, supervisor) = queued_behind_a_holder(&laptop);
+    // The supervisor dies under the payload it was watching.
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    laptop.pass("upkeep", &ssh);
+    let raised = capacity_alerts(&laptop, "upkeep");
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(raised[0].contains("looks unhealthy"), "{raised:?}");
+    assert!(raised[0].contains("orphaned"), "{raised:?}");
+    let holder = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
+    if let Some(pid) = holder["payload"]["pid"].as_i64() {
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+}
+
+#[test]
+fn a_long_wait_with_no_live_holder_alerts_the_owner() {
+    let (_temp, laptop, _mac, ssh) = fixture();
+    laptop.ship("upkeep");
+    assert!(
+        laptop
+            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .status
+            .success()
+    );
+    let (_home, supervisor) = queued_behind_a_holder(&laptop);
+    let holder = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
+    let payload = holder["payload"]["pid"].as_i64();
+    // Nothing runs for the holder any more, so nothing holds capacity.
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    if let Some(pid) = payload {
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    laptop.pass("upkeep", &ssh);
+    let raised = capacity_alerts(&laptop, "upkeep");
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(
+        raised[0].contains("nothing live holds capacity"),
+        "{raised:?}"
+    );
+}
