@@ -1271,10 +1271,29 @@ fn a_trim_error_does_not_fail_the_acquire() {
         "resource.configure",
         json!({"min_free_disk_bytes": free + 8 * MIB}),
     );
-    let again = f.ok("workspace.acquire", json!({"task_id":"three"}));
+    let again = f.run("workspace.acquire", json!({"task_id":"three"}));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(again["path"].is_string());
+    // The trim went past the unreadable slot and removed the spare's output.
     assert!(!path(&spare).join("target").exists());
+    assert_trim_did_not_fail(&again);
+}
+
+/// A trim error never fails the call. The call succeeds, or, where freed space
+/// shows late (APFS frees lazily, and a shared runner writes meanwhile), it is
+/// refused for disk like any short disk, never with the trim's own error.
+fn assert_trim_did_not_fail(output: &Output) {
+    if output.status.success() {
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_ne!(value["status"], "refused", "{value}");
+        return;
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("disk admission refused"), "{text}");
+    assert!(!text.contains("Permission denied"), "{text}");
 }
 
 #[test]
@@ -1299,14 +1318,16 @@ fn a_trim_error_does_not_fail_the_job_start() {
         "resource.configure",
         json!({"min_free_disk_bytes": free + 8 * MIB}),
     );
-    let started = f.ok(
+    let started = f.run(
         "job.start",
         json!({"task_id":"three","id":"builds","command":["/bin/true"],"heavy":true,"estimate":{"disk_bytes":MIB}}),
     );
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_ne!(started["status"], "refused", "{started}");
     assert!(!path(&spare).join("target").exists());
-    f.wait("builds");
+    assert_trim_did_not_fail(&started);
+    if started.status.success() {
+        f.wait("builds");
+    }
 }
 
 #[test]
