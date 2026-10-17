@@ -2486,3 +2486,68 @@ fn a_refresh_whose_directory_cannot_be_read_drops_nothing() {
     );
     assert!(listed_ships(&laptop, "liaison").contains(&"server".to_owned()));
 }
+
+/// Make a ship's home unreadable by putting a folder where its database is.
+fn make_unreadable(machine: &Machine, ship: &str) {
+    let database = machine.folder(ship).join("privateer.sqlite");
+    let _ = fs::remove_file(&database);
+    fs::create_dir_all(&database).unwrap();
+}
+
+#[test]
+fn an_unreadable_home_on_the_linked_machine_drops_no_ship_here() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    mac.ship("server");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    assert!(listed_ships(&laptop, "liaison").contains(&"server".to_owned()));
+
+    make_unreadable(&mac, "server");
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+
+    let server = laptop.ok("liaison", "ship.show", json!({"name": "server"}));
+    assert_eq!(
+        server["location"],
+        json!({"peer": "machine-mac"}),
+        "{server}"
+    );
+}
+
+#[test]
+fn an_unreadable_home_here_drops_no_ship_on_the_linked_machine() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    let before = mac.ok("fitforge", "ship.show", json!({"name": "scout"}));
+    assert_eq!(before["location"]["peer"], "machine-laptop", "{before}");
+
+    make_unreadable(&laptop, "scout");
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+
+    let after = mac.ok("fitforge", "ship.show", json!({"name": "scout"}));
+    assert_eq!(after["location"], before["location"], "{after}");
+}
+
+#[test]
+fn a_directory_without_the_complete_flag_drops_nothing() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    mac.ship("server");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+
+    // An older peer's reply: the same directory, with no complete flag.
+    let older = remote_ssh_with(&mac, "older-ssh", r#"| sed 's/"complete":[a-z]*,//'"#);
+    mac.ok("fitforge", "ship.retire", json!({"name": "server"}));
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&older));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+
+    let server = laptop.ok("liaison", "ship.show", json!({"name": "server"}));
+    assert_eq!(
+        server["location"],
+        json!({"peer": "machine-mac"}),
+        "{server}"
+    );
+}
