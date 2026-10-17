@@ -245,6 +245,16 @@ fn classify(log: &str) -> Option<RouteFailure> {
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 native_error = Some(text);
             }
+        } else if event["event"] == "result" && event["result"]["status"] != "SUCCESS" {
+            // AGY ends a run with a result event instead of Pi's message_end.
+            // Only a failed result carries an error; a SUCCESS reply is never a throttle.
+            let text = ["errorMessage", "error_message", "error", "response"]
+                .iter()
+                .find_map(|field| event["result"][field].as_str())
+                .filter(|text| !text.is_empty());
+            if let Some(text) = text {
+                native_error = Some(text.to_owned());
+            }
         }
     }
     if let Some(info) = rejected {
@@ -618,5 +628,32 @@ mod tests {
             Some(1_792_195_200_000 - now)
         );
         assert_eq!(reset_delay_ms("resets in 0 hours", now), None);
+    }
+
+    fn agy_result_log(status: &str, response: &str) -> String {
+        serde_json::to_string(&json!({
+            "event":"result",
+            "result":{"status":status,"response":response,"num_turns":1}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn agy_result_quota_error_is_a_short_throttle() {
+        let failure = classify(&agy_result_log(
+            "ERROR",
+            "429 quota exceeded; retry-after: 120",
+        ))
+        .unwrap();
+        // Not a stated free allowance, so it keeps the doubling schedule (record ignores
+        // the reset hint unless the failure is an allowance) and covers only its model.
+        assert!(!failure.allowance && !failure.account);
+        assert_eq!(failure.reset_ms, Some(120_000));
+    }
+
+    #[test]
+    fn agy_result_non_throttle_errors_and_successes_are_ignored() {
+        assert!(classify(&agy_result_log("ERROR", "permission denied")).is_none());
+        assert!(classify(&agy_result_log("SUCCESS", "429 quota in the reply text")).is_none());
     }
 }
