@@ -55,9 +55,15 @@ impl Machine {
 
     /// One request to this machine's gateway, as a linking machine sends it.
     fn gateway(&self, command: &str, args: Value) -> Value {
+        self.gateway_with(command, args, &[])
+    }
+
+    /// The same, with extra environment for the gateway process.
+    fn gateway_with(&self, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
         use std::io::{BufRead, Write};
         let mut child = self
             .command("fitforge", &["gateway"], None)
+            .envs(env.iter().copied())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -1674,6 +1680,95 @@ fn a_ship_created_on_a_linked_machine_lives_only_there() {
     assert!(!ships(&mac, "fitforge").to_string().contains("nearby"));
 }
 
+/// The unit a ship's dispatcher was installed with under `machine`'s home.
+fn unit_text(machine: &Machine, ship: &str) -> String {
+    let dir = machine.root.join(".config/systemd/user");
+    let mut units = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("privateer-{ship}-")))
+        });
+    let unit = units.next().unwrap_or_else(|| panic!("no unit for {ship}"));
+    fs::read_to_string(unit).unwrap()
+}
+
+#[test]
+fn a_ship_created_for_another_machine_records_the_login_shell_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    // The gateway's own PATH is bare; its login shell knows where harnesses live.
+    // The fake shell prints only PATH, so nothing else from it can be recorded.
+    let login_bin = mac.root.join("login-bin");
+    let shell = mac.root.join("login-shell");
+    fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nprintf %s '{}:/usr/bin:/bin'\n",
+            login_bin.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let systemctl = mac.root.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let service = [
+        ("PRIVATEER_SERVICE", "systemd"),
+        ("PRIVATEER_SYSTEMCTL", systemctl.to_str().unwrap()),
+        ("SHELL", shell.to_str().unwrap()),
+    ];
+
+    let response = mac.gateway_with(
+        "ship.create",
+        json!({"name": "bench", "from_machine": "laptop", "created_by": "captain", "harness": "codex"}),
+        &service,
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    let unit = unit_text(&mac, "bench");
+    assert!(
+        unit.contains(&login_bin.display().to_string()),
+        "a gateway-made unit records the login shell's PATH:\n{unit}"
+    );
+    // The gateway's own PATH is still first.
+    assert!(
+        unit.contains(&format!(
+            "PATH={}:/usr/bin:/bin",
+            mac.root.join("bin").display()
+        )),
+        "{unit}"
+    );
+
+    // A ship made here, with no machine, records only this process's PATH.
+    let local = laptop
+        .command(
+            "liaison",
+            &[
+                "ship.create",
+                "--json",
+                r#"{"name":"nearby","harness":"codex"}"#,
+            ],
+            Some(&mac_ssh),
+        )
+        .envs(service.iter().copied())
+        .output()
+        .unwrap();
+    assert!(local.status.success(), "{}", text(&local));
+    let unit = unit_text(&laptop, "nearby");
+    assert!(!unit.contains("login-bin"), "{unit}");
+    assert!(
+        unit.contains(&format!(
+            "PATH={}:/usr/bin:/bin",
+            laptop.root.join("bin").display()
+        )),
+        "{unit}"
+    );
+}
+
 #[test]
 fn only_an_agent_that_may_spawn_creates_a_ship_on_a_linked_machine() {
     let (_temp, laptop, mac, _ssh) = fixture();
@@ -2007,56 +2102,35 @@ fn a_captain_reply_reaches_the_home_that_asked_across_the_link() {
 }
 
 #[test]
-fn a_captain_reply_refused_across_the_link_is_put_before_the_captain() {
+fn a_ship_reply_to_a_request_this_machine_never_held_still_reaches_the_captain() {
     let (_temp, laptop, mac, ssh) = fixture();
-    laptop.ship("rig");
     let linked = link(&laptop, &mac, &ssh);
     assert!(linked.status.success(), "{}", text(&linked));
-    let asked = captain_sends(
-        &laptop,
-        "rig",
-        &ssh,
-        json!({"to": "fitforge", "kind": "request", "body": "Upload build 12?"}),
+    // The captain asks fitforge from the Mac itself, so the request is
+    // written only there; fitforge's answer closes it there.
+    let asked = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "captain", "to": "fitforge", "kind": "request", "body": "Upload build 12?"}),
     );
-    assert!(asked.status.success(), "{}", text(&asked));
-    let asked: Value = serde_json::from_slice(&asked.stdout).unwrap();
     let answered = mac.ok(
         "fitforge",
         "mail.send",
         json!({"from": "fitforge", "to": "captain", "kind": "reply",
-            "correlation": asked["id"], "body": "Yes, ship it"}),
+            "correlation": asked["id"], "body": "Yes, uploaded"}),
     );
+    let request = mac.ok("fitforge", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(request["state"], "answered", "{request}");
 
-    // Nothing here holds the request any more, so the reply cannot close it.
-    let home: String = rusqlite::Connection::open(laptop.registry())
-        .unwrap()
-        .query_row("SELECT home FROM ships WHERE name='rig'", [], |r| r.get(0))
-        .unwrap();
-    let database = PathBuf::from(home).join("privateer.sqlite");
-    rusqlite::Connection::open(&database)
-        .unwrap()
-        .execute(
-            "DELETE FROM mail WHERE id=?1",
-            [asked["id"].as_str().unwrap()],
-        )
-        .unwrap();
+    // The captain's home here reads the answer, not a refusal of it.
     let pass = laptop.pass("liaison", &ssh);
-    assert_eq!(pass["machines"][0]["refused"], 1, "{pass}");
-
-    let notices: Vec<Value> = captain_mail(&laptop, "liaison")
-        .into_iter()
-        .filter(|m| m["kind"] == "notice")
-        .collect();
-    assert_eq!(notices.len(), 1, "{notices:?}");
-    assert_eq!(notices[0]["payload"]["refused"]["id"], answered["id"]);
-    assert_eq!(notices[0]["payload"]["refused"]["from"], "fitforge");
-    assert!(
-        notices[0]["payload"]["refused"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("unknown request"),
-        "{notices:?}"
-    );
+    assert_eq!(pass["machines"][0]["delivered"], 1, "{pass}");
+    assert_eq!(pass["machines"][0]["refused"], 0, "{pass}");
+    let inbox = captain_mail(&laptop, "liaison");
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert_eq!(inbox[0]["id"], answered["id"]);
+    assert_eq!(inbox[0]["kind"], "reply");
+    assert_eq!(inbox[0]["body"], "Yes, uploaded");
 }
 
 #[test]
@@ -2550,4 +2624,52 @@ fn a_directory_without_the_complete_flag_drops_nothing() {
         json!({"peer": "machine-mac"}),
         "{server}"
     );
+}
+
+#[test]
+fn mail_closing_requests_the_desk_never_held_reaches_the_captain() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    // scout asks the captain while the desk is still here, then the desk moves.
+    let early = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Merge PR 7?"}),
+    );
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    // The captain asks scout from the laptop, not at the desk; scout answers,
+    // and withdraws its earlier request. Both requests live only here.
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "reply",
+               "correlation": asked["id"], "body": "Rotated"}),
+    );
+    laptop.ok(
+        "scout",
+        "mail.withdraw",
+        json!({"id": early["id"], "reason": "PR 7 merged"}),
+    );
+
+    // The desk takes both and puts neither before the captain as a refusal.
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 2, "{pass}");
+    let inbox = captain_mail(&mac, "fitforge");
+    let kinds: Vec<(&str, &str)> = inbox
+        .iter()
+        .map(|m| (m["kind"].as_str().unwrap(), m["body"].as_str().unwrap()))
+        .collect();
+    assert_eq!(kinds, [("reply", "Rotated"), ("notice", "PR 7 merged")]);
+    for (id, state) in [(&asked["id"], "answered"), (&early["id"], "withdrawn")] {
+        let request = laptop.ok("scout", "mail.show", json!({"id": id}));
+        assert_eq!(request["state"], state, "{request}");
+    }
 }

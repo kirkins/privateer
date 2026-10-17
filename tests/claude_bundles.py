@@ -5,6 +5,8 @@ HOME, CLAUDE_CONFIG_DIR, XDG and PRIVATEER_FLEET."""
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,35 @@ from native import handle
 SESSION = '00000000-0000-4000-8000-000000000001'
 ATTENDED = str(ROOT / 'plugins/attended-claude')
 
+# Option rows as Claude Code's --help lists them, keyed by the flag each declares.
+CLAUDE_ROWS = {
+    '--setting-sources': '  --setting-sources <sources>           Comma-separated list of setting sources',
+    '--strict-mcp-config': '  --strict-mcp-config                   Only use MCP servers from --mcp-config',
+    '--settings': '  --settings <file-or-json>             Path to a settings JSON file or a JSON string',
+    '--plugin-dir': '  --plugin-dir <path>                   Load a plugin from a directory or .zip',
+    '--print': '  -p, --print                           Print response and exit',
+    '--add-dir': '  --add-dir <directories...>            Additional directories to allow tool access to',
+    '--resume': '  -r, --resume [value]                  Resume a conversation by session ID',
+}
+
+
+def native_on_path(name):
+    """The CLI on PATH, unless it is a #! wrapper: a wrapper can run a state-changing
+    activation (for example `mise use -g`), so the installed-CLI checks never run one."""
+    found = shutil.which(name)
+    if found is None:
+        return None
+    with open(found, 'rb') as stream:
+        return None if stream.read(2) == b'#!' else found
+
+
+def claude_help(omit=(), extra=()):
+    rows = [row for flag, row in CLAUDE_ROWS.items() if flag not in omit]
+    return '\n'.join(['Usage: claude [options] [command] [prompt]', '', 'Options:', *rows, *extra]) + '\n'
+
+
+# Resolved before setUp isolates PATH to the fake claude.
+INSTALLED_CLAUDE = native_on_path('claude')
 
 class ClaudeBundles(unittest.TestCase):
     def setUp(self):
@@ -66,9 +97,12 @@ class ClaudeBundles(unittest.TestCase):
     def preflight(self, plan=None, args=('--print', '--', 'brief'), **kwargs):
         return claude_bundles.preflight(plan or self.plan(), ['claude', *args], cwd=self.repo, **kwargs)
 
-    def probe(self, version=b'2.1.300 (Claude Code)\n'):
-        return patch.object(claude_bundles.subprocess, 'run',
-                            return_value=subprocess.CompletedProcess([], 0, version, b''))
+    def probe(self, version=b'2.1.300 (Claude Code)\n', help_text=None):
+        """Fake `claude` answering --version and --help, as the capability probe asks."""
+        help_text = claude_help() if help_text is None else help_text
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, help_text.encode() if argv[-1] == '--help' else version, b'')
+        return patch.object(bundles.subprocess, 'run', side_effect=run)
 
     def refuses(self, call):
         with self.probe() as probe, self.assertRaises(ValueError):
@@ -88,7 +122,7 @@ class ClaudeBundles(unittest.TestCase):
         self.assertEqual(argv[-7:], ['--print', '--model', 'exact', '--add-dir', str(self.ledger), '--', 'brief'])
         self.assertEqual(empty[:4], ['claude', *claude_bundles.FLAGS])
         self.assertNotIn('--plugin-dir', empty)
-        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(probe.call_count, 3)  # --version twice, --help once (cached)
         self.settings({})
         with self.probe():
             self.assertNotIn('--settings', self.preflight(self.plan([])))
@@ -160,7 +194,7 @@ class ClaudeBundles(unittest.TestCase):
             self.assertIn(SESSION, self.preflight(args=['--resume', SESSION, '--', 'brief']))
         self.refuses(lambda: self.preflight(args=['--resume', SESSION, '--', 'brief'], attended=True))
 
-    def test_version_pin_exact_binary_and_plan_kind(self):
+    def test_plan_kind_and_wrapper_refuse(self):
         del self.registry['claude_version']
         with self.assertRaises(ValueError):
             self.plan()
@@ -168,10 +202,39 @@ class ClaudeBundles(unittest.TestCase):
         pi_plan = bundles.plan(self.registry, [], 'crew')
         self.registry['claude_version'] = '2.1.300'
         self.refuses(lambda: self.preflight(pi_plan))
-        with self.probe(b'2.1.301 (Claude Code)\n'), self.assertRaises(ValueError):
-            self.preflight()
         self.binary.write_text('#!/bin/bash\nmise use -g claude\n')
         self.refuses(self.preflight)
+
+    def test_version_is_a_record_not_a_pin_flags_are(self):
+        # The registry's claude_version no longer has to match what is installed.
+        for version in (b'2.1.300 (Claude Code)\n', b'2.1.301 (Claude Code)\n', b'3.0.0 (Claude Code)\n'):
+            with self.subTest(version=version), self.probe(version):
+                self.assertIn('--strict-mcp-config', self.preflight())
+
+    def test_missing_flag_refuses_and_names_it(self):
+        for missing in ('--strict-mcp-config', '--setting-sources', '--plugin-dir', '--print'):
+            with self.subTest(missing=missing):
+                directory = self.base / f'without-{missing.strip("-")}'
+                directory.mkdir()
+                (directory / 'claude').write_bytes(b'\x7fELFfixture')
+                (directory / 'claude').chmod(0o700)
+                env = {**os.environ, 'PATH': str(directory)}
+                with self.probe(help_text=claude_help(omit=(missing,))), \
+                        self.assertRaisesRegex(ValueError, f'lacks bounded-loading flags: {re.escape(missing)}$'):
+                    claude_bundles.preflight(self.plan(), ['claude', '--print', '--', 'brief'], cwd=self.repo, env=env)
+
+    def test_flag_named_only_in_a_description_does_not_count(self):
+        help_text = claude_help(omit=('--settings',), extra=['  --model <model>  Model, not --settings'])
+        with self.probe(help_text=help_text), self.assertRaisesRegex(ValueError, '--settings'):
+            self.preflight()
+
+    @unittest.skipUnless(INSTALLED_CLAUDE, 'no Claude Code on PATH')
+    def test_installed_claude_declares_bounded_flags(self):
+        # Reads the real installed Claude's --version and --help only.
+        binary = INSTALLED_CLAUDE
+        version = bundles.require_flags(binary, dict(os.environ), self.repo, 'Claude Code', claude_bundles.NEEDED)
+        self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+$')
+        print(f'verified installed Claude Code {version} at {binary}', file=sys.stderr)
 
     def test_native_adapter_unbounded_unchanged_bounded_resume_and_attended_adapter(self):
         request = {'method': 'command', 'context': {'repo': str(self.repo), 'title': 'brief', 'control': {}},

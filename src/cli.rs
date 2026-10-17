@@ -1024,6 +1024,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             }
         }
     }
+    // Claude in Chrome drives the captain's own signed-in browser, and Claude
+    // may enable it for every session by default. A ship gets it only when its
+    // options say so; other hosted sessions are kept out of the browser, and
+    // the captain's own session keeps the captain's defaults.
+    if harness == "claude" && !chooses("--chrome") && !chooses("--no-chrome") {
+        if own_harness && options["chrome"] == true {
+            route.push("--chrome".to_owned());
+        } else if hosted {
+            route.push("--no-chrome".to_owned());
+        }
+    }
     let binary = if harness == "opencode-v2" {
         "opencode".to_owned()
     } else {

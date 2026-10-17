@@ -190,7 +190,7 @@ pub(crate) fn configure(store: &mut Store, args: Value) -> Result<Value> {
         .iter()
         .map(|b| b["ref"].clone())
         .collect();
-    let result = json!({"configured":true,"pi_version":"1.2.0","refs":refs});
+    let result = json!({"configured":true,"pi_version":registry["pi_version"],"refs":refs});
     store.audit("bundle.configure", &result)?;
     Ok(result)
 }

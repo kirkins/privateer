@@ -444,36 +444,6 @@ fn abort(args: &Value) -> Result<Value> {
     Ok(json!({"state": "aborted", "dispatcher": dispatcher}))
 }
 
-/// The PATH a dispatcher started here records: this process's own, then the
-/// login shell's, since a gateway reached over SSH has a bare PATH that
-/// would not find the harness.
-fn service_path() -> String {
-    let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    let login = std::env::var("SHELL")
-        .ok()
-        .filter(|shell| shell.starts_with('/'))
-        .and_then(|shell| {
-            Command::new(shell)
-                .args(["-lc", "printf %s \"$PATH\""])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-        })
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
-    for entry in login.iter().flat_map(std::env::split_paths) {
-        if !entries.contains(&entry) {
-            entries.push(entry);
-        }
-    }
-    std::env::join_paths(entries)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 fn git_quietly(command: &mut Command) -> &mut Command {
     command
         .stdin(Stdio::null())
@@ -523,7 +493,7 @@ fn begin(args: &Value) -> Result<Value> {
             "{ship}'s first mate uses the plugin {plugin}, which this machine does not have"
         );
     }
-    let path = service_path();
+    let path = crate::service::login_path();
     let harness = manifest["first_mate"]["manifest"]
         .as_str()
         .and_then(crate::bundled::harness);

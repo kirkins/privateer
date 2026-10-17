@@ -1,15 +1,17 @@
-"""Pi 1.2 bounded loader: supported flags plus the checks Pi 1.2.0 needs.
+"""Pi bounded loader: supported flags, and an installed Pi that declares them.
 Registry, selection and pins live in bundles.py.
 """
 import json
 import os
 from pathlib import Path
-import subprocess
 
-from bundles import PI_VERSION as VERSION, file_bytes, present, require, safe_path, validate_plan
+from bundles import file_bytes, present, require, require_flags, safe_path, validate_plan
 
 FLAGS = ["--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
          "--no-context-files", "--no-themes"]
+# Everything the bounded launch passes: the isolation flags, selected skills
+# and the explicit extension paths. Any installed Pi declaring these will do.
+NEEDED = [*FLAGS, "--skill", "-e"]
 
 
 def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
@@ -68,10 +70,7 @@ def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
         require(not arg.startswith(('-e', '-c', '-r', '-a')))
         clean.append(arg)
         i += 1
-    probe = subprocess.run([binary, '--version'], env=env, cwd=cwd,
-                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=5, check=False)
-    require(probe.returncode == 0 and probe.stdout.strip() == VERSION.encode())
+    require_flags(binary, env, cwd, 'Pi', NEEDED)
     loaded = [argv[0], *FLAGS]
     for item in value['integrations']['extensions']:
         loaded.extend(['-e', item['path']])

@@ -777,7 +777,7 @@ fn replay_after_release_does_not_acquire_a_new_workspace_and_retry_stays_pinned(
     );
     assert_eq!(f.acquire("one")["lease_id"], new["lease_id"]);
     assert!(
-        f.ok("job.list", json!({}))
+        f.ok("job.list", json!({}))["jobs"]
             .as_array()
             .unwrap()
             .iter()
@@ -872,7 +872,7 @@ fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
         .success()
     );
     assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
-    assert_eq!(f.ok("job.list", json!({})), json!([]));
+    assert_eq!(f.ok("job.list", json!({}))["jobs"], json!([]));
 }
 
 #[test]

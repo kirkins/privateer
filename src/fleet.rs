@@ -256,7 +256,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         Caller::Agent { actor } => Some(actor.clone()),
         Caller::Operator => None,
     };
-    create_here(store, args, template, creator)
+    create_here(store, args, template, creator, None)
 }
 
 /// Ask a linked machine to create a ship in its own fleet. Authority is
@@ -384,16 +384,27 @@ pub(crate) fn create_for_machine(conn: &Connection, from: &str, args: &Value) ->
         object.remove("created_by");
     }
     let creator = (created_by != "captain").then(|| created_by.to_owned());
-    create_here(&mut store, &args, None, creator)
+    // The gateway is reached over SSH, where this process's PATH is bare;
+    // the unit records the login shell's, as a move's dispatcher does.
+    create_here(
+        &mut store,
+        &args,
+        None,
+        creator,
+        Some(crate::service::login_path()),
+    )
 }
 
 /// Create a ship in this machine's fleet. `template` lends the new ship its
 /// harness, model and hosting; `creator` is recorded, or the captain.
+/// `service_path` is the PATH the dispatcher's unit records, or this
+/// process's own when `None`.
 fn create_here(
     store: &mut Store,
     args: &Value,
     template: Option<String>,
     creator: Option<String>,
+    service_path: Option<String>,
 ) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
@@ -513,7 +524,10 @@ fn create_here(
     register(&ship, &home, &created_by)?;
     let child = Store::open(&home)?;
     link(&child, &ship)?;
-    let dispatcher = crate::service::ensure(&home, &ship)?;
+    let dispatcher = match service_path {
+        Some(path) => crate::service::ensure_with_path(&home, &ship, &path)?,
+        None => crate::service::ensure(&home, &ship)?,
+    };
     let charter = child.charter(&ship)?;
     Ok(json!({"ship": ship, "folder": folder, "harness": harness,
         "actions": charter["actions"], "created_by": created_by, "dispatcher": dispatcher}))

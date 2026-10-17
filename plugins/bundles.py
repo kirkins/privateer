@@ -14,10 +14,10 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 
 from protocol import serve
 
-PI_VERSION = "1.2.0"
 NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 REF = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*@[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -28,11 +28,51 @@ CREDENTIAL_REF = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 CREDENTIAL_ENV = "PRIVATEER_CREDENTIAL_"
 MAX_FILES = 128
 MAX_BYTES = 2 * 1024 * 1024
+# Placeholder recorded in plans that carry no Pi version (Claude plans).
+NO_PI_VERSION = "0.0.0"
+# An option row of a CLI's --help: exactly two spaces, then the flag spec.
+OPTION_ROW = re.compile(r"  (-\S.*)")
+FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)")
+# Options declared by each installed CLI, keyed by (path, reported version).
+_OPTIONS = {}
 
 
 def require(condition):
     if not condition:
         raise ValueError("unsupported bounded resources")
+
+
+def declared_options(help_text):
+    """Flag names in a CLI's option table. Only the spec before a column gap
+    counts, so flags named inside descriptions never satisfy a requirement."""
+    names = set()
+    for line in help_text.splitlines():
+        match = OPTION_ROW.fullmatch(line.rstrip())
+        if match:
+            names.update(FLAG.findall(re.split(r"\s{2,}", match.group(1), maxsplit=1)[0]))
+    return names
+
+
+def require_flags(binary, env, cwd, label, needed):
+    """Refuse unless the installed CLI declares every needed flag. Asks the
+    binary itself (--version, then --help), never reads its config or
+    credentials. Results are cached per executable path and version for the
+    run, so a version string alone never decides support. Returns the version."""
+    run = {"env": env, "cwd": cwd, "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+           "stderr": subprocess.PIPE, "timeout": 10, "check": False}
+    probe = subprocess.run([binary, "--version"], **run)
+    words = probe.stdout.decode("utf-8", "replace").split()[:1]
+    require(probe.returncode == 0 and bool(words) and SEMVER.fullmatch(words[0]))
+    version = words[0]
+    key = (str(binary), version)
+    if key not in _OPTIONS:
+        helped = subprocess.run([binary, "--help"], **run)
+        require(helped.returncode == 0)
+        _OPTIONS[key] = declared_options(helped.stdout.decode("utf-8", "replace"))
+    missing = [flag for flag in needed if flag not in _OPTIONS[key]]
+    if missing:
+        raise ValueError(f"installed {label} {version} lacks bounded-loading flags: {', '.join(missing)}")
+    return version
 
 
 def keys(value, expected):
@@ -194,8 +234,12 @@ def validate_registry(value):
     require(isinstance(value, dict))
     keys(value, ('schema_version', 'pi_version', 'integrations', 'bundles',
                  *(('claude_version',) if 'claude_version' in value else ())))
-    require(type(value['schema_version']) is int and value['schema_version'] == 1 and value['pi_version'] == PI_VERSION
-            and isinstance(value.get('claude_version', '0.0.0'), str) and SEMVER.fullmatch(value.get('claude_version', '0.0.0')))
+    # Versions are records of what the registry was made with, not pins: the
+    # installed CLI must show the bounded-loading flags at launch instead.
+    require(type(value['schema_version']) is int and value['schema_version'] == 1
+            and isinstance(value['pi_version'], str) and SEMVER.fullmatch(value['pi_version'])
+            and isinstance(value.get('claude_version', '0.0.0'), str)
+            and SEMVER.fullmatch(value.get('claude_version', '0.0.0')))
     integration = value['integrations']
     # Explicit reviewed:true + extensions:[] means the operator asserts no
     # extension integrations are required. Omission is NOT that approval.
@@ -254,7 +298,7 @@ def plan(registry, selected, role, harness='pi'):
         result = claude_plan(registry, selected, skills)
     else:
         require(harness == 'pi')
-        result = {'schema_version': 1, 'pi_version': PI_VERSION, 'selection': selected,
+        result = {'schema_version': 1, 'pi_version': registry['pi_version'], 'selection': selected,
                   'integrations': registry['integrations'], 'skills': skills}
     # Only selected bundles' names and refs, and only when there are any, so
     # plans (and digests) without credentials are unchanged.
@@ -280,7 +324,7 @@ def validate_plan(value):
                for i in range(0, len(skills), 8)]
     for index, item in enumerate(bundles):
         item['ref'] = f'selected@{index}'
-    registry = {'schema_version': value['schema_version'], 'pi_version': value.get('pi_version', PI_VERSION),
+    registry = {'schema_version': value['schema_version'], 'pi_version': value.get('pi_version', NO_PI_VERSION),
                 'integrations': value.get('integrations', {'reviewed': True, 'extensions': []}), 'bundles': bundles}
     if claude:
         registry['claude_version'] = value['claude_version']

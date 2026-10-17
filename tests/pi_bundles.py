@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,42 @@ sys.path.insert(0, str(ROOT / 'plugins'))
 import bundles
 import pi_bundles
 from native import handle
+
+# Option rows as Pi's --help lists them, keyed by the flag each row declares.
+PI_ROWS = {
+    '--no-extensions': '  --no-extensions, -ne           Disable extension discovery and built-in extensions',
+    '--no-mcp': '  --no-mcp                       Disable built-in MCP support',
+    '--no-skills': '  --no-skills, -ns               Disable skills discovery and loading',
+    '--no-prompt-templates': '  --no-prompt-templates, -np     Disable prompt template discovery and loading',
+    '--no-context-files': '  --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery',
+    '--no-themes': '  --no-themes                    Disable theme discovery and loading',
+    '--skill': '  --skill <path>                 Load a skill file or directory (can be used multiple times)',
+    '-e': '  --extension, -e <path>         Load an extension file or builtin:<name>',
+    '--provider': '  --provider <name>              Provider to search for --model (requires --model)',
+}
+
+
+def native_on_path(name):
+    """The CLI on PATH, unless it is a #! wrapper: a wrapper can run a state-changing
+    activation (for example `mise use -g`), so the installed-CLI checks never run one."""
+    found = shutil.which(name)
+    if found is None:
+        return None
+    with open(found, 'rb') as stream:
+        return None if stream.read(2) == b'#!' else found
+
+
+def pi_help(omit=(), extra=()):
+    rows = [row for flag, row in PI_ROWS.items() if flag not in omit]
+    return '\n'.join(['pi - fixture', 'Usage:', '  pi [options]', '', 'Options:', *rows, *extra]) + '\n'
+
+
+def fake_pi(version=b'1.3.0\n', help_text=None):
+    """Fake `pi`: answers --version and --help only, as the capability probe asks."""
+    help_text = pi_help() if help_text is None else help_text
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, help_text.encode() if argv[-1] == '--help' else version, b'')
+    return patch.object(bundles.subprocess, 'run', side_effect=run)
 
 
 class Bundles(unittest.TestCase):
@@ -54,7 +92,7 @@ class Bundles(unittest.TestCase):
                                  cwd=self.repo, env=self.env, **kwargs)
 
     def probe(self):
-        return patch.object(pi_bundles.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'1.2.0\n', b''))
+        return fake_pi()
 
     def test_selected_only_plan_and_explicit_empty(self):
         plan = self.plan()
@@ -73,7 +111,7 @@ class Bundles(unittest.TestCase):
             bundles.plan(self.registry, [], 'nested')
 
     def test_invalid_registry_schema_and_unsupported_resources(self):
-        mutations = [lambda r: r.update(schema_version=2), lambda r: r.update(pi_version='1.2.1'),
+        mutations = [lambda r: r.update(schema_version=2), lambda r: r.update(pi_version='latest'),
                      lambda r: r['integrations'].pop('reviewed'), lambda r: r['integrations'].update(reviewed=False),
                      lambda r: r.update(credentials={'token': 'SENTINEL'}),
                      lambda r: r['bundles'][0].update(mcp={'url': 'http://invalid'}),
@@ -178,7 +216,7 @@ class Bundles(unittest.TestCase):
         self.assertIn('--no-mcp', argv)
         self.assertIn('--skill', argv)
         self.assertNotIn('--skill', empty)
-        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(probe.call_count, 3)  # --version twice, --help once (cached)
 
     def test_only_explicit_approved_integrations_and_privateer_mail_load(self):
         ext = self.base / 'approved.mjs'
@@ -319,10 +357,48 @@ class Bundles(unittest.TestCase):
                 self.preflight(args=['pi', *args, '--', 'brief'])
             probe.assert_not_called()
 
-    def test_wrong_version_and_activation_wrapper_refuse(self):
-        with patch.object(pi_bundles.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'1.3.0\n', b'')):
-            with self.assertRaises(ValueError):
-                self.preflight()
+    def test_version_is_not_a_pin_flags_are(self):
+        # Any reported version runs when the installed Pi declares every flag.
+        for version in (b'1.2.0\n', b'1.3.0\n', b'1.4.2\n'):
+            with self.subTest(version=version), fake_pi(version):
+                self.assertIn('--no-mcp', self.preflight())
+
+    def test_missing_flag_refuses_and_names_it(self):
+        # One binary per case: capabilities are cached per path and version.
+        for missing in ('--no-mcp', '-e', '--skill', '--no-themes'):
+            with self.subTest(missing=missing):
+                directory = self.base / f'without-{missing.strip("-")}'
+                directory.mkdir()
+                (directory / 'pi').write_bytes(b'\x7fELFfixture')
+                (directory / 'pi').chmod(0o700)
+                env = {**self.env, 'PATH': str(directory)}
+                with fake_pi(help_text=pi_help(omit=(missing,))), \
+                        self.assertRaisesRegex(ValueError, f'lacks bounded-loading flags: {re.escape(missing)}$'):
+                    pi_bundles.preflight(self.plan(), ['pi', '--print', '--mode', 'json', '--', 'brief'],
+                                         cwd=self.repo, env=env)
+
+    def test_flag_named_only_in_a_description_does_not_count(self):
+        help_text = pi_help(omit=('--no-mcp',), extra=['  --provider <name>  Provider, see --no-mcp in docs'])
+        with fake_pi(help_text=help_text), self.assertRaisesRegex(ValueError, '--no-mcp'):
+            self.preflight()
+
+    def test_capabilities_cached_per_path_and_version(self):
+        with self.probe() as probe:
+            self.preflight()
+            self.preflight()
+        # --version each run, --help once for this path and version.
+        self.assertEqual(probe.call_count, 3)
+
+    def test_installed_pi_declares_bounded_flags(self):
+        # Reads the real installed Pi's --version and --help only, offline. A #! wrapper skips.
+        binary = native_on_path('pi')
+        if binary is None:
+            self.skipTest('no native Pi on PATH (a #! wrapper is never run)')
+        version = bundles.require_flags(binary, {**os.environ, 'PI_OFFLINE': '1'}, self.repo, 'Pi', pi_bundles.NEEDED)
+        self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+$')
+        print(f'verified installed Pi {version} at {binary}', file=sys.stderr)
+
+    def test_activation_wrapper_refuses(self):
         self.binary.write_text('#!/bin/sh\nmise use pi\n')
         with self.probe() as probe, self.assertRaises(ValueError):
             self.preflight()

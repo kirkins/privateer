@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in actual installed Pi 1.2 CLI inventories, no inference or credentials.
+"""Opt-in actual installed Pi CLI inventories, no inference or credentials.
 
 Usage: python3 tests/pi_bundles_native.py /absolute/native/pi
 Only this test sets a disposable PI_CODING_AGENT_DIR. HOME is never replaced.
@@ -22,6 +22,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'plugins'))
 import bundles
+import pi_bundles
 
 NATIVE = Path(sys.argv.pop(1)).absolute() if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
 SENTINEL = 'UNSELECTED_SECRET_SENTINEL_82d9'
@@ -71,6 +72,10 @@ class Native(unittest.TestCase):
             raise unittest.SkipTest('pass an exact installed native Pi binary to opt in; not inventory evidence')
         if NATIVE.name != 'pi' or not NATIVE.is_file():
             raise RuntimeError('exact native Pi required')
+        # The version this run actually qualifies: the native binary's own report,
+        # after it declares every bounded-loading flag.
+        cls.version = bundles.require_flags(str(NATIVE), {'HOME': os.environ['HOME'], 'PATH': os.environ['PATH'],
+                                                          'PI_OFFLINE': '1'}, ROOT, 'Pi', pi_bundles.NEEDED)
 
     def setUp(self):
         # Keep the fixture below an owned, non-sticky ancestor. In an unprivileged
@@ -98,7 +103,7 @@ class Native(unittest.TestCase):
         shutil.copyfile(self.client, Path(self.selected['root']) / 'client.py')
         self.selected['sha256'] = bundles.tree_digest(self.selected['root'])
         inspector = ROOT / 'tests/fixtures/pi-bundles/inventory.mjs'
-        self.registry = {'schema_version': 1, 'pi_version': '1.2.0',
+        self.registry = {'schema_version': 1, 'pi_version': self.version,
                          'integrations': {'reviewed': True, 'extensions': [
                              {'path': str(inspector), 'sha256': hashlib.sha256(inspector.read_bytes()).hexdigest()}]},
                          'bundles': [{'ref': 'selected@1', 'roles': ['first_mate', 'crew'], 'skills': [self.selected]},
@@ -191,7 +196,7 @@ class Native(unittest.TestCase):
             self.assertFalse(b.result()['selected'])
         self.assertEqual(self.server.requests.count('/lookup'), 4)
         self.assertEqual(self.server.connections, 4, 'no additional/idle ambient MCP TCP connections')
-        print(json.dumps({'native_pi': '1.2.0', 'inventory': 'selected/empty/attended/hosted-crew/concurrent',
+        print(json.dumps({'native_pi': self.version, 'inventory': 'selected/empty/attended/hosted-crew/concurrent',
                           'ambient_mcp_connections': 0, 'api_calls': self.server.requests.count('/lookup')}))
 
     def test_required_extension_factory_failure_refuses_without_agent_turn(self):

@@ -439,6 +439,9 @@ args = sys.argv[1:]
 if args == ["--version"]:
     print("2.1.300 (Claude Code)")
     sys.exit(0)
+if args == ["--help"]:
+    print("Options:\n  --setting-sources <sources>  Comma-separated list of setting sources\n  --strict-mcp-config  Only use MCP servers from --mcp-config\n  --settings <file-or-json>  Path to a settings JSON file\n  --plugin-dir <path>  Load a plugin from a directory\n  -p, --print  Print response and exit")
+    sys.exit(0)
 with open({}, "a") as f:
     f.write(json.dumps(args) + "\n")
 flags = args[:args.index("--")]
