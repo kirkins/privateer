@@ -10,10 +10,10 @@ The first stage supports named/versioned **local skills and their supporting
 scripts/files**. Optional MCP servers and optional executable tool extensions
 are deferred: definitions containing those fields fail validation, rather than
 silently dropping them. The separate [stage-two offline MCP factory qualification](pi-mcp-stage2-qualification.md)
-adds test fixtures/design evidence only; it does not enable MCP in this registry. There is no credential broker or secret injection in
-this stage. Keep API adapters needing credentials disabled until their
-credential-reference/selected-client boundary is separately qualified. Never
-put credential values in bundles, prompts, argv, registry definitions or scripts.
+adds test fixtures/design evidence only; it does not enable MCP in this registry. A bundle
+may name [credentials](#credentials) its scripts need; a launch gets the path of
+each selected one's captain-stored file, never the value. Never put credential
+values in bundles, prompts, argv, registry definitions or scripts.
 
 ## Compatibility and custody
 
@@ -67,6 +67,7 @@ No registry is installed/enabled by shipping this code.
   "bundles": [{
     "ref": "local-lookup@1",
     "roles": ["first_mate", "crew"],
+    "credentials": [{"name": "BRAVE_API_KEY", "ref": "brave-search"}],
     "skills": [{
       "name": "local-lookup",
       "root": "/absolute/operator-reviewed/local-lookup",
@@ -101,7 +102,7 @@ or group/world-writable components (root-owned sticky temporary-directory
 ancestors are allowed for fixtures). Trees are limited to 128 entries/2 MiB; registry/selection/plan sizes
 are bounded. Pins are rechecked before native execution; drift anywhere in the
 approved registry refuses new selection, including explicit empty selection.
-There is no per-run directory or credential material to leak or clean up.
+There is no per-run directory to leak or clean up.
 
 A skill root contains `SKILL.md` and supporting scripts/files. For deterministic
 Pi-compatible validation this first stage accepts exactly `name` and
@@ -120,6 +121,56 @@ python3 plugins/bundles.py --digest /absolute/operator-reviewed/local-lookup
 The tree hash is SHA-256 of all files in relative POSIX-path order, each encoded
 as `relative-path + NUL + lowercase-sha256(file) + LF`. It covers supporting
 files, not external dependencies or arbitrary imports made by trusted code.
+
+## Credentials
+
+A bundle's optional `credentials` list holds names and refs only. `name` is
+the environment-safe variable stem (`[A-Z][A-Z0-9_]*`, at most 64), `ref` the
+stored credential (lowercase words joined by hyphens, at most 40). Any other
+field, such as an inline `value`, or a ref shaped unlike a short identifier
+refuses the registry. Two selected bundles may share a credential but cannot
+give one name two refs.
+
+The captain stores the secret, from the CLI only:
+
+```sh
+privateer credential.set --json '{"ref":"brave-search"}' < key.txt
+privateer credential.list --json '{}'
+privateer credential.remove --json '{"ref":"brave-search"}'
+```
+
+`credential.set` reads the value from stdin (one trailing newline dropped, at
+most 16 KiB), never from argv or JSON arguments, and refuses any argument but
+`ref`. It writes `<ref>` as a 0600 file, through a same-directory rename, in a
+0700 directory beside the fleet registry: `fleet.credentials` next to
+`PRIVATEER_FLEET`, else under `$XDG_STATE_HOME/privateer/`, else
+`~/.local/state/privateer/`. That is outside every home, repository and SQLite
+file. `credential.list` shows refs only. All three are operator commands:
+agents are refused, and RPC and `peer.call` refuse them since there is no
+stdin to read a secret from.
+
+At launch, `native_launch.py` checks each of the plan's refs before any native
+probe: the directory is 0700 and the file is a regular 0600 file this user owns,
+with a single link, and every path component passes the bundle-path checks (no
+symlinks, nothing group or world writable). A missing or wrongly moded ref
+refuses the launch. It then sets only
+`PRIVATEER_CREDENTIAL_<NAME>_FILE=<path>` for the run, Claude and Pi alike.
+The plan, its digest, argv and prompts carry names and refs, never the value
+or the file's content; a selected skill's script reads the file itself.
+
+Crew never inherit a parent's credentials: every job starts without any
+inherited `PRIVATEER_CREDENTIAL_*` variable, and each native launch scrubs them
+again before adding its own. A crew that needs one selects the bundle itself,
+as with bundles. The directory is resolved from the launch's environment the
+way the runtime resolves the fleet registry; a process serving another fleet
+through `--fleet` would look in the environment's, and refuse a ref missing
+there.
+
+**Honest limit.** The agent runs as the same OS user and can read the file:
+this keeps the key out of prompts, argv, logs, the repository, the registry
+and SQLite, but not out of the model's reach. A later stage may add a local
+proxy that adds the header itself, so the agent's environment never names the
+key. It is not built.
 
 ## Per-run native loader and fail-closed limits
 
@@ -169,9 +220,10 @@ launch-time drift checks, not immutable filesystem snapshots or protection from
 same-user concurrent mutation. Trusted integration imports/scripts can access
 other files/network and must be reviewed; the loader cannot sandbox them or
 redact arbitrary output from trusted/native code. No selected-MCP connection,
-credential resolution, or full real-profile/hosted production qualification is
-claimed. Bounded resume is intentionally unsupported rather than pretending old
-session context can be erased by changing today's inventory.
+credential brokering beyond the stored-file path above, or full
+real-profile/hosted production qualification is claimed. Bounded resume is
+intentionally unsupported rather than pretending old session context can be
+erased by changing today's inventory.
 
 ## Bounded Claude launches
 
@@ -279,7 +331,14 @@ timeout and oversized results are bounded/redacted. Temporary fixture cleanup is
 per-run and does not edit the real agent directory. Without an explicit binary,
 the native suite skips and must **not** be cited as inventory evidence.
 
+The deterministic suites and `tests/tool_bundles.rs` also check credentials:
+`credential.*` are operator-only and stdin-only with 0700/0600 modes, list
+shows refs only, a plan carries only selected bundles' names and refs, a launch
+gets only their `_FILE` paths, a missing, re-moded, moved or symlinked file
+refuses before any probe, inherited paths are scrubbed and no value appears in
+argv, the plan or the environment.
+
 A full attended Herdr terminal/production profile, selected MCP/deferred schemas,
-credential-bearing clients, malicious same-user code and paid-model completion
-are outside this first-stage evidence. No production deployment or merge is
+a real credential-bearing client, malicious same-user code and paid-model
+completion are outside this first-stage evidence. No production deployment or merge is
 implied by passing these fixtures.

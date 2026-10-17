@@ -203,6 +203,65 @@ class ClaudeBundles(unittest.TestCase):
                 self.refuses(lambda: native_launch.launch('claude', ['claude', *flags, '--', 'brief'],
                                                           bundles=self.plan(), attended=attended))
 
+    def store(self, ref, value=b'SENTINEL-SECRET'):
+        directory = self.base / 'fleet.credentials'
+        directory.mkdir(mode=0o700, exist_ok=True)
+        path = directory / ref
+        path.write_bytes(value)
+        path.chmod(0o600)
+        return path
+
+    def test_credentials_reach_only_their_own_launch_as_file_paths(self):
+        brave = {'name': 'BRAVE_API_KEY', 'ref': 'brave-search'}
+        self.registry['bundles'][0]['credentials'] = [brave]
+        self.registry['bundles'].append({'ref': 'other@1', 'roles': ['crew'], 'skills': [self.make_skill('other')],
+                                         'credentials': [{'name': 'OTHER_KEY', 'ref': 'other'}]})
+        # Names and refs only: an inline value or a value-shaped ref refuses.
+        for item in ({**brave, 'value': 'SENTINEL-SECRET'}, {'name': 'BRAVE_API_KEY', 'ref': 'BSA0123456789abcdef'},
+                     {'name': 'brave key', 'ref': 'brave-search'}, {'name': 'BRAVE_API_KEY', 'ref': 'x' * 41},
+                     {'name': 'BRAVE_API_KEY'}):
+            registry = json.loads(json.dumps(self.registry))
+            registry['bundles'][0]['credentials'] = [item]
+            with self.subTest(item=item), self.assertRaises(ValueError):
+                bundles.validate_registry(registry)
+        plan = self.plan()
+        self.assertEqual(plan['credentials'], [brave])
+        self.assertNotIn('credentials', self.plan([]))
+        self.assertNotIn('OTHER_KEY', json.dumps(plan))
+        path = self.store('brave-search')
+        self.store('other')
+        os.environ['PRIVATEER_CREDENTIAL_OTHER_KEY_FILE'] = str(self.base / 'fleet.credentials/other')
+
+        def launch(plan):
+            with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+                native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=plan)
+            return execute.call_args.args[1], execute.call_args.args[2]
+
+        argv, env = launch(plan)
+        self.assertEqual({k: v for k, v in env.items() if k.startswith('PRIVATEER_CREDENTIAL_')},
+                         {'PRIVATEER_CREDENTIAL_BRAVE_API_KEY_FILE': str(path)})
+        self.assertNotIn('SENTINEL-SECRET', json.dumps([argv, env, handle('claude', {
+            'method': 'command', 'options': {},
+            'context': {'repo': str(self.repo), 'title': 'brief', 'control': {}, 'tool_bundles': plan}})]))
+        # A parent's credential paths are never inherited, bounded or not.
+        _, env = launch(self.plan([]))
+        self.assertFalse([k for k in env if k.startswith('PRIVATEER_CREDENTIAL_')])
+        with patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('claude', ['claude', '--', 'brief'])
+        self.assertFalse([k for k in execute.call_args.args[2] if k.startswith('PRIVATEER_CREDENTIAL_')])
+        # Missing, wrongly moded, linked or exposed storage refuses before launch.
+        for breach, undo in ((lambda: path.chmod(0o640), lambda: path.chmod(0o600)),
+                             (lambda: path.rename(path.with_name('moved')), lambda: path.with_name('moved').rename(path)),
+                             (lambda: path.parent.chmod(0o750), lambda: path.parent.chmod(0o700)),
+                             (lambda: (path.rename(path.with_name('real')), path.symlink_to(path.with_name('real'))),
+                              lambda: (path.unlink(), path.with_name('real').rename(path)))):
+            breach()
+            with self.subTest(breach=breach), patch.object(native_launch.os, 'execvpe') as execute:
+                self.refuses(lambda: native_launch.launch('claude', ['claude', '--', 'brief'], bundles=plan))
+                execute.assert_not_called()
+            undo()
+        self.assertEqual(launch(plan)[1]['PRIVATEER_CREDENTIAL_BRAVE_API_KEY_FILE'], str(path))
+
 
 if __name__ == '__main__':
     unittest.main()

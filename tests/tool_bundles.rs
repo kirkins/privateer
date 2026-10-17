@@ -600,3 +600,98 @@ int main(int argc, char **argv) {{
     assert_ne!(changed, wake_digest);
     assert_eq!(recorded, changed);
 }
+
+#[test]
+fn credentials_are_the_captains_from_stdin_and_plans_carry_only_refs() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let (temp, mut store, mut config) = fixture();
+    let root = temp.path().canonicalize().unwrap();
+    let cli = |command: &str, args: Value, input: &[u8], agent: bool| -> (bool, String) {
+        let mut cli = support::command(env!("CARGO_BIN_EXE_privateer"));
+        cli.args([command, "--json", &args.to_string()])
+            .env("HOME", root.join("user"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if agent {
+            cli.env("PRIVATEER_ROLE", "agent")
+                .env("PRIVATEER_ACTOR", "ship");
+        }
+        let mut child = cli.spawn().unwrap();
+        // A refused command may exit before reading its stdin.
+        let _ = child.stdin.take().unwrap().write_all(input);
+        let output = child.wait_with_output().unwrap();
+        let text = [output.stdout, output.stderr].concat();
+        (output.status.success(), String::from_utf8(text).unwrap())
+    };
+    let brave = json!({"ref":"brave-search"});
+    let directory = root.join("fleet.credentials");
+    for (command, args) in [
+        ("credential.set", brave.clone()),
+        ("credential.list", json!({})),
+        ("credential.remove", brave.clone()),
+    ] {
+        let (ok, text) = cli(command, args, b"SENTINEL-SECRET\n", true);
+        assert!(!ok && text.contains("operator command"), "{text}");
+    }
+    assert!(!directory.exists());
+    // The secret comes from stdin alone: never JSON arguments, never empty.
+    let (ok, text) = cli(
+        "credential.set",
+        json!({"ref":"brave-search","value":"SENTINEL-SECRET"}),
+        b"",
+        false,
+    );
+    assert!(!ok && text.contains("stdin"), "{text}");
+    assert!(!cli("credential.set", brave.clone(), b"\n", false).0);
+    assert!(!cli("credential.set", json!({"ref":"Brave"}), b"x", false).0);
+    let (ok, text) = cli("credential.set", brave.clone(), b"SENTINEL-SECRET\n", false);
+    assert!(ok && !text.contains("SENTINEL"), "{text}");
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&directory), 0o700);
+    assert_eq!(mode(&directory.join("brave-search")), 0o600);
+    assert_eq!(
+        fs::read(directory.join("brave-search")).unwrap(),
+        b"SENTINEL-SECRET"
+    );
+    let (ok, text) = cli("credential.list", json!({}), b"", false);
+    assert!(ok, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"refs":["brave-search"]})
+    );
+    // Never over RPC or a peer: there is no stdin to read the secret from.
+    let error = dispatch(&mut store, "credential.list", json!({})).unwrap_err();
+    assert!(error.to_string().contains("captain's CLI"));
+    // A bundle names the ref; its selected plan carries the name and ref only.
+    config["bundles"][0]["credentials"] = json!([{"name":"BRAVE_API_KEY","ref":"brave-search"}]);
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    let selected = plan(&mut store, Some(json!(["fixture@1"]))).unwrap();
+    assert_eq!(
+        selected_plan(&selected)["credentials"],
+        json!([{"name":"BRAVE_API_KEY","ref":"brave-search"}])
+    );
+    assert!(!selected.to_string().contains("SENTINEL"));
+    assert!(
+        selected_plan(&plan(&mut store, Some(json!([]))).unwrap())
+            .get("credentials")
+            .is_none()
+    );
+    // An exposed directory refuses rather than listing or storing.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(!cli("credential.list", json!({}), b"", false).0);
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let (ok, text) = cli("credential.remove", brave.clone(), b"", false);
+    assert!(ok && text.contains("\"removed\":true"), "{text}");
+    assert!(!directory.join("brave-search").exists());
+    let (_, text) = cli("credential.list", json!({}), b"", false);
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"refs":[]})
+    );
+}
