@@ -259,10 +259,13 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
 }
 
 /// Ask a linked machine to create a ship in its own fleet. Authority is
-/// decided here, exactly as for a ship created here, before the machine is
-/// contacted, and held under this home's write lock until it answers, so a
-/// revoke committed first wins. The machine applies its own defaults: the
-/// requester's harness, model and hosting may not exist there.
+/// decided here, exactly as for a ship created here, in a short write
+/// transaction before the machine is contacted, so a revoke committed first
+/// wins. No lock is held across the call: it can outlast every other
+/// writer's wait, and the remote creation could not be undone by rolling
+/// back anyway. A revoke committed during the call is noted in the audit
+/// entry. The machine applies its own defaults: the requester's harness,
+/// model and hosting may not exist there.
 fn create_on_machine(store: &mut Store, machine: &str, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
@@ -279,12 +282,9 @@ fn create_on_machine(store: &mut Store, machine: &str, args: &Value) -> Result<V
             request[key] = value.clone();
         }
     }
-    let authority = match store.caller() {
-        Caller::Agent { .. } => Some(store.write_transaction()?),
-        Caller::Operator => None,
-    };
     let created_by = match store.caller() {
         Caller::Agent { actor } => {
+            let authority = store.write_transaction()?;
             let own = own_actions(store, actor)?;
             ensure!(
                 own.iter().any(|a| a == "spawn"),
@@ -295,21 +295,52 @@ fn create_on_machine(store: &mut Store, machine: &str, args: &Value) -> Result<V
                 // The machine would otherwise give the captain's defaults.
                 None => request["actions"] = json!(own),
             }
+            store.audit(
+                "ship.create.requested",
+                &json!({"ship": name, "machine": machine, "actions": request["actions"], "by": actor}),
+            )?;
+            authority.commit()?;
             actor.clone()
         }
-        Caller::Operator => "captain".into(),
+        Caller::Operator => {
+            store.audit(
+                "ship.create.requested",
+                &json!({"ship": name, "machine": machine, "by": "captain"}),
+            )?;
+            "captain".into()
+        }
     };
     request["created_by"] = json!(created_by);
-    let mut made = crate::machines::create_linked(machine, request)?;
-    store.audit(
-        "ship.created",
-        &json!({"ship": name, "machine": machine, "folder": made["folder"], "by": created_by}),
-    )?;
-    if let Some(authority) = authority {
-        authority.commit()?;
+    let mut made = match crate::machines::create_linked(machine, request) {
+        Ok(made) => made,
+        Err(error) => {
+            // A call that timed out here may still have created the ship there.
+            let failed = store.audit(
+                "ship.create.failed",
+                &json!({"ship": name, "machine": machine, "by": created_by, "error": format!("{error:#}")}),
+            );
+            return Err(match failed {
+                Ok(_) => error,
+                Err(audit) => {
+                    error.context(format!("recording the failure also failed: {audit:#}"))
+                }
+            });
+        }
+    };
+    let mut created =
+        json!({"ship": name, "machine": machine, "folder": made["folder"], "by": created_by});
+    if let Caller::Agent { actor } = store.caller() {
+        // The decision stands, since the ship exists there; say it was overtaken.
+        let active = store.charter(actor).is_ok_and(|c| c["active"] == true);
+        if !active {
+            created["revoked_during_call"] = json!(true);
+        }
     }
-    // Learn the new ship now rather than at the next refresh; refreshing
-    // writes every home here, so it runs after the lock is released.
+    // The ship exists there either way; a reply saying otherwise would invite a retry.
+    if let Err(error) = store.audit("ship.created", &created) {
+        made["audit"] = json!(format!("created, but not recorded here: {error:#}"));
+    }
+    // Learn the new ship now rather than at the next refresh.
     if let Err(error) = crate::machines::refresh_one(machine) {
         made["directory"] = json!(format!(
             "reachable from here after the next refresh: {error:#}"
@@ -331,6 +362,11 @@ pub(crate) fn create_for_machine(conn: &Connection, from: &str, args: &Value) ->
             !members(conn)?.iter().any(|m| m.name == created_by),
             "{created_by} is a ship on this machine, not on {from}"
         );
+        // Another linked machine's ship; `from`'s own cached directory may
+        // not list a ship made there since the last refresh.
+        if let Some(machine) = crate::machines::ship_elsewhere(conn, created_by, from)? {
+            bail!("{created_by} is a ship on the linked machine {machine}, not on {from}");
+        }
     }
     // A new ship goes beside the ship that holds the captain's mail here,
     // the fleet's liaison or else its first ship: the requester's folders

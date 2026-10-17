@@ -583,6 +583,21 @@ pub(crate) fn stow_linked(name: &str, command: &str) -> Result<Value> {
     call(&machine, command, json!({}), None)
 }
 
+/// The linked machine other than `except` whose directory lists `name`.
+pub(crate) fn ship_elsewhere(
+    conn: &Connection,
+    name: &str,
+    except: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT machine FROM machine_ships WHERE name=?1 AND machine<>?2 LIMIT 1",
+            [name, except],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Ask a linked machine this one reaches to create a ship in its fleet.
 /// The caller has already decided the creator's authority.
 pub(crate) fn create_linked(name: &str, mut request: Value) -> Result<Value> {

@@ -26,6 +26,10 @@ impl Machine {
 
     /// A privateer command on this machine, in a ship's folder.
     fn run(&self, ship: &str, args: &[&str], ssh: Option<&Path>) -> Output {
+        self.command(ship, args, ssh).output().unwrap()
+    }
+
+    fn command(&self, ship: &str, args: &[&str], ssh: Option<&Path>) -> std::process::Command {
         let mut command = support::command(support::BIN);
         command
             .args(args)
@@ -42,7 +46,26 @@ impl Machine {
         if let Some(ssh) = ssh {
             command.env("PRIVATEER_SSH_EXECUTABLE", ssh);
         }
-        command.output().unwrap()
+        command
+    }
+
+    /// One request to this machine's gateway, as a linking machine sends it.
+    fn gateway(&self, command: &str, args: Value) -> Value {
+        use std::io::{BufRead, Write};
+        let mut child = self
+            .command("fitforge", &["gateway"], None)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = json!({"id": "test", "command": command, "args": args});
+        writeln!(child.stdin.take().unwrap(), "{request}").unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        serde_json::from_str(&line).unwrap()
     }
 
     fn ok(&self, ship: &str, command: &str, args: Value) -> Value {
@@ -100,9 +123,13 @@ fn fixture() -> (tempfile::TempDir, Machine, Machine, PathBuf) {
 }
 
 fn link(laptop: &Machine, mac: &Machine, ssh: &Path) -> Output {
+    link_as(laptop, "liaison", "laptop", mac, ssh)
+}
+
+fn link_as(laptop: &Machine, ship: &str, known_as: &str, mac: &Machine, ssh: &Path) -> Output {
     let registry = mac.registry();
     laptop.run(
-        "liaison",
+        ship,
         &[
             "machine",
             "add",
@@ -113,7 +140,7 @@ fn link(laptop: &Machine, mac: &Machine, ssh: &Path) -> Output {
             "--remote-fleet",
             registry.to_str().unwrap(),
             "--as",
-            "laptop",
+            known_as,
         ],
         Some(ssh),
     )
@@ -717,6 +744,51 @@ fn a_ship_created_on_a_linked_machine_lives_only_there() {
         json!({"name": "y", "machine": "mac", "harness": "no-such-harness"}),
     );
     assert!(remote.contains("machine mac:"), "{remote}");
+    // The machine's refusal is recorded here, after the call.
+    let audit = laptop.ok("liaison", "audit.list", json!({"limit": 1000}));
+    assert!(
+        audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "ship.create.failed"
+                && e["payload"]["ship"] == "y"
+                && e["payload"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("machine mac:")),
+        "{audit}"
+    );
+
+    // The gateway itself refuses a creator that is not a ship on the asking
+    // machine, and a machine not linked to it, creating nothing.
+    let desk = Machine {
+        root: laptop.root.with_file_name("desk"),
+    };
+    desk.ship("drafts");
+    assert!(
+        link_as(&desk, "drafts", "desk", &mac, &mac_ssh)
+            .status
+            .success()
+    );
+    let gateway_refusal = |args: Value| {
+        let response = mac.gateway("ship.create", args);
+        assert_eq!(response["ok"], false, "{response}");
+        response["error"].as_str().unwrap().to_owned()
+    };
+    let own =
+        gateway_refusal(json!({"name": "x", "from_machine": "laptop", "created_by": "fitforge"}));
+    assert!(own.contains("fitforge is a ship on this machine"), "{own}");
+    let third =
+        gateway_refusal(json!({"name": "x", "from_machine": "laptop", "created_by": "drafts"}));
+    assert!(
+        third.contains("drafts is a ship on the linked machine desk"),
+        "{third}"
+    );
+    let stranger =
+        gateway_refusal(json!({"name": "x", "from_machine": "nowhere", "created_by": "captain"}));
+    assert!(stranger.contains("nowhere"), "{stranger}");
+    assert!(!mac.folder("x").exists());
 
     // Without a machine, ship.create still makes the ship here.
     let local = laptop.ok(
@@ -780,8 +852,54 @@ fn only_an_agent_that_may_spawn_creates_a_ship_on_a_linked_machine() {
     assert!(!mac.folder("bench").exists());
 
     // With spawn, the new ship holds the creator's actions and names it.
-    let made = agent(request);
+    // While the Mac is creating it, the liaison's home still takes writes:
+    // the first connection writes there before reaching the Mac.
+    let probe = laptop.root.join("probe-ssh");
+    fs::write(
+        &probe,
+        format!(
+            "#!/bin/sh
+[ -e {root}/probe.log ] || (cd {root}/liaison && {bin} note.put --json '{{\"ship\":\"liaison\",\"focus\":\"ship\",\"body\":\"during the call\"}}' > {root}/probe.out 2>&1; echo $? > {root}/probe.log)
+exec {mac_ssh} \"$@\"
+",
+            root = laptop.root.display(),
+            bin = support::BIN,
+            mac_ssh = mac_ssh.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    let made = laptop.run(
+        "liaison",
+        &[
+            "ship.create",
+            "--json",
+            &request.to_string(),
+            "--role",
+            "agent",
+            "--actor",
+            "liaison",
+        ],
+        Some(&probe),
+    );
     assert!(made.status.success(), "{}", text(&made));
+    assert_eq!(
+        fs::read_to_string(laptop.root.join("probe.log"))
+            .unwrap()
+            .trim(),
+        "0",
+        "a write in the creator's home failed during the call: {}",
+        fs::read_to_string(laptop.root.join("probe.out")).unwrap_or_default()
+    );
+    let audit = laptop.ok("liaison", "audit.list", json!({"limit": 1000}));
+    let kinds: Vec<&str> = audit["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{audit}"))
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .filter(|k| k.starts_with("ship.create"))
+        .collect();
+    assert_eq!(kinds, ["ship.create.requested", "ship.created"], "{audit}");
     let made: Value = serde_json::from_slice(&made.stdout).unwrap();
     assert_eq!(made["created_by"], "liaison", "{made}");
     assert_eq!(made["actions"], json!(["inspect", "spawn", "message"]));
