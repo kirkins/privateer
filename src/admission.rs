@@ -526,16 +526,21 @@ pub fn admit(
     // ramp, so one job is never refused for its own size alone.
     // A job that just ended still shows in the load average for minutes;
     // it no longer runs, so it does not hold the next one back.
-    let load = (host.load - request.released_load).max(0.0);
-    let per_cpu = (load + recent_cpus) / host.cpus;
-    refuse_unless!(
-        per_cpu < settings.max_load_per_cpu,
-        "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {:.1} of it from jobs that just ended, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
-        settings.max_load_per_cpu,
-        host.load,
-        request.released_load.min(host.load),
-        host.cpus
-    );
+    // Only a job that declares CPUs is judged by them. A crew reserves memory
+    // alone: refusing it on a busy machine would stop first mates from
+    // starting crews whenever builds are running.
+    if demand.cpus > 0.0 {
+        let load = (host.load - request.released_load).max(0.0);
+        let per_cpu = (load + recent_cpus) / host.cpus;
+        refuse_unless!(
+            per_cpu < settings.max_load_per_cpu,
+            "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {:.1} of it from jobs that just ended, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
+            settings.max_load_per_cpu,
+            host.load,
+            request.released_load.min(host.load),
+            host.cpus
+        );
+    }
     // Memory: running out is worse than waiting, so the job's own estimate
     // must fit above the floor too, while other estimated jobs run. The
     // estimate keeps big jobs from starting together; it must not keep the
@@ -1052,6 +1057,47 @@ mod tests {
         assert!(admit(&settings, &host, 0, &[crew("crew-job")], &build).is_ok());
         // Another job's crew still counts, so the build waits.
         assert!(admit(&settings, &host, 0, &[crew("other-job")], &build).is_err());
+    }
+
+    #[test]
+    fn a_crew_starts_on_a_busy_machine_when_its_memory_fits() {
+        let settings = Settings {
+            min_free_disk_bytes: 0,
+            ..Settings::default()
+        };
+        // Load 21.77 on 10 CPUs is far past the limit of 1.0 per CPU.
+        let busy = host(21.77);
+        let crew = |memory_bytes: u64| Request {
+            heavy: false,
+            demand: Some(Demand {
+                cpus: 0.0,
+                memory_bytes,
+                disk_bytes: 0,
+            }),
+            ..heavy(0.0)
+        };
+        assert!(admit(&settings, &busy, 0, &[], &crew(2 * GIB)).is_ok());
+        // Memory still gates a crew: another estimated job holds 7 of the 8 GiB.
+        let other = Held {
+            heavy: false,
+            home: std::path::Path::new("/"),
+            charter: None,
+            created_ms: 0,
+            demand: Some(Demand {
+                cpus: 0.0,
+                memory_bytes: 7 * GIB,
+                disk_bytes: 0,
+            }),
+            disk_key: None,
+            disk_free_at_admit: None,
+            disk_trimmed: 0,
+            job_id: "other",
+        };
+        let refused = admit(&settings, &busy, 0, &[other], &crew(2 * GIB)).unwrap_err();
+        assert!(refused.to_string().contains("MiB available"), "{refused}");
+        // A heavy job declares CPUs, so the same load still holds it back.
+        let refused = admit(&settings, &busy, 0, &[], &heavy(0.0)).unwrap_err();
+        assert!(refused.to_string().contains("CPU demand"), "{refused}");
     }
 
     #[test]

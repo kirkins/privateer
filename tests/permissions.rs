@@ -40,6 +40,18 @@ impl Fleet {
         }
         let f = Self { _tmp: tmp, root };
         f.init("liaison", "claude");
+        // Admission has its own tests. Crews here start on whatever memory the
+        // test machine has, so neither the floor nor a crew's estimate may refuse them.
+        f.ok(
+            Some("liaison"),
+            &[
+                "resource.configure",
+                "--json",
+                &json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,
+                    "crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}})
+                .to_string(),
+            ],
+        );
         f
     }
     fn command(&self, ship: Option<&str>, args: &[&str]) -> Command {

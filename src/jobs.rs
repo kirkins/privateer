@@ -2474,6 +2474,34 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+mod capacity_wait_tests {
+    use super::*;
+
+    #[test]
+    fn a_light_holder_is_named_as_a_job_not_a_heavy_job() {
+        let holder = Holder {
+            key: "key".into(),
+            job_id: "crew-job".into(),
+            ship: "apps".into(),
+            home: PathBuf::new(),
+            charter: None,
+            heavy: false,
+            started_ms: Store::now_ms(),
+            state: "running".into(),
+            supervisor_alive: true,
+            payload_alive: true,
+            escaped_alive: false,
+            expected_ms: None,
+            unhealthy: None,
+        };
+        assert_eq!(
+            wait_line("queued", Some(&holder)),
+            "queued is waiting behind apps's job crew-job (started under a minute ago)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod reply_capture_tests {
     use super::*;
 
