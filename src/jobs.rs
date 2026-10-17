@@ -2366,34 +2366,43 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             reason = Some("Codex read-only crew exited without a durable crew report".into());
         }
     }
-    job = alter(store, id, |j| {
-        j.status = if group_remains {
-            "orphaned".into()
-        } else {
-            outcome.into()
-        };
-        j.exit_code = status.code();
-        j.finished_ms = Some(Store::now_ms());
-        j.stdout_dropped_bytes = stdout_dropped;
-        j.stderr_dropped_bytes = stderr_dropped;
-        if group_remains {
+    if group_remains {
+        job = alter(store, id, |j| {
+            j.status = "orphaned".into();
+            j.exit_code = status.code();
+            j.finished_ms = Some(Store::now_ms());
+            j.stdout_dropped_bytes = stdout_dropped;
+            j.stderr_dropped_bytes = stderr_dropped;
             j.leader_result = Some(LeaderResult {
                 status: outcome.into(),
                 reason: reason.clone(),
             });
-        }
-        j.reason = if group_remains {
-            Some(reason.unwrap_or_else(|| {
+            j.reason = Some(reason.unwrap_or_else(|| {
                 "payload group or a descendant that left it is still running; reservation preserved".into()
-            }))
-        } else {
-            reason
-        };
-    })?;
-    if group_remains {
+            }));
+        })?;
         update_reservation(store, &job)?;
     } else {
+        // Release before the terminal status commits, so a reader who sees the
+        // job finished also sees its capacity given back. The outcome is
+        // recorded as the leader's result first: if the supervisor dies between
+        // the two writes, reconcile settles to that outcome, not "disappeared".
+        job = alter(store, id, |j| {
+            j.leader_result = Some(LeaderResult {
+                status: outcome.into(),
+                reason: reason.clone(),
+            });
+        })?;
         release(store, &job)?;
+        job = alter(store, id, |j| {
+            j.status = outcome.into();
+            j.leader_result = None;
+            j.exit_code = status.code();
+            j.finished_ms = Some(Store::now_ms());
+            j.stdout_dropped_bytes = stdout_dropped;
+            j.stderr_dropped_bytes = stderr_dropped;
+            j.reason = reason;
+        })?;
     }
     store.audit(
         "job.finished",
