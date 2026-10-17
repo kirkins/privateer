@@ -394,3 +394,83 @@ fn the_captain_hears_from_ships_on_the_other_machine_and_answers_them() {
     assert_eq!(refused["ok"], false, "{}", text(&forged));
     assert!(messages(&mac, "fitforge", "notice").is_empty());
 }
+
+#[test]
+fn a_machines_owner_hears_of_its_problems_and_may_stow_it() {
+    let (_temp, laptop, _mac, ssh) = fixture();
+    laptop.ship("upkeep");
+    let named = laptop.run("liaison", &["machine", "owner", "upkeep"], None);
+    assert!(named.status.success(), "{}", text(&named));
+    let alerts = |laptop: &Machine| -> Vec<String> {
+        messages(laptop, "upkeep", "notice")
+            .iter()
+            .filter(|m| m["from"] == "crew")
+            .filter_map(|m| m["body"].as_str().map(str::to_owned))
+            .collect()
+    };
+
+    // A disk floor the machine cannot meet reaches the owner once.
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes": 1_u64 << 60}),
+    );
+    laptop.pass("liaison", &ssh);
+    assert!(
+        alerts(&laptop).is_empty(),
+        "only the owner's dispatcher alerts"
+    );
+    laptop.pass("upkeep", &ssh);
+    laptop.pass("upkeep", &ssh);
+    let raised = alerts(&laptop);
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(
+        raised[0].contains("below the machine's floor"),
+        "{raised:?}"
+    );
+    // And again when it clears.
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes": 0}),
+    );
+    laptop.pass("upkeep", &ssh);
+    let all = alerts(&laptop);
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(all[1].contains("Cleared"), "{all:?}");
+
+    // The owner may stow the machine, asking in its own name, and resume it.
+    let agent = |ship: &str, command: &str| {
+        laptop.run(
+            ship,
+            &[command, "--json", "{}", "--role", "agent", "--actor", ship],
+            None,
+        )
+    };
+    let refused = agent("liaison", "stow.start");
+    assert!(!refused.status.success(), "{}", text(&refused));
+    let stowed = agent("upkeep", "stow.start");
+    assert!(stowed.status.success(), "{}", text(&stowed));
+    let asked = messages(&laptop, "liaison", "request");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0]["from"], "upkeep");
+    assert!(
+        asked[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("upkeep, which looks after this machine"),
+        "{asked:?}"
+    );
+    let resumed = agent("upkeep", "stow.resume");
+    assert!(resumed.status.success(), "{}", text(&resumed));
+
+    // It cannot end the captain's stow.
+    laptop.ok("liaison", "stow.start", json!({}));
+    let ended = agent("upkeep", "stow.resume");
+    assert!(!ended.status.success());
+    assert!(
+        text(&ended).contains("only the captain"),
+        "{}",
+        text(&ended)
+    );
+}

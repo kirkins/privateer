@@ -445,6 +445,13 @@ fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
 }
 /// Queue entries in arrival order, dropping those whose supervisor is gone (or
 /// never appeared within the start grace) so they cannot block the line.
+/// How long the oldest live entry in this host's capacity queue has waited.
+pub(crate) fn oldest_wait_ms(store: &Store) -> Result<Option<i64>> {
+    let conn = host_ledger(store)?;
+    Ok(live_queue(&conn)?
+        .first()
+        .map(|entry| Store::now_ms() - entry.created_ms))
+}
 fn live_queue(conn: &Connection) -> Result<Vec<Queued>> {
     let mut statement = conn.prepare("SELECT record FROM queue")?;
     let mut entries: Vec<Queued> = statement

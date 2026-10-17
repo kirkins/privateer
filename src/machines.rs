@@ -55,7 +55,9 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            peer TEXT NOT NULL, known_as TEXT, added_ms INTEGER NOT NULL, refreshed_ms INTEGER,
            next_contact_ms INTEGER, failures INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE IF NOT EXISTS machine_ships(machine TEXT NOT NULL, name TEXT NOT NULL,
-           scope TEXT NOT NULL, PRIMARY KEY(machine, name));",
+           scope TEXT NOT NULL, PRIMARY KEY(machine, name));
+         CREATE TABLE IF NOT EXISTS machine_owner(only INTEGER PRIMARY KEY CHECK(only=1),
+           ship TEXT NOT NULL, set_ms INTEGER NOT NULL);",
     )?;
     // Columns added after the table was first created. Check and add them
     // under the write lock so concurrent opens cannot both add one.
@@ -309,6 +311,181 @@ pub(crate) fn captain_home(conn: &Connection) -> Result<Option<(String, PathBuf)
     Ok(chosen.map(|m| (m.name.clone(), m.home.clone())))
 }
 
+/// The ship that looks after this machine, if the captain named one.
+pub(crate) fn owner(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT ship FROM machine_owner", [], |r| r.get(0))
+        .optional()?)
+}
+
+/// Whether `ship` is this machine's owner.
+pub fn is_owner(ship: &str) -> bool {
+    crate::fleet::registry()
+        .and_then(|conn| owner(&conn))
+        .is_ok_and(|owner| owner.as_deref() == Some(ship))
+}
+
+/// Name the ship that looks after this machine, or clear it. The owner
+/// receives the machine's host-level problems and may stow the machine;
+/// it gains no authority over other ships' work.
+fn set_owner(ship: Option<&str>) -> Result<Value> {
+    let conn = crate::fleet::registry()?;
+    match ship {
+        Some(ship) => {
+            ensure!(
+                crate::fleet::members(&conn)?
+                    .iter()
+                    .any(|m| m.name == ship && m.home.is_dir()),
+                "{ship} is not a ship on this machine"
+            );
+            conn.execute(
+                "INSERT INTO machine_owner(only, ship, set_ms) VALUES(1, ?1, ?2)
+                 ON CONFLICT(only) DO UPDATE SET ship=excluded.ship, set_ms=excluded.set_ms",
+                params![ship, Store::now_ms()],
+            )?;
+        }
+        None => {
+            conn.execute("DELETE FROM machine_owner", [])?;
+        }
+    }
+    Ok(json!({"owner": owner(&conn)?}))
+}
+
+/// Host-level problems are checked at most this often.
+const ALERT_EVERY_MS: i64 = 60_000;
+/// A capacity queue whose head has waited this long, or a route backed off
+/// for at least this long, is worth the owner's attention.
+const LONG_WAIT_MS: i64 = 600_000;
+const LONG_BACKOFF_MS: i64 = 1_800_000;
+
+/// The machine's problems right now, each with a stable key and a sentence.
+fn host_problems(store: &Store) -> Result<Vec<(String, String)>> {
+    let mut problems = vec![];
+    let ledger = crate::jobs::host_ledger(store)?;
+    let settings = crate::admission::settings(&ledger)?;
+    let free = crate::admission::disk(store.home())?.0;
+    if free < settings.min_free_disk_bytes {
+        problems.push((
+            "disk_floor".into(),
+            format!(
+                "Free disk is below the machine's floor: {} MiB free, {} MiB must stay free, so new jobs wait. Propose a cleanup to the captain.",
+                free / (1024 * 1024),
+                settings.min_free_disk_bytes / (1024 * 1024)
+            ),
+        ));
+    }
+    if let Some(waited) = crate::jobs::oldest_wait_ms(store)?.filter(|w| *w >= LONG_WAIT_MS) {
+        problems.push((
+            "capacity_wait".into(),
+            format!(
+                "A job has waited {} minutes in this machine's capacity queue. Check resource.status for what holds capacity, and runtime.needs for stuck reservations.",
+                waited / 60_000
+            ),
+        ));
+    }
+    for route in crate::routes::list(&ledger)? {
+        let until = route["until_ms"].as_i64().unwrap_or(0);
+        let name = route["route"].as_str().unwrap_or("");
+        if until - Store::now_ms() >= LONG_BACKOFF_MS {
+            problems.push((
+                format!("route:{name}"),
+                format!(
+                    "The model route {name} is backing off for another {} minutes after: {}.",
+                    (until - Store::now_ms()) / 60_000,
+                    route["last_error"].as_str().unwrap_or("repeated failures")
+                ),
+            ));
+        }
+    }
+    Ok(problems)
+}
+
+/// When this process last looked for host-level problems.
+static LAST_ALERT_CHECK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Tell this machine's owner about host-level problems as they start and
+/// when they clear, as runtime notices on its duty task. Only the owner's
+/// own dispatcher does this, at most once a minute.
+pub(crate) fn alert_owner(store: &Store) -> Value {
+    if let Ok(mut last) = LAST_ALERT_CHECK.lock() {
+        if last.is_some_and(|at| at.elapsed().as_millis() < ALERT_EVERY_MS as u128) {
+            return Value::Null;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let work = || -> Result<Value> {
+        let path = crate::fleet::registry_path()?;
+        if !path.is_file() || !ever_linked(&path) {
+            return Ok(Value::Null);
+        }
+        let conn = crate::fleet::registry()?;
+        let Some(ship) = owner(&conn)? else {
+            return Ok(Value::Null);
+        };
+        if !crate::fleet::members(&conn)?
+            .iter()
+            .any(|m| m.name == ship && m.home == store.home())
+        {
+            return Ok(Value::Null);
+        }
+        let db = store.connection();
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS machine_alerts(key TEXT PRIMARY KEY, raised_ms INTEGER NOT NULL);",
+        )?;
+        let profile = crate::mail::dispatch(
+            &mut Store::open(store.home())?,
+            "ship.show",
+            json!({"name": ship}),
+        )?;
+        let duty = profile["first_mate"]["duty_task"].as_str().unwrap_or("");
+        let problems = host_problems(store)?;
+        let tx = store.write_transaction()?;
+        let mut statement = tx.prepare("SELECT key FROM machine_alerts")?;
+        let raised: Vec<String> = statement
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        let notice = |key: &str, body: String| -> Result<()> {
+            if duty.is_empty() {
+                return Ok(());
+            }
+            crate::mail::record_crew(
+                &tx,
+                &json!({"id": format!("machine-{key}-{}", Store::now_ms()), "to": ship,
+                    "kind": "notice", "task_id": duty, "urgency": "normal", "body": body,
+                    "payload": {"machine_alert": key}}),
+            )?;
+            Ok(())
+        };
+        let mut sent = vec![];
+        for (key, body) in &problems {
+            if !raised.contains(key) {
+                tx.execute(
+                    "INSERT INTO machine_alerts(key, raised_ms) VALUES(?1, ?2)",
+                    params![key, Store::now_ms()],
+                )?;
+                notice(key, format!("This machine needs you: {body}"))?;
+                sent.push(json!({"raised": key}));
+            }
+        }
+        for key in raised {
+            if !problems.iter().any(|(k, _)| *k == key) {
+                tx.execute("DELETE FROM machine_alerts WHERE key=?1", [&key])?;
+                notice(
+                    &key,
+                    format!("Cleared on this machine: {key} is no longer a problem."),
+                )?;
+                sent.push(json!({"cleared": key}));
+            }
+        }
+        tx.commit()?;
+        Ok(json!(sent))
+    };
+    work().unwrap_or_else(
+        |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
+    )
+}
+
 /// Ships on linked machines, with the machine each is on and its scope.
 pub(crate) fn remote_ships() -> Result<Vec<(String, String, String)>> {
     let path = crate::fleet::registry_path()?;
@@ -458,7 +635,7 @@ fn list() -> Result<Value> {
             "ships": cached(&conn, &machine.name)?.into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
         }));
     }
-    Ok(json!({"machines": out}))
+    Ok(json!({"owner": owner(&conn)?, "machines": out}))
 }
 
 /// Forget a link here. The other machine keeps its side until removed there.
@@ -821,9 +998,10 @@ pub fn gateway(caller: Caller) -> Result<()> {
 }
 
 /// `privateer machine add NAME SSH_TARGET --executable PATH [--remote-fleet
-/// PATH] [--as NAME] | list | refresh [NAME] | collect [NAME] | remove NAME`
+/// PATH] [--as NAME] | list | refresh [NAME] | collect [NAME] | remove NAME |
+/// owner [SHIP|--clear]`
 pub fn cli(args: &[String]) -> Result<()> {
-    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] | list | refresh [NAME] | collect [NAME] | remove NAME";
+    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] | list | refresh [NAME] | collect [NAME] | remove NAME | owner [SHIP|--clear]";
     let flags = crate::cli::flags(args, &["executable", "remote-fleet", "as"])?;
     let result = match flags.positional.first().map(String::as_str) {
         Some("add") => {
@@ -844,6 +1022,11 @@ pub fn cli(args: &[String]) -> Result<()> {
         Some("refresh") => refresh(flags.positional.get(1).map(String::as_str))?,
         Some("collect") => collect_now(flags.positional.get(1).map(String::as_str))?,
         Some("remove") => remove(flags.positional.get(1).context(usage)?)?,
+        Some("owner") if flags.switches.iter().any(|s| s == "clear") => set_owner(None)?,
+        Some("owner") => match flags.positional.get(1) {
+            Some(ship) => set_owner(Some(ship))?,
+            None => json!({"owner": owner(&crate::fleet::registry()?)?}),
+        },
         _ => bail!(usage),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -859,6 +1042,11 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "machine.refresh" => refresh(args.get("name").and_then(Value::as_str)),
         "machine.collect" => collect_now(args.get("name").and_then(Value::as_str)),
         "machine.remove" => remove(required(&args, "name")?),
+        "machine.owner" => match args.get("ship") {
+            None => Ok(json!({"owner": owner(&crate::fleet::registry()?)?})),
+            Some(Value::Null) => set_owner(None),
+            Some(ship) => set_owner(Some(ship.as_str().context("ship must be a name")?)),
+        },
         _ => bail!("unknown machine command {command}"),
     }
 }
