@@ -60,6 +60,10 @@ struct Job {
     agent_request_hash: Option<String>,
     action: String,
     heavy: bool,
+    /// Whether the caller asked for heavy work by name. Only then does the
+    /// heavy disk default apply; an unlabelled job is heavy for CPU and memory.
+    #[serde(default)]
+    heavy_declared: bool,
     timeout_secs: u64,
     ledger: PathBuf,
     status: String,
@@ -144,6 +148,17 @@ struct Reservation {
     /// Resolved estimate counted by admission while recently admitted.
     #[serde(default)]
     demand: Option<Demand>,
+    /// The filesystem the declared space is on, as `disk_key`, and its free
+    /// space when the reservation was admitted. Free space lost since then is
+    /// what the job has already written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk_free_bytes: Option<u64>,
+    /// The trims `disk_key` had seen in total when this was admitted, so the
+    /// trims made while it runs can be told apart from its own writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk_trimmed_at_admit: Option<u64>,
     /// The job's recorded descendants outside its payload group.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     escaped: Vec<Process>,
@@ -327,10 +342,15 @@ pub(crate) fn wait_for_workspace_disk(
     };
     // Only the filesystem this workspace will use: a full root must not
     // block a pool on a separate volume.
+    // Space the held jobs on this filesystem still have to write counts too.
+    let pool_key = admission::disk_key(pool)?;
     let fits = |conn: &Connection| -> Result<(bool, u64, u64)> {
         let settings = admission::settings(conn)?;
         let available = admission::disk(pool)?.0;
-        let required = settings.min_free_disk_bytes.max(charter_floor);
+        let required = settings
+            .min_free_disk_bytes
+            .max(charter_floor)
+            .saturating_add(committed_disk_on(conn, &pool_key, available)?);
         Ok((available >= required, available, required))
     };
     let (enough, available, required) = fits(&ledger(&ledger_path)?)?;
@@ -507,6 +527,39 @@ struct DiskFloor<'a> {
     charter_min_free_bytes: u64,
     path: &'a Path,
 }
+/// Live reservations as admission sees them. A reservation's own loss counts
+/// the trims made on its filesystem while it ran as space it did not write.
+fn held_view<'a>(conn: &Connection, held: &'a [Reservation]) -> Result<Vec<admission::Held<'a>>> {
+    held.iter()
+        .map(|r| {
+            let disk_trimmed = match (&r.disk_key, r.disk_trimmed_at_admit) {
+                (Some(key), Some(at)) => admission::trim_total(conn, key)?.saturating_sub(at),
+                _ => 0,
+            };
+            Ok(admission::Held {
+                heavy: r.heavy,
+                home: &r.home,
+                charter: r.charter.as_deref(),
+                created_ms: r.created_ms,
+                demand: r.demand,
+                disk_key: r.disk_key.as_deref(),
+                disk_free_at_admit: r.disk_free_bytes,
+                disk_trimmed,
+            })
+        })
+        .collect()
+}
+
+/// Disk the live reservations on one filesystem still have to write.
+pub(crate) fn committed_disk_on(conn: &Connection, disk_key: &str, free: u64) -> Result<u64> {
+    let held = reservations(conn)?;
+    Ok(admission::committed_disk(
+        &held_view(conn, &held)?,
+        disk_key,
+        free,
+    ))
+}
+
 /// Admit and record a reservation under the ledger's write lock, so homes
 /// sharing the host decide one at a time against the same readings.
 ///
@@ -516,6 +569,7 @@ fn reserve(
     conn: &Connection,
     reservation: &mut Reservation,
     estimate: Option<&Estimate>,
+    heavy_declared: bool,
     charter_cap: Option<u64>,
     floor: DiskFloor<'_>,
     from_queue: bool,
@@ -558,21 +612,25 @@ fn reserve(
             // Never garbage-collect reservations merely because a wrapper disappeared.
             let held = reservations(conn)?;
             let host = admission::measure()?;
-            reservation.demand = admission::demand(&settings, &host, reservation.heavy, estimate);
-            let view: Vec<admission::Held> = held
-                .iter()
-                .map(|r| admission::Held {
-                    heavy: r.heavy,
-                    home: &r.home,
-                    charter: r.charter.as_deref(),
-                    created_ms: r.created_ms,
-                    demand: r.demand,
-                })
-                .collect();
+            reservation.demand = admission::demand(
+                &settings,
+                &host,
+                reservation.heavy,
+                heavy_declared,
+                estimate,
+            );
+            // Only the filesystem this job will use: a full root must not
+            // block work on a separate volume. The same reading decides
+            // admission and feeds the falling-space trend the owner sees.
+            let disk_key = admission::disk_key(floor.path)?;
+            let (disk_available_bytes, disk_total_bytes) = admission::disk(floor.path)?;
+            let now = Store::now_ms();
+            admission::note_disk(conn, &disk_key, disk_available_bytes, now)?;
+            let view = held_view(conn, &held)?;
             admission::admit(
                 &settings,
                 &host,
-                Store::now_ms(),
+                now,
                 &view,
                 &admission::Request {
                     heavy: reservation.heavy,
@@ -581,10 +639,15 @@ fn reserve(
                     charter_cap,
                     demand: reservation.demand,
                     charter_min_free_bytes: floor.charter_min_free_bytes,
-                    disk_path: floor.path,
-                    released_load: released_load(conn, Store::now_ms())?,
+                    disk_key: &disk_key,
+                    disk_available_bytes,
+                    disk_total_bytes,
+                    released_load: released_load(conn, now)?,
                 },
             )?;
+            reservation.disk_trimmed_at_admit = Some(admission::trim_total(conn, &disk_key)?);
+            reservation.disk_key = Some(disk_key);
+            reservation.disk_free_bytes = Some(disk_available_bytes);
             if from_queue {
                 conn.execute("DELETE FROM queue WHERE key=?1", [&reservation.key])?;
                 // Its ramp starts now, not when it joined the queue.
@@ -1263,6 +1326,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .map(PathBuf::from)
             .unwrap_or_else(|| repo.clone()),
     )?;
+    let heavy_declared = args.get("heavy").and_then(Value::as_bool).is_some();
     let heavy = args.get("heavy").and_then(Value::as_bool).unwrap_or(true);
     let estimate = args
         .get("estimate")
@@ -1426,6 +1490,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         agent_request_hash,
         action: action.to_owned(),
         heavy,
+        heavy_declared,
         timeout_secs,
         ledger: ledger_path.clone(),
         status: "starting".to_owned(),
@@ -1477,9 +1542,31 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         payload: None,
         charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
         demand: None,
+        disk_key: None,
+        disk_free_bytes: None,
+        disk_trimmed_at_admit: None,
         escaped: vec![],
         wake: is_wake(store, &id)?,
     };
+    // Trimming does file I/O, so it runs before the write transaction below.
+    let charter_floor = charter
+        .get("min_free_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(2 * 1024 * 1024 * 1024);
+    let demand = admission::demand(
+        &admission::settings(&shared_ledger(store)?)?,
+        &admission::measure()?,
+        heavy,
+        heavy_declared,
+        estimate.as_ref(),
+    );
+    crate::workspace::make_room_for_job(
+        store,
+        workspace._lock.as_ref(),
+        &job.cwd,
+        charter_floor,
+        demand,
+    )?;
     let conn = store.connection();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let admitted = (|| -> Result<Option<Job>> {
@@ -1539,6 +1626,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             &ledger,
             &mut reservation,
             estimate.as_ref(),
+            heavy_declared,
             charter_cap,
             DiskFloor {
                 charter_min_free_bytes: charter
@@ -1754,6 +1842,9 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             payload: None,
             charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
             demand: None,
+            disk_key: None,
+            disk_free_bytes: None,
+            disk_trimmed_at_admit: None,
             escaped: vec![],
             wake: is_wake(store, &job.id)?,
         };
@@ -1762,6 +1853,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             &ledger(&job.ledger)?,
             &mut reservation,
             job.estimate.as_ref(),
+            job.heavy_declared,
             cap,
             DiskFloor {
                 charter_min_free_bytes: charter
@@ -2948,6 +3040,16 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             status["queue"] = json!(live_queue(&conn)?);
             status["disk_floor_met"] =
                 json!(host.disk_available_bytes >= settings.min_free_disk_bytes);
+            // How fast free space has been falling here, and when that rate
+            // would reach the floor. Both are null until enough readings
+            // exist to describe a rate.
+            let trend = admission::disk_trend(&conn, &admission::disk_key(store.home())?)?;
+            status["disk_trend"] = json!(trend);
+            status["disk_forecast"] = json!(
+                trend
+                    .as_ref()
+                    .and_then(|t| admission::disk_forecast(settings.min_free_disk_bytes, t))
+            );
             status["model_routes"] = json!(crate::routes::list(&conn)?);
             let now = Store::now_ms();
             status["released_load"] = json!(released_load(&conn, now)?);

@@ -1,8 +1,10 @@
 //! Built-in Treehouse workspaces. A lease belongs to a task, not a process.
 //! External operations have durable intents; an inherited flock fences helpers
 //! across caller crashes. No job outcome implicitly discards or releases work.
+mod cache;
 mod lifecycle;
 mod process;
+pub(crate) use cache::make_room_for_job;
 pub use lifecycle::dispatch;
 pub(crate) use lifecycle::sweep;
 
@@ -26,7 +28,7 @@ use std::{
 
 pub(crate) struct Lock(File);
 impl Lock {
-    fn acquire(store: &Store) -> Result<Self> {
+    pub(crate) fn acquire(store: &Store) -> Result<Self> {
         let path = store.home().join("workspace.lock");
         crate::store::reject_symlinks(&path)?;
         let file = OpenOptions::new()
@@ -84,7 +86,10 @@ pub(crate) struct Execution {
 }
 
 pub(crate) fn init(store: &Store) -> Result<()> {
-    store.connection().execute_batch("CREATE TABLE IF NOT EXISTS workspaces (task_id TEXT PRIMARY KEY REFERENCES tasks(id), record TEXT NOT NULL);")?;
+    store.connection().execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspaces (task_id TEXT PRIMARY KEY REFERENCES tasks(id), record TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS workspace_slot_use (path TEXT PRIMARY KEY, released_ms INTEGER NOT NULL);",
+    )?;
     Ok(())
 }
 
@@ -305,6 +310,18 @@ fn acquire_locked(
             .get("min_free_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(2 * 1024 * 1024 * 1024);
+        let binary = binary(store)?;
+        let pool_root = fs::canonicalize(&pool)?;
+        cache::make_room(
+            store,
+            lock,
+            &cache::Pool {
+                binary: binary.clone(),
+                git_repo: git_repo.clone(),
+                root: pool_root.clone(),
+            },
+            charter_floor,
+        )?;
         disk_queue = Some(crate::jobs::wait_for_workspace_disk(
             store,
             task,
@@ -322,7 +339,7 @@ fn acquire_locked(
             repo: repo.into(),
             git_repo,
             pool: fs::canonicalize(pool)?,
-            binary: binary(store)?,
+            binary,
             holder: format!("privateer:{home_hash}:{generation}"),
             branch: format!("privateer/{home_hash}/{}/{generation}", hash(task)),
             base_branch,
@@ -355,6 +372,16 @@ fn acquire_locked(
                         .get("min_free_bytes")
                         .and_then(Value::as_u64)
                         .unwrap_or(2 * 1024 * 1024 * 1024);
+                    cache::make_room(
+                        store,
+                        lock,
+                        &cache::Pool {
+                            binary: w.binary.clone(),
+                            git_repo: w.git_repo.clone(),
+                            root: w.pool.clone(),
+                        },
+                        charter_floor,
+                    )?;
                     Some(crate::jobs::wait_for_workspace_disk(
                         store,
                         task,
@@ -413,14 +440,21 @@ fn disk_admission(store: &Store, task: &str, pool: &Path) -> Result<()> {
         .get("min_free_bytes")
         .and_then(Value::as_u64)
         .unwrap_or(2 * 1024 * 1024 * 1024);
-    let host_floor =
-        crate::admission::settings(&crate::jobs::shared_ledger(store)?)?.min_free_disk_bytes;
+    let ledger = crate::jobs::shared_ledger(store)?;
+    let host_floor = crate::admission::settings(&ledger)?.min_free_disk_bytes;
     let host_available = crate::admission::disk(Path::new("/"))?.0;
-    let available = host_available.min(crate::admission::disk(pool)?.0);
-    let required = minimum.max(host_floor);
+    let pool_available = crate::admission::disk(pool)?.0;
+    let available = host_available.min(pool_available);
+    // Space that running jobs on this filesystem still have to write counts too.
+    let held = crate::jobs::committed_disk_on(
+        &ledger,
+        &crate::admission::disk_key(pool)?,
+        pool_available,
+    )?;
+    let required = minimum.max(host_floor).saturating_add(held);
     ensure!(
         available >= required,
-        "workspace disk admission refused: {available} available, {required} required (host floor {host_floor}, charter floor {minimum})"
+        "workspace disk admission refused: {available} available, {required} required (host floor {host_floor}, charter floor {minimum}, {held} held by running jobs)"
     );
     Ok(())
 }

@@ -125,6 +125,19 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     );
     w.state = "released".into();
     save(store, &w)?;
+    cache::record_release(store, &path)?;
+    // The release stands even if trimming fails; the failure is kept.
+    let pool = cache::Pool {
+        binary: w.binary.clone(),
+        git_repo: w.git_repo.clone(),
+        root: w.pool.clone(),
+    };
+    if let Err(error) = cache::trim(store, &lock, &pool, None) {
+        store.audit(
+            "workspace.trim_failed",
+            &json!({"pool": w.pool, "error": format!("{error:#}")}),
+        )?;
+    }
     public(store, &w)
 }
 

@@ -81,10 +81,12 @@ def main():
         configure_workspaces(root, homes.values())
         evidence["workspace_backend"] = "test protocol fixture backed by real Git worktrees"
         # One shared heavy slot for the whole host makes the cross-home refusal
-        # deterministic; live load and memory limits are left generous here.
+        # deterministic; live load, memory and disk limits are left generous
+        # here. These scripted payloads write one small file, so they do not
+        # claim the host's heavy-job disk appetite.
         invoke(homes["navigator"], "resource.configure", {
             "max_heavy_jobs": 1, "max_load_per_cpu": 64, "min_available_memory_bytes": 0,
-            "heavy_estimate": {"memory_bytes": 0},
+            "heavy_estimate": {"memory_bytes": 0, "disk_bytes": 0},
         })
         for source, targets in (
             ("navigator", ("applications", "infrastructure")),

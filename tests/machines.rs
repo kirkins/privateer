@@ -5,6 +5,7 @@
 //! connects back.
 mod support;
 
+use rusqlite::params;
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -480,6 +481,150 @@ fn the_captain_hears_from_ships_on_the_other_machine_and_answers_them() {
     let refused: Value = serde_json::from_slice(&forged.stdout).unwrap_or(Value::Null);
     assert_eq!(refused["ok"], false, "{}", text(&forged));
     assert!(messages(&mac, "fitforge", "notice").is_empty());
+}
+
+#[test]
+fn a_machines_owner_hears_before_free_disk_reaches_the_floor() {
+    let (_temp, laptop, _mac, ssh) = fixture();
+    laptop.ship("upkeep");
+    assert!(
+        laptop
+            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .status
+            .success()
+    );
+    let free = laptop.ok("liaison", "resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // A floor an eighth under what is free now, so the machine is above it:
+    // only a falling rate can raise anything. Margins are fractions of the
+    // live reading, so writes by other work on the machine move them little.
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes":free - free / 8}),
+    );
+    // A quarter of what is free was written in the last six hours, as an
+    // earlier reading says: the floor is about three hours of that away.
+    let home = laptop.folder("upkeep").join(".privateer");
+    let key = privateer::admission::disk_key(&home).unwrap();
+    let ledger = rusqlite::Connection::open(laptop.root.join("ledger/resources.sqlite")).unwrap();
+    ledger
+        .execute(
+            "INSERT INTO disk_samples(path,sampled_ms,free_bytes) VALUES(?1,?2,?3)",
+            params![
+                key,
+                privateer::store::Store::now_ms() - 6 * 3_600_000,
+                (free + free / 4) as i64
+            ],
+        )
+        .unwrap();
+    let alerts = |ship: &str| -> Vec<String> {
+        messages(&laptop, ship, "notice")
+            .iter()
+            .filter(|m| m["from"] == "crew")
+            .filter_map(|m| m["body"].as_str().map(str::to_owned))
+            .collect()
+    };
+    laptop.pass("upkeep", &ssh);
+    let raised = alerts("upkeep");
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert!(raised[0].contains("Free disk is falling"), "{raised:?}");
+    assert!(raised[0].contains("per hour"), "{raised:?}");
+    // It is not the floor's alarm: the machine is still above its floor.
+    assert!(
+        !raised[0].contains("below the machine's floor"),
+        "{raised:?}"
+    );
+    // And again once the space stops falling.
+    ledger
+        .execute("DELETE FROM disk_samples WHERE path=?1", [&key])
+        .unwrap();
+    laptop.pass("upkeep", &ssh);
+    let all = alerts("upkeep");
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(all[1].contains("Cleared"), "{all:?}");
+}
+
+#[test]
+fn a_falling_warning_is_not_cleared_while_the_floor_alarm_is_up() {
+    let (_temp, laptop, _mac, ssh) = fixture();
+    laptop.ship("upkeep");
+    assert!(
+        laptop
+            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .status
+            .success()
+    );
+    let free = laptop.ok("liaison", "resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes":free - free / 8}),
+    );
+    let home = laptop.folder("upkeep").join(".privateer");
+    let key = privateer::admission::disk_key(&home).unwrap();
+    let ledger = rusqlite::Connection::open(laptop.root.join("ledger/resources.sqlite")).unwrap();
+    ledger
+        .execute(
+            "INSERT INTO disk_samples(path,sampled_ms,free_bytes) VALUES(?1,?2,?3)",
+            params![
+                key,
+                privateer::store::Store::now_ms() - 6 * 3_600_000,
+                (free + free / 4) as i64
+            ],
+        )
+        .unwrap();
+    let notices = || -> Vec<String> {
+        messages(&laptop, "upkeep", "notice")
+            .iter()
+            .filter(|m| m["from"] == "crew")
+            .filter_map(|m| m["body"].as_str().map(str::to_owned))
+            .collect()
+    };
+    laptop.pass("upkeep", &ssh);
+    assert_eq!(notices().len(), 1, "{:?}", notices());
+    assert!(
+        notices()[0].contains("Free disk is falling"),
+        "{:?}",
+        notices()
+    );
+    // The floor is crossed while the space is still falling: the floor alarm
+    // arrives, and the warning is not cleared in the same pass.
+    // Well above live free space, so other writers on a shared runner cannot
+    // free enough in between to keep this machine above it.
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes":free + free / 8}),
+    );
+    laptop.pass("upkeep", &ssh);
+    let all = notices();
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(all[1].contains("below the machine's floor"), "{all:?}");
+    assert!(all.iter().all(|body| !body.contains("Cleared")), "{all:?}");
+    // The floor recovers, and the space is still falling: the floor clears
+    // alone, and the warning stays raised.
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes":free - free / 8}),
+    );
+    laptop.pass("upkeep", &ssh);
+    let recovered = notices();
+    assert_eq!(recovered.len(), 3, "{recovered:?}");
+    assert!(recovered[2].contains("Cleared"), "{recovered:?}");
+    assert!(recovered[2].contains("disk_floor"), "{recovered:?}");
+    // Only once the space stops falling does the warning clear.
+    ledger
+        .execute("DELETE FROM disk_samples WHERE path=?1", [&key])
+        .unwrap();
+    laptop.pass("upkeep", &ssh);
+    let cleared = notices();
+    assert_eq!(cleared.len(), 4, "{cleared:?}");
+    assert!(cleared[3].contains("disk_trend"), "{cleared:?}");
 }
 
 #[test]

@@ -27,7 +27,7 @@ impl Fixture {
         fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "--quiet", "--initial-branch=main"]);
         fs::write(repo.join("file.txt"), "base\n").unwrap();
-        fs::write(repo.join(".gitignore"), "/cache/\n").unwrap();
+        fs::write(repo.join(".gitignore"), "/cache/\n/target/\n").unwrap();
         git(&repo, &["add", "."]);
         git(
             &repo,
@@ -542,7 +542,7 @@ fn custody_changes_stop_old_workers_before_the_new_owner_reuses_the_checkout() {
 #[test]
 fn queued_jobs_hold_their_own_workspace_until_cancelled() {
     let f = Fixture::new();
-    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0}}));
+    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}));
     let first = f.ok(
         "job.start",
         json!({"task_id":"one","id":"heavy","command":["/bin/sleep","3"],"heavy":true}),
@@ -1154,7 +1154,7 @@ fn the_dispatcher_releases_only_workspaces_whose_work_has_landed() {
 #[test]
 fn a_workspace_needs_only_disk_and_does_not_wait_behind_heavy_jobs() {
     let f = Fixture::new();
-    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0}}));
+    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}));
     f.ok(
         "job.start",
         json!({"task_id":"one","id":"building","command":["/bin/sleep","3"],"heavy":true}),
@@ -1180,4 +1180,179 @@ fn a_workspace_needs_only_disk_and_does_not_wait_behind_heavy_jobs() {
     f.ok("resource.configure", json!({"min_free_disk_bytes":0}));
     f.wait("building");
     f.wait("waiting");
+}
+
+const MIB: u64 = 1024 * 1024;
+
+fn add_task(f: &Fixture, id: &str) {
+    f.ok(
+        "task.create",
+        json!({"id":id,"charter_id":"mission","owner":"ship","title":id}),
+    );
+}
+
+/// A build's output in a slot, sized so the budget arithmetic is exact.
+fn build_output(slot: &Path, bytes: usize) {
+    fs::create_dir_all(slot.join("target")).unwrap();
+    fs::write(slot.join("target/blob"), vec![0u8; bytes]).unwrap();
+}
+
+#[test]
+fn release_past_budget_trims_the_least_recently_released_outputs() {
+    let f = Fixture::new();
+    add_task(&f, "three");
+    add_task(&f, "four");
+    let slots: Vec<Value> = ["one", "two", "three", "four"]
+        .into_iter()
+        .map(|task| f.acquire(task))
+        .collect();
+    for w in &slots {
+        build_output(&path(w), MIB as usize);
+    }
+    // 1.5 MiB keeps one 1 MiB output and no more.
+    f.ok(
+        "resource.configure",
+        json!({"workspace_cache_budget_bytes": MIB * 3 / 2}),
+    );
+    for w in &slots[..3] {
+        f.release(w, false);
+        // Release times order the trims; keep them distinct.
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!path(&slots[0]).join("target").exists());
+    assert!(!path(&slots[1]).join("target").exists());
+    assert!(path(&slots[2]).join("target/blob").exists());
+    // A leased slot is never trimmed, however far the pool is over budget.
+    assert!(path(&slots[3]).join("target/blob").exists());
+    // Only build output goes: the source checkout stays whole.
+    assert!(path(&slots[0]).join("file.txt").exists());
+}
+
+#[test]
+fn a_short_disk_trims_released_output_before_it_waits() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    build_output(&path(&w), 64 * MIB as usize);
+    f.release(&w, false);
+    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // The floor sits above the free space now, so only trimming the released
+    // output can make room; without a wait, the admission must succeed.
+    f.ok(
+        "resource.configure",
+        json!({"min_free_disk_bytes": free + 8 * MIB}),
+    );
+    let again = f.ok("workspace.acquire", json!({"task_id":"two"}));
+    assert_eq!(again["path"], w["path"]);
+    assert!(!path(&again).join("target").exists());
+}
+
+#[test]
+fn a_trim_error_does_not_fail_the_acquire() {
+    let f = Fixture::new();
+    add_task(&f, "three");
+    let stuck = f.acquire("one");
+    let spare = f.acquire("two");
+    build_output(&path(&stuck), MIB as usize);
+    build_output(&path(&spare), 16 * MIB as usize);
+    // A directory in the released output that cannot be read: sizing it fails.
+    let locked = path(&stuck).join("target/locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    f.release(&stuck, false);
+    f.release(&spare, false);
+    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // The floor needs room only the spare's output can give. The trim skips
+    // the unreadable slot, trims the spare, and the acquire goes ahead.
+    f.ok(
+        "resource.configure",
+        // Far above live free space, so the disk is short however other
+        // writers move it; the call may then be refused for disk.
+        json!({"min_free_disk_bytes": free + 512 * MIB}),
+    );
+    let again = f.run("workspace.acquire", json!({"task_id":"three"}));
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    // The trim went past the unreadable slot and removed the spare's output.
+    assert!(!path(&spare).join("target").exists());
+    assert_trim_did_not_fail(&again);
+}
+
+/// A trim error never fails the call. The call succeeds, or, where freed space
+/// shows late (APFS frees lazily, and a shared runner writes meanwhile), it is
+/// refused for disk like any short disk, never with the trim's own error.
+fn assert_trim_did_not_fail(output: &Output) {
+    if output.status.success() {
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_ne!(value["status"], "refused", "{value}");
+        return;
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("disk admission refused"), "{text}");
+    assert!(!text.contains("Permission denied"), "{text}");
+}
+
+#[test]
+fn a_trim_error_does_not_fail_the_job_start() {
+    let f = Fixture::new();
+    add_task(&f, "three");
+    let stuck = f.acquire("one");
+    let spare = f.acquire("two");
+    build_output(&path(&stuck), MIB as usize);
+    build_output(&path(&spare), 16 * MIB as usize);
+    let locked = path(&stuck).join("target/locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    f.release(&stuck, false);
+    f.release(&spare, false);
+    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // The job's declared space does not fit in what is free. The trim skips
+    // the unreadable slot, trims the spare, and the job starts.
+    f.ok(
+        "resource.configure",
+        // Far above live free space, so the disk is short however other
+        // writers move it; the call may then be refused for disk.
+        json!({"min_free_disk_bytes": free + 512 * MIB}),
+    );
+    let started = f.run(
+        "job.start",
+        json!({"task_id":"three","id":"builds","command":["/bin/true"],"heavy":true,"estimate":{"disk_bytes":MIB}}),
+    );
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!path(&spare).join("target").exists());
+    assert_trim_did_not_fail(&started);
+    if started.status.success() {
+        f.wait("builds");
+    }
+}
+
+#[test]
+fn trimming_never_touches_a_slot_with_untracked_work() {
+    let f = Fixture::new();
+    let kept = f.acquire("one");
+    let trimmed = f.acquire("two");
+    build_output(&path(&kept), MIB as usize);
+    build_output(&path(&trimmed), MIB as usize);
+    f.release(&kept, false);
+    // Scratch work appears in the released slot; a trim must not touch it.
+    fs::write(path(&kept).join("notes.txt"), "keep me").unwrap();
+    f.ok(
+        "resource.configure",
+        json!({"workspace_cache_budget_bytes": 0}),
+    );
+    f.release(&trimmed, false);
+    assert!(path(&kept).join("target/blob").exists());
+    assert_eq!(
+        fs::read_to_string(path(&kept).join("notes.txt")).unwrap(),
+        "keep me"
+    );
+    assert!(!path(&trimmed).join("target").exists());
 }

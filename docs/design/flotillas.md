@@ -77,7 +77,13 @@ another.
 **Disk first.** A host-wide free-disk floor in the shared admission settings
 (`min_free_disk_bytes`, default 2 GiB), set with
 `resource.configure {"min_free_disk_bytes": ...}` and shown by
-`resource.status`. Jobs that would start below it can wait in the existing
+`resource.status`. Jobs declare what they will write as well (`estimate.disk_bytes`,
+defaulting to `heavy_estimate.disk_bytes`, 4 GiB, for heavy jobs), and admission
+counts that demand and the demand of every live reservation above the floors, so
+a machine that is running out of room refuses the next build by name rather than
+starting one that fails. The machine's owner is warned while free space is still
+above the floor but falling toward it within a day ([choosing the floor for a
+real workload](../resources.md)). Jobs that would start below it can wait in the existing
 host-wide capacity queue; `workspace.acquire` can opt into that queue with
 `wait_for_capacity:true`. Long job waits appear in `runtime.needs` as a typed
 disk floor blocker. The per-charter `min_free_bytes` floor remains in force, and
