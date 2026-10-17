@@ -11,7 +11,7 @@ from native_launch import native_environment
 def run(argv, control):
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              env=native_environment())
-    denied = False
+    denied = errored = False
     try:
         while line := child.stdout.readline(1024 * 1024 + 1):
             if len(line) > 1024 * 1024:
@@ -22,6 +22,7 @@ def run(argv, control):
                 event = json.loads(line)
                 if isinstance(event, dict) and event.get("type") == "result":
                     denied |= bool(event.get("permission_denials"))
+                    errored |= event.get("is_error") is True
         status = child.wait()
         if denied:
             reported = False
@@ -36,7 +37,8 @@ def run(argv, control):
             print(json.dumps({"type":"native.permission_blocked", "captain_question_recorded":reported,
                               "reason":"A native tool was denied; use privateer permissions to configure fleet access."}), flush=True)
             return 2
-        return status
+        # A run that ended on an error result failed, whatever Claude exits with.
+        return status or int(errored)
     finally:
         child.stdout.close()
         if child.poll() is None:
