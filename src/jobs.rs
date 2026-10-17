@@ -473,17 +473,17 @@ fn dequeue(store: &Store, job: &Job) -> Result<()> {
     )?;
     Ok(())
 }
-/// Admit and record a reservation under the ledger's write lock, so homes
-/// sharing the host decide one at a time against the same readings.
-///
-/// A request from the queue must be at its head; a direct request may not
-/// jump a non-empty queue. Either way an unfitting request is `Refused`.
 /// The disk floors for one reservation, measured on the filesystem the work
 /// will use rather than the host root.
 struct DiskFloor<'a> {
     charter_min_free_bytes: u64,
     path: &'a Path,
 }
+/// Admit and record a reservation under the ledger's write lock, so homes
+/// sharing the host decide one at a time against the same readings.
+///
+/// A request from the queue must be at its head; a direct request may not
+/// jump a non-empty queue. Either way an unfitting request is `Refused`.
 fn reserve(
     conn: &Connection,
     reservation: &mut Reservation,
@@ -2601,7 +2601,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 );
                 values.push(value);
             }
-            let host = admission::measure()?;
+            let mut host = admission::measure()?;
+            // Report the disk this home's work uses, as admission measures it.
+            (host.disk_available_bytes, host.disk_total_bytes) = admission::disk(store.home())?;
             let mut status = admission::report(&settings, &host);
             status["ledger"] = json!(path);
             status["heavy_reserved"] = json!(values.iter().filter(|v| v["heavy"] == true).count());
