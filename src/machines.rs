@@ -570,6 +570,19 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     Ok(theirs)
 }
 
+/// Run a stow command on a linked machine over its gateway. The machine
+/// stows its own ships under its own ledger; this one only asks.
+pub(crate) fn stow_linked(name: &str, command: &str) -> Result<Value> {
+    identifier(name)?;
+    let conn = crate::fleet::registry()?;
+    let machine = machine(&conn, name)?;
+    ensure!(
+        machine.role == "collects",
+        "{name} reaches this machine; stow it from there"
+    );
+    call(&machine, command, json!({}), None)
+}
+
 fn hostname() -> String {
     let mut buffer = [0u8; 256];
     let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
@@ -968,6 +981,16 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 }
             }
             Ok(json!({"recorded": recorded}))
+        }
+        // A stow runs under this machine's own ledger, from any home here.
+        _ if command.starts_with("stow.") => {
+            let home = crate::fleet::members(&conn)?
+                .into_iter()
+                .find(|m| m.home.is_dir())
+                .context("this machine has no ships to stow")?
+                .home;
+            let mut store = Store::open_as(&home, caller.clone())?;
+            crate::dispatch(&mut store, command, args.clone())
         }
         _ => bail!("unknown gateway command {command}"),
     }

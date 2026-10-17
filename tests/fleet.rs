@@ -742,6 +742,7 @@ fn a_stow_asks_every_ship_holds_new_jobs_but_not_wakes_and_resumes() {
     };
 
     let out = machine.ok(&liaison, &["stow"]);
+    assert!(out.starts_with("Stowing the fleet ("), "{out}");
     assert!(out.contains("asked apps to stow"), "{out}");
     assert!(out.contains("asked liaison to stow"), "{out}");
     let inbox = machine.json(&apps, "mail.inbox", json!({"address":"apps"}));
