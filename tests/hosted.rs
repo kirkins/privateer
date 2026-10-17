@@ -484,6 +484,14 @@ impl Herdr {
             .cloned()
             .collect()
     }
+    fn status(&self, workspace_id: &str, status: &str) {
+        let mut panes = self.panes.lock().unwrap();
+        let pane = panes
+            .iter_mut()
+            .find(|pane| pane["workspace_id"] == workspace_id)
+            .expect("hosted pane exists");
+        pane["agent_status"] = json!(status);
+    }
     /// The sidebar, top to bottom.
     fn order(&self) -> Vec<String> {
         self.spaces
@@ -493,6 +501,53 @@ impl Herdr {
             .map(|(id, _)| id.clone())
             .collect()
     }
+}
+
+fn hosted_fixture() -> (Place, Herdr) {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"start hosted mate"}),
+    );
+    assert_eq!(place.tick()["hosted"]["pane"], "w2:p1");
+    until("the hosted harness", || place.root.join("pi-env").exists());
+    (place, herdr)
+}
+
+fn captain_blocked_alerts(place: &Place) -> Vec<Value> {
+    place.json(
+        "mail.inbox",
+        json!({"address":"captain","all":true,"limit":100}),
+    )["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["payload"]["hosted_blocked"] == "infra")
+        .cloned()
+        .collect()
+}
+
+fn age_hosted_block(place: &Place) {
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_block_alerts SET blocked_since_ms=?1 WHERE ship='infra'",
+            [privateer::store::Store::now_ms() - 5 * 60 * 1000 - 1],
+        )
+        .unwrap();
 }
 
 /// The real dashboard runs directly in a disposable PTY. No ANSI transcript
@@ -1538,6 +1593,70 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
     assert_eq!(place.wakes(), 2);
     place.stop_wake("due missing-socket fallback", &report);
+}
+
+#[test]
+fn hosted_blocked_alerts_once_after_the_threshold() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "blocked");
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    age_hosted_block(&place);
+    place.tick();
+    let alerts = captain_blocked_alerts(&place);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0]["to"], "captain");
+    assert_eq!(alerts[0]["from"], "crew");
+    assert_eq!(alerts[0]["urgency"], "normal");
+    assert_eq!(alerts[0]["task_id"], "infra-duty");
+    assert!(
+        alerts[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for input in Herdr")
+    );
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    place.stop_native("infra");
+}
+
+#[test]
+fn hosted_blocked_alerts_again_after_clear_and_reblock() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "blocked");
+    place.tick();
+    age_hosted_block(&place);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    herdr.status("w2", "idle");
+    place.tick();
+    herdr.status("w2", "blocked");
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    age_hosted_block(&place);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 2);
+    place.stop_native("infra");
+}
+
+#[test]
+fn hosted_blocked_alerts_never_for_an_idle_pane() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    assert_eq!(
+        place
+            .database()
+            .query_row(
+                "SELECT COUNT(*) FROM hosted_block_alerts WHERE ship='infra'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+    );
+    place.stop_native("infra");
 }
 
 #[test]
