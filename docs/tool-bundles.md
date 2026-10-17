@@ -7,10 +7,12 @@ install packages, edit native configuration, replace `HOME`/the agent directory,
 search credential stores, or infer which personal extensions are required.
 
 The first stage supports named/versioned **local skills and their supporting
-scripts/files**. Optional MCP servers and optional executable tool extensions
-are deferred: definitions containing those fields fail validation, rather than
-silently dropping them. The separate [stage-two offline MCP factory qualification](pi-mcp-stage2-qualification.md)
-adds test fixtures/design evidence only; it does not enable MCP in this registry. A bundle
+scripts/files**. Remote streamable-HTTP MCP servers load for Pi runs that select
+them, see [Selected MCP servers](#selected-mcp-servers-pi-http). stdio MCP servers
+and optional executable tool extensions are deferred: definitions containing
+those fields fail validation, rather than silently dropping them. The separate
+[stage-two offline MCP factory qualification](pi-mcp-stage2-qualification.md)
+holds the Pi factory fixtures and limits. A bundle
 may name [credentials](#credentials) its scripts need; a launch gets the path of
 each selected one's captain-stored file, never the value. Never put credential
 values in bundles, prompts, argv, registry definitions or scripts.
@@ -300,6 +302,35 @@ This is exposure hygiene, not credential isolation; whether a personal
 `~/.claude/CLAUDE.md` or auto-memory follows the setting sources is not yet
 qualified.
 
+## Selected MCP servers (Pi, HTTP)
+
+A bundle may hold `mcp_servers`, at most four, each with exactly `name` (a lowercase
+slug, at most 32 characters), `url`, `credential` (a name the same bundle declares
+under `credentials`), `timeout` (an integer from 1 to 300) and an optional
+`description` (printable, at most 200 characters). The URL is `https`, or `http`
+only to `127.0.0.1`, `[::1]` or `localhost`, with no userinfo or fragment. A plan
+holds at most eight servers, unique after lower-casing and `-` to `_`. A bundle
+needs a skill or a server. Any other key (`headers`, `command`, `env`, `oauth`,
+`exposure`...) refuses, as does any string holding `$`, a leading `!` or a control
+character.
+
+Only a Pi run that selects the bundle loads its servers. The launcher sets
+`PRIVATEER_MCP_SERVERS` to the selected records (names, URLs, credential names,
+timeouts, descriptions; no paths or values) and adds Privateer's
+`plugins/pi-mcp/selected.ts` gate. Each Bearer token is read from its
+captain-stored credential file inside the Pi process, and is sent only as an
+`Authorization` header to that server, with `exposure: direct`. The gate passes
+when every selected server lists tools and no other `mcp__` tool exists. It
+refuses, before any model turn, when another extension registered a server, a
+token file is missing or malformed, a server is refused (401) or lists no tools
+within `min(30, timeout)` seconds. A refusal exits 78 with one line naming only
+the server. Claude refuses any plan with servers. Plans without servers are unchanged,
+and a run gets no MCP tool unless it selects one.
+
+Limits: the token sits in the Pi process's memory; a same-user agent can still
+read the credential file; URLs are not content-pinned; stdio servers are not
+supported yet; Claude refuses servers.
+
 ## Test evidence and reproduction
 
 Always capacity-admit heavy suites through `job.start` in an active charter.
@@ -307,7 +338,8 @@ Always capacity-admit heavy suites through `job.start` in an active charter.
 ```sh
 cargo test -j1 --test tool_bundles --test plugins
 python3 tests/pi_bundles.py
-python3 tests/pi_bundles_native.py /absolute/installed/native/pi
+node tests/pi-mcp-selected.mjs
+python3 tests/pi_offline_netns.py -- python3 tests/pi_bundles_native.py /absolute/installed/native/pi
 python3 tests/claude_bundles.py
 python3 tests/claude_bundles_native.py /absolute/installed/native/claude
 ```

@@ -28,7 +28,7 @@ def launch_environment():
     """The native environment without any inherited credential paths: a run
     never inherits a parent's, and gets only its own selected bundles'."""
     env = native_environment()
-    for name in [name for name in env if name.startswith("PRIVATEER_CREDENTIAL_")]:
+    for name in [name for name in env if name.startswith(("PRIVATEER_CREDENTIAL_", "PRIVATEER_MCP_"))]:
         del env[name]
     return env
 
@@ -52,6 +52,10 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         if harness != "pi":
             raise ValueError("bounded resources support only Pi and Claude")
         from pi_bundles import preflight
+        if bundles.get("mcp_servers"):
+            # Records only (names, URLs, credential names, limits): the token
+            # is read from its file inside the Pi process, never passed here.
+            env["PRIVATEER_MCP_SERVERS"] = json.dumps(bundles["mcp_servers"], separators=(",", ":"), sort_keys=True)
         directory = Path(__file__).resolve().parent
         extensions = [directory / "attended/mail.ts"] if attended else []
         crew = str(directory / "attended/crew.ts")

@@ -436,5 +436,118 @@ class Bundles(unittest.TestCase):
         self.assertNotIn(sentinel, run.stdout + run.stderr)
 
 
+    # Selected MCP servers: remote streamable-HTTP, Pi only, Bearer by credential ref.
+    def mcp_record(self, **change):
+        record = {'name': 'docs', 'url': 'https://mcp.example.test/mcp', 'credential': 'DOCS_TOKEN', 'timeout': 5}
+        record.update(change)
+        return {key: value for key, value in record.items() if value is not None}
+
+    def mcp_bundle(self, ref='docs@1', servers=None, skills=(), credentials=None):
+        bundle = {'ref': ref, 'roles': ['first_mate', 'crew'], 'skills': list(skills),
+                  'credentials': [{'name': 'DOCS_TOKEN', 'ref': 'docs-search'}] if credentials is None else credentials,
+                  'mcp_servers': [self.mcp_record()] if servers is None else servers}
+        return bundle
+
+    def registry_with(self, *bundle_list):
+        return dict(self.registry, bundles=list(bundle_list))
+
+    def test_selected_mcp_registry_refuses_every_unsafe_shape(self):
+        bundles.validate_registry(self.registry_with(self.mcp_bundle(skills=[self.a])))
+        cases = [
+            {'command': 'npx'}, {'headers': {'Authorization': 'x'}}, {'oauth': True}, {'type': 'stdio'},
+            {'url': 'https://mcp.example.test/$TOKEN'}, {'url': 'http://mcp.example.test/mcp'},
+            {'url': 'https://user:pw@mcp.example.test/mcp'}, {'url': 'https://mcp.example.test/mcp#x'},
+            {'url': 'ftp://mcp.example.test/mcp'}, {'url': 'https://mcp.example.test/' + 'a' * 2048},
+            {'credential': 'UNDECLARED'}, {'timeout': 0}, {'timeout': 301}, {'timeout': True},
+            {'name': 'x' * 33}, {'name': 'Docs'}, {'name': '$docs'}, {'name': 'docs_1'},
+            {'description': '!run'}, {'description': 'x' * 201}, {'description': 'a\nb'}, {'description': 'a$b'},
+        ]
+        for change in cases:
+            record = self.mcp_record()
+            record.update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[record], skills=[self.a])))
+        # Declared credential must belong to the same bundle.
+        with self.assertRaises(ValueError):
+            bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[self.mcp_record(credential='OTHER')],
+                                                                         skills=[self.a], credentials=[])))
+        # A bundle needs at least one skill or one server; an empty server list is not a server.
+        with self.assertRaises(ValueError):
+            bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[], skills=[])))
+        with self.assertRaises(ValueError):
+            bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[self.mcp_record()] * 5, skills=[self.a])))
+
+    def test_selected_mcp_limits_and_collisions_are_per_plan(self):
+        first = [self.mcp_record(name=f's{i}') for i in range(4)]
+        second = [self.mcp_record(name=f't{i}') for i in range(4)]
+        # Eight is the most in one plan; nine across three bundles refuses at selection.
+        registry = self.registry_with(self.mcp_bundle('a@1', servers=first), self.mcp_bundle('b@1', servers=second),
+                                      self.mcp_bundle('c@1', servers=[self.mcp_record(name='c0')]))
+        bundles.validate_registry(registry)
+        with self.assertRaises(ValueError):
+            bundles.plan(registry, ['a@1', 'b@1', 'c@1'], 'crew')
+        self.assertEqual(len(bundles.plan(registry, ['a@1', 'b@1'], 'crew')['mcp_servers']), 8)
+        # One normalized name across two selected bundles refuses at selection.
+        collide = self.registry_with(self.mcp_bundle('a@1', servers=[self.mcp_record(name='a-b')]),
+                                     self.mcp_bundle('b@1', servers=[self.mcp_record(name='a-b')]))
+        with self.assertRaises(ValueError):
+            bundles.plan(collide, ['a@1', 'b@1'], 'crew')
+
+    def test_selected_mcp_plan_carries_only_selected_servers(self):
+        registry = self.registry_with(self.mcp_bundle('docs@1', servers=[self.mcp_record()], skills=[self.a]),
+                                      {'ref': 'other@1', 'roles': ['crew'], 'skills': [self.b],
+                                       'mcp_servers': [self.mcp_record(name='hidden', url='https://hidden.example.test/mcp', credential='HIDDEN')],
+                                       'credentials': [{'name': 'HIDDEN', 'ref': 'hidden-ref'}]})
+        plan = bundles.plan(registry, ['docs@1'], 'crew')
+        self.assertEqual([s['name'] for s in plan['mcp_servers']], ['docs'])
+        self.assertNotIn('hidden', json.dumps(plan))
+        bundles.validate_plan(plan)
+        # Without servers, the plan is exactly the earlier shape: no key at all.
+        self.assertNotIn('mcp_servers', self.plan())
+        self.assertEqual(self.plan(), bundles.plan(self.registry, ['selected@1'], 'crew'))
+        # A tampered record in a stored plan refuses at validation.
+        tampered = copy.deepcopy(plan)
+        tampered['mcp_servers'][0]['headers'] = {'Authorization': 'x'}
+        with self.assertRaises(ValueError):
+            bundles.validate_plan(tampered)
+        # Claude has no bounded MCP loader: refuse, never drop the server.
+        with self.assertRaises(ValueError):
+            bundles.plan(registry, ['docs@1'], 'crew', harness='claude')
+
+    def test_selected_mcp_preflight_adds_only_the_runtime_gate(self):
+        import native_launch
+        registry = self.registry_with(self.mcp_bundle(skills=[self.a]))
+        directory = self.base / 'fleet.credentials'
+        directory.mkdir(mode=0o700)
+        (directory / 'docs-search').write_bytes(b'SENTINEL-MCP-TOKEN')
+        (directory / 'docs-search').chmod(0o600)
+        env = dict(self.env, PRIVATEER_FLEET=str(self.base / 'fleet.sqlite'), PRIVATEER_MCP_SERVERS='{"ambient":true}')
+        with patch.dict(os.environ, env, clear=True), self.probe(), patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '--print', '--', 'brief'], bundles=bundles.plan(registry, ['docs@1'], 'crew'))
+        argv, launched = execute.call_args.args[1:]
+        gate = str(ROOT / 'plugins/pi-mcp/selected.ts')
+        self.assertIn(gate, argv)
+        self.assertLess(argv.index(gate), argv.index('--'))
+        recorded = json.loads(launched['PRIVATEER_MCP_SERVERS'])
+        self.assertEqual([r['name'] for r in recorded], ['docs'])
+        self.assertNotIn('SENTINEL-MCP-TOKEN', json.dumps([argv, launched]))
+        self.assertEqual(launched['PRIVATEER_CREDENTIAL_DOCS_TOKEN_FILE'], str(directory / 'docs-search'))
+        # No servers: no gate, no inherited selection, and the old argv shape.
+        plain_env = dict(env)
+        with patch.dict(os.environ, plain_env, clear=True), self.probe(), patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '--print', '--', 'brief'], bundles=self.plan())
+        argv, launched = execute.call_args.args[1:]
+        self.assertNotIn(gate, argv)
+        self.assertNotIn('PRIVATEER_MCP_SERVERS', launched)
+
+    def test_selected_mcp_missing_credential_refuses_before_native_probe(self):
+        import native_launch
+        registry = self.registry_with(self.mcp_bundle(skills=[self.a]))
+        env = dict(self.env, PRIVATEER_FLEET=str(self.base / 'fleet.sqlite'))
+        with patch.dict(os.environ, env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
+            native_launch.launch('pi', ['pi', '--print', '--', 'brief'], bundles=bundles.plan(registry, ['docs@1'], 'crew'))
+        probe.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

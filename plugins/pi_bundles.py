@@ -76,6 +76,9 @@ def preflight(value, argv, cwd=None, env=None, runtime_extensions=()):
     loaded = [argv[0], *FLAGS]
     for item in value['integrations']['extensions']:
         loaded.extend(['-e', item['path']])
+    if value.get('mcp_servers'):
+        # Runs that select MCP servers load Privateer's gate, and no others.
+        loaded.extend(['-e', str(Path(__file__).resolve().parent / 'pi-mcp' / 'selected.ts')])
     for path in runtime_paths:
         loaded.extend(['-e', path])
     for item in value['skills']:
