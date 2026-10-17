@@ -6,6 +6,16 @@ and `gh`, with `acceptEdits` unless a profile selects another mode. Launch flags
 work even in folders where Claude has not accepted the project-trust dialog.
 Native deny rules and managed restrictions still apply.
 
+Every headless Claude launch also names the ship's home and the resource
+ledger with `--add-dir`, and removes the tools whose work would outlive the job
+(`CronCreate`, `ScheduleWakeup`, `RemoteTrigger`). First mates (wakes, errands
+and attended sessions) additionally lose Claude's own delegation tools (`Task`
+or `Agent`, `Workflow`, `EnterWorktree`): they hand work to crew jobs, which the
+fleet tracks, rather than to agents it cannot see. A ship whose first mate runs
+unattended on Claude can select `"permission_mode": "auto"` in its profile, so
+Claude's classifier approves routine commands instead of denying every command
+outside the allow list; this depends on the account offering auto mode.
+
 Configure the whole local fleet from any directory:
 
 ```sh

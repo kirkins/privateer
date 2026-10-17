@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 
 from protocol import context, option, serve
-from tool_permissions import options_for, claude_rules, policy
+from tool_permissions import options_for, claude_disallowed, claude_rules, policy
 
 
 PROFILES = {
@@ -270,6 +270,15 @@ def build(harness, request):
         # Privateer CLI on the command line so the agent can reach its home.
         control = request["context"].get("control")
         argv += ["--allowedTools", *claude_rules(tool_policy, control)]
+        argv += ["--disallowedTools", *claude_disallowed(request["context"].get("role"))]
+        # The home and the shared resource ledger hold the ship's records and
+        # crew logs; a crew workspace is elsewhere, so name them for Claude's
+        # file tools as Codex and Cursor do.
+        if control:
+            for extra in [control["cli_argv"][2], *control.get("writable", [])]:
+                extra = Path(extra).resolve()
+                if extra.is_dir() and str(extra) not in argv:
+                    argv += ["--add-dir", str(extra)]
         argv += ["--", prompt]
     elif harness == "opencode-v2":
         if boolean(options, "auto"):

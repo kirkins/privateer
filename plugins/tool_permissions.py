@@ -57,6 +57,16 @@ def options_for(harness, options, value):
     return options
 
 
+# Claude tools whose work would outlive the job or escape the fleet's records.
+CLAUDE_DETACHED = ["CronCreate", "ScheduleWakeup", "RemoteTrigger"]
+# A first mate delegates through crew jobs, not Claude's own agents or worktrees.
+CLAUDE_DELEGATION = ["Agent", "Task", "Workflow", "EnterWorktree"]
+
+
+def claude_disallowed(role):
+    return CLAUDE_DETACHED + (CLAUDE_DELEGATION if role == "first_mate" else [])
+
+
 def claude_rules(value, control=None):
     value = policy(value)
     cli = control["cli_argv"][0] if control else os.environ.get("PRIVATEER_CONTROL_CLI")
@@ -111,4 +121,6 @@ def attended_argv(harness, argv, value):
         if value["mode"] == "standard" and not any(x.split("=", 1)[0] == "--permission-mode" for x in prefix):
             extra += ["--permission-mode", "acceptEdits"]
         extra += ["--allowedTools", *claude_rules(value)]
+        # An attended Claude session is the ship's first mate.
+        extra += ["--disallowedTools", *claude_disallowed("first_mate")]
     return [prefix[0], *extra, *prefix[1:], *tail]

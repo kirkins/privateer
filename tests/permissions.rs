@@ -196,6 +196,9 @@ fn attended_launches_receive_the_same_fleet_policy() {
     assert!(!args.contains(&"plan".into()));
     assert!(args.contains(&"Bash(git *)".into()));
     assert!(args.contains(&"Bash(gh *)".into()));
+    // The attended session is the first mate: it delegates through crew jobs.
+    let blocked = args.iter().position(|a| a == "--disallowedTools").unwrap();
+    assert!(args[blocked..].contains(&"Workflow".into()));
 }
 
 #[test]
