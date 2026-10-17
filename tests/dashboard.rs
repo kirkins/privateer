@@ -1298,3 +1298,25 @@ fn mouse_is_ignored_while_the_sea_is_open() {
     assert_eq!(app.selected, 0);
     assert!(app.voyage.is_some());
 }
+
+#[test]
+fn voyage_counts_a_ship_working_only_from_its_own_fresh_herdr_pane() {
+    let mut view = privateer::dashboard::herdr::View::demo();
+    for pane in &mut view.panes {
+        if pane.pane_id == "demo:apps" {
+            pane.agent_status = "working".into();
+        }
+    }
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        herdr: Some(view),
+        herdr_age: Some(0),
+        ..App::default()
+    };
+    assert_eq!(
+        app.working_ships().into_iter().collect::<Vec<_>>(),
+        ["apps"]
+    );
+    app.herdr_age = Some(10);
+    assert!(app.working_ships().is_empty(), "a stale view says nothing");
+}

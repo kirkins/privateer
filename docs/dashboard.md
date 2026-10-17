@@ -225,6 +225,7 @@ JSON `--once` output), not used as attention.
 | a / d in approval | Select approve / deny; Enter commits |
 | Page Up/Down, wheel | Scroll details / navigate list |
 | i | Separate mail history |
+| v | Voyage sea (v or Escape returns) |
 | Escape / Home | Return to bridge (or cancel draft) |
 | q / Ctrl-C | Exit (q is literal text while answering) |
 
@@ -232,6 +233,25 @@ Mouse clicks select, never focus or send; hit targets follow list offsets and
 are cleared on resize. At least 40 columns by 14 rows is required. Terminal
 control and bidi-override characters are removed. Summaries and messages can
 still contain private text; this is not screenshot sanitization.
+
+## Voyage
+
+`v` replaces the bridge with an animated sea of the fleet, drawn only from the
+snapshot and Herdr view the bridge already holds; it reads and changes nothing.
+This machine's ships come first, liaison leading, then each linked machine's
+ships under its own heading, drawn as distant boats because their state is
+read on that machine. A boat's shape says its state without colour or motion:
+sails up while its first mate works (a running wake, or its own validated
+Herdr pane reporting `working` in a fresh view), anchored when idle, a bare
+hull when its dispatcher is stopped, `!` when its state cannot be read and
+`?` when there is none. Presence alone does not raise the sails, because a
+hosted first mate holds it whenever its pane is open. Small boats trail a ship
+for its active crew, a bottle drifts from the liaison to a ship with open
+requests (the sender is approximated), and a flag marks a ship that needs the
+captain. The bottom row is a key to what is on screen. Spare rows become open
+water between the rows of ships; as space runs out names go, then boats become
+one symbol each, then a count of ships not shown. `--reduced-motion` holds the
+sea still.
 
 ## Reliability and verification
 
