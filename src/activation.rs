@@ -396,6 +396,16 @@ fn job_status(store: &mut Store, job_id: &str) -> Result<Value> {
     crate::jobs::dispatch(store, "job.status", json!({"id": job_id}))
 }
 
+fn own_route_blocked(store: &Store, profile: &Value) -> Result<bool> {
+    let Some(route) = profile["manifest"]
+        .as_str()
+        .and_then(|manifest| crate::routes::route_of(manifest, &profile["options"]))
+    else {
+        return Ok(false);
+    };
+    Ok(crate::routes::refusal(store, &route)?.is_some())
+}
+
 /// Record the outcome of wakes whose first mate has finished.
 fn settle(store: &mut Store) -> Result<Vec<Value>> {
     let running: Vec<(String, String)> = {
@@ -562,7 +572,7 @@ pub(crate) fn warm_session(
 /// Decide whether a ship's first mate is due, and wake it if so.
 fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let name = ship["name"].as_str().context("ship name")?.to_owned();
-    let profile = ship["first_mate"].clone();
+    let mut profile = ship["first_mate"].clone();
     if crate::permissions::paused(store, &name)? {
         return Ok(
             json!({"ship":name,"skipped":"tool permission question awaits captain or a policy change"}),
@@ -592,7 +602,17 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // one durable admission path, before the headless fallback below.
     let mut host_error = None;
     let mut host_backoff_until_ms = None;
+    let mut own_blocked = None;
+    // While the configured route is backing off, use headless fallback wakes.
+    // Keeping the hosted session on its own native route avoids changing host adapter
+    // identity or inheriting the ship's route-specific config/tool bundles.
     if crate::host::hosted(&profile) {
+        match own_route_blocked(store, &profile) {
+            Ok(blocked) => own_blocked = Some(blocked),
+            Err(error) => host_error = Some(format!("checking first-mate route: {error:#}")),
+        }
+    }
+    if crate::host::hosted(&profile) && own_blocked == Some(false) {
         match crate::host::launch(store, &name, &profile) {
             Ok(crate::host::Attempt::Launched(hosted)) => {
                 return Ok(json!({"ship": name, "hosted": hosted}));
@@ -693,21 +713,32 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     }
     // Resume only a single focus's warm session: mixing topics in one
     // conversation is what makes long sessions costly and confused.
-    let harness = harness_id(&profile);
-    let resume = match foci.as_slice() {
+    let mut harness = harness_id(&profile);
+    let mut resume = match foci.as_slice() {
         [focus] if profile.get("tool_bundles").is_none() => {
             warm_session(store, &name, focus, &harness, &profile)?
         }
         _ => None,
     };
-    // A headless wake on a backed-off route would only fail; its mail waits.
-    if let Some(route) = profile["manifest"]
-        .as_str()
-        .and_then(|m| crate::routes::route_of(m, &profile["options"]))
-    {
-        if crate::routes::refusal(store, &route)?.is_some() {
+    // A headless wake on a backed-off route would only fail. Try the captain's
+    // first_mate order; if it has no clear route, preserve the existing wait.
+    if own_blocked.is_none() {
+        own_blocked = Some(own_route_blocked(store, &profile)?);
+    }
+    if own_blocked == Some(true) {
+        let Some(fallback) =
+            crate::crew_routes::first_mate_fallback(store, &name, &task, &profile)?
+        else {
             return Ok(json!({"ship": name, "skipped": "model route backing off"}));
-        }
+        };
+        profile["manifest"] = fallback.manifest;
+        profile["options"] = fallback.options;
+        profile.as_object_mut().unwrap().remove("config");
+        profile.as_object_mut().unwrap().remove("tool_bundles");
+        // A resumed session belongs to the configured route's harness. The
+        // fallback must start fresh under its own harness and route options.
+        resume = None;
+        harness = harness_id(&profile);
     }
     let text = wake_text(store, &wake, &name, &mail, through, resume.is_some())?;
     let mut start = json!({
@@ -790,7 +821,13 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let work = crate::scheduling::tick(store)?;
     let mut considered = vec![];
     for ship in ships(store)? {
-        considered.push(consider(store, &ship)?);
+        considered.push(match consider(store, &ship) {
+            Ok(report) => report,
+            Err(error) => json!({
+                "ship": ship["name"],
+                "error": format!("{error:#}").chars().take(2_000).collect::<String>()
+            }),
+        });
     }
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
     // Mail other machines hold for ships here, which they cannot send.
