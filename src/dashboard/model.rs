@@ -215,6 +215,14 @@ pub struct Job {
     pub status: String,
 }
 
+impl Job {
+    /// Recorded as launching or running: counts as crew and is never dropped
+    /// by the display bound.
+    pub fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "launching" | "running")
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Recent {
     pub home: PathBuf,
@@ -356,7 +364,7 @@ impl Snapshot {
         snapshot.activity = read_notices(&tx, home, false)?;
         {
             // Stored outcomes only. We do not probe processes or settle jobs.
-            let mut q = tx.prepare("SELECT substr(j.id,1,160),substr(json_extract(j.record,'$.task_id'),1,160),substr(json_extract(j.record,'$.status'),1,40),substr(t.owner,1,160) FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') ORDER BY j.rowid DESC LIMIT 201")?;
+            let mut q = tx.prepare("SELECT substr(j.id,1,160),substr(json_extract(j.record,'$.task_id'),1,160),substr(json_extract(j.record,'$.status'),1,40),substr(t.owner,1,160) FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') ORDER BY CASE WHEN json_extract(j.record,'$.status') IN ('launching','running') THEN 0 ELSE 1 END, j.rowid DESC LIMIT 201")?;
             for row in q.query_map([], |r| {
                 Ok(Job {
                     home: Some(home.to_path_buf()),

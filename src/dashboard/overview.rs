@@ -52,7 +52,7 @@ fn work<'a>(ship: &Ship, snapshot: &'a Snapshot) -> Work<'a> {
         crew: snapshot
             .jobs
             .iter()
-            .filter(|j| j.owner == ship.id && matches!(j.status.as_str(), "launching" | "running"))
+            .filter(|j| j.owner == ship.id && j.is_active())
             .map(|j| j.task_id.as_str())
             .collect(),
     }
@@ -134,6 +134,28 @@ pub fn observed(snapshot: &Snapshot) -> bool {
     snapshot.ships.iter().any(|s| s.live.is_some())
 }
 
+/// Longest ship name shown in the table; the liaison star takes two more columns.
+const NAME_CHARS: usize = 22;
+
+/// A name cut to `NAME_CHARS` with an ellipsis (ASCII dots in `--ascii`).
+fn short_name(name: &str, ascii: bool) -> String {
+    let name = clean(name, 160);
+    if name.chars().count() <= NAME_CHARS {
+        return name;
+    }
+    let mark = if ascii { "..." } else { "…" };
+    let kept: String = name
+        .chars()
+        .take(NAME_CHARS - mark.chars().count())
+        .collect();
+    format!("{kept}{mark}")
+}
+
+/// Empty cell marker: a middle dot, or a hyphen in `--ascii`.
+fn empty(ascii: bool) -> &'static str {
+    if ascii { "-" } else { "·" }
+}
+
 /// Header, rows and widths of the fleet table that fit in `width` columns.
 pub fn table(
     snapshot: &Snapshot,
@@ -143,7 +165,7 @@ pub fn table(
     let name = snapshot
         .ships
         .iter()
-        .map(|s| Line::from(clean(&s.name, 160)).width() as u16 + 2)
+        .map(|s| Line::from(short_name(&s.name, ascii)).width() as u16 + 2)
         .max()
         .unwrap_or(4)
         .clamp(6, 24);
@@ -164,11 +186,12 @@ pub fn table(
         .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
     let number = |n: usize| {
         if n == 0 {
-            Cell::from("·").style(Style::default().fg(Color::DarkGray))
+            Cell::from(empty(ascii)).style(Style::default().fg(Color::DarkGray))
         } else {
             Cell::from(n.to_string()).style(attention())
         }
     };
+    let dash = if ascii { "-" } else { "—" };
     let rows = snapshot
         .ships
         .iter()
@@ -178,12 +201,13 @@ pub fn table(
             let aboard = match &ship.live {
                 Some(l) if l.error.is_some() => "unavailable",
                 Some(l) if l.attended => "aboard",
+                Some(_) if ascii => "-",
                 Some(_) => "—",
                 None => "",
             };
             let mut cells = [
                 Cell::from(Line::from(vec![
-                    Span::raw(clean(&ship.name, 160)),
+                    Span::raw(short_name(&ship.name, ascii)),
                     Span::styled(
                         match (ship.liaison, ascii) {
                             (false, _) => "",
@@ -206,7 +230,7 @@ pub fn table(
                     work.owned.to_string()
                 }),
                 Cell::from(match work.crew.as_slice() {
-                    [] => "·".to_owned(),
+                    [] => empty(ascii).to_owned(),
                     [task] => format!("1 {}", clean(task, 40)),
                     crew => format!("{} running", crew.len()),
                 })
@@ -215,13 +239,13 @@ pub fn table(
                 } else {
                     attention()
                 }),
-                Cell::from(live.map_or("—", |l| if l.dispatcher { "running" } else { "stopped" }))
+                Cell::from(live.map_or(dash, |l| if l.dispatcher { "running" } else { "stopped" }))
                     .style(Style::default().fg(if live.is_some_and(|l| !l.dispatcher) {
                         Color::DarkGray
                     } else {
                         Color::Reset
                     })),
-                Cell::from(live.and_then(|l| l.wakes.first()).map_or("—".into(), |w| {
+                Cell::from(live.and_then(|l| l.wakes.first()).map_or(dash.into(), |w| {
                     format!("{} {}", clean(&w.mode, 40), clean(&w.status, 40))
                 })),
             ];
@@ -270,6 +294,21 @@ mod tests {
         ];
         assert_eq!(inbox(&mixed, 1), "2 to answer · 2 unread · 1 error");
         assert_eq!(inbox(&[mail("notice", "unread", true)], 0), "All read");
+    }
+
+    #[test]
+    fn long_names_end_in_an_ellipsis_and_ascii_uses_plain_marks() {
+        let short = "Apps";
+        assert_eq!(short_name(short, false), short);
+        let long = "Repository maintenance and release coordination crew";
+        let cut = short_name(long, false);
+        assert_eq!(cut.chars().count(), NAME_CHARS);
+        assert!(cut.ends_with('…') && long.starts_with(cut.trim_end_matches('…')));
+        let plain = short_name(long, true);
+        assert_eq!(plain.chars().count(), NAME_CHARS);
+        assert!(plain.ends_with("..."));
+        assert_eq!(empty(false), "·");
+        assert_eq!(empty(true), "-");
     }
 
     #[test]

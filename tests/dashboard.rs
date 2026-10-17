@@ -711,7 +711,13 @@ fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
     // The fleet table shows the running crew for apps (demo job build-1 on app-build).
     assert!(bridge.contains("1 app-build"));
     app.select_tab(1);
-    assert!(render(&mut app, 140, 40).contains("1 app-build"));
+    let assigned = render(&mut app, 140, 40);
+    assert!(assigned.contains("1 app-build"));
+    // The running task's title is rendered in the selected ship's details again.
+    assert!(
+        assigned.contains("Investigate the failing build"),
+        "{assigned}"
+    );
     assert_eq!(app.assignment_indices().len(), 1);
     app.select_tab(2);
     assert_eq!(app.scoped_panes().len(), 1);
@@ -1185,4 +1191,42 @@ fn a_message_leaving_history_requires_explicit_reselection_not_an_adjacent_row()
     assert_eq!(app.history_read.take().unwrap().id, "a");
     app.update_mail(Vec::new(), Vec::new());
     assert!(app.selected_history().is_none());
+}
+
+#[test]
+fn short_terminals_keep_a_fleet_row_and_ascii_marks_empty_cells_and_long_names() {
+    use privateer::dashboard::model::Ship;
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        ..App::default()
+    };
+    let screen = render(&mut app, 100, 14);
+    let lines: Vec<&str> = screen.lines().collect();
+    let header = lines
+        .iter()
+        .position(|l| l.contains("Running crew"))
+        .expect(&screen);
+    assert!(lines[header + 1].contains("Navigator"), "{screen}");
+
+    let mut app = App {
+        snapshot: Snapshot {
+            ships: vec![Ship {
+                id: "release".into(),
+                name: "Repository maintenance and release coordination crew".into(),
+                ..Ship::default()
+            }],
+            ..Snapshot::default()
+        },
+        ascii: true,
+        ..App::default()
+    };
+    let screen = render(&mut app, 120, 34);
+    let row = screen
+        .lines()
+        .find(|l| l.contains("Repository"))
+        .expect(&screen);
+    assert!(row.contains("Repository maintena..."), "{screen}");
+    assert!(!row.contains("release coordination"), "{screen}");
+    assert!(!row.contains('·') && !row.contains('—'), "{row}");
+    assert!(row.contains(" - "), "{row}");
 }

@@ -2,7 +2,7 @@ use super::{
     bridge::{Answer, Attention, Binding, FRESH_MS, RECENT_MS},
     captain::{Composer, Exchange, HistoryBinding, Mail},
     herdr,
-    model::{Snapshot, Task, clean},
+    model::{Snapshot, Task, clean, count},
     overview,
 };
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
@@ -632,6 +632,55 @@ impl App {
             .map_or_else(|| "unlisted home".into(), |s| clean(&s.name, 160))
     }
 
+    /// The ship's open tasks, owned or offered to it, with custody and origin.
+    /// Work delegated from another home is marked, so it is not mistaken for
+    /// the ship's own work.
+    fn push_ship_work(&self, lines: &mut Vec<Line<'static>>, ship: &super::model::Ship) {
+        const SHOWN: usize = 20;
+        let own_home = ship.live.as_ref().map(|l| l.home.as_path());
+        let open: Vec<&Task> = self
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|t| {
+                (t.owner == ship.id || t.handoff_to.as_deref() == Some(ship.id.as_str()))
+                    && !matches!(t.status.as_str(), "done" | "cancelled")
+            })
+            .collect();
+        if open.is_empty() {
+            lines.push(Line::from("Open work: none recorded for this ship"));
+            return;
+        }
+        lines.push(Line::from(format!(
+            "Open work: {}",
+            count(open.len(), "task", "tasks")
+        )));
+        for task in open.iter().take(SHOWN) {
+            let delegated = matches!(
+                (own_home, task.home.as_deref()),
+                (Some(own), Some(home)) if own != home
+            );
+            lines.push(Line::from(format!(
+                "{} · {} · {} · {} · owner {} · origin {}",
+                if delegated { "Delegated" } else { "Own" },
+                clean(&task.title, 512),
+                clean(&task.id, 160),
+                clean(&task.status, 40),
+                self.ship_name(&task.owner),
+                self.home_label(task.home.as_deref()),
+            )));
+            if let Some(target) = &task.handoff_to {
+                lines.push(Line::from(format!(
+                    "  offered to {} (not accepted)",
+                    self.ship_name(target)
+                )));
+            }
+        }
+        if open.len() > SHOWN {
+            lines.push(Line::from(format!("+{} more open", open.len() - SHOWN)));
+        }
+    }
+
     fn need_details(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if !self.notice.is_empty() {
@@ -704,6 +753,9 @@ impl App {
                     "origin/home {}",
                     clean(&live.home.display().to_string(), 512)
                 )));
+                if let Some(error) = &live.error {
+                    lines.push(Line::from(format!("Unavailable: {}", clean(error, 512))));
+                }
             }
             lines.push(Line::from(format!(
                 "{} scope: {}",
@@ -714,6 +766,7 @@ impl App {
                     clean(&ship.description, 512)
                 }
             )));
+            self.push_ship_work(&mut lines, ship);
         }
         if let Some(error) = &self.attention.error {
             lines.push(Line::from(format!("UNAVAILABLE: {}", clean(error, 512))));
@@ -877,7 +930,8 @@ impl App {
         } else {
             let parts = Layout::vertical([
                 Constraint::Length(
-                    (self.snapshot.ships.len() as u16 + 3).min((rows[1].height / 3).max(3)),
+                    // Border, header and at least one ship row stay visible.
+                    (self.snapshot.ships.len() as u16 + 3).min((rows[1].height / 3).max(4)),
                 ),
                 Constraint::Length(4),
                 Constraint::Min(3),

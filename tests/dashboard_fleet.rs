@@ -935,7 +935,7 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
     use privateer::dashboard::{fleet, ui::App};
     let m = Machine::new();
     let apps = m.ship("apps");
-    m.ship("infra");
+    let infra = m.ship("infra");
     let home = apps.join(".privateer");
     for (id, owner) in [
         ("delegated", "infra"),
@@ -959,6 +959,17 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
         &apps,
         "task.accept",
         json!({"id":"transferred","actor":"infra"}),
+    );
+    // Infra's own task, offered onward and not yet accepted.
+    m.json(
+        &infra,
+        "task.create",
+        json!({"id":"offered","owner":"infra","title":"Assignment offered","charter_id":"infra"}),
+    );
+    m.json(
+        &infra,
+        "task.handoff",
+        json!({"id":"offered","actor":"infra","target":"apps"}),
     );
     let view = m.dashboard();
     let snapshot = &view["snapshot"];
@@ -1028,9 +1039,28 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
         2
     );
     app.select_tab(0);
-    // Lists name ships rather than showing home paths; a path appears only in the
-    // details of the selected ship (here infra, not the delegating home).
+    // Lists name ships rather than showing home paths; the selected ship's
+    // details name each task's origin ship, marking work delegated from another home.
     let bridge = screen_width(&mut app, 240);
+    assert!(
+        bridge.contains("Delegated · Assignment delegated"),
+        "{bridge}"
+    );
+    assert!(
+        bridge.contains("Delegated · Assignment transferred"),
+        "{bridge}"
+    );
+    assert!(bridge.contains("Own · Assignment offered"), "{bridge}");
+    assert!(bridge.contains("origin apps"), "{bridge}");
+    assert!(
+        bridge.contains("offered to apps (not accepted)"),
+        "{bridge}"
+    );
+    assert!(
+        !bridge.contains("Assignment unregistered"),
+        "crew's task is not infra's work: {bridge}"
+    );
+    assert!(!bridge.contains(&home.display().to_string()), "{bridge}");
     assert!(
         app.snapshot
             .pending
@@ -1043,7 +1073,6 @@ fn delegated_work_keeps_owners_origins_and_custody_visible_across_homes() {
             .iter()
             .any(|j| j.id == "job-delegated" && j.home.as_ref() == Some(&home))
     );
-    assert!(!bridge.contains(&home.display().to_string()), "{bridge}");
     app.select_tab(3);
     assert!(
         app.snapshot
@@ -1145,6 +1174,20 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
             .count(),
         2
     );
+    // Apps' build is delegated to infra: its origin (apps) differs from infra's
+    // own home, and the pending handoff is named.
+    let offered = screen_width(&mut app, 240);
+    assert!(
+        offered.contains("Delegated · apps build · build"),
+        "{offered}"
+    );
+    assert!(offered.contains("origin apps"), "{offered}");
+    assert!(
+        offered.contains("offered to infra (not accepted)"),
+        "{offered}"
+    );
+    assert!(offered.contains("Own · infra build · build"), "{offered}");
+    assert!(offered.contains("origin infra"), "{offered}");
     app.selected = app
         .assignment_indices()
         .iter()
@@ -1188,6 +1231,14 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
     assert!(app.snapshot.jobs.iter().any(
         |j| j.id == "apps-job" && j.home.as_ref() == app.selected_task().unwrap().home.as_ref()
     ));
+    // Accepted: the same apps-origin task is infra's now, with no offer pending.
+    let accepted = screen_width(&mut app, 240);
+    assert!(
+        accepted.contains("Delegated · apps build · build"),
+        "{accepted}"
+    );
+    assert!(accepted.contains("owner infra · origin apps"), "{accepted}");
+    assert!(!accepted.contains("offered to infra"), "{accepted}");
     assert_eq!(
         m.json(&infra, "task.show", json!({"id":"build"}))["owner"],
         "infra"
@@ -2268,4 +2319,71 @@ fn fleet_home_tabulates_live_ships_liaison_first_and_rows_open_their_workspace()
     let narrow = rows(&mut app, 80).join("\n");
     assert!(narrow.contains("zeta") && narrow.contains("apps"));
     assert!(!narrow.contains("Last wake") && !narrow.contains("Dispatcher"));
+    // Infra's home is gone: its unavailable state is explained in the details.
+    app.select_ship(Some("infra".into()));
+    let details = rows(&mut app, 120).join("\n");
+    assert!(
+        details.contains("Unavailable: ship home is missing"),
+        "{details}"
+    );
+}
+
+#[test]
+fn a_busy_homes_finished_jobs_never_hide_another_homes_running_crew() {
+    use privateer::dashboard::{fleet, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    let infra = m.ship("infra");
+    m.json(
+        &apps,
+        "task.create",
+        json!({"id":"build","owner":"apps","title":"Apps build","charter_id":"apps"}),
+    );
+    m.json(
+        &infra,
+        "task.create",
+        json!({"id":"crew-task","owner":"infra","title":"Infra crew","charter_id":"infra"}),
+    );
+    // Apps has far more finished history than the display bound; infra has one
+    // running job. Rows are written directly: job.start would wait for each one.
+    let mut conn = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    let tx = conn.transaction().unwrap();
+    for n in 0..250 {
+        tx.execute(
+            "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+            rusqlite::params![
+                format!("finished-{n}"),
+                json!({"task_id":"build","status":"succeeded"}).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let conn = rusqlite::Connection::open(infra.join(".privateer/privateer.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO jobs(id,record) VALUES('infra-running',?1)",
+        [json!({"task_id":"crew-task","status":"running"}).to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    let registry = m.root.join("fleet.sqlite");
+    let snapshot = fleet::read(&registry, None).unwrap();
+    let running: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .filter(|j| j.is_active())
+        .map(|j| (j.id.as_str(), j.owner.as_str()))
+        .collect();
+    assert_eq!(running, [("infra-running", "infra")]);
+    assert!(
+        snapshot.truncated,
+        "finished history beyond the bound is clipped"
+    );
+    let mut app = App {
+        snapshot,
+        ..App::default()
+    };
+    // Nothing is selected, so "1 crew-task" can only be infra's running crew.
+    let screen = screen_width(&mut app, 160);
+    assert!(screen.contains("1 crew-task"), "{screen}");
 }
