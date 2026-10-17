@@ -782,11 +782,12 @@ fn print_stow(action: &str, out: &Value) -> Result<()> {
         }
     };
     // A machine asked to lift its hold and not heard from again is left
-    // unknown: `resume --all` did not finish what it was asked to do.
+    // unknown: `resume --all` did not finish what it was asked to do. A
+    // machine that only reaches this one is never asked, so it cannot count.
     let unknown_after_all: Vec<&str> = if out["all"] == true {
         machines
             .iter()
-            .filter(|m| m["held"] != Value::Bool(false))
+            .filter(|m| m["asked"] == true && m["held"] != Value::Bool(false))
             .filter_map(|m| m["machine"].as_str())
             .collect()
     } else {

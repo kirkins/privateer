@@ -681,6 +681,22 @@ fn a_resume_notice_lists_a_linked_machine_still_stowed() {
 /// `--all` lifts the linked machines this one reaches before its own, so the
 /// notice this machine's ships read names no machine that is still stowed.
 #[test]
+fn a_resume_of_all_from_the_reached_side_succeeds() {
+    // The Mac lists the laptop as a machine that reaches it and that it
+    // cannot ask; `--all` never tries the laptop, so it must not fail on it.
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    mac.ok("fitforge", "stow.start", json!({}));
+    let all = mac.run("fitforge", &["stow", "resume", "--all"], None);
+    assert!(all.status.success(), "{}", text(&all));
+    assert_eq!(
+        mac.ok("fitforge", "stow.status", json!({}))["held"],
+        false,
+        "the Mac runs again"
+    );
+}
+
+#[test]
 fn a_resume_of_all_lifts_the_linked_machines_first() {
     let (_temp, laptop, mac, ssh) = fixture();
     assert!(link(&laptop, &mac, &ssh).status.success());
