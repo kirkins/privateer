@@ -203,21 +203,31 @@ pub(crate) fn refuse_remote_name(conn: &Connection, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// This machine's active ships and their scopes, the directory it offers.
-fn local_ships(conn: &Connection) -> Result<Vec<Entry>> {
+/// This machine's active ships and their scopes, the directory it offers, and
+/// whether every home was read. A home that cannot be opened may hold a live
+/// ship, so the directory is then partial. A home whose folder is gone has
+/// departed, as `register` treats it.
+fn local_ships(conn: &Connection) -> Result<(Vec<Entry>, bool)> {
     let mut ships = vec![];
+    let mut complete = true;
     for member in crate::fleet::members(conn)? {
         // Opening a home creates it; never resurrect a deleted ship folder.
         if !member.home.is_dir() {
             continue;
         }
         let Ok(mut store) = Store::open(&member.home) else {
+            complete = false;
             continue;
         };
         let (scope, consumes) = crate::fleet::directory_entry(&mut store, &member.name);
         ships.push((member.name, scope, consumes));
     }
-    Ok(ships)
+    Ok((ships, complete))
+}
+
+/// Whether a directory message says every home on its machine was read.
+fn is_complete(message: &Value) -> bool {
+    message["complete"].as_bool() == Some(true)
 }
 
 fn directory(ships: &[Entry]) -> Value {
@@ -291,8 +301,11 @@ fn record(conn: &Connection, machine: &Machine, ships: &[Entry]) -> Result<()> {
 }
 
 /// Give one home the machine's peer and a directory entry for each of its
-/// ships. Ships the home hosts are never touched.
-fn install(store: &mut Store, machine: &Machine, ships: &[Entry]) -> Result<usize> {
+/// ships. Ships the home hosts are never touched. When `prune` is set, entries
+/// behind this machine's peer that its complete directory no longer lists have
+/// left it (retired or moved), so they are dropped and audited; entries behind
+/// other peers stay.
+fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -> Result<usize> {
     crate::peers::dispatch(store, "peer.put", machine.peer.clone())?;
     let peer = peer_name(&machine.name);
     let mut installed = 0;
@@ -308,17 +321,43 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry]) -> Result<usiz
         )?;
         installed += 1;
     }
+    if prune {
+        let listed: Vec<&str> = ships.iter().map(|(name, _, _)| name.as_str()).collect();
+        let gone: Vec<String> = store
+            .connection()
+            .prepare(
+                "DELETE FROM ships WHERE json_extract(record,'$.location.peer')=?1
+                   AND name NOT IN (SELECT value FROM json_each(?2)) RETURNING name",
+            )?
+            .query_map(params![peer, json!(listed).to_string()], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for name in gone {
+            store.audit(
+                "ship.dropped",
+                &json!({"ship": name, "peer": peer, "machine": machine.name}),
+            )?;
+        }
+    }
     Ok(installed)
 }
 
-fn install_everywhere(conn: &Connection, machine: &Machine, ships: &[Entry]) -> Result<usize> {
+fn install_everywhere(
+    conn: &Connection,
+    machine: &Machine,
+    ships: &[Entry],
+    prune: bool,
+) -> Result<usize> {
     let mut homes = 0;
     for member in crate::fleet::members(conn)? {
         if !member.home.is_dir() {
             continue;
         }
-        let mut store = Store::open(&member.home)?;
-        install(&mut store, machine, ships)?;
+        // One home that cannot be opened must not stop every other home's
+        // refresh; it catches up on a later exchange.
+        let Ok(mut store) = Store::open(&member.home) else {
+            continue;
+        };
+        install(&mut store, machine, ships, prune)?;
         homes += 1;
     }
     Ok(homes)
@@ -663,7 +702,8 @@ pub(crate) fn reached_for_dashboard(conn: &Connection) -> Result<Vec<Reached>> {
 pub(crate) fn reach_remote(store: &mut Store, conn: &Connection) -> Result<usize> {
     let mut installed = 0;
     for machine in machines(conn)? {
-        installed += install(store, &machine, &cached(conn, &machine.name)?)?;
+        // The cache does not record whether its directory was complete.
+        installed += install(store, &machine, &cached(conn, &machine.name)?, false)?;
     }
     Ok(installed)
 }
@@ -822,12 +862,12 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
         .known_as
         .as_deref()
         .context("link has no local name")?;
-    let ours = local_ships(conn)?;
+    let (ours, complete) = local_ships(conn)?;
     let result = call(
         machine,
         "fleet.link",
         with_stows(
-            json!({"machine": known_as, "ships": directory(&ours)}),
+            json!({"machine": known_as, "ships": directory(&ours), "complete": complete}),
             conn,
         ),
         timeout,
@@ -841,7 +881,8 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     );
     record(conn, machine, &theirs)?;
     absorb(conn, &machine.name, &result["stows"])?;
-    install_everywhere(conn, machine, &theirs)?;
+    // An older peer sends no flag, so its directory only adds ships.
+    install_everywhere(conn, machine, &theirs, is_complete(&result))?;
     Ok(theirs)
 }
 
@@ -1555,12 +1596,13 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 failures: 0,
             };
             record(&conn, &machine, &theirs)?;
-            install_everywhere(&conn, &machine, &theirs)?;
+            install_everywhere(&conn, &machine, &theirs, is_complete(args))?;
             // The machine that reached us carries its stow state in the same
             // exchange, so a request here bound to a stow there resolves now.
             let ended = absorb(&conn, name, args.get("stows").unwrap_or(&Value::Null))?;
+            let (ours, complete) = local_ships(&conn)?;
             Ok(with_stows(
-                json!({"ships": directory(&local_ships(&conn)?), "requests_ended": ended}),
+                json!({"ships": directory(&ours), "complete": complete, "requests_ended": ended}),
                 &conn,
             ))
         }
