@@ -308,7 +308,9 @@ A bundle may hold `mcp_servers`, at most four, each with exactly `name` (a lower
 slug, at most 32 characters), `url`, `credential` (a name the same bundle declares
 under `credentials`), `timeout` (an integer from 1 to 300) and an optional
 `description` (printable, at most 200 characters). The URL is `https`, or `http`
-only to `127.0.0.1`, `[::1]` or `localhost`, with no userinfo or fragment. A plan
+only to `127.0.0.1`, `[::1]` or `localhost`, with no userinfo, fragment, backslash
+or whitespace. The host is letters, digits, dots and hyphens or a bracketed IPv6
+literal, and any port must parse. A plan
 holds at most eight servers, unique after lower-casing and `-` to `_`. A bundle
 needs a skill or a server. Any other key (`headers`, `command`, `env`, `oauth`,
 `exposure`...) refuses, as does any string holding `$`, a leading `!` or a control
@@ -330,6 +332,14 @@ and a run gets no MCP tool unless it selects one.
 Limits: the token sits in the Pi process's memory; a same-user agent can still
 read the credential file; URLs are not content-pinned; stdio servers are not
 supported yet; Claude refuses servers.
+
+- The agent can read its own credential file; this is an accepted limit.
+- Redirects are followed, but `Authorization` is dropped on a cross-origin redirect.
+- A URL, including its query string, appears in argv and in the environment. No
+  secret belongs in a URL; use a credential reference for any token.
+- After startup, a server registered by any other extension refuses the run
+  (`mcp_servers_change`), and a tool call outside the selected `mcp__` namespaces
+  is blocked (`tool_call`).
 
 ## Test evidence and reproduction
 

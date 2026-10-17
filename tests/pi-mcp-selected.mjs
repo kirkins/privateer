@@ -2,7 +2,7 @@
 // readiness gate. No network, real secrets or Pi process. Run: node tests/pi-mcp-selected.mjs
 import assert from "node:assert/strict";
 import {
-  EXIT_UNAVAILABLE, gate, loadEntries, missing, parseRecords, prefixOf, readToken, serverEntry, UnavailableError,
+  EXIT_UNAVAILABLE, foreignTool, gate, loadEntries, missing, parseRecords, prefixOf, readToken, serverEntry, UnavailableError,
 } from "../plugins/pi-mcp/selected.mjs";
 
 const SENTINEL = `SENTINEL-${"a".repeat(24)}`;
@@ -28,7 +28,14 @@ const refusals = {
   "timeout string": [record({ timeout: "5" })],
   "name with underscore": [record({ name: "docs_1" })],
   "nine servers": Array.from({ length: 9 }, (_, i) => record({ name: `s${i}` })),
-  "collision after normalization": [record({ name: "a-b" }), record({ name: "a-b" })],
+  "backslash host": [record({ url: "https://evil.example\\.good.example/mcp" })],
+  "backslash path": [record({ url: "https://mcp.example.test\\/mcp" })],
+  "space in host": [record({ url: "https://mcp example.test/mcp" })],
+  "tab in url": [record({ url: "https://mcp.example.test/mcp\t" })],
+  "bad port": [record({ url: "https://mcp.example.test:99999/mcp" })],
+  "non-numeric port": [record({ url: "https://mcp.example.test:abc/mcp" })],
+  "underscore host": [record({ url: "https://bad_host.example.test/mcp" })],
+  "userinfo in host": [record({ url: "https://user@mcp.example.test/mcp" })],
 };
 
 for (const [label, records] of Object.entries(refusals)) {
@@ -36,6 +43,10 @@ for (const [label, records] of Object.entries(refusals)) {
 }
 assert.throws(() => parseRecords({}), undefined, "missing variable");
 assert.throws(() => parseRecords(env([])), undefined, "empty list");
+// Two servers whose names collide are refused as a collision, not as a bad name.
+assert.throws(() => parseRecords(env([record({ name: "a-b" }), record({ name: "a-b" })])), { message: "collision" });
+// Names that differ before normalization do not both pass the name rule.
+assert.throws(() => parseRecords(env([record({ name: "a-b" }), record({ name: "a_b" })])), { message: "name" });
 
 // Accepted shapes: loopback http, query strings and a description.
 assert.equal(parseRecords(env([record({ url: "http://127.0.0.1:9000/mcp?x=1" })])).length, 1);
@@ -86,6 +97,10 @@ const records = [record({ name: "docs" })];
 assert.deepEqual(missing(["mcp__docs__search"], records), { foreign: null, absent: null });
 assert.deepEqual(missing([], records), { foreign: null, absent: "docs" });
 assert.deepEqual(missing(["mcp__docs__search", "mcp__other__x"], records), { foreign: "other", absent: null });
+// Only a selected namespace's tool passes the tool_call guard; built-in tools are not MCP.
+assert.equal(foreignTool("mcp__docs__search", records), false);
+assert.equal(foreignTool("mcp__other__search", records), true);
+assert.equal(foreignTool("bash", records), false);
 
 // Readiness gate, on a fake clock: no real sleeping.
 function fakePi({ tools = [], servers = [] } = {}) {
@@ -129,6 +144,24 @@ function clock() {
   checks.start();
   await checks.wait();
   assert.deepEqual(calls, ["intruder"]);
+}
+{
+  // A server registered after startup refuses at mcp_servers_change; none passes.
+  const calls = [];
+  const fail = (server) => calls.push(server);
+  gate(fakePi({ servers: [{ name: "late" }] }), records, { ...clock(), fail }).late();
+  gate(fakePi(), records, { ...clock(), fail }).late();
+  assert.deepEqual(calls, ["late"]);
+}
+{
+  // Readiness that was never started refuses; it does not resolve as ready.
+  const calls = [];
+  const checks = gate(fakePi(), records, { ...clock(), fail: (server) => calls.push(server) });
+  assert.throws(() => checks.wait(), /never started/);
+  assert.deepEqual(calls, ["readiness"]);
+}
+for (const url of ["https://evil.example\\.good.example/mcp", "https://mcp.example.test\\/mcp", "https://mcp example.test/mcp", "https://mcp.example.test/mcp\n"]) {
+  assert.throws(() => parseRecords(env([record({ url })])), undefined, JSON.stringify(url));
 }
 assert.equal(EXIT_UNAVAILABLE, 78);
 console.log("pi-mcp-selected: ok");

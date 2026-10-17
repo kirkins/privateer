@@ -205,13 +205,24 @@ def plain(text):
     return '$' not in text and not text.startswith('!') and text.isprintable()
 
 
+HOST = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?\Z")
+LOOPBACK = ('127.0.0.1', '::1', 'localhost')
+
+
 def url(value):
-    """https, or http only to loopback. No userinfo or fragment; query is allowed."""
+    """https, or http only to loopback. No userinfo, fragment, backslash or
+    whitespace. The authority is a plain host (letters, digits, dots, hyphens)
+    or a bracketed IPv6 literal, with an optional port that must parse."""
     require(isinstance(value, str) and len(value) <= 2048 and plain(value) and '#' not in value)
+    # WHATWG parsers read "\" as "/": a reviewed host could differ from the one connected.
+    require('\\' not in value and not any(c.isspace() for c in value))
     parts = urlsplit(value)
-    require(parts.scheme in ('https', 'http') and parts.hostname and '@' not in parts.netloc
-            and parts.username is None and parts.password is None)
-    require(parts.scheme == 'https' or parts.hostname in ('127.0.0.1', '::1', 'localhost'))
+    require(parts.scheme in ('https', 'http') and HOST.fullmatch(parts.netloc))
+    try:
+        parts.port
+    except ValueError:
+        raise ValueError('unsupported bounded resources') from None
+    require(parts.scheme == 'https' or parts.hostname in LOOPBACK)
 
 
 def mcp_server(value, names):

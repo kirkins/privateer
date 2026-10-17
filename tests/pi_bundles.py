@@ -458,6 +458,12 @@ class Bundles(unittest.TestCase):
             {'url': 'https://mcp.example.test/$TOKEN'}, {'url': 'http://mcp.example.test/mcp'},
             {'url': 'https://user:pw@mcp.example.test/mcp'}, {'url': 'https://mcp.example.test/mcp#x'},
             {'url': 'ftp://mcp.example.test/mcp'}, {'url': 'https://mcp.example.test/' + 'a' * 2048},
+            # Backslash, whitespace, host characters and ports the parser would read differently.
+            {'url': 'https://evil.example\\.good.example/mcp'}, {'url': 'https://mcp.example.test\\/mcp'},
+            {'url': 'https://mcp example.test/mcp'}, {'url': 'https://mcp.example.test/mcp\t'},
+            {'url': 'https://mcp.example.test:99999/mcp'}, {'url': 'https://mcp.example.test:abc/mcp'},
+            {'url': 'https://bad_host.example.test/mcp'}, {'url': 'https://[::1/mcp'},
+            {'url': 'https://user@mcp.example.test/mcp'}, {'url': 'https://mcp.example.test:/mcp'},
             {'credential': 'UNDECLARED'}, {'timeout': 0}, {'timeout': 301}, {'timeout': True},
             {'name': 'x' * 33}, {'name': 'Docs'}, {'name': '$docs'}, {'name': 'docs_1'},
             {'description': '!run'}, {'description': 'x' * 201}, {'description': 'a\nb'}, {'description': 'a$b'},
@@ -471,6 +477,9 @@ class Bundles(unittest.TestCase):
         with self.assertRaises(ValueError):
             bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[self.mcp_record(credential='OTHER')],
                                                                          skills=[self.a], credentials=[])))
+        # Accepted forms: an explicit port on a plain host, and a bracketed IPv6 literal.
+        for good in ('https://mcp.example.test:8443/mcp', 'https://mcp.example.test/mcp?x=1', 'http://[::1]:9000/mcp'):
+            bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[self.mcp_record(url=good)], skills=[self.a])))
         # A bundle needs at least one skill or one server; an empty server list is not a server.
         with self.assertRaises(ValueError):
             bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[], skills=[])))
@@ -492,6 +501,9 @@ class Bundles(unittest.TestCase):
                                      self.mcp_bundle('b@1', servers=[self.mcp_record(name='a-b')]))
         with self.assertRaises(ValueError):
             bundles.plan(collide, ['a@1', 'b@1'], 'crew')
+        # Names that differ only before normalization (case) still collide after it.
+        with self.assertRaises(ValueError):
+            bundles.server_keys([{'name': 'A-b'}, {'name': 'a-b'}])
 
     def test_selected_mcp_plan_carries_only_selected_servers(self):
         registry = self.registry_with(self.mcp_bundle('docs@1', servers=[self.mcp_record()], skills=[self.a]),
@@ -513,6 +525,11 @@ class Bundles(unittest.TestCase):
         # Claude has no bounded MCP loader: refuse, never drop the server.
         with self.assertRaises(ValueError):
             bundles.plan(registry, ['docs@1'], 'crew', harness='claude')
+        # A forged Claude plan that carries servers refuses at validation.
+        claude = bundles.plan(dict(self.registry, claude_version='2.1.300'), ['selected@1'], 'crew', harness='claude')
+        bundles.validate_plan(claude)
+        with self.assertRaises(ValueError):
+            bundles.validate_plan(dict(claude, mcp_servers=[self.mcp_record()]))
 
     def test_selected_mcp_preflight_adds_only_the_runtime_gate(self):
         import native_launch

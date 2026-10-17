@@ -17,10 +17,13 @@ const LOOPBACK = ["127.0.0.1", "[::1]", "localhost"];
 // command), and control characters.
 const plain = (text) => !text.includes("$") && !text.startsWith("!") && !/[\u0000-\u001f\u007f]/.test(text);
 
+// No backslash or whitespace: WHATWG URL parsing rewrites "\" to "/", so a string
+// that reads one way to a reviewer could connect to another host.
 function checkUrl(text) {
-  if (typeof text !== "string" || text.length > 2048 || !plain(text) || text.includes("#")) throw new Error("url");
+  if (typeof text !== "string" || text.length > 2048 || !plain(text) || /[\\\s#]/.test(text)) throw new Error("url");
   const url = new URL(text);
   if (url.username || url.password || text.includes("@")) throw new Error("url");
+  if (!/^[a-z0-9.-]+$/.test(url.hostname) && !url.hostname.startsWith("[")) throw new Error("url");
   if (url.protocol === "https:") return;
   if (url.protocol !== "http:" || !LOOPBACK.includes(url.hostname)) throw new Error("url");
 }
@@ -56,6 +59,10 @@ export function readToken(path, read = (file) => readFileSync(file, "utf8")) {
 
 /** Pi's tool namespace for a server: non-alphanumerics become "_". */
 export const prefixOf = (name) => `mcp__${name.replace(/[^A-Za-z0-9]/g, "_")}__`;
+
+/** True for an "mcp__" tool that no selected server's namespace owns. */
+export const foreignTool = (name, records) =>
+  name.startsWith("mcp__") && !records.some((record) => name.startsWith(prefixOf(record.name)));
 
 /** The config Pi's createMcpExtension receives for one selected server. */
 export function serverEntry(record, token) {
@@ -124,8 +131,18 @@ export function gate(pi, records, { fail = unavailable, now = Date.now, sleep = 
         }
       })();
     },
+    /** Pi's mcp_servers_change handler: any server registered after startup refuses. */
+    late() {
+      const extra = pi.getMcpServers();
+      if (extra.length > 0) return fail(String(extra[0]?.name ?? "another extension"));
+    },
     wait() {
-      return pending ?? Promise.resolve();
+      // Readiness that never started is not ready: refuse rather than let a run proceed.
+      if (!pending) {
+        fail("readiness");
+        throw new Error("readiness was never started");
+      }
+      return pending;
     },
   };
 }

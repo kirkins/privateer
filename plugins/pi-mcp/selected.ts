@@ -2,7 +2,7 @@
 // Bearer token read from a credential file inside this Pi process. Loaded only
 // by a bounded Pi run that selects servers; helpers and the gate are in selected.mjs.
 import { createMcpExtension } from "@earendil-works/pi-coding-agent";
-import { gate, loadEntries, parseRecords, unavailable, UnavailableError } from "./selected.mjs";
+import { foreignTool, gate, loadEntries, parseRecords, unavailable, UnavailableError } from "./selected.mjs";
 
 const factory = createMcpExtension({
   loadConfig: () => {
@@ -32,6 +32,12 @@ export default function selected(pi: any) {
   // Registered before the MCP factory, so the refusal sees only servers that
   // other extensions registered at load time, not this run's own.
   pi.on("session_start", () => checks.start());
+  // The factory connects servers registered after startup. Refuse any such
+  // registration, and block any MCP tool outside this run's selected namespaces.
+  pi.on("mcp_servers_change", () => checks.late());
+  pi.on("tool_call", (event: any) => {
+    if (foreignTool(event.toolName, records)) return { block: true, reason: "MCP server not selected for this run" };
+  });
   factory(pi);
   pi.on("before_agent_start", () => checks.wait());
 }

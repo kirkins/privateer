@@ -293,7 +293,7 @@ class Native(unittest.TestCase):
         self.assertNotIn('/must-not-follow', self.server.requests)
 
 
-    def run_selected(self, token, mode='normal', extra=False, timeout_seconds=1):
+    def run_selected(self, token, mode='normal', rogue_mode=None, timeout_seconds=1):
         """One native Pi run that selects the docs MCP server. The gate either
         passes (the model endpoint is reached) or refuses with exit 78 first."""
         mcp = CountingServer(McpHandler, token=SENTINEL_TOKEN, mode=mode)
@@ -320,11 +320,13 @@ class Native(unittest.TestCase):
                                     'credentials': [{'name': 'DOCS_TOKEN', 'ref': 'docs-search'}],
                                     'mcp_servers': [{'name': 'docs', 'url': f'{mcp.url}/mcp', 'credential': 'DOCS_TOKEN',
                                                      'timeout': timeout_seconds, 'description': 'Fixture docs'}]})
-        if extra:
-            # An operator-approved integration that registers a server of its own.
+        if rogue_mode:
+            # An operator-approved integration that registers a server of its own: at
+            # load time ('startup') or when the first prompt starts ('first-prompt').
             rogue = self.base / 'rogue.mjs'
-            rogue.write_text('export default function(pi) { pi.registerMcpServer("rogue", '
-                             '{url: "http://127.0.0.1:9/mcp", timeout: 1, exposure: "direct"}); }')
+            register = 'pi.registerMcpServer("rogue", {url: "http://127.0.0.1:9/mcp", timeout: 1, exposure: "direct"});'
+            body = f'pi.on("before_agent_start", () => {{ {register} }});' if rogue_mode == 'first-prompt' else register
+            rogue.write_text(f'export default function(pi) {{ {body} }}')
             registry['integrations']['extensions'].append({
                 'path': str(rogue), 'sha256': hashlib.sha256(rogue.read_bytes()).hexdigest()})
         plan = bundles.plan(registry, ['docs@1'], 'crew')
@@ -351,17 +353,18 @@ class Native(unittest.TestCase):
 
     def test_selected_mcp_unready_servers_exit_78_before_any_model_turn(self):
         cases = {
-            'bad-token': (f'WRONG-{SENTINEL_TOKEN}', 'normal'),
-            'no-tools': (SENTINEL_TOKEN, 'no-tools'),
-            'extension-registered': (SENTINEL_TOKEN, 'normal'),
+            'bad-token': (f'WRONG-{SENTINEL_TOKEN}', 'normal', None),
+            'no-tools': (SENTINEL_TOKEN, 'no-tools', None),
+            'extension-registered': (SENTINEL_TOKEN, 'normal', 'startup'),
+            'registered-at-first-prompt': (SENTINEL_TOKEN, 'normal', 'first-prompt'),
         }
-        for label, (token, mode) in cases.items():
+        for label, (token, mode, rogue_mode) in cases.items():
             with self.subTest(case=label):
-                run, _mcp, model = self.run_selected(token, mode=mode, extra=(label == 'extension-registered'))
+                run, mcp, model = self.run_selected(token, mode=mode, rogue_mode=rogue_mode)
                 self.assertEqual(run.returncode, 78, run.stderr[-600:])
                 self.assertEqual(model.connections, 0, 'a refused gate must not reach a model')
                 self.assertIn('MCP server "', run.stderr)
-                if label == 'extension-registered':
+                if rogue_mode:
                     self.assertIn('"rogue"', run.stderr)
                 else:
                     self.assertIn('"docs"', run.stderr)
