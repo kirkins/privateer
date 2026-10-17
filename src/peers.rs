@@ -433,6 +433,18 @@ pub(crate) fn collected(store: &Store) -> Result<Vec<String>> {
     Ok(names.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Whether a peer links this home to another machine: a machine's gateway,
+/// or a machine that collects from this one.
+pub(crate) fn machine(store: &Store, name: &str) -> Result<bool> {
+    init(store)?;
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM peer_endpoints WHERE name=?1 AND
+           (json_extract(config_json, '$.gateway')=1 OR json_extract(config_json, '$.transport')='collected'))",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
 /// Forget a peer and the ships this home knew to live behind it.
 pub(crate) fn forget(store: &Store, name: &str) -> Result<()> {
     init(store)?;

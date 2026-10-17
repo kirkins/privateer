@@ -15,7 +15,15 @@
 //! collect it each pass, deliver it locally by its id and acknowledge it, so
 //! a crash between the two collects it again and redelivery stays idempotent.
 //! Directories are exchanged when the link is made and refreshed at a bounded
-//! interval. The captain's mail does not cross machines yet.
+//! interval.
+//!
+//! The captain reads mail on the linking machine, where the front door runs.
+//! Mail the other machine's ships write to the captain after the link is
+//! made is collected with the rest and delivered into the captain's home
+//! here, the fleet's liaison (or its first ship); it stays in the writing
+//! home's captain mailbox too. The captain's own mail to a ship on the other
+//! machine is written in that same home and goes out through the gateway, so
+//! requests and replies close on both machines.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -283,6 +291,37 @@ fn install_everywhere(
     Ok(homes)
 }
 
+/// The home on this machine that holds the captain's mail from ships on
+/// other machines: the fleet's one liaison, else its first ship.
+pub(crate) fn captain_home(conn: &Connection) -> Result<Option<(String, PathBuf)>> {
+    let members: Vec<_> = crate::fleet::members(conn)?
+        .into_iter()
+        .filter(|m| m.home.is_dir())
+        .collect();
+    let liaisons: Vec<_> = members
+        .iter()
+        .filter(|m| crate::door::is_liaison(&m.home))
+        .collect();
+    let chosen = match liaisons.as_slice() {
+        [one] => Some(*one),
+        _ => members.first(),
+    };
+    Ok(chosen.map(|m| (m.name.clone(), m.home.clone())))
+}
+
+/// Ships on linked machines, with the machine each is on and its scope.
+pub(crate) fn remote_ships() -> Result<Vec<(String, String, String)>> {
+    let path = crate::fleet::registry_path()?;
+    if !path.is_file() || !ever_linked(&path) {
+        return Ok(vec![]);
+    }
+    let conn = crate::fleet::registry()?;
+    let mut statement =
+        conn.prepare("SELECT name, machine, scope FROM machine_ships ORDER BY name")?;
+    let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Make every linked machine's ships reachable from a newly linked home.
 pub(crate) fn reach_remote(store: &mut Store, conn: &Connection) -> Result<usize> {
     let mut installed = 0;
@@ -512,12 +551,20 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
     for envelope in messages {
         let id = required(envelope, "id")?.to_owned();
         let to = envelope["to"].as_str().unwrap_or("");
-        let Some(home) = homes.iter().find(|m| m.name == to && m.home.is_dir()) else {
+        let home = if to == crate::mail::CAPTAIN {
+            captain_home(conn)?.map(|(_, home)| home)
+        } else {
+            homes
+                .iter()
+                .find(|m| m.name == to && m.home.is_dir())
+                .map(|m| m.home.clone())
+        };
+        let Some(home) = home else {
             refused.push(json!({"id": id, "error": format!("no ship named {to} on this machine")}));
             continue;
         };
         // A home that cannot be opened now is retried on the next pass.
-        let Ok(mut store) = Store::open(&home.home) else {
+        let Ok(mut store) = Store::open(&home) else {
             continue;
         };
         match crate::dispatch(&mut store, "mail.deliver", envelope.clone()) {
@@ -666,24 +713,33 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "fleet.collect" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;
             let peer = peer_name(&machine.name);
+            // Mail to the captain from before the link stays here.
+            let linked_ms: i64 = conn.query_row(
+                "SELECT added_ms FROM machines WHERE name=?1",
+                [&machine.name],
+                |r| r.get(0),
+            )?;
             let mut messages = vec![];
             let mut bytes = 0;
             for member in crate::fleet::members(&conn)? {
-                if messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
-                    break;
-                }
                 if !member.home.is_dir() {
                     continue;
                 }
                 let store = Store::open(&member.home)?;
-                for envelope in crate::mail::awaiting(
-                    &store,
-                    &peer,
-                    COLLECT_LIMIT - messages.len(),
-                    COLLECT_BYTES - bytes,
-                )? {
-                    bytes += envelope.to_string().len();
-                    messages.push(envelope);
+                for captain in [false, true] {
+                    if messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
+                        break;
+                    }
+                    let (limit, room) = (COLLECT_LIMIT - messages.len(), COLLECT_BYTES - bytes);
+                    let found = if captain {
+                        crate::mail::awaiting_captain(&store, &peer, linked_ms, limit, room)?
+                    } else {
+                        crate::mail::awaiting(&store, &peer, limit, room)?
+                    };
+                    for envelope in found {
+                        bytes += envelope.to_string().len();
+                        messages.push(envelope);
+                    }
                 }
             }
             Ok(json!({"messages": messages}))
@@ -708,11 +764,17 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     ))
                 })
                 .collect();
+            let captain: Vec<(String, Option<String>)> = delivered
+                .iter()
+                .map(|(id, _)| (id.clone(), None))
+                .chain(refused.iter().map(|(id, e)| (id.clone(), Some(e.clone()))))
+                .collect();
             let mut recorded = 0;
             for member in crate::fleet::members(&conn)? {
                 if member.home.is_dir() {
                     let store = Store::open(&member.home)?;
                     recorded += crate::mail::collected(&store, &peer, &delivered, &refused)?;
+                    recorded += crate::mail::collected_captain(&store, &peer, &captain)?;
                 }
             }
             Ok(json!({"recorded": recorded}))

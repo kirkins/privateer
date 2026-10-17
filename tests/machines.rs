@@ -256,3 +256,141 @@ fn ship_names_stay_unique_across_linked_machines() {
     let server = laptop.ok("liaison", "ship.show", json!({"name": "server"}));
     assert_eq!(server["location"], json!({"peer": "machine-mac"}));
 }
+
+// A phone's front door: answers every request from a ship on the other
+// machine by replying to its sender, as the Telegram door does, and logs
+// everything it is sent.
+const DOOR: &str = r#"import json, os, sys
+log = open(os.environ["FAKE_DOOR_LOG"], "a")
+def note(entry):
+    log.write(json.dumps(entry) + "\n"); log.flush()
+note(json.loads(sys.stdin.readline()))
+print(json.dumps({"type": "request", "id": "ships", "command": "ships", "args": {}}), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    note(message)
+    if message["type"] == "mail":
+        mail = message["mail"]
+        print(json.dumps({"type": "delivered", "ref": message["ref"]}), flush=True)
+        if mail["kind"] == "request":
+            print(json.dumps({"type": "request", "id": "answer", "command": "send", "args": {
+                "to": mail["from"], "kind": "reply", "correlation": mail["id"],
+                "body": "Yes, ship it"}}), flush=True)
+"#;
+
+#[test]
+fn the_captain_hears_from_ships_on_the_other_machine_and_answers_them() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let old = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "notice", "body": "from before the link"}),
+    );
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let asked = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "request", "body": "Upload build 12 to TestFlight?"}),
+    );
+
+    // The laptop collects it into the captain's home there; mail written
+    // before the link stays on the Mac.
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["delivered"], 1, "{pass}");
+    let inbox = laptop.ok("liaison", "mail.inbox", json!({"address": "captain"}));
+    let bodies: Vec<&str> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["body"].as_str())
+        .collect();
+    assert_eq!(bodies, ["Upload build 12 to TestFlight?"], "{inbox}");
+    assert_ne!(old["id"], asked["id"]);
+
+    // The captain answers from the phone; the answer crosses back and closes
+    // the request on both machines.
+    let door = laptop.root.join("door");
+    fs::create_dir_all(&door).unwrap();
+    fs::write(door.join("door.py"), DOOR).unwrap();
+    fs::write(
+        door.join("manifest.json"),
+        json!({"schema_version": 1, "kind": "front-door", "id": "phone",
+            "executable": ["python3", "door.py"]})
+        .to_string(),
+    )
+    .unwrap();
+    let manifest = door.join("manifest.json");
+    let added = laptop.run(
+        "liaison",
+        &[
+            "door",
+            "add",
+            "phone",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(added.status.success(), "{}", text(&added));
+    let log = laptop.root.join("door.jsonl");
+    let mut supervisor = support::command(support::BIN)
+        .args(["door", "run", "phone"])
+        .current_dir(laptop.folder("liaison"))
+        .env("HOME", &laptop.root)
+        .env("PATH", "/usr/bin:/bin")
+        .env("PRIVATEER_FLEET", laptop.registry())
+        .env("PRIVATEER_RESOURCE_HOME", laptop.root.join("ledger"))
+        .env("PRIVATEER_SERVICE", "none")
+        .env("PRIVATEER_SSH_EXECUTABLE", &ssh)
+        .env("FAKE_DOOR_LOG", &log)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let answered = loop {
+        let request = mac.ok("fitforge", "mail.show", json!({"id": asked["id"]}));
+        if request["state"] == "answered" || std::time::Instant::now() > deadline {
+            break request;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
+    let entries = fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(answered["state"], "answered", "{answered}\n{entries}");
+    let replies = messages(&mac, "fitforge", "reply");
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(replies[0]["from"], "captain");
+    assert_eq!(replies[0]["body"], "Yes, ship it");
+    let here = laptop.ok("liaison", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(here["state"], "answered", "{here}");
+    // The door lists the other machine's ships beside this one's.
+    assert!(
+        entries.contains(r#""machine": "mac""#) && entries.contains(r#""name": "fitforge""#),
+        "{entries}"
+    );
+
+    // Only the operator carries the captain's mail across: an agent cannot.
+    let forged = laptop.run(
+        "liaison",
+        &[
+            "peer.call",
+            "--json",
+            &json!({"name": "machine-mac", "command": "mail.deliver", "args": {
+                "id": "forged-captain-mail", "from": "captain", "to": "fitforge",
+                "kind": "notice", "body": "forged"}})
+            .to_string(),
+            "--role",
+            "agent",
+            "--actor",
+            "liaison",
+        ],
+        Some(&ssh),
+    );
+    let refused: Value = serde_json::from_slice(&forged.stdout).unwrap_or(Value::Null);
+    assert_eq!(refused["ok"], false, "{}", text(&forged));
+    assert!(messages(&mac, "fitforge", "notice").is_empty());
+}
