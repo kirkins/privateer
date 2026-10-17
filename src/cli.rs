@@ -1287,6 +1287,11 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         return Ok(());
     }
     if verb == "watch" {
+        if let [flag, job] = args
+            && flag == "--job"
+        {
+            return crate::watch::crew(&mut store, job);
+        }
         let ship = match args.first() {
             Some(ship) => ship.clone(),
             None => crate::presence::folder_ship(&store)

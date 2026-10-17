@@ -545,6 +545,7 @@ impl Client {
         pane: &str,
         agent: &str,
         display: &str,
+        title: &str,
         state: &str,
         message: &str,
     ) -> Result<()> {
@@ -554,7 +555,7 @@ impl Client {
         )?;
         self.request(
             "pane.report_metadata",
-            json!({"pane_id":pane,"source":"privateer","agent":agent,"display_agent":display,"title":format!("{display} first mate")}),
+            json!({"pane_id":pane,"source":"privateer","agent":agent,"display_agent":display,"title":title}),
         )?;
         Ok(())
     }
