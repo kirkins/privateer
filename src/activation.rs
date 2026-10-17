@@ -786,11 +786,13 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         considered.push(consider(store, &ship)?);
     }
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
+    // Mail other machines hold for ships here, which they cannot send.
+    let machines = crate::machines::tick(store.home(), budget);
     // Landed work frees its checkout without waking anyone.
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 

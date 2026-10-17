@@ -19,7 +19,24 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+static REGISTRY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Serve another registry than the environment names, for the whole process:
+/// a machine's gateway is told which fleet it answers for.
+pub fn use_registry(path: PathBuf) -> Result<()> {
+    ensure!(
+        path.is_absolute(),
+        "the fleet registry path must be absolute"
+    );
+    REGISTRY
+        .set(path)
+        .map_err(|_| anyhow::anyhow!("the fleet registry is already chosen"))
+}
+
 pub fn registry_path() -> Result<PathBuf> {
+    if let Some(path) = REGISTRY.get() {
+        return Ok(path.clone());
+    }
     if let Some(path) = std::env::var_os("PRIVATEER_FLEET") {
         return Ok(PathBuf::from(path));
     }
@@ -49,6 +66,7 @@ pub(crate) fn registry() -> Result<Connection> {
            created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
     )?;
     crate::releases::init(&conn)?;
+    crate::machines::init(&conn)?;
     Ok(conn)
 }
 
@@ -75,6 +93,7 @@ pub(crate) fn members(conn: &Connection) -> Result<Vec<Member>> {
 /// Add a ship to the fleet. A name belongs to one home while it is active.
 pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
     let conn = registry()?;
+    crate::machines::refuse_remote_name(&conn, ship)?;
     let existing: Option<(String, Option<i64>)> = conn
         .query_row(
             "SELECT home, retired_ms FROM ships WHERE name=?1",
@@ -123,7 +142,7 @@ fn reach(store: &mut Store, other: &str, other_home: &Path, scope: &str) -> Resu
     Ok(true)
 }
 
-fn scope_of(store: &mut Store, ship: &str) -> String {
+pub(crate) fn scope_of(store: &mut Store, ship: &str) -> String {
     crate::mail::dispatch(store, "ship.show", json!({"name": ship}))
         .ok()
         .and_then(|s| s["scope"].as_str().map(str::to_owned))
@@ -150,6 +169,7 @@ pub fn link(store: &Store, ship: &str) -> Result<usize> {
         }
         reach(&mut theirs, ship, store.home(), &our_scope)?;
     }
+    linked += crate::machines::reach_remote(&mut ours, &conn)?;
     Ok(linked)
 }
 
@@ -210,6 +230,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
     crate::mail::unreserved(name)?;
+    crate::machines::refuse_remote_name(&registry()?, name)?;
     let creator = caller_ship(store);
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
     let parent = creator.as_ref().and_then(|c| {

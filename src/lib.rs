@@ -20,6 +20,7 @@ pub mod herdr;
 pub mod host;
 pub mod input;
 pub mod jobs;
+pub mod machines;
 pub mod mail;
 pub mod needs;
 pub mod opencode_mail;
@@ -113,6 +114,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "workspace" => workspace::dispatch(store, command, args),
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
         "fleet" => fleet::dispatch(store, command, args),
+        "machine" => machines::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),

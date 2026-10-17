@@ -1,5 +1,12 @@
 //! A peer is an address, not an authority level. Native SSH carries the same
 //! one-request JSON-lines protocol used by the local CLI.
+//!
+//! A peer usually names one remote home. A machine peer (`gateway`) reaches
+//! another machine's gateway instead, which hands mail to the right home
+//! there; `fleet` names that machine's registry when it is not the default.
+//! A `collected` peer has no transport at all: the other machine cannot be
+//! reached from here, so mail for ships behind it waits until that machine
+//! collects it.
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -24,8 +31,16 @@ struct Peer {
     transport: String,
     #[serde(default)]
     host: Option<String>,
+    #[serde(default)]
     executable: String,
+    #[serde(default)]
     home: String,
+    /// A machine peer: the remote side is a gateway, not one home.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    gateway: bool,
+    /// The remote fleet registry a gateway serves, when not its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fleet: Option<String>,
     #[serde(default = "default_timeout")]
     timeout_ms: u64,
     #[serde(default = "default_response_limit")]
@@ -87,11 +102,33 @@ fn absolute_path(value: &str, what: &str) -> Result<()> {
 fn validate(peer: &Peer) -> Result<()> {
     token(&peer.name, 64, "peer name")?;
     ensure!(
-        matches!(peer.transport.as_str(), "ssh" | "local"),
+        matches!(peer.transport.as_str(), "ssh" | "local" | "collected"),
         "unsupported peer transport"
     );
+    if peer.transport == "collected" {
+        ensure!(
+            peer.host.is_none()
+                && peer.executable.is_empty()
+                && peer.home.is_empty()
+                && !peer.gateway
+                && peer.fleet.is_none(),
+            "a collected peer has no host, executable, home or fleet"
+        );
+        return Ok(());
+    }
     absolute_path(&peer.executable, "peer executable")?;
-    absolute_path(&peer.home, "peer home")?;
+    if peer.gateway {
+        ensure!(
+            peer.home.is_empty(),
+            "a machine peer reaches a gateway, not a home"
+        );
+        if let Some(fleet) = &peer.fleet {
+            absolute_path(fleet, "peer fleet registry")?;
+        }
+    } else {
+        ensure!(peer.fleet.is_none(), "only a machine peer names a fleet");
+        absolute_path(&peer.home, "peer home")?;
+    }
     ensure!(
         (1..=120_000).contains(&peer.timeout_ms),
         "peer timeout must be 1..120000 milliseconds"
@@ -154,13 +191,24 @@ fn call(peer: &Peer, id: &str, command: &str, args: Value, caller: &Caller) -> R
     );
     let request = serde_json::to_vec(&json!({"id":id,"command":command,"args":args}))?;
     ensure!(request.len() <= 1_048_576, "peer request exceeds 1 MiB");
+    ensure!(
+        peer.transport != "collected",
+        "peer {} is collected from its own machine and cannot be called",
+        peer.name
+    );
     // An agent stays an agent at the remote home: the role travels as CLI
     // flags, which the remote side can only use to narrow its caller.
-    let mut remote_argv = vec![peer.executable.as_str(), "--home", peer.home.as_str()];
+    let mut remote_argv = vec![peer.executable.as_str()];
+    if !peer.gateway {
+        remote_argv.extend(["--home", peer.home.as_str()]);
+    }
+    if let Some(fleet) = &peer.fleet {
+        remote_argv.extend(["--fleet", fleet.as_str()]);
+    }
     if let Caller::Agent { actor } = caller {
         remote_argv.extend(["--role", "agent", "--actor", actor.as_str()]);
     }
-    remote_argv.push("rpc");
+    remote_argv.push(if peer.gateway { "gateway" } else { "rpc" });
     let mut child_command = if peer.transport == "local" {
         let mut cmd = Command::new(&peer.executable);
         // As over SSH, the identity is the flags above, never this
@@ -353,6 +401,50 @@ pub(crate) fn call_peer_with_timeout(
         &json!({"name":name,"command":command,"correlation_id":id,"ok":response["ok"]}),
     )?;
     Ok(response)
+}
+
+/// Call a peer that is not stored in any home, such as a machine's gateway
+/// while the link to it is being made.
+pub(crate) fn call_config(
+    config: &Value,
+    id: &str,
+    command: &str,
+    args: Value,
+    caller: &Caller,
+    timeout: Option<Duration>,
+) -> Result<Value> {
+    let mut peer: Peer = serde_json::from_value(config.clone())?;
+    validate(&peer)?;
+    if let Some(timeout) = timeout {
+        peer.timeout_ms = peer
+            .timeout_ms
+            .min(timeout.as_millis().clamp(1, 120_000) as u64);
+    }
+    call(&peer, id, command, args, caller)
+}
+
+/// Peers whose mail waits for collection rather than being delivered.
+pub(crate) fn collected(store: &Store) -> Result<Vec<String>> {
+    init(store)?;
+    let mut statement = store.connection().prepare(
+        "SELECT name FROM peer_endpoints WHERE json_extract(config_json, '$.transport')='collected'",
+    )?;
+    let names = statement.query_map([], |r| r.get(0))?;
+    Ok(names.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Forget a peer and the ships this home knew to live behind it.
+pub(crate) fn forget(store: &Store, name: &str) -> Result<()> {
+    init(store)?;
+    let tx = store.write_transaction()?;
+    tx.execute(
+        "DELETE FROM ships WHERE json_extract(record, '$.location.peer')=?1",
+        [name],
+    )?;
+    tx.execute("DELETE FROM peer_endpoints WHERE name=?1", [name])?;
+    tx.commit()?;
+    store.audit("peer.forgotten", &json!({"name": name}))?;
+    Ok(())
 }
 
 /// Whether a peer with this name is configured.

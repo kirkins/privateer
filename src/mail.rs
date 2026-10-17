@@ -699,6 +699,20 @@ fn quarantine(store: &Store, id: &str, wire_bytes: usize) -> Result<()> {
     Ok(())
 }
 
+/// The request-closure state a receiving home reports having applied for
+/// this message. Only a receipt for this exact closure proves application;
+/// legacy peers accept the notice too, but do not return this evidence.
+pub(crate) fn applied_end(message: &Value, result: &Value) -> Option<String> {
+    let receipt = &result["request_end"];
+    let end = &message["payload"]["request_end"];
+    (end.is_object()
+        && receipt["id"] == message["correlation"]
+        && receipt["ended_by"] == message["id"]
+        && receipt["state"] == end["state"])
+        .then(|| receipt["state"].as_str().map(str::to_owned))
+        .flatten()
+}
+
 /// Try once to deliver a pending outgoing message; record the outcome.
 fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -> Result<Delivery> {
     let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
@@ -717,19 +731,7 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         timeout,
     )
     .and_then(|response| match response["ok"].as_bool() {
-        Some(true) => {
-            let receipt = &response["result"]["request_end"];
-            let end = &message["payload"]["request_end"];
-            // Only a receipt for this exact closure proves application. Legacy
-            // peers accept the notice too, but do not return this evidence.
-            let applied = (end.is_object()
-                && receipt["id"] == message["correlation"]
-                && receipt["ended_by"] == message["id"]
-                && receipt["state"] == end["state"])
-                .then(|| receipt["state"].as_str().map(str::to_owned))
-                .flatten();
-            Ok(applied)
-        }
+        Some(true) => Ok(applied_end(&message, &response["result"])),
         _ => bail!(
             "{}",
             response["error"]
@@ -803,6 +805,8 @@ fn flush_pending(
         Caller::Operator => None,
     };
     let deadline = budget.map(|budget| Instant::now() + budget);
+    // Mail behind a collected peer waits for its machine to take it.
+    let collected = json!(crate::peers::collected(store)?).to_string();
     let mut failed = vec![];
     let (mut delivered, mut attempted, mut examined) = (0, 0, 0);
     while attempted < max_attempts && examined < max_attempts + EXTRA_CLASSIFICATIONS {
@@ -819,12 +823,13 @@ fn flush_pending(
                AND (?2 OR COALESCE(r.next_attempt_ms, 0)<=?3)
                AND (?4 IS NULL OR json_extract(s.record, '$.location.peer')=?4)
                AND json_extract(s.record, '$.location.peer') NOT IN (SELECT value FROM json_each(?5))
+               AND json_extract(s.record, '$.location.peer') NOT IN (SELECT value FROM json_each(?6))
                AND NOT EXISTS (
                  SELECT 1 FROM mail older JOIN ships os ON os.name=older.recipient
                  WHERE older.delivery='pending' AND older.seq<m.seq
                    AND json_extract(os.record, '$.location.peer')=json_extract(s.record, '$.location.peer'))
              ORDER BY COALESCE(r.last_attempt_ms, 0), m.seq LIMIT 1",
-            params![sender, manual, Store::now_ms(), only_peer, json!(failed).to_string()],
+            params![sender, manual, Store::now_ms(), only_peer, json!(failed).to_string(), collected],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional()?;
         let Some((id, peer)) = next else { break };
@@ -854,6 +859,71 @@ fn flush_pending(
     Ok(
         json!({"delivered": delivered, "pending": pending, "attempted": attempted, "quarantined":quarantined}),
     )
+}
+
+/// Pending mail for ships behind a collected peer, oldest first, as the
+/// envelopes another machine collects: at most `limit` messages and about
+/// `max_bytes` of them.
+pub(crate) fn awaiting(
+    store: &Store,
+    peer: &str,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<Vec<Value>> {
+    let mut statement = store.connection().prepare(
+        "SELECT m.id FROM mail m JOIN ships s ON s.name=m.recipient
+         WHERE m.delivery='pending' AND json_extract(s.record, '$.location.peer')=?1
+         ORDER BY m.seq LIMIT ?2",
+    )?;
+    let ids: Vec<String> = statement
+        .query_map(params![peer, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut envelopes = vec![];
+    let mut bytes = 0;
+    for id in ids {
+        let envelope = envelope(&by_id(store, &id)?.context("message vanished")?);
+        bytes += envelope.to_string().len();
+        if bytes > max_bytes && !envelopes.is_empty() {
+            break;
+        }
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+/// Record what another machine collected from `peer`: delivered messages,
+/// with the request-closure state it applied, and messages it refused, which
+/// are quarantined with the reason rather than offered again.
+pub(crate) fn collected(
+    store: &Store,
+    peer: &str,
+    delivered: &[(String, Option<String>)],
+    refused: &[(String, String)],
+) -> Result<usize> {
+    let tx = store.write_transaction()?;
+    let now = Store::now_ms();
+    let behind = "AND recipient IN (SELECT name FROM ships WHERE json_extract(record, '$.location.peer')=?2)";
+    let mut changed = 0;
+    for (id, end_state) in delivered {
+        changed += tx.execute(
+            &format!(
+                "UPDATE mail SET delivery='delivered', delivered_ms=?3, delivery_attempts=delivery_attempts+1,
+                   delivery_error=NULL, remote_end_state=?4 WHERE id=?1 AND delivery='pending' {behind}"
+            ),
+            params![id, peer, now, end_state],
+        )?;
+    }
+    for (id, error) in refused {
+        changed += tx.execute(
+            &format!(
+                "UPDATE mail SET delivery='quarantined', delivery_attempts=delivery_attempts+1,
+                   delivery_error=?3 WHERE id=?1 AND delivery='pending' {behind}"
+            ),
+            params![id, peer, error.chars().take(4096).collect::<String>()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
 }
 
 fn flush(store: &Store, args: &Value) -> Result<Value> {
