@@ -1416,6 +1416,108 @@ fn an_idle_ship_moves_to_the_other_machine_and_back() {
         scout["location"],
         json!({"peer": "machine-laptop"}),
         "{scout}"
+/// The captain's own mail written in a home on this machine, sent over the link.
+fn captain_sends(machine: &Machine, ship: &str, ssh: &Path, mail: Value) -> Output {
+    let mut mail = mail;
+    mail["from"] = json!("captain");
+    machine.run(ship, &["mail.send", "--json", &mail.to_string()], Some(ssh))
+}
+
+/// What the captain has been sent in a home here, notices included.
+fn captain_mail(machine: &Machine, ship: &str) -> Vec<Value> {
+    machine.ok(ship, "mail.inbox", json!({"address": "captain"}))["messages"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_captain_reply_reaches_the_home_that_asked_across_the_link() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("rig");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    // The captain asks from a ship's home that is not the captain's.
+    let asked = captain_sends(
+        &laptop,
+        "rig",
+        &ssh,
+        json!({"to": "fitforge", "kind": "request", "body": "Upload build 12?"}),
+    );
+    assert!(asked.status.success(), "{}", text(&asked));
+    let asked: Value = serde_json::from_slice(&asked.stdout).unwrap();
+
+    let answered = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "reply",
+            "correlation": asked["id"], "body": "Yes, ship it"}),
+    );
+    assert!(answered["id"].is_string(), "{answered}");
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["delivered"], 1, "{pass}");
+    assert_eq!(pass["machines"][0]["refused"], 0, "{pass}");
+
+    // The reply closes the request where it was written and waits in that
+    // home's captain mailbox, which the captain's door reads.
+    let here = laptop.ok("rig", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(here["state"], "answered", "{here}");
+    let inbox = captain_mail(&laptop, "rig");
+    let bodies: Vec<&str> = inbox.iter().filter_map(|m| m["body"].as_str()).collect();
+    assert_eq!(bodies, ["Yes, ship it"], "{bodies:?}");
+    assert!(captain_mail(&laptop, "liaison").is_empty());
+}
+
+#[test]
+fn a_captain_reply_refused_across_the_link_is_put_before_the_captain() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("rig");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let asked = captain_sends(
+        &laptop,
+        "rig",
+        &ssh,
+        json!({"to": "fitforge", "kind": "request", "body": "Upload build 12?"}),
+    );
+    assert!(asked.status.success(), "{}", text(&asked));
+    let asked: Value = serde_json::from_slice(&asked.stdout).unwrap();
+    let answered = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "reply",
+            "correlation": asked["id"], "body": "Yes, ship it"}),
+    );
+
+    // Nothing here holds the request any more, so the reply cannot close it.
+    let home: String = rusqlite::Connection::open(laptop.registry())
+        .unwrap()
+        .query_row("SELECT home FROM ships WHERE name='rig'", [], |r| r.get(0))
+        .unwrap();
+    let database = PathBuf::from(home).join("privateer.sqlite");
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "DELETE FROM mail WHERE id=?1",
+            [asked["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["refused"], 1, "{pass}");
+
+    let notices: Vec<Value> = captain_mail(&laptop, "liaison")
+        .into_iter()
+        .filter(|m| m["kind"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["payload"]["refused"]["id"], answered["id"]);
+    assert_eq!(notices[0]["payload"]["refused"]["from"], "fitforge");
+    assert!(
+        notices[0]["payload"]["refused"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unknown request"),
+        "{notices:?}"
     );
 }
 
@@ -1446,4 +1548,70 @@ fn a_ship_with_unpushed_work_stays_where_it_is() {
     assert!(!mac.folder("scout").exists());
     let scout = laptop.ok("liaison", "ship.show", json!({"name": "scout"}));
     assert_eq!(scout["location"], json!({"peer": "fleet-scout"}), "{scout}");
+fn a_captain_reply_to_a_request_asked_before_the_link_reaches_the_other_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let asked = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "request", "body": "Before the link?"}),
+    );
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+
+    // The request was never collected here, so the captain's home does not
+    // hold it; the reply goes across the link and the other machine checks it.
+    let answer = captain_sends(
+        &laptop,
+        "liaison",
+        &ssh,
+        json!({"to": "fitforge", "kind": "reply", "correlation": asked["id"], "body": "Yes"}),
+    );
+    assert!(answer.status.success(), "{}", text(&answer));
+    let answered = mac.ok("fitforge", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(answered["state"], "answered", "{answered}");
+    let replies = messages(&mac, "fitforge", "reply");
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(replies[0]["from"], "captain");
+    assert!(captain_mail(&laptop, "liaison").is_empty());
+}
+
+#[test]
+fn a_captain_message_the_other_machine_refuses_is_put_before_the_captain() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+
+    let answer = captain_sends(
+        &laptop,
+        "liaison",
+        &ssh,
+        json!({"to": "fitforge", "kind": "reply", "correlation": "no-such-request", "body": "Yes"}),
+    );
+    assert!(answer.status.success(), "{}", text(&answer));
+    let answer: Value = serde_json::from_slice(&answer.stdout).unwrap();
+    let notices: Vec<Value> = captain_mail(&laptop, "liaison")
+        .into_iter()
+        .filter(|m| m["kind"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["payload"]["refused"]["id"], answer["id"]);
+    assert_eq!(notices[0]["payload"]["refused"]["to"], "fitforge");
+    assert!(
+        notices[0]["body"].as_str().unwrap().contains("was refused"),
+        "{notices:?}"
+    );
+
+    // The refused reply does not hold back the captain's later mail to that machine.
+    let later = captain_sends(
+        &laptop,
+        "liaison",
+        &ssh,
+        json!({"to": "fitforge", "kind": "notice", "body": "Still reaching you"}),
+    );
+    assert!(later.status.success(), "{}", text(&later));
+    let inbox = messages(&mac, "fitforge", "notice");
+    assert!(
+        inbox.iter().any(|m| m["body"] == "Still reaching you"),
+        "{inbox:?}"
+    );
 }

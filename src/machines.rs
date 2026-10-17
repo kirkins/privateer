@@ -975,7 +975,11 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
         let id = required(envelope, "id")?.to_owned();
         let to = envelope["to"].as_str().unwrap_or("");
         let home = if to == crate::mail::CAPTAIN {
-            captain_home(conn)?.map(|(_, home)| home)
+            // A home that cannot be read now is retried on the next pass.
+            let Ok(home) = captain_destination(conn, envelope) else {
+                continue;
+            };
+            home
         } else {
             homes
                 .iter()
@@ -993,7 +997,13 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
         match crate::dispatch(&mut store, "mail.deliver", envelope.clone()) {
             Ok(result) => delivered
                 .push(json!({"id": id, "end_state": crate::mail::applied_end(envelope, &result)})),
-            Err(error) => refused.push(json!({"id": id, "error": format!("{error:#}")})),
+            Err(error) => {
+                let reason = format!("{error:#}");
+                if to == crate::mail::CAPTAIN {
+                    surface_captain_refusal(conn, &id, envelope, &reason)?;
+                }
+                refused.push(json!({"id": id, "error": reason}));
+            }
         }
     }
     if !delivered.is_empty() || !refused.is_empty() {
@@ -1005,6 +1015,52 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
         )?;
     }
     Ok(json!({"machine": machine.name, "delivered": delivered.len(), "refused": refused.len()}))
+}
+
+/// Where a captain's message collected here is delivered: the home that
+/// holds the request it answers, so the request closes where it was written
+/// (and the captain's door reads the reply from that home's captain mailbox),
+/// or else the captain's home.
+fn captain_destination(conn: &Connection, envelope: &Value) -> Result<Option<PathBuf>> {
+    if let Some(request) = envelope["correlation"].as_str() {
+        let captain = captain_home(conn)?.map(|(_, home)| home);
+        let members = crate::fleet::members(conn)?
+            .into_iter()
+            .filter(|m| m.home.is_dir())
+            .map(|m| m.home);
+        // A home that cannot be read may hold the request, so when it is not
+        // found elsewhere the message waits for the next pass.
+        let mut unreadable = false;
+        for home in captain.into_iter().chain(members) {
+            let Ok(store) = Store::open(&home) else {
+                unreadable = true;
+                continue;
+            };
+            if crate::mail::find(&store, request)?.is_some() {
+                return Ok(Some(home));
+            }
+        }
+        ensure!(
+            !unreadable,
+            "a fleet home cannot be read; the request is not yet located"
+        );
+    }
+    Ok(captain_home(conn)?.map(|(_, home)| home))
+}
+
+/// A captain's message that this machine refused is put before the captain,
+/// not left only in the collection record: a notice in the captain's home.
+fn surface_captain_refusal(
+    conn: &Connection,
+    id: &str,
+    envelope: &Value,
+    reason: &str,
+) -> Result<()> {
+    let Some((_, home)) = captain_home(conn)? else {
+        return Ok(());
+    };
+    let from = envelope["from"].as_str().unwrap_or("unknown");
+    crate::mail::surface_refusal(&Store::open(&home)?, id, from, from, "captain", reason)
 }
 
 /// One dispatcher pass: for each machine this one reaches, refresh the
