@@ -240,6 +240,14 @@ impl Client {
             .context("Herdr response missing result")
     }
 
+    /// The pane the captain's Herdr client has focused, when Herdr says.
+    pub fn focused_pane(&mut self) -> Result<Option<String>> {
+        let result = self.request("session.snapshot", json!({}))?;
+        Ok(result["snapshot"]["focused_pane_id"]
+            .as_str()
+            .map(str::to_owned))
+    }
+
     pub fn snapshot(&mut self) -> Result<View> {
         let result = self.request("session.snapshot", json!({}))?;
         let snapshot = &result["snapshot"];
