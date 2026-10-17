@@ -304,6 +304,28 @@ def main() -> int:
             assert re.search(r"asked (just now|\d+ [smhd] ago)", reread[0]["text"]), reread[0]
             assert "reply to answer" in reread[0]["text"], reread[0]
 
+            # An ask only the captain's hands can clear comes first, under its own
+            # heading, with the exact step beside it.
+            fleet.call("ops", "mail.send", {
+                "from": "ops", "to": "captain", "kind": "request",
+                "body": "The disk check finished.",
+                "payload": {"needs_hands": {"step": "Run `sudo privateer-unlock ops` on the Mac"}}})
+            before = len(telegram.sent())
+            telegram.message("/waiting")
+
+            def reshown() -> list:
+                texts = [m["text"] for m in telegram.sent()[before:]]
+                both = any("needs your hands" in t for t in texts) and any(
+                    "Is the Mac still stowed?" in t for t in texts)
+                return texts if both else []
+
+            texts = wait_for("the hands-on card and the ordinary card", reshown)
+            hands_at = next(i for i, t in enumerate(texts) if "needs your hands" in t)
+            ordinary_at = next(i for i, t in enumerate(texts) if "Is the Mac still stowed?" in t)
+            assert hands_at < ordinary_at, texts
+            assert texts[hands_at - 1] == "Needs your hands:", texts
+            assert "privateer-unlock ops" in texts[hands_at], texts[hands_at]
+
             # A stow names its machine. The Mac is linked (before the door
             # starts, so its calls can reach it), and its hold is its own: this
             # machine's status names it, a resume of one machine never speaks

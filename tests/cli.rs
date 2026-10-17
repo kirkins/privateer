@@ -666,6 +666,9 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
     assert!(agents.starts_with("<!-- privateer:generated -->"));
     assert!(agents.contains("first mate of the Privateer ship **infra-ship**"));
     assert!(agents.contains("Its scope: Deploys and build servers."));
+    // A captain's own hands are marked, with the exact step, never buried in a report.
+    assert!(agents.contains(r#""needs_hands":{"step":"#), "{agents}");
+    assert!(agents.contains("Never bury such an ask under a report"));
     assert!(agents.contains(&format!("{BIN} --home ")));
     // Issue 101: a ship that may publish owns its pull requests to merge.
     assert!(agents.contains("you own your pull requests end to end"));
@@ -883,6 +886,10 @@ fn liaison_preset_acts_for_the_captain_and_keeps_captain_edits() {
     // ... and read runtime state back before restating what a request claims.
     assert!(emitted.contains("never a current fact"));
     assert!(emitted.contains("`stow.status`"));
+    // Hands-on asks are relayed first and apart, each with its step.
+    assert!(emitted.contains("`hands_on`"));
+    assert!(emitted.contains(r#""needs_hands":{"step":"#));
+    assert!(emitted.contains("Relay the `hands_on` asks first"));
     folder.ok(&["init", "--harness", "codex"]);
     assert!(
         fs::read_to_string(folder.ship.join("AGENTS.md"))

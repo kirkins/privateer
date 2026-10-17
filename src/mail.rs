@@ -18,6 +18,8 @@ pub const CREW: &str = "crew";
 const KINDS: &[&str] = &["request", "reply", "notice", "decision"];
 const URGENCIES: &[&str] = &["low", "normal", "high"];
 const MAX_MESSAGE_BYTES: usize = 65_536;
+/// The exact hands-on step a request to the captain may name.
+pub(crate) const MAX_HANDS_STEP_BYTES: usize = 1_024;
 pub(crate) const MAX_SCOPE_CHARS: usize = 2_000;
 /// Extra local classifications cannot turn a bounded flush into a backlog
 /// scan. They do not consume its separate allowance for network attempts.
@@ -515,6 +517,22 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
                     .iter()
                     .all(|v| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200)),
             "choices must contain at most 20 bounded strings"
+        );
+    }
+    if let Some(hands) = payload.get("needs_hands") {
+        // Only the captain's own hands can do these; the list carries the step
+        // beside the ask, so the step must be a real, bounded instruction.
+        ensure!(
+            kind == "request" && to == CAPTAIN,
+            "needs_hands marks a request to the captain"
+        );
+        let step = hands
+            .get("step")
+            .and_then(Value::as_str)
+            .context("needs_hands needs a step: the exact thing the captain must do")?;
+        ensure!(
+            !step.trim().is_empty() && step.len() <= MAX_HANDS_STEP_BYTES,
+            "needs_hands step must be 1 to {MAX_HANDS_STEP_BYTES} bytes"
         );
     }
     ensure!(

@@ -196,6 +196,9 @@ class Door:
         body = mail.get("body") or ""
         if not body:
             body = "```json\n" + json.dumps(mail.get("payload") or {}, indent=2) + "\n```"
+        if event.get("step"):
+            # The exact thing only the captain can do, ahead of the request's words.
+            body = f"**Your hands:** {event['step']}\n\n{body}"
         if suppress_noop_ack(self.cfg, body):
             tg.log(f"{event['ref']}: a routine acknowledgement stays out of the chat")
             return ""
@@ -209,6 +212,8 @@ class Door:
             header += f" · {event['note']}"
         if kind in ("request", "decision"):
             header += " · reply to answer"
+        if event.get("step"):
+            header += " · needs your hands"
         # A reply threads under the captain's message it answers.
         reply_to = None
         if mail.get("correlation"):
@@ -571,20 +576,34 @@ class Door:
         self.say("\n".join(lines), html=True)
 
     def cmd_waiting(self) -> None:
-        waiting = self.runtime.call("waiting")["waiting"]
+        listed = self.runtime.call("waiting")
+        waiting = listed["waiting"]
         if not waiting:
             self.say("Nothing is waiting on you. ⚓")
             return
         self.say(f"{len(waiting)} waiting on you; reply to each to answer:")
-        for item in waiting[:20]:
-            # Shown again as replyable messages, without re-acknowledging
-            # anything, and carrying the age so an old request reads as old.
-            age = item.get("age_ms")
-            note = f"asked {age_phrase(age)}" if isinstance(age, int) else ""
-            err = self.push({"ref": "", "ship": item["ship"], "mail": item["mail"], "note": note})
-            if err:
-                self.say(f"⚠️ could not show one: {err}")
-                return
+        # Asks only the captain's hands can clear come first, each with its step.
+        hands = listed.get("hands_on") or []
+        hand_ids = {item["mail"].get("id") for item in hands}
+        rest = [item for item in waiting if item["mail"].get("id") not in hand_ids]
+        shown = 0
+        for title, items in (("Needs your hands:", hands), ("Everything else:", rest)):
+            if not items or shown >= 20:
+                continue
+            self.say(title)
+            for item in items:
+                if shown == 20:
+                    break
+                # Shown again as replyable messages, without re-acknowledging
+                # anything, and carrying the age so an old request reads as old.
+                age = item.get("age_ms")
+                note = f"asked {age_phrase(age)}" if isinstance(age, int) else ""
+                err = self.push({"ref": "", "ship": item["ship"], "mail": item["mail"],
+                                 "note": note, "step": item.get("step")})
+                if err:
+                    self.say(f"⚠️ could not show one: {err}")
+                    return
+                shown += 1
 
     # --- attachments and voice -------------------------------------------
 

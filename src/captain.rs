@@ -51,9 +51,15 @@ fn desk(store: &Store) -> Result<Option<String>> {
 /// how long ago that was (`age_ms`), so whoever reads the list can say "X asked
 /// at T" instead of restating a request body as if it were news. Ages are
 /// computed once here, against `now_ms`, and never stored.
+///
+/// Asks only the captain's hands can do (marked `needs_hands` by the sender)
+/// also appear in `hands_on`, each with its exact `step`, so they are never
+/// read as one more report. The marker is read from the record, never guessed
+/// from the text.
 pub fn waiting() -> Result<Value> {
     let now = Store::now_ms();
     let mut waiting = vec![];
+    let mut hands_on = vec![];
     for (ship, home) in fleet()? {
         let mut store = Store::open(&home)?;
         let open = crate::mail::dispatch(
@@ -63,13 +69,20 @@ pub fn waiting() -> Result<Value> {
         )?;
         for mail in open["requests"].as_array().into_iter().flatten() {
             let asked = mail["created_ms"].as_i64().unwrap_or(now);
-            waiting.push(json!({"ship": ship, "asked_ms": asked,
-                "age_ms": (now - asked).max(0), "mail": mail}));
+            let step = mail["payload"]["needs_hands"]["step"].as_str();
+            let item = json!({"ship": ship, "asked_ms": asked,
+                "age_ms": (now - asked).max(0), "step": step, "mail": mail});
+            if step.is_some() {
+                hands_on.push(item.clone());
+            }
+            waiting.push(item);
         }
     }
     waiting.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
     waiting.truncate(MAX_WAITING);
-    Ok(json!({"now_ms": now, "waiting": waiting}))
+    hands_on.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
+    hands_on.truncate(MAX_WAITING);
+    Ok(json!({"now_ms": now, "hands_on": hands_on, "waiting": waiting}))
 }
 
 /// Answer an open captain request with what the captain told the liaison.
