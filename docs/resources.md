@@ -109,10 +109,11 @@ falls below the floor. It is also told *before* that, while there is still room
 to act. Every job admission and every owner check keeps a free-space reading for
 the filesystem it measured, at most one every five minutes, for seven days, and
 the readings are keyed by filesystem so work anywhere on that disk feeds the same
-series. A falling rate is read from the last twelve hours of readings, starting
-at the last cleanup: a rise of a gibibyte or more between two readings. The rate
-is a least-squares fit, and it needs at least an hour of readings after that
-point, so one build's writing cannot read as a machine filling up. When the rate
+series. A falling rate is read from the last twelve hours of readings. The window
+starts at the last cleanup (a rise of a gibibyte or more between two readings)
+or at the last trim of build output (see below), whichever is later. The rate is
+a least-squares fit, and it needs at least an hour of readings after that point,
+so one build's writing cannot read as a machine filling up. When the rate
 would reach the floor within `disk_warn_horizon_secs` (default 24 hours), the
 owner is mailed a notice with the rate and the hours left.
 
@@ -131,6 +132,35 @@ horizon of 0 warns only once the floor is crossed.
 A falling rate is not an order to clean up: only the machine's owner and the
 captain decide what to remove. The runtime's part is to say so while there is
 still time.
+
+## Build output in released worktrees
+
+A task's worktree is returned to its pool when its work has landed, but the
+build output in it (a Rust `target` directory, for one) stays with the slot and
+can run to gigabytes. A pool that is reused keeps those bytes; one that grows
+keeps all of them. `workspace_cache_budget_bytes` (8 GiB by default) is how much
+build output released slots of a pool may keep:
+
+```json
+{"workspace_cache_budget_bytes": 8589934592}
+```
+
+The budget is enforced in two places. When a workspace is released, and when a
+workspace or job would not fit above the floor plus the disk held jobs still
+have to write, the runtime trims the least recently released slots until the
+pool is within budget and the space asked for is free. A held or leased slot is
+never trimmed, however large its output. Trimming removes only the slot's
+`target` directory, and only from a slot whose worktree is clean and tracks
+nothing under `target`: source, uncommitted work and untracked files stay where
+they are. A slot that does not qualify is skipped, and the next least recently
+released one is tried. A trim that fails is recorded in the audit log and does
+not undo the release.
+
+A trim frees space that the job holding the disk did not write, so the job's
+credit for its declared space is computed as if the trim had not happened. The
+trend the owner sees restarts from the trim, so a trim is not read as a cleanup
+rise or as a fall caused by a job. Setting the budget to 0 keeps no build output
+in released slots; the next build there starts cold.
 
 ## Limitations
 

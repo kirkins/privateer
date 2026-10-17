@@ -79,6 +79,10 @@ pub struct Settings {
     /// How far ahead a falling free-space rate may reach the floor before the
     /// machine's owner is warned. 0 warns only once the floor is crossed.
     pub disk_warn_horizon_secs: u64,
+    /// Build output (`target` directories) that released worktree slots of a
+    /// pool may keep. Beyond it, the least recently released slots are
+    /// trimmed. 0 keeps none.
+    pub workspace_cache_budget_bytes: u64,
 }
 
 impl Default for Settings {
@@ -95,6 +99,7 @@ impl Default for Settings {
             },
             ramp_secs: 60,
             disk_warn_horizon_secs: 24 * 60 * 60,
+            workspace_cache_budget_bytes: 8 * GIB,
         }
     }
 }
@@ -120,6 +125,9 @@ pub struct Held<'a> {
     /// space measured when it was admitted.
     pub disk_key: Option<&'a str>,
     pub disk_free_at_admit: Option<u64>,
+    /// Bytes trimmed from that filesystem since this job was admitted. A trim
+    /// frees space this job did not write, so it is added back to the loss.
+    pub disk_trimmed: u64,
 }
 
 /// What a new job asks for.
@@ -155,7 +163,9 @@ pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS disk_samples (path TEXT NOT NULL, sampled_ms INTEGER NOT NULL,
-           free_bytes INTEGER NOT NULL, PRIMARY KEY (path, sampled_ms));",
+           free_bytes INTEGER NOT NULL, PRIMARY KEY (path, sampled_ms));
+         CREATE TABLE IF NOT EXISTS disk_trims (disk_key TEXT PRIMARY KEY,
+           total_bytes INTEGER NOT NULL, last_ms INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -249,6 +259,9 @@ fn effective(raw: &Map<String, Value>) -> Result<Settings> {
                         "disk_warn_horizon_secs must be 0..2592000 (0 warns only below the floor)",
                     )?;
             }
+            "workspace_cache_budget_bytes" => {
+                settings.workspace_cache_budget_bytes = bytes(value, key)?;
+            }
             _ => bail!("unknown admission setting {key}"),
         }
     }
@@ -328,7 +341,7 @@ pub fn demand(
 /// admitted, since a reading already shows what was written. The credit is
 /// capped at the loss since the oldest of them was admitted, so concurrent
 /// jobs cannot all claim the same loss.
-fn committed_disk(held: &[Held], disk_key: &str, free_now: u64) -> u64 {
+pub fn committed_disk(held: &[Held], disk_key: &str, free_now: u64) -> u64 {
     let on_disk: Vec<&Held> = held
         .iter()
         .filter(|h| h.disk_key == Some(disk_key))
@@ -338,8 +351,9 @@ fn committed_disk(held: &[Held], disk_key: &str, free_now: u64) -> u64 {
         .filter_map(|h| h.demand)
         .fold(0u64, |sum, d| sum.saturating_add(d.disk_bytes));
     let lost = |h: &Held| {
-        h.disk_free_at_admit
-            .map_or(0, |free| free.saturating_sub(free_now))
+        h.disk_free_at_admit.map_or(0, |free| {
+            free.saturating_add(h.disk_trimmed).saturating_sub(free_now)
+        })
     };
     let credit = on_disk
         .iter()
@@ -676,6 +690,44 @@ pub fn note_disk(conn: &Connection, path: &str, free: u64, now_ms: i64) -> Resul
     Ok(())
 }
 
+/// Bytes trimmed from one filesystem over its whole life. A reservation keeps
+/// the total it saw at admission, so the difference is what was trimmed while
+/// it ran. It only grows, so no retention window can lose a trim.
+pub fn trim_total(conn: &Connection, disk_key: &str) -> Result<u64> {
+    let total: Option<i64> = conn
+        .query_row(
+            "SELECT total_bytes FROM disk_trims WHERE disk_key=?1",
+            [disk_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(total.unwrap_or(0).max(0) as u64)
+}
+
+/// Record that `bytes` of build output were trimmed from one filesystem and
+/// read `free` bytes free afterwards. The reading is written even when a
+/// sample was taken moments ago, so the trend restarts from the trimmed disk.
+pub fn record_trim(
+    conn: &Connection,
+    disk_key: &str,
+    bytes: u64,
+    free: u64,
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO disk_trims(disk_key,total_bytes,last_ms) VALUES(?1,?2,?3)
+         ON CONFLICT(disk_key) DO UPDATE SET total_bytes=total_bytes+excluded.total_bytes,
+           last_ms=excluded.last_ms",
+        params![disk_key, bytes.min(i64::MAX as u64) as i64, now_ms],
+    )?;
+    conn.execute(
+        "INSERT INTO disk_samples(path,sampled_ms,free_bytes) VALUES(?1,?2,?3)
+         ON CONFLICT(path,sampled_ms) DO UPDATE SET free_bytes=excluded.free_bytes",
+        params![disk_key, now_ms, free.min(i64::MAX as u64) as i64],
+    )?;
+    Ok(())
+}
+
 /// The rate at which free space has been moving over the recent readings of
 /// one filesystem. The window ends at the newest reading and starts at the
 /// last cleanup in it, and the slope is a least-squares fit. None until those
@@ -690,12 +742,22 @@ pub fn disk_trend(conn: &Connection, path: &str) -> Result<Option<DiskTrend>> {
     let Some(newest) = newest else {
         return Ok(None);
     };
+    // A trim is a reset like a cleanup: readings before it describe a disk
+    // that was not trimmed, so they cannot stand for a rate after it.
+    let last_trim: Option<i64> = conn
+        .query_row(
+            "SELECT last_ms FROM disk_trims WHERE disk_key=?1",
+            [path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let since = (newest - DISK_TREND_WINDOW_MS).max(last_trim.unwrap_or(i64::MIN));
     let mut statement = conn.prepare(
         "SELECT sampled_ms,free_bytes FROM disk_samples WHERE path=?1 AND sampled_ms>=?2
          ORDER BY sampled_ms",
     )?;
     let readings = statement
-        .query_map(params![path, newest - DISK_TREND_WINDOW_MS], |r| {
+        .query_map(params![path, since], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -858,6 +920,7 @@ mod tests {
             }),
             disk_key: Some("dev:1"),
             disk_free_at_admit: Some(36 * GIB),
+            disk_trimmed: 0,
         }
     }
 
@@ -923,6 +986,56 @@ mod tests {
         assert!(admit(&settings, &host, 0, &two, &request).is_err());
         request.demand.as_mut().unwrap().disk_bytes = 26 * GIB;
         assert!(admit(&settings, &host, 0, &two, &request).is_ok());
+    }
+
+    #[test]
+    fn a_trim_restarts_the_trend_so_it_is_not_read_as_a_rise() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let hour = 3_600_000;
+        // Space falls by half a gibibyte every half hour for three hours.
+        for step in 0..=6 {
+            let free = 20 * GIB - step * GIB / 2;
+            note_disk(&conn, "dev:1", free, step as i64 * hour / 2).unwrap();
+        }
+        // A trim frees half a gibibyte at three hours; the disk reads 17.5 GiB
+        // free after it, and falls on from there.
+        record_trim(&conn, "dev:1", GIB / 2, 17 * GIB + GIB / 2, 3 * hour).unwrap();
+        note_disk(&conn, "dev:1", 17 * GIB, 3 * hour + hour / 2).unwrap();
+        note_disk(&conn, "dev:1", 16 * GIB + GIB / 2, 4 * hour).unwrap();
+        let trend = disk_trend(&conn, "dev:1").unwrap().unwrap();
+        // The window starts at the trim, so the trim is not a rise in it.
+        assert_eq!(trend.from_ms, 3 * hour);
+        assert_eq!(trend.from_free_bytes, 17 * GIB + GIB / 2);
+        assert!((trend.bytes_per_hour + GIB as f64).abs() < 1.0);
+        assert_eq!(trim_total(&conn, "dev:1").unwrap(), GIB / 2);
+    }
+
+    #[test]
+    fn a_trim_during_a_held_job_is_not_credited_to_it() {
+        let settings = Settings {
+            min_free_disk_bytes: 2 * GIB,
+            max_load_per_cpu: 1024.0,
+            ..Settings::default()
+        };
+        let host = host(0.0);
+        // A 4 GiB build admitted at 36 GiB free writes 1 GiB, while a trim
+        // frees 3 GiB, so the disk reads 38 GiB free. The build has written
+        // 1 GiB, so 3 GiB of its declared space is still ahead: a 33 GiB job
+        // fits in 38 GiB with the 2 GiB floor. Reading the trim as the build's
+        // own gain would credit it with 4 GiB and refuse this job.
+        let mut trimmed = held_on("dev:1", 4 * GIB, 36 * GIB);
+        trimmed.disk_trimmed = 3 * GIB;
+        let mut request = heavy(0.0);
+        request.demand = Some(Demand {
+            cpus: 1.0,
+            memory_bytes: 0,
+            disk_bytes: 33 * GIB,
+        });
+        request.disk_available_bytes = 38 * GIB;
+        assert!(admit(&settings, &host, 0, &[trimmed], &request).is_ok());
+        let untrimmed = held_on("dev:1", 4 * GIB, 36 * GIB);
+        assert!(admit(&settings, &host, 0, &[untrimmed], &request).is_err());
     }
 
     #[test]

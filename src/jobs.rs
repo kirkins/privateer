@@ -155,6 +155,10 @@ struct Reservation {
     disk_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     disk_free_bytes: Option<u64>,
+    /// The trims `disk_key` had seen in total when this was admitted, so the
+    /// trims made while it runs can be told apart from its own writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disk_trimmed_at_admit: Option<u64>,
     /// The job's recorded descendants outside its payload group.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     escaped: Vec<Process>,
@@ -338,10 +342,15 @@ pub(crate) fn wait_for_workspace_disk(
     };
     // Only the filesystem this workspace will use: a full root must not
     // block a pool on a separate volume.
+    // Space the held jobs on this filesystem still have to write counts too.
+    let pool_key = admission::disk_key(pool)?;
     let fits = |conn: &Connection| -> Result<(bool, u64, u64)> {
         let settings = admission::settings(conn)?;
         let available = admission::disk(pool)?.0;
-        let required = settings.min_free_disk_bytes.max(charter_floor);
+        let required = settings
+            .min_free_disk_bytes
+            .max(charter_floor)
+            .saturating_add(committed_disk_on(conn, &pool_key, available)?);
         Ok((available >= required, available, required))
     };
     let (enough, available, required) = fits(&ledger(&ledger_path)?)?;
@@ -518,6 +527,39 @@ struct DiskFloor<'a> {
     charter_min_free_bytes: u64,
     path: &'a Path,
 }
+/// Live reservations as admission sees them. A reservation's own loss counts
+/// the trims made on its filesystem while it ran as space it did not write.
+fn held_view<'a>(conn: &Connection, held: &'a [Reservation]) -> Result<Vec<admission::Held<'a>>> {
+    held.iter()
+        .map(|r| {
+            let disk_trimmed = match (&r.disk_key, r.disk_trimmed_at_admit) {
+                (Some(key), Some(at)) => admission::trim_total(conn, key)?.saturating_sub(at),
+                _ => 0,
+            };
+            Ok(admission::Held {
+                heavy: r.heavy,
+                home: &r.home,
+                charter: r.charter.as_deref(),
+                created_ms: r.created_ms,
+                demand: r.demand,
+                disk_key: r.disk_key.as_deref(),
+                disk_free_at_admit: r.disk_free_bytes,
+                disk_trimmed,
+            })
+        })
+        .collect()
+}
+
+/// Disk the live reservations on one filesystem still have to write.
+pub(crate) fn committed_disk_on(conn: &Connection, disk_key: &str, free: u64) -> Result<u64> {
+    let held = reservations(conn)?;
+    Ok(admission::committed_disk(
+        &held_view(conn, &held)?,
+        disk_key,
+        free,
+    ))
+}
+
 /// Admit and record a reservation under the ledger's write lock, so homes
 /// sharing the host decide one at a time against the same readings.
 ///
@@ -584,18 +626,7 @@ fn reserve(
             let (disk_available_bytes, disk_total_bytes) = admission::disk(floor.path)?;
             let now = Store::now_ms();
             admission::note_disk(conn, &disk_key, disk_available_bytes, now)?;
-            let view: Vec<admission::Held> = held
-                .iter()
-                .map(|r| admission::Held {
-                    heavy: r.heavy,
-                    home: &r.home,
-                    charter: r.charter.as_deref(),
-                    created_ms: r.created_ms,
-                    demand: r.demand,
-                    disk_key: r.disk_key.as_deref(),
-                    disk_free_at_admit: r.disk_free_bytes,
-                })
-                .collect();
+            let view = held_view(conn, &held)?;
             admission::admit(
                 &settings,
                 &host,
@@ -614,6 +645,7 @@ fn reserve(
                     released_load: released_load(conn, now)?,
                 },
             )?;
+            reservation.disk_trimmed_at_admit = Some(admission::trim_total(conn, &disk_key)?);
             reservation.disk_key = Some(disk_key);
             reservation.disk_free_bytes = Some(disk_available_bytes);
             if from_queue {
@@ -1512,9 +1544,29 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         demand: None,
         disk_key: None,
         disk_free_bytes: None,
+        disk_trimmed_at_admit: None,
         escaped: vec![],
         wake: is_wake(store, &id)?,
     };
+    // Trimming does file I/O, so it runs before the write transaction below.
+    let charter_floor = charter
+        .get("min_free_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(2 * 1024 * 1024 * 1024);
+    let demand = admission::demand(
+        &admission::settings(&shared_ledger(store)?)?,
+        &admission::measure()?,
+        heavy,
+        heavy_declared,
+        estimate.as_ref(),
+    );
+    crate::workspace::make_room_for_job(
+        store,
+        workspace._lock.as_ref(),
+        &job.cwd,
+        charter_floor,
+        demand,
+    )?;
     let conn = store.connection();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let admitted = (|| -> Result<Option<Job>> {
@@ -1792,6 +1844,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             demand: None,
             disk_key: None,
             disk_free_bytes: None,
+            disk_trimmed_at_admit: None,
             escaped: vec![],
             wake: is_wake(store, &job.id)?,
         };
