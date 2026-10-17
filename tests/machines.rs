@@ -161,12 +161,18 @@ fn link_as(laptop: &Machine, ship: &str, known_as: &str, mac: &Machine, ssh: &Pa
 /// ledger and PATH, as a real remote host does; the plain fake ssh would
 /// pass the caller's environment through. Each connection is logged.
 fn remote_ssh(machine: &Machine) -> PathBuf {
-    let ssh = machine.root.join("ssh");
+    remote_ssh_with(machine, "ssh", "")
+}
+
+/// A fake ssh like `remote_ssh`, with `answer` (a shell pipeline) applied to
+/// what the remote gateway writes back.
+fn remote_ssh_with(machine: &Machine, name: &str, answer: &str) -> PathBuf {
+    let ssh = machine.root.join(name);
     fs::create_dir_all(machine.root.join("bin")).unwrap();
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nfor argument do remote=$argument; done\necho connected >> {root}/ssh.log\nexec env HOME={root} PATH={root}/bin:/usr/bin:/bin PRIVATEER_FLEET={root}/fleet.sqlite PRIVATEER_RESOURCE_HOME={root}/ledger /bin/sh -c \"$remote\"\n",
+            "#!/bin/sh\nfor argument do remote=$argument; done\necho connected >> {root}/ssh.log\nenv HOME={root} PATH={root}/bin:/usr/bin:/bin PRIVATEER_FLEET={root}/fleet.sqlite PRIVATEER_RESOURCE_HOME={root}/ledger /bin/sh -c \"$remote\" {answer}\n",
             root = machine.root.display()
         ),
     )
@@ -187,6 +193,25 @@ fn messages(machine: &Machine, ship: &str, kind: &str) -> Vec<Value> {
         .unwrap()
         .iter()
         .filter(|m| m["kind"] == kind)
+        .cloned()
+        .collect()
+}
+
+/// One exchange with a linked machine now, outside the dispatcher's schedule,
+/// and what it ended of the requests bound to that machine's stows.
+fn collect_as(machine: &Machine, ship: &str, ssh: &Path) -> Value {
+    let output = machine.run(ship, &["machine.collect", "--json", "{}"], Some(ssh));
+    assert!(output.status.success(), "{}", text(&output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// The captain's closing notices in this home, where the requests were written.
+fn notices(machine: &Machine, ship: &str) -> Vec<Value> {
+    machine.ok(ship, "mail.inbox", json!({"address": "captain"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["kind"] == "notice")
         .cloned()
         .collect()
 }
@@ -700,6 +725,43 @@ fn a_resume_of_all_from_the_reached_side_succeeds() {
 }
 
 #[test]
+fn a_resume_of_all_ends_requests_bound_to_each_machines_stow() {
+    // `--all` reaches each machine's own resume, so a request bound to either
+    // machine's stow ends when that stow lifts.
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    let stow_of = |machine: &Machine, ship: &str| -> String {
+        machine.ok(ship, "stow.start", json!({}));
+        machine.ok(ship, "stow.status", json!({}))["stow"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let ours = stow_of(&laptop, "liaison");
+    let theirs = stow_of(&mac, "fitforge");
+    let bind = |machine: &Machine, ship: &str, id: &str, stow: &str| {
+        let sent = machine.ok(
+            ship,
+            "mail.send",
+            json!({"id": id, "from": ship, "to": "captain", "kind": "request",
+                "body": "Resume the stow?", "payload": {"depends_on": {"stow": stow}}}),
+        );
+        assert_eq!(sent["state"], "open", "{sent}");
+    };
+    bind(&laptop, "liaison", "laptop-bound", &ours);
+    bind(&mac, "fitforge", "mac-bound", &theirs);
+
+    let all = laptop.run("liaison", &["stow", "resume", "--all"], Some(&mac_ssh));
+    assert!(all.status.success(), "{}", text(&all));
+    let state = |machine: &Machine, ship: &str, id: &str| {
+        machine.ok(ship, "mail.show", json!({"id": id}))["state"].clone()
+    };
+    assert_eq!(state(&laptop, "liaison", "laptop-bound"), "withdrawn");
+    assert_eq!(state(&mac, "fitforge", "mac-bound"), "withdrawn");
+}
+
+#[test]
 fn a_resume_of_all_lifts_the_linked_machines_first() {
     let (_temp, laptop, mac, ssh) = fixture();
     assert!(link(&laptop, &mac, &ssh).status.success());
@@ -963,6 +1025,305 @@ fn a_resume_that_cannot_reach_a_linked_machine_says_so() {
         "the Mac is still stowed"
     );
     assert!(messages(&mac, "fitforge", "notice").is_empty());
+}
+
+#[test]
+fn a_request_bound_to_a_linked_machines_stow_ends_when_that_machine_resumes() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    // The remote ssh carries mac's own home and ledger, as a real remote host
+    // does, so the gateway answers for mac's stows and not the laptop's.
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    mac.ok("fitforge", "stow.start", json!({}));
+    let stow = mac.ok("fitforge", "stow.status", json!({}))["stow"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A stow this home has not heard of yet is a binding it may record.
+    let bound = laptop.ok(
+        "liaison",
+        "mail.send",
+        json!({"id": "peer-bound", "from": "liaison", "to": "captain", "kind": "request",
+            "body": "Resume the stow on mac?", "payload": {"depends_on": {"stow": stow,
+            "machine": "mac"}}}),
+    );
+    assert_eq!(bound["state"], "open", "{bound}");
+
+    // An exchange records the peer's stows; a stow still in force holds the
+    // request open.
+    let exchanged = collect_as(&laptop, "liaison", &mac_ssh);
+    assert_eq!(
+        exchanged["collected"][0]["requests_ended"], 0,
+        "{exchanged}"
+    );
+    let listed = laptop.ok("liaison", "machine.list", json!({}));
+    let macs = listed["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "mac")
+        .unwrap()
+        .clone();
+    assert_eq!(macs["stows"]["active"], json!([stow]), "{macs}");
+    assert_eq!(
+        laptop.ok("liaison", "mail.show", json!({"id": "peer-bound"}))["state"],
+        "open"
+    );
+
+    // The peer's resume arrives with the next exchange and ends it.
+    mac.ok("fitforge", "stow.resume", json!({}));
+    let exchanged = collect_as(&laptop, "liaison", &mac_ssh);
+    assert_eq!(
+        exchanged["collected"][0]["requests_ended"], 1,
+        "{exchanged}"
+    );
+    let ended = laptop.ok("liaison", "mail.show", json!({"id": "peer-bound"}));
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    let reason = ended["end_reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("stow {stow} on mac resumed at ")),
+        "{ended}"
+    );
+    let closing = notices(&laptop, "liaison");
+    assert_eq!(closing.len(), 1, "{closing:?}");
+    assert_eq!(closing[0]["correlation"], "peer-bound");
+    assert_eq!(closing[0]["body"], reason);
+
+    // A repeat exchange finds nothing open: no second closing notice.
+    let exchanged = collect_as(&laptop, "liaison", &mac_ssh);
+    assert_eq!(
+        exchanged["collected"][0]["requests_ended"], 0,
+        "{exchanged}"
+    );
+    assert_eq!(
+        notices(&laptop, "liaison").len(),
+        1,
+        "a second notice was written"
+    );
+}
+
+#[test]
+fn a_request_bound_to_a_stow_the_linked_machine_never_had_is_ended_as_unknown() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+
+    // No stow in force on mac: the binding was a guess and cannot sit forever.
+    let bound = laptop.ok(
+        "liaison",
+        "mail.send",
+        json!({"id": "unknown-bound", "from": "liaison", "to": "captain", "kind": "request",
+            "body": "Resume the stow on mac?", "payload": {"depends_on": {"stow": "stow-0000000",
+            "machine": "mac"}}}),
+    );
+    assert_eq!(bound["state"], "open", "{bound}");
+    let exchanged = collect_as(&laptop, "liaison", &mac_ssh);
+    assert_eq!(
+        exchanged["collected"][0]["requests_ended"], 1,
+        "{exchanged}"
+    );
+    let ended = laptop.ok("liaison", "mail.show", json!({"id": "unknown-bound"}));
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    assert_eq!(
+        ended["end_reason"], "stow stow-0000000 not known on mac",
+        "{ended}"
+    );
+    assert_eq!(notices(&laptop, "liaison").len(), 1);
+
+    // A binding to a machine this fleet is not linked with is refused outright.
+    let unlinked = laptop.run(
+        "liaison",
+        &[
+            "mail.send",
+            "--json",
+            &json!({"id": "elsewhere", "from": "liaison", "to": "captain", "kind": "request",
+            "body": "Which machine?", "payload": {"depends_on": {"stow": "stow-0000000",
+            "machine": "nowhere"}}})
+            .to_string(),
+        ],
+        None,
+    );
+    assert!(!unlinked.status.success());
+    assert!(
+        text(&unlinked).contains("no linked machine named nowhere"),
+        "{}",
+        text(&unlinked)
+    );
+}
+
+#[test]
+fn a_request_on_a_linked_machine_bound_to_this_machines_stow_ends_when_it_resumes() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    // This machine stows; the link is one-way, so the other machine never
+    // connects back and learns of it in the exchange the laptop makes.
+    laptop.ok("liaison", "stow.start", json!({}));
+    let stow = laptop.ok("liaison", "stow.status", json!({}))["stow"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bound = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"id": "peer-bound", "from": "fitforge", "to": "captain", "kind": "request",
+            "body": "Resume the stow on the laptop?", "payload": {"depends_on": {"stow": stow,
+            "machine": "laptop"}}}),
+    );
+    assert_eq!(bound["state"], "open", "{bound}");
+
+    collect_as(&laptop, "liaison", &mac_ssh);
+    assert_eq!(
+        mac.ok("fitforge", "mail.show", json!({"id": "peer-bound"}))["state"],
+        "open",
+        "a stow the peer reports as in force holds its request"
+    );
+
+    laptop.ok("liaison", "stow.resume", json!({}));
+    collect_as(&laptop, "liaison", &mac_ssh);
+    let ended = mac.ok("fitforge", "mail.show", json!({"id": "peer-bound"}));
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    assert!(
+        ended["end_reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("stow {stow} on laptop resumed at ")),
+        "{ended}"
+    );
+    assert_eq!(notices(&mac, "fitforge").len(), 1);
+}
+
+/// Drops the stows field from a gateway answer, as a peer that predates it
+/// sends it: the stows object is the only one with an `active` list.
+const WITHOUT_STOWS: &str = r#"| sed -E 's/,"stows":\{"active":\[[^]]*\],"resumed":\[[^]]*\]\}//'"#;
+
+#[test]
+fn a_peer_too_old_to_report_its_stows_leaves_a_bound_request_open() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let old_ssh = remote_ssh_with(&mac, "old-ssh", WITHOUT_STOWS);
+    assert!(link(&laptop, &mac, &old_ssh).status.success());
+    mac.ok("fitforge", "stow.start", json!({}));
+    let stow = mac.ok("fitforge", "stow.status", json!({}))["stow"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bound = laptop.ok(
+        "liaison",
+        "mail.send",
+        json!({"id": "old-bound", "from": "liaison", "to": "captain", "kind": "request",
+            "body": "Resume the stow on mac?", "payload": {"depends_on": {"stow": stow,
+            "machine": "mac"}}}),
+    );
+    assert_eq!(bound["state"], "open", "{bound}");
+
+    // With no stows field there is nothing to record and nothing to end, even
+    // for a stow the peer has since resumed: the request waits for a peer that
+    // reports, rather than being ended as unknown.
+    let exchanged = collect_as(&laptop, "liaison", &old_ssh);
+    assert_eq!(
+        exchanged["collected"][0]["requests_ended"], 0,
+        "{exchanged}"
+    );
+    mac.ok("fitforge", "stow.resume", json!({}));
+    let exchanged = collect_as(&laptop, "liaison", &old_ssh);
+    assert_eq!(
+        exchanged["collected"][0]["requests_ended"], 0,
+        "{exchanged}"
+    );
+    assert_eq!(
+        laptop.ok("liaison", "mail.show", json!({"id": "old-bound"}))["state"],
+        "open"
+    );
+    assert!(notices(&laptop, "liaison").is_empty());
+}
+
+#[test]
+fn a_request_between_two_homes_bound_to_a_local_stow_ends_with_one_closing_notice() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    laptop.ok("liaison", "stow.start", json!({}));
+    let stow = laptop.ok("liaison", "stow.status", json!({}))["stow"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sent = laptop.run(
+        "liaison",
+        &[
+            "mail.send",
+            "--json",
+            &json!({"id": "cross-bound", "from": "liaison", "to": "fitforge", "kind": "request",
+            "body": "Build once the stow lifts?", "payload": {"depends_on": {"stow": stow}}})
+            .to_string(),
+        ],
+        Some(&ssh),
+    );
+    assert!(sent.status.success(), "{}", text(&sent));
+    let sent: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(sent["delivery"], "delivered", "{sent}");
+
+    // The sender's home closes its row; the closing notice travels to the
+    // other home, which then holds the request as withdrawn.
+    laptop.ok("liaison", "stow.resume", json!({}));
+    assert_eq!(
+        laptop.ok("liaison", "mail.show", json!({"id": "cross-bound"}))["state"],
+        "withdrawn"
+    );
+    laptop.pass("liaison", &ssh);
+    assert_eq!(
+        mac.ok("fitforge", "mail.show", json!({"id": "cross-bound"}))["state"],
+        "withdrawn"
+    );
+    let closing = |mac: &Machine| {
+        messages(mac, "fitforge", "notice")
+            .into_iter()
+            .filter(|m| m["correlation"] == "cross-bound")
+            .count()
+    };
+    assert_eq!(closing(&mac), 1);
+
+    // Another exchange writes no second notice, and a resume on the receiving
+    // machine does not end its own copy: it is closed by the sender's home.
+    laptop.pass("liaison", &ssh);
+    collect_as(&laptop, "liaison", &ssh);
+    mac.ok("fitforge", "stow.start", json!({}));
+    mac.ok("fitforge", "stow.resume", json!({}));
+    assert_eq!(closing(&mac), 1);
+    assert_eq!(
+        mac.ok("fitforge", "mail.show", json!({"id": "cross-bound"}))["state"],
+        "withdrawn"
+    );
+}
+
+#[test]
+fn a_request_collected_from_another_machine_is_not_closed_by_this_machines_resume() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    // The binding is mac's own stow, so the copy that reaches the laptop
+    // is a received copy, and this machine's resume must leave it open.
+    mac.ok("fitforge", "stow.start", json!({}));
+    let mac_stow = mac.ok("fitforge", "stow.status", json!({}))["stow"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sent = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"id": "collected-bound", "from": "fitforge", "to": "liaison", "kind": "request",
+            "body": "Build once mac resumes?", "payload": {"depends_on": {"stow": mac_stow}}}),
+    );
+    assert_eq!(sent["state"], "open", "{sent}");
+    collect_as(&laptop, "liaison", &ssh);
+    assert_eq!(
+        laptop.ok("liaison", "mail.show", json!({"id": "collected-bound"}))["state"],
+        "open"
+    );
+
+    laptop.ok("liaison", "stow.start", json!({}));
+    laptop.ok("liaison", "stow.resume", json!({}));
+    let copy = laptop.ok("liaison", "mail.show", json!({"id": "collected-bound"}));
+    assert_eq!(copy["state"], "open", "{copy}");
+    assert_eq!(copy["delivery"], "received", "{copy}");
 }
 
 #[test]

@@ -840,6 +840,15 @@ fn print_stow(action: &str, out: &Value) -> Result<()> {
                 "Resumed {on} ({}): new jobs start again.",
                 out["stow"].as_str().unwrap_or("")
             );
+            if let Some(ended) = out["requests_ended"].as_u64().filter(|ended| *ended > 0) {
+                println!("  ended {ended} request(s) that waited for this stow");
+            }
+            for home in out["homes_skipped"].as_array().into_iter().flatten() {
+                println!(
+                    "  could not end requests in {} (its home could not be opened)",
+                    home.as_str().unwrap_or("?")
+                );
+            }
             print_machines(
                 "`privateer stow resume --all` lifts a linked machine's hold first, so no notice has to leave one still stowed.",
             );

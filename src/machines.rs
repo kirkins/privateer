@@ -15,7 +15,9 @@
 //! collect it each pass, deliver it locally by its id and acknowledge it, so
 //! a crash between the two collects it again and redelivery stays idempotent.
 //! Directories are exchanged when the link is made and refreshed at a bounded
-//! interval.
+//! interval. The same exchange states each machine's stows, in both directions
+//! and on both commands, so a request bound to a peer's stow learns of its
+//! resume without a connection or a remote-control channel of its own.
 //!
 //! The captain's mail gathers on one machine, the captain's desk, where the
 //! front door runs. By default that is the linking machine: mail the other
@@ -77,6 +79,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     for (table, column, declaration) in [
         ("machines", "next_contact_ms", "INTEGER"),
         ("machines", "failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("machines", "stows", "TEXT NOT NULL DEFAULT '{}'"),
         ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
     ] {
         let present: bool = migrate.query_row(
@@ -622,6 +625,134 @@ pub(crate) fn reach_remote(store: &mut Store, conn: &Connection) -> Result<usize
     Ok(installed)
 }
 
+/// Whether this fleet is linked with a machine by that name, in either
+/// direction: a request may bind to a stow on a machine this one reaches or on
+/// one that reaches it.
+pub(crate) fn linked(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM machines WHERE name=?1)",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
+/// One machine's stows, as this registry reads them: ids in force, and ids
+/// resumed with the time each resumed.
+type Stows = (Vec<String>, Vec<(String, i64)>);
+
+/// One machine's stows as the exchange carries them.
+fn carried(active: &[String], resumed: &[(String, i64)]) -> Value {
+    json!({"active": active,
+        "resumed": resumed.iter().map(|(id, at)| json!({"id": id, "resumed_ms": at}))
+            .collect::<Vec<_>>()})
+}
+
+/// The stows a machine reported, as this registry last recorded them.
+fn stows_of(conn: &Connection, machine: &str) -> Result<Value> {
+    let raw: Option<String> = conn
+        .query_row("SELECT stows FROM machines WHERE name=?1", [machine], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let (active, resumed) = parse_stows(
+        &raw.and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or(Value::Null),
+    )?;
+    Ok(carried(&active, &resumed))
+}
+
+/// This machine's stows for an exchange, from this machine's own ledger. `None`
+/// when no home or ledger can be read: the exchange then omits the field, which
+/// a peer reads as nothing to act on, rather than as no stows in force.
+fn stows_here(conn: &Connection) -> Option<Value> {
+    let member = crate::fleet::members(conn)
+        .ok()?
+        .into_iter()
+        .find(|m| m.home.is_dir())?;
+    crate::stow::state(&Store::open(&member.home).ok()?)
+}
+
+/// An exchange body, with this machine's stows added when they can be read.
+fn with_stows(mut body: Value, conn: &Connection) -> Value {
+    if let Some(stows) = stows_here(conn) {
+        body["stows"] = stows;
+    }
+    body
+}
+
+/// A peer's reported stows, bounded and no wider than one stow id each. A peer
+/// too old to report them reports nothing, which reads as none known.
+fn parse_stows(reported: &Value) -> Result<Stows> {
+    let ids = |key: &str, limit: usize| -> Vec<String> {
+        reported[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .filter(|id| !id.is_empty() && id.len() <= 200)
+            .take(limit)
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut resumed = vec![];
+    for stow in reported["resumed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(64)
+    {
+        let (Some(id), Some(at)) = (
+            stow["id"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 200),
+            stow["resumed_ms"].as_i64(),
+        ) else {
+            continue;
+        };
+        resumed.push((id.to_owned(), at));
+    }
+    Ok((ids("active", 8), resumed))
+}
+
+/// Record what a machine reports about its stows, then end the requests here
+/// bound to a stow this machine can now resolve: one the peer reports as
+/// resumed, or one it reports neither in force nor recently resumed, which is
+/// a typo or a stow that ended before we heard of it. A request bound to a
+/// stow still in force stays open. Returns how many requests were ended.
+fn absorb(conn: &Connection, machine: &str, reported: &Value) -> Result<usize> {
+    // A peer too old to report stows sends no field: record nothing, end nothing.
+    if !reported.is_object() {
+        return Ok(0);
+    }
+    let (active, resumed) = parse_stows(reported)?;
+    conn.execute(
+        "UPDATE machines SET stows=?2 WHERE name=?1",
+        params![machine, carried(&active, &resumed).to_string()],
+    )?;
+    let reason = |stow: &str| -> Option<String> {
+        resumed
+            .iter()
+            .find(|(id, _)| id == stow)
+            .map(|(_, at)| format!("stow {stow} on {machine} resumed at {at}"))
+            .or_else(|| {
+                (!active.iter().any(|id| id == stow))
+                    .then(|| format!("stow {stow} not known on {machine}"))
+            })
+    };
+    let mut ended = 0;
+    for member in crate::fleet::members(conn)? {
+        if !member.home.is_dir() {
+            continue;
+        }
+        // A home that cannot be opened now is resolved on the next exchange.
+        let Ok(home) = Store::open(&member.home) else {
+            continue;
+        };
+        ended += crate::mail::end_stow_bound(&home, Some(machine), reason)?;
+    }
+    Ok(ended)
+}
+
 fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
     let response = crate::peers::call_config(
         &machine.peer,
@@ -652,7 +783,10 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     let result = call(
         machine,
         "fleet.link",
-        json!({"machine": known_as, "ships": directory(&ours)}),
+        with_stows(
+            json!({"machine": known_as, "ships": directory(&ours)}),
+            conn,
+        ),
         timeout,
     )?;
     let theirs = parse_directory(&result["ships"])?;
@@ -663,6 +797,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
         clashing.join(", ")
     );
     record(conn, machine, &theirs)?;
+    absorb(conn, &machine.name, &result["stows"])?;
     install_everywhere(conn, machine, &theirs)?;
     Ok(theirs)
 }
@@ -923,6 +1058,7 @@ fn list() -> Result<Value> {
             "target": machine.peer["host"],
             "known_as": machine.known_as,
             "refreshed_ms": machine.refreshed_ms,
+            "stows": stows_of(&conn, &machine.name)?,
             "ships": cached(&conn, &machine.name)?.into_iter().map(|(n, _, _)| n).collect::<Vec<_>>(),
         }));
     }
@@ -1010,9 +1146,12 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
     let result = call(
         machine,
         "fleet.collect",
-        json!({"machine": known_as, "captain": captain}),
+        with_stows(json!({"machine": known_as, "captain": captain}), conn),
         Some(timeout),
     )?;
+    // What the peer reports about its stows travels with the mail: a request
+    // bound to a stow there ends on this exchange, not a later one.
+    let ended = absorb(conn, &machine.name, &result["stows"])?;
     let messages = result["messages"]
         .as_array()
         .context("collected messages")?;
@@ -1084,7 +1223,10 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
             Some(timeout),
         )?;
     }
-    Ok(json!({"machine": machine.name, "delivered": delivered.len(), "refused": refused.len()}))
+    Ok(
+        json!({"machine": machine.name, "delivered": delivered.len(),
+        "refused": refused.len(), "requests_ended": ended}),
+    )
 }
 
 /// Where a captain's message collected here is delivered: the home that
@@ -1364,7 +1506,13 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             };
             record(&conn, &machine, &theirs)?;
             install_everywhere(&conn, &machine, &theirs)?;
-            Ok(json!({"ships": directory(&local_ships(&conn)?)}))
+            // The machine that reached us carries its stow state in the same
+            // exchange, so a request here bound to a stow there resolves now.
+            let ended = absorb(&conn, name, args.get("stows").unwrap_or(&Value::Null))?;
+            Ok(with_stows(
+                json!({"ships": directory(&local_ships(&conn)?), "requests_ended": ended}),
+                &conn,
+            ))
         }
         _ if delivery => {
             let home = home_of(&conn, required(args, "to")?)?;
@@ -1374,6 +1522,12 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "fleet.collect" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;
             let peer = peer_name(&machine.name);
+            // The collecting machine's stow state rides along with its mail.
+            let ended = absorb(
+                &conn,
+                &machine.name,
+                args.get("stows").unwrap_or(&Value::Null),
+            )?;
             // Mail to the captain from before the link stays here.
             let linked_ms: i64 = conn.query_row(
                 "SELECT added_ms FROM machines WHERE name=?1",
@@ -1410,7 +1564,10 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     }
                 }
             }
-            Ok(json!({"messages": messages}))
+            Ok(with_stows(
+                json!({"messages": messages, "requests_ended": ended}),
+                &conn,
+            ))
         }
         "fleet.collected" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;

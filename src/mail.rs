@@ -4,7 +4,9 @@
 //! hosts one or more ships; the directory records where each ship lives.
 //! `captain` is the reserved address of the person. Messages are durable,
 //! idempotent and typed: a `request` or `decision` stays open until its single
-//! `reply` or explicit closure, so the runtime tracks owed answers.
+//! `reply` or explicit closure, so the runtime tracks owed answers. A request
+//! may record the stow it depends on, and a resume of that stow ends it
+//! through the same durable closure path a sender's withdrawal uses.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, Row, params};
@@ -462,6 +464,126 @@ pub(crate) fn hands_step(kind: &str, to: &str, payload: &Value) -> Result<Option
     Ok(Some(step.to_owned()))
 }
 
+/// End every open request in this home bound to a stow, as withdrawn on the
+/// sender's behalf, with the reason `why` gives that stow. `machine` selects
+/// the binding: `None` is a stow on this machine, `Some` one on a linked
+/// machine. `why` returning `None` leaves that request open, which is how an
+/// exchange keeps a request bound to a stow the peer reports as in force.
+///
+/// Only open requests are touched, so a repeated resume or exchange writes no
+/// second closing notice. The runtime owns this closure: the sender asked for
+/// it by recording the binding, and `withdrawn` is a state a peer accepts.
+pub(crate) fn end_stow_bound<F>(store: &Store, machine: Option<&str>, why: F) -> Result<usize>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // A received copy is the sender's request: the sender's home closes it and
+    // the closing notice carries the end here. So only rows this home sent, or
+    // that a ship hosted here sent, are ended by this home.
+    // One write covers the scan and the ends: a sender that passed its stow
+    // check either committed before this scan or reads the resumed ledger.
+    let tx = store.write_transaction()?;
+    let ids = {
+        let mut statement = store.connection().prepare(
+            "SELECT id FROM mail WHERE state='open'
+             AND json_extract(payload,'$.depends_on.stow') IS NOT NULL
+             AND json_extract(payload,'$.depends_on.machine') IS ?1
+             AND (delivery IS NOT 'received' OR sender IN
+               (SELECT name FROM ships WHERE json_extract(record,'$.location')='here'))",
+        )?;
+        statement
+            .query_map([machine], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut ended = 0;
+    for id in ids {
+        if let Some(request) = by_id(store, &id)?.filter(|r| r["state"] == "open") {
+            let stow = request["payload"]["depends_on"]["stow"]
+                .as_str()
+                .unwrap_or_default();
+            if let Some(reason) = why(stow) {
+                end_request(store, &request, "withdrawn", &reason)?;
+                ended += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(ended)
+}
+
+/// A request may record the stow it depends on, so a resume ends it instead of
+/// leaving it open to be relayed as current fact. Explicit only: nothing is
+/// read from the body. `{"stow": id}` is a stow on this machine, which must
+/// exist and still be in force; `machine` names a linked machine, whose stow
+/// is accepted even if this home has not heard of it yet, because a stow id
+/// reaches this home only through an exchange.
+fn bind(payload: &mut Value, opens: bool) -> Result<()> {
+    let Some(binding) = payload.get("depends_on").cloned() else {
+        return Ok(());
+    };
+    ensure!(opens, "depends_on applies to requests and decisions");
+    ensure!(binding.is_object(), "depends_on must be an object");
+    let stow = required(&binding, "stow")?;
+    ensure!(
+        !stow.is_empty() && stow.len() <= 200,
+        "a stow id is a short string"
+    );
+    // A binding that names this machine is this machine's stow: one spelling
+    // for one stow, so the local check and the local resume both find it.
+    let this = crate::machines::this_machine();
+    let machine = match binding.get("machine").filter(|v| !v.is_null()) {
+        None => None,
+        Some(machine) => {
+            let machine = machine
+                .as_str()
+                .context("depends_on.machine must be a name")?;
+            identifier(machine)?;
+            if machine == this {
+                None
+            } else {
+                ensure!(
+                    crate::machines::linked(&crate::fleet::registry()?, machine)?,
+                    "no linked machine named {machine}"
+                );
+                Some(machine.to_owned())
+            }
+        }
+    };
+    payload["depends_on"] = match machine {
+        Some(machine) => json!({"stow": stow, "machine": machine}),
+        None => json!({"stow": stow}),
+    };
+    Ok(())
+}
+
+/// A binding to a stow on this machine must name one that exists and is still
+/// in force. Called inside the write transaction that stores the request: a
+/// resume lifts the hold before it ends bound requests, so a request stored
+/// after the lift is refused here, and one stored before it is ended there.
+fn confirm_stow(store: &Store, payload: &Value) -> Result<()> {
+    let Some(binding) = payload.get("depends_on") else {
+        return Ok(());
+    };
+    if binding.get("machine").is_some() {
+        return Ok(());
+    }
+    let stow = binding["stow"].as_str().context("depends_on.stow")?;
+    let ledger = crate::jobs::host_ledger(store)?;
+    let known: Option<Option<i64>> = ledger
+        .query_row("SELECT resumed_ms FROM stows WHERE id=?1", [stow], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(resumed_ms) = known else {
+        bail!("no stow {stow} on this machine");
+    };
+    ensure!(
+        resumed_ms.is_none(),
+        "stow {stow} on this machine has resumed"
+    );
+    Ok(())
+}
+
 fn send(store: &Store, args: &Value) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
@@ -578,6 +700,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         ensure!(to == CAPTAIN, "decisions are addressed to the captain");
     }
     let opens = matches!(kind, "request" | "decision");
+    bind(&mut payload, opens)?;
     let deadline_ms = match args.get("reply_within_secs").filter(|v| !v.is_null()) {
         Some(v) => {
             ensure!(opens, "reply_within_secs applies to requests and decisions");
@@ -611,6 +734,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         existing["duplicate"] = json!(true);
         return Ok(existing);
     }
+    confirm_stow(store, &payload)?;
     if let Some(task) = task_id {
         let linked = store.task(task)?;
         ensure!(
