@@ -311,6 +311,36 @@ pub(crate) fn ensure_with_path(home: &Path, ship: &str, path: &str) -> Result<St
     start(&service, &home.join("serve.log"))
 }
 
+/// The PATH a dispatcher started here records: this process's own, then the
+/// login shell's, since a gateway reached over SSH has a bare PATH that
+/// would not find the harness.
+pub(crate) fn login_path() -> String {
+    let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let login = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| shell.starts_with('/'))
+        .and_then(|shell| {
+            Command::new(shell)
+                .args(["-lc", "printf %s \"$PATH\""])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+        })
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    for entry in login.iter().flat_map(std::env::split_paths) {
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    std::env::join_paths(entries)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Make sure a front door's supervisor is running; report how.
 pub fn ensure_door(name: &str) -> Result<String> {
     let service = door(name)?;

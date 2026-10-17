@@ -55,9 +55,15 @@ impl Machine {
 
     /// One request to this machine's gateway, as a linking machine sends it.
     fn gateway(&self, command: &str, args: Value) -> Value {
+        self.gateway_with(command, args, &[])
+    }
+
+    /// The same, with extra environment for the gateway process.
+    fn gateway_with(&self, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
         use std::io::{BufRead, Write};
         let mut child = self
             .command("fitforge", &["gateway"], None)
+            .envs(env.iter().copied())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -1672,6 +1678,95 @@ fn a_ship_created_on_a_linked_machine_lives_only_there() {
     assert_eq!(local["folder"], json!(laptop.folder("nearby")), "{local}");
     assert_eq!(local.get("machine"), None, "{local}");
     assert!(!ships(&mac, "fitforge").to_string().contains("nearby"));
+}
+
+/// The unit a ship's dispatcher was installed with under `machine`'s home.
+fn unit_text(machine: &Machine, ship: &str) -> String {
+    let dir = machine.root.join(".config/systemd/user");
+    let mut units = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("privateer-{ship}-")))
+        });
+    let unit = units.next().unwrap_or_else(|| panic!("no unit for {ship}"));
+    fs::read_to_string(unit).unwrap()
+}
+
+#[test]
+fn a_ship_created_for_another_machine_records_the_login_shell_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    // The gateway's own PATH is bare; its login shell knows where harnesses live.
+    // The fake shell prints only PATH, so nothing else from it can be recorded.
+    let login_bin = mac.root.join("login-bin");
+    let shell = mac.root.join("login-shell");
+    fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nprintf %s '{}:/usr/bin:/bin'\n",
+            login_bin.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let systemctl = mac.root.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let service = [
+        ("PRIVATEER_SERVICE", "systemd"),
+        ("PRIVATEER_SYSTEMCTL", systemctl.to_str().unwrap()),
+        ("SHELL", shell.to_str().unwrap()),
+    ];
+
+    let response = mac.gateway_with(
+        "ship.create",
+        json!({"name": "bench", "from_machine": "laptop", "created_by": "captain", "harness": "codex"}),
+        &service,
+    );
+    assert_eq!(response["ok"], true, "{response}");
+    let unit = unit_text(&mac, "bench");
+    assert!(
+        unit.contains(&login_bin.display().to_string()),
+        "a gateway-made unit records the login shell's PATH:\n{unit}"
+    );
+    // The gateway's own PATH is still first.
+    assert!(
+        unit.contains(&format!(
+            "PATH={}:/usr/bin:/bin",
+            mac.root.join("bin").display()
+        )),
+        "{unit}"
+    );
+
+    // A ship made here, with no machine, records only this process's PATH.
+    let local = laptop
+        .command(
+            "liaison",
+            &[
+                "ship.create",
+                "--json",
+                r#"{"name":"nearby","harness":"codex"}"#,
+            ],
+            Some(&mac_ssh),
+        )
+        .envs(service.iter().copied())
+        .output()
+        .unwrap();
+    assert!(local.status.success(), "{}", text(&local));
+    let unit = unit_text(&laptop, "nearby");
+    assert!(!unit.contains("login-bin"), "{unit}");
+    assert!(
+        unit.contains(&format!(
+            "PATH={}:/usr/bin:/bin",
+            laptop.root.join("bin").display()
+        )),
+        "{unit}"
+    );
 }
 
 #[test]
