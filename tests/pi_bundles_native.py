@@ -6,6 +6,7 @@ Only this test sets a disposable PI_CODING_AGENT_DIR. HOME is never replaced.
 Production loader retains the original native config directory unchanged.
 """
 import concurrent.futures
+import copy
 import hashlib
 import http.server
 import json
@@ -26,6 +27,7 @@ import pi_bundles
 
 NATIVE = Path(sys.argv.pop(1)).absolute() if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
 SENTINEL = 'UNSELECTED_SECRET_SENTINEL_82d9'
+SENTINEL_TOKEN = 'SENTINEL-' + '5f0c2d8e41b94a7c9e3a6d1b8f2e0c7a'
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -63,6 +65,72 @@ class FixtureHTTPServer(http.server.ThreadingHTTPServer):
         accepted = super().get_request()
         self.connections += 1
         return accepted
+
+# Selected-MCP fakes: an authless-by-default MCP endpoint that requires one Bearer
+# token, and a model endpoint that only counts connections (a gate that passes
+# reaches it; a gate that refuses never does). Both loopback, both per test.
+sys.path.insert(0, str(ROOT / 'tests/fixtures/pi-mcp'))
+import server as mcp_fixture
+
+
+class McpHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        self.server.seen.append((self.headers.get('Authorization') == 'Bearer ' + self.server.token, body.get('method')))
+        if self.headers.get('Authorization') != 'Bearer ' + self.server.token:
+            self.send_response(401)
+            self.end_headers()
+            return
+        if 'id' not in body:
+            self.send_response(202)
+            self.end_headers()
+            return
+        result = {'tools': []} if body.get('method') == 'tools/list' and self.server.mode == 'no-tools' \
+            else mcp_fixture.response(body, 'selected')
+        data = json.dumps({'jsonrpc': '2.0', 'id': body['id'], 'result': result}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self.send_response(405)
+        self.end_headers()
+
+
+class CountingServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, handler, **attributes):
+        super().__init__(('127.0.0.1', 0), handler)
+        self.connections = 0
+        self.seen = []
+        self.__dict__.update(attributes)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    def get_request(self):
+        self.connections += 1
+        return super().get_request()
+
+    @property
+    def url(self):
+        return f'http://127.0.0.1:{self.server_port}'
+
+
+class ModelHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        self.send_response(500)
+        self.end_headers()
+
+    do_GET = do_POST
 
 
 class Native(unittest.TestCase):
@@ -223,6 +291,89 @@ class Native(unittest.TestCase):
             self.assertEqual(json.loads(run.stdout), {'ok': False, 'error': 'lookup-unavailable'})
             self.assertNotIn(SENTINEL, run.stdout + run.stderr)
         self.assertNotIn('/must-not-follow', self.server.requests)
+
+
+    def run_selected(self, token, mode='normal', rogue_mode=None, timeout_seconds=1):
+        """One native Pi run that selects the docs MCP server. The gate either
+        passes (the model endpoint is reached) or refuses with exit 78 first."""
+        mcp = CountingServer(McpHandler, token=SENTINEL_TOKEN, mode=mode)
+        self.addCleanup(mcp.server_close)
+        self.addCleanup(mcp.shutdown)
+        model = CountingServer(ModelHandler)
+        self.addCleanup(model.server_close)
+        self.addCleanup(model.shutdown)
+        # One fleet (and credential directory) per run: a test may run several.
+        self.runs = getattr(self, 'runs', 0) + 1
+        fleet = self.base / f'run{self.runs}' / 'fleet.sqlite'
+        directory = fleet.with_suffix('.credentials')
+        fleet.parent.mkdir()
+        directory.mkdir(mode=0o700)
+        (directory / 'docs-search').write_text(token + '\n')
+        (directory / 'docs-search').chmod(0o600)
+        (self.agent / 'models.json').write_text(json.dumps({'providers': {'spike': {
+            'baseUrl': f'{model.url}/v1', 'api': 'openai-completions', 'apiKey': 'unused',
+            'models': [{'id': 'm'}]}}}))
+        registry = copy.deepcopy(self.registry)
+        # The inventory integration exits at agent_start: it would end a run before its model turn.
+        registry['integrations']['extensions'] = []
+        registry['bundles'].append({'ref': 'docs@1', 'roles': ['crew'], 'skills': [],
+                                    'credentials': [{'name': 'DOCS_TOKEN', 'ref': 'docs-search'}],
+                                    'mcp_servers': [{'name': 'docs', 'url': f'{mcp.url}/mcp', 'credential': 'DOCS_TOKEN',
+                                                     'timeout': timeout_seconds, 'description': 'Fixture docs'}]})
+        if rogue_mode:
+            # An operator-approved integration that registers a server of its own: at
+            # load time ('startup') or when the first prompt starts ('first-prompt').
+            rogue = self.base / 'rogue.mjs'
+            register = 'pi.registerMcpServer("rogue", {url: "http://127.0.0.1:9/mcp", timeout: 1, exposure: "direct"});'
+            body = f'pi.on("before_agent_start", () => {{ {register} }});' if rogue_mode == 'first-prompt' else register
+            rogue.write_text(f'export default function(pi) {{ {body} }}')
+            registry['integrations']['extensions'].append({
+                'path': str(rogue), 'sha256': hashlib.sha256(rogue.read_bytes()).hexdigest()})
+        plan = bundles.plan(registry, ['docs@1'], 'crew')
+        env = dict(self.env, PRIVATEER_FLEET=str(fleet))
+        args = [sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(plan),
+                'pi', 'pi', '--offline', '--no-session', '--model', 'spike/m', '--print', '--', 'hello']
+        run = subprocess.run(args, cwd=self.repo, env=env, text=True, capture_output=True, stdin=subprocess.DEVNULL,
+                             timeout=60)
+        leaks = [p for p in self.base.rglob('*') if p.is_file() and p.name != 'docs-search'
+                 and SENTINEL_TOKEN.encode() in p.read_bytes()]
+        self.assertEqual(leaks, [], 'token must never reach a log, config or registry file')
+        self.assertNotIn(SENTINEL_TOKEN, run.stdout + run.stderr)
+        return run, mcp, model
+
+    def test_selected_mcp_gate_passes_only_with_a_valid_bearer(self):
+        run, mcp, model = self.run_selected(SENTINEL_TOKEN)
+        # The gate passed: the run reached a model turn, after the server listed its tools.
+        self.assertGreater(model.connections, 0, (run.returncode, run.stdout[-400:], run.stderr[-600:]))
+        self.assertIn('tools/list', [method for ok, method in mcp.seen if ok])
+        self.assertTrue(all(ok for ok, _method in mcp.seen))
+        self.assertGreater(mcp.connections, 0)
+        print(json.dumps({'case': 'selected-valid-bearer', 'native_pi': self.version, 'mcp_requests': len(mcp.seen),
+                          'model_connections': model.connections, 'exit': run.returncode}), flush=True)
+
+    def test_selected_mcp_unready_servers_exit_78_before_any_model_turn(self):
+        cases = {
+            'bad-token': (f'WRONG-{SENTINEL_TOKEN}', 'normal', None),
+            'no-tools': (SENTINEL_TOKEN, 'no-tools', None),
+            'extension-registered': (SENTINEL_TOKEN, 'normal', 'startup'),
+            'registered-at-first-prompt': (SENTINEL_TOKEN, 'normal', 'first-prompt'),
+        }
+        for label, (token, mode, rogue_mode) in cases.items():
+            with self.subTest(case=label):
+                run, mcp, model = self.run_selected(token, mode=mode, rogue_mode=rogue_mode)
+                self.assertEqual(run.returncode, 78, run.stderr[-600:])
+                self.assertEqual(model.connections, 0, 'a refused gate must not reach a model')
+                self.assertIn('MCP server "', run.stderr)
+                if rogue_mode:
+                    self.assertIn('"rogue"', run.stderr)
+                else:
+                    self.assertIn('"docs"', run.stderr)
+
+    def test_selected_mcp_token_with_expansion_marker_refuses_before_any_request(self):
+        run, mcp, model = self.run_selected(f'{SENTINEL_TOKEN}$HOME')
+        self.assertEqual(run.returncode, 78, run.stderr[-600:])
+        self.assertEqual(model.connections, 0)
+        self.assertEqual(mcp.seen, [], 'a token Pi could expand must never be sent')
 
 
 if __name__ == '__main__':

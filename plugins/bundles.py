@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+from urllib.parse import urlsplit
 
 from protocol import serve
 
@@ -198,6 +199,60 @@ def credentials(value):
         names.add(item['name'])
 
 
+def plain(text):
+    """Refuse shell/env expansion markers and control characters in any MCP
+    string: Pi would expand '$' and run a leading '!' header value."""
+    return '$' not in text and not text.startswith('!') and text.isprintable()
+
+
+HOST = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?\Z")
+LOOPBACK = ('127.0.0.1', '::1', 'localhost')
+
+
+def url(value):
+    """https, or http only to loopback. No userinfo, fragment, backslash or
+    whitespace. The authority is a plain host (letters, digits, dots, hyphens)
+    or a bracketed IPv6 literal, with an optional port that must parse."""
+    require(isinstance(value, str) and len(value) <= 2048 and plain(value) and '#' not in value)
+    # WHATWG parsers read "\" as "/": a reviewed host could differ from the one connected.
+    require('\\' not in value and not any(c.isspace() for c in value))
+    parts = urlsplit(value)
+    require(parts.scheme in ('https', 'http') and HOST.fullmatch(parts.netloc))
+    try:
+        parts.port
+    except ValueError:
+        raise ValueError('unsupported bounded resources') from None
+    require(parts.scheme == 'https' or parts.hostname in LOOPBACK)
+
+
+def mcp_server(value, names):
+    """One selected MCP server: a remote streamable-HTTP endpoint whose Bearer
+    token is the named credential. Any other key refuses; no headers or commands."""
+    require(isinstance(value, dict) and set(value) <= {'name', 'url', 'credential', 'timeout', 'description'}
+            and {'name', 'url', 'credential', 'timeout'} <= set(value))
+    require(isinstance(value['name'], str) and len(value['name']) <= 32 and NAME.fullmatch(value['name'])
+            and plain(value['name']))
+    url(value['url'])
+    require(isinstance(value['credential'], str) and value['credential'] in names)
+    require(type(value['timeout']) is int and 1 <= value['timeout'] <= 300)
+    if 'description' in value:
+        description = value['description']
+        require(isinstance(description, str) and len(description) <= 200 and plain(description))
+
+
+def mcp_servers(value, names, maximum):
+    require(isinstance(value, list) and 0 < len(value) <= maximum)
+    for item in value:
+        mcp_server(item, names)
+
+
+def server_keys(servers):
+    """Per plan, at most 8 servers, unique across bundles after lower() and '-' to '_'."""
+    require(len(servers) <= 8)
+    keys = [server['name'].lower().replace('-', '_') for server in servers]
+    require(len(set(keys)) == len(keys))
+
+
 def credential_directory(env):
     """Beside the fleet registry, resolved as the runtime resolves it:
     PRIVATEER_FLEET, else $XDG_STATE_HOME/privateer/fleet.sqlite, else
@@ -257,19 +312,24 @@ def validate_registry(value):
     require(isinstance(bundles, list) and len(bundles) <= 32)
     refs = set()
     for bundle in bundles:
-        # MCP and optional executable extensions are not silently discarded:
-        # not supported in this first stage.
-        keys(bundle, ('ref', 'roles', 'skills', *(('credentials',) if 'credentials' in bundle else ())))
+        # Optional executable extensions are not silently discarded: not
+        # supported in this stage. MCP servers are remote HTTP only (Pi only).
+        keys(bundle, ('ref', 'roles', 'skills', *(('credentials',) if 'credentials' in bundle else ()),
+                      *(('mcp_servers',) if 'mcp_servers' in bundle else ())))
         require(isinstance(bundle['ref'], str) and REF.fullmatch(bundle['ref']) and bundle['ref'] not in refs)
         refs.add(bundle['ref'])
         strings(bundle['roles'], ('first_mate', 'crew'), 2)
-        require(bundle['roles'] and isinstance(bundle['skills'], list) and 0 < len(bundle['skills']) <= 8)
+        require(bundle['roles'] and isinstance(bundle['skills'], list) and len(bundle['skills']) <= 8)
         names = set()
         for item in bundle['skills']:
             skill(item)
             require(item['name'] not in names)
             names.add(item['name'])
         credentials(bundle.get('credentials', []))
+        if 'mcp_servers' in bundle:
+            mcp_servers(bundle['mcp_servers'], {item['name'] for item in bundle.get('credentials', [])}, 4)
+        # A bundle needs at least one skill or one server.
+        require(bundle['skills'] or bundle.get('mcp_servers'))
     require(len(json.dumps(value)) <= 48 * 1024)
 
 
@@ -286,16 +346,21 @@ def plan(registry, selected, role, harness='pi'):
     by_ref = {b['ref']: b for b in registry['bundles']}
     skills = []
     secrets = []
+    servers = []
     for reference in selected:
         require(reference in by_ref and role in by_ref[reference]['roles'])
         skills.extend(by_ref[reference]['skills'])
+        servers.extend(by_ref[reference].get('mcp_servers', []))
         for item in by_ref[reference].get('credentials', []):
             if item not in secrets:
                 secrets.append(item)
     require(len({s['name'] for s in skills}) == len(skills) and len(skills) <= 16)
     # One name, one ref: two selected bundles cannot disagree on a variable.
     credentials(secrets)
+    server_keys(servers)
     if harness == 'claude':
+        # Claude has no bounded MCP loader yet: refuse rather than drop a server.
+        require(not servers)
         from claude_bundles import plan as claude_plan
         result = claude_plan(registry, selected, skills)
     else:
@@ -303,9 +368,11 @@ def plan(registry, selected, role, harness='pi'):
         result = {'schema_version': 1, 'pi_version': registry['pi_version'], 'selection': selected,
                   'integrations': registry['integrations'], 'skills': skills}
     # Only selected bundles' names and refs, and only when there are any, so
-    # plans (and digests) without credentials are unchanged.
+    # plans (and digests) without credentials or servers are unchanged.
     if secrets:
         result['credentials'] = secrets
+    if servers:
+        result['mcp_servers'] = servers
     require(len(json.dumps(result)) <= 24 * 1024)
     return result
 
@@ -316,9 +383,15 @@ def validate_plan(value):
     claude = isinstance(value, dict) and 'claude_version' in value
     keys(value, ('schema_version', 'selection', 'skills',
                  *(('claude_version', 'settings') if claude else ('pi_version', 'integrations')),
-                 *(('credentials',) if 'credentials' in value else ())))
+                 *(('credentials',) if 'credentials' in value else ()),
+                 *(('mcp_servers',) if 'mcp_servers' in value else ())))
     selection(value['selection'])
     credentials(value.get('credentials', []))
+    if 'mcp_servers' in value:
+        # Only a Pi plan carries servers, and only a non-empty list (plan() omits empty).
+        require(not claude)
+        mcp_servers(value['mcp_servers'], {item['name'] for item in value.get('credentials', [])}, 8)
+        server_keys(value['mcp_servers'])
     # Reuse registry qualification without carrying unselected definitions.
     skills = value['skills']
     require(isinstance(skills, list) and len(skills) <= 16)

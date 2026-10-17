@@ -2235,14 +2235,12 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 .env_remove("PRIVATEER_ACTOR");
         }
     }
-    // No job inherits its starter's credential paths. A bounded launch adds
-    // only its own selected bundles' paths, after checking their files.
-    // Bytes, not str: a non-UTF-8 name must be scrubbed too.
+    // No job inherits its starter's credential paths or MCP selection. A bounded
+    // launch adds only its own selected bundles' paths and servers, after
+    // checking their files. Bytes, not str: a non-UTF-8 name must be scrubbed too.
     for (name, _) in std::env::vars_os() {
-        if name
-            .as_encoded_bytes()
-            .starts_with(b"PRIVATEER_CREDENTIAL_")
-        {
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b"PRIVATEER_CREDENTIAL_") || bytes.starts_with(b"PRIVATEER_MCP_") {
             cmd.env_remove(name);
         }
     }
