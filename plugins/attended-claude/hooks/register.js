@@ -2,7 +2,7 @@
 const PREFIX = "privateer-mail:";
 // A hosted session has nobody to type /privateer-mail resume after an error.
 const HOSTED_RETRY_MS = 60000;
-let config, session, key, timer, flight, pending, prepared, nudge, resumeAt;
+let config, session, key, timer, flight, pending, prepared, nudge, offer, resumeAt;
 let active = false, busy = false, paused = false, seen = 0, generation = 0, statusText, nudged = "";
 
 // The captain's fleet commands, as a front door and the Pi session offer them.
@@ -97,8 +97,8 @@ async function snapshot($, gen) {
 
 async function deliver($, gen) {
   const value = await snapshot($, gen);
-  if (!value || !value.actionable || busy || paused || pending || prepared || nudge) return;
-  if ((await $.prompt.read()).text.length || !await owned($, gen) || busy || paused || pending || nudge) return;
+  if (!value || !value.actionable || busy || paused || pending || prepared || nudge || offer) return;
+  if ((await $.prompt.read()).text.length || !await owned($, gen) || busy || paused || pending || nudge || offer) return;
   const item = { gen, text: message(value), through: value.through_seq };
   pending = item;
   try {
@@ -117,10 +117,44 @@ async function deliver($, gen) {
   }
 }
 
+// Runtime-owned scheduled work for a hosted session. Eligibility, budgets and
+// leases live in Rust; the mod reports idleness and starts one offered turn.
+async function work($, gen) {
+  if (!config.hosted || !active || gen !== generation) return;
+  const idle = !busy && !paused && !pending && !prepared && !nudge && !offer
+    && !(await $.prompt.read()).text.length;
+  let attention = null;
+  try {
+    const { context } = await $.session.usage();
+    if (Number.isFinite(context?.tokens) && context?.window > 0) {
+      attention = { tokens: Math.round(context.tokens), window: context.window };
+    }
+  } catch { /* the context reading is optional */ }
+  if (!await owned($, gen)) return;
+  const response = await call($, "work.poll", { ship: config.ship, holder: config.holder, idle, attention });
+  const next = response?.offer;
+  if (!next) return;
+  const release = () => call($, "work.release", { ship: config.ship, holder: config.holder, offer_id: next.id });
+  if (gen !== generation || offer || !idle || busy || pending || nudge) { await release(); return; }
+  if (typeof next.id !== "string" || typeof next.task_id !== "string"
+      || typeof next.prompt !== "string" || next.prompt.length > 24000) throw Error("invalid work offer");
+  const item = { gen, id: next.id, task: next.task_id, text: next.prompt, started: false };
+  offer = item;
+  try {
+    const result = await $.prompt.submit({ text: item.text });
+    if (result.drop && offer === item) { offer = undefined; await release(); }
+  } catch (error) {
+    if (offer === item) { offer = undefined; await release(); }
+    throw error;
+  }
+}
+
 async function poll($) {
   if (!active || flight) return;
   const gen = generation;
-  const operation = deliver($, gen).catch(async () => {
+  const operation = deliver($, gen).then(() => work($, gen).catch(async () => {
+    if (active && gen === generation) await status($, "⚓ work delivery unavailable; durable offer retained");
+  })).catch(async () => {
     if (active && gen === generation) await status($, "⚓ mail unavailable; inbox preserved; /privateer-mail resume");
   });
   flight = operation;
@@ -156,7 +190,7 @@ function followText(idle) {
 async function follow($) {
   const gen = generation;
   try {
-    if (!active || busy || paused || pending || prepared || nudge || !await owned($, gen)) return;
+    if (!active || busy || paused || pending || prepared || nudge || offer || !await owned($, gen)) return;
     const idle = (await call($, "ship.bearings", { ship: config.ship })).idle_tasks;
     if (!Array.isArray(idle) || !idle.length) { nudged = ""; return; }
     const set = idle.map(t => t.id).sort().join(" ");
@@ -190,7 +224,7 @@ async function captain($, name, args) {
 async function stop($) {
   active = false; generation++;
   timer?.cancel(); timer = undefined;
-  pending = undefined; prepared = undefined; nudge = undefined;
+  pending = undefined; prepared = undefined; nudge = undefined; offer = undefined;
   await $.env.set("PRIVATEER_CLAUDE_MAIL_UNTIL", undefined);
 }
 
@@ -265,7 +299,7 @@ export function register(on) {
     if (!config) return next(e);
     await bind($);
     if (e.origin?.kind === "plugin") {
-      const ours = [pending, nudge].find(item => item?.gen === generation && e.text.includes(item.text));
+      const ours = [pending, nudge, offer].find(item => item?.gen === generation && e.text.includes(item.text));
       if (e.origin.name === "privateer-mail" && (!active || paused || !ours
           || !await owned($, generation))) return { drop: "Privateer mail wake superseded or paused; inbox preserved." };
       return next(e);
@@ -296,6 +330,11 @@ export function register(on) {
         if (item === prepared) prepared = undefined;
       }
       if (nudge && e.text.includes(nudge.text)) nudge = undefined;
+      if (offer && !offer.started && e.text.includes(offer.text)) {
+        offer.started = true;
+        // Do not invent acceptance on failure; the runtime keeps the claim.
+        void call($, "work.started", { ship: config.ship, holder: config.holder, offer_id: offer.id }).catch(() => {});
+      }
       await save($);
     }
     return next(e);
@@ -307,6 +346,12 @@ export function register(on) {
       busy = false;
       if (!completed) await pause($);
       await save($);
+      if (offer?.started) {
+        const done = offer;
+        offer = undefined;
+        // An ambiguous native stop is reconciled by the durable deadline.
+        void call($, "work.settled", { ship: config.ship, holder: config.holder, offer_id: done.id }).catch(() => {});
+      }
     }
     const result = await next(e);
     if (main) void attention($, "turn");

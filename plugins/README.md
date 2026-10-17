@@ -403,7 +403,13 @@ moving them (`ship.bearings` `idle_tasks`), it submits one follow-through prompt
 asking the first mate to continue them or record why they wait, once per
 distinct set. `/stow`, `/yolo`, `/afk`, `/back` and `/ships` run the Privateer CLI
 as the captain (an operator role, not the ship's agent identity) and only from
-the keyboard (composer or bridge origin), never for another plugin's call. Native model and permission
+the keyboard (composer or bridge origin), never for another plugin's call.
+A hosted Claude session also takes runtime-owned scheduled work, as the Pi
+adapter's `work.mjs` does: each poll reports idleness and context to
+`work.poll`, an offer arriving while idle (no draft, busy turn, pending mail or
+nudge) becomes one native prompt, and its turn start and completion call
+`work.started` and `work.settled`. An offer that cannot be submitted is
+released back to the runtime; eligibility, budgets and leases stay in Rust. Native model and permission
 settings still apply; options follow `--`, for example
 `privateer start claude -- --permission-mode auto`. No permission bypass,
 provider selection, credential copy or global plugin installation is added.

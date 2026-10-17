@@ -36,7 +36,7 @@ a second payload. Wake budgets, provider backoff, fleet stow and ordinary job
 admission remain in force; work offers count toward the same hourly wake budget
 as mail wakes. Heavy payloads still go through heavy-job admission.
 
-For runtime-hosted Pi / Pi-signed / OMP sessions, the attended adapter reports
+For runtime-hosted Pi / Pi-signed / OMP / Claude sessions, the attended adapter reports
 idle/busy state and a current context sample through `work.poll`. Healthy idle
 sessions receive one work offer through the native custom-message interface.
 The native start and settle events acknowledge acceptance and the result.
