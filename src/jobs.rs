@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -24,10 +24,13 @@ use uuid::Uuid;
 
 const LOG_LIMIT: usize = 1024 * 1024;
 /// A log keeps its first bytes (where harnesses announce their session) and
-/// its most recent bytes (the latest activity and the final usage), in two
-/// rotating tail segments; the middle of a longer log is dropped.
+/// its most recent bytes (the latest activity and the final usage), in a tail
+/// cut back in place; the middle of a longer log is dropped.
 const LOG_HEAD: usize = LOG_LIMIT / 4;
 const LOG_SEGMENT: usize = (LOG_LIMIT - LOG_HEAD) / 2;
+/// The tail is cut back to `LOG_SEGMENT` once it reaches this size; the room
+/// left under the limit holds the truncation marker.
+const TAIL_FULL: usize = 2 * LOG_SEGMENT - 256;
 const START_GRACE_MS: i64 = 30_000;
 const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
 const QUEUE_POLL: Duration = Duration::from_secs(1);
@@ -1912,10 +1915,12 @@ fn persist_reply(line: &[u8], path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy a pipe into `path`, bounded to about `LOG_LIMIT`: the head goes
-/// straight to the file, later bytes to two rotating tail segments that are
-/// appended after a truncation marker when the pipe ends. Returns the number
-/// of bytes dropped between head and tail.
+/// Copy a pipe into `path`, bounded to about `LOG_LIMIT`. The log file is the
+/// live record: each byte read is written to it before the next read, so a
+/// deadline, cancel or supervisor kill keeps everything printed so far. The
+/// head is kept as written. When the tail fills, its older bytes are dropped
+/// and a truncation marker sits between head and tail, rewritten in place.
+/// Returns the number of bytes dropped between head and tail.
 fn capture(
     mut pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
     path: PathBuf,
@@ -1928,28 +1933,17 @@ fn capture(
         flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
         "cannot bound log reader"
     );
-    let open_new = |path: &Path| {
-        OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-    };
     let mut file = OpenOptions::new()
         .create_new(true)
+        .read(true)
         .write(true)
         .mode(0o600)
         .open(&path)?;
-    let segment_path = move |n: u64| {
-        let mut name = path.clone().into_os_string();
-        name.push(format!(".tail{}", n % 2));
-        PathBuf::from(name)
-    };
     Ok(thread::spawn(move || {
         let mut head = 0usize;
-        let mut segments = 0u64;
-        let mut segment: Option<(fs::File, usize)> = None;
+        // Length of the truncation marker between head and tail, once any.
+        let mut marker_len = 0u64;
+        let mut tail_len = 0usize;
         let mut dropped = 0u64;
         let mut buf = [0u8; 8192];
         let mut stopping_bytes = 0usize;
@@ -1985,20 +1979,27 @@ fn capture(
                     head += take;
                     let mut rest = &buf[take..n];
                     while !rest.is_empty() {
-                        if segment.as_ref().is_none_or(|(_, len)| *len >= LOG_SEGMENT) {
-                            // The segment two rotations back is overwritten.
-                            if segments >= 2 {
-                                dropped +=
-                                    fs::metadata(segment_path(segments)).map_or(0, |m| m.len());
-                            }
-                            segment = Some((open_new(&segment_path(segments))?, 0));
-                            segments += 1;
-                        }
-                        let (out, len) = segment.as_mut().expect("segment opened above");
-                        let chunk = rest.len().min(LOG_SEGMENT - *len);
-                        out.write_all(&rest[..chunk])?;
-                        *len += chunk;
+                        let chunk = rest.len().min(TAIL_FULL - tail_len);
+                        file.write_all(&rest[..chunk])?;
+                        tail_len += chunk;
                         rest = &rest[chunk..];
+                        if tail_len >= TAIL_FULL {
+                            // Keep the newest LOG_SEGMENT tail bytes and rewrite
+                            // them after the head, behind a marker for the cut.
+                            let keep = LOG_SEGMENT;
+                            let mut kept = vec![0u8; keep];
+                            let kept_at = head as u64 + marker_len + (tail_len - keep) as u64;
+                            file.seek(SeekFrom::Start(kept_at))?;
+                            file.read_exact(&mut kept)?;
+                            dropped += (tail_len - keep) as u64;
+                            let marker = truncation_marker(dropped);
+                            file.set_len(head as u64)?;
+                            file.seek(SeekFrom::Start(head as u64))?;
+                            file.write_all(&marker)?;
+                            file.write_all(&kept)?;
+                            marker_len = marker.len() as u64;
+                            tail_len = keep;
+                        }
                     }
                     if stop.load(Ordering::Relaxed) {
                         stopping_bytes += n;
@@ -2020,25 +2021,19 @@ fn capture(
         {
             persist_reply(&event_line, reply_path)?;
         }
-        drop(segment);
-        if segments > 0 {
-            if dropped > 0 {
-                // Its own line, so JSON-lines readers skip the cut edges.
-                writeln!(
-                    file,
-                    "\n{}",
-                    json!({"type": "privateer.log.truncated", "dropped_bytes": dropped})
-                )?;
-            }
-            for n in segments.saturating_sub(2)..segments {
-                let tail = segment_path(n);
-                std::io::copy(&mut fs::File::open(&tail)?, &mut file)?;
-                fs::remove_file(&tail)?;
-            }
-        }
         file.sync_all()?;
         Ok(dropped)
     }))
+}
+
+/// The line between head and tail that says how many bytes were dropped. It
+/// is its own line, so JSON-lines readers skip the cut edges.
+fn truncation_marker(dropped: u64) -> Vec<u8> {
+    format!(
+        "\n{}\n",
+        json!({"type": "privateer.log.truncated", "dropped_bytes": dropped})
+    )
+    .into_bytes()
 }
 
 pub fn supervise(store: &mut Store, id: &str) -> Result<()> {

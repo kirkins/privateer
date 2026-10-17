@@ -2045,14 +2045,20 @@ fn escaping_payload(linger: &str) -> Vec<String> {
 fn escaped_pid(fixture: &Fixture) -> i32 {
     let path = fixture.repo.join("escaped.pid");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.exists() {
+    // The file can exist before the payload has written the pid into it.
+    loop {
+        if let Some(pid) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
         assert!(
             Instant::now() < deadline,
             "the payload never started its child"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    fs::read_to_string(path).unwrap().trim().parse().unwrap()
 }
 
 fn gone(pid: i32) -> bool {
@@ -2117,5 +2123,44 @@ fn a_finished_job_keeps_its_capacity_while_what_it_left_still_runs() {
     ok(&home, "job.cancel", json!({"id":"build"}));
     wait(&home, "build", &["cancelled", "succeeded"]);
     assert!(gone(child));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+/// Where a job's stdout log is, for the one incarnation this fixture ran.
+fn stdout_log(home: &Path, id: &str) -> PathBuf {
+    let job = ok(home, "job.status", json!({"id":id}));
+    home.join("jobs")
+        .join(id)
+        .join(job["incarnation"].as_str().unwrap())
+        .join("stdout.log")
+}
+
+#[test]
+fn a_killed_job_keeps_the_lines_it_printed_before_the_kill() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // A slow harness prints a line every 100 ms and is killed at 2 s, part way.
+    let command = json!({"task_id":"task","id":"slow","heavy":true,"timeout_secs":2,
+        "command":["/bin/sh","-c","head -c 400000 /dev/zero | tr '\\0' x | fold -w 1023; echo; i=0; while :; do i=$((i+1)); echo line-$i; sleep 0.1; done"]});
+    ok(&home, "job.start", command);
+    // Streamed lines reach the log while the harness is still running.
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The first lines come after 400 KB of filler, so they sit in the tail.
+    let live = fs::read_to_string(stdout_log(&home, "slow")).unwrap();
+    assert!(
+        live.contains("line-1\n") && live.contains("line-3\n"),
+        "{} bytes",
+        live.len()
+    );
+    let done = wait(&home, "slow", &["timed_out"]);
+    let text = fs::read_to_string(stdout_log(&home, "slow")).unwrap();
+    assert!(text.len() <= 1024 * 1024, "{}", text.len());
+    assert!(
+        text.contains("line-1\n") && text.contains("line-3\n"),
+        "{done}"
+    );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
