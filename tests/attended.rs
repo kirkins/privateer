@@ -912,9 +912,10 @@ fn simultaneous_attended_starts_have_one_live_harness_and_lease_owner() {
     fs::write(
         &harness,
         format!(
-            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n",
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.02; done\n",
             began.display(),
-            release.display()
+            release.display(),
+            ship.root.display()
         ),
     )
     .unwrap();

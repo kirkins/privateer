@@ -198,6 +198,13 @@ fn a_killed_supervisor_still_yields_exactly_one_outcome() {
             .unwrap()
             .contains("supervisor disappeared; payload capacity preserved")
     );
+    // The outcome names the ship's own way to free it.
+    assert!(
+        outcomes[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains(r#"job.cancel {"id":"long"}"#)
+    );
     // Stopping the orphan settles it without a second outcome.
     let cancelled = fleet.ok("job.cancel", json!({"id": "long"}), Some("infra"));
     assert_eq!(cancelled["status"], "cancelled");

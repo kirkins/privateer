@@ -77,7 +77,7 @@ impl Place {
                  printf '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\" > '{root}/pi-context'\n\
                  printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
                  if [ -e '{root}/native-fail' ]; then exit 17; fi\n\
-                 while [ ! -e '{root}/release' ] && [ -d '{root}' ]; do sleep 0.05; done\n\
+                 while [ ! -e '{root}/release' ]; do [ -d '{root}' ] || exit 1; sleep 0.05; done\n\
                  printf '%s\\n' '{{\"type\":\"session\",\"id\":\"11111111-1111-4111-8111-111111111111\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
                 root = root.display()
             ),

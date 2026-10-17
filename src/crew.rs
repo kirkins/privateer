@@ -158,6 +158,15 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
             "Its leader process {leader}; descendants were still running.\n"
         ));
     }
+    if status == "orphaned" {
+        // Freeing it is the ship's own step; resource.recover is the captain's,
+        // and refuses while any recorded process remains.
+        body.push_str(&format!(
+            "It still holds its capacity. Once you have what you need from it, \
+             job.cancel {{\"id\":\"{job_id}\"}} stops its recorded process group and \
+             frees that capacity; killing processes by hand can miss some.\n"
+        ));
+    }
     body.push_str(&format!(
         "Command: {command}\nLogs: {}/{{stdout,stderr}}.log\n",
         logs.display()
