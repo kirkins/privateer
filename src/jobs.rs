@@ -569,10 +569,17 @@ fn reserve(
                     demand: r.demand,
                 })
                 .collect();
+            // Only the filesystem this job will use: a full root must not
+            // block work on a separate volume. The same reading decides
+            // admission and feeds the falling-space trend the owner sees.
+            let disk_key = admission::disk_key(floor.path)?;
+            let disk_available_bytes = admission::disk(floor.path)?.0;
+            let now = Store::now_ms();
+            admission::note_disk(conn, &disk_key, disk_available_bytes, now)?;
             admission::admit(
                 &settings,
                 &host,
-                Store::now_ms(),
+                now,
                 &view,
                 &admission::Request {
                     heavy: reservation.heavy,
@@ -581,8 +588,8 @@ fn reserve(
                     charter_cap,
                     demand: reservation.demand,
                     charter_min_free_bytes: floor.charter_min_free_bytes,
-                    disk_path: floor.path,
-                    released_load: released_load(conn, Store::now_ms())?,
+                    disk_available_bytes,
+                    released_load: released_load(conn, now)?,
                 },
             )?;
             if from_queue {
@@ -2948,6 +2955,16 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             status["queue"] = json!(live_queue(&conn)?);
             status["disk_floor_met"] =
                 json!(host.disk_available_bytes >= settings.min_free_disk_bytes);
+            // How fast free space has been falling here, and when that rate
+            // would reach the floor. Both are null until enough readings
+            // exist to describe a rate.
+            let trend = admission::disk_trend(&conn, &admission::disk_key(store.home())?)?;
+            status["disk_trend"] = json!(trend);
+            status["disk_forecast"] = json!(
+                trend
+                    .as_ref()
+                    .and_then(|t| admission::disk_forecast(settings.min_free_disk_bytes, t))
+            );
             status["model_routes"] = json!(crate::routes::list(&conn)?);
             let now = Store::now_ms();
             status["released_load"] = json!(released_load(&conn, now)?);

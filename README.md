@@ -39,6 +39,10 @@ for separate checkouts, durable leases and explicit safe cleanup. Install
 [Treehouse](https://github.com/kunchenguid/treehouse#install) on PATH for those
 jobs. Ordinary non-Git jobs do not require it.
 
+Jobs share the machine through one host-wide ledger: CPUs, memory and declared
+disk, with floors the machine's owner sets for its real workload. See
+[setting a machine's resource floor](docs/resources.md).
+
 Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
 Herdr. With no current ship, first-run setup offers a dedicated ship folder.
 Entry shows the bridge without boarding anyone, so first mates keep answering

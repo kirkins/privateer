@@ -121,8 +121,11 @@ class Pilot:
                  "batch_secs": 0, "max_delay_secs": 0, "retry_backoff_secs": 1, "max_wakes_per_hour": 20}})
         configure_workspaces(self.root, self.homes.values())
         self.evidence["workspace_backend"] = "test protocol fixture backed by real Git worktrees"
+        # One shared heavy slot; these scripted payloads write one small
+        # file, so they claim no heavy-job memory or disk appetite.
         self.call("apps", "resource.configure", {"max_heavy_jobs": 1, "max_load_per_cpu": 1024,
-                  "min_available_memory_bytes": 0, "ramp_secs": 0})
+                  "min_available_memory_bytes": 0, "ramp_secs": 0,
+                  "heavy_estimate": {"memory_bytes": 0, "disk_bytes": 0}})
         for ship, other in (("review", "apps"), ("apps", "review")):
             self.call(ship, "peer.put", {"name": other, "transport": "local", "executable": str(self.binary),
                                         "home": str(self.homes[other])})

@@ -542,7 +542,7 @@ fn custody_changes_stop_old_workers_before_the_new_owner_reuses_the_checkout() {
 #[test]
 fn queued_jobs_hold_their_own_workspace_until_cancelled() {
     let f = Fixture::new();
-    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0}}));
+    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}));
     let first = f.ok(
         "job.start",
         json!({"task_id":"one","id":"heavy","command":["/bin/sleep","3"],"heavy":true}),
@@ -1154,7 +1154,7 @@ fn the_dispatcher_releases_only_workspaces_whose_work_has_landed() {
 #[test]
 fn a_workspace_needs_only_disk_and_does_not_wait_behind_heavy_jobs() {
     let f = Fixture::new();
-    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0}}));
+    f.ok("resource.configure", json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,"heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}));
     f.ok(
         "job.start",
         json!({"task_id":"one","id":"building","command":["/bin/sleep","3"],"heavy":true}),

@@ -40,13 +40,13 @@ impl Fixture {
         )
         .unwrap();
         // These cases exercise supervision with one deterministic heavy slot;
-        // live load and memory admission is tested separately. These tiny
-        // payloads must not inherit the production 2 GiB heavy-job estimate.
+        // live load, memory and disk admission is tested separately. These
+        // tiny payloads must not inherit the production heavy-job estimates.
         privateer::dispatch(
             &mut store,
             "resource.configure",
             json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,
-                "heavy_estimate":{"memory_bytes":0}}),
+                "heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}),
         )
         .unwrap();
         let charter = json!({"id":"mission","objective":"isolated supervisor fixture","repo":self.repo,
@@ -1401,6 +1401,241 @@ fn disk_floor_refusal_queues_jobs_and_resource_status_reports_it() {
 }
 
 #[test]
+fn a_job_declares_disk_demand_and_admission_counts_it() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    let free = ok(&home, "resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    // Whatever this machine has free, give the floor all but a gigabyte, so
+    // every admitted job here leaves half that headroom spare.
+    let gib = 1024 * 1024 * 1024;
+    let headroom = gib.min(free / 4);
+    let floor = free - headroom;
+    ok(
+        &home,
+        "resource.configure",
+        json!({"min_free_disk_bytes":floor,"heavy_estimate":{"disk_bytes":8*gib,"memory_bytes":0},
+            "max_heavy_jobs":null}),
+    );
+    // A heavy job declares the heavy default by default, so it does not fit
+    // in a gigabyte of headroom, and the refusal says what it wanted.
+    let refused = heavy_job(&home, "heavy-hungry", json!({}));
+    assert!(!refused.status.success());
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("disk available"), "{error}");
+    assert!(error.contains("declared by running jobs"), "{error}");
+    assert!(error.contains("this one declares 8192 MiB"), "{error}");
+    // A light job without an estimate needs only the floor, and runs.
+    start_light(&home, "light", &["true"]);
+    // A job may declare what it will really write, in either direction.
+    let modest = heavy_job(
+        &other,
+        "modest",
+        json!({"estimate":{"disk_bytes":headroom/4}}),
+    );
+    assert!(
+        modest.status.success(),
+        "{}",
+        String::from_utf8_lossy(&modest.stderr)
+    );
+    ok(&other, "job.cancel", json!({"id":"modest"}));
+    let greedy = heavy_job(&other, "greedy", json!({"estimate":{"disk_bytes":free*2}}));
+    assert!(!greedy.status.success());
+    assert!(String::from_utf8_lossy(&greedy.stderr).contains("this one declares"));
+    // Disk a running job holds counts against the next one, in another home,
+    // for as long as that job runs.
+    let holding = run(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"holding","command":["sleep","30"],"heavy":true,
+            "estimate":{"disk_bytes":headroom/2}}),
+    );
+    assert!(
+        holding.status.success(),
+        "{}",
+        String::from_utf8_lossy(&holding.stderr)
+    );
+    wait(&home, "holding", &["running"]);
+    // The resolved demand is recorded with the reservation, so another home's
+    // admission and resource.status both see it.
+    let reservations = ok(&home, "resource.status", json!({}))["reservations"].clone();
+    let held = reservations
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"] == "holding")
+        .unwrap();
+    assert_eq!(held["demand"]["disk_bytes"], headroom / 2);
+    let behind = heavy_job(
+        &other,
+        "behind",
+        json!({"estimate":{"disk_bytes":headroom*3/4}}),
+    );
+    assert!(!behind.status.success());
+    assert!(String::from_utf8_lossy(&behind.stderr).contains("declared by running jobs"));
+    ok(&home, "job.cancel", json!({"id":"holding"}));
+    // Once the first job is over and its reservation is released, its disk is
+    // not held back any more.
+    let released = Instant::now() + Duration::from_secs(10);
+    while ok(&home, "resource.status", json!({}))["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["job_id"] == "holding")
+    {
+        assert!(
+            Instant::now() < released,
+            "the cancelled job kept its reservation"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let after = heavy_job(
+        &other,
+        "after",
+        json!({"estimate":{"disk_bytes":headroom/2}}),
+    );
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    ok(&other, "job.cancel", json!({"id":"after"}));
+    // The heavy default and the warning horizon are host-wide settings.
+    ok(
+        &home,
+        "resource.configure",
+        json!({"heavy_estimate":{"disk_bytes":8*gib,"memory_bytes":0},"disk_warn_horizon_secs":0}),
+    );
+    assert_eq!(
+        ok(&home, "resource.status", json!({}))["settings"]["heavy_estimate"]["disk_bytes"],
+        8 * gib
+    );
+    assert_eq!(
+        ok(&home, "resource.status", json!({}))["settings"]["disk_warn_horizon_secs"],
+        0
+    );
+    for bad in [
+        json!({"heavy_estimate":{"disk_bytes":-1}}),
+        json!({"disk_warn_horizon_secs":-1}),
+        json!({"disk_warn_horizon_secs":30*86_400+1}),
+    ] {
+        assert!(
+            !run(&home, "resource.configure", bad.clone())
+                .status
+                .success(),
+            "{bad}"
+        );
+    }
+    let refused = run(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"bad-declared","command":["true"],"estimate":{"disk_bytes":-1}}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("whole number of bytes"));
+}
+
+#[test]
+fn a_reservation_written_before_jobs_declared_disk_stays_readable() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"legacy-demand","command":["sleep","30"],"heavy":false}),
+    );
+    wait(&home, "legacy-demand", &["running"]);
+    let conn = rusqlite::Connection::open(fixture.ledger.join("resources.sqlite")).unwrap();
+    let (key, record): (String, String) = conn
+        .query_row(
+            "SELECT key,record FROM reservations WHERE json_extract(record,'$.job_id')='legacy-demand'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // The shape an older build wrote: no disk demand in the record.
+    let mut stored: Value = serde_json::from_str(&record).unwrap();
+    stored["demand"] = json!({"cpus":1.0,"memory_bytes":0});
+    conn.execute(
+        "UPDATE reservations SET record=?2 WHERE key=?1",
+        params![key, stored.to_string()],
+    )
+    .unwrap();
+    // Reading it counts no disk, rather than refusing the whole host status.
+    let status = ok(&home, "resource.status", json!({}));
+    let held = status["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"] == "legacy-demand")
+        .unwrap();
+    assert_eq!(held["demand"]["disk_bytes"], 0);
+    ok(&home, "job.cancel", json!({"id":"legacy-demand"}));
+}
+
+#[test]
+fn admission_keeps_a_free_space_sample_and_resource_status_reports_the_trend() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // One reading is not yet a rate.
+    assert_eq!(
+        ok(&home, "resource.status", json!({}))["disk_trend"],
+        json!(null)
+    );
+    assert_eq!(
+        ok(&home, "resource.status", json!({}))["disk_forecast"],
+        json!(null)
+    );
+    // A job records the reading it admitted against, under the filesystem it
+    // runs on, whichever home that work belongs to.
+    let key = privateer::admission::disk_key(&home).unwrap();
+    start_light(&home, "sampler", &["true"]);
+    let status = ok(&home, "resource.status", json!({}));
+    let conn = rusqlite::Connection::open(fixture.ledger.join("resources.sqlite")).unwrap();
+    let samples: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM disk_samples WHERE path=?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(samples, 1, "{status}");
+    // Readings hours apart describe a rate, which resource.status reports and
+    // the owner's warning uses.
+    conn.execute(
+        "INSERT INTO disk_samples(path,sampled_ms,free_bytes) VALUES(?1,?2,?3)",
+        params![
+            key,
+            Store::now_ms() - 6 * 3_600_000,
+            status["host"]["disk_available_bytes"].as_u64().unwrap() + 6 * 1024 * 1024 * 1024
+        ],
+    )
+    .unwrap();
+    let status = ok(&home, "resource.status", json!({}));
+    assert_eq!(status["disk_trend"]["path"], key);
+    // The newest reading is the one admission took, moments ago: close to the
+    // live figure, since the machine keeps writing.
+    let newest = status["disk_trend"]["to_free_bytes"].as_u64().unwrap();
+    let live = status["host"]["disk_available_bytes"].as_u64().unwrap();
+    assert!(newest.abs_diff(live) < 64 * 1024 * 1024, "{status}");
+    assert!(
+        Store::now_ms() - status["disk_trend"]["to_ms"].as_i64().unwrap() < 60_000,
+        "{status}"
+    );
+    let forecast = &status["disk_forecast"];
+    assert!(
+        forecast["gib_per_hour"].as_f64().unwrap() > 0.9,
+        "{forecast}"
+    );
+    assert!(
+        forecast["hours_to_floor"].as_f64().unwrap() > 0.0,
+        "{forecast}"
+    );
+}
+
+#[test]
 fn recent_estimates_space_out_heavy_jobs_until_their_ramp_passes() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
@@ -1419,7 +1654,7 @@ fn recent_estimates_space_out_heavy_jobs_until_their_ramp_passes() {
         &home,
         "resource.configure",
         json!({"max_heavy_jobs":null,"max_load_per_cpu":limit,"min_available_memory_bytes":0,
-            "heavy_estimate":{"memory_bytes":0},"ramp_secs":2}),
+            "heavy_estimate":{"memory_bytes":0,"disk_bytes":0},"ramp_secs":2}),
     );
     let big = json!({"estimate":{"cpus":big}});
     let first = heavy_job(&home, "big-build", big);
@@ -1460,7 +1695,7 @@ fn a_lone_heavy_job_needs_only_the_floor_while_others_count_its_estimate() {
         "resource.configure",
         json!({"max_heavy_jobs":null,"max_load_per_cpu":1000.0,
             "min_available_memory_bytes":available / 4,
-            "heavy_estimate":{"memory_bytes":available},"ramp_secs":1}),
+            "heavy_estimate":{"memory_bytes":available,"disk_bytes":0},"ramp_secs":1}),
     );
     let first = heavy_job(&home, "first-build", json!({}));
     assert!(

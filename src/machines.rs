@@ -428,7 +428,10 @@ fn host_problems(store: &Store) -> Result<Vec<(String, String)>> {
     let mut problems = vec![];
     let ledger = crate::jobs::host_ledger(store)?;
     let settings = crate::admission::settings(&ledger)?;
+    let disk_key = crate::admission::disk_key(store.home())?;
     let free = crate::admission::disk(store.home())?.0;
+    let now = Store::now_ms();
+    crate::admission::note_disk(&ledger, &disk_key, free, now)?;
     if free < settings.min_free_disk_bytes {
         problems.push((
             "disk_floor".into(),
@@ -436,6 +439,29 @@ fn host_problems(store: &Store) -> Result<Vec<(String, String)>> {
                 "Free disk is below the machine's floor: {} MiB free, {} MiB must stay free, so new jobs wait. Propose a cleanup to the captain.",
                 free / (1024 * 1024),
                 settings.min_free_disk_bytes / (1024 * 1024)
+            ),
+        ));
+    } else if let Some(forecast) = crate::admission::disk_trend(&ledger, &disk_key)?
+        .as_ref()
+        .and_then(|trend| {
+            crate::admission::disk_warning(
+                settings.min_free_disk_bytes,
+                settings.disk_warn_horizon_secs,
+                trend,
+            )
+        })
+    {
+        // Still above the floor, but falling toward it fast enough that the
+        // owner can act before builds start failing rather than after.
+        problems.push((
+            "disk_trend".into(),
+            format!(
+                "Free disk is falling: {} MiB now, {} MiB must stay free, and at the last {:.1} GiB per hour over the last {} hours the floor arrives in about {} hours. Propose a cleanup to the captain.",
+                free / (1024 * 1024),
+                settings.min_free_disk_bytes / (1024 * 1024),
+                forecast.gib_per_hour,
+                forecast.span_ms / 3_600_000,
+                forecast.hours_to_floor.ceil().max(1.0) as i64
             ),
         ));
     }

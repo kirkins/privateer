@@ -315,8 +315,11 @@ fn an_unavailable_supervisor_does_not_strand_jobs_or_capacity() {
     assert_eq!(
         rpc.call(
             "resource.configure",
+            // These payloads are an echo that must never run: they are not
+            // heavy work, so they claim no memory or disk appetite.
             json!({"max_heavy_jobs":1,"max_load_per_cpu":1024,
-                   "min_available_memory_bytes":0,"ramp_secs":0})
+                   "min_available_memory_bytes":0,"ramp_secs":0,
+                   "heavy_estimate":{"memory_bytes":0,"disk_bytes":0}})
         )["ok"],
         true
     );

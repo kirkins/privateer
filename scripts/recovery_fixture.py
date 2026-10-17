@@ -153,8 +153,10 @@ def wait_for(commands, description, observe):
 
 
 def crew_args(root, binary, home):
+    # One CPU and 64 MiB for a scripted fixture that writes one small file:
+    # no heavy-job disk appetite either.
     return {"id": "repair-job", "task_id": "repair", "heavy": True,
-            "estimate": {"cpus": 1, "memory_bytes": 67108864},
+            "estimate": {"cpus": 1, "memory_bytes": 67108864, "disk_bytes": 0},
             "cleanup_descendants": True, "wait_for_capacity": True, "max_wait_secs": 20,
             "command": [sys.executable, str(root / "fixture-runtime.py"), "_worker",
                         str(root), str(binary), str(home)]}
