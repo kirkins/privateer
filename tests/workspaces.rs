@@ -1,6 +1,7 @@
 mod support;
 
 use privateer::{dispatch, store::Store};
+use rusqlite::params;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -872,6 +873,70 @@ fn disk_and_cwd_refusals_do_not_allocate_or_start_work() {
     );
     assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
     assert_eq!(f.ok("job.list", json!({})), json!([]));
+}
+
+#[test]
+fn workspace_disk_floor_wait_uses_host_fifo_and_cleans_up_on_timeout() {
+    let f = Fixture::new();
+    let total = f.ok("resource.status", json!({}))["host"]["disk_total_bytes"]
+        .as_u64()
+        .unwrap();
+    f.ok(
+        "resource.configure",
+        json!({"min_free_disk_bytes":total.saturating_mul(2)}),
+    );
+    let result = f.run(
+        "workspace.acquire",
+        json!({
+            "task_id":"one", "wait_for_capacity":true, "max_wait_secs":1
+        }),
+    );
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no workspace disk capacity"));
+    assert_eq!(f.ok("resource.status", json!({}))["queue"], json!([]));
+    assert!(f.ok("workspace.status", json!({"task_id":"one"})).is_null());
+}
+
+#[test]
+fn runtime_needs_surfaces_long_workspace_disk_queue_entries() {
+    let f = Fixture::new();
+    f.ok("resource.status", json!({}));
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let record = json!({
+        "key":"workspace:fixture:one",
+        "home":f.home,
+        "job_id":"one",
+        "incarnation":"fixture-incarnation",
+        "created_ms":Store::now_ms() - 61_000,
+        "supervisor":{"pid":123,"started":"fixture-start"},
+        "kind":"workspace"
+    });
+    ledger
+        .execute(
+            "INSERT INTO queue(key,record) VALUES(?1,?2)",
+            params![record["key"].as_str().unwrap(), record.to_string()],
+        )
+        .unwrap();
+    let needs = dispatch(
+        &mut Store::open(&f.home).unwrap(),
+        "runtime.needs",
+        json!({}),
+    )
+    .unwrap();
+    let blocker = needs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["source"] == "workspace")
+        .unwrap();
+    assert_eq!(blocker["evidence"], "workspace_disk_wait");
+    assert_eq!(blocker["task_id"], "one");
+    ledger
+        .execute(
+            "DELETE FROM queue WHERE key=?1",
+            [record["key"].as_str().unwrap()],
+        )
+        .unwrap();
 }
 
 #[test]

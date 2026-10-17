@@ -270,6 +270,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 &selected,
                 !workspace::is_wake(store, &args)?,
                 None,
+                false,
+                0,
             )?;
             if let Some(lease) = &execution.lease_id {
                 args["_workspace_lease_id"] = serde_json::json!(lease);

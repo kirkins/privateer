@@ -536,7 +536,7 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
     if store.charter(&ship).is_err() {
         let mut charter = json!({"id": ship,
             "objective": setup.objective.clone().unwrap_or_else(|| if liaison {"Act for the captain: onboard them, set up and staff ships, relay mail and delegate work to peers".into()} else {format!("Work as the ship {ship}")}),
-            "repo": folder, "min_free_bytes": 0, "job_timeout_secs": 3600});
+            "repo": folder, "job_timeout_secs": 3600});
         if let Some(actions) = &setup.actions {
             charter["actions"] = actions.clone();
         }
