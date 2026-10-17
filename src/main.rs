@@ -143,6 +143,10 @@ fn run() -> Result<()> {
         caller.require_operator("machine")?;
         return privateer::machines::cli(&positional);
     }
+    if command == "grant" && !json_given && !file_given {
+        caller.require_operator("grant")?;
+        return privateer::grants::cli(&positional);
+    }
     // Front doors belong to the captain's whole fleet, not to one ship home.
     if command == "door" && !json_given && !file_given {
         caller.require_operator("door")?;

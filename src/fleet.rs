@@ -67,6 +67,7 @@ pub(crate) fn registry() -> Result<Connection> {
     )?;
     crate::releases::init(&conn)?;
     crate::machines::init(&conn)?;
+    crate::grants::init(&conn)?;
     Ok(conn)
 }
 
@@ -193,17 +194,21 @@ pub(crate) fn caller_ship(store: &Store) -> Option<String> {
 
 /// An active fleet ship the caller may manage: any ship for the captain, only
 /// ships it created for an agent. `verb` completes "can VERB only ships it created".
-pub(crate) fn managed(store: &Store, name: &str, verb: &str) -> Result<Member> {
+pub(crate) fn managed(store: &Store, name: &str, action: &str, verb: &str) -> Result<Member> {
     let member = members(&registry()?)?
         .into_iter()
         .find(|m| m.name == name)
         .with_context(|| format!("no active ship named {name} in the fleet"))?;
     if let Caller::Agent { actor } = store.caller() {
-        ensure!(
-            &member.created_by == actor,
-            "{actor} can {verb} only ships it created; {name} was created by {}",
-            member.created_by
-        );
+        // A ship manages what it created; anything more is the captain's grant.
+        if &member.created_by != actor {
+            crate::grants::require(store, actor, action, name).with_context(|| {
+                format!(
+                    "{actor} can {verb} only ships it created or a grant covers; {name} was created by {}",
+                    member.created_by
+                )
+            })?;
+        }
     }
     Ok(member)
 }
@@ -375,7 +380,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
 fn retire(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     let conn = registry()?;
-    let member = managed(store, name, "retire")?;
+    let member = managed(store, name, "ship.retire", "retire")?;
     if let Some(expected) = args.get("expected_home").and_then(Value::as_str) {
         ensure!(
             member.home == Path::new(expected),
@@ -425,7 +430,7 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
 fn set_actions(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     let requested = args.get("actions").context("actions is required")?;
-    let member = managed(store, name, "change the actions of")?;
+    let member = managed(store, name, "ship.actions", "change the actions of")?;
     // Hold this home's write lock through the grant: a revoke committed
     // first wins, and one committed later cannot interleave with the check.
     let authority = match store.caller() {
@@ -483,7 +488,7 @@ fn set_scope(store: &mut Store, args: &Value) -> Result<Value> {
             .find(|m| m.name == name)
             .with_context(|| format!("no active ship named {name} in the fleet"))?
     } else {
-        managed(store, name, "change the scope of")?
+        managed(store, name, "ship.scope", "change the scope of")?
     };
     ensure!(member.home.is_dir(), "{name}'s folder is gone");
     let set = "UPDATE ships SET record=json_set(record,'$.scope',?2) WHERE name=?1";
@@ -557,7 +562,7 @@ fn set_consumes(store: &mut Store, args: &Value) -> Result<Value> {
             .find(|m| m.name == name)
             .with_context(|| format!("no active ship named {name} in the fleet"))?
     } else {
-        managed(store, name, "change what is consumed by")?
+        managed(store, name, "ship.consumes", "change what is consumed by")?
     };
     ensure!(member.home.is_dir(), "{name}'s folder is gone");
     let own = Store::open(&member.home)?;

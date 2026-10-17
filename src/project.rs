@@ -50,7 +50,7 @@ fn target_home(store: &Store, target: &str, own: Option<&str>) -> Result<PathBuf
     if Some(target) == own {
         return Ok(store.home().to_path_buf());
     }
-    Ok(managed(store, target, "add projects to")?.home)
+    Ok(managed(store, target, "project.add", "add projects to")?.home)
 }
 
 fn add(store: &mut Store, args: &Value) -> Result<Value> {
