@@ -391,7 +391,19 @@ acknowledges a message or claims task completion.
 `/privateer-mail pause|resume|status` works without a model turn. Errors,
 interruptions, refusals and declined native prompt admission pause automatic
 wakes. Only an explicit resume or a captain prompt permits recovery; background
-peer and scheduled events do not clear the pause. Native model and permission
+peer and scheduled events do not clear the pause. A hosted session
+(`PRIVATEER_HOSTED=1`), which nobody is watching, also resumes a minute after
+the pause, as the Pi adapter does.
+
+The mod also carries the Pi session's other first-mate duties. After each main
+turn it reports the context window's fill (`attention.report`, kind `turn`, from
+the native session usage), and after a compaction the tokens before it (kind
+`compaction`). After a completed turn that leaves running tasks with nothing
+moving them (`ship.bearings` `idle_tasks`), it submits one follow-through prompt
+asking the first mate to continue them or record why they wait, once per
+distinct set. `/stow`, `/yolo`, `/afk`, `/back` and `/ships` run the Privateer CLI
+as the captain (an operator role, not the ship's agent identity) and only from
+the keyboard (composer or bridge origin), never for another plugin's call. Native model and permission
 settings still apply; options follow `--`, for example
 `privateer start claude -- --permission-mode auto`. No permission bypass,
 provider selection, credential copy or global plugin installation is added.
