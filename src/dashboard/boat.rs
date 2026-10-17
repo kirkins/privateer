@@ -8,6 +8,20 @@ pub struct Boat {
     moved_at: u64,
 }
 
+/// The sailboat's two rows (sail, then hull), shared with the voyage sea.
+pub fn art(ascii: bool) -> [&'static str; 2] {
+    if ascii {
+        [" /|\\ ", "\\___/"]
+    } else {
+        [" ◿│◣ ", "╲▁▁▁╱"]
+    }
+}
+
+/// A small trailing boat: hull only, drawn on the hull row.
+pub fn small(ascii: bool) -> &'static str {
+    if ascii { "\\_/" } else { "╲▁╱" }
+}
+
 impl Boat {
     pub fn advance(&mut self) {
         self.tick = self.tick.wrapping_add(1);
@@ -48,8 +62,7 @@ impl Boat {
                 }
             })
             .collect::<Vec<_>>();
-        let top = if ascii { " /|\\ " } else { " ◿│◣ " };
-        let hull = if ascii { "\\___/" } else { "╲▁▁▁╱" };
+        let [top, hull] = art(ascii);
         for (i, c) in top.chars().enumerate() {
             sail[self.column + i] = c;
         }

@@ -33,6 +33,7 @@ struct Options {
     demo: bool,
     once: bool,
     ascii: bool,
+    reduced_motion: bool,
     no_herdr: bool,
     hosted: bool,
 }
@@ -52,10 +53,11 @@ fn options() -> Result<Option<Options>> {
             "--demo" => out.demo = true,
             "--once" => out.once = true,
             "--ascii" => out.ascii = true,
+            "--reduced-motion" => out.reduced_motion = true,
             "--no-herdr" => out.no_herdr = true,
             "--help" | "-h" => {
                 println!(
-                    "Privateer · bridge\n\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\nprivateer-dashboard --demo [--once]\n\n--once: bounded read-only JSON observation\n--no-herdr: do not connect to Herdr\n--ascii: plain fleet markers (* aboard, o not aboard, x unavailable, * liaison)\n\nOne column: Fleet table, Needs you, Recently done. Running crew counts jobs recorded\nas launching or running (not live health). ↑↓ selects; Tab switches Fleet/Needs;\nEnter focuses an EXISTING validated mate space or answers a typed runtime need.\nChoices are offered when provided; otherwise type a reply. Approvals bind exact\nartifact/environment/version; no deployment. i: separate mail history; q: quit.\nNo launch, Board, Watch, tabs, pane creation/reorder, or automatic focus."
+                    "Privateer · bridge\n\nprivateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\nprivateer-dashboard --demo [--once]\n\n--once: bounded read-only JSON observation\n--no-herdr: do not connect to Herdr\n--ascii: plain fleet markers (* aboard, o not aboard, x unavailable, * liaison)\n--reduced-motion: hold the voyage sea still\n\nOne column: Fleet table, Needs you, Recently done. Running crew counts jobs recorded\nas launching or running (not live health). ↑↓ selects; Tab switches Fleet/Needs;\nEnter focuses an EXISTING validated mate space or answers a typed runtime need.\nChoices are offered when provided; otherwise type a reply. Approvals bind exact\nartifact/environment/version; no deployment. i: separate mail history; v: voyage, an animated sea of the fleet (v or Esc returns); q: quit.\nNo launch, Board, Watch, tabs, pane creation/reorder, or automatic focus."
                 );
                 return Ok(None);
             }
@@ -358,6 +360,7 @@ fn run(opts: Options) -> Result<()> {
         herdr: opts.demo.then(View::demo),
         demo: opts.demo,
         ascii: opts.ascii,
+        reduced: opts.reduced_motion,
         home_age: Some(0),
         herdr_configured: herdr.is_some(),
         mail: if opts.demo { sample_mail() } else { Vec::new() },
