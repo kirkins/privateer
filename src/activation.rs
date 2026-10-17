@@ -777,8 +777,9 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
     let hosted_observations = crate::host::repair(store);
-    let hosted_blocked = crate::host::alert_blocked(store, &hosted_observations)
-        .unwrap_or_else(|error| json!({"error": format!("{error:#}")}));
+    let hosted_blocked = crate::host::alert_blocked(store, &hosted_observations).unwrap_or_else(
+        |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
+    );
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;

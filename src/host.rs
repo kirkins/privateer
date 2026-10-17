@@ -146,45 +146,59 @@ pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String)]) -> Res
     for (ship, status) in observed {
         match status.as_str() {
             "blocked" => {
-                let since: Option<i64> = tx
+                let state: Option<(i64, bool)> = tx
                     .query_row(
-                        "SELECT blocked_since_ms FROM hosted_block_alerts WHERE ship=?1",
+                        "SELECT blocked_since_ms, alerted FROM hosted_block_alerts WHERE ship=?1",
                         [ship],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
-                let since = match since {
-                    Some(since) => since,
+                let (since, alerted) = match state {
+                    Some((since, alerted)) => (since, alerted),
                     None => {
                         tx.execute(
                             "INSERT INTO hosted_block_alerts(ship,blocked_since_ms,alerted) VALUES(?1,?2,0)",
                             params![ship, now],
                         )?;
-                        now
+                        (now, false)
                     }
                 };
-                let alerted: bool = tx.query_row(
-                    "SELECT alerted FROM hosted_block_alerts WHERE ship=?1",
-                    [ship],
-                    |row| row.get(0),
-                )?;
                 if !alerted && now.saturating_sub(since) >= BLOCKED_ALERT_AFTER_MS {
-                    let id = format!("hosted-blocked-{ship}-{since}");
-                    let body = format!(
-                        "{ship}'s live session is waiting for input in Herdr. Answer the prompt in its pane to resume the first mate."
-                    );
-                    crate::mail::record_captain_notice(
-                        &tx,
-                        ship,
-                        &id,
-                        &body,
-                        json!({"hosted_blocked":ship,"blocked_since_ms":since}),
-                    )?;
-                    tx.execute(
-                        "UPDATE hosted_block_alerts SET alerted=1 WHERE ship=?1",
-                        [ship],
-                    )?;
-                    alerts.push(json!({"ship":ship,"alerted":true}));
+                    let raw: Option<String> = tx
+                        .query_row("SELECT record FROM ships WHERE name=?1", [ship], |row| {
+                            row.get(0)
+                        })
+                        .optional()?;
+                    let duty_task = raw
+                        .and_then(|record| serde_json::from_str::<Value>(&record).ok())
+                        .and_then(|record| {
+                            record["first_mate"]["duty_task"]
+                                .as_str()
+                                .map(str::to_owned)
+                        });
+                    if let Some(duty_task) = duty_task {
+                        let id = format!("hosted-blocked-{ship}-{since}");
+                        let body = format!(
+                            "{ship}'s live session is waiting for input in Herdr. Answer the prompt in its pane to resume the first mate."
+                        );
+                        crate::mail::record_crew(
+                            &tx,
+                            &json!({
+                                "id": id,
+                                "to": "captain",
+                                "kind": "notice",
+                                "task_id": duty_task,
+                                "urgency": "normal",
+                                "body": body,
+                                "payload": {"hosted_blocked":ship,"blocked_since_ms":since}
+                            }),
+                        )?;
+                        tx.execute(
+                            "UPDATE hosted_block_alerts SET alerted=1 WHERE ship=?1",
+                            [ship],
+                        )?;
+                        alerts.push(json!({"ship":ship,"alerted":true}));
+                    }
                 }
             }
             "idle" | "working" | "done" => {
@@ -345,10 +359,13 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
 /// launch's backoff. Keep the reserved deadline even after adoption, so a
 /// harness that immediately exits cannot be relaunched on every tick.
 pub(crate) fn started(store: &Store, ship: &str, holder: &str) -> Result<()> {
-    store.connection().execute(
+    let tx = store.write_transaction()?;
+    tx.execute(
         "UPDATE host_launches SET failures=0,error=NULL WHERE ship=?1 AND holder=?2",
         params![ship, holder],
     )?;
+    tx.execute("DELETE FROM hosted_block_alerts WHERE ship=?1", [ship])?;
+    tx.commit()?;
     Ok(())
 }
 

@@ -1606,8 +1606,9 @@ fn hosted_blocked_alerts_once_after_the_threshold() {
     let alerts = captain_blocked_alerts(&place);
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0]["to"], "captain");
-    assert_eq!(alerts[0]["from"], "infra");
-    assert_eq!(alerts[0]["urgency"], "high");
+    assert_eq!(alerts[0]["from"], "crew");
+    assert_eq!(alerts[0]["urgency"], "normal");
+    assert_eq!(alerts[0]["task_id"], "infra-duty");
     assert!(
         alerts[0]["body"]
             .as_str()

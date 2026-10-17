@@ -613,7 +613,7 @@ impl Client {
         if let Some(view) = &view {
             for (ship, binding) in mates {
                 if binding.socket != self.path
-                    || !view.panes.iter().any(|p| binding.matches(&view, p))
+                    || !view.panes.iter().any(|p| binding.matches(view, p))
                 {
                     continue;
                 }
