@@ -1865,6 +1865,101 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
 }
 
 #[test]
+fn a_hosted_claude_first_mate_resumes_past_a_long_preamble_and_records_why() {
+    let place = Place::new();
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:claude");
+    first_mate["options"] = json!({"model":"claude-opus-5-5","permission_mode":"auto"});
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let trust =
+        json!({"projects": {place.folder.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
+    fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
+
+    // Starts `claude` afresh and returns the argv it was given.
+    let launch = |place: &Place| -> Vec<String> {
+        let _ = fs::remove_file(place.root.join("pi-argv"));
+        let _ = fs::remove_file(place.root.join("pi-env"));
+        place.retry_now();
+        place.tick();
+        until("the hosted Claude", || place.root.join("pi-env").exists());
+        let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+        place.stop_native("infra");
+        argv.lines().map(str::to_owned).collect()
+    };
+    // The last host.launched audit: whether its launch resumed a conversation.
+    let launched = |place: &Place| -> Value {
+        let payload: String = place
+            .database()
+            .query_row(
+                "SELECT payload FROM audit WHERE kind='host.launched' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    };
+
+    // No transcript at all: fresh, and the audit says so.
+    let args = launch(&place);
+    assert!(!args.iter().any(|a| a == "--continue"), "{args:?}");
+    let audit = launched(&place);
+    assert_eq!(audit["continued"], json!(false), "{audit}");
+    assert_eq!(audit["continuation"], json!("no transcript"), "{audit}");
+
+    // Claude's own naming: every character but a letter or digit is a dash.
+    let folder: String = place
+        .folder
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = place.root.join(".claude/projects").join(folder);
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::write(
+        transcripts.join("wake.jsonl"),
+        "{\"entrypoint\":\"sdk-cli\"}\n",
+    )
+    .unwrap();
+    let args = launch(&place);
+    assert!(!args.iter().any(|a| a == "--continue"), "{args:?}");
+    let audit = launched(&place);
+    assert_eq!(audit["continued"], json!(false), "{audit}");
+    assert_eq!(audit["continuation"], json!("headless only"), "{audit}");
+
+    // Claude's record of the session opens with 110 KB of records that carry
+    // no entrypoint before the interactive one; the decision must still see it.
+    let preamble = format!(
+        "{{\"type\":\"api-request-blob\",\"blob\":\"{}\"}}\n",
+        "x".repeat(110 * 1024)
+    );
+    fs::write(
+        transcripts.join("session.jsonl"),
+        format!("{preamble}{{\"entrypoint\":\"cli\"}}\n"),
+    )
+    .unwrap();
+    let args = launch(&place);
+    assert!(args.iter().any(|a| a == "--continue"), "{args:?}");
+    let audit = launched(&place);
+    assert_eq!(audit["continued"], json!(true), "{audit}");
+    assert_eq!(audit["continuation"], json!("interactive"), "{audit}");
+}
+
+#[test]
 fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
     let place = Place::new();
     let socket = place.root.join("config/herdr/herdr.sock");
