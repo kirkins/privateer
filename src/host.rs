@@ -51,10 +51,14 @@ fn claude_trusted(folder: &Path) -> bool {
         .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
 }
 
-/// Whether Claude holds a conversation for this folder, which `--continue`
-/// needs: without one, an interactive `--continue` exits. Claude keeps a
-/// folder's transcripts under its path with every other character a dash.
+/// Whether Claude holds an interactive conversation for this folder, which
+/// `--continue` needs: without one, an interactive `--continue` exits. Claude
+/// keeps a folder's transcripts under its path with every other character a
+/// dash, and `--continue` passes over headless (`claude -p`, entrypoint
+/// `sdk-cli`) ones, which a ship's wakes and errands leave there; only a
+/// transcript whose opening records name the `cli` entrypoint counts.
 pub(crate) fn claude_has_conversation(folder: &Path) -> bool {
+    use std::io::Read;
     let Some((dir, _)) = claude_config() else {
         return false;
     };
@@ -63,10 +67,20 @@ pub(crate) fn claude_has_conversation(folder: &Path) -> bool {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
+    let interactive = |path: &Path| {
+        let mut head = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(64 * 1024).read_to_end(&mut head))
+            .is_ok_and(|_| {
+                let mark = br#""entrypoint":"cli""#;
+                head.windows(mark.len()).any(|w| w == mark)
+            })
+    };
     std::fs::read_dir(dir.join("projects").join(name)).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        entries.flatten().any(|e| {
+            let path = e.path();
+            path.extension().is_some_and(|x| x == "jsonl") && interactive(&path)
+        })
     })
 }
 
