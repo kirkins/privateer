@@ -562,7 +562,14 @@ pub(crate) fn warm_session(
 /// Decide whether a ship's first mate is due, and wake it if so.
 fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let name = ship["name"].as_str().context("ship name")?.to_owned();
-    let profile = ship["first_mate"].clone();
+    let mut profile = ship["first_mate"].clone();
+    let own_route_blocked = profile["manifest"]
+        .as_str()
+        .and_then(|m| crate::routes::route_of(m, &profile["options"]))
+        .map(|route| crate::routes::refusal(store, &route))
+        .transpose()?
+        .flatten()
+        .is_some();
     if crate::permissions::paused(store, &name)? {
         return Ok(
             json!({"ship":name,"skipped":"tool permission question awaits captain or a policy change"}),
@@ -592,7 +599,10 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // one durable admission path, before the headless fallback below.
     let mut host_error = None;
     let mut host_backoff_until_ms = None;
-    if crate::host::hosted(&profile) {
+    // While the configured route is backing off, use headless fallback wakes.
+    // Keeping the hosted session on its own native route avoids changing host adapter
+    // identity or inheriting the ship's route-specific config/tool bundles.
+    if crate::host::hosted(&profile) && !own_route_blocked {
         match crate::host::launch(store, &name, &profile) {
             Ok(crate::host::Attempt::Launched(hosted)) => {
                 return Ok(json!({"ship": name, "hosted": hosted}));
@@ -693,21 +703,27 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     }
     // Resume only a single focus's warm session: mixing topics in one
     // conversation is what makes long sessions costly and confused.
-    let harness = harness_id(&profile);
-    let resume = match foci.as_slice() {
+    let mut harness = harness_id(&profile);
+    let mut resume = match foci.as_slice() {
         [focus] if profile.get("tool_bundles").is_none() => {
             warm_session(store, &name, focus, &harness, &profile)?
         }
         _ => None,
     };
-    // A headless wake on a backed-off route would only fail; its mail waits.
-    if let Some(route) = profile["manifest"]
-        .as_str()
-        .and_then(|m| crate::routes::route_of(m, &profile["options"]))
-    {
-        if crate::routes::refusal(store, &route)?.is_some() {
+    // A headless wake on a backed-off route would only fail. Try the captain's
+    // first_mate order; if it has no clear route, preserve the existing wait.
+    if own_route_blocked {
+        let Some(fallback) = crate::crew_routes::first_mate_fallback(store, &name)? else {
             return Ok(json!({"ship": name, "skipped": "model route backing off"}));
-        }
+        };
+        profile["manifest"] = fallback.manifest;
+        profile["options"] = fallback.options;
+        profile.as_object_mut().unwrap().remove("config");
+        profile.as_object_mut().unwrap().remove("tool_bundles");
+        // A resumed session belongs to the configured route's harness. The
+        // fallback must start fresh under its own harness and route options.
+        resume = None;
+        harness = harness_id(&profile);
     }
     let text = wake_text(store, &wake, &name, &mail, through, resume.is_some())?;
     let mut start = json!({
