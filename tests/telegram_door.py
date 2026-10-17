@@ -314,7 +314,13 @@ def main() -> int:
             telegram.message("/waiting")
 
             def reshown() -> list:
+                # Only the cards after the list's header: a request's own push
+                # may still be in flight and land after `before`, ahead of the list.
                 texts = [m["text"] for m in telegram.sent()[before:]]
+                header = next((i for i, t in enumerate(texts) if "waiting on you" in t), None)
+                if header is None:
+                    return []
+                texts = texts[header:]
                 both = any("needs your hands" in t for t in texts) and any(
                     "Is the Mac still stowed?" in t for t in texts)
                 return texts if both else []
