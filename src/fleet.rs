@@ -243,10 +243,10 @@ fn within(own: &[String], actor: &str, requested: &Value) -> Result<()> {
 /// own active charter's actions, including authority to spawn. Creation and
 /// revocation serialize on the creating home's write lock.
 fn create(store: &mut Store, args: &Value) -> Result<Value> {
-    let name = required(args, "name")?;
-    identifier(name)?;
-    crate::mail::unreserved(name)?;
-    crate::machines::refuse_remote_name(&registry()?, name)?;
+    if let Some(machine) = args.get("machine").filter(|v| !v.is_null()) {
+        let machine = machine.as_str().context("machine must be a name")?;
+        return create_on_machine(store, machine, args);
+    }
     // The ship whose home this runs in lends a new ship its harness, model
     // and hosting. Only an agent creating a ship becomes its creator; when
     // the operator runs `ship new` in a ship's folder, the captain is.
@@ -255,6 +255,149 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         Caller::Agent { actor } => Some(actor.clone()),
         Caller::Operator => None,
     };
+    create_here(store, args, template, creator)
+}
+
+/// Ask a linked machine to create a ship in its own fleet. Authority is
+/// decided here, exactly as for a ship created here, in a short write
+/// transaction before the machine is contacted, so a revoke committed first
+/// wins. No lock is held across the call: it can outlast every other
+/// writer's wait, and the remote creation could not be undone by rolling
+/// back anyway. A revoke committed during the call is noted in the audit
+/// entry. The machine applies its own defaults: the requester's harness,
+/// model and hosting may not exist there.
+fn create_on_machine(store: &mut Store, machine: &str, args: &Value) -> Result<Value> {
+    let name = required(args, "name")?;
+    identifier(name)?;
+    crate::mail::unreserved(name)?;
+    let conn = registry()?;
+    ensure!(
+        !members(&conn)?.iter().any(|m| m.name == name),
+        "the fleet already has a ship named {name} on this machine; ship names are unique across linked machines"
+    );
+    crate::machines::refuse_remote_name(&conn, name)?;
+    let mut request = json!({"name": name});
+    for key in ["scope", "objective", "harness", "host", "folder", "actions"] {
+        if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
+            request[key] = value.clone();
+        }
+    }
+    let created_by = match store.caller() {
+        Caller::Agent { actor } => {
+            let authority = store.write_transaction()?;
+            let own = own_actions(store, actor)?;
+            ensure!(
+                own.iter().any(|a| a == "spawn"),
+                "ship.create requires spawn in the creating ship's charter"
+            );
+            match request.get("actions") {
+                Some(requested) => within(&own, actor, requested)?,
+                // The machine would otherwise give the captain's defaults.
+                None => request["actions"] = json!(own),
+            }
+            store.audit(
+                "ship.create.requested",
+                &json!({"ship": name, "machine": machine, "actions": request["actions"], "by": actor}),
+            )?;
+            authority.commit()?;
+            actor.clone()
+        }
+        Caller::Operator => {
+            store.audit(
+                "ship.create.requested",
+                &json!({"ship": name, "machine": machine, "by": "captain"}),
+            )?;
+            "captain".into()
+        }
+    };
+    request["created_by"] = json!(created_by);
+    let mut made = match crate::machines::create_linked(machine, request) {
+        Ok(made) => made,
+        Err(error) => {
+            // A call that timed out here may still have created the ship there.
+            let failed = store.audit(
+                "ship.create.failed",
+                &json!({"ship": name, "machine": machine, "by": created_by, "error": format!("{error:#}")}),
+            );
+            return Err(match failed {
+                Ok(_) => error,
+                Err(audit) => {
+                    error.context(format!("recording the failure also failed: {audit:#}"))
+                }
+            });
+        }
+    };
+    let mut created =
+        json!({"ship": name, "machine": machine, "folder": made["folder"], "by": created_by});
+    if let Caller::Agent { actor } = store.caller() {
+        // The decision stands, since the ship exists there; say it was overtaken.
+        let active = store.charter(actor).is_ok_and(|c| c["active"] == true);
+        if !active {
+            created["revoked_during_call"] = json!(true);
+        }
+    }
+    // The ship exists there either way; a reply saying otherwise would invite a retry.
+    if let Err(error) = store.audit("ship.created", &created) {
+        made["audit"] = json!(format!("created, but not recorded here: {error:#}"));
+    }
+    // Learn the new ship now rather than at the next refresh.
+    if let Err(error) = crate::machines::refresh_one(machine) {
+        made["directory"] = json!(format!(
+            "reachable from here after the next refresh: {error:#}"
+        ));
+    }
+    made["machine"] = json!(machine);
+    Ok(made)
+}
+
+/// Create a ship that a linked machine asked for, in this machine's fleet.
+/// The requesting machine already decided the creator's authority; the
+/// gateway accepts it from the captain's SSH access. `created_by` is the
+/// captain or a ship on `from`, which ship-name uniqueness makes unambiguous.
+pub(crate) fn create_for_machine(conn: &Connection, from: &str, args: &Value) -> Result<Value> {
+    let created_by = required(args, "created_by")?;
+    if created_by != "captain" {
+        identifier(created_by)?;
+        ensure!(
+            !members(conn)?.iter().any(|m| m.name == created_by),
+            "{created_by} is a ship on this machine, not on {from}"
+        );
+        // Another linked machine's ship; `from`'s own cached directory may
+        // not list a ship made there since the last refresh.
+        if let Some(machine) = crate::machines::ship_elsewhere(conn, created_by, from)? {
+            bail!("{created_by} is a ship on the linked machine {machine}, not on {from}");
+        }
+    }
+    // A new ship goes beside the ship that holds the captain's mail here,
+    // the fleet's liaison or else its first ship: the requester's folders
+    // mean nothing on this machine, and this keeps one predictable place
+    // for ships made from elsewhere, as a ship made here goes beside its
+    // creator. An explicit folder is used as given.
+    let (_, home) = crate::machines::captain_home(conn)?
+        .context("this machine has no ships yet; create its first ship there")?;
+    let mut store = Store::open(&home)?;
+    let mut args = args.clone();
+    if let Some(object) = args.as_object_mut() {
+        object.remove("machine");
+        object.remove("from_machine");
+        object.remove("created_by");
+    }
+    let creator = (created_by != "captain").then(|| created_by.to_owned());
+    create_here(&mut store, &args, None, creator)
+}
+
+/// Create a ship in this machine's fleet. `template` lends the new ship its
+/// harness, model and hosting; `creator` is recorded, or the captain.
+fn create_here(
+    store: &mut Store,
+    args: &Value,
+    template: Option<String>,
+    creator: Option<String>,
+) -> Result<Value> {
+    let name = required(args, "name")?;
+    identifier(name)?;
+    crate::mail::unreserved(name)?;
+    crate::machines::refuse_remote_name(&registry()?, name)?;
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
     let parent = template.as_ref().and_then(|c| {
         let profile =

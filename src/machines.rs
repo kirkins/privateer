@@ -583,6 +583,45 @@ pub(crate) fn stow_linked(name: &str, command: &str) -> Result<Value> {
     call(&machine, command, json!({}), None)
 }
 
+/// The linked machine other than `except` whose directory lists `name`.
+pub(crate) fn ship_elsewhere(
+    conn: &Connection,
+    name: &str,
+    except: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT machine FROM machine_ships WHERE name=?1 AND machine<>?2 LIMIT 1",
+            [name, except],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Ask a linked machine this one reaches to create a ship in its fleet.
+/// The caller has already decided the creator's authority.
+pub(crate) fn create_linked(name: &str, mut request: Value) -> Result<Value> {
+    identifier(name)?;
+    let conn = crate::fleet::registry()?;
+    let machine = machine(&conn, name)?;
+    ensure!(
+        machine.role == "collects",
+        "{name} reaches this machine; create ships on {name} from there"
+    );
+    request["from_machine"] = json!(
+        machine
+            .known_as
+            .as_deref()
+            .context("link has no local name")?
+    );
+    call(&machine, "ship.create", request, None)
+}
+
+/// Re-exchange directories with one machine this one reaches.
+pub(crate) fn refresh_one(name: &str) -> Result<()> {
+    refresh(Some(name)).map(|_| ())
+}
+
 fn hostname() -> String {
     let mut buffer = [0u8; 256];
     let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
@@ -981,6 +1020,12 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 }
             }
             Ok(json!({"recorded": recorded}))
+        }
+        // A ship the linking machine asked for, in this machine's fleet. Only
+        // ship.create crosses this way; managing that ship stays here.
+        "ship.create" => {
+            let from = reaching_here(&conn, required(args, "from_machine")?)?;
+            crate::fleet::create_for_machine(&conn, &from.name, args)
         }
         // A stow runs under this machine's own ledger, from any home here.
         _ if command.starts_with("stow.") => {
