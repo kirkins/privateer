@@ -13,6 +13,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -120,6 +121,19 @@ def wait_for(what: str, predicate, timeout: float = 30):
     raise AssertionError(f"timed out waiting for {what}")
 
 
+def check_age_phrases() -> None:
+    """The exact words the door puts on an age: a stow incident made this matter."""
+    probe = ("import json, sys; sys.path.insert(0, sys.argv[1]); import door; "
+             "print(json.dumps([door.age_phrase(ms) for ms in "
+             "(0, -5000, 5_000, 30_000, 120_000, 7_200_000, 3 * 86_400_000)]))")
+    out = subprocess.run([sys.executable, "-c", probe, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    # A clock that reads behind the mail never says "0 s ago" or a negative age.
+    assert json.loads(out.stdout) == ["just now", "just now", "just now", "30 s ago",
+                                      "2 min ago", "2 h ago", "3 d ago"], out.stdout
+
+
 class Fleet:
     def __init__(self, binary: str, root: pathlib.Path):
         self.binary, self.root = binary, root
@@ -162,6 +176,7 @@ class Fleet:
 def main() -> int:
     binary = os.path.abspath(sys.argv[1])
     telegram = FakeTelegram()
+    check_age_phrases()
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp).resolve()
         fleet = Fleet(binary, root)
@@ -242,6 +257,20 @@ def main() -> int:
             status = wait_for("the status answer", lambda: [
                 m for m in telegram.sent() if "Fleet status" in m["text"]])[0]
             assert "liaison" in status["text"] and "ops" in status["text"], status
+
+            # /waiting re-shows what is still outstanding, saying how long ago
+            # each request was asked, so an old one reads as old.
+            fleet.call("ops", "mail.send", {"from": "ops", "to": "captain", "kind": "request",
+                                            "body": "Is the Mac still stowed?"})
+            telegram.message("/waiting")
+            listed = wait_for("the waiting list", lambda: [
+                m for m in telegram.sent() if "waiting on you" in m["text"]])
+            assert listed[0]["text"].startswith("1 waiting on you"), listed[0]
+            reread = wait_for("the request re-shown with its age", lambda: [
+                m for m in telegram.sent()
+                if "Is the Mac still stowed?" in m["text"] and "· asked" in m["text"]])
+            assert re.search(r"asked (just now|\d+ [smhd] ago)", reread[0]["text"]), reread[0]
+            assert "reply to answer" in reread[0]["text"], reread[0]
 
             # Captain commands configure all ships without inference or settings edits.
             telegram.message("/yolo on", user=999)
