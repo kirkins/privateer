@@ -81,12 +81,24 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "stow.resume",
 ];
 
+/// Whether a command is the operator's alone for this caller. The ship the
+/// captain named as this machine's owner may also stow the machine.
+pub fn operator_only(caller: &Caller, command: &str) -> bool {
+    if !OPERATOR_COMMANDS.contains(&command) {
+        return false;
+    }
+    match caller {
+        Caller::Agent { actor } => !(command.starts_with("stow.") && machines::is_owner(actor)),
+        Caller::Operator => true,
+    }
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     if !args.is_object() {
         bail!("command arguments must be a JSON object");
     }
     if let Caller::Agent { actor } = store.caller() {
-        if OPERATOR_COMMANDS.contains(&command) {
+        if operator_only(store.caller(), command) {
             bail!("{command} is an operator command; agents cannot run it");
         }
         // Agents speak, and read mail, only as themselves.

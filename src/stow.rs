@@ -7,6 +7,11 @@
 //! ledger's lock. Each ship gets an ordinary captain request in its own home,
 //! which the runtime tracks until the ship replies. First mates' wakes are not
 //! held, so they can wake to stow; running jobs finish on their own.
+//!
+//! The ship the captain named as this machine's owner may stow the machine
+//! too, to clear it for the captain or for one big build. Its requests come
+//! from the owner, so the replies reach it, and only the owner or the captain
+//! resumes the hold it started; the owner cannot end the captain's.
 use crate::fleet::{members, registry};
 use crate::store::Store;
 use anyhow::{Result, bail, ensure};
@@ -22,6 +27,37 @@ const STOW: &str = "The captain is stowing the fleet to update Privateer, so new
 Then reply to this request with what you left in flight and what you will do first when the fleet resumes.";
 
 const RESUME: &str = "The captain has resumed the fleet: new jobs start again. Carry on from your notes, and re-queue any checks you cancelled for the stow.";
+
+/// Who asks: the captain, or the machine's owner, which looks after the
+/// machine and asks in its own words.
+fn asking(store: &Store) -> Option<String> {
+    match store.caller() {
+        crate::store::Caller::Agent { actor } => Some(actor.clone()),
+        crate::store::Caller::Operator => None,
+    }
+}
+
+fn stow_text(by: Option<&str>) -> String {
+    match by {
+        None => STOW.into(),
+        Some(owner) => STOW.replacen(
+            "The captain is stowing the fleet to update Privateer, so new jobs are held until the fleet resumes.",
+            &format!("{owner}, which looks after this machine, is stowing it to clear it for the captain or for one large build, so new jobs are held until it resumes."),
+            1,
+        ),
+    }
+}
+
+fn resume_text(by: Option<&str>) -> String {
+    match by {
+        None => RESUME.into(),
+        Some(owner) => RESUME.replacen(
+            "The captain has resumed the fleet",
+            &format!("{owner} has resumed the machine"),
+            1,
+        ),
+    }
+}
 
 fn record(conn: &rusqlite::Connection, id: &str) -> Result<Value> {
     let (started, resumed, ships): (i64, Option<i64>, String) = conn.query_row(
@@ -42,10 +78,20 @@ fn start(store: &Store) -> Result<Value> {
         bail!("the fleet is already stowed ({active}); see `privateer stow status`");
     }
     let id = format!("stow-{}", Store::now_ms());
+    let by = asking(store);
+    // The owner does not ask itself.
     let ships: Vec<Value> = members(&registry()?)?
         .into_iter()
-        .filter(|m| m.home.is_dir())
-        .map(|m| json!({"name": m.name, "home": m.home, "request": format!("{id}-{}", m.name)}))
+        .filter(|m| m.home.is_dir() && by.as_deref() != Some(m.name.as_str()))
+        .map(|m| {
+            let mut ship =
+                json!({"name": m.name, "home": m.home, "request": format!("{id}-{}", m.name)});
+            if let Some(owner) = &by {
+                ship["from"] = json!(owner);
+                ship["from_home"] = json!(store.home());
+            }
+            ship
+        })
         .collect();
     ensure!(!ships.is_empty(), "the fleet has no ships to stow");
     // The hold comes first, so no new job slips in while ships are asked.
@@ -56,17 +102,12 @@ fn start(store: &Store) -> Result<Value> {
     let mut asked = vec![];
     for ship in &ships {
         let name = ship["name"].as_str().unwrap_or_default();
-        let sent = Store::open(std::path::Path::new(
-            ship["home"].as_str().unwrap_or_default(),
-        ))
-        .and_then(|mut home| {
-            crate::mail::dispatch(
-                &mut home,
-                "mail.send",
-                json!({"id": ship["request"], "from": crate::mail::CAPTAIN, "to": name,
-                        "kind": "request", "body": STOW}),
-            )
-        });
+        let sent = send(
+            ship,
+            by.as_deref(),
+            json!({"id": ship["request"], "to": name,
+            "kind": "request", "body": stow_text(by.as_deref())}),
+        );
         asked.push(match sent {
             Ok(_) => json!({"ship": name, "asked": true}),
             Err(error) => json!({"ship": name, "asked": false, "error": format!("{error:#}")}),
@@ -143,32 +184,50 @@ fn status(store: &Store) -> Result<Value> {
         "started_ms": stow["started_ms"], "resumed_ms": stow["resumed_ms"], "ships": ships}))
 }
 
+/// Mail one stowed ship: from the captain, in its own home, or from the
+/// owner that asked, in the owner's home, so the reply reaches the owner.
+fn send(ship: &Value, by: Option<&str>, mut mail: Value) -> Result<Value> {
+    let home = match by {
+        Some(owner) => {
+            mail["from"] = json!(owner);
+            ship["from_home"].as_str().unwrap_or_default()
+        }
+        None => {
+            mail["from"] = json!(crate::mail::CAPTAIN);
+            ship["home"].as_str().unwrap_or_default()
+        }
+    };
+    let mut home = Store::open(std::path::Path::new(home))?;
+    crate::mail::dispatch(&mut home, "mail.send", mail)
+}
+
 /// Lift the hold and tell every stowed ship to carry on.
 fn resume(store: &Store) -> Result<Value> {
     let ledger = crate::jobs::host_ledger(store)?;
     let Some(id) = crate::jobs::stowed(&ledger)? else {
         bail!("the fleet is not stowed");
     };
+    let stow = record(&ledger, &id)?;
+    let started_by = stow["ships"][0]["from"].as_str().map(str::to_owned);
+    if let Some(owner) = asking(store) {
+        ensure!(
+            started_by.as_deref() == Some(owner.as_str()),
+            "only the captain resumes a stow the captain started"
+        );
+    }
     ledger.execute(
         "UPDATE stows SET resumed_ms=?2 WHERE id=?1",
         params![id, Store::now_ms()],
     )?;
     let mut told = vec![];
-    for ship in record(&ledger, &id)?["ships"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
+    for ship in stow["ships"].as_array().into_iter().flatten() {
         let name = ship["name"].as_str().unwrap_or_default();
-        let home = std::path::Path::new(ship["home"].as_str().unwrap_or_default());
-        let sent = Store::open(home).and_then(|mut home| {
-            crate::mail::dispatch(
-                &mut home,
-                "mail.send",
-                json!({"id": format!("{id}-resume-{name}"), "from": crate::mail::CAPTAIN,
-                    "to": name, "kind": "notice", "body": RESUME}),
-            )
-        });
+        let sent = send(
+            ship,
+            started_by.as_deref(),
+            json!({"id": format!("{id}-resume-{name}"),
+            "to": name, "kind": "notice", "body": resume_text(started_by.as_deref())}),
+        );
         told.push(json!({"ship": name, "told": sent.is_ok()}));
     }
     store.audit("stow.resume", &json!({"stow": id}))?;

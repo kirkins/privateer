@@ -156,7 +156,7 @@ fn run() -> Result<()> {
         "unexpected argument {}",
         positional.first().map(String::as_str).unwrap_or("")
     );
-    if privateer::OPERATOR_COMMANDS.contains(&command.as_str()) || command == "serve" {
+    if privateer::operator_only(&caller, &command) || command == "serve" {
         caller.require_operator(&command)?;
     }
     let home = home.context(
