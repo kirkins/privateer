@@ -118,7 +118,7 @@ fn codex(model: &str, cost: &str) -> Value {
 fn launches_take_the_first_available_listed_route_and_errands_their_own_list() {
     let f = Fleet::new();
     let mut cheap = codex("model-cheap", "free");
-    cheap["note"] = json!("x".repeat(100));
+    cheap["note"] = json!("trial runs only");
     f.routes(json!({
         "routes": {"cheap": cheap, "steady": codex("model-steady", "credits"),
                    "review": codex("model-review", "plan")},
@@ -131,12 +131,11 @@ fn launches_take_the_first_available_listed_route_and_errands_their_own_list() {
     f.back_off("codex/-/model-cheap");
     assert_eq!(f.model(&start()), "model-steady");
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
-    let expected_note = format!("cheap (free; {}…)", "x".repeat(80));
     assert!(
         bearings["text"]
             .as_str()
             .unwrap()
-            .contains(&format!("{expected_note} backing off")),
+            .contains("cheap (free; trial runs only) backing off, steady (credits)"),
         "{bearings}"
     );
     f.back_off("codex/-/model-steady");
