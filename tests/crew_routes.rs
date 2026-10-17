@@ -32,7 +32,33 @@ impl Fleet {
             "task.create",
             json!({"id":"fix","charter_id":"engineering","owner":"engineering","title":"Fix it"}),
         );
+        // These tests are about routing. Admission has its own tests, so the
+        // host's live memory and disk, and the crew memory the bundled
+        // manifests declare, never decide a launch here.
+        fleet.json(
+            None,
+            "resource.configure",
+            json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,
+                "max_load_per_cpu":1024,"ramp_secs":0,
+                "crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
+        );
         fleet
+    }
+    /// Wait until no launch is queued for capacity, so the next one is judged
+    /// against the ledger as it now is.
+    fn queue_drained(&self) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            let status = self.json(None, "resource.status", json!({}));
+            if status["queue"].as_array().unwrap().is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "queue never drained: {status}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     fn command(&self, agent: Option<&str>, args: &[&str]) -> Command {
         let mut c = support::command(BIN);
@@ -228,4 +254,223 @@ fn agents_launch_only_listed_routes_while_the_captain_may_launch_any() {
         f.model(&f.json(None, "agent.start", unlisted)),
         "model-pricey"
     );
+}
+
+/// Crew reserve the memory their launch declares, as admission counts any
+/// estimate: a crew that does not fit beside the crews already running is
+/// refused, or waits for capacity.
+#[test]
+fn a_crew_launch_reserves_its_memory_and_waits_when_it_does_not_fit() {
+    let f = Fleet::new();
+    // Stub harnesses run for a while, so their reservations stay visible.
+    fs::write(f.root.join("bin/codex"), "#!/bin/sh\nsleep 30\n").unwrap();
+    let sized = |bytes: u64| {
+        let mut route = codex("model-sized", "credits");
+        route["options"]["memory_bytes"] = json!(bytes);
+        route
+    };
+    f.routes(
+        json!({"routes": {"small": sized(1 << 20), "big": sized(1 << 50)},
+        "crew": ["small", "big"]}),
+    );
+    // The first crew runs alone, so it needs only the floor.
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-small","route":"small"}),
+    );
+    let job = f.json(None, "job.status", json!({"id":"crew-small"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 20, "{job}");
+    let status = f.json(None, "resource.status", json!({}));
+    let reserved = status["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"] == "crew-small")
+        .unwrap_or_else(|| panic!("no reservation for crew-small: {status}"));
+    assert_eq!(reserved["demand"]["memory_bytes"], 1u64 << 20, "{reserved}");
+    // A crew that does not fit beside it is refused, or waits when asked.
+    let refused = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"big"}),
+    );
+    assert!(refused.contains("admission refused"), "{refused}");
+    assert!(refused.contains("estimated for this job"), "{refused}");
+    let queued = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-big","route":"big","wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let job = f.json(None, "job.status", json!({"id":"crew-big"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 50, "{job}");
+    let status = f.json(None, "resource.status", json!({}));
+    assert!(
+        status["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["job_id"] == "crew-big"),
+        "{status}"
+    );
+    f.json(None, "job.cancel", json!({"id":"crew-big"}));
+    f.queue_drained();
+    f.json(None, "job.cancel", json!({"id":"crew-small"}));
+}
+
+/// A manifest with no memory figure reserves the host's default.
+#[test]
+fn a_crew_manifest_without_a_memory_figure_reserves_the_default() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/codex"), "#!/bin/sh\nsleep 30\n").unwrap();
+    // This host's setting for codex would replace the default under test.
+    f.json(
+        None,
+        "resource.configure",
+        json!({"crew_memory_bytes":null,"crew_default_memory_bytes":1u64 << 50}),
+    );
+    let dir = f.root.join("custom/codex");
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("manifest.json");
+    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/codex/adapter.py");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"codex","executable":["python3", adapter],
+            "timeout_ms":2000,"max_output_bytes":65536})
+        .to_string(),
+    )
+    .unwrap();
+    let mut holder = codex("model-holder", "credits");
+    holder["options"]["memory_bytes"] = json!(1u64 << 20);
+    f.routes(json!({"routes": {"holder": holder,
+        "own": {"manifest": manifest, "cost": "credits",
+            "options": {"model":"model-own","sandbox":"danger-full-access"}}},
+        "crew": ["holder", "own"]}));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-holder","route":"holder"}),
+    );
+    let queued = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-default","route":"own","wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let job = f.json(None, "job.status", json!({"id":"crew-default"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 50, "{job}");
+    f.json(None, "job.cancel", json!({"id":"crew-default"}));
+    f.queue_drained();
+    f.json(None, "job.cancel", json!({"id":"crew-holder"}));
+}
+
+/// A memory figure a caller passes with an explicit manifest is not a route's
+/// figure, so it cannot shrink the crew's own reservation.
+#[test]
+fn a_caller_memory_figure_cannot_shrink_an_explicit_manifest_crew() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/codex"), "#!/bin/sh\nsleep 30\n").unwrap();
+    f.json(
+        None,
+        "resource.configure",
+        json!({"crew_memory_bytes":null,"crew_default_memory_bytes":1u64 << 50}),
+    );
+    let dir = f.root.join("custom/codex");
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("manifest.json");
+    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/codex/adapter.py");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"codex","executable":["python3", adapter],
+            "timeout_ms":2000,"max_output_bytes":65536})
+        .to_string(),
+    )
+    .unwrap();
+    // Alone on the host a crew needs only the floor, so it starts; its
+    // reservation is the manifest's default, not the caller's figure.
+    let started = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-explicit","manifest":manifest,
+            "options":{"model":"model-own","memory_bytes":1u64 << 20}}),
+    );
+    assert_eq!(started["id"], "crew-explicit", "{started}");
+    let job = f.json(None, "job.status", json!({"id":"crew-explicit"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 50, "{job}");
+    f.json(None, "job.cancel", json!({"id":"crew-explicit"}));
+}
+
+/// The route's own figure beats this host's setting for its harness, which
+/// beats the manifest's; a request's own memory raises the figure, never
+/// lowers it.
+#[test]
+fn a_route_figure_beats_the_host_setting_which_beats_the_manifest() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/codex"), "#!/bin/sh\nsleep 30\n").unwrap();
+    f.json(
+        None,
+        "resource.configure",
+        json!({"crew_memory_bytes":null}),
+    );
+    f.routes(json!({"routes": {"steady": codex("model-steady", "credits")}, "crew": ["steady"]}));
+    // The bundled codex manifest declares 2 GiB and nothing overrides it. It
+    // runs alone, so only the floor counts for it.
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-manifest"}),
+    );
+    let job = f.json(None, "job.status", json!({"id":"crew-manifest"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 2u64 << 30, "{job}");
+    // This host's setting for codex replaces the manifest's figure.
+    f.json(
+        None,
+        "resource.configure",
+        json!({"crew_memory_bytes":{"codex":1u64 << 40}}),
+    );
+    let host = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-host","wait_for_capacity":true}),
+    );
+    assert_eq!(host["status"], "queued", "{host}");
+    let job = f.json(None, "job.status", json!({"id":"crew-host"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 40, "{job}");
+    f.json(None, "job.cancel", json!({"id":"crew-host"}));
+    f.queue_drained();
+    // The route's own figure replaces both.
+    let mut sized = codex("model-sized", "credits");
+    sized["options"]["memory_bytes"] = json!(1u64 << 41);
+    f.routes(json!({"routes": {"sized": sized}, "crew": ["sized"]}));
+    let route = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-route","wait_for_capacity":true}),
+    );
+    assert_eq!(route["status"], "queued", "{route}");
+    let job = f.json(None, "job.status", json!({"id":"crew-route"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 41, "{job}");
+    assert!(
+        job["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a != "memory_bytes")
+    );
+    f.json(None, "job.cancel", json!({"id":"crew-route"}));
+    f.queue_drained();
+    // A request asking for more memory than its route keeps the larger figure.
+    let asked = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-asked","wait_for_capacity":true,
+            "estimate":{"memory_bytes":1u64 << 50}}),
+    );
+    assert_eq!(asked["status"], "queued", "{asked}");
+    let job = f.json(None, "job.status", json!({"id":"crew-asked"}));
+    assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 50, "{job}");
+    f.json(None, "job.cancel", json!({"id":"crew-asked"}));
+    f.queue_drained();
+    f.json(None, "job.cancel", json!({"id":"crew-manifest"}));
 }

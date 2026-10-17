@@ -22,7 +22,20 @@ impl Fixture {
         let base = temp.path().canonicalize().unwrap();
         let repo = base.join("repo");
         fs::create_dir(&repo).unwrap();
-        let store = Store::open(&base.join("home")).unwrap();
+        let mut store = Store::open(&base.join("home")).unwrap();
+        // Crew memory is admission's concern, tested apart: keep the shared
+        // machine ledger and its free memory out of the crews started here.
+        fs::write(
+            base.join("home/config.json"),
+            json!({"resource_home": base.join("ledger")}).to_string(),
+        )
+        .unwrap();
+        privateer::dispatch(
+            &mut store,
+            "resource.configure",
+            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
+        )
+        .unwrap();
         let charter = json!({"id":"mission","active":true,"repo":repo,"actions":["spawn","implement","test"],"job_timeout_secs":20,"min_free_bytes":0,"max_heavy_jobs":1});
         store
             .connection()

@@ -82,7 +82,7 @@ fn a_scheduled_wake_uses_the_same_first_mate_fallback_as_mail_wakes() {
     );
     std::fs::create_dir_all(fleet.root.join("ledger")).unwrap();
     let ledger = rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
-    ledger.execute_batch("CREATE TABLE model_routes(route TEXT PRIMARY KEY,failures INTEGER NOT NULL,until_ms INTEGER NOT NULL,last_error TEXT,updated_ms INTEGER NOT NULL)").unwrap();
+    ledger.execute_batch("CREATE TABLE IF NOT EXISTS model_routes(route TEXT PRIMARY KEY,failures INTEGER NOT NULL,until_ms INTEGER NOT NULL,last_error TEXT,updated_ms INTEGER NOT NULL)").unwrap();
     ledger
         .execute(
             "INSERT INTO model_routes VALUES('own/-/own-model',1,9223372036854770000,'429',0)",

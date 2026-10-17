@@ -146,6 +146,15 @@ impl Fleet {
             json!({"id":"fleet","objective":"Answer mail","repo":repo,"min_free_bytes":0,"job_timeout_secs":60}),
         )
         .unwrap();
+        // Crew memory and the free-memory floor are admission's concern, tested
+        // apart. These fleets run several crews at once on whatever memory the
+        // test machine has, so neither the floor nor a crew's estimate may refuse them.
+        dispatch(
+            &mut store,
+            "resource.configure",
+            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20}}),
+        )
+        .unwrap();
         for (task, owner) in [
             ("apps-duty", "apps"),
             ("infra-duty", "infra"),

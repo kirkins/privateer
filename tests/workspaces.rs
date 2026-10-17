@@ -53,6 +53,14 @@ impl Fixture {
         )
         .unwrap();
         dispatch(&mut store, "charter.put", json!({"id":"mission","objective":"isolated workspace fixture","repo":repo,"min_free_bytes":0,"job_timeout_secs":20})).unwrap();
+        // Crew memory is admission's concern, tested apart: these crews run
+        // side by side on whatever memory the test machine has.
+        dispatch(
+            &mut store,
+            "resource.configure",
+            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
+        )
+        .unwrap();
         for task in ["one", "two"] {
             dispatch(
                 &mut store,

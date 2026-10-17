@@ -1086,6 +1086,13 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
 #[test]
 fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     let mut fleet = Fleet::new(now_settings());
+    // Crew memory and the free-memory floor are admission's concern, tested
+    // apart: these crews only need to start.
+    fleet.ok(
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
+        None,
+    );
     fleet.ok(
         "charter.put",
         json!({"id":"fleet","actions":["inspect","spawn","message"]}),
@@ -1187,6 +1194,11 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
 fn a_stated_reset_holds_a_throttled_route_past_the_short_window() {
     let fleet = Fleet::new(now_settings());
     fleet.ok(
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
+        None,
+    );
+    fleet.ok(
         "charter.put",
         json!({"id":"fleet","actions":["inspect","spawn","message"]}),
         None,
@@ -1242,6 +1254,11 @@ fn a_stated_reset_holds_a_throttled_route_past_the_short_window() {
 #[test]
 fn codex_crew_sandbox_defaults_and_flags_read_only() {
     let fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
+        None,
+    );
     // An isolated bundled:codex manifest so the test never runs real Codex.
     let plugins = fleet.root.join("plugins");
     fs::create_dir_all(plugins.join("codex")).unwrap();

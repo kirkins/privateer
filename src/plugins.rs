@@ -241,6 +241,29 @@ fn config_file(s: &str) -> Result<PathBuf> {
     );
     absolute_file(s)
 }
+/// The harness a launch runs, and the memory its manifest declares for crew
+/// (`memory_bytes`, optional). Read the manifest the way plugin dispatch does,
+/// so a pinned provider and a listed route are both covered.
+pub(crate) fn launch_manifest(charter: &Value, args: &Value) -> Result<(String, Option<u64>)> {
+    let (path, _) = selected_paths(charter, args)?;
+    let raw = fs::read(&path).context("cannot read plugin manifest")?;
+    ensure!(raw.len() <= 65_536, "plugin manifest too large");
+    let manifest: Value = serde_json::from_slice(&raw).context("invalid plugin manifest")?;
+    let id = manifest["id"]
+        .as_str()
+        .context("plugin manifest has no id")?
+        .to_owned();
+    let memory = match manifest.get("memory_bytes") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|bytes| *bytes > 0)
+                .context("memory_bytes must be a positive number of bytes")?,
+        ),
+    };
+    Ok((id, memory))
+}
 fn selected_paths(charter: &Value, args: &Value) -> Result<(PathBuf, Option<PathBuf>)> {
     let pin = charter.get("provider_plugin").filter(|v| !v.is_null());
     if let Some(pin) = pin {

@@ -391,6 +391,19 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             text.push_str(&format!("- {id} on {focus}: {}\n", clip(brief, LINE_CHARS)));
         }
     }
+    // Jobs waiting for this machine's capacity. A healthy heavy holder is
+    // ordinary serialization, so it is named here rather than raised as an
+    // alert the owner cannot act on.
+    let waits = crate::jobs::capacity_waits(store, ship)?;
+    if !waits.is_empty() {
+        text.push_str("Jobs waiting for this machine's capacity:\n");
+        for wait in &waits {
+            text.push_str(&format!(
+                "- {}\n",
+                clip(wait["line"].as_str().unwrap_or(""), LINE_CHARS)
+            ));
+        }
+    }
     if !idle.is_empty() {
         text.push_str(
             "Running tasks with nothing moving them (no job, open request or pinned wait):\n",
@@ -438,7 +451,8 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
-        "idle_tasks": idle, "attention": attention, "scheduling": scheduling, "text": text,
+        "idle_tasks": idle, "attention": attention, "scheduling": scheduling,
+        "capacity_waits": waits, "text": text,
         "hosted_pane": hosted_pane,
     }))
 }

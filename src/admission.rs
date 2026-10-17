@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -83,6 +84,13 @@ pub struct Settings {
     /// pool may keep. Beyond it, the least recently released slots are
     /// trimmed. 0 keeps none.
     pub workspace_cache_budget_bytes: u64,
+    /// Memory a crew launch reserves when neither its route, this host's
+    /// setting for its harness, nor its harness manifest says how much it
+    /// needs.
+    pub crew_default_memory_bytes: u64,
+    /// Per-harness crew memory, by harness id, overriding the harness
+    /// manifest's figure on this host.
+    pub crew_memory_bytes: BTreeMap<String, u64>,
 }
 
 impl Default for Settings {
@@ -100,6 +108,8 @@ impl Default for Settings {
             ramp_secs: 60,
             disk_warn_horizon_secs: 24 * 60 * 60,
             workspace_cache_budget_bytes: 8 * GIB,
+            crew_default_memory_bytes: 2 * GIB,
+            crew_memory_bytes: BTreeMap::new(),
         }
     }
 }
@@ -128,6 +138,8 @@ pub struct Held<'a> {
     /// Bytes trimmed from that filesystem since this job was admitted. A trim
     /// frees space this job did not write, so it is added back to the loss.
     pub disk_trimmed: u64,
+    /// The job this reservation is for.
+    pub job_id: &'a str,
 }
 
 /// What a new job asks for.
@@ -148,6 +160,9 @@ pub struct Request<'a> {
     /// Load the one-minute average still carries from jobs that just ended,
     /// which no longer run (see `released_load`).
     pub released_load: f64,
+    /// The supervised job whose agent started this one, when an agent did.
+    /// That job's reservation is not another job competing for memory.
+    pub started_by: Option<&'a str>,
 }
 
 /// What the one-minute load average still holds of a job that ended
@@ -278,6 +293,28 @@ fn effective(raw: &Map<String, Value>) -> Result<Settings> {
             "workspace_cache_budget_bytes" => {
                 settings.workspace_cache_budget_bytes = bytes(value, key)?;
             }
+            "crew_default_memory_bytes" => {
+                settings.crew_default_memory_bytes = bytes(value, key)?;
+            }
+            "crew_memory_bytes" => {
+                let by_harness = value
+                    .as_object()
+                    .context("crew_memory_bytes must map harness ids to bytes")?;
+                settings.crew_memory_bytes = by_harness
+                    .iter()
+                    .map(|(harness, bytes_value)| {
+                        ensure!(!harness.is_empty(), "crew_memory_bytes needs harness ids");
+                        Ok((
+                            harness.clone(),
+                            bytes_value.as_u64().filter(|b| *b > 0).with_context(|| {
+                                format!(
+                                    "crew_memory_bytes.{harness} must be a positive number of bytes"
+                                )
+                            })?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
+            }
             _ => bail!("unknown admission setting {key}"),
         }
     }
@@ -314,6 +351,21 @@ pub fn configure(conn: &Connection, changes: &Value) -> Result<Settings> {
         let _ = conn.execute_batch("ROLLBACK");
     }
     result
+}
+
+/// The memory a crew launch reserves: its route's own figure, else this
+/// host's setting for its harness, else the harness manifest's, else the
+/// default for a manifest that declares none.
+pub fn crew_memory(
+    settings: &Settings,
+    harness: &str,
+    manifest: Option<u64>,
+    route: Option<u64>,
+) -> u64 {
+    route
+        .or_else(|| settings.crew_memory_bytes.get(harness).copied())
+        .or(manifest)
+        .unwrap_or(settings.crew_default_memory_bytes)
 }
 
 /// The demand to record for a job, or None when it is neither heavy nor
@@ -474,22 +526,32 @@ pub fn admit(
     // ramp, so one job is never refused for its own size alone.
     // A job that just ended still shows in the load average for minutes;
     // it no longer runs, so it does not hold the next one back.
-    let load = (host.load - request.released_load).max(0.0);
-    let per_cpu = (load + recent_cpus) / host.cpus;
-    refuse_unless!(
-        per_cpu < settings.max_load_per_cpu,
-        "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {:.1} of it from jobs that just ended, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
-        settings.max_load_per_cpu,
-        host.load,
-        request.released_load.min(host.load),
-        host.cpus
-    );
+    // Only a job that declares CPUs is judged by them. A crew reserves memory
+    // alone: refusing it on a busy machine would stop first mates from
+    // starting crews whenever builds are running.
+    if demand.cpus > 0.0 {
+        let load = (host.load - request.released_load).max(0.0);
+        let per_cpu = (load + recent_cpus) / host.cpus;
+        refuse_unless!(
+            per_cpu < settings.max_load_per_cpu,
+            "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {:.1} of it from jobs that just ended, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
+            settings.max_load_per_cpu,
+            host.load,
+            request.released_load.min(host.load),
+            host.cpus
+        );
+    }
     // Memory: running out is worse than waiting, so the job's own estimate
     // must fit above the floor too, while other estimated jobs run. The
     // estimate keeps big jobs from starting together; it must not keep the
     // only one from starting on a small machine whose person is using it, so
     // a job running alone needs only the floor.
-    let alone = held.iter().all(|h| h.demand.is_none());
+    // The crew that started this job holds its own reservation, which is not
+    // another estimated job competing for memory.
+    let alone = held
+        .iter()
+        .filter(|h| Some(h.job_id) != request.started_by)
+        .all(|h| h.demand.is_none());
     let own = if alone { 0 } else { demand.memory_bytes };
     let left = host.memory_available_bytes as i128 - recent_memory as i128 - own as i128;
     refuse_unless!(
@@ -928,6 +990,7 @@ mod tests {
             disk_available_bytes: 100 * GIB,
             disk_total_bytes: 200 * GIB,
             released_load,
+            started_by: None,
         }
     }
 
@@ -963,6 +1026,81 @@ mod tests {
     }
 
     #[test]
+    fn a_build_under_its_own_crew_runs_alone_on_the_floor() {
+        let settings = Settings::default();
+        // The crew holds 6 GiB of the 7 GiB free; the build needs 2 GiB more.
+        let host = Host {
+            memory_available_bytes: 7 * GIB,
+            ..host(0.0)
+        };
+        let crew = |job: &'static str| Held {
+            heavy: false,
+            job_id: job,
+            demand: Some(Demand {
+                cpus: 1.0,
+                memory_bytes: 6 * GIB,
+                disk_bytes: 0,
+            }),
+            ..held(0)
+        };
+        let build = Request {
+            started_by: Some("crew-job"),
+            demand: Some(Demand {
+                cpus: 1.0,
+                memory_bytes: 2 * GIB,
+                disk_bytes: 0,
+            }),
+            ..heavy(0.0)
+        };
+        // Its own crew's reservation is not another job: the build runs alone
+        // on the floor, and is admitted.
+        assert!(admit(&settings, &host, 0, &[crew("crew-job")], &build).is_ok());
+        // Another job's crew still counts, so the build waits.
+        assert!(admit(&settings, &host, 0, &[crew("other-job")], &build).is_err());
+    }
+
+    #[test]
+    fn a_crew_starts_on_a_busy_machine_when_its_memory_fits() {
+        let settings = Settings {
+            min_free_disk_bytes: 0,
+            ..Settings::default()
+        };
+        // Load 21.77 on 10 CPUs is far past the limit of 1.0 per CPU.
+        let busy = host(21.77);
+        let crew = |memory_bytes: u64| Request {
+            heavy: false,
+            demand: Some(Demand {
+                cpus: 0.0,
+                memory_bytes,
+                disk_bytes: 0,
+            }),
+            ..heavy(0.0)
+        };
+        assert!(admit(&settings, &busy, 0, &[], &crew(2 * GIB)).is_ok());
+        // Memory still gates a crew: another estimated job holds 7 of the 8 GiB.
+        let other = Held {
+            heavy: false,
+            home: std::path::Path::new("/"),
+            charter: None,
+            created_ms: 0,
+            demand: Some(Demand {
+                cpus: 0.0,
+                memory_bytes: 7 * GIB,
+                disk_bytes: 0,
+            }),
+            disk_key: None,
+            disk_free_at_admit: None,
+            disk_trimmed: 0,
+            job_id: "other",
+        };
+        let refused = admit(&settings, &busy, 0, &[other], &crew(2 * GIB)).unwrap_err();
+        assert!(refused.to_string().contains("MiB available"), "{refused}");
+        // A heavy job declares CPUs, so the same load still holds it back.
+        let refused = admit(&settings, &busy, 0, &[], &heavy(0.0)).unwrap_err();
+        assert!(refused.to_string().contains("CPU demand"), "{refused}");
+    }
+
+    #[test]
     fn released_load_fades_with_the_one_minute_average_and_never_exceeds_it() {
         assert_eq!(released_load(10.0, 14.0, 0), 10.0);
         assert_eq!(released_load(10.0, 4.0, 0), 4.0);
@@ -986,6 +1124,7 @@ mod tests {
             disk_key: Some("dev:1"),
             disk_free_at_admit: Some(36 * GIB),
             disk_trimmed: 0,
+            job_id: "job",
         }
     }
 

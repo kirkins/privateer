@@ -129,6 +129,17 @@ fn start(home: &Path, id: &str, command: &[&str]) -> Value {
         json!({"task_id":"task","id":id,"command":command,"heavy":true}),
     )
 }
+/// A ship hosted in this home, as `init` records it, so bearings can be
+/// asked for it.
+fn ship(home: &Path, name: &str) {
+    let mut store = Store::open(home).unwrap();
+    privateer::dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":name,"scope":"builds"}),
+    )
+    .unwrap();
+}
 /// A heavy job that leaves its leftover descendants running.
 fn start_keeping(home: &Path, id: &str, command: &[&str]) -> Value {
     ok(
@@ -1906,6 +1917,119 @@ fn a_light_job_starts_while_a_heavy_job_waits_in_the_queue() {
     assert_ne!(light["status"], "queued", "{light}");
     wait(&home, "light-now", &["succeeded"]);
     wait(&home, "heavy-wait", &["succeeded"]);
+}
+
+/// Bearings name the heavy job a queued job waits behind, so a first mate
+/// sees an ordinary wait without the machine's owner being told about it.
+#[test]
+fn bearings_name_the_heavy_job_a_queued_job_waits_behind() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    ship(&home, "peer");
+    start(&home, "running", &["sleep", "30"]);
+    wait(&home, "running", &["running"]);
+    let queued = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"heavy-wait","command":["true"],
+            "heavy":true,"wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let bearings = ok(&home, "ship.bearings", json!({"ship":"peer"}));
+    assert_eq!(bearings["capacity_waits"].as_array().unwrap().len(), 1);
+    let wait = &bearings["capacity_waits"][0];
+    assert_eq!(wait["id"], "heavy-wait");
+    assert_eq!(wait["behind"]["job_id"], "running");
+    assert_eq!(wait["behind"]["ship"], "peer");
+    assert!(wait["behind"]["unhealthy"].is_null(), "{wait}");
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("heavy-wait is waiting behind peer's heavy job running"),
+        "{text}"
+    );
+    ok(&home, "job.cancel", json!({"id":"running"}));
+}
+
+/// A light job that waits for capacity is not called heavy, while bearings
+/// name the holder it waits behind.
+#[test]
+fn a_light_queued_job_is_not_called_heavy_and_waits_behind_any_holder() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    ship(&home, "peer");
+    start(&home, "running", &["sleep", "30"]);
+    wait(&home, "running", &["running"]);
+    // Any load now exceeds the CPU limit, so the estimated light job queues.
+    ok(
+        &home,
+        "resource.configure",
+        json!({"max_load_per_cpu":0.000001}),
+    );
+    let queued = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"light-wait","command":["true"],
+            "heavy":false,"estimate":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0},
+            "wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let bearings = ok(&home, "ship.bearings", json!({"ship":"peer"}));
+    let wait = &bearings["capacity_waits"][0];
+    assert_eq!(wait["id"], "light-wait");
+    assert_eq!(wait["heavy"], false, "{wait}");
+    assert_eq!(wait["behind"]["job_id"], "running");
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("light-wait is waiting behind peer's heavy job running"),
+        "{text}"
+    );
+    ok(&home, "job.cancel", json!({"id":"light-wait"}));
+    ok(&home, "job.cancel", json!({"id":"running"}));
+}
+
+/// A holder that lost its supervisor, kept only escaped descendants, or has
+/// run far past what this work takes here looks unhealthy; ordinary heavy
+/// work does not, however long it has held capacity.
+#[test]
+fn a_holder_that_lost_its_supervisor_looks_unhealthy_to_the_host() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    ship(&home, "peer");
+    start(&home, "running", &["sleep", "30"]);
+    let until = Instant::now() + Duration::from_secs(12);
+    let supervisor = loop {
+        let job = ok(&home, "job.status", json!({"id":"running"}));
+        if let Some(pid) = job["supervisor"]["pid"].as_i64() {
+            break pid as i32;
+        }
+        assert!(Instant::now() < until, "supervisor never recorded");
+        thread::sleep(Duration::from_millis(20));
+    };
+    let queued = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"heavy-wait","command":["true"],
+            "heavy":true,"wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let holder = |home: &Path| {
+        let bearings = ok(home, "ship.bearings", json!({"ship":"peer"}));
+        bearings["capacity_waits"][0]["behind"].clone()
+    };
+    let healthy = holder(&home);
+    assert!(healthy["unhealthy"].is_null(), "{healthy}");
+    assert_eq!(healthy["payload_alive"], true, "{healthy}");
+    // The supervisor dies under the payload it was watching.
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    let orphaned = holder(&home);
+    assert_eq!(orphaned["payload_alive"], true, "{orphaned}");
+    assert_eq!(orphaned["supervisor_alive"], false, "{orphaned}");
+    assert!(
+        orphaned["unhealthy"].as_str().unwrap().contains("orphaned"),
+        "{orphaned}"
+    );
+    // The wait is still named; only the holder's health changed.
+    assert_eq!(orphaned["job_id"], "running", "{orphaned}");
 }
 
 #[test]

@@ -148,6 +148,9 @@ struct Reservation {
     payload: Option<Process>,
     #[serde(default)]
     charter: Option<String>,
+    /// The supervised job whose agent started this one, when an agent did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_by: Option<String>,
     /// Resolved estimate counted by admission while recently admitted.
     #[serde(default)]
     demand: Option<Demand>,
@@ -169,7 +172,112 @@ struct Reservation {
     /// first mate must wake to stow.
     #[serde(default)]
     wake: bool,
+    /// The job's own timeout, so a watcher on any home can tell a slow build
+    /// from a stuck one without reading another ship's job records.
+    #[serde(default)]
+    timeout_ms: Option<i64>,
+    /// The ship whose task this job serves, recorded so a watcher on another
+    /// home can name whose work is holding capacity without opening that
+    /// home's records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ship: Option<String>,
+    /// A key for the work this reservation runs (its command) and the task
+    /// it serves, so runs of the same work on this host can be compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
 }
+
+impl Reservation {
+    /// How long this reservation may hold capacity before a watcher judges
+    /// it unhealthy. A timeout is the base, since that is the bound its own
+    /// supervisor enforces; a run of the same work on this host that took
+    /// longer raises it, because work that has always taken twenty minutes
+    /// is not unhealthy at twelve.
+    fn expected_ms(&self, conn: &Connection) -> Result<Option<i64>> {
+        let Some(timeout) = self.timeout_ms else {
+            return Ok(None);
+        };
+        Ok(Some(
+            match longest_recorded_run(conn, self.work.as_deref(), self.task.as_deref())? {
+                Some(run) => run.max(timeout),
+                None => timeout.saturating_mul(EXPECTED_RUN_MULTIPLE),
+            },
+        ))
+    }
+
+    /// The ship whose work holds this reservation, as it was recorded at
+    /// admission: the charter that admitted it is the fallback, and a job
+    /// from a home this ledger cannot name says so rather than guessing.
+    fn ship(&self) -> String {
+        self.ship
+            .clone()
+            .or_else(|| self.charter.clone())
+            .unwrap_or_else(|| "another ship".into())
+    }
+}
+
+/// A job holding this host's capacity, and what can be seen of it from any
+/// home: only the ledger and live processes are read, never another ship's
+/// records.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Holder {
+    pub key: String,
+    pub job_id: String,
+    /// The ship whose home holds this job, as the fleet records it.
+    pub ship: String,
+    pub home: PathBuf,
+    pub charter: Option<String>,
+    pub heavy: bool,
+    /// When it began holding capacity, which for a queued job is its
+    /// admission, not when it was asked for.
+    pub started_ms: i64,
+    pub state: String,
+    pub supervisor_alive: bool,
+    pub payload_alive: bool,
+    pub escaped_alive: bool,
+    /// How long this kind of work may hold capacity before the owner should
+    /// hear about it; None when no job timeout was recorded for it.
+    pub expected_ms: Option<i64>,
+    /// Why this holder looks unhealthy, or None while it looks ordinary.
+    pub unhealthy: Option<String>,
+}
+
+impl Holder {
+    /// Whether any process is still running for this reservation.
+    pub fn live(&self) -> bool {
+        self.supervisor_alive || self.payload_alive || self.escaped_alive
+    }
+    pub fn age_ms(&self, now_ms: i64) -> i64 {
+        (now_ms - self.started_ms).max(0)
+    }
+    pub fn to_json(&self, now_ms: i64) -> Value {
+        json!({
+            "key": self.key, "job_id": self.job_id, "ship": self.ship, "home": self.home,
+            "charter": self.charter, "heavy": self.heavy, "started_ms": self.started_ms,
+            "age_ms": self.age_ms(now_ms), "state": self.state,
+            "supervisor_alive": self.supervisor_alive, "payload_alive": self.payload_alive,
+            "escaped_alive": self.escaped_alive, "expected_ms": self.expected_ms,
+            "live": self.live(), "unhealthy": self.unhealthy,
+        })
+    }
+}
+
+/// How long a job may hold capacity before a watcher judges it unhealthy.
+///
+/// The job's own timeout is what its supervisor enforces, so a holder that
+/// outlives it several times over is not a slow build but a stuck one. When
+/// this host has run the same command or task before, its longest recorded
+/// run is the better yardstick and replaces that multiple; a build that has
+/// always taken twenty minutes is not unhealthy at twelve. This is a floor
+/// for a first warning only: the owner is told once and the facts stay in
+/// `resource.status` and `runtime.needs`.
+const EXPECTED_RUN_MULTIPLE: i64 = 3;
+/// Recorded runs older than this say little about today's machine.
+const RUN_HISTORY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Recorded runs kept per ledger, bounded so it cannot grow without limit.
+const RUN_HISTORY_ROWS: i64 = 256;
 
 /// A job waiting for capacity, first come first served across homes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -305,7 +413,10 @@ fn ledger(path: &Path) -> Result<Connection> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS released (key TEXT PRIMARY KEY, cpus REAL NOT NULL,
-           load REAL NOT NULL, released_ms INTEGER NOT NULL);",
+           load REAL NOT NULL, released_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS runs (key TEXT NOT NULL, work TEXT, task TEXT,
+           duration_ms INTEGER NOT NULL, finished_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS runs_finished ON runs(finished_ms);",
     )?;
     admission::init(&conn)?;
     crate::routes::init(&conn)?;
@@ -496,6 +607,204 @@ pub(crate) fn oldest_wait_ms(store: &Store) -> Result<Option<i64>> {
         .first()
         .map(|entry| Store::now_ms() - entry.created_ms))
 }
+/// A stable key for a job's command, so runs of the same work are comparable
+/// across homes without recording the command itself in the shared ledger.
+pub fn work_key(command: &[String]) -> String {
+    crate::core::hash(&json!(command))
+}
+/// Remember how long a reservation held capacity, so a later job running the
+/// same work can be judged against what this host has actually done with it.
+/// Bounded by age and by row count, like every other record in the ledger.
+fn record_run(conn: &Connection, reservation: &Reservation, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO runs(key,work,task,duration_ms,finished_ms) VALUES(?1,?2,?3,?4,?5)",
+        params![
+            reservation.key,
+            reservation.work,
+            reservation.task,
+            (now_ms - reservation.created_ms).max(0),
+            now_ms
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM runs WHERE finished_ms < ?1",
+        [now_ms - RUN_HISTORY_MS],
+    )?;
+    conn.execute(
+        "DELETE FROM runs WHERE rowid <= (SELECT COALESCE(MAX(rowid),0)-?1 FROM runs)",
+        [RUN_HISTORY_ROWS],
+    )?;
+    Ok(())
+}
+/// The longest run this host has recorded for the same command or the same
+/// task within the history window, or None when it has run none.
+fn longest_recorded_run(
+    conn: &Connection,
+    work: Option<&str>,
+    task: Option<&str>,
+) -> Result<Option<i64>> {
+    if work.is_none() && task.is_none() {
+        return Ok(None);
+    }
+    let longest: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(duration_ms) FROM runs WHERE finished_ms >= ?1
+               AND ((?2 IS NOT NULL AND work = ?2) OR (?3 IS NOT NULL AND task = ?3))",
+            params![
+                Store::now_ms() - RUN_HISTORY_MS,
+                work,
+                task.map(str::to_owned)
+            ],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(longest)
+}
+/// What holds this host's capacity right now, and whether each holder looks
+/// like ordinary work. Reads only the shared ledger and live processes, so
+/// any home on this machine may ask; nothing is released or changed.
+pub(crate) fn capacity_holders(store: &Store) -> Result<Vec<Holder>> {
+    let path = ledger_dir(store)?.join("resources.sqlite");
+    if !path.is_file() {
+        return Ok(vec![]);
+    }
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let now = Store::now_ms();
+    let mut holders = vec![];
+    for r in reservations(&conn)? {
+        // Only reservations admission counts hold capacity: light work with
+        // no estimate is not waiting for anything.
+        if !(r.heavy || r.demand.is_some()) {
+            continue;
+        }
+        let supervisor_alive = match &r.supervisor {
+            Some(p) => same_process(p)?,
+            None => false,
+        };
+        let payload_alive = match &r.payload {
+            Some(p) => group_alive(p)?,
+            None => false,
+        };
+        let escaped_alive = escaped_alive(&r.escaped)?;
+        let expected_ms = r.expected_ms(&conn)?;
+        let age = (now - r.created_ms).max(0);
+        let starting = age <= START_GRACE_MS;
+        // A holder is unhealthy when nothing supervises what still runs, when
+        // only descendants that left the payload's group survive it, when no
+        // live process can be shown to hold it at all, or when it has run far
+        // longer than this work takes here. Ordinary heavy work is healthy
+        // however long it has been running, which is the whole point: a busy
+        // machine is not a broken one. A reservation still inside the start
+        // grace is judged only on what already runs, since its supervisor
+        // may not have recorded itself yet.
+        let unhealthy = if !supervisor_alive && (payload_alive || escaped_alive) {
+            Some(
+                "orphaned: its supervisor is gone while its payload or a descendant still runs"
+                    .into(),
+            )
+        } else if supervisor_alive && !payload_alive && escaped_alive {
+            Some("only descendants that left its process group still run".into())
+        } else if !starting && !supervisor_alive && !payload_alive && !escaped_alive {
+            Some("no live process can be shown to hold this reservation".into())
+        } else {
+            expected_ms
+                .filter(|expected| age > *expected)
+                .map(|expected| {
+                    format!(
+                        "it has held capacity for {} minutes, well past the {} minutes this work takes here",
+                        age / 60_000,
+                        expected / 60_000
+                    )
+                })
+        };
+        holders.push(Holder {
+            ship: r.ship(),
+            key: r.key,
+            job_id: r.job_id,
+            home: r.home,
+            charter: r.charter,
+            heavy: r.heavy,
+            started_ms: r.created_ms,
+            state: r.state,
+            supervisor_alive,
+            payload_alive,
+            escaped_alive,
+            expected_ms,
+            unhealthy,
+        });
+    }
+    holders.sort_by_key(|h| h.started_ms);
+    Ok(holders)
+}
+/// This home's queued jobs and what they wait behind, as bearings show it:
+/// one entry per job still waiting for this machine's capacity. Each names
+/// the holder it waits for, the ship that holder belongs to, and whether
+/// that holder looks unhealthy.
+pub(crate) fn capacity_waits(store: &Store, ship: &str) -> Result<Vec<Value>> {
+    let mut statement = store.connection().prepare(
+        "SELECT json_extract(record,'$.id'), json_extract(record,'$.task_id'),
+           json_extract(record,'$.created_ms'), json_extract(record,'$.heavy')
+         FROM jobs WHERE json_extract(record,'$.status')='queued'
+           AND json_extract(record,'$.task_id') IN (SELECT id FROM tasks WHERE owner=?1)
+         ORDER BY json_extract(record,'$.created_ms') LIMIT 20",
+    )?;
+    let queued: Vec<(String, String, i64, bool)> = statement
+        .query_map([ship], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get::<_, Option<bool>>(3)?.unwrap_or(false),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if queued.is_empty() {
+        return Ok(vec![]);
+    }
+    let now = Store::now_ms();
+    let holders = capacity_holders(store)?;
+    // The holder a queued job waits behind is the live job, of any kind, that
+    // has held capacity longest: a crew's memory counts as much as a build's.
+    // A queue with no live holder is stated as such rather than blamed on an
+    // ordinary job.
+    let waiting_behind = holders
+        .iter()
+        .filter(|h| h.live())
+        .min_by_key(|h| h.started_ms);
+    let mut waits = vec![];
+    for (id, task, created_ms, heavy) in queued {
+        let behind = waiting_behind.map(|h| h.to_json(now));
+        waits.push(json!({
+            "id": id, "task_id": task, "heavy": heavy,
+            "waited_ms": (now - created_ms).max(0),
+            "behind": behind,
+            "line": wait_line(&id, waiting_behind),
+        }));
+    }
+    Ok(waits)
+}
+/// The sentence a first mate reads for one job waiting for this machine.
+fn wait_line(id: &str, holder: Option<&Holder>) -> String {
+    let Some(holder) = holder else {
+        return format!(
+            "{id} is waiting in this machine's capacity queue; nothing running here holds capacity"
+        );
+    };
+    let minutes = holder.age_ms(Store::now_ms()) / 60_000;
+    let age = if minutes == 0 {
+        "under a minute".to_owned()
+    } else {
+        format!("{minutes} minutes")
+    };
+    let kind = if holder.heavy { "heavy job" } else { "job" };
+    format!(
+        "{id} is waiting behind {ship}'s {kind} {job} (started {age} ago)",
+        ship = holder.ship,
+        job = holder.job_id,
+    )
+}
 fn live_queue(conn: &Connection) -> Result<Vec<Queued>> {
     let mut statement = conn.prepare("SELECT record FROM queue")?;
     let mut entries: Vec<Queued> = statement
@@ -548,6 +857,7 @@ fn held_view<'a>(conn: &Connection, held: &'a [Reservation]) -> Result<Vec<admis
                 disk_key: r.disk_key.as_deref(),
                 disk_free_at_admit: r.disk_free_bytes,
                 disk_trimmed,
+                job_id: r.job_id.as_str(),
             })
         })
         .collect()
@@ -646,6 +956,7 @@ fn reserve(
                     disk_available_bytes,
                     disk_total_bytes,
                     released_load: released_load(conn, now)?,
+                    started_by: reservation.started_by.as_deref(),
                 },
             )?;
             reservation.disk_trimmed_at_admit = Some(admission::trim_total(conn, &disk_key)?);
@@ -720,8 +1031,9 @@ fn release(store: &Store, job: &Job) -> Result<()> {
             |r| r.get(0),
         )
         .optional()?;
+    let held = held.and_then(|raw| serde_json::from_str::<Reservation>(&raw).ok());
     let cpus = held
-        .and_then(|raw| serde_json::from_str::<Reservation>(&raw).ok())
+        .as_ref()
         .and_then(|r| r.demand)
         .map(|d| d.cpus)
         .filter(|cpus| *cpus > 0.0);
@@ -738,6 +1050,11 @@ fn release(store: &Store, job: &Job) -> Result<()> {
             "DELETE FROM released WHERE released_ms < ?1",
             [now - RELEASED_WINDOW_MS],
         )?;
+    }
+    // And how long it held capacity, so the next job running the same work is
+    // judged against this host's own record rather than a fixed multiple.
+    if let Some(reservation) = held {
+        record_run(&conn, &reservation, Store::now_ms())?;
     }
     conn.execute("DELETE FROM reservations WHERE key=?1", [key])?;
     Ok(())
@@ -1177,6 +1494,41 @@ fn check_workspace_owner(store: &Store, job: &Job) -> Result<()> {
     }
     Ok(())
 }
+/// The estimate a crew launch is admitted under. Its memory is the route's
+/// own figure, else this host's setting for its harness, else the harness
+/// manifest's, else the default. A memory figure the request asks for counts
+/// too, and the larger of the two is kept, so a request cannot admit a crew
+/// its route sized bigger.
+pub(crate) fn crew_estimate(
+    store: &Store,
+    charter: &Value,
+    args: &Value,
+    route_memory: Option<Value>,
+) -> Result<Estimate> {
+    let requested = args
+        .get("estimate")
+        .filter(|v| !v.is_null())
+        .map(admission::estimate)
+        .transpose()?;
+    let (harness, manifest) = crate::plugins::launch_manifest(charter, args)?;
+    let route = route_memory
+        .map(|v| {
+            v.as_u64()
+                .filter(|bytes| *bytes > 0)
+                .context("options.memory_bytes must be a positive number of bytes")
+        })
+        .transpose()?;
+    let settings = admission::settings(&shared_ledger(store)?)?;
+    let memory = admission::crew_memory(&settings, &harness, manifest, route);
+    let mut estimate = requested.unwrap_or_default();
+    estimate.memory_bytes = Some(
+        estimate
+            .memory_bytes
+            .map_or(memory, |asked| asked.max(memory)),
+    );
+    Ok(estimate)
+}
+
 /// Only the validated agent.start path may start a harness under spawn.
 /// Public job.start cannot use this to bypass implementation authority.
 pub(crate) fn start_agent(store: &Store, mut args: Value) -> Result<Value> {
@@ -1544,12 +1896,20 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         supervisor: None,
         payload: None,
         charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
+        started_by: job.started_by.clone(),
         demand: None,
         disk_key: None,
         disk_free_bytes: None,
         disk_trimmed_at_admit: None,
         escaped: vec![],
         wake: is_wake(store, &id)?,
+        timeout_ms: Some(job.timeout_secs as i64 * 1000),
+        ship: store
+            .task(task_id)
+            .ok()
+            .and_then(|task| task["owner"].as_str().map(str::to_owned)),
+        work: Some(work_key(&job.command)),
+        task: Some(job.task_id.clone()),
     };
     // Trimming does file I/O, so it runs before the write transaction below.
     let charter_floor = charter
@@ -1844,12 +2204,20 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             supervisor: job.supervisor.clone(),
             payload: None,
             charter: charter.get("id").and_then(Value::as_str).map(str::to_owned),
+            started_by: job.started_by.clone(),
             demand: None,
             disk_key: None,
             disk_free_bytes: None,
             disk_trimmed_at_admit: None,
             escaped: vec![],
             wake: is_wake(store, &job.id)?,
+            timeout_ms: Some(job.timeout_secs as i64 * 1000),
+            ship: store
+                .task(&job.task_id)
+                .ok()
+                .and_then(|task| task["owner"].as_str().map(str::to_owned)),
+            work: Some(work_key(&job.command)),
+            task: Some(job.task_id.clone()),
         };
         let cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
         match reserve(
@@ -2103,6 +2471,34 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod capacity_wait_tests {
+    use super::*;
+
+    #[test]
+    fn a_light_holder_is_named_as_a_job_not_a_heavy_job() {
+        let holder = Holder {
+            key: "key".into(),
+            job_id: "crew-job".into(),
+            ship: "apps".into(),
+            home: PathBuf::new(),
+            charter: None,
+            heavy: false,
+            started_ms: Store::now_ms(),
+            state: "running".into(),
+            supervisor_alive: true,
+            payload_alive: true,
+            escaped_alive: false,
+            expected_ms: None,
+            unhealthy: None,
+        };
+        assert_eq!(
+            wait_line("queued", Some(&holder)),
+            "queued is waiting behind apps's job crew-job (started under a minute ago)"
+        );
+    }
 }
 
 #[cfg(test)]
