@@ -934,15 +934,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         crate::presence::leave(&store, &ship, &holder)?;
         return Err(error);
     }
-    let _hosted_lease = if hosted {
-        Some(crate::host::Lease {
-            store: &store,
-            ship: &ship,
-            holder: &holder,
-        })
-    } else {
-        None
-    };
+    let mut hosted_lease = hosted.then(|| crate::host::Lease {
+        store: &store,
+        ship: &ship,
+        holder: holder.clone(),
+    });
     // Bounded live starts are fresh: old history can retain facts from
     // resources no longer selected, and --continue cannot name the exact
     // session a plan digest was recorded for. Omitted selection keeps resumes.
@@ -963,22 +959,49 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     {
         route.push("--continue".to_owned());
     }
-    if hosted
-        && harness == "claude"
-        && bundle_plan.is_none()
-        && !["--continue", "-c", "--resume", "-r", "--session-id"]
-            .iter()
-            .any(|flag| chooses(flag))
-        && crate::host::claude_has_conversation(
-            &home.parent().context("ship folder")?.canonicalize()?,
-        )
-    {
-        route.push("--continue".to_owned());
-    }
+    // Rechecked at every launch: a session that slept has a conversation to
+    // continue even if its first launch had none.
+    let claude_continues = || -> Result<bool> {
+        Ok(hosted
+            && harness == "claude"
+            && bundle_plan.is_none()
+            && !["--continue", "-c", "--resume", "-r", "--session-id"]
+                .iter()
+                .any(|flag| chooses(flag))
+            && crate::host::claude_has_conversation(&folder.canonicalize()?))
+    };
     let control = crate::executable::installed()?;
     let plugins = fs::canonicalize(plugins_dir()?)?;
     let policy = serde_json::to_string(&crate::permissions::load()?)?;
-    let launch = || {
+    if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
+        for (file, what) in [
+            ("attended/mail.ts", "attended mail adapter"),
+            // The captain's fleet commands, such as /stow, in the live session.
+            ("attended/captain.ts", "Pi captain commands"),
+        ] {
+            ensure!(
+                plugins.join(file).is_file(),
+                "{what} missing from {}",
+                plugins.display()
+            );
+        }
+        if matches!(harness.as_str(), "pi" | "pi-signed") {
+            ensure!(
+                plugins.join("attended/calm.ts").is_file(),
+                "Pi calm extension missing"
+            );
+        }
+    } else if harness == "claude" {
+        ensure!(
+            plugins.join("attended-claude/hooks/hooks.json").is_file(),
+            "Claude attended mail plugin missing"
+        );
+    } else if harness == "opencode-v2" {
+        crate::opencode_mail::install(folder, &plugins)?;
+    } else if harness == "cursor" {
+        cursor_settings(folder, &control)?;
+    }
+    let build = |holder: &str| -> Result<std::process::Command> {
         let mut command = std::process::Command::new("python3");
         command.arg(plugins.join("native_launch.py"));
         if let Some(plan) = &bundle_plan {
@@ -989,83 +1012,50 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             .arg(&policy)
             .arg(&harness)
             .arg(&binary);
+        if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
+            command.arg("-e").arg(plugins.join("attended/mail.ts"));
+            command.arg("-e").arg(plugins.join("attended/captain.ts"));
+            if matches!(harness.as_str(), "pi" | "pi-signed") {
+                command.arg("-e").arg(plugins.join("attended/calm.ts"));
+            }
+        } else if harness == "claude" {
+            command
+                .arg("--plugin-dir")
+                .arg(plugins.join("attended-claude"));
+        } else if harness == "opencode-v2" {
+            command.arg("--standalone");
+        }
+        command.args(&route);
+        if claude_continues()? {
+            command.arg("--continue");
+        }
         command
+            .args(passthrough)
+            .current_dir(folder)
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", &ship)
+            .env("PRIVATEER_HOME", home)
+            .env("PRIVATEER_CONTROL_CLI", &control)
+            .env("PRIVATEER_ATTENDED_HARNESS", &harness)
+            .env("PRIVATEER_PRESENCE_HOLDER", holder);
+        for (name, key) in [
+            ("PRIVATEER_QUIET_COMPACT_SECS", "quiet_compact_secs"),
+            ("PRIVATEER_QUIET_COMPACT_PERCENT", "quiet_compact_percent"),
+        ] {
+            if let Some(value) = profile["first_mate"][key].as_u64() {
+                command.env(name, value.to_string());
+            }
+        }
+        if hosted {
+            command.env("PRIVATEER_HOSTED", "1");
+        }
+        Ok(command)
     };
-    let mut command = launch();
-    if matches!(harness.as_str(), "pi" | "pi-signed" | "omp") {
-        let plugins = fs::canonicalize(plugins_dir()?)?;
-        let extension = plugins.join("attended/mail.ts");
-        ensure!(
-            extension.is_file(),
-            "attended mail adapter missing from {}",
-            plugins.display()
-        );
-        command = launch();
-        command.arg("-e").arg(extension);
-        // The captain's fleet commands, such as /stow, in the live session.
-        let captain = plugins.join("attended/captain.ts");
-        ensure!(captain.is_file(), "Pi captain commands missing");
-        command.arg("-e").arg(captain);
-        if matches!(harness.as_str(), "pi" | "pi-signed") {
-            let calm = plugins.join("attended/calm.ts");
-            ensure!(calm.is_file(), "Pi calm extension missing");
-            command.arg("-e").arg(calm);
-        }
-    } else if harness == "claude" {
-        let plugins = fs::canonicalize(plugins_dir()?)?;
-        let plugin = plugins.join("attended-claude");
-        ensure!(
-            plugin.join("hooks/hooks.json").is_file(),
-            "Claude attended mail plugin missing"
-        );
-        command = launch();
-        command.arg("--plugin-dir").arg(plugin);
-    } else if harness == "opencode-v2" {
-        let plugins = fs::canonicalize(plugins_dir()?)?;
-        crate::opencode_mail::install(folder, &plugins)?;
-        command = launch();
-        command.arg("--standalone");
-    } else if harness == "cursor" {
-        cursor_settings(folder, &control)?;
-    }
-    command
-        .args(&route)
-        .args(passthrough)
-        .current_dir(folder)
-        .env("PRIVATEER_ROLE", "agent")
-        .env("PRIVATEER_ACTOR", &ship)
-        .env("PRIVATEER_HOME", home)
-        .env("PRIVATEER_CONTROL_CLI", control)
-        .env("PRIVATEER_ATTENDED_HARNESS", &harness)
-        .env("PRIVATEER_PRESENCE_HOLDER", &holder);
-    for (name, key) in [
-        ("PRIVATEER_QUIET_COMPACT_SECS", "quiet_compact_secs"),
-        ("PRIVATEER_QUIET_COMPACT_PERCENT", "quiet_compact_percent"),
-    ] {
-        if let Some(value) = profile["first_mate"][key].as_u64() {
-            command.env(name, value.to_string());
-        }
-    }
-    if hosted {
-        command.env("PRIVATEER_HOSTED", "1");
-    }
     // The child can invoke a startup hook immediately after spawn.
     if hosted {
         crate::presence::adopt(&store, &ship, &holder, 90)?;
     } else {
         crate::presence::claim(&store, &ship, &holder, 90, Some(&harness))?;
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = crate::presence::leave(&store, &ship, &holder);
-            return Err(error).with_context(|| format!("cannot start {binary}; is it installed?"));
-        }
-    };
-    if hosted {
-        // A failure to record readiness leaves the conservative reserved retry
-        // in place; never abandon an already spawned native process over it.
-        let _ = crate::host::started(&store, &ship, &holder);
     }
     // Ctrl-C belongs to the harness; this process must live to release
     // presence afterwards.
@@ -1073,34 +1063,57 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let heartbeat = {
-        let (stop, home, ship, holder) = (
-            stop.clone(),
-            home.to_path_buf(),
-            ship.clone(),
-            holder.clone(),
-        );
-        std::thread::spawn(move || {
-            let Ok(store) = Store::open(&home) else {
-                return;
-            };
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                for _ in 0..30 {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Ships recorded before the setting existed sleep by default too.
+    let sleep_after = if hosted {
+        profile["first_mate"]["sleep_after_secs"]
+            .as_u64()
+            .unwrap_or(crate::host::sleep::DEFAULT_AFTER_SECS)
+    } else {
+        0
+    };
+    let terminal = crate::host::sleep::Terminal::save();
+    let mut holder = holder;
+    let status = loop {
+        let mut child = match build(&holder).and_then(|mut command| {
+            command
+                .spawn()
+                .with_context(|| format!("cannot start {binary}; is it installed?"))
+        }) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = crate::presence::leave(&store, &ship, &holder);
+                return Err(error);
+            }
+        };
+        if hosted {
+            // A failure to record readiness leaves the conservative reserved retry
+            // in place; never abandon an already spawned native process over it.
+            let _ = crate::host::started(&store, &ship, &holder);
+        }
+        match crate::host::sleep::supervise(&store, &ship, &holder, &mut child, sleep_after)? {
+            crate::host::sleep::Ended::Exited(status) => break status,
+            crate::host::sleep::Ended::Asleep(asleep) => {
+                holder.clone_from(&asleep.holder);
+                if let Some(lease) = hosted_lease.as_mut() {
+                    lease.holder.clone_from(&holder);
                 }
-                if !crate::presence::refresh(&store, &ship, &holder, 90).unwrap_or(false) {
-                    return;
+                let Some(reason) = crate::host::sleep::rest(&store, &ship, &asleep, &terminal)?
+                else {
+                    std::process::exit(0);
+                };
+                crate::host::sleep::woke(&store, &ship, reason);
+                // What admitted the first launch may have been revoked since.
+                let mut check = Store::open(home)?;
+                let profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
+                if let Err(error) =
+                    crate::host::validate_start(&mut check, &ship, &profile["first_mate"])
+                {
+                    let _ = crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
+                    return Err(error);
                 }
             }
-        })
+        }
     };
-    let status = child.wait()?;
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = heartbeat.join();
     if hosted && !status.success() {
         crate::host::failed(
             &store,

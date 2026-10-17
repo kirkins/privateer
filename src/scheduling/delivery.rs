@@ -71,7 +71,7 @@ fn blocked(
     Ok(awake.then(|| "Waiting for the current coordinator".into()))
 }
 
-fn ready_ids(store: &Store, ship: &str) -> Result<Vec<String>> {
+pub(super) fn ready_ids(store: &Store, ship: &str) -> Result<Vec<String>> {
     let mut statement = store.connection().prepare(
         "SELECT s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id
          WHERE t.owner=?1 AND json_extract(s.record,'$.owner')=?1 AND json_extract(s.record,'$.state')='ready'
@@ -193,8 +193,13 @@ pub(super) fn poll(store: &Store, args: &Value) -> Result<Value> {
     let (ship, holder) = lease(store, args)?;
     let idle = args["idle"].as_bool().context("idle must be boolean")?;
     let now = Store::now_ms();
-    store.connection().execute("INSERT INTO work_sessions(ship,holder,idle,checked_ms) VALUES(?1,?2,?3,?4)
-        ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder,idle=excluded.idle,checked_ms=excluded.checked_ms", params![ship,holder,idle,now])?;
+    // An idle spell lasts while this session keeps reporting idle without a
+    // gap; a busy report, a new session or a silent adapter starts it afresh.
+    store.connection().execute("INSERT INTO work_sessions(ship,holder,idle,checked_ms,idle_since_ms) VALUES(?1,?2,?3,?4,CASE WHEN ?3 THEN ?4 END)
+        ON CONFLICT(ship) DO UPDATE SET idle_since_ms=CASE WHEN NOT excluded.idle THEN NULL
+          WHEN work_sessions.holder=excluded.holder AND work_sessions.idle AND excluded.checked_ms-work_sessions.checked_ms<=?5
+          THEN COALESCE(work_sessions.idle_since_ms,excluded.checked_ms) ELSE excluded.checked_ms END,
+          holder=excluded.holder,idle=excluded.idle,checked_ms=excluded.checked_ms", params![ship,holder,idle,now,IDLE_GAP_MS])?;
     // Renew only this native session's active turn. Readiness is not progress.
     if !idle {
         let mut statement = store.connection().prepare("SELECT task_id FROM task_schedule WHERE json_extract(record,'$.holder')=?1 AND json_extract(record,'$.owner')=?2 AND json_extract(record,'$.state')='claimed' LIMIT 100")?;

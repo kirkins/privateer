@@ -522,7 +522,10 @@ impl Herdr {
 }
 
 fn hosted_fixture() -> (Place, Herdr) {
-    let place = Place::new();
+    hosted(Place::new())
+}
+
+fn hosted(place: Place) -> (Place, Herdr) {
     let socket = place.root.join("config/herdr/herdr.sock");
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let herdr = Herdr::start(
@@ -1611,6 +1614,55 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
     assert_eq!(place.wakes(), 2);
     place.stop_wake("due missing-socket fallback", &report);
+}
+
+#[test]
+fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_wakes_it() {
+    let place = Place::new();
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["sleep_after_secs"] = json!(1);
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let (place, herdr) = hosted(place);
+    let pid = place.native_pid();
+    let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
+    let holder = env.trim().split_once(' ').unwrap().1.to_owned();
+
+    // Its mail adapter reports it idle for longer than sleep_after_secs.
+    let idle = json!({"ship":"infra","holder":holder,"idle":true});
+    place.agent("work.poll", idle.clone());
+    std::thread::sleep(Duration::from_millis(1100));
+    place.agent("work.poll", idle);
+    until(
+        "the idle native payload to exit",
+        || unsafe { libc::kill(pid, 0) } == -1,
+    );
+    for file in ["pi-pid", "pi-env", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+
+    // Asleep, the pane keeps the ship's hosted lease under a new holder, so
+    // the dispatcher neither opens another space nor wakes it headless.
+    let lease = place.json("ship.presence", json!({"ship":"infra"}));
+    let asleep = lease["lease"]["holder"].as_str().unwrap().to_owned();
+    assert!(asleep.starts_with("host:") && asleep != holder, "{lease}");
+    assert_eq!(place.tick()["skipped"], "its live first mate has the mail");
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(place.wakes(), 0);
+
+    // Mail wakes it in the same pane, on the same conversation, as the
+    // session the lease now names.
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
+    );
+    until("the woken harness", || place.root.join("pi-env").exists());
+    let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
+    assert_eq!(env.trim(), format!("1 {asleep}"));
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    assert_eq!(place.wakes(), 0);
+    place.stop_native("infra");
 }
 
 #[test]

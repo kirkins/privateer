@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 const BRIEF_BYTES: usize = 16_384;
 const CLAIM_MS: i64 = 120_000;
 const ADAPTER_MS: i64 = 60_000;
+/// Adapters report every five seconds; a longer silence breaks an idle spell.
+const IDLE_GAP_MS: i64 = 30_000;
 const MAX_ATTEMPTS: u32 = 3;
 const ACTIVE: &str = "'starting','queued','launching','running','orphaned'";
 
@@ -46,7 +48,22 @@ pub(crate) fn init(store: &Store) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS task_schedule(task_id TEXT PRIMARY KEY REFERENCES tasks(id),record TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS work_sessions(ship TEXT PRIMARY KEY,holder TEXT NOT NULL,idle INTEGER NOT NULL,checked_ms INTEGER NOT NULL);",
     )?;
+    let tx = store.write_transaction()?;
+    let has_idle_since: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_sessions') WHERE name='idle_since_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_idle_since {
+        tx.execute_batch("ALTER TABLE work_sessions ADD COLUMN idle_since_ms INTEGER;")?;
+    }
+    tx.commit()?;
     Ok(())
+}
+
+/// Whether a ship has scheduled work ready for its first mate now.
+pub(crate) fn has_ready(store: &Store, ship: &str) -> Result<bool> {
+    Ok(!delivery::ready_ids(store, ship)?.is_empty())
 }
 
 pub(crate) fn available(store: &Store) -> Result<bool> {

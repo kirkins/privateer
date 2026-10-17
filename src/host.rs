@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub mod bridge;
+pub(crate) mod sleep;
 
 /// How long a launch may take to adopt its lease before it lapses.
 const LAUNCH_TTL_SECS: u64 = 60;
@@ -387,11 +388,12 @@ pub(crate) fn failed(store: &Store, ship: &str, holder: &str, error: &str) -> Re
 pub(crate) struct Lease<'a> {
     pub store: &'a Store,
     pub ship: &'a str,
-    pub holder: &'a str,
+    /// The current holder, which changes when the first mate sleeps.
+    pub holder: String,
 }
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        let _ = crate::presence::leave(self.store, self.ship, self.holder);
+        let _ = crate::presence::leave(self.store, self.ship, &self.holder);
     }
 }
 
