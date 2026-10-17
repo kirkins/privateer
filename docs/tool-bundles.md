@@ -249,7 +249,9 @@ python3 tests/claude_bundles_native.py /absolute/installed/native/claude
 
 The Claude suites run in a temporary HOME, `CLAUDE_CONFIG_DIR` and XDG. The
 deterministic one uses a fake `claude` for argv plans and each refusal; the
-Rust suite checks planning and digest-gated resume. The opt-in native probe
+Rust suite checks planning and digest-gated resume, and drives real `serve`
+wakes through a compiled fake `claude` (fresh, then resumed, then fresh after
+a carried setting changes). The opt-in native probe
 points `ANTHROPIC_BASE_URL` at a dead loopback port with a fixture API key,
 reads `system/init` and kills the process: no model call. It seeds a personal
 skill, hook and MCP server, and checks that only the selected skill, the
