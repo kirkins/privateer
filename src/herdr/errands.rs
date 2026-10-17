@@ -326,6 +326,16 @@ fn validated_client(store: &Store, target: &Target) -> std::result::Result<Clien
         return Err(PublishError::Unsafe);
     }
     let view = client.snapshot().map_err(|_| PublishError::Unavailable)?;
+    // A sleeping first mate's pane is listed under the sleep label, which is
+    // not its harness: keep the caption record until it wakes, rather than
+    // discard it as an incompatible occupant.
+    let asleep = view.panes.iter().any(|p| {
+        p.pane_id == binding.pane.pane_id
+            && p.agent.as_deref() == Some(crate::host::sleep::PANE_AGENT)
+    });
+    if asleep {
+        return Err(PublishError::Unavailable);
+    }
     let validate = || -> Result<()> {
         // The snapshot already refuses duplicate pane and terminal identities.
         let pane = view

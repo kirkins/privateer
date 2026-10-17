@@ -116,7 +116,7 @@ pub fn run(store: &mut Store, ship: &str) -> Result<()> {
         }
     }
     if let Some(herdr) = herdr.as_mut() {
-        herdr.release();
+        let _ = herdr.release();
     }
     Ok(())
 }
@@ -226,7 +226,7 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
         }
     }
     if let Some(herdr) = herdr.as_mut() {
-        herdr.release();
+        let _ = herdr.release();
     }
     Ok(())
 }
@@ -683,10 +683,29 @@ impl Herdr {
         }
     }
 
-    pub(crate) fn release(&mut self) {
-        if let Some(client) = self.client.as_mut() {
-            let _ = client.release_agent(&self.pane, &self.agent);
+    /// The pane as Herdr lists it now; an error when Herdr cannot say.
+    pub(crate) fn pane(&mut self) -> Result<Value> {
+        if self.client.is_none() {
+            self.client = Some(crate::herdr::Client::connect(&self.socket)?);
         }
+        let client = self.client.as_mut().context("connected above")?;
+        let result = client.pane_get(&self.pane);
+        if result.is_err() {
+            self.client = None;
+        }
+        result
+    }
+
+    pub(crate) fn release(&mut self) -> Result<()> {
+        if self.client.is_none() {
+            self.client = Some(crate::herdr::Client::connect(&self.socket)?);
+        }
+        let client = self.client.as_mut().context("connected above")?;
+        let result = client.release_agent(&self.pane, &self.agent);
+        if result.is_err() {
+            self.client = None;
+        }
+        result
     }
 }
 

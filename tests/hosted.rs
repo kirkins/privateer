@@ -311,6 +311,8 @@ struct Herdr {
     reject_caption: Arc<AtomicBool>,
     /// The pane the captain's client has focused.
     focus: Arc<Mutex<Option<String>>>,
+    /// Herdr answers ok to reports and drops them.
+    drop_reports: Arc<AtomicBool>,
 }
 
 impl Herdr {
@@ -330,6 +332,8 @@ impl Herdr {
         let reject_caption = Arc::new(AtomicBool::new(false));
         let focus = Arc::new(Mutex::new(None::<String>));
         let focused = focus.clone();
+        let drop_reports = Arc::new(AtomicBool::new(false));
+        let dropping = drop_reports.clone();
         let reject_label = reject_caption.clone();
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
@@ -478,6 +482,68 @@ impl Herdr {
                         }
                         json!({"type":"ok"})
                     }
+                    "pane.report_agent" => {
+                        // Herdr drops a report naming the agent it recorded as exited in this
+                        // pane, and answers ok; any other report takes the pane.
+                        let mut live = live.lock().unwrap();
+                        if let Some(pane) =
+                            live.iter_mut().find(|p| p["pane_id"] == params["pane_id"])
+                        {
+                            if !dropping.load(Ordering::SeqCst)
+                                && pane["exited_agent"] != params["agent"]
+                            {
+                                pane["agent"] = params["agent"].clone();
+                                pane["agent_source"] = params["source"].clone();
+                                pane["agent_status"] = params["state"].clone();
+                                pane["exited_agent"] = Value::Null;
+                            }
+                        }
+                        json!({"type":"ok"})
+                    }
+                    "pane.report_metadata" => {
+                        let mut live = live.lock().unwrap();
+                        if let Some(pane) =
+                            live.iter_mut().find(|p| p["pane_id"] == params["pane_id"])
+                        {
+                            // A guard names the agent the label must still be.
+                            // Errand captions keep their own source and are not
+                            // modelled here.
+                            let guarded = params.get("agent").is_some_and(|a| *a != pane["agent"]);
+                            if params["source"] == "privateer"
+                                && !dropping.load(Ordering::SeqCst)
+                                && !guarded
+                            {
+                                if let Some(display) = params.get("display_agent") {
+                                    pane["display_agent"] = display.clone();
+                                }
+                                if params.get("clear_display_agent") == Some(&json!(true)) {
+                                    pane["display_agent"] = Value::Null;
+                                }
+                            }
+                        }
+                        json!({"type":"ok"})
+                    }
+                    "pane.release_agent" => {
+                        let mut live = live.lock().unwrap();
+                        if let Some(pane) =
+                            live.iter_mut().find(|p| p["pane_id"] == params["pane_id"])
+                        {
+                            if pane["agent"] == params["agent"]
+                                && pane["agent_source"] == params["source"]
+                            {
+                                pane["agent"] = Value::Null;
+                                pane["agent_source"] = Value::Null;
+                                pane["agent_status"] = json!("unknown");
+                                pane["display_agent"] = Value::Null;
+                            }
+                        }
+                        json!({"type":"ok"})
+                    }
+                    "pane.get" => {
+                        let live = live.lock().unwrap();
+                        let pane = live.iter().find(|p| p["pane_id"] == params["pane_id"]);
+                        json!({"pane": pane.cloned().unwrap_or(Value::Null)})
+                    }
                     _ => json!({"type":"ok"}),
                 };
                 let _ = writeln!(stream, "{}", json!({"id":request["id"],"result":result}));
@@ -498,6 +564,7 @@ impl Herdr {
             creating,
             reject_caption,
             focus,
+            drop_reports,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -516,6 +583,27 @@ impl Herdr {
             .find(|pane| pane["workspace_id"] == workspace_id)
             .expect("hosted pane exists");
         pane["agent_status"] = json!(status);
+    }
+    /// Herdr has recorded the harness in this pane as exited, so it drops a
+    /// report naming that agent until a new agent process is detected.
+    fn exit_agent(&self, pane_id: &str, agent: &str) {
+        let mut panes = self.panes.lock().unwrap();
+        let pane = panes
+            .iter_mut()
+            .find(|p| p["pane_id"] == pane_id)
+            .expect("hosted pane exists");
+        pane["agent"] = Value::Null;
+        pane["agent_status"] = json!("unknown");
+        pane["display_agent"] = Value::Null;
+        pane["exited_agent"] = json!(agent);
+    }
+    fn pane_state(&self, pane_id: &str) -> Value {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .iter()
+            .find(|p| p["pane_id"] == pane_id)
+            .cloned()
+            .unwrap()
     }
     /// The sidebar, top to bottom.
     fn order(&self) -> Vec<String> {
@@ -1623,33 +1711,52 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     place.stop_wake("due missing-socket fallback", &report);
 }
 
-#[test]
-fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
+/// Idle the hosted first mate past its sleep threshold until it sleeps: its
+/// adapter reports it idle, and its native payload exits. Herdr has recorded
+/// the harness as exited by then, which is when it drops a report naming it.
+fn sleep_hosted(place: &Place, herdr: &Herdr) -> String {
+    let pid = place.native_pid();
+    let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
+    let holder = env.trim().split_once(' ').unwrap().1.to_owned();
+    let idle = json!({"ship":"infra","holder":holder,"idle":true});
+    place.agent("work.poll", idle.clone());
+    std::thread::sleep(Duration::from_millis(1100));
+    herdr.exit_agent("w2:p1", "pi");
+    place.agent("work.poll", idle);
+    until(
+        "the idle native payload to exit",
+        || unsafe { libc::kill(pid, 0) } == -1,
+    );
+    for file in ["pi-pid", "pi-env", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    holder
+}
+
+/// The hosted first mate "infra", set to sleep after one second, in its pane.
+fn hosted_sleeper() -> (Place, Herdr) {
     let place = Place::new();
     let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
     first_mate["sleep_after_secs"] = json!(1);
     place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
-    let (place, herdr) = hosted(place);
-    // Its adapter reports it idle for longer than sleep_after_secs; the
-    // native payload itself exits.
-    let sleep = |place: &Place| -> String {
-        let pid = place.native_pid();
-        let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
-        let holder = env.trim().split_once(' ').unwrap().1.to_owned();
-        let idle = json!({"ship":"infra","holder":holder,"idle":true});
-        place.agent("work.poll", idle.clone());
-        std::thread::sleep(Duration::from_millis(1100));
-        place.agent("work.poll", idle);
-        until(
-            "the idle native payload to exit",
-            || unsafe { libc::kill(pid, 0) } == -1,
-        );
-        for file in ["pi-pid", "pi-env", "pi-argv"] {
-            fs::remove_file(place.root.join(file)).unwrap();
-        }
-        holder
-    };
-    let holder = sleep(&place);
+    hosted(place)
+}
+
+/// Audit rows of reports Herdr answered ok but did not take.
+fn ignored_reports(place: &Place) -> Vec<Value> {
+    place.json("audit.list", json!({"limit":1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "host.report_ignored")
+        .map(|event| event["payload"].clone())
+        .collect()
+}
+
+#[test]
+fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
+    let (place, herdr) = hosted_sleeper();
+    let holder = sleep_hosted(&place, &herdr);
 
     // Asleep, the pane keeps the ship's hosted lease under a new holder, so
     // the dispatcher neither opens another space nor wakes it headless, and
@@ -1669,6 +1776,15 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
                     .is_some_and(|m| m.contains("asleep"))
         })
     });
+    // Herdr lists the pane under the mate's own label, not the harness's
+    // (which it dropped), with the ship as its name.
+    until("the pane listed as asleep", || {
+        let pane = herdr.pane_state("w2:p1");
+        pane["agent"] == "privateer"
+            && pane["display_agent"] == "infra"
+            && pane["agent_status"] == "idle"
+    });
+    assert!(ignored_reports(&place).is_empty());
 
     // Mail wakes it in the same pane, on the same conversation, as the
     // session the lease now names, and hands the pane back to detection.
@@ -1687,7 +1803,7 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
 
     // Asleep again, the captain moving to its pane wakes it.
     *herdr.focus.lock().unwrap() = Some("w1:p1".into());
-    sleep(&place);
+    sleep_hosted(&place, &herdr);
     until("the asleep report", || {
         herdr.calls("pane.report_agent").len() >= 2
     });
@@ -1696,6 +1812,36 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
         place.root.join("pi-env").exists()
     });
     assert_eq!(herdr.calls("workspace.create").len(), 1);
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_sleep_report_herdr_drops_is_warned_about_and_audited_once() {
+    let (place, herdr) = hosted_sleeper();
+    herdr.drop_reports.store(true, Ordering::SeqCst);
+    sleep_hosted(&place, &herdr);
+    until("the audit of the dropped report", || {
+        !ignored_reports(&place).is_empty()
+    });
+    // Herdr keeps answering ok; later reports and the release are not audited again.
+    std::thread::sleep(Duration::from_millis(1500));
+    let rows = ignored_reports(&place);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["ship"], "infra");
+    assert_eq!(rows[0]["step"], "report");
+    assert_eq!(rows[0]["sent"]["agent"], "privateer");
+    assert_eq!(rows[0]["sent"]["display_agent"], "infra");
+    assert!(rows[0]["read"]["agent"].is_null(), "{rows:?}");
+    assert!(herdr.pane_state("w2:p1")["display_agent"].is_null());
+
+    // Herdr accepts reports again; mail still wakes the mate.
+    herdr.drop_reports.store(false, Ordering::SeqCst);
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
+    );
+    until("the woken harness", || place.root.join("pi-env").exists());
+    assert_eq!(ignored_reports(&place).len(), 1);
     place.stop_native("infra");
 }
 

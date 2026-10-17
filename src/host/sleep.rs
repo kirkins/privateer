@@ -10,7 +10,7 @@
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Idle reports arrive every five seconds; an older one says nothing about now.
 const FRESH_MS: i64 = 15_000;
@@ -205,12 +205,18 @@ impl Terminal {
     }
 }
 
+/// The agent a sleeping first mate reports as in its pane. Herdr drops a report
+/// naming the agent it recorded as exited there, and clears that record only
+/// when it detects a new agent process, so the harness's own name never works
+/// here. `herdr agent prompt` cannot reach a pane under this label either: a
+/// sleeping mate wakes by mail, focus, or input sent to its pane.
+pub(crate) const PANE_AGENT: &str = "privateer";
+
 /// Hold a sleeping ship's lease in its pane until something wakes it. Return
 /// why it woke, or None once the lease is gone, so the pane can close.
 pub(crate) fn rest(
     store: &Store,
     ship: &str,
-    harness: &str,
     asleep: &Asleep,
     terminal: &Terminal,
 ) -> Result<Option<&'static str>> {
@@ -218,16 +224,62 @@ pub(crate) fn rest(
     println!(
         "⚓ {ship}'s first mate is asleep to free memory. New mail or scheduled work wakes it.\n  Type a message and press Enter to mail it and wake the first mate, or just press Enter."
     );
-    // Herdr lists only panes it sees an agent in, so the sleeping pane keeps
-    // the ship in its agent list itself, where `herdr agent prompt` reaches
-    // the line reader below. Herdr's own detection takes over once woken.
+    // Herdr lists only panes it sees an agent in, so the sleeping pane reports
+    // itself as one under PANE_AGENT. Herdr's own detection takes over once woken.
     let mut herdr =
-        crate::watch::Herdr::from_env(ship, harness, &format!("{ship} first mate · asleep"));
+        crate::watch::Herdr::from_env(ship, PANE_AGENT, &format!("{ship} first mate · asleep"));
     let woke = wait(store, ship, asleep, terminal, herdr.as_mut());
+    // Released before the harness starts again, or Herdr keeps the label.
     if let Some(herdr) = herdr.as_mut() {
-        herdr.release();
+        match herdr.release() {
+            Ok(()) => {
+                let read = read_back(herdr);
+                // Only a pane still under the label is a dropped release; a pane
+                // Herdr could not be asked about is not audited as one.
+                if read["agent"] == PANE_AGENT {
+                    ignored(store, ship, "release", json!({"agent": PANE_AGENT}), read);
+                }
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                println!("✗ Herdr did not release {ship}'s pane: {error}");
+                ignored(
+                    store,
+                    ship,
+                    "release",
+                    json!({"agent": PANE_AGENT}),
+                    json!({"error": error}),
+                );
+            }
+        }
     }
     woke
+}
+
+/// Whether Herdr lists the pane as this ship's asleep first mate.
+fn listed(pane: &Value, ship: &str) -> bool {
+    pane["agent"] == PANE_AGENT
+        && pane["agent_status"] != "unknown"
+        && pane["display_agent"] == ship
+}
+
+/// The pane as Herdr now lists it, or the reason Herdr could not say.
+fn read_back(herdr: &mut crate::watch::Herdr) -> Value {
+    herdr
+        .pane()
+        .unwrap_or_else(|error| json!({"error": format!("{error:#}")}))
+}
+
+/// A report or release Herdr answered ok but did not take. Warned about on
+/// the pane once, and audited once per sleep, with what was sent and read back.
+fn ignored(store: &Store, ship: &str, step: &str, sent: Value, read: Value) {
+    println!(
+        "⚠ Herdr does not list {ship}'s asleep first mate in this pane ({step}); Herdr may have dropped the report."
+    );
+    let _ = store.audit(
+        "host.report_ignored",
+        &json!({"ship": ship, "step": step, "sent": sent, "read": read}),
+    );
 }
 
 fn wait(
@@ -241,6 +293,8 @@ fn wait(
     let mut keyboard = terminal.0.is_some();
     let mut refreshed = Instant::now();
     let mut reported: Option<Instant> = None;
+    let mut unlisted = false;
+    let mut verify: Option<Instant> = None;
     // Focus wakes it only when the captain moves to the pane: a pane that
     // was focused as it fell asleep, or whose focus Herdr cannot report,
     // waits for Enter.
@@ -260,8 +314,24 @@ fn wait(
         }
         if let Some(herdr) = herdr.as_deref_mut() {
             if reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(20)) {
-                herdr.report("idle", &format!("{ship}: asleep · focus or Enter wakes it"));
+                let message = format!("{ship}: asleep · focus or Enter wakes it");
+                herdr.report("idle", &message);
                 reported = Some(Instant::now());
+                // Read back a little later: Herdr's own exit detection may lag
+                // the harness's exit, and a report it lists only afterwards counts.
+                verify = Some(Instant::now() + Duration::from_secs(5));
+            }
+            if verify.is_some_and(|at| Instant::now() >= at) {
+                verify = None;
+                if !unlisted {
+                    let read = read_back(herdr);
+                    if !listed(&read, ship) {
+                        unlisted = true;
+                        let sent =
+                            json!({"agent": PANE_AGENT, "display_agent": ship, "state": "idle"});
+                        ignored(store, ship, "report", sent, read);
+                    }
+                }
             }
             match herdr.focused() {
                 Some(true) if !focused => return Ok(Some("focus")),
