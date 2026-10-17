@@ -132,7 +132,7 @@ and a zero native exit. Error, aborted, truncated and incomplete runs fail the
 job; native retries may recover before the final settled event. Explicit resume
 must match the requested UUID or the existing session file's header. No extra
 model retries or provider fallback are introduced. Repeated `message_update`
-snapshots are checked by the bridge but omitted from the capped job log; the
+snapshots are parsed by the bridge but omitted from the capped job log; the
 final summary records their count. Other native events are preserved. The
 summary counts only authoritative completed-message and compaction usage,
 excluding repeated streaming snapshots. This confirms native run completion,
