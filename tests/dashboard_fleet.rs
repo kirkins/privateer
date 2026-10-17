@@ -2468,3 +2468,105 @@ fn fleet_without_linked_machines_has_no_group_headings() {
     assert!(!text.contains("This machine"));
     assert!(!text.contains("reached"));
 }
+
+/// Links machine `mac` with the given ships and last-reached time to a registry.
+fn link_mac(registry: &Path, refreshed_ms: i64, ships: &[&str]) {
+    let conn = rusqlite::Connection::open(registry).unwrap();
+    conn.execute(
+        "INSERT INTO machines(name, role, peer, known_as, added_ms, refreshed_ms) VALUES('mac','collects','{}','laptop',1,?1)",
+        [refreshed_ms],
+    )
+    .unwrap();
+    for name in ships {
+        let scope = format!("Scope of {name}");
+        conn.execute(
+            "INSERT INTO machine_ships(machine, name, scope, consumes) VALUES('mac', ?1, ?2, '[]')",
+            [*name, scope.as_str()],
+        )
+        .unwrap();
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[test]
+fn local_work_owned_by_a_linked_ship_still_lists_it_under_its_machine() {
+    use crossterm::event::KeyCode;
+    use privateer::dashboard::{fleet, ui::App};
+    let m = Machine::new();
+    let apps = m.ship("apps");
+    // A local task delegated to a ship that lives on the linked machine.
+    m.json(
+        &apps,
+        "task.create",
+        json!({"id":"delegated","owner":"mini-a","title":"Assignment delegated","charter_id":"apps"}),
+    );
+    let registry = m.root.join("fleet.sqlite");
+    link_mac(&registry, now_ms() - 12 * 60_000, &["mini-a"]);
+
+    let snapshot = fleet::read(&registry, None).unwrap();
+    let rows: Vec<_> = snapshot.ships.iter().filter(|s| s.id == "mini-a").collect();
+    assert_eq!(rows.len(), 1, "{snapshot:?}");
+    assert_eq!(rows[0].remote.as_deref(), Some("mac"));
+    assert!(rows[0].live.is_none());
+
+    let mut app = App {
+        snapshot,
+        ..App::default()
+    };
+    let text = screen(&mut app);
+    let heading = text.find("mac · last reached 12 min ago").unwrap();
+    assert!(text.find("mini-a · remote").unwrap() > heading, "{text}");
+    assert!(text.find("This machine ·").unwrap() < heading, "{text}");
+
+    app.select_ship(Some("mini-a".into()));
+    assert!(!app.bridge_key(KeyCode::Enter));
+    assert!(app.notice.contains("nothing opens from here"));
+}
+
+#[test]
+fn remote_rows_open_nothing_on_click_and_future_reach_times_read_just_now() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use privateer::dashboard::{fleet, ui::App};
+    let m = Machine::new();
+    m.ship("apps");
+    let registry = m.root.join("fleet.sqlite");
+    link_mac(&registry, now_ms() + 60 * 60_000, &["mini-a"]);
+
+    let snapshot = fleet::read(&registry, None).unwrap();
+    let mut app = App {
+        snapshot,
+        ..App::default()
+    };
+    let text = screen(&mut app);
+    assert!(text.contains("mac · last reached just now"), "{text}");
+    // The screen buffer is one flat string; cut it back into 120-column rows.
+    let lines: Vec<String> = text
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(120)
+        .map(|row| row.iter().collect())
+        .collect();
+    let row = lines
+        .iter()
+        .position(|l| l.contains("mini-a · remote"))
+        .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row: row as u16,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.ship.as_deref(), Some("mini-a"));
+    assert!(
+        app.notice.contains("nothing opens from here"),
+        "{}",
+        app.notice
+    );
+    assert!(!app.board_requested && !app.watch_requested);
+}

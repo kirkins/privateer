@@ -156,7 +156,6 @@ fn empty(ascii: bool) -> &'static str {
     if ascii { "-" } else { "·" }
 }
 
-/// Header, rows and widths of the fleet table that fit in `width` columns.
 /// One row of the fleet table: a heading naming a machine, or a ship by its
 /// index in `snapshot.ships`.
 #[derive(Debug, PartialEq, Eq)]
@@ -207,6 +206,7 @@ pub fn row_of(rows: &[FleetRow], ship: usize) -> Option<usize> {
     rows.iter().position(|row| *row == FleetRow::Ship(ship))
 }
 
+/// Header, rows and widths of the fleet table that fit in `width` columns.
 pub fn table(
     snapshot: &Snapshot,
     width: u16,

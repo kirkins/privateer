@@ -136,10 +136,16 @@ fn attach_linked(registry: &Path, snapshot: &mut Snapshot) -> Result<()> {
             last_reached_ms: reached.refreshed_ms,
         });
         for (name, scope) in reached.ships {
-            // Ship names are unique across linked machines; a clash here is
-            // a local ship, which stays the one shown.
-            if snapshot.ships.iter().any(|ship| ship.id == name) {
-                continue;
+            // Ship names are unique across linked machines; a clash with a
+            // real local ship (live state present) stays the one shown. A bare
+            // placeholder, named only by local work, is replaced by the remote
+            // entry so the ship is not shown as local.
+            if let Some(index) = snapshot.ships.iter().position(|ship| ship.id == name) {
+                let ship = &snapshot.ships[index];
+                if ship.live.is_some() || ship.remote.is_some() {
+                    continue;
+                }
+                snapshot.ships.remove(index);
             }
             if snapshot.ships.len() >= ROW_LIMIT {
                 snapshot.truncated = true;
