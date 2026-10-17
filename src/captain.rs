@@ -8,6 +8,9 @@
 //! the captain and record an answer the captain gave it, but only by citing the
 //! captain's own message, which the reply keeps. Production approvals are a
 //! separate operator grant and are never relayed.
+//!
+//! The list carries each request's age, so a request read hours after it was
+//! asked is not restated to the captain as if it had just arrived.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::params;
@@ -44,8 +47,12 @@ fn desk(store: &Store) -> Result<Option<String>> {
 }
 
 /// Every open request or decision addressed to the captain, in every fleet
-/// home, oldest first.
+/// home, oldest first. Each entry carries when it was asked (`asked_ms`) and
+/// how long ago that was (`age_ms`), so whoever reads the list can say "X asked
+/// at T" instead of restating a request body as if it were news. Ages are
+/// computed once here, against `now_ms`, and never stored.
 pub fn waiting() -> Result<Value> {
+    let now = Store::now_ms();
     let mut waiting = vec![];
     for (ship, home) in fleet()? {
         let mut store = Store::open(&home)?;
@@ -55,12 +62,14 @@ pub fn waiting() -> Result<Value> {
             json!({"address": crate::mail::CAPTAIN, "state": "open"}),
         )?;
         for mail in open["requests"].as_array().into_iter().flatten() {
-            waiting.push(json!({"ship": ship, "mail": mail}));
+            let asked = mail["created_ms"].as_i64().unwrap_or(now);
+            waiting.push(json!({"ship": ship, "asked_ms": asked,
+                "age_ms": (now - asked).max(0), "mail": mail}));
         }
     }
-    waiting.sort_by_key(|w| w["mail"]["created_ms"].as_i64().unwrap_or(0));
+    waiting.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
     waiting.truncate(MAX_WAITING);
-    Ok(json!({"waiting": waiting}))
+    Ok(json!({"now_ms": now, "waiting": waiting}))
 }
 
 /// Answer an open captain request with what the captain told the liaison.

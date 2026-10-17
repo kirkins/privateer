@@ -875,6 +875,14 @@ fn liaison_preset_acts_for_the_captain_and_keeps_captain_edits() {
     assert!(emitted.contains("Production deployment stays with the captain"));
     assert!(emitted.contains("project.add"));
     assert!(!emitted.contains("ask the captain to run"));
+    // A stow incident: the liaison restated a request body as current fact.
+    // It must say when each request was asked, off the list's own ages.
+    assert!(emitted.contains(r#"Report an outstanding item as "X asked at T, N min ago""#));
+    assert!(emitted.contains("`asked_ms`"));
+    assert!(emitted.contains("`age_ms`"));
+    // ... and read runtime state back before restating what a request claims.
+    assert!(emitted.contains("never a current fact"));
+    assert!(emitted.contains("`stow.status`"));
     folder.ok(&["init", "--harness", "codex"]);
     assert!(
         fs::read_to_string(folder.ship.join("AGENTS.md"))

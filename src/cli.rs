@@ -707,7 +707,16 @@ scopes are what every ship reads to find an owner.
 
 `captain.waiting {{}}` lists every open request and decision addressed to the
 captain across the fleet, the raw mail list `/waiting` shows (distinct from the
-dashboard's bounded typed Needs).
+dashboard's bounded typed Needs). Each entry carries `asked_ms` when it was sent
+and `age_ms` how long ago that was, against the list's `now_ms`.
+Report an outstanding item as "X asked at T, N min ago": the age is what tells
+the captain how fresh it is. An open request is a frozen statement of what was
+true when it was written, never a current fact: before you restate any claim of
+runtime state in it (a machine stowed, a job running, something installed, a
+ship awake), read that state back now — `stow.status`, `job.list`,
+`ship.show`, the owning ship's latest mail — and tell the captain what it says
+today, or that the claim is stale. If what the runtime says disagrees with the
+request, say so instead of repeating the request body.
 When the captain asks what is outstanding, read it, ask each owning ship to
 withdraw what is stale (`mail.withdraw`), then go through the real decisions
 one at a time in plain words. When the captain decides one in conversation
