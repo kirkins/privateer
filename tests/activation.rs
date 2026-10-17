@@ -97,6 +97,10 @@ fn a_cleared_first_mate_route_is_used_again_for_the_next_wake() {
     let mut fleet = Fleet::new(now_settings());
     native_routes(&fleet, false);
     back_off(&fleet, "own/-/own-model");
+    fleet.send(json!({"id":"fallback-first","from":"apps","to":"infra","kind":"request","body":"Run while own route is backed off."}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
     rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite"))
         .unwrap()
         .execute(
@@ -104,10 +108,28 @@ fn a_cleared_first_mate_route_is_used_again_for_the_next_wake() {
             [],
         )
         .unwrap();
-    fleet.send(json!({"id":"own-route","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
+    fleet.send(json!({"id":"own-route","from":"apps","to":"infra","kind":"request","body":"Use the configured route again."}));
     assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
     assert_eq!(wake_model(&mut fleet), "own-model");
     assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
+#[test]
+fn a_provider_pinned_charter_waits_instead_of_changing_first_mate_route() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","objective":"Answer mail","repo":fleet.root.join("repo"),
+            "min_free_bytes":0,"job_timeout_secs":60,
+            "provider_plugin":{"manifest":fleet.root.join("own/manifest.json")}}),
+        None,
+    );
+    back_off(&fleet, "own/-/own-model");
+    fleet.send(json!({"id":"pinned","from":"apps","to":"infra","kind":"request","body":"Keep the pinned provider."}));
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["skipped"], "model route backing off", "{report}");
+    assert!(fleet.wakes().is_empty());
 }
 
 #[test]
@@ -133,6 +155,33 @@ fn a_hosted_first_mate_on_a_backed_off_route_falls_back_headlessly_without_relau
         launches, 0,
         "hosted route must not be relaunched while backed off"
     );
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    let launches_after_settle: i64 = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM host_launches WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        launches_after_settle, 0,
+        "hosting stays off while backed off"
+    );
+    rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE model_routes SET until_ms=0 WHERE route='own/-/own-model'",
+            [],
+        )
+        .unwrap();
+    fleet.send(json!({"id":"host-again","from":"apps","to":"infra","kind":"request","body":"Host again on the own route."}));
+    // This fixture's adapter cannot host, so the relaunch is refused, but it
+    // is attempted: the own route is clear again and the wake uses it.
+    let report = Fleet::infra(&fleet.tick());
+    assert!(report["host_error"].is_string(), "{report}");
+    assert_eq!(wake_model(&mut fleet), "own-model");
     assert_eq!(fleet.settle()["status"], "succeeded");
 }
 
