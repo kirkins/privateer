@@ -18,9 +18,11 @@ def serve(handle):
         result = handle(request)
         response = {"id": request["id"], "version": 1, "ok": True, "result": result}
     except Exception as error:
+        # A refusal states its own public message (rule and bundle, never values).
+        public = getattr(error, "public_message", None)
         response = {"id": request.get("id") if isinstance(request, dict) else None,
                     "version": 1, "ok": False,
-                    "error": "Adapter validation failed; inspect private configuration locally."}
+                    "error": public or "Adapter validation failed; inspect private configuration locally."}
         if getattr(error, "public_code", None) == "unsupported-tool-policy":
             from tool_permissions import UnsupportedYolo
             response.update(error_code="unsupported-tool-policy", error=UnsupportedYolo.public_message)

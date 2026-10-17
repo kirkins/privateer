@@ -486,6 +486,46 @@ class Bundles(unittest.TestCase):
         with self.assertRaises(ValueError):
             bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[self.mcp_record()] * 5, skills=[self.a])))
 
+    def test_mcp_only_bundle_needs_no_skills_key(self):
+        # Absent skills reads as none: a server-only bundle validates and plans with an empty skill list.
+        only = {'ref': 'docs@1', 'roles': ['crew'], 'credentials': [{'name': 'DOCS_TOKEN', 'ref': 'docs-search'}],
+                'mcp_servers': [self.mcp_record()]}
+        registry = self.registry_with(only)
+        bundles.validate_registry(registry)
+        plan = bundles.plan(registry, ['docs@1'], 'crew')
+        self.assertEqual(plan['skills'], [])
+        self.assertEqual([s['name'] for s in plan['mcp_servers']], ['docs'])
+        # Neither skills nor servers still refuses, naming the bundle and the rule.
+        empty = {'ref': 'none@1', 'roles': ['crew']}
+        with self.assertRaisesRegex(ValueError, r'^bundle none@1 refused: skills or mcp_servers$'):
+            bundles.validate_registry(self.registry_with(empty))
+        with self.assertRaisesRegex(ValueError, r'^bundle none@1 refused: skills or mcp_servers$'):
+            bundles.validate_registry(self.registry_with(dict(empty, skills=[])))
+
+    def test_refusals_name_bundle_and_field_but_never_values(self):
+        sentinel = 'REFUSAL_SENTINEL_7b2e'
+        cases = [
+            ('mcp_servers.url', self.mcp_bundle(servers=[self.mcp_record(url=f'http://{sentinel}.example.test/mcp?token={sentinel}')], skills=[self.a])),
+            ('mcp_servers.credential', self.mcp_bundle(servers=[self.mcp_record(credential=sentinel)], skills=[self.a])),
+            ('skills.sha256', self.mcp_bundle(skills=[dict(self.a, sha256='e' * 64)])),
+        ]
+        for field, bundle in cases:
+            with self.subTest(field=field), self.assertRaises(ValueError) as caught:
+                bundles.validate_registry(self.registry_with(bundle))
+            self.assertEqual(str(caught.exception), f'bundle docs@1 refused: {field}')
+            public = caught.exception.public_message
+            self.assertEqual(public, f'bundle docs@1 refused: {field}')
+            self.assertNotIn(sentinel, public)
+        # The adapter protocol carries that public message, never a generic or raw one.
+        request = {'id': 'refuse', 'version': 1, 'method': 'validate',
+                   'registry': self.registry_with(self.mcp_bundle(servers=[self.mcp_record(url=f'http://{sentinel}.example.test/')], skills=[self.a]))}
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/bundles.py')], input=json.dumps(request),
+                             text=True, capture_output=True, timeout=5)
+        response = json.loads(run.stdout)
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error'], 'bundle docs@1 refused: mcp_servers.url')
+        self.assertNotIn(sentinel, run.stdout + run.stderr)
+
     def test_selected_mcp_limits_and_collisions_are_per_plan(self):
         first = [self.mcp_record(name=f's{i}') for i in range(4)]
         second = [self.mcp_record(name=f't{i}') for i in range(4)]

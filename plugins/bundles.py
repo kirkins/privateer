@@ -38,9 +38,39 @@ FLAG = re.compile(r"(?<![\w-])(--?[A-Za-z][\w-]*)")
 _OPTIONS = {}
 
 
+class Refused(ValueError):
+    """A registry refusal. `field` names the failing rule, `bundle` the bundle
+    it belongs to. Neither ever carries an input value: only the public message
+    reaches the operator."""
+
+    def __init__(self, field=None, bundle=None):
+        super().__init__("unsupported bounded resources")
+        self.field = field
+        self.bundle = bundle
+
+    @property
+    def public_message(self):
+        target = f"bundle {self.bundle}" if self.bundle else "registry"
+        return f"{target} refused: {self.field or 'shape'}"
+
+    def __str__(self):
+        return self.public_message
+
+
 def require(condition):
     if not condition:
-        raise ValueError("unsupported bounded resources")
+        raise Refused()
+
+
+def at(field, check):
+    """Run a zero-argument check and return its value; a refusal inside it is
+    labelled with the innermost field that first names it."""
+    try:
+        return check()
+    except Refused as error:
+        if error.field is None:
+            error.field = field
+        raise
 
 
 def declared_options(help_text):
@@ -161,8 +191,8 @@ def skill(value):
     keys(value, ('name', 'root', 'sha256'))
     require(isinstance(value['name'], str) and len(value['name']) <= 64 and NAME.fullmatch(value['name']))
     require(isinstance(value['sha256'], str) and HEX.fullmatch(value['sha256']))
-    root = safe_path(value['root'], directory=True)
-    require(tree_digest(root) == value['sha256'])
+    root = at('skills.root', lambda: safe_path(value['root'], directory=True))
+    at('skills.sha256', lambda: require(tree_digest(root) == value['sha256']))
     # Intentionally narrow frontmatter, so Pi cannot quietly skip/rename an
     # approved skill or let first-discovered collisions decide the inventory.
     text = file_bytes(safe_path(str(root / 'SKILL.md'))).decode('utf-8')
@@ -183,7 +213,8 @@ def skill(value):
         # which Pi could interpret differently or silently skip.
         require(re.fullmatch(r'[A-Za-z][A-Za-z0-9 .,;()/!?_-]*', description)
                 and description.lower() not in ('true', 'false', 'null', 'yes', 'no', 'on', 'off'))
-    require(fields.get('name') == value['name'] and 0 < len(description) <= 1024)
+    at('skills.name', lambda: require(fields.get('name') == value['name']))
+    at('skills.description', lambda: require(0 < len(description) <= 1024))
 
 
 def credentials(value):
@@ -221,36 +252,39 @@ def url(value):
     try:
         parts.port
     except ValueError:
-        raise ValueError('unsupported bounded resources') from None
+        raise Refused() from None
     require(parts.scheme == 'https' or parts.hostname in LOOPBACK)
 
 
 def mcp_server(value, names):
     """One selected MCP server: a remote streamable-HTTP endpoint whose Bearer
     token is the named credential. Any other key refuses; no headers or commands."""
-    require(isinstance(value, dict) and set(value) <= {'name', 'url', 'credential', 'timeout', 'description'}
-            and {'name', 'url', 'credential', 'timeout'} <= set(value))
-    require(isinstance(value['name'], str) and len(value['name']) <= 32 and NAME.fullmatch(value['name'])
-            and plain(value['name']))
-    url(value['url'])
-    require(isinstance(value['credential'], str) and value['credential'] in names)
-    require(type(value['timeout']) is int and 1 <= value['timeout'] <= 300)
+    at('mcp_servers', lambda: require(isinstance(value, dict)
+            and set(value) <= {'name', 'url', 'credential', 'timeout', 'description'}
+            and {'name', 'url', 'credential', 'timeout'} <= set(value)))
+    at('mcp_servers.name', lambda: require(isinstance(value['name'], str) and len(value['name']) <= 32
+            and NAME.fullmatch(value['name']) and plain(value['name'])))
+    at('mcp_servers.url', lambda: url(value['url']))
+    at('mcp_servers.credential', lambda: require(isinstance(value['credential'], str)
+            and value['credential'] in names))
+    at('mcp_servers.timeout', lambda: require(type(value['timeout']) is int and 1 <= value['timeout'] <= 300))
     if 'description' in value:
         description = value['description']
-        require(isinstance(description, str) and len(description) <= 200 and plain(description))
+        at('mcp_servers.description', lambda: require(isinstance(description, str)
+                and len(description) <= 200 and plain(description)))
 
 
 def mcp_servers(value, names, maximum):
-    require(isinstance(value, list) and 0 < len(value) <= maximum)
+    at('mcp_servers', lambda: require(isinstance(value, list) and 0 < len(value) <= maximum))
     for item in value:
         mcp_server(item, names)
 
 
 def server_keys(servers):
     """Per plan, at most 8 servers, unique across bundles after lower() and '-' to '_'."""
-    require(len(servers) <= 8)
+    at('mcp_servers', lambda: require(len(servers) <= 8))
     keys = [server['name'].lower().replace('-', '_') for server in servers]
-    require(len(set(keys)) == len(keys))
+    at('mcp_servers.name', lambda: require(len(set(keys)) == len(keys)))
 
 
 def credential_directory(env):
@@ -286,11 +320,45 @@ def credential_environment(value, env):
     return found
 
 
+def bundle_name(index, bundle):
+    """The ref when it is well formed (a plain name@version), else its position."""
+    ref = bundle.get('ref') if isinstance(bundle, dict) else None
+    if isinstance(ref, str) and REF.fullmatch(ref):
+        return ref
+    return f'at index {index}'
+
+
+def bundle(value, refs):
+    # Optional executable extensions are not silently discarded: not
+    # supported in this stage. MCP servers are remote HTTP only (Pi only).
+    at('fields', lambda: keys(value, ('ref', 'roles', *(('skills',) if 'skills' in value else ()),
+                                      *(('credentials',) if 'credentials' in value else ()),
+                                      *(('mcp_servers',) if 'mcp_servers' in value else ()))))
+    at('ref', lambda: require(isinstance(value['ref'], str) and REF.fullmatch(value['ref'])
+                              and value['ref'] not in refs))
+    refs.add(value['ref'])
+    at('roles', lambda: strings(value['roles'], ('first_mate', 'crew'), 2))
+    at('roles', lambda: require(value['roles']))
+    # An absent skills key reads as none: a bundle may carry only MCP servers.
+    skills = value.get('skills', [])
+    at('skills', lambda: require(isinstance(skills, list) and len(skills) <= 8))
+    names = set()
+    for item in skills:
+        at('skills', lambda: skill(item))
+        at('skills.name', lambda: require(item['name'] not in names))
+        names.add(item['name'])
+    at('credentials', lambda: credentials(value.get('credentials', [])))
+    if 'mcp_servers' in value:
+        mcp_servers(value['mcp_servers'], {item['name'] for item in value.get('credentials', [])}, 4)
+    # A bundle needs at least one skill or one server.
+    at('skills or mcp_servers', lambda: require(skills or value.get('mcp_servers')))
+
+
 def validate_registry(value):
     # claude_version is optional: only bounded Claude launches need the pin.
-    require(isinstance(value, dict))
-    keys(value, ('schema_version', 'pi_version', 'integrations', 'bundles',
-                 *(('claude_version',) if 'claude_version' in value else ())))
+    at('registry', lambda: require(isinstance(value, dict)))
+    at('registry', lambda: keys(value, ('schema_version', 'pi_version', 'integrations', 'bundles',
+                                        *(('claude_version',) if 'claude_version' in value else ()))))
     # Versions are records of what the registry was made with, not pins: the
     # installed CLI must show the bounded-loading flags at launch instead.
     require(type(value['schema_version']) is int and value['schema_version'] == 1
@@ -311,25 +379,11 @@ def validate_registry(value):
     bundles = value['bundles']
     require(isinstance(bundles, list) and len(bundles) <= 32)
     refs = set()
-    for bundle in bundles:
-        # Optional executable extensions are not silently discarded: not
-        # supported in this stage. MCP servers are remote HTTP only (Pi only).
-        keys(bundle, ('ref', 'roles', 'skills', *(('credentials',) if 'credentials' in bundle else ()),
-                      *(('mcp_servers',) if 'mcp_servers' in bundle else ())))
-        require(isinstance(bundle['ref'], str) and REF.fullmatch(bundle['ref']) and bundle['ref'] not in refs)
-        refs.add(bundle['ref'])
-        strings(bundle['roles'], ('first_mate', 'crew'), 2)
-        require(bundle['roles'] and isinstance(bundle['skills'], list) and len(bundle['skills']) <= 8)
-        names = set()
-        for item in bundle['skills']:
-            skill(item)
-            require(item['name'] not in names)
-            names.add(item['name'])
-        credentials(bundle.get('credentials', []))
-        if 'mcp_servers' in bundle:
-            mcp_servers(bundle['mcp_servers'], {item['name'] for item in bundle.get('credentials', [])}, 4)
-        # A bundle needs at least one skill or one server.
-        require(bundle['skills'] or bundle.get('mcp_servers'))
+    for index, item in enumerate(bundles):
+        try:
+            bundle(item, refs)
+        except Refused as error:
+            raise Refused(error.field, bundle_name(index, item)) from None
     require(len(json.dumps(value)) <= 48 * 1024)
 
 
@@ -349,7 +403,7 @@ def plan(registry, selected, role, harness='pi'):
     servers = []
     for reference in selected:
         require(reference in by_ref and role in by_ref[reference]['roles'])
-        skills.extend(by_ref[reference]['skills'])
+        skills.extend(by_ref[reference].get('skills', []))
         servers.extend(by_ref[reference].get('mcp_servers', []))
         for item in by_ref[reference].get('credentials', []):
             if item not in secrets:
