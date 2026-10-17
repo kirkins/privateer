@@ -52,6 +52,22 @@ impl Mode {
     }
 }
 
+/// The two rows of one ship's sprite. Each sail state has its own shape, so the
+/// state reads without colour and without motion.
+fn hull(sail: Sail, ascii: bool) -> [&'static str; 2] {
+    match (sail, ascii) {
+        (Sail::Up, _) => boat::art(ascii),
+        (Sail::Anchored, false) => [" ┃  ", "╲⊥▁▁╱"],
+        (Sail::Anchored, true) => ["  |  ", "\\T__/"],
+        (Sail::Docked, false) => ["     ", "▕╲▁▁▏"],
+        (Sail::Docked, true) => ["     ", "|\\__|"],
+        (Sail::Error, false) => ["  ! ", "╲✕▁╱"],
+        (Sail::Error, true) => ["  ! ", "\\x_/"],
+        (Sail::Unknown, false) => ["  ? ", "╲▁▁▁╱"],
+        (Sail::Unknown, true) => ["  ? ", "\\___/"],
+    }
+}
+
 /// Sail state, from recorded facts only. Unknown is never drawn as an all-clear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sail {
@@ -186,13 +202,14 @@ pub fn scene(
         .find(|m| m.capacity(width, height) >= total)
         .unwrap_or(Mode::Symbols);
     let (sw, sh) = mode.slot();
-    let cap = mode.capacity(width, height);
-    let shown = if total <= cap {
+    let cols = width / sw;
+    // When ships overflow, the last grid row is kept for the "+n more ships" line.
+    let grid_rows = height / sh;
+    let shown = if total <= mode.capacity(width, height) {
         total
     } else {
-        cap.saturating_sub(1)
+        cols * grid_rows.saturating_sub(1)
     };
-    let cols = width / sw;
     let t = elapsed.as_millis();
     let slot = |i: usize| ((i % cols) * sw, (i / cols) * sh);
     let mut placed = Vec::new();
@@ -229,7 +246,7 @@ pub fn scene(
         placed.push(Placed {
             x: x + offset,
             y,
-            rows: boat::art(ascii).iter().map(|r| (*r).into()).collect(),
+            rows: hull(sail, ascii).iter().map(|r| (*r).into()).collect(),
             mark: Mark::Boat {
                 ship: id.clone(),
                 sail,
@@ -281,31 +298,36 @@ pub fn scene(
             placed.push(Placed {
                 x,
                 y: y + 2,
-                rows: vec![clip(&name, sw)],
+                rows: vec![clip(&name, sw - 1)],
                 mark: Mark::Name(name),
             });
         }
     }
 
     let omitted = total - shown;
-    if omitted > 0 && cap > 0 {
-        let (x, y) = slot(cap - 1);
+    if omitted > 0 && grid_rows > 0 {
         placed.push(Placed {
-            x,
-            y,
-            rows: vec![clip(&format!("+{omitted} more ships"), sw)],
+            x: 0,
+            y: (grid_rows - 1) * sh,
+            rows: vec![clip(&format!("+{omitted} more ships"), width)],
             mark: Mark::More(omitted),
         });
     }
 
     // Open requests drift as a bottle from the liaison (the first slot) toward
     // each drawn ship that has them. The sender is approximated: the snapshot
-    // records a count per ship, not who sent each request.
+    // records a count per ship, not who sent each request. Symbol mode draws
+    // no bottles, so they never cover a ship's symbol. Reduced motion holds
+    // them halfway.
     let sender = origins
         .first()
-        .filter(|_| ships.first().is_some_and(|s| s.liaison));
+        .filter(|_| mode != Mode::Symbols && ships.first().is_some_and(|s| s.liaison));
     if let Some(&(_, fx, fy)) = sender {
-        let p = (t % TRIP_MS as u128) as i64;
+        let p = if reduced {
+            TRIP_MS / 2
+        } else {
+            (t % TRIP_MS as u128) as i64
+        };
         // Progress is a pure function of time; integer rounding keeps it monotone.
         let at = |from: usize, to: usize| {
             (from as i64 + (to as i64 - from as i64) * p / TRIP_MS) as usize
@@ -630,17 +652,120 @@ mod tests {
 
     #[test]
     fn reduced_motion_holds_the_scene_still() {
-        let snapshot = fleet(4);
-        let a = scene(&snapshot, Duration::from_millis(0), 80, 24, true, false);
-        let b = scene(&snapshot, Duration::from_millis(5_000), 80, 24, true, false);
-        let boats_at = |s: &Scene| {
-            s.placed
+        let mut snapshot = fleet(4);
+        snapshot.ships.push(ship("reader", false, Some(live(2))));
+        snapshot.jobs.push(job("ship-00", "running"));
+        for (w, h) in [(80, 24), (40, 14)] {
+            let still = scene(&snapshot, Duration::ZERO, w, h, true, false);
+            assert!(
+                still
+                    .placed
+                    .iter()
+                    .any(|p| matches!(p.mark, Mark::Bottle { .. }))
+            );
+            for ms in [1_000, 2_500, 5_000, 9_999] {
+                let later = scene(&snapshot, Duration::from_millis(ms), w, h, true, false);
+                assert_eq!(still.placed, later.placed, "{w}x{h} at {ms}ms");
+            }
+        }
+    }
+
+    #[test]
+    fn each_sail_state_has_its_own_text_shape() {
+        let states = [
+            Sail::Up,
+            Sail::Anchored,
+            Sail::Docked,
+            Sail::Error,
+            Sail::Unknown,
+        ];
+        for ascii in [false, true] {
+            for (i, a) in states.iter().enumerate() {
+                for b in &states[i + 1..] {
+                    assert_ne!(hull(*a, ascii), hull(*b, ascii), "{a:?} vs {b:?}");
+                }
+            }
+            let error = hull(Sail::Error, ascii).join("");
+            assert!(error.contains('!'), "{error}");
+            assert!(
+                hull(Sail::Anchored, ascii)
+                    .join("")
+                    .contains(if ascii { 'T' } else { '⊥' })
+            );
+        }
+        for sprite in states.iter().flat_map(|s| hull(*s, true)) {
+            assert!(sprite.is_ascii(), "{sprite}");
+        }
+    }
+
+    #[test]
+    fn symbol_mode_draws_no_bottles() {
+        let mut snapshot = fleet(3);
+        snapshot.ships.push(ship("reader", false, Some(live(2))));
+        let symbols = scene(&snapshot, Duration::from_millis(3_000), 10, 4, false, false);
+        assert_eq!(symbols.mode, Mode::Symbols);
+        assert!(
+            !symbols
+                .placed
                 .iter()
-                .filter(|p| matches!(p.mark, Mark::Boat { .. }))
-                .map(|p| (p.x, p.y))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(boats_at(&a), boats_at(&b));
+                .any(|p| matches!(p.mark, Mark::Bottle { .. }))
+        );
+        let boats = scene(
+            &snapshot,
+            Duration::from_millis(3_000),
+            60,
+            20,
+            false,
+            false,
+        );
+        assert_ne!(boats.mode, Mode::Symbols);
+        assert!(
+            boats
+                .placed
+                .iter()
+                .any(|p| matches!(p.mark, Mark::Bottle { .. }))
+        );
+    }
+
+    #[test]
+    fn overflow_count_is_written_out_in_full() {
+        for (w, h) in [(40, 14), (60, 20), (20, 6)] {
+            // Twice the cells, so every mode overflows.
+            let snapshot = fleet(2 * w * h);
+            let scene = scene(&snapshot, Duration::ZERO, w, h, false, false);
+            assert!(scene.omitted > 0, "{w}x{h}");
+            let text = format!("+{} more ships", scene.omitted);
+            let line = scene
+                .placed
+                .iter()
+                .find(|p| p.mark == Mark::More(scene.omitted))
+                .expect("count drawn");
+            assert_eq!(line.rows, vec![text], "{w}x{h}");
+            assert_eq!(line.y, (h / scene.mode.slot().1 - 1) * scene.mode.slot().1);
+        }
+    }
+
+    #[test]
+    fn names_stop_one_cell_short_of_the_next_slot() {
+        let mut snapshot = Snapshot::default();
+        for i in 0..4 {
+            snapshot.ships.push(ship(
+                &format!("ship-{i}-with-a-very-long-name-indeed"),
+                i == 0,
+                Some(live(0)),
+            ));
+        }
+        let scene = scene(&snapshot, Duration::ZERO, 100, 30, false, false);
+        assert_eq!(scene.mode, Mode::Names);
+        let names: Vec<_> = scene
+            .placed
+            .iter()
+            .filter(|p| matches!(p.mark, Mark::Name(_)))
+            .collect();
+        assert_eq!(names.len(), 4);
+        for name in names {
+            assert!(name.width() < 20, "{:?}", name.rows);
+        }
     }
 
     #[test]

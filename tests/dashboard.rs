@@ -1261,3 +1261,40 @@ fn v_opens_the_voyage_sea_and_esc_or_v_returns_to_the_bridge() {
     app.bridge_key(KeyCode::Char('v'));
     assert!(app.voyage.is_none());
 }
+
+#[test]
+fn demo_voyage_keeps_the_sample_label() {
+    use crossterm::event::KeyCode;
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        demo: true,
+        home_age: Some(0),
+        ..App::default()
+    };
+    app.bridge_key(KeyCode::Char('v'));
+    let sea = render(&mut app, 100, 30);
+    assert!(sea.contains("voyage · DEMO / sample only"), "{sea}");
+}
+
+#[test]
+fn mouse_is_ignored_while_the_sea_is_open() {
+    use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+    let mut app = App {
+        snapshot: Snapshot::demo(),
+        home_age: Some(0),
+        ..App::default()
+    };
+    render(&mut app, 100, 30);
+    app.bridge_key(KeyCode::Char('v'));
+    render(&mut app, 100, 30);
+    for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    assert_eq!(app.selected, 0);
+    assert!(app.voyage.is_some());
+}

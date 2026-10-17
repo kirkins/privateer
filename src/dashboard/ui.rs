@@ -588,7 +588,7 @@ impl App {
         false
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        if self.composer.is_some() || self.answer.is_some() {
+        if self.voyage.is_some() || self.composer.is_some() || self.answer.is_some() {
             return;
         }
         let point = Position::new(event.column, event.row);
@@ -891,7 +891,9 @@ impl App {
         ])
         .split(area);
         frame.render_widget(
-            Paragraph::new(if self.voyage.is_some() {
+            Paragraph::new(if self.voyage.is_some() && self.demo {
+                " PRIVATEER · voyage · DEMO / sample only · sea drawn from recorded state"
+            } else if self.voyage.is_some() {
                 " PRIVATEER · voyage · sea drawn from recorded state, not live health"
             } else if self.demo {
                 " PRIVATEER · bridge · DEMO / sample only"
