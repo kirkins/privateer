@@ -1,6 +1,6 @@
 # Design: crews park on their own heavy jobs and resume
 
-Status: round 1 implemented (`crew.park`, park record, resume through `agent.start`, run-time budget, cancel of a parked crew). Round 2 (deadline-kill park, held crews and `crew.resume`, `ship.bearings`, the `agent.start` refusal) is not yet implemented; see [Implementation notes](#implementation-notes). Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
+Status: rounds 1 and 2 implemented (`crew.park`, park record, resume through `agent.start`, per-incarnation run-time budget, cancel of a parked crew; deadline-kill park, held crews and `crew.resume`, `ship.bearings`, the `agent.start` refusal). Still open: the tests listed under [Test plan](#test-plan) items 2 and 6 to 7 (parked time not charged, restart survival, stow-held resume through admission); see [Implementation notes](#implementation-notes). Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
 
 ## Problem
 
@@ -133,4 +133,6 @@ Decisions made while implementing round 1, where the text above was not exact:
 - The native session is read from the crew's complete log when it resumes, not at `crew.park`: the park is finalised after the payload's output is captured, so that log is whole only then.
 - The job.start reply to a crew carries a `park` hint, since that is where the crew learns to park rather than poll; the crew brief only names `crew.park`, to stay within its size budget.
 - Hosted crews are refused `crew.park` for now.
-- Round 2 is not done: the deadline-kill park, `held` crews and `crew.resume`, `ship.bearings` listing parks, the `agent.start` refusal on a parked task, and the restart-recovery of a park whose child already settled.
+- Round 2 is done in commit d8f7b6d: the deadline-kill park, `held` crews and `crew.resume`, `ship.bearings` listing parks, and the `agent.start` refusal on a parked task (`replace:true` cancels the crew and its jobs).
+- The budget is per incarnation: a resumed crew gets a fresh `timeout_secs` grant, and the park count and elapsed cap bound the total. This replaces the earlier `run_ms` carry-over in the Deadline section above.
+- Still open: restart recovery of a park whose child already settled is designed (Resume, Recovery at boot) but not yet tested.
