@@ -672,8 +672,14 @@ fn a_daily_allowance_goes_first_until_capped_and_returns_when_its_cap_passes() {
         text.contains("flash (plan; daily 07:00 UTC, tier 1)"),
         "{text}"
     );
-    assert!(text.contains("use-it-or-lose-it allowances nearest their refresh"), "{text}");
-    assert!(text.contains("Idle allowances: flash (daily 07:00 UTC, refreshes in"), "{text}");
+    assert!(
+        text.contains("use-it-or-lose-it allowances nearest their refresh"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Idle allowances: flash (daily 07:00 UTC, refreshes in"),
+        "{text}"
+    );
 
     let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
     let route = "codex/-/model-flash";
@@ -711,7 +717,10 @@ fn a_daily_allowance_goes_first_until_capped_and_returns_when_its_cap_passes() {
         .unwrap();
     assert_eq!(f.model(&start()), "model-flash");
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
-    assert!(!bearings["text"].as_str().unwrap().contains("capped"), "{bearings}");
+    assert!(
+        !bearings["text"].as_str().unwrap().contains("capped"),
+        "{bearings}"
+    );
     // The explicit route is honoured over the ranking.
     let steady = f.json(
         Some("engineering"),
@@ -729,7 +738,10 @@ fn allowance_shapes_need_a_tier_one_shape_per_model_and_no_legacy_reset() {
         fs::write(&file, routes.to_string()).unwrap();
         let o = f.run(None, &["routes", "set", file.to_str().unwrap()]);
         let stderr = String::from_utf8_lossy(&o.stderr);
-        assert!(!o.status.success() && stderr.contains(wanted), "{routes}: {stderr}");
+        assert!(
+            !o.status.success() && stderr.contains(wanted),
+            "{routes}: {stderr}"
+        );
     };
     let mut untiered = codex("model-a", "plan");
     untiered["allowance"] = json!({"daily_utc": "07:00"});
@@ -738,7 +750,10 @@ fn allowance_shapes_need_a_tier_one_shape_per_model_and_no_legacy_reset() {
     both["allowance"] = json!({"daily_utc": "07:00"});
     both["tier"] = json!(1);
     both["allowance_resets_utc"] = json!("07:00");
-    refuse(json!({"routes": {"a": both}}), "move the time into allowance.daily_utc");
+    refuse(
+        json!({"routes": {"a": both}}),
+        "move the time into allowance.daily_utc",
+    );
     let mut daily = codex("model-a", "plan");
     daily["allowance"] = json!({"daily_utc": "07:00"});
     daily["tier"] = json!(1);

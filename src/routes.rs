@@ -601,7 +601,9 @@ fn throttle_kind(failure: &RouteFailure) -> Throttle {
         .any(|sign| lower.contains(sign))
     {
         Throttle::Spent
-    } else if lower.starts_with("429") || lower.contains("rate limit") || lower.contains("rate_limit")
+    } else if lower.starts_with("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
     {
         Throttle::Plain
     } else {
@@ -1510,16 +1512,45 @@ mod allowance_tests {
         let conn = ledger();
         let route = "codex/-/plan";
         let now = Store::now_ms();
-        job(&conn, route, None, &rolling(), now - HOUR, now - HOUR + 1000);
+        job(
+            &conn,
+            route,
+            None,
+            &rolling(),
+            now - HOUR,
+            now - HOUR + 1000,
+        );
         let usage = usage_of(&conn, route).unwrap();
         assert_eq!(usage.window_ends_ms, Some(now + 4 * HOUR));
-        job(&conn, route, Some("You've hit your limit"), &rolling(), now - 60_000, now);
+        job(
+            &conn,
+            route,
+            Some("You've hit your limit"),
+            &rolling(),
+            now - 60_000,
+            now,
+        );
         assert!((held(&conn, route) - 4 * HOUR).abs() < 2000);
         let usage = usage_of(&conn, route).unwrap();
-        assert!(usage.capped_until_ms.is_some_and(|c| (c - now - 4 * HOUR).abs() < 2000));
+        assert!(
+            usage
+                .capped_until_ms
+                .is_some_and(|c| (c - now - 4 * HOUR).abs() < 2000)
+        );
         // A run still in flight when the cap was set ends on an outage.
-        job(&conn, route, Some("503 overloaded"), &rolling(), now - 30_000, now + 1);
-        assert!((held(&conn, route) - 4 * HOUR).abs() < 2000, "{}", held(&conn, route));
+        job(
+            &conn,
+            route,
+            Some("503 overloaded"),
+            &rolling(),
+            now - 30_000,
+            now + 1,
+        );
+        assert!(
+            (held(&conn, route) - 4 * HOUR).abs() < 2000,
+            "{}",
+            held(&conn, route)
+        );
         // A success clears the hold and the cap.
         job(&conn, route, None, &rolling(), now, now + 2);
         assert!(blocked(&conn, route).unwrap().is_none());
@@ -1531,26 +1562,77 @@ mod allowance_tests {
         let conn = ledger();
         let route = "codex/-/plan";
         let now = Store::now_ms();
-        job(&conn, route, None, &rolling(), now - 2 * HOUR, now - 2 * HOUR);
+        job(
+            &conn,
+            route,
+            None,
+            &rolling(),
+            now - 2 * HOUR,
+            now - 2 * HOUR,
+        );
         // Three runs launched together hit one per-minute limit: one strike.
         for at in 0..3 {
-            job(&conn, route, Some("429 rate limit"), &rolling(), now - 10_000, now - 5000 + at);
+            job(
+                &conn,
+                route,
+                Some("429 rate limit"),
+                &rolling(),
+                now - 10_000,
+                now - 5000 + at,
+            );
         }
         assert_eq!(usage_of(&conn, route).unwrap().strikes, 1);
         assert!(usage_of(&conn, route).unwrap().capped_until_ms.is_none());
         // Re-reading the same jobs after a crash counts nothing again.
-        job(&conn, route, Some("429 rate limit"), &rolling(), now - 10_000, now - 5000);
+        job(
+            &conn,
+            route,
+            Some("429 rate limit"),
+            &rolling(),
+            now - 10_000,
+            now - 5000,
+        );
         assert_eq!(usage_of(&conn, route).unwrap().strikes, 1);
         // The second burst is a second strike, still the short doubling.
-        conn.execute("UPDATE model_routes SET failures=1, until_ms=0", []).unwrap();
-        job(&conn, route, Some("429 rate limit"), &rolling(), now - 4000, now - 3000);
+        conn.execute("UPDATE model_routes SET failures=1, until_ms=0", [])
+            .unwrap();
+        job(
+            &conn,
+            route,
+            Some("429 rate limit"),
+            &rolling(),
+            now - 4000,
+            now - 3000,
+        );
         assert_eq!(usage_of(&conn, route).unwrap().strikes, 2);
-        assert!((held(&conn, route) - 60_000).abs() < 4000, "{}", held(&conn, route));
+        assert!(
+            (held(&conn, route) - 60_000).abs() < 4000,
+            "{}",
+            held(&conn, route)
+        );
         // The third goes to the hourly probe, not the end of the window.
-        job(&conn, route, Some("429 rate limit"), &rolling(), now - 2000, now - 1000);
-        assert!((held(&conn, route) - HOUR).abs() < 2000, "{}", held(&conn, route));
+        job(
+            &conn,
+            route,
+            Some("429 rate limit"),
+            &rolling(),
+            now - 2000,
+            now - 1000,
+        );
+        assert!(
+            (held(&conn, route) - HOUR).abs() < 2000,
+            "{}",
+            held(&conn, route)
+        );
         // An outage is never a strike.
-        job(&conn, route, Some("connection error"), &rolling(), now - 500, now);
+        job(
+            &conn,
+            route,
+            Some("connection error"),
+            &rolling(),
+            now - 500,
+            now,
+        );
         assert_eq!(usage_of(&conn, route).unwrap().strikes, 3);
     }
 
@@ -1562,10 +1644,15 @@ mod allowance_tests {
             ..Usage::default()
         };
         let now = Store::now_ms();
-        let (judged, strike) = allowance_spent(failure("429 rate limit"), &rolling(), &usage, now, now);
+        let (judged, strike) =
+            allowance_spent(failure("429 rate limit"), &rolling(), &usage, now, now);
         assert!(strike && judged.allowance);
         assert_eq!(judged.probe_step, Some(0));
-        assert!(judged.ceiling_ms.is_some_and(|c| (c - 30 * 60_000).abs() < 2000));
+        assert!(
+            judged
+                .ceiling_ms
+                .is_some_and(|c| (c - 30 * 60_000).abs() < 2000)
+        );
     }
 
     #[test]
@@ -1574,7 +1661,8 @@ mod allowance_tests {
         let usage = Usage::default();
         // A spent allowance with no window known and no stated reset probes,
         // no longer than the window.
-        let (plain, _) = allowance_spent(failure("usage limit reached"), &rolling(), &usage, now, now);
+        let (plain, _) =
+            allowance_spent(failure("usage limit reached"), &rolling(), &usage, now, now);
         assert_eq!((plain.reset_ms, plain.ceiling_ms), (None, Some(5 * HOUR)));
         // A stated reset longer than the window holds until the weekly reset.
         let mut stated = failure("usage limit reached; resets in 30 hours");
@@ -1585,7 +1673,12 @@ mod allowance_tests {
         // A stated reset within the window is just that reset.
         let mut short = failure("usage limit reached");
         short.reset_ms = Some(HOUR);
-        assert_eq!(allowance_spent(short, &rolling(), &usage, now, now).0.reset_ms, Some(HOUR));
+        assert_eq!(
+            allowance_spent(short, &rolling(), &usage, now, now)
+                .0
+                .reset_ms,
+            Some(HOUR)
+        );
     }
 
     #[test]
@@ -1598,14 +1691,31 @@ mod allowance_tests {
             shape: Shape::Daily(minute),
             free: false,
         };
-        job(&conn, route, Some("quota exhausted"), &daily, now - 1000, now);
-        assert!((held(&conn, route) - 3 * HOUR).abs() < 61_000, "{}", held(&conn, route));
+        job(
+            &conn,
+            route,
+            Some("quota exhausted"),
+            &daily,
+            now - 1000,
+            now,
+        );
+        assert!(
+            (held(&conn, route) - 3 * HOUR).abs() < 61_000,
+            "{}",
+            held(&conn, route)
+        );
         assert!(list(&conn).unwrap()[0]["capped_until_ms"].is_i64());
         // Once the hold has passed, the cap is neither honoured nor shown.
-        conn.execute("UPDATE model_routes SET until_ms=?1", [now - 1]).unwrap();
-        conn.execute("UPDATE route_usage SET capped_until_ms=?1", [now - 1]).unwrap();
+        conn.execute("UPDATE model_routes SET until_ms=?1", [now - 1])
+            .unwrap();
+        conn.execute("UPDATE route_usage SET capped_until_ms=?1", [now - 1])
+            .unwrap();
         assert!(blocked(&conn, route).unwrap().is_none());
-        assert!(capped_until(&conn, route, Store::now_ms()).unwrap().is_none());
+        assert!(
+            capped_until(&conn, route, Store::now_ms())
+                .unwrap()
+                .is_none()
+        );
         assert!(list(&conn).unwrap().is_empty());
     }
 

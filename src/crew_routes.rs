@@ -329,7 +329,9 @@ fn shape(value: &Value) -> Result<Shape> {
                 .context("window_hours must be a whole number from 1 to 168")?;
             let weekly = value
                 .get("weekly_utc")
-                .map(|at| weekly_minute(at).context("weekly_utc must read like \"Mon 07:00\" (UTC)"))
+                .map(|at| {
+                    weekly_minute(at).context("weekly_utc must read like \"Mon 07:00\" (UTC)")
+                })
                 .transpose()?;
             Ok(Shape::Rolling {
                 window_ms: hours * 3_600_000,
@@ -891,10 +893,16 @@ mod tests {
         let list = names(&["plan", "b", "a"]);
         let usage = HashMap::new();
         // A loses its headroom first, so it goes first, then B, then carry-over.
-        assert_eq!(rank(&list, &policy, &usage, NOW), names(&["a", "b", "plan"]));
+        assert_eq!(
+            rank(&list, &policy, &usage, NOW),
+            names(&["a", "b", "plan"])
+        );
         // Past A's refresh, A's next loss is a day away and B's is nearer.
         let later = NOW + 3 * HOUR;
-        assert_eq!(rank(&list, &policy, &usage, later), names(&["b", "a", "plan"]));
+        assert_eq!(
+            rank(&list, &policy, &usage, later),
+            names(&["b", "a", "plan"])
+        );
     }
 
     #[test]
@@ -940,10 +948,16 @@ mod tests {
 
     #[test]
     fn shapes_and_reset_times_parse() {
-        assert_eq!(shape(&json!({"daily_utc":"07:00"})).unwrap(), Shape::Daily(420));
+        assert_eq!(
+            shape(&json!({"daily_utc":"07:00"})).unwrap(),
+            Shape::Daily(420)
+        );
         assert_eq!(
             shape(&json!({"window_hours":5,"weekly_utc":"Tue 01:00"})).unwrap(),
-            Shape::Rolling { window_ms: 5 * HOUR, weekly: Some(1440 + 60) }
+            Shape::Rolling {
+                window_ms: 5 * HOUR,
+                weekly: Some(1440 + 60)
+            }
         );
         for bad in [
             json!({}),
@@ -960,7 +974,10 @@ mod tests {
             crate::routes::utc_time(next_weekly(0, NOW)),
             "2026-10-19 00:00 UTC"
         );
-        assert_eq!(crate::routes::utc_time(next_daily(420, NOW)), "2026-10-18 07:00 UTC");
+        assert_eq!(
+            crate::routes::utc_time(next_daily(420, NOW)),
+            "2026-10-18 07:00 UTC"
+        );
         assert_eq!(span(26 * HOUR), "26h");
         assert_eq!(span(80 * 60_000), "1h20m");
     }

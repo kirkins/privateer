@@ -53,6 +53,7 @@ A **new** table in the host ledger, created by `routes::init`:
 ```
 route_usage(route TEXT PRIMARY KEY, last_succeeded_ms INTEGER, last_throttled_ms INTEGER,
   last_throttle TEXT, strikes INTEGER NOT NULL DEFAULT 0, window_ends_ms INTEGER,
+  window_utilization REAL, weekly_ends_ms INTEGER, weekly_utilization REAL,
   capped_until_ms INTEGER, updated_ms INTEGER NOT NULL)
 ```
 
