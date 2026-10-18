@@ -44,11 +44,17 @@ if [ "$MODE" != nosession ]; then
 fi
 case "$MODE" in
   held) sleep 60 ;;
+  late)
+    sleep 3
+    "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 6; echo built"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
+    sleep 60 ;;
   deadline)
     "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 30"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
   *)
     child='sleep 2; echo built'
+    if [ "$MODE" = slow ] || [ "$MODE" = aged ]; then child='sleep 6; echo built'; fi
+    if [ "$MODE" = aged ]; then sleep 5; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
@@ -378,4 +384,161 @@ fn a_launch_on_a_task_with_a_parked_crew_is_refused_unless_it_replaces_it() {
     );
     f.wait("crew-6", &["cancelled"]);
     f.wait("child-1", &["cancelled"]);
+}
+
+/// Parked time is not charged to the crew's budget. The crew works for 5
+/// seconds, parks on a 6 second job, and so spends 11 seconds in all against
+/// an 8 second budget. The resume gets a fresh budget and completes.
+#[test]
+fn parked_time_is_not_charged_to_the_crew_budget() {
+    let f = Fleet::new();
+    f.set_mode("aged");
+    f.short_budget();
+    start_crew(&f, "crew-9");
+    f.wait("crew-9", &["parked"]);
+    f.wait("child-1", &["succeeded"]);
+    f.wait("crew-resume-park-crew-9-1-1", &["succeeded"]);
+    let resumed = f.wait("crew-9", &["resumed"]);
+    assert_eq!(resumed["reason"], "resumed as crew-resume-park-crew-9-1-1");
+    let launches = f.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert!(
+        launches[1].contains(&format!("--resume {SESSION}")),
+        "{launches:?}"
+    );
+}
+
+/// The dispatcher is stopped while the crew's heavy job runs and is started
+/// again after the job ends. The park survives the outage, and the crew
+/// resumes exactly once.
+#[test]
+fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
+    let f = Fleet::new();
+    f.set_mode("slow");
+    let home = f.root.join("engineering/.privateer");
+    fs::write(
+        home.join("config.json"),
+        json!({"ship": "engineering", "resource_home": f.root.join("ledger")}).to_string(),
+    )
+    .unwrap();
+    let service = |verb: &str| {
+        let out = f
+            .command(None, &["service", verb])
+            .env("PRIVATEER_SERVICE", "detached")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "service {verb}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    service("start");
+    start_crew(&f, "crew-10");
+    f.wait("crew-10", &["parked"]);
+    service("stop");
+    assert!(!privateer::service::running(&home).unwrap());
+    // The heavy job ends while no dispatcher is running.
+    f.wait("child-1", &["succeeded"]);
+    service("start");
+    f.wait("crew-10", &["resumed"]);
+    f.wait("crew-resume-park-crew-10-1-1", &["succeeded"]);
+    std::thread::sleep(std::time::Duration::from_millis(2500)); // Two more passes.
+    service("stop");
+    let launches = f.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    let resumes = f.json(None, "job.list", json!({}))["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| {
+            j["id"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("crew-resume-park-crew-10")
+        })
+        .count();
+    assert_eq!(resumes, 1);
+}
+
+/// A stow holds a crew's resume like any other launch. The heavy job ends
+/// while the machine is stowed, and the crew stays parked with no launch.
+/// Once the stow is lifted, the next tick resumes it.
+#[test]
+fn a_resume_held_by_a_stow_goes_through_admission() {
+    let f = Fleet::new();
+    f.set_mode("slow");
+    start_crew(&f, "crew-11");
+    f.wait("crew-11", &["parked"]);
+    f.ok(None, &["stow"]);
+    f.wait("child-1", &["succeeded"]);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+    let parked = f.json(None, "job.status", json!({"id": "crew-11"}));
+    assert_eq!(parked["status"], "parked", "{parked}");
+    f.ok(None, &["stow", "resume"]);
+    f.ok(
+        None,
+        &["serve", "--json", &json!({"once": true}).to_string()],
+    );
+    f.wait("crew-resume-park-crew-11-1-1", &["succeeded"]);
+    f.wait("crew-11", &["resumed"]);
+    let launches = f.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert!(
+        launches[1].contains(&format!("--resume {SESSION}")),
+        "{launches:?}"
+    );
+}
+
+/// The incident replay: the heavy job ends after the crew's deadline. The
+/// crew resumes, the first mate gets no failure, and a second start for the
+/// task is refused while the crew is parked, so no duplicate start happens.
+#[test]
+fn a_heavy_job_that_ends_after_the_crew_deadline_resumes_without_a_duplicate() {
+    let f = Fleet::new();
+    f.set_mode("late");
+    f.short_budget();
+    start_crew(&f, "crew-12");
+    // The crew starts a 6 second job at 3 seconds. Its 8 second budget runs
+    // out while the job is still going, so it parks, and the job ends after
+    // the crew's deadline.
+    f.wait("crew-12", &["parked"]);
+    let refused = f.run(
+        Some("engineering"),
+        &[
+            "agent.start",
+            "--json",
+            &json!({"task_id": "fix", "id": "crew-dup", "manifest": "bundled:claude"}).to_string(),
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a duplicate start ran beside a parked crew"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("parked crew"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    f.wait("child-1", &["succeeded"]);
+    f.wait("crew-resume-park-crew-12-1-1", &["succeeded"]);
+    f.wait("crew-12", &["resumed"]);
+    let launches = f.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert!(
+        launches[1].contains(&format!("--resume {SESSION}")),
+        "{launches:?}"
+    );
+    let notices = f.ship_notices();
+    assert!(
+        !notices
+            .iter()
+            .any(|b| b.contains("crew-12") && b.to_lowercase().contains("fail")),
+        "the first mate got a failure: {notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|b| b.contains("crew-dup")),
+        "a duplicate start reached the first mate: {notices:?}"
+    );
 }

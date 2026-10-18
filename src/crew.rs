@@ -693,9 +693,18 @@ pub(crate) fn settle_own_park(store: &mut Store, crew: &str) -> Result<()> {
     }
 }
 
+/// Whether a fleet stow holds new launches on this host.
+fn stowed(store: &Store) -> Result<bool> {
+    Ok(crate::jobs::stowed(&crate::jobs::host_ledger(store)?)?.is_some())
+}
+
 /// Parks whose child settled while nothing was watching (the dispatcher was
 /// down, or a settlement was missed) resume now. Each is claimed once.
 pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
+    // A stowed fleet starts nothing, so parks wait for `stow resume`.
+    if stowed(store)? {
+        return Ok(());
+    }
     let children: Vec<String> = {
         let mut stmt = store
             .connection()
@@ -829,6 +838,11 @@ fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &st
             )?;
             // The crew's record now says where its work went; it reports nothing.
             crate::jobs::finish_resumed(store, crew, &id)?;
+        }
+        Err(_) if stowed(store)? => {
+            // A stow holds the resume like any launch: it is not a failure. The
+            // park waits, and the next tick resumes it once the stow is lifted.
+            set_state(store, park, "parked")?;
         }
         Err(error) => {
             store.connection().execute(

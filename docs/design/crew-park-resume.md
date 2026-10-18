@@ -1,6 +1,6 @@
 # Design: crews park on their own heavy jobs and resume
 
-Status: rounds 1 and 2 implemented (`crew.park`, park record, resume through `agent.start`, per-incarnation run-time budget, cancel of a parked crew; deadline-kill park, held crews and `crew.resume`, `ship.bearings`, the `agent.start` refusal). Still open: the tests listed under [Test plan](#test-plan) items 2 and 6 to 7 (parked time not charged, restart survival, stow-held resume through admission); see [Implementation notes](#implementation-notes). Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
+Status: rounds 1 to 3 implemented. Round 3 adds the tests for parked time, dispatcher restart, stow-held resume and the incident replay, and the fix a stow-held resume needed: it now waits as `parked` instead of failing, and the next tick resumes it once the stow is lifted. Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
 
 ## Problem
 
@@ -135,4 +135,6 @@ Decisions made while implementing round 1, where the text above was not exact:
 - Hosted crews are refused `crew.park` for now.
 - Round 2 is done in commit d8f7b6d: the deadline-kill park, `held` crews and `crew.resume`, `ship.bearings` listing parks, and the `agent.start` refusal on a parked task (`replace:true` cancels the crew and its jobs).
 - The budget is per incarnation: a resumed crew gets a fresh `timeout_secs` grant, and the park count and elapsed cap bound the total. This replaces the earlier `run_ms` carry-over in the Deadline section above.
-- Still open: restart recovery of a park whose child already settled is designed (Resume, Recovery at boot) but not yet tested.
+- Restart recovery (Recovery at boot): a park whose child settled while the dispatcher was down resumes once, on the next tick. Tested by `a_park_survives_a_dispatcher_restart_and_resumes_once`.
+- A stow holds a resume like any launch. While stowed, `resume_pending` takes no park, and a resume refused by the stow leaves its park `parked` rather than failing the crew. Tested by `a_resume_held_by_a_stow_goes_through_admission`.
+- Still open: a resume whose start did not land (Recovery at boot, the one retry under the same id) is designed but not yet tested.
