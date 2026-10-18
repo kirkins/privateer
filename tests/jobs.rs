@@ -2021,7 +2021,15 @@ fn a_holder_that_lost_its_supervisor_looks_unhealthy_to_the_host() {
         let bearings = ok(home, "ship.bearings", json!({"ship":"peer"}));
         bearings["capacity_waits"][0]["behind"].clone()
     };
-    let healthy = holder(&home);
+    // The ledger copy of the payload is written just after the job record.
+    let until = Instant::now() + Duration::from_secs(5);
+    let healthy = loop {
+        let seen = holder(&home);
+        if seen["payload_alive"] == true || Instant::now() >= until {
+            break seen;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
     assert!(healthy["unhealthy"].is_null(), "{healthy}");
     assert_eq!(healthy["payload_alive"], true, "{healthy}");
     // The supervisor dies under the payload it was watching.

@@ -2713,11 +2713,18 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
         "job.start",
         json!({"task_id":"task","id":"holder","command":["sleep","60"],"heavy":true,"wait_for_capacity":true}),
     );
-    assert_eq!(holder["status"], "starting", "{holder}");
+    // A fast machine may already have it launching by the time start returns.
+    assert!(
+        matches!(holder["status"].as_str(), Some("starting" | "launching")),
+        "{holder}"
+    );
     let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
     let supervisor = loop {
         let job = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
-        if let Some(pid) = job["supervisor"]["pid"].as_i64() {
+        if let (Some(pid), "running") = (
+            job["supervisor"]["pid"].as_i64(),
+            job["status"].as_str().unwrap_or_default(),
+        ) {
             break pid as i32;
         }
         assert!(
