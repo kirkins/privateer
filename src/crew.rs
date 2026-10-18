@@ -709,11 +709,11 @@ fn stowed(store: &Store) -> Result<bool> {
 /// Parks whose child settled while nothing was watching (the dispatcher was
 /// down, or a settlement was missed) resume now. Each is claimed once.
 pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
-    // A spent cap ends a parked crew even while the fleet is stowed.
+    // A spent cap ends a parked or held crew, even while the fleet is stowed.
     let parked: Vec<(String, String)> = {
         let mut stmt = store
             .connection()
-            .prepare("SELECT id, crew_job_id FROM crew_parks WHERE state='parked'")?;
+            .prepare("SELECT id, crew_job_id FROM crew_parks WHERE state IN ('parked','held')")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
@@ -768,7 +768,7 @@ fn spent_cap(store: &Store, root: &str, task: &str, new_park: bool) -> Result<Op
     let elapsed_ms = Store::now_ms() - created;
     if elapsed_ms > (max_elapsed as i64).saturating_mul(1000) {
         return Ok(Some(format!(
-            "crew {root} has run for more than {max_elapsed} seconds in total; its park ends"
+            "crew {root} has run for more than {max_elapsed} seconds in total"
         )));
     }
     let parks: i64 = store.connection().query_row(
@@ -1116,6 +1116,13 @@ fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
         rows.collect::<rusqlite::Result<_>>()?
     };
     ensure!(!held.is_empty(), "task {task} has no held crew to resume");
+    // A resume is one more run: refused once the crew's caps are spent, as at
+    // a deadline. The dispatcher's next pass ends such a crew.
+    for (park, _) in &held {
+        if let Some(reason) = spent_cap_for_park(store, park)? {
+            bail!("crew.resume refused: {reason}");
+        }
+    }
     let mut resumed = vec![];
     for (park, crew) in held {
         if !claim(store, &park, "held")? {

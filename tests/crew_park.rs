@@ -627,6 +627,77 @@ fn closing_the_task_ends_a_parked_crew_and_its_job_quietly() {
     );
 }
 
+/// crew.resume refuses a held crew whose caps are spent, and says why; the
+/// crew stays held and nothing launches.
+#[test]
+fn crew_resume_is_refused_once_the_crews_caps_are_spent() {
+    let f = Fleet::new();
+    f.set_mode("held");
+    f.short_budget();
+    start_crew(&f, "crew-29");
+    f.wait("crew-29", &["parked"]);
+    f.json(
+        None,
+        "charter.put",
+        json!({"id": "engineering", "job_timeout_secs": 8, "crew_max_parks": 0}),
+    );
+    let refused = f.run(
+        None,
+        &[
+            "crew.resume",
+            "--json",
+            &json!({"task_id": "fix"}).to_string(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "a spent crew was resumed");
+    assert!(
+        stderr.contains("crew.resume refused") && stderr.contains("the cap is 0"),
+        "{stderr}"
+    );
+    assert_eq!(f.wait("crew-29", &["parked"])["status"], "parked");
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+}
+
+/// A held crew past its elapsed cap is ended by the dispatcher's pass, like a
+/// parked one, and its first mate is told why.
+#[test]
+fn a_held_crew_past_its_elapsed_cap_ends() {
+    let f = Fleet::new();
+    f.set_mode("held");
+    f.short_budget();
+    let home = f.root.join("engineering/.privateer");
+    fs::write(
+        home.join("config.json"),
+        json!({"ship": "engineering", "resource_home": f.root.join("ledger")}).to_string(),
+    )
+    .unwrap();
+    start_crew(&f, "crew-30");
+    f.wait("crew-30", &["parked"]);
+    // The crew has run for at least its 8 second budget already.
+    f.json(
+        None,
+        "charter.put",
+        json!({"id": "engineering", "job_timeout_secs": 8, "crew_max_elapsed_secs": 5}),
+    );
+    f.service("start");
+    let crew = f.wait("crew-30", &["cancelled"]);
+    f.service("stop");
+    assert!(
+        crew["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("more than 5 seconds in total; the park ends"),
+        "{crew}"
+    );
+    let notices = f.ship_notices();
+    assert!(
+        notices.iter().any(|b| b.contains("crew-30 cancelled")),
+        "the first mate was not told the crew ended: {notices:?}"
+    );
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+}
+
 /// A spent park cap at the deadline ends the crew with the reason, and a
 /// crew with a heavy job outstanding has that job cancelled too.
 #[test]
