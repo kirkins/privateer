@@ -1220,7 +1220,51 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     assert_eq!(herdr.panes.lock().unwrap().len(), 2);
     assert_eq!(herdr.calls("pane.focus").len(), 1);
     assert!(herdr.calls("agent.focus").is_empty());
+    // A reboot ends every lease, and btrfs/APFS may renumber the device under
+    // unchanged inodes. Such a claim is stale, but only a free lease retires
+    // it: the dashboard holding it on this boot keeps custody.
+    let held = claim();
+    let write = |c: &Value| fs::write(&claim_path, c.to_string()).unwrap();
+    let mut earlier = held.clone();
+    earlier["boot"] = json!("00000000-0000-0000-0000-000000000000");
+    let mut moved = held.clone();
+    for name in ["registry", "guard", "live"] {
+        moved[name][0] = json!(moved[name][0].as_u64().unwrap().wrapping_add(1));
+    }
+    let mut legacy = moved.clone();
+    legacy.as_object_mut().unwrap().remove("boot");
+    for stale in [&earlier, &legacy] {
+        write(stale);
+        let error = tick(&apps)["bridge"]["error"].clone();
+        assert!(error.as_str().unwrap().contains("retained"), "{error}");
+        assert_eq!(herdr.calls("workspace.create").len(), 3);
+    }
+    // A live claim from before boots were recorded learns this boot.
+    let mut unstamped = held.clone();
+    unstamped.as_object_mut().unwrap().remove("boot");
+    write(&unstamped);
+    assert_eq!(tick(&apps)["bridge"]["status"], "live");
+    assert_eq!(claim()["boot"], held["boot"]);
+    assert!(held["boot"].is_string());
     herdr.dashboards.lock().unwrap()[1].stop();
+    // Within one boot a renumbered device is still a replaced scope.
+    write(&moved);
+    let error = tick(&apps)["bridge"]["error"].clone();
+    assert_eq!(error, "bridge claim scope changed");
+    assert_eq!(herdr.calls("workspace.create").len(), 3);
+    // Once the lease is free, each stale claim is taken over, not wedged.
+    herdr.suppress_input.store(true, Ordering::SeqCst);
+    for (stale, creates) in [(&earlier, 4), (&legacy, 5)] {
+        write(stale);
+        assert_eq!(tick(&apps)["bridge"]["status"], "launched");
+        assert_eq!(herdr.calls("workspace.create").len(), creates);
+        let now = claim();
+        assert_ne!(now["token"], held["token"]);
+        assert_eq!(now["boot"], held["boot"]);
+        assert_eq!(now["live"], held["live"]);
+        assert_eq!(now["adopted"], false);
+    }
+    herdr.suppress_input.store(false, Ordering::SeqCst);
     use std::os::fd::AsRawFd;
     let lease = fs::File::open(coordination.join("live")).unwrap();
     assert_eq!(
