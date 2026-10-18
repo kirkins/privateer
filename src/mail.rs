@@ -779,7 +779,8 @@ fn check_answer(decision: &Value, answer: &Value) -> Result<()> {
         );
     }
     if let Some(text) = fields.get("text") {
-        bounded_text(text, "answer.text", 1, 2000)?;
+        // As long as a Telegram message, so a typed reply to a card always fits.
+        bounded_text(text, "answer.text", 1, 4096)?;
     }
     Ok(())
 }

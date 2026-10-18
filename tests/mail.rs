@@ -2720,7 +2720,7 @@ fn a_captain_answers_by_option_text_or_both_and_a_bad_answer_leaves_the_decision
         json!({"option_id":5}),
         json!({"option_id":"ship","extra":1}),
         json!({"text":""}),
-        json!({"text":"t".repeat(2001)}),
+        json!({"text":"t".repeat(4097)}),
         json!("ship"),
     ] {
         assert!(answer(&mut s, "bad", "choose", bad).is_err());
