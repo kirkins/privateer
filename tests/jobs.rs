@@ -2581,6 +2581,7 @@ fn this_boot() -> String {
         .trim()
         .to_owned()
 }
+#[cfg(target_os = "linux")]
 fn this_pid_namespace() -> String {
     fs::read_link("/proc/self/ns/pid")
         .unwrap()
@@ -2589,6 +2590,7 @@ fn this_pid_namespace() -> String {
 }
 /// A supervisor identity recorded on a machine with another boot. Its PID is
 /// one that is alive here, so only the boot id tells it apart.
+#[cfg(target_os = "linux")]
 fn laptop_supervisor(namespace: &str) -> Value {
     json!({"pid": std::process::id(), "started": "linux:00000000-0000-4000-8000-1a7709000000:4242",
         "pid_namespace": namespace, "zombie": false})
@@ -2693,6 +2695,7 @@ fn a_supervisor_in_another_pid_namespace_of_this_boot_is_still_left_alone() {
     assert_eq!(audits(&home, "job.foreign"), 0);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_ledger_in_a_directory_this_user_cannot_reach_settles_once_without_opening_it() {
     // The server runs as another user than the laptop: the laptop's ledger
