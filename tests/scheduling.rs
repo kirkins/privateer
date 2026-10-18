@@ -1293,6 +1293,11 @@ fn deferred_blocked_handed_off_and_asking_tasks_raise_no_backlog_alarm() {
     );
     fleet.send(json!({"from":"infra","to":"apps","kind":"request",
         "body":"Which window is free?","task_id":"infra-asking"}));
+    // Open and unscheduled, but waiting on an answer the ship asked for: only
+    // the open-request clause keeps it off the list, since it is not running.
+    task(&mut fleet, "infra-open-asking");
+    fleet.send(json!({"from":"infra","to":"apps","kind":"request",
+        "body":"Which deploy window?","task_id":"infra-open-asking"}));
     fleet.tick();
     pass(&fleet, 3600);
     let report = fleet.tick();
@@ -1330,6 +1335,81 @@ fn a_stowed_ship_is_not_woken_for_its_backlog() {
         .unwrap();
     assert_eq!(backlog(&fleet.tick())["fired"], "backlog-infra-1");
     assert_eq!(notices(&fleet).len(), 1);
+}
+
+/// A quiet pass with nothing new writes no alarm row: the row is read on every
+/// tick, and only a change to it may write (the trigger counts UPDATEs).
+#[test]
+fn a_quiet_tick_with_nothing_changed_leaves_the_alarm_row_untouched() {
+    let fleet = Fleet::new(support::now_settings());
+    fleet
+        .store
+        .connection()
+        .execute_batch(
+            "CREATE TABLE alarm_writes(n INTEGER NOT NULL);
+             INSERT INTO alarm_writes VALUES(0);
+             CREATE TRIGGER alarm_writes_count AFTER UPDATE ON backlog_alarms
+             BEGIN UPDATE alarm_writes SET n=n+1; END;",
+        )
+        .unwrap();
+    let writes = |fleet: &Fleet| -> i64 {
+        fleet
+            .store
+            .connection()
+            .query_row("SELECT n FROM alarm_writes", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(backlog(&fleet.tick())["skipped"], "first backlog check");
+    // The first pass after the row exists lists the candidate and may write
+    // its new candidate set once; after that nothing changes.
+    assert_eq!(backlog(&fleet.tick())["skipped"], "spaced");
+    let settled = writes(&fleet);
+    for _ in 0..3 {
+        assert_eq!(backlog(&fleet.tick())["skipped"], "spaced");
+    }
+    assert_eq!(writes(&fleet), settled);
+    assert!(notices(&fleet).is_empty());
+}
+
+/// A task that faults, is re-enqueued and faults again is a new revision, so
+/// the wake that listed its first fault counts as productive.
+#[test]
+fn a_fault_re_enqueued_and_faulted_again_counts_as_productive() {
+    let mut fleet = Fleet::new(support::now_settings());
+    enqueue(&mut fleet);
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.state','fault','$.reason','first')
+             WHERE task_id='infra-repair'",
+            [],
+        )
+        .unwrap();
+    fleet.tick();
+    pass(&fleet, 3600);
+    let first = backlog(&fleet.tick());
+    assert_eq!(first["fired"], "backlog-infra-1", "{first}");
+    fleet.settle();
+    // Re-enqueued (a new revision) and faulted again before the next check.
+    call(
+        &mut fleet,
+        "task.enqueue",
+        json!({"id":"infra-repair","brief":"Try again."}),
+    );
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.state','fault','$.reason','again')
+             WHERE task_id='infra-repair'",
+            [],
+        )
+        .unwrap();
+    pass(&fleet, 3600);
+    fleet.tick();
+    assert_eq!(audits(&mut fleet, "backlog.productive"), 1);
+    assert_eq!(audits(&mut fleet, "backlog.unproductive"), 0);
 }
 
 /// With more candidates than a notice lists, only a handled task resets the

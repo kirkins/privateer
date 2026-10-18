@@ -40,6 +40,7 @@ struct Candidate {
 
 /// A ship's alarm row: the last fire, the spacing before the next, and what
 /// that fire listed, to judge whether its wake moved anything.
+#[derive(Clone, PartialEq)]
 struct Alarm {
     fired_ms: i64,
     next_ms: i64,
@@ -81,6 +82,11 @@ fn load_alarm(store: &Store, ship: &str) -> Result<Option<Alarm>> {
 }
 
 fn save_alarm(store: &Store, ship: &str, alarm: &Alarm, mail_id: Option<&str>) -> Result<()> {
+    // Every tick passes through here for every quiet ship, so write only a
+    // row that changed. A fire always carries its mail id and always writes.
+    if mail_id.is_none() && load_alarm(store, ship)?.as_ref() == Some(alarm) {
+        return Ok(());
+    }
     store.connection().execute(
         "INSERT INTO backlog_alarms(ship, fired_ms, next_ms, backoff_secs, fires, quiet, evaluated,
            considered, candidates, mail_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -330,10 +336,6 @@ fn consider(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
             json!({"ship": ship, "skipped": "first backlog check", "next_ms": now + interval * 1000}),
         );
     }
-    let ledger = crate::jobs::host_ledger(store)?;
-    if crate::jobs::stowed(&ledger)?.is_some() {
-        return Ok(skipped(ship, "stowed"));
-    }
     if crate::permissions::paused(store, ship)? {
         return Ok(skipped(
             ship,
@@ -353,6 +355,12 @@ fn consider(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
     }
     if let Some(reason) = not_quiet(store, ship, profile)? {
         return Ok(skipped(ship, reason));
+    }
+    // The shared host ledger is opened only for a ship that passed the cheap
+    // checks above, not for every ship on every tick.
+    let ledger = crate::jobs::host_ledger(store)?;
+    if crate::jobs::stowed(&ledger)?.is_some() {
+        return Ok(skipped(ship, "stowed"));
     }
     if crate::activation::own_route_blocked(store, profile)? {
         return Ok(skipped(ship, "model route backing off"));
