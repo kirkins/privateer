@@ -2649,6 +2649,7 @@ fn the_captains_desk_can_sit_on_the_machine_this_one_reaches() {
 #[test]
 fn the_captain_reads_and_answers_at_a_desk_on_another_machine() {
     let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
     assert!(link(&laptop, &mac, &ssh).status.success());
     let ship = mac.ok(
         "fitforge",
@@ -2668,8 +2669,17 @@ fn the_captain_reads_and_answers_at_a_desk_on_another_machine() {
             .map(|w| w["mail"]["body"].as_str().unwrap().to_owned())
             .collect()
     };
+    // Asked on the laptop before the desk moves: the desk never holds it.
+    let rotate = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the key?"}),
+    );
     // The laptop alone has not collected the Mac's asks.
-    assert!(bodies(&laptop.ok("liaison", "captain.waiting", json!({}))).is_empty());
+    assert_eq!(
+        bodies(&laptop.ok("liaison", "captain.waiting", json!({}))),
+        ["Rotate the key?"]
+    );
 
     assert!(
         laptop
@@ -2678,9 +2688,22 @@ fn the_captain_reads_and_answers_at_a_desk_on_another_machine() {
             .success()
     );
 
-    // With the desk on the Mac, the captain's commands on the laptop run there.
+    // With the desk on the Mac, the captain's commands on the laptop run
+    // there, and the ask only the laptop holds is still listed.
     let waiting = laptop.ok_over("liaison", "captain.waiting", json!({}), &ssh);
-    assert_eq!(bodies(&waiting), ["Ship build 14?", "Rename the scheme?"]);
+    assert_eq!(
+        bodies(&waiting),
+        ["Ship build 14?", "Rename the scheme?", "Rotate the key?"]
+    );
+    // It is answered where it is held.
+    laptop.ok_over(
+        "liaison",
+        "captain.reply",
+        json!({"id": rotate["id"], "body": "Yes"}),
+        &ssh,
+    );
+    let rotated = laptop.ok("scout", "mail.show", json!({"id": rotate["id"]}));
+    assert_eq!(rotated["state"], "answered", "{rotated}");
     laptop.ok_over(
         "liaison",
         "captain.reply",

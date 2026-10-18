@@ -288,6 +288,37 @@ fn locate(query: &str, notices: bool) -> Result<Item> {
     }
 }
 
+/// The desk's list, plus the open asks only this machine holds: those
+/// written before the desk moved, or not handed to it yet. The desk's copy
+/// of an ask keeps its id, so an ask is listed once.
+fn with_local_asks(mut desk: Value) -> Result<Value> {
+    let local = waiting()?;
+    for list in ["waiting", "hands_on"] {
+        let ids: std::collections::HashSet<String> = desk[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|w| w["mail"]["id"].as_str().map(str::to_owned))
+            .collect();
+        let extra: Vec<Value> = local[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["mail"]["id"].as_str().is_some_and(|id| !ids.contains(id)))
+            .cloned()
+            .collect();
+        if extra.is_empty() {
+            continue;
+        }
+        let merged = desk[list]
+            .as_array_mut()
+            .context("the desk's list is not a list")?;
+        merged.extend(extra);
+        merged.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
+    }
+    Ok(desk)
+}
+
 /// Whether a home on this machine holds captain mail whose id starts with
 /// `query`, open or not.
 fn held_here(query: &str) -> Result<bool> {
@@ -412,7 +443,11 @@ pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value>
             _ => false,
         };
         if at_desk && let Some(result) = crate::machines::at_desk(command, &_args)? {
-            return Ok(result);
+            return if command == "captain.waiting" {
+                with_local_asks(result)
+            } else {
+                Ok(result)
+            };
         }
     }
     match command {
