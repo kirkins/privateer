@@ -23,7 +23,7 @@ const SOURCE_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 const QUOTE_CHARS: usize = 2_000;
 
 /// Active fleet ships whose folders still exist, with their homes.
-fn fleet() -> Result<Vec<(String, PathBuf)>> {
+pub(crate) fn fleet() -> Result<Vec<(String, PathBuf)>> {
     Ok(crate::fleet::members(&crate::fleet::registry()?)?
         .into_iter()
         .filter(|m| m.home.is_dir())
@@ -350,6 +350,13 @@ pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value>
         "captain.relay" => relay(store, &_args),
         "captain.reply" => reply(store, &_args),
         "captain.dismiss" => dismiss(store, &_args),
+        "captain.feed" => {
+            ensure!(
+                *store.caller() == Caller::Operator,
+                "only the captain reads the captain's mail feed"
+            );
+            crate::feed::feed(&_args)
+        }
         _ => bail!("unknown captain command {command}"),
     }
 }

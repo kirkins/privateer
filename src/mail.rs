@@ -39,6 +39,7 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS mail_recipient ON mail(recipient, seq);
          CREATE INDEX IF NOT EXISTS mail_sender ON mail(sender, seq);
          CREATE INDEX IF NOT EXISTS mail_correlation ON mail(correlation);
+         CREATE INDEX IF NOT EXISTS mail_time ON mail(created_ms, seq);
          CREATE TABLE IF NOT EXISTS mail_cursor(address TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);",
     )?;
     let tx = store.write_transaction()?;
@@ -295,9 +296,9 @@ pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
 }
 
-const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms,ended_by,ended_ms,end_reason";
+pub(crate) const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms,ended_by,ended_ms,end_reason";
 
-fn message(r: &Row) -> rusqlite::Result<Value> {
+pub(crate) fn message(r: &Row) -> rusqlite::Result<Value> {
     let payload: String = r.get(9)?;
     Ok(json!({
         "seq": r.get::<_, i64>(0)?, "id": r.get::<_, String>(1)?,

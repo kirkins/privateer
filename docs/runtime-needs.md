@@ -22,6 +22,9 @@ The operator's `captain.reply {id, body?, payload?}` and `captain.dismiss {id,
 note?}` find an item by id or unique prefix in whichever fleet home holds it
 and answer it, or close it without an answer (`dismissed`), there; a dismissed
 item leaves both lists (see [architecture](architecture.md)).
+The operator's `captain.feed` is the captain's whole mail history across
+those homes, a cursor-paged `{entries, more, next}` with bodies and state; it
+is a read of stored mail, not a Needs observation.
 Neither liaison desk permission nor cited prose permits `runtime.needs`, live
 bridge actions, or an approval grant. Unsupported facts remain unknown.
 

@@ -3676,3 +3676,44 @@ fn a_dismissal_closes_the_ask_on_the_desk_and_where_it_was_asked() {
     let waiting = mac.ok("fitforge", "captain.waiting", json!({}));
     assert_eq!(waiting["waiting"], json!([]), "{waiting}");
 }
+
+#[test]
+fn the_other_machines_captain_mail_reaches_the_feed_through_the_desk() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let asked = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "request", "body": "Upload build 12?"}),
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["delivered"], 1, "{pass}");
+
+    // The desk copy is one entry in the desk home, named by its asking ship.
+    let feed = laptop.ok("liaison", "captain.feed", json!({}));
+    let entries: Vec<&Value> = feed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["id"] == asked["id"])
+        .collect();
+    assert_eq!(entries.len(), 1, "{feed}");
+    assert_eq!(entries[0]["ship"], "fitforge");
+    assert_eq!(entries[0]["home"], "liaison");
+    assert_eq!(entries[0]["body"], "Upload build 12?");
+    assert_eq!(entries[0]["state"], "open");
+
+    // Answered from the desk: the feed shows the reply and the closed ask.
+    laptop.ok_over(
+        "liaison",
+        "captain.reply",
+        json!({"id": asked["id"], "body": "Yes"}),
+        &ssh,
+    );
+    let feed = laptop.ok("liaison", "captain.feed", json!({"ship": "fitforge"}));
+    let entries = feed["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{feed}");
+    assert_eq!(entries[0]["state"], "answered");
+    assert_eq!(entries[1]["from"], "captain");
+    assert_eq!(entries[1]["correlation"], asked["id"]);
+}
