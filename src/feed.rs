@@ -104,27 +104,30 @@ struct Query {
     ship: Option<String>,
 }
 
+/// Messages in feed order, each with its position.
+type Rows = Vec<(Key, Value)>;
+
 /// One home's next rows in feed order, keeping only the copies this feed
 /// shows. Returns them and, unless the home ran out, the last key it read.
-fn scan(homes: &[Home], index: usize, query: &Query) -> Result<(Vec<(Key, Value)>, Option<Key>)> {
+fn scan(homes: &[Home], index: usize, query: &Query) -> Result<(Rows, Option<Key>)> {
     let home = &homes[index];
     let order = if query.forward { "ASC" } else { "DESC" };
     let sql = format!(
         "SELECT {} FROM mail WHERE ({})
-           AND (?1 IS NULL OR (created_ms, seq) > (?1, ?2))
-           AND (?3 IS NULL OR (created_ms, seq) < (?3, ?4))
+           AND (created_ms, seq) > (?1, ?2) AND (created_ms, seq) < (?3, ?4)
          ORDER BY created_ms {order}, seq {order} LIMIT ?5",
         crate::mail::COLUMNS,
         query.scope
     );
+    // Open ends are the extremes, never NULL, so SQLite seeks the time index.
     let mut after = query
         .after
         .as_ref()
-        .map(|k| (k.ms, k.seq_bound(&home.ship)));
+        .map_or((i64::MIN, i64::MIN), |k| (k.ms, k.seq_bound(&home.ship)));
     let mut before = query
         .before
         .as_ref()
-        .map(|k| (k.ms, k.seq_bound(&home.ship)));
+        .map_or((i64::MAX, i64::MAX), |k| (k.ms, k.seq_bound(&home.ship)));
     let mut kept = vec![];
     let mut scanned = 0;
     let budget = query.want * SCAN_PAGES;
@@ -134,10 +137,10 @@ fn scan(homes: &[Home], index: usize, query: &Query) -> Result<(Vec<(Key, Value)
         let rows = statement
             .query_map(
                 params![
-                    after.map(|a| a.0),
-                    after.map(|a| a.1),
-                    before.map(|b| b.0),
-                    before.map(|b| b.1),
+                    after.0,
+                    after.1,
+                    before.0,
+                    before.1,
                     batch as i64,
                     query.ship,
                 ],
@@ -154,9 +157,9 @@ fn scan(homes: &[Home], index: usize, query: &Query) -> Result<(Vec<(Key, Value)
                 seq: row["seq"].as_i64().unwrap_or(0),
             };
             if query.forward {
-                after = Some((key.ms, key.seq));
+                after = (key.ms, key.seq);
             } else {
-                before = Some((key.ms, key.seq));
+                before = (key.ms, key.seq);
             }
             if shown_here(homes, index, &row)? {
                 kept.push((key.clone(), row));
