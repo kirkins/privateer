@@ -650,6 +650,118 @@ fn show(value: Option<Value>) -> Value {
     value
 }
 
+/// What a route can do now, as bearings and `fleet.snapshot` read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum State {
+    Available,
+    /// Not held off, and its declared allowance unused since it last renewed.
+    Idle,
+    BackingOff,
+    /// Held off with its allowance spent until it reopens.
+    Capped,
+}
+
+impl State {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            State::Available => "available",
+            State::Idle => "idle",
+            State::BackingOff => "backing_off",
+            State::Capped => "capped",
+        }
+    }
+}
+
+/// One route's state as of a time. Every field is a stored fact or derived
+/// from one, so it changes with time only when `now` crosses a stored instant
+/// (a hold's end, a window's end, a daily renewal).
+#[derive(Clone, Debug)]
+pub(crate) struct RouteState {
+    /// The captain's name for it; None for a ledger hold no listed route names.
+    pub name: Option<String>,
+    /// Its identity (harness/provider/model), or the ledger key held.
+    pub route: Option<String>,
+    pub cost: Option<String>,
+    pub tier: Option<u64>,
+    pub state: State,
+    /// When a hold ends.
+    pub until_ms: Option<i64>,
+    /// The hold's classified error, as `routes::refusal` shows it.
+    pub error: Option<String>,
+    pub allowance: Option<Allowance>,
+    pub usage: Option<crate::routes::Usage>,
+}
+
+/// Every route the policy names, in name order, then each ledger hold that no
+/// named route's identity is, in key order.
+pub(crate) fn states(
+    policy: &Value,
+    ledger: &rusqlite::Connection,
+    now: i64,
+) -> Result<Vec<RouteState>> {
+    let usage = crate::routes::usage(ledger)?;
+    let capped = |id: &str, until: i64| {
+        usage
+            .get(id)
+            .and_then(|u| u.capped_until_ms)
+            .is_some_and(|cap| cap > now)
+            .then_some(until)
+    };
+    let mut states = vec![];
+    let mut named = std::collections::HashSet::new();
+    for (name, route) in policy["routes"].as_object().into_iter().flatten() {
+        let id = identity(route);
+        let used = id.as_ref().and_then(|id| usage.get(id)).cloned();
+        let declared = allowance(route);
+        let blocked = match &id {
+            Some(id) => crate::routes::blocked_at(ledger, id, now)?,
+            None => None,
+        };
+        let state = match &blocked {
+            Some((until, _)) if id.as_deref().and_then(|id| capped(id, *until)).is_some() => {
+                State::Capped
+            }
+            Some(_) => State::BackingOff,
+            None if declared.is_some_and(|a| idle(a.shape, used.as_ref(), now)) => State::Idle,
+            None => State::Available,
+        };
+        named.extend(id.clone());
+        let (until_ms, error) = blocked.unzip();
+        states.push(RouteState {
+            name: Some(name.clone()),
+            route: id,
+            cost: route["cost"].as_str().map(str::to_owned),
+            tier: Some(tier(route)),
+            state,
+            until_ms,
+            error,
+            allowance: declared,
+            usage: used,
+        });
+    }
+    for (key, until, error) in crate::routes::held(ledger, now)? {
+        if named.contains(&key) {
+            continue;
+        }
+        let state = match capped(&key, until) {
+            Some(_) => State::Capped,
+            None => State::BackingOff,
+        };
+        states.push(RouteState {
+            name: None,
+            usage: usage.get(&key).cloned(),
+            route: Some(key),
+            cost: None,
+            tier: None,
+            state,
+            until_ms: Some(until),
+            error: Some(error),
+            allowance: None,
+        });
+    }
+    Ok(states)
+}
+
 /// The bearings lines: each list in order with the captain's notes and each
 /// allowance's shape, routes backing off or capped marked, and then any
 /// allowance that is going unused.
@@ -658,8 +770,11 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     let ledger = crate::jobs::host_ledger(store)?;
-    let usage = crate::routes::usage(&ledger)?;
     let now = Store::now_ms();
+    let states: std::collections::HashMap<String, RouteState> = states(&policy, &ledger, now)?
+        .into_iter()
+        .filter_map(|state| Some((state.name.clone()?, state)))
+        .collect();
     let mut parts = vec![];
     let mut shaped = false;
     let mut idle: Vec<String> = vec![];
@@ -672,8 +787,8 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         for name in names {
             let route = &policy["routes"][name.as_str()];
             let cost = route["cost"].as_str().unwrap_or("?");
-            let id = identity(route);
-            let used = id.as_ref().and_then(|id| usage.get(id));
+            let read = states.get(&name);
+            let used = read.and_then(|r| r.usage.as_ref());
             let mut details = vec![cost.to_owned()];
             details.extend(
                 route["note"]
@@ -698,25 +813,19 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                 details.push(format!("tier {}", tier(route)));
             }
             let mut label = format!("{name} ({})", details.join("; "));
-            let blocked = match &id {
-                Some(id) => crate::routes::blocked(&ledger, id)?,
-                None => None,
-            };
-            let capped = used
-                .and_then(|u| u.capped_until_ms)
-                .filter(|until| *until > now);
-            match (blocked, capped) {
-                (Some((until, _)), Some(_)) => {
+            match read.map_or((State::Available, None), |r| (r.state, r.until_ms)) {
+                (State::Capped, Some(until)) => {
                     label.push_str(&format!(" capped until {}", clock(until, now)));
                 }
-                (Some(_), None) => label.push_str(" backing off"),
-                (None, _) => {
+                (State::Capped | State::BackingOff, _) => label.push_str(" backing off"),
+                (state, _) => {
                     if let Some(end) = used.and_then(|u| u.window_ends_ms).filter(|e| *e > now)
                         && matches!(declared.map(|a| a.shape), Some(Shape::Rolling { .. }))
                     {
                         label.push_str(&format!(" window open until {}", clock(end, now)));
                     }
                     if kind != "first_mate"
+                        && state == State::Idle
                         && let Some(allowance) = declared
                         && let Some(line) = idle_line(&name, allowance.shape, used, now)
                         && !idle.contains(&line)
@@ -751,7 +860,7 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
-fn describe(shape: Shape) -> String {
+pub(crate) fn describe(shape: Shape) -> String {
     match shape {
         Shape::Daily(minute) => format!("daily {:02}:{:02} UTC", minute / 60, minute % 60),
         Shape::Rolling { window_ms, weekly } => {
@@ -772,33 +881,41 @@ fn describe(shape: Shape) -> String {
 
 /// An allowance with no use since it last renewed: a daily one not used since
 /// its last reset, a rolling one with no window open.
+fn idle(shape: Shape, used: Option<&crate::routes::Usage>, now: i64) -> bool {
+    match shape {
+        Shape::Daily(minute) => used
+            .and_then(|u| u.last_succeeded_ms)
+            .is_none_or(|at| at < next_daily(minute, now) - DAY_MS),
+        Shape::Rolling { .. } => used
+            .and_then(|u| u.window_ends_ms)
+            .is_none_or(|end| end <= now),
+    }
+}
+
+/// The bearings line for an idle allowance, when it is idle.
 fn idle_line(
     name: &str,
     shape: Shape,
     used: Option<&crate::routes::Usage>,
     now: i64,
 ) -> Option<String> {
-    let last = used.and_then(|u| u.last_succeeded_ms);
-    let last_used = match last {
+    if !idle(shape, used, now) {
+        return None;
+    }
+    let last_used = match used.and_then(|u| u.last_succeeded_ms) {
         Some(at) => format!("last used {} ago", span(now - at)),
         None => "no use recorded".to_owned(),
     };
-    match shape {
-        Shape::Daily(minute) => {
-            let next = next_daily(minute, now);
-            (last.is_none_or(|at| at < next - DAY_MS)).then(|| {
-                format!(
-                    "{name} ({}, refreshes in {}, {last_used})",
-                    describe(shape),
-                    span(next - now)
-                )
-            })
+    Some(match shape {
+        Shape::Daily(minute) => format!(
+            "{name} ({}, refreshes in {}, {last_used})",
+            describe(shape),
+            span(next_daily(minute, now) - now)
+        ),
+        Shape::Rolling { .. } => {
+            format!("{name} ({}, no window open, {last_used})", describe(shape))
         }
-        Shape::Rolling { .. } => used
-            .and_then(|u| u.window_ends_ms)
-            .is_none_or(|end| end <= now)
-            .then(|| format!("{name} ({}, no window open, {last_used})", describe(shape))),
-    }
+    })
 }
 
 /// A UTC time of day, with its weekday when it is a day or more away.
@@ -881,6 +998,91 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn route_states_come_from_stored_holds_and_usage_only() {
+        let policy = json!({"routes": {
+            "busy": route("busy", json!({})),
+            "capped": route("capped", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+            "fresh": route("fresh", json!({"allowance": daily_in(3, NOW), "tier": 2})),
+            "open": route("open", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+            "plain": route("plain", json!({})),
+        }});
+        let id = |name: &str| identity(&policy["routes"][name]).unwrap();
+        let ledger = rusqlite::Connection::open_in_memory().unwrap();
+        crate::routes::init(&ledger).unwrap();
+        let hold = |route: &str, until: i64, error: &str| {
+            ledger
+                .execute(
+                    "INSERT INTO model_routes VALUES(?1, 1, ?2, ?3, ?4)",
+                    rusqlite::params![route, until, error, NOW],
+                )
+                .unwrap();
+        };
+        hold(&id("busy"), NOW + 10 * 60_000, "429 rate limited");
+        hold(&id("capped"), NOW + 4 * HOUR, "usage limit reached");
+        hold("opencode/zen/other", NOW + 2 * HOUR, "free allowance spent");
+        let usage = |route: &str, last: i64, window_ends: Option<i64>, capped: Option<i64>| {
+            ledger
+                .execute(
+                    "INSERT INTO route_usage(route, last_succeeded_ms, strikes, window_ends_ms,
+                       window_utilization, capped_until_ms, updated_ms)
+                     VALUES(?1, ?2, 0, ?3, 0.4, ?4, ?2)",
+                    rusqlite::params![route, last, window_ends, capped],
+                )
+                .unwrap();
+        };
+        usage(&id("capped"), NOW - HOUR, None, Some(NOW + 4 * HOUR));
+        usage(&id("open"), NOW - HOUR, Some(NOW + 3 * HOUR), None);
+        // Daily `fresh` was last used before its last reset, a day ago: idle.
+        usage(&id("fresh"), NOW - 22 * HOUR, None, None);
+        let read = |now: i64| -> Vec<(Option<String>, State, Option<i64>, Option<String>)> {
+            states(&policy, &ledger, now)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.name, s.state, s.until_ms, s.error))
+                .collect()
+        };
+        let name = |n: &str| Some(n.to_owned());
+        let at_now = read(NOW);
+        assert_eq!(
+            at_now,
+            vec![
+                (
+                    name("busy"),
+                    State::BackingOff,
+                    Some(NOW + 10 * 60_000),
+                    name("429 rate limited")
+                ),
+                (
+                    name("capped"),
+                    State::Capped,
+                    Some(NOW + 4 * HOUR),
+                    name("usage limit reached")
+                ),
+                (name("fresh"), State::Idle, None, None),
+                (name("open"), State::Available, None, None),
+                (name("plain"), State::Available, None, None),
+                (
+                    None,
+                    State::BackingOff,
+                    Some(NOW + 2 * HOUR),
+                    name("free allowance spent")
+                ),
+            ]
+        );
+        let unnamed = states(&policy, &ledger, NOW).unwrap().pop().unwrap();
+        assert_eq!(unnamed.route.as_deref(), Some("opencode/zen/other"));
+        // Time passing without crossing a stored instant changes nothing.
+        assert_eq!(read(NOW + 5 * 60_000), at_now);
+        // Crossing one does: the backoff ends, the window closes and the
+        // rolling allowance goes idle, the daily one renews and stays idle.
+        let later = read(NOW + 3 * HOUR + 60_000);
+        assert_eq!(later[0].1, State::Available);
+        assert_eq!(later[1].1, State::Capped);
+        assert_eq!(later[3].1, State::Idle);
+        assert_eq!(later.len(), 5, "the unnamed hold ended");
     }
 
     #[test]

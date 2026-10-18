@@ -7,6 +7,7 @@
 //! the `fleet.collect` it already makes. Nothing in a section is computed
 //! from the current time, so it hashes the same while nothing changes. See
 //! docs/design/fleet-snapshot.md.
+use crate::jobs::TERMINAL_SQL;
 use crate::needs::ObservationBudget;
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, ensure};
@@ -29,7 +30,6 @@ const JOBS_SHOWN: usize = 20;
 const NEEDS_PER_HOME: u64 = 40;
 const DOING_CHARS: usize = 200;
 const ERROR_CHARS: usize = 500;
-const TERMINAL: &str = "('succeeded','failed','cancelled','timed_out','resumed')";
 
 pub(crate) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -204,6 +204,40 @@ fn holders(store: &Store) -> Option<Holders> {
     })
 }
 
+/// This machine's routes: each one the captain names and each ledger hold
+/// none of them is, as `crew_routes::states` reads them at `now`. Stored
+/// facts only: `until_ms` and the allowance's ends are absolute, so a route
+/// reads the same until `now` crosses one of them. None when the routes file
+/// or the ledger cannot be read.
+fn routes(store: &Store, now: i64) -> Option<Vec<Value>> {
+    let Some(policy) = crate::crew_routes::load().ok()? else {
+        return Some(vec![]);
+    };
+    let states = match crate::jobs::ledger_readonly(store, Duration::from_millis(100)).ok()? {
+        Some(ledger) => crate::crew_routes::states(&policy, &ledger, now).ok()?,
+        None => {
+            let empty = Connection::open_in_memory().ok()?;
+            crate::routes::init(&empty).ok()?;
+            crate::crew_routes::states(&policy, &empty, now).ok()?
+        }
+    };
+    Some(states.into_iter().map(route_json).collect())
+}
+
+fn route_json(route: crate::crew_routes::RouteState) -> Value {
+    let allowance = route.allowance.map(|allowance| {
+        let used = route.usage.clone().unwrap_or_default();
+        json!({"shape": crate::crew_routes::describe(allowance.shape),
+            "window_ends_ms": used.window_ends_ms, "weekly_ends_ms": used.weekly_ends_ms,
+            "window_used": used.window_utilization, "week_used": used.weekly_utilization,
+            "last_used_ms": used.last_succeeded_ms})
+    });
+    json!({"name": route.name, "route": route.route, "cost": route.cost, "tier": route.tier,
+        "state": route.state.as_str(), "until_ms": route.until_ms,
+        "error": route.error.map(|e| e.chars().take(ERROR_CHARS).collect::<String>()),
+        "allowance": allowance})
+}
+
 /// The first line of a crew progress report, after the runtime's lead line.
 fn doing_text(body: &str) -> String {
     let text = match body.split_once('\n') {
@@ -225,6 +259,14 @@ fn column(conn: &Connection, table: &str, name: &str) -> Result<bool> {
         [name],
         |r| r.get(0),
     )?)
+}
+
+/// A ship's open tasks, by the `tasks_owner` index.
+const OPEN_TASKS: &str = "FROM tasks WHERE owner=?1 AND status IN ('open','running','blocked')";
+
+/// A home's live jobs, by the `jobs_live` index.
+fn live_jobs() -> String {
+    format!("FROM jobs WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL}")
 }
 
 /// A stored lease: holder, started, expires, the holder that slept, since when.
@@ -281,16 +323,13 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     budget.check()?;
-    let open = "status IN ('open','running','blocked')";
-    let open_tasks_total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM tasks WHERE owner=?1 AND {open}"),
-        [ship],
-        |r| r.get(0),
-    )?;
+    let open_tasks_total: i64 =
+        conn.query_row(&format!("SELECT COUNT(*) {OPEN_TASKS}"), [ship], |r| {
+            r.get(0)
+        })?;
     let open_tasks = conn
         .prepare(&format!(
-            "SELECT id, title, status, handoff_to FROM tasks WHERE owner=?1 AND {open}
-             ORDER BY rowid DESC LIMIT ?2"
+            "SELECT id, title, status, handoff_to {OPEN_TASKS} ORDER BY rowid DESC LIMIT ?2"
         ))?
         .query_map(params![ship, TASKS_SHOWN], |r| {
             Ok(json!({"id": r.get::<_, String>(0)?,
@@ -299,17 +338,13 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;
-    let jobs_total: i64 = conn.query_row(
-        &format!(
-            "SELECT COUNT(*) FROM jobs WHERE json_extract(record,'$.status') NOT IN {TERMINAL}"
-        ),
-        [],
-        |r| r.get(0),
-    )?;
+    let jobs_total: i64 = conn.query_row(&format!("SELECT COUNT(*) {}", live_jobs()), [], |r| {
+        r.get(0)
+    })?;
     let live: Vec<Value> = conn
         .prepare(&format!(
-            "SELECT record FROM jobs WHERE json_extract(record,'$.status') NOT IN {TERMINAL}
-             ORDER BY json_extract(record,'$.created_ms') DESC, id LIMIT ?1"
+            "SELECT record {} ORDER BY json_extract(record,'$.created_ms') DESC, id LIMIT ?1",
+            live_jobs()
         ))?
         .query_map([JOBS_SHOWN], |r| r.get::<_, String>(0))?
         .map(|raw| Ok(serde_json::from_str(&raw?)?))
@@ -346,19 +381,19 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
             })
             .optional()?
             .map(|t| t.chars().take(500).collect());
-        let park: Option<(String, String, i64)> = if status == "parked" {
+        let park: Option<(String, String, i64, String)> = if status == "parked" {
             conn.query_row(
-                "SELECT child_job_id, next, updated_ms FROM crew_parks
+                "SELECT child_job_id, next, updated_ms, root FROM crew_parks
                  WHERE crew_job_id=?1 ORDER BY updated_ms DESC LIMIT 1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
         } else {
             None
         };
         let doing = match &park {
-            Some((_, next, at)) => {
+            Some((_, next, at, _)) => {
                 json!({"text": doing_text(next), "at_ms": at, "report_id": null})
             }
             None => conn
@@ -378,7 +413,8 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
                 .unwrap_or(Value::Null),
         };
         let wait = match (status, &park) {
-            ("parked", Some((child, _, _))) => json!({"for": "job", "job_id": child}),
+            ("parked", Some((child, _, _, root))) => json!({"for": "job", "job_id": child,
+                "park": crate::crew::park_count(store, root, task_id)?}),
             ("queued", _) => {
                 let disk = job["reason"]
                     .as_str()
@@ -459,6 +495,7 @@ pub(crate) fn local_section(conn: &Connection, machine: &str, now: i64) -> Resul
     let mut needs = vec![];
     let mut stowed = Value::Null;
     let mut holders_read: Option<Option<Holders>> = None;
+    let mut routes_read: Option<Vec<Value>> = None;
     for member in members.into_iter().take(SHIP_LIMIT) {
         if !member.home.is_dir() {
             continue;
@@ -479,6 +516,10 @@ pub(crate) fn local_section(conn: &Connection, machine: &str, now: i64) -> Resul
                 unknown.push("ledger".into());
             }
             holders_read = Some(read);
+            routes_read = routes(&store, now);
+            if routes_read.is_none() {
+                unknown.push("routes".into());
+            }
             stowed = crate::stow::state(&store)
                 .map(|s| json!(s["active"].as_array().is_some_and(|a| !a.is_empty())))
                 .unwrap_or(Value::Null);
@@ -509,7 +550,8 @@ pub(crate) fn local_section(conn: &Connection, machine: &str, now: i64) -> Resul
     let desk = crate::machines::desk_here(conn);
     let mut section = json!({
         "machine": {"name": machine, "desk": desk, "stowed": stowed,
-            "truncated": truncated, "unknown": unknown},
+            "truncated": truncated, "unknown": unknown,
+            "routes": routes_read.unwrap_or_default()},
         "ships": ships, "needs": needs,
     });
     bound(&mut section);
@@ -618,7 +660,7 @@ fn directory_only(name: &str, link: &str, error: &str, ships: &[(String, String)
     Shown {
         row: json!({"name": name, "link": link, "reachable": false, "error": error,
             "via": "directory", "as_of_ms": null, "changed_ms": null, "desk": null,
-            "stowed": null, "truncated": false, "unknown": []}),
+            "stowed": null, "truncated": false, "unknown": [], "routes": []}),
         section: Some(json!({"ships": ships.iter().map(|(ship, _)| json!({
             "name": ship, "machine": name, "presence": "unknown"})).collect::<Vec<_>>(),
             "needs": []})),
@@ -798,10 +840,14 @@ pub fn snapshot(args: &Value) -> Result<Value> {
             .and_then(Value::as_i64)
             .is_some_and(|s| row["changed_ms"].as_i64() == Some(s));
         row["unchanged"] = json!(unchanged);
-        machines.push(row.clone());
         if unchanged {
+            if let Some(fields) = row.as_object_mut() {
+                fields.remove("routes");
+            }
+            machines.push(row);
             continue;
         }
+        machines.push(row.clone());
         let Some(section) = shown.section else {
             continue;
         };
@@ -868,6 +914,34 @@ mod tests {
             "built the index"
         );
         assert_eq!(doing_text(&"x".repeat(500)).len(), DOING_CHARS);
+    }
+
+    #[test]
+    fn live_jobs_and_open_tasks_are_read_through_their_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("home")).unwrap();
+        let plan = |sql: &str| -> String {
+            let conn = store.connection();
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = statement
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.join("; ")
+        };
+        for sql in [
+            format!("SELECT COUNT(*) {}", live_jobs()),
+            format!(
+                "SELECT record {} ORDER BY json_extract(record,'$.created_ms') DESC, id LIMIT 20",
+                live_jobs()
+            ),
+        ] {
+            assert!(plan(&sql).contains("jobs_live"), "{}", plan(&sql));
+        }
+        let tasks =
+            format!("SELECT id {OPEN_TASKS} ORDER BY rowid DESC LIMIT 20").replace("?1", "'a'");
+        assert!(plan(&tasks).contains("tasks_owner"), "{}", plan(&tasks));
     }
 
     fn registry() -> (tempfile::TempDir, Connection) {

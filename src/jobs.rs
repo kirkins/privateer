@@ -334,6 +334,11 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);",
     )?;
+    // Live jobs, newest first, without reading every record (`fleet.snapshot`).
+    store.connection().execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS jobs_live ON jobs(json_extract(record,'$.created_ms'))
+         WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL};"
+    ))?;
     // The process that claimed a park's resume, so recovery leaves a launch
     // that is still in flight alone (added after the table first shipped).
     let claimer: bool = store.connection().query_row(
@@ -713,14 +718,22 @@ pub(crate) fn capacity_holders(store: &Store) -> Result<Vec<Holder>> {
     capacity_holders_waiting(store, Duration::from_secs(5))
 }
 
-/// The same, waiting at most `busy` for a writer holding the ledger.
-pub(crate) fn capacity_holders_waiting(store: &Store, busy: Duration) -> Result<Vec<Holder>> {
+/// The host ledger opened read-only, waiting at most `busy` on a writer;
+/// None when the ledger has never been written.
+pub(crate) fn ledger_readonly(store: &Store, busy: Duration) -> Result<Option<Connection>> {
     let path = ledger_dir(store)?.join("resources.sqlite");
     if !path.is_file() {
-        return Ok(vec![]);
+        return Ok(None);
     }
     let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(busy)?;
+    Ok(Some(conn))
+}
+/// `capacity_holders`, waiting at most `busy` for a writer holding the ledger.
+pub(crate) fn capacity_holders_waiting(store: &Store, busy: Duration) -> Result<Vec<Holder>> {
+    let Some(conn) = ledger_readonly(store, busy)? else {
+        return Ok(vec![]);
+    };
     let now = Store::now_ms();
     let mut holders = vec![];
     for r in reservations(&conn)? {
@@ -1561,6 +1574,9 @@ fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<(
     );
     Ok(())
 }
+/// `terminal` as an SQL list. A query must repeat the `jobs_live` condition
+/// with it word for word for SQLite to use that index.
+pub(crate) const TERMINAL_SQL: &str = "('succeeded','failed','cancelled','timed_out','resumed')";
 fn terminal(status: &str) -> bool {
     // `resumed`: a parked crew whose work moved to the job its park resumed.
     matches!(
