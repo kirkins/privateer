@@ -853,3 +853,115 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         _ => bail!("unknown command {command}; try routes.show or routes.set"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::Usage;
+    use std::collections::HashMap;
+
+    const HOUR: i64 = 3_600_000;
+    // 2026-10-17 19:50 UTC, a Saturday.
+    const NOW: i64 = 1_792_266_600_000;
+
+    fn route(model: &str, extra: Value) -> Value {
+        let mut route = json!({"manifest":"bundled:codex","options":{"model":model},"cost":"plan"});
+        for (key, value) in extra.as_object().unwrap() {
+            route[key] = value.clone();
+        }
+        route
+    }
+
+    fn daily_in(hours: i64, now: i64) -> Value {
+        let minute = (now + hours * HOUR) / 60_000 % 1440;
+        json!({"daily_utc": format!("{:02}:{:02}", minute / 60, minute % 60)})
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn two_daily_allowances_both_drain_across_a_refresh() {
+        let policy = json!({"routes": {
+            "a": route("a", json!({"allowance": daily_in(2, NOW), "tier": 1})),
+            "b": route("b", json!({"allowance": daily_in(20, NOW), "tier": 1})),
+            "plan": route("plan", json!({})),
+        }});
+        let list = names(&["plan", "b", "a"]);
+        let usage = HashMap::new();
+        // A loses its headroom first, so it goes first, then B, then carry-over.
+        assert_eq!(rank(&list, &policy, &usage, NOW), names(&["a", "b", "plan"]));
+        // Past A's refresh, A's next loss is a day away and B's is nearer.
+        let later = NOW + 3 * HOUR;
+        assert_eq!(rank(&list, &policy, &usage, later), names(&["b", "a", "plan"]));
+    }
+
+    #[test]
+    fn a_better_tier_is_never_passed_and_idle_windows_wait_behind_deadlines() {
+        let policy = json!({"routes": {
+            "weak": route("weak", json!({"allowance": daily_in(1, NOW), "tier": 2})),
+            "steady": route("steady", json!({})),
+            "idle": route("idle", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+            "open": route("open", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+            "daily": route("daily", json!({"allowance": daily_in(8, NOW), "tier": 1})),
+        }});
+        let mut usage = HashMap::new();
+        usage.insert(
+            "codex/-/open".to_owned(),
+            Usage {
+                window_ends_ms: Some(NOW + 2 * HOUR),
+                ..Usage::default()
+            },
+        );
+        let list = names(&["steady", "weak", "idle", "daily", "open"]);
+        assert_eq!(
+            rank(&list, &policy, &usage, NOW),
+            names(&["open", "daily", "idle", "steady", "weak"])
+        );
+        // A list with no shapes and no tiers keeps the captain's order.
+        let plain = names(&["steady"]);
+        assert_eq!(rank(&plain, &policy, &usage, NOW), plain);
+    }
+
+    #[test]
+    fn idle_rolling_windows_rank_by_their_weekly_reset() {
+        let policy = json!({"routes": {
+            "late": route("late", json!({"allowance": {"window_hours": 5, "weekly_utc": "Fri 00:00"}, "tier": 1})),
+            "soon": route("soon", json!({"allowance": {"window_hours": 5, "weekly_utc": "Mon 00:00"}, "tier": 1})),
+            "none": route("none", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+        }});
+        let list = names(&["none", "late", "soon"]);
+        assert_eq!(
+            rank(&list, &policy, &HashMap::new(), NOW),
+            names(&["soon", "late", "none"])
+        );
+    }
+
+    #[test]
+    fn shapes_and_reset_times_parse() {
+        assert_eq!(shape(&json!({"daily_utc":"07:00"})).unwrap(), Shape::Daily(420));
+        assert_eq!(
+            shape(&json!({"window_hours":5,"weekly_utc":"Tue 01:00"})).unwrap(),
+            Shape::Rolling { window_ms: 5 * HOUR, weekly: Some(1440 + 60) }
+        );
+        for bad in [
+            json!({}),
+            json!({"daily_utc":"07:00","window_hours":5}),
+            json!({"daily_utc":"07:00","weekly_utc":"Mon 00:00"}),
+            json!({"window_hours":0}),
+            json!({"window_hours":5,"weekly_utc":"Monday 00:00"}),
+            json!({"window_hours":5,"pool":"go"}),
+        ] {
+            assert!(shape(&bad).is_err(), "{bad}");
+        }
+        // Monday 00:00 UTC after Saturday 2026-10-17 is 2026-10-19.
+        assert_eq!(
+            crate::routes::utc_time(next_weekly(0, NOW)),
+            "2026-10-19 00:00 UTC"
+        );
+        assert_eq!(crate::routes::utc_time(next_daily(420, NOW)), "2026-10-18 07:00 UTC");
+        assert_eq!(span(26 * HOUR), "26h");
+        assert_eq!(span(80 * 60_000), "1h20m");
+    }
+}
