@@ -4760,3 +4760,111 @@ fn the_activity_list_merges_reached_machine_and_lists_reaching_machines() {
             .contains("links one way")
     );
 }
+
+#[test]
+fn the_activity_list_pages_across_reached_machine_and_after_time_keeps_reached() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let remote = remote_ssh(&mac);
+
+    let store_laptop =
+        privateer::store::Store::open(&laptop.folder("liaison").join(".privateer")).unwrap();
+    let store_mac =
+        privateer::store::Store::open(&mac.folder("fitforge").join(".privateer")).unwrap();
+
+    let conn_l = store_laptop.connection();
+    let conn_m = store_mac.connection();
+
+    conn_l.execute("DELETE FROM audit;", []).unwrap();
+    conn_m.execute("DELETE FROM audit;", []).unwrap();
+    let _ = conn_l.execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+    let _ = conn_m.execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+
+    conn_l
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![100, "laptop.event1", r#"{"ship":"liaison"}"#],
+        )
+        .unwrap();
+    conn_m
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                200,
+                "mac.event1",
+                r#"{"ship":"fitforge","secret_token":"leak123","error":"Bearer leaktoken456"}"#
+            ],
+        )
+        .unwrap();
+    conn_l
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![300, "laptop.event2", r#"{"ship":"liaison"}"#],
+        )
+        .unwrap();
+    conn_m
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![400, "mac.event2", r#"{"ship":"fitforge"}"#],
+        )
+        .unwrap();
+
+    // 1. Paging that crosses a reached machine:
+    let mut pages = vec![];
+    let mut args = json!({"limit": 1});
+    loop {
+        let page = laptop.ok_over("liaison", "activity.list", args.clone(), &remote);
+        let more = page["more"].as_bool().unwrap();
+        let next = page["next"].clone();
+        pages.push(page);
+        if !more {
+            break;
+        }
+        args["after"] = next;
+        assert!(pages.len() < 10, "paging loop did not terminate");
+    }
+
+    assert_eq!(pages.len(), 4, "{pages:?}");
+    assert_eq!(pages[0]["entries"][0]["kind"], "laptop.event1");
+    assert_eq!(pages[0]["entries"][0]["machine"], "laptop");
+    assert_eq!(pages[1]["entries"][0]["kind"], "mac.event1");
+    assert_eq!(pages[1]["entries"][0]["machine"], "mac");
+    assert_eq!(pages[2]["entries"][0]["kind"], "laptop.event2");
+    assert_eq!(pages[2]["entries"][0]["machine"], "laptop");
+    assert_eq!(pages[3]["entries"][0]["kind"], "mac.event2");
+    assert_eq!(pages[3]["entries"][0]["machine"], "mac");
+
+    // Every entry has a valid cursor
+    for page in &pages {
+        let e = &page["entries"][0];
+        assert!(e["cursor"].as_str().unwrap().starts_with("a1."));
+    }
+
+    // Remote entry was masked on this side:
+    let mac_detail = &pages[1]["entries"][0]["detail"];
+    assert_eq!(mac_detail["secret_token"], "<set>");
+    assert!(mac_detail["error"].as_str().unwrap().contains("•••"));
+    assert!(
+        !mac_detail["error"]
+            .as_str()
+            .unwrap()
+            .contains("leaktoken456")
+    );
+
+    // 2. after as a time with a reached machine keeps it reached:
+    let after_time = laptop.ok_over("liaison", "activity.list", json!({"after": 150}), &remote);
+    let machines = after_time["machines"].as_array().unwrap();
+    let mac_entry = machines.iter().find(|m| m["name"] == "mac").unwrap();
+    assert_eq!(mac_entry["reached"], true, "{after_time}");
+    assert!(mac_entry.get("error").is_none(), "{after_time}");
+
+    let after_entries = after_time["entries"].as_array().unwrap();
+    assert_eq!(after_entries.len(), 3, "{after_time}");
+    assert_eq!(after_entries[0]["kind"], "mac.event1");
+    assert_eq!(after_entries[0]["at_ms"], 200);
+    assert_eq!(after_entries[1]["kind"], "laptop.event2");
+    assert_eq!(after_entries[1]["at_ms"], 300);
+    assert_eq!(after_entries[2]["kind"], "mac.event2");
+    assert_eq!(after_entries[2]["at_ms"], 400);
+}

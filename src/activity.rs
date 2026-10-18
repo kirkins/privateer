@@ -10,13 +10,12 @@
 //! this keeps audit bounded and avoids expanding the carry payload.
 use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result};
-use rusqlite::params;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
-const SCAN_PAGES: usize = 100;
+const SCAN_PAGES: usize = 4;
 const CURSOR_PREFIX: &str = "a1.";
 const SET: &str = "<set>";
 
@@ -93,16 +92,18 @@ pub(crate) fn masked(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(masked).collect()),
+        Value::String(text) => json!(crate::block_ask::mask(text)),
         other => other.clone(),
     }
 }
 
 pub(crate) fn matches_kind(kind: &str, filters: &[String]) -> bool {
     filters.iter().any(|pattern| {
-        kind == pattern
-            || (pattern.ends_with('.') && kind.starts_with(pattern))
-            || (!pattern.ends_with('.')
-                && (kind.starts_with(&format!("{pattern}.")) || kind.starts_with(pattern)))
+        if pattern.ends_with('.') {
+            kind.starts_with(pattern)
+        } else {
+            kind == pattern || kind.starts_with(&format!("{pattern}."))
+        }
     })
 }
 
@@ -151,9 +152,35 @@ fn local_homes(asking: Option<&Store>) -> Result<Vec<Home>> {
 }
 
 fn scan(machine: &str, home: &Home, query: &Query) -> Result<(Rows, Option<Key>)> {
-    let sql = "SELECT seq, time_ms, kind, payload FROM audit
-               WHERE (time_ms, seq) > (?1, ?2)
-               ORDER BY time_ms ASC, seq ASC LIMIT ?3";
+    let mut sql = "SELECT seq, time_ms, kind, payload FROM audit
+               WHERE (time_ms, seq) > (?1, ?2)"
+        .to_string();
+    let mut pattern_params: Vec<String> = vec![];
+    if let Some(kinds) = &query.kinds {
+        if kinds.is_empty() {
+            sql.push_str(" AND (0)");
+        } else {
+            let mut clauses = vec![];
+            let mut param_idx = 4;
+            for pattern in kinds {
+                if pattern.ends_with('.') {
+                    clauses.push(format!("kind LIKE ?{param_idx}"));
+                    pattern_params.push(format!("{pattern}%"));
+                    param_idx += 1;
+                } else {
+                    clauses.push(format!(
+                        "(kind = ?{param_idx} OR kind LIKE ?{})",
+                        param_idx + 1
+                    ));
+                    pattern_params.push(pattern.clone());
+                    pattern_params.push(format!("{pattern}.%"));
+                    param_idx += 2;
+                }
+            }
+            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+        }
+    }
+    sql.push_str(" ORDER BY time_ms ASC, seq ASC LIMIT ?3");
     let mut after = query
         .after
         .as_ref()
@@ -161,11 +188,19 @@ fn scan(machine: &str, home: &Home, query: &Query) -> Result<(Rows, Option<Key>)
     let mut kept = vec![];
     let mut scanned = 0;
     let budget = query.want * SCAN_PAGES;
-    let mut statement = home.store.connection().prepare(sql)?;
+    let mut statement = home.store.connection().prepare(&sql)?;
     loop {
         let batch = (query.want - kept.len()).min(budget - scanned).max(1);
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Integer(after.0),
+            rusqlite::types::Value::Integer(after.1),
+            rusqlite::types::Value::Integer(batch as i64),
+        ];
+        for p in &pattern_params {
+            params.push(rusqlite::types::Value::Text(p.clone()));
+        }
         let rows = statement
-            .query_map(params![after.0, after.1, batch as i64], |r| {
+            .query_map(rusqlite::params_from_iter(params), |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
@@ -206,6 +241,7 @@ fn scan(machine: &str, home: &Home, query: &Query) -> Result<(Rows, Option<Key>)
             let detail = masked(&raw_payload);
             let entry = json!({
                 "id": format!("{}:{seq}", home.ship),
+                "cursor": key.encode(),
                 "machine": machine,
                 "ship": entry_ship,
                 "home": home.ship,
@@ -339,8 +375,12 @@ pub fn list(store: &Store, args: &Value) -> Result<Value> {
     // Linked machines if available
     if let Ok(conn) = crate::fleet::registry() {
         if let Ok(linked) = crate::machines::linked_for_snapshot(&conn) {
+            let forwarded_after = match args.get("after").filter(|v| !v.is_null()) {
+                Some(value) if value.is_i64() || value.is_u64() => Some(value.clone()),
+                _ => query.after.as_ref().map(|k| json!(k.encode())),
+            };
             let asked = json!({
-                "after": query.after.as_ref().map(|k| k.encode()),
+                "after": forwarded_after,
                 "limit": query.want,
                 "ship": query.ship,
                 "kinds": query.kinds,
@@ -377,19 +417,11 @@ pub fn list(store: &Store, args: &Value) -> Result<Value> {
                         if let Some(entries) = answered["entries"].as_array_mut() {
                             for entry in entries {
                                 entry["machine"] = json!(name);
-                                let at_ms = entry["at_ms"].as_i64().unwrap_or(0);
-                                let home = entry["home"].as_str().unwrap_or("").to_owned();
-                                let seq = entry["id"]
-                                    .as_str()
-                                    .and_then(|id| id.split(':').nth(1))
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0);
-                                let key = Key {
-                                    ms: at_ms,
-                                    home,
-                                    seq,
+                                let Ok(key) = Key::parse(&entry["cursor"], true) else {
+                                    continue;
                                 };
-                                found.push((key, entry.clone()));
+                                let entry = masked(entry);
+                                found.push((key, entry));
                             }
                         }
                         if answered["more"].as_bool().unwrap_or(false) {

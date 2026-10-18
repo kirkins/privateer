@@ -3197,6 +3197,18 @@ fn the_activity_list_filters_by_ship_and_kinds() {
     );
     let web_job_ids = activity_ids(&web_job);
     assert_eq!(web_job_ids, ["web:2"], "{web_job}");
+
+    // kinds pattern without trailing dot matches exact name or name followed by '.' only, not jobs.something
+    conn_a
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![500, "jobs.something", r#"{"ship":"apps"}"#],
+        )
+        .unwrap();
+    let job_kind = machine.json(&apps, "activity.list", json!({"kinds": ["job"]}));
+    let job_ids = activity_ids(&job_kind);
+    assert_eq!(job_ids, ["apps:2", "web:2"], "{job_kind}");
 }
 
 #[test]
@@ -3230,7 +3242,9 @@ fn the_activity_list_masks_secret_looking_values_in_audit_detail() {
                     },
                     "argv": ["/bin/sh", "-c", "echo leak"],
                     "env": {"LEAK": "val"},
-                    "public_field": "unmasked"
+                    "public_field": "unmasked",
+                    "error_text": "failed with Bearer secrettoken12345 in call",
+                    "resource_change": "url=https://user:password123@host.com/path"
                 }"#
             ],
         )
@@ -3247,6 +3261,28 @@ fn the_activity_list_masks_secret_looking_values_in_audit_detail() {
     assert_eq!(detail["nested"]["password"], "<set>", "{detail}");
     assert_eq!(detail["nested"]["public_nested"], "visible", "{detail}");
     assert_eq!(detail["public_field"], "unmasked", "{detail}");
+    assert!(
+        detail["error_text"].as_str().unwrap().contains("•••"),
+        "{detail}"
+    );
+    assert!(
+        !detail["error_text"]
+            .as_str()
+            .unwrap()
+            .contains("secrettoken12345"),
+        "{detail}"
+    );
+    assert!(
+        detail["resource_change"].as_str().unwrap().contains("•••"),
+        "{detail}"
+    );
+    assert!(
+        !detail["resource_change"]
+            .as_str()
+            .unwrap()
+            .contains("password123"),
+        "{detail}"
+    );
     assert!(
         detail.get("argv").is_none(),
         "argv must be omitted: {detail}"
@@ -3289,4 +3325,135 @@ fn the_activity_list_caps_limit_to_max() {
     assert_eq!(entries.len(), 200, "limit must cap at 200");
     assert_eq!(capped["more"], true);
     assert!(capped["next"].is_string());
+}
+
+#[test]
+fn the_activity_list_equal_times_across_two_homes_page_each_entry_once() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+
+    let conn_a = Store::open(&apps.join(".privateer")).unwrap();
+    let conn_w = Store::open(&web.join(".privateer")).unwrap();
+
+    conn_a
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    conn_w
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    let _ = conn_a
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+    let _ = conn_w
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+
+    for i in 1..=3 {
+        conn_a
+            .connection()
+            .execute(
+                "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![100, format!("event.a{i}"), r#"{"ship":"apps"}"#],
+            )
+            .unwrap();
+        conn_w
+            .connection()
+            .execute(
+                "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![100, format!("event.w{i}"), r#"{"ship":"web"}"#],
+            )
+            .unwrap();
+    }
+
+    let all = machine.json(&apps, "activity.list", json!({"limit": 100}));
+    let expected_ids = activity_ids(&all);
+    assert_eq!(expected_ids.len(), 6);
+
+    let pages = activity_pages(&machine, &apps, json!({"limit": 2}));
+    assert_eq!(pages.len(), 3, "{pages:?}");
+
+    let mut paged_ids = vec![];
+    for page in pages {
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for e in entries {
+            paged_ids.push(e["id"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(paged_ids, expected_ids);
+
+    let pages_1 = activity_pages(&machine, &apps, json!({"limit": 1}));
+    assert_eq!(pages_1.len(), 6, "{pages_1:?}");
+    let mut paged_ids_1 = vec![];
+    for page in pages_1 {
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        paged_ids_1.push(entries[0]["id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(paged_ids_1, expected_ids);
+}
+
+#[test]
+fn the_activity_list_resume_from_last_entry_cursor_returns_only_newer_entries() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+
+    let conn_a = Store::open(&apps.join(".privateer")).unwrap();
+    conn_a
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    let _ = conn_a
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+
+    conn_a
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![100, "event.1", r#"{"ship":"apps"}"#],
+        )
+        .unwrap();
+    conn_a
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![200, "event.2", r#"{"ship":"apps"}"#],
+        )
+        .unwrap();
+
+    let initial = machine.json(&apps, "activity.list", json!({"limit": 10}));
+    assert_eq!(initial["more"], false);
+    assert_eq!(initial["next"], serde_json::Value::Null);
+    let entries = initial["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+
+    for e in entries {
+        assert!(e["cursor"].as_str().unwrap().starts_with("a1."));
+    }
+
+    let last_cursor = entries.last().unwrap()["cursor"].as_str().unwrap();
+
+    let empty = machine.json(&apps, "activity.list", json!({"after": last_cursor}));
+    assert_eq!(empty["entries"].as_array().unwrap().len(), 0);
+    assert_eq!(empty["more"], false);
+
+    conn_a
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![300, "event.3", r#"{"ship":"apps"}"#],
+        )
+        .unwrap();
+
+    let newer = machine.json(&apps, "activity.list", json!({"after": last_cursor}));
+    let newer_entries = newer["entries"].as_array().unwrap();
+    assert_eq!(newer_entries.len(), 1);
+    assert_eq!(newer_entries[0]["id"], "apps:3");
+    assert_eq!(newer_entries[0]["at_ms"], 300);
 }
