@@ -154,6 +154,67 @@ fn reopen(store: &Store, work: &mut Scheduled) -> Result<()> {
     Ok(())
 }
 
+/// Whether a task has a scheduling row.
+pub(crate) fn scheduled(store: &Store, task: &str) -> Result<bool> {
+    Ok(available(store)? && load(store, task)?.is_some())
+}
+
+/// Park a scheduled task on its own open block ask, as `task.defer` with a
+/// request wait would, in the caller's transaction. An unscheduled task gains
+/// no row, and finished or stopped work is left alone. Returns whether the
+/// task was parked.
+pub(crate) fn park_on_ask(store: &Store, task: &str, ask: &str, reason: &str) -> Result<bool> {
+    if !available(store)? {
+        return Ok(false);
+    }
+    let Some(mut work) = load(store, task)? else {
+        return Ok(false);
+    };
+    if matches!(work.state.as_str(), "done" | "stopped" | "fault") {
+        return Ok(false);
+    }
+    let now = Store::now_ms();
+    if matches!(work.state.as_str(), "offered" | "claimed" | "executing") {
+        work.attempts = 0;
+        finish_wake(store, &work, "succeeded", now)?;
+    }
+    work.state = "waiting".into();
+    work.wait = Some(json!({"kind": "request", "ref": ask, "reason": reason}));
+    work.reason = Some(reason.chars().take(1000).collect());
+    work.not_before_ms = 0;
+    work.last_checked_ms = now;
+    save(store, &work)?;
+    store.connection().execute(
+        "UPDATE tasks SET status='blocked' WHERE id=?1 AND status NOT IN ('done','cancelled')",
+        [task],
+    )?;
+    Ok(true)
+}
+
+/// Hold a scheduled task until its owner says otherwise, as a manual
+/// `task.defer` does, in the caller's transaction.
+pub(crate) fn hold(store: &Store, task: &str, reason: &str) -> Result<bool> {
+    if !available(store)? {
+        return Ok(false);
+    }
+    let Some(mut work) = load(store, task)? else {
+        return Ok(false);
+    };
+    if work.state == "done" {
+        return Ok(false);
+    }
+    work.state = "stopped".into();
+    work.wait = Some(json!({"kind": "manual", "reason": reason}));
+    work.reason = Some(reason.chars().take(1000).collect());
+    work.last_checked_ms = Store::now_ms();
+    save(store, &work)?;
+    store.connection().execute(
+        "UPDATE tasks SET status='blocked' WHERE id=?1 AND status NOT IN ('done','cancelled')",
+        [task],
+    )?;
+    Ok(true)
+}
+
 fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
     work.last_checked_ms = now;
     let task = store.task(&work.task_id)?;
@@ -217,10 +278,17 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
             Some("request") => {
                 let request = crate::mail::find(store, required(&wait, "ref")?)?
                     .context("wait request vanished")?;
-                if matches!(
-                    request["state"].as_str(),
-                    Some("denied" | "withdrawn" | "closed")
-                ) {
+                // A block ask that a covering policy change ended is resolved:
+                // the denied tool is now allowed.
+                let covered = request["state"] == "withdrawn"
+                    && request["end_reason"] == crate::block_ask::POLICY_CHANGED
+                    && request["payload"]["type"] == "tool_permission";
+                if !covered
+                    && matches!(
+                        request["state"].as_str(),
+                        Some("denied" | "withdrawn" | "closed")
+                    )
+                {
                     fault(
                         store,
                         work,
@@ -228,7 +296,7 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
                         now,
                     )?;
                 }
-                matches!(request["state"].as_str(), Some("answered" | "approved"))
+                covered || matches!(request["state"].as_str(), Some("answered" | "approved"))
             }
             _ => bail!("invalid scheduling wait"),
         };

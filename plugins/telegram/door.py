@@ -74,6 +74,10 @@ SENT = "sent.json"
 OUTGOING = "outgoing.json"
 TARGET = "target.json"
 DECISIONS = "decisions.json"
+# Decision cards the door showed, by mail id: their message, text and buttons,
+# so later mail on the same ask edits the card instead of adding a message.
+CARDS = "cards.json"
+CARD_LIMIT = 200
 
 
 class Runtime:
@@ -197,6 +201,22 @@ class Door:
         kind = mail.get("kind", "notice")
         sender = mail.get("from") or ship
         body = mail.get("body") or ""
+        payload = mail.get("payload") or {}
+        # One card per ask: mail the runtime attached to an open ask, and the
+        # ask's closure, edit the card the captain already has.
+        if payload.get("attached_to") and kind != "reply":
+            self.attach(mail, payload)
+            return ""
+        if kind == "notice" and isinstance(payload.get("request_end"), dict):
+            cards = tg.read_state(CARDS, {})
+            ended = mail.get("correlation")
+            if ended in cards:
+                if not cards[ended].get("resolved"):
+                    self.resolve(ended, payload["request_end"].get("reason") or "closed")
+                return ""
+            # An item added to a card ends with it; its card already says so.
+            if any(ended in (card.get("members") or []) for card in cards.values()):
+                return ""
         # Only a decision message carries a typed card; other mail may use the
         # same payload key for its own data.
         decision = (mail.get("payload") or {}).get("decision") if kind == "decision" else None
@@ -244,6 +264,8 @@ class Door:
                                        html=True, markup=markup if last else None)
             if err:
                 return err
+            if last and typed and markup:
+                self.remember_card(mail.get("id"), message_id, text, markup)
             tg.remember_target(message_id, target, int(self.cfg.get("msg_map_limit", tg.MSG_MAP_LIMIT)))
         try:
             import tts
@@ -252,6 +274,64 @@ class Door:
         except Exception as e:
             tg.log(f"tts unavailable: {e!r}")
         return ""
+
+    def remember_card(self, mail_id, message_id, text: str, markup: dict) -> None:
+        cards = tg.read_state(CARDS, {})
+        cards.pop(mail_id, None)
+        cards[mail_id] = {"message_id": message_id, "text": text, "markup": markup,
+                          "also": [], "blocked": [], "members": []}
+        while len(cards) > CARD_LIMIT:
+            cards.pop(next(iter(cards)))
+        tg.write_state(CARDS, cards)
+
+    def edit_card(self, card: dict, extra: str = "") -> str:
+        """Rewrite a card's text. Telegram drops the buttons of an edit that
+        does not carry them, so the card's own buttons are always sent again."""
+        text = card["text"]
+        if card.get("blocked"):
+            text += "\n\n<b>Also blocked:</b> " + "; ".join(tg.escape_html(b) for b in card["blocked"])
+            if card.get("markup"):
+                text += "\nYour answer applies to every blocked task."
+        if card.get("also"):
+            text += "\n<b>Also:</b> " + ", ".join(tg.escape_html(a) for a in card["also"])
+        text += extra
+        _, err = tg.api(self.cfg, "editMessageText", {
+            "chat_id": tg.chat_id(self.cfg), "message_id": card["message_id"], "text": text,
+            "parse_mode": "HTML", "disable_web_page_preview": "true",
+            "reply_markup": json.dumps(card.get("markup") or {"inline_keyboard": []})})
+        return err
+
+    def attach(self, mail: dict, payload: dict) -> None:
+        cards = tg.read_state(CARDS, {})
+        card = cards.get(payload["attached_to"])
+        if not card or card.get("resolved"):
+            # Its card was shown before this door kept cards: /waiting counts it.
+            tg.log(f"{mail.get('id')} joins {payload['attached_to']}, whose card is not known here")
+            return
+        sender = mail.get("from") or "a ship"
+        card.setdefault("members", []).append(mail.get("id"))
+        if payload.get("type") == "tool_permission":
+            card["also"].append(f"{sender} (same denial)")
+            card["blocked"].extend(f"{sender} {item}" for item in
+                                   (payload.get("decision") or {}).get("blocked") or [])
+        else:
+            card["also"].append(f"{sender} ({mail.get('kind', 'notice')})")
+        err = self.edit_card(card)
+        if err:
+            tg.log(f"could not edit the card for {payload['attached_to']}: {err}")
+        tg.write_state(CARDS, cards)
+
+    def resolve(self, mail_id: str, reason: str) -> None:
+        # The card is kept, marked resolved, so the closures of the items
+        # added to it are recognised and send nothing.
+        cards = tg.read_state(CARDS, {})
+        card = cards[mail_id]
+        card["markup"] = None
+        card["resolved"] = reason
+        err = self.edit_card(card, f"\n\n<b>Resolved:</b> {tg.escape_html(reason)}")
+        if err:
+            tg.log(f"could not mark the card for {mail_id} resolved: {err}")
+        tg.write_state(CARDS, cards)
 
     def decision_markup(self, mail: dict) -> dict | None:
         """Buttons for a decision: one per typed option, or one per plain choice."""
@@ -401,6 +481,11 @@ class Door:
             if option_id:
                 args["payload"] = {"answer": {"option_id": option_id}}
             self.send(args, msg.get("message_id"), f"decision: {choice}")
+            # An answered card keeps no buttons, even when later mail edits it.
+            cards = tg.read_state(CARDS, {})
+            if decision["mail"] in cards:
+                cards[decision["mail"]]["markup"] = None
+                tg.write_state(CARDS, cards)
             tg.api(self.cfg, "editMessageReplyMarkup", {
                 "chat_id": tg.chat_id(self.cfg), "message_id": msg.get("message_id"),
                 "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
@@ -633,6 +718,8 @@ class Door:
                 # anything, and carrying the age so an old request reads as old.
                 age = item.get("age_ms")
                 note = f"asked {age_phrase(age)}" if isinstance(age, int) else ""
+                if item.get("attached"):
+                    note += f" · +{item['attached']} attached"
                 err = self.push({"ref": "", "ship": item["ship"], "mail": item["mail"],
                                  "note": note, "step": item.get("step")})
                 if err:

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Confirm a headless Claude run and surface native permission denials as durable questions."""
+"""Confirm a headless Claude run and record its native permission denials for the runtime."""
 import json
-import os
 import subprocess
 import sys
 
@@ -20,6 +19,7 @@ class ClaudeTurn(Turn):
         super().__init__(flags[flags.index("--resume") + 1] if "--resume" in flags else None)
         self.result = None
         self.denied = False
+        self.denials = []
 
     def observe(self, value):
         if not isinstance(value, dict):
@@ -33,7 +33,10 @@ class ClaudeTurn(Turn):
             if value.get("session_id") != self.session:
                 raise ValueError("changed-session")
             self.result = value
-            self.denied |= bool(value.get("permission_denials"))
+            denials = value.get("permission_denials")
+            self.denied |= bool(denials)
+            if isinstance(denials, list):
+                self.denials = [d for d in denials if isinstance(d, dict)]
             # The result's usage already covers the whole run.
             usage = value.get("usage")
             self.usage = {}
@@ -48,18 +51,34 @@ class ClaudeTurn(Turn):
                 and result.get("is_error") is False)
 
 
-def report_denial(control):
-    reported = False
-    if control and os.environ.get("PRIVATEER_JOB"):
-        try:
-            result = subprocess.run(control["cli_argv"] + ["permissions.blocked", "--json",
-                                    json.dumps({"job_id": os.environ["PRIVATEER_JOB"]})],
-                                    capture_output=True, timeout=15)
-            reported = result.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    print(json.dumps({"type":"native.permission_blocked", "captain_question_recorded":reported,
-                      "reason":"A native tool was denied; use privateer permissions to configure fleet access."}), flush=True)
+# The runtime reads denials from this line at settlement, not from Claude's
+# result line, which a long log can lose. It stays short: a few inputs, clipped.
+MAX_DENIALS = 4
+INPUT_BYTES = 4096
+
+
+def clipped(value):
+    """A tool input as it was, or with its long strings cut to about INPUT_BYTES."""
+    if len(json.dumps(value, separators=(",", ":"))) <= INPUT_BYTES:
+        return value
+    if isinstance(value, dict):
+        return {k: (v[:INPUT_BYTES] if isinstance(v, str) else v) for k, v in value.items()
+                if isinstance(v, str) or len(json.dumps(v)) <= INPUT_BYTES}
+    return json.dumps(value)[:INPUT_BYTES]
+
+
+def report_denial(denials):
+    seen, kept = set(), []
+    for denial in denials:
+        entry = {"tool_name": str(denial.get("tool_name", "")), "tool_input": clipped(denial.get("tool_input"))}
+        key = json.dumps(entry, sort_keys=True)
+        if entry["tool_name"] and key not in seen:
+            seen.add(key)
+            kept.append(entry)
+    print(json.dumps({"type": "native.permission_blocked", "denials": kept[:MAX_DENIALS],
+                      "denied": len(kept),
+                      "reason": "A native tool was denied; the runtime asks the captain once."},
+                     separators=(",", ":")), flush=True)
 
 
 def run(argv, control):
@@ -95,7 +114,7 @@ def run(argv, control):
             summary["usage"] = turn.usage
         print(json.dumps(summary, separators=(",", ":")), flush=True)
         if turn.denied:
-            report_denial(control)
+            report_denial(turn.denials)
         return 0 if success else 2
     finally:
         child.stdout.close()

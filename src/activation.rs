@@ -881,6 +881,11 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
+    // Asks a policy change covers end, even when it was made in another home.
+    let asks_ended = crate::block_ask::sweep(store).unwrap_or_else(|error| {
+        eprintln!("privateer: could not sweep tool-permission asks: {error:#}");
+        vec![]
+    });
     crate::crew::resume_pending(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
@@ -907,7 +912,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 

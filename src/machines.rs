@@ -446,6 +446,30 @@ fn desk(conn: &Connection) -> Result<Option<(String, i64)>> {
         .optional()?)
 }
 
+/// Whether `name` is the linked machine that holds this machine's captain
+/// desk: the one named by `machine captain`, else a machine that links to
+/// this one and collects its captain mail.
+pub(crate) fn holds_desk(name: &str) -> bool {
+    let Ok(conn) = crate::fleet::registry() else {
+        return false;
+    };
+    match desk(&conn) {
+        Ok(Some((desk, _))) => desk == name,
+        Ok(None) => machine(&conn, name).is_ok_and(|m| m.role == "collected"),
+        Err(_) => false,
+    }
+}
+
+/// The name a machine this one reaches knows this one by, for its peer.
+pub(crate) fn known_as_by_peer(peer: &str) -> Option<String> {
+    let conn = crate::fleet::registry().ok()?;
+    machines(&conn)
+        .ok()?
+        .into_iter()
+        .find(|m| m.role == "collects" && peer_name(&m.name) == peer)
+        .and_then(|m| m.known_as)
+}
+
 /// Keep the captain's mail on a machine this one reaches, or here again.
 /// Captain mail written before the change stays where it is.
 fn set_desk(machine: Option<&str>) -> Result<Value> {
@@ -1399,7 +1423,10 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
             }
         };
         forget_wait(conn, machine, &id)?;
-        match crate::dispatch(&mut store, "mail.deliver", envelope.clone()) {
+        // The runtime names the machine it collected from, for the desk check.
+        let mut stamped = envelope.clone();
+        stamped["via"] = json!(machine.name);
+        match crate::dispatch(&mut store, "mail.deliver", stamped) {
             Ok(result) => delivered
                 .push(json!({"id": id, "end_state": crate::mail::applied_end(&envelope, &result)})),
             Err(error) => {
@@ -1892,7 +1919,16 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         _ if delivery => {
             let home = home_of(&conn, required(args, "to")?)?;
             let mut store = Store::open_as(&home, caller.clone())?;
-            crate::dispatch(&mut store, "mail.deliver", args.clone())
+            // A delivering machine names itself; only a machine linked to this
+            // one, as it gave its name, is kept for the desk check.
+            let mut args = args.clone();
+            let linked = args["via"]
+                .as_str()
+                .is_some_and(|via| reaching_here(&conn, via).is_ok());
+            if !linked && let Some(fields) = args.as_object_mut() {
+                fields.remove("via");
+            }
+            crate::dispatch(&mut store, "mail.deliver", args)
         }
         "fleet.collect" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;

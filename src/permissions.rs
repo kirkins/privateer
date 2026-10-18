@@ -1,7 +1,6 @@
 //! Captain-owned launch policy. This changes harness approvals, not charters.
 use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -123,6 +122,8 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     }
     result?;
     tx.commit()?;
+    // Asks the new policy covers end now; the rest stay open under its hash.
+    crate::block_ask::sweep_fleet();
     Ok(value)
 }
 
@@ -143,67 +144,101 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
     Ok(())
 }
 
-/// Turn a native denial into one pending captain question per owning task.
-/// No denied input/command is copied into mail, and no permission is granted.
+/// A denial a ship reports itself: a hosted or attended first mate, whose
+/// harness result the runtime cannot read, names the task, tool and input;
+/// a job names itself and its denial line is read from its log. Either way
+/// it becomes the same one captain decision. No permission is granted.
 fn blocked(store: &mut Store, args: Value) -> Result<Value> {
-    let job_id = required(&args, "job_id")?;
-    let job = crate::jobs::dispatch(store, "job.status", json!({"id":job_id}))?;
-    let task_id = job["task_id"].as_str().context("job has no task")?;
-    store.authorize(task_id, "message")?;
-    let owner = store.task(task_id)?["owner"]
-        .as_str()
-        .context("task owner")?
-        .to_owned();
+    let (task_id, job_id) = match args.get("job_id").and_then(Value::as_str) {
+        Some(job_id) => {
+            let job = crate::jobs::dispatch(store, "job.status", json!({"id":job_id}))?;
+            let task = job["task_id"]
+                .as_str()
+                .context("job has no task")?
+                .to_owned();
+            (task, Some(job_id.to_owned()))
+        }
+        None => (required(&args, "task_id")?.to_owned(), None),
+    };
+    store.authorize(&task_id, "message")?;
+    let task = store.task(&task_id)?;
+    let owner = task["owner"].as_str().context("task owner")?.to_owned();
     if let Caller::Agent { actor } = store.caller() {
         ensure!(
             actor == &owner,
             "only the task owner may report a permission block"
         );
     }
-    let policy_hash = policy_hash(store)?;
-    let existing: Option<String> = store.connection().query_row(
-        "SELECT id FROM mail WHERE sender=?1 AND recipient='captain' AND task_id=?2 AND kind='request' AND state='open' AND json_extract(payload,'$.type')='tool_permission' AND json_extract(payload,'$.policy_hash')=?3 LIMIT 1",
-        [&owner,task_id,&policy_hash], |r|r.get(0)).optional()?;
-    if let Some(id) = existing {
-        return Ok(json!({"request_id":id,"duplicate":true}));
-    }
-    let episode: i64 = store.connection().query_row(
-        "SELECT COUNT(*) FROM mail WHERE sender=?1 AND recipient='captain' AND task_id=?2 AND state <> 'open' AND json_extract(payload,'$.type')='tool_permission'", [&owner,task_id], |r|r.get(0))?;
-    let id = format!(
-        "permissions-{:x}",
-        Sha256::digest(format!("{owner}\0{task_id}\0{policy_hash}\0{episode}"))
-    );
-    crate::mail::dispatch(
+    let denials = match &job_id {
+        Some(job_id) => {
+            let job = crate::jobs::record(store, job_id)?;
+            let log = store
+                .home()
+                .join("jobs")
+                .join(job_id)
+                .join(job["incarnation"].as_str().unwrap_or_default())
+                .join("stdout.log");
+            crate::block_ask::logged_denials(&log)
+        }
+        None => {
+            let tool = required(&args, "tool")?;
+            let input = args.get("input").cloned().unwrap_or(json!({}));
+            ensure!(
+                tool.len() <= 128 && input.to_string().len() <= 16_384,
+                "tool is limited to 128 bytes and input to 16 KiB"
+            );
+            vec![json!({"tool_name": tool, "tool_input": input})]
+        }
+    };
+    let denials = if denials.is_empty() {
+        vec![json!({"tool_name": "unknown", "tool_input": {}})]
+    } else {
+        denials
+    };
+    let folder = store.home().parent().map(std::path::Path::to_path_buf);
+    let (records, more) = crate::block_ask::records(&denials, folder.as_deref());
+    let tx = store.write_transaction()?;
+    let raised = crate::block_ask::raise(
         store,
-        "mail.send",
-        json!({"id":id,"from":owner,"to":"captain","kind":"request","task_id":task_id,
-        "request_kind":"tool-permission","body":"Claude could not run an unapproved tool. How should this task proceed? The captain can add a fleet rule with `privateer permissions allow 'Tool(rule)'`, or enable all first mates with `privateer permissions yolo` (Telegram: /yolo on). No settings-file edit is needed. Retry is paused until the policy changes or you answer this request.","payload":{"type":"tool_permission","policy_hash":policy_hash}}),
+        &owner,
+        &task_id,
+        &task,
+        job_id.as_deref(),
+        "wake",
+        records,
+        more,
     )?;
-    Ok(json!({"request_id":id,"duplicate":false}))
+    tx.commit()?;
+    Ok(
+        json!({"request_id": raised["ask"], "duplicate": raised["duplicate"],
+        "declined": raised["declined"], "rules": raised["rules"]}),
+    )
 }
 
-fn policy_hash(store: &Store) -> Result<String> {
+pub(crate) fn policy_hash(store: &Store) -> Result<String> {
     Ok(format!(
         "{:x}",
         Sha256::digest(for_store(store)?.to_string())
     ))
 }
 
+/// Whether a ship's own denial holds back its automatic wakes: an open ask
+/// the policy does not yet cover, and no fresh mail since it. A crew's or an
+/// errand's ask holds only its task (see `block_ask`).
 pub(crate) fn paused(store: &Store, owner: &str) -> Result<bool> {
-    let pending: Option<(i64, Option<String>)> = store.connection().query_row(
-        "SELECT seq,task_id FROM mail WHERE sender=?1 AND recipient='captain' AND kind='request' AND state='open' AND json_extract(payload,'$.type')='tool_permission' AND json_extract(payload,'$.policy_hash')=?2 ORDER BY seq DESC LIMIT 1",
-        [owner,&policy_hash(store)?], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    let Some((question, task)) = pending else {
+    let Some((question, task)) = crate::block_ask::pausing_ask(store, owner)? else {
         return Ok(false);
     };
     // Stop retries of already-observed blocked work, not fresh incoming mail.
     // A failed wake covers that new mail too, so it earns one attempt only.
+    // A low notice ("still blocked?", a requester's note) wakes nobody, so it
+    // is not fresh either.
     let through: i64 = store.connection().query_row(
         "SELECT COALESCE(MAX(through_seq),0) FROM wakes WHERE ship=?1",
         [owner],
         |r| r.get(0),
     )?;
-    let fresh: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2 AND (sender<>'crew' OR task_id IS NOT ?3))",rusqlite::params![owner,question.max(through),task],|r|r.get(0))?;
+    let fresh: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2 AND (sender<>'crew' OR task_id IS NOT ?3) AND (kind<>'notice' OR urgency<>'low'))",rusqlite::params![owner,question.max(through),task],|r|r.get(0))?;
     Ok(!fresh)
 }
 

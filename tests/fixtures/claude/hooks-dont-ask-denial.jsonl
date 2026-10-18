@@ -1,0 +1,5 @@
+{"session_id":"97442a4e-9e71-4596-88d5-e93a6fc46a46","cwd":"/tmp/scratch","hook_event_name":"SessionStart","source":"startup"}
+{"session_id":"97442a4e-9e71-4596-88d5-e93a6fc46a46","cwd":"/tmp/scratch","permission_mode":"dontAsk","hook_event_name":"UserPromptSubmit","prompt":"Run exactly this shell command with the Bash tool and nothing else: curl -sS https://example.com/ -o /dev/null. If it is denied, do not retry; stop and say denied."}
+{"session_id":"97442a4e-9e71-4596-88d5-e93a6fc46a46","cwd":"/tmp/scratch","permission_mode":"dontAsk","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"curl -sS https://example.com/ -o /dev/null","description":"Fetch example.com and discard output"},"tool_use_id":"toolu_01QByPZ5hrdgAPK4rVawKLgD"}
+{"session_id":"97442a4e-9e71-4596-88d5-e93a6fc46a46","cwd":"/tmp/scratch","permission_mode":"dontAsk","effort":{"level":"high"},"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Denied.","background_tasks":[],"session_crons":[]}
+{"session_id":"97442a4e-9e71-4596-88d5-e93a6fc46a46","cwd":"/tmp/scratch","hook_event_name":"SessionEnd","reason":"other"}

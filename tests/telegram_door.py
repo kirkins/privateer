@@ -445,6 +445,50 @@ def main() -> int:
             assert written["payload"] == {"answer": {"text": "Build 12, with the notes fixed."}}, written
             assert fleet.call("ops", "mail.show", {"id": asked["id"]})["state"] == "answered"
 
+            # A tool denial is one card with its buttons. Mail the runtime adds
+            # to that ask edits the card, buttons kept, and sends no new message.
+            blocked = fleet.call("ops", "permissions.blocked", {
+                "task_id": "ops-duty", "tool": "Bash", "input": {"command": "apify run actor/x"}})
+            ask = blocked["request_id"]
+            block_card = wait_for("the block card", lambda: [
+                m for m in telegram.sent() if "was denied Bash(apify run" in m["text"]])[0]
+            block_buttons = json.loads(block_card["reply_markup"])["inline_keyboard"]
+            assert [row[0]["text"] for row in block_buttons] == [
+                "Allow Bash(apify run *)", "Continue without it", "Stop the task"], block_buttons
+            before = len(telegram.sent())
+            relay = fleet.call("liaison", "mail.send", {
+                "from": "liaison", "to": "captain", "kind": "request", "about": ask,
+                "body": "ops is blocked on apify; please allow it"})
+            assert relay["attached_to"] == ask, relay
+            assert f"added to {ask}" in relay["note"], relay
+            edit = wait_for("the card edit", lambda: [
+                m for m in telegram.called("editMessageText")
+                if m.get("message_id") == str(block_card["_message_id"])])[-1]
+            assert "liaison (request)" in edit["text"], edit
+            assert json.loads(edit["reply_markup"]) == json.loads(block_card["reply_markup"]), edit
+            # The same denial on another ship joins the card too, which then
+            # says the answer applies to every blocked task.
+            same = fleet.call("liaison", "permissions.blocked", {
+                "task_id": "liaison-duty", "tool": "Bash", "input": {"command": "apify run actor/y"}})
+            assert same["request_id"] != ask, same
+            joined = wait_for("the same-denial edit", lambda: [
+                m for m in telegram.called("editMessageText")
+                if m.get("message_id") == str(block_card["_message_id"])
+                and "applies to every blocked task" in m["text"]])[-1]
+            assert "liaison-duty" in joined["text"], joined
+            assert json.loads(joined["reply_markup"]) == json.loads(block_card["reply_markup"]), joined
+            time.sleep(2)
+            assert len(telegram.sent()) == before, telegram.sent()[before:]
+            # Its closure resolves the same card and clears its buttons; the
+            # items added to it end with it and send nothing new.
+            fleet.call("ops", "mail.withdraw", {"id": ask, "reason": "done another way"})
+            closed = wait_for("the resolved card", lambda: [
+                m for m in telegram.called("editMessageText")
+                if m.get("message_id") == str(block_card["_message_id"])
+                and "Resolved:" in m["text"]])[-1]
+            assert json.loads(closed["reply_markup"]) == {"inline_keyboard": []}, closed
+            assert len(telegram.sent()) == before, telegram.sent()[before:]
+
             for ship in ("liaison", "ops"):
                 for m in fleet.inbox(ship, ship):
                     assert "everything" not in m["body"] and "elsewhere" not in m["body"], m

@@ -217,6 +217,79 @@ pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Resul
     Ok(written == 1)
 }
 
+/// Record mail the runtime writes for a ship, in the caller's transaction:
+/// a block ask to the captain, or a notice to another ship. `message` holds
+/// id, from, to, kind, body, payload and urgency, and optionally task_id and
+/// correlation. Mail for a ship behind a peer waits as pending for the next
+/// flush. The id is the idempotency key; false means it already existed.
+pub(crate) fn record_runtime(store: &Store, message: &Value) -> Result<bool> {
+    let text = |key: &str| message[key].as_str().context("invalid runtime message");
+    let (to, kind, urgency) = (text("to")?, text("kind")?, text("urgency")?);
+    ensure!(
+        KINDS.contains(&kind) && kind != "reply" && URGENCIES.contains(&urgency),
+        "invalid runtime message"
+    );
+    let peer = if to == CAPTAIN {
+        None
+    } else {
+        ship(store, to)?
+            .as_ref()
+            .and_then(remote_peer)
+            .map(str::to_owned)
+    };
+    let written = store.connection().execute(
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms,state,delivery)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(id) DO NOTHING",
+        params![
+            text("id")?,
+            text("from")?,
+            to,
+            kind,
+            message["correlation"].as_str(),
+            message["task_id"].as_str(),
+            text("body")?,
+            message["payload"].to_string(),
+            urgency,
+            Store::now_ms(),
+            matches!(kind, "request" | "decision").then_some("open"),
+            peer.map(|_| "pending")
+        ],
+    )?;
+    Ok(written == 1)
+}
+
+/// End the open mail attached to a primary ask that ended, in every fleet
+/// home on this machine: each row is ended by the home that sent it.
+pub(crate) fn end_attachments(store: &Store, ask: &str, reason: &str) -> Result<usize> {
+    let mut ended = 0;
+    let why = format!("merged ask {ask} ended: {reason}");
+    let mut end_in = |store: &Store| -> Result<()> {
+        let tx = store.write_transaction()?;
+        let mut statement = store.connection().prepare(&format!(
+            "SELECT {COLUMNS} FROM mail WHERE recipient='captain' AND state='open'
+             AND kind IN ('request','decision') AND COALESCE(delivery,'') <> 'received'
+             AND json_extract(payload,'$.attached_to')=?1"
+        ))?;
+        let rows = statement
+            .query_map([ask], message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for row in rows {
+            end_request(store, &row, "withdrawn", &why)?;
+            ended += 1;
+        }
+        tx.commit()?;
+        Ok(())
+    };
+    end_in(store)?;
+    for home in crate::block_ask::other_homes(store.home()) {
+        if let Ok(other) = Store::open(&home.1) {
+            end_in(&other)?;
+        }
+    }
+    Ok(ended)
+}
+
 /// A message by id, for runtime modules that check it against the caller.
 pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
@@ -295,7 +368,7 @@ fn outcome_id(store: &Store, prefix: &str) -> Result<String> {
 /// Record a sender-authored closure as an ordinary correlated notice. Old
 /// peers can retain the notice without understanding it; new peers apply it.
 /// The caller holds the write transaction. Delivery uses the existing outbox.
-fn end_request(store: &Store, request: &Value, state: &str, reason: &str) -> Result<()> {
+pub(crate) fn end_request(store: &Store, request: &Value, state: &str, reason: &str) -> Result<()> {
     let id = outcome_id(store, "end")?;
     let peer = ship(store, request["to"].as_str().context("request recipient")?)?
         .as_ref()
@@ -358,6 +431,17 @@ fn withdraw(store: &Store, args: &Value) -> Result<Value> {
         )?;
     }
     tx.commit()?;
+    // Items added to a withdrawn block ask end with it.
+    if request["payload"]["type"] == "tool_permission" && request["to"] == CAPTAIN {
+        let why = if reason.is_empty() {
+            "withdrawn"
+        } else {
+            reason
+        };
+        if let Err(error) = end_attachments(store, id, why) {
+            eprintln!("privateer: could not end the items added to {id}: {error:#}");
+        }
+    }
     // Bounded and retryable, like mail.send. Task closure only enqueues.
     // Preserve FIFO and retry delays even when this request is retried.
     let peer = ship(store, request["to"].as_str().context("request recipient")?)?
@@ -733,7 +817,7 @@ fn validate_decision(decision: &Value) -> Result<()> {
 /// Check the typed parts of a message's payload, and fill in what older doors
 /// read. Shared by sending and by delivery, so a home refuses the same shapes
 /// whichever way they arrive.
-fn typed_payload(kind: &str, payload: &mut Value) -> Result<()> {
+pub(crate) fn typed_payload(kind: &str, payload: &mut Value) -> Result<()> {
     // Only a decision message carries a typed decision. Other mail keeps any
     // payload it had, including a key named decision or answer, as before.
     if kind != "decision" {
@@ -803,7 +887,47 @@ fn check_answer(decision: &Value, answer: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A payload without the fields the runtime adds for its topic, which may
+/// differ on a replay once the ask it named has closed.
+fn without_topic(payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    if let Some(fields) = payload.as_object_mut() {
+        for key in ["about", "attached_to", "attached_ship"] {
+            fields.remove(key);
+        }
+    }
+    payload
+}
+
+/// Whose words a captain reply carries, for the operator marker that alone
+/// lets an answer widen fleet permissions.
+#[derive(Clone, Copy)]
+pub(crate) enum Mark {
+    /// The caller's own: the operator's reply is marked.
+    Caller,
+    /// Someone passing the captain's words on: never marked.
+    Relayed,
+    /// A runtime copy of another reply, which keeps that reply's marker.
+    Keep(bool),
+}
+
 fn send(store: &Store, args: &Value) -> Result<Value> {
+    send_with(store, args, Mark::Caller)
+}
+
+/// `mail.send` for a captain reply that relays the captain's words: it is
+/// stored as a reply, but carries no operator marker.
+pub(crate) fn send_relayed(store: &Store, args: &Value) -> Result<Value> {
+    send_with(store, args, Mark::Relayed)
+}
+
+/// `mail.send` for a runtime copy of a captain reply (a fan-out to an
+/// attached ask), keeping the original's operator marker.
+pub(crate) fn send_copy(store: &Store, args: &Value, operator: bool) -> Result<Value> {
+    send_with(store, args, Mark::Keep(operator))
+}
+
+fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
         "message exceeds 64 KiB"
@@ -859,6 +983,49 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         payload.get("request_end").is_none(),
         "request_end is reserved for runtime closure"
     );
+    for reserved in ["operator", "attached_to", "attached_ship"] {
+        ensure!(
+            payload.get(reserved).is_none(),
+            "payload.{reserved} is set by the runtime"
+        );
+    }
+    // Block asks and their links are the runtime's own: a ship that could
+    // write them could hide a card behind a real one and have its rules
+    // granted by the captain's answer to that one. Only a runtime copy keeps
+    // what the reply it copies carried.
+    if !matches!(mark, Mark::Keep(_)) {
+        ensure!(
+            payload["type"] != "tool_permission",
+            "tool-permission asks are raised by the runtime"
+        );
+        for reserved in [
+            "block",
+            "about",
+            "fanned_from",
+            "block_notice",
+            "block_cleared",
+        ] {
+            ensure!(
+                payload.get(reserved).is_none(),
+                "payload.{reserved} is set by the runtime; pass about as an argument"
+            );
+        }
+    }
+    // Only the operator's own answer to a block ask is marked; a relay or a
+    // bridge is not. Other replies keep the payload they were given.
+    let operator = from == CAPTAIN
+        && kind == "reply"
+        && match mark {
+            Mark::Caller => {
+                *store.caller() == Caller::Operator && payload.get("relayed_by").is_none()
+            }
+            Mark::Relayed => false,
+            Mark::Keep(operator) => operator,
+        };
+    let about = optional_str(args, "about")?;
+    if let Some(about) = about {
+        identifier(about)?;
+    }
     if args["request_kind"] == "production_approval" {
         ensure!(
             kind == "request" && to == CAPTAIN,
@@ -939,6 +1106,32 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     );
 
     let tx = store.write_transaction()?;
+    if operator && correlation.is_some_and(|c| crate::block_ask::is_ask_id(store, c)) {
+        payload["operator"] = json!(true);
+    }
+    // The topic is the runtime's: the captain decision this mail is about.
+    // Captain mail on an open block ask's topic is attached to it.
+    let mut urgency = urgency;
+    let mut attached = None;
+    if kind != "reply" && from != CAPTAIN {
+        if let Some(topic) = crate::block_ask::topic(store, about, correlation, task_id, kind)? {
+            payload["about"] = json!(topic);
+            let primary = crate::block_ask::open_primary(store, &topic)?;
+            if let Some((ask, ship)) = &primary {
+                if to == CAPTAIN
+                    && request_kind != Some("production_approval")
+                    && payload.get("needs_hands").is_none()
+                {
+                    payload["attached_to"] = json!(ask);
+                    payload["attached_ship"] = json!(ship);
+                    attached = primary.clone();
+                } else if kind == "notice" && ship == to {
+                    // "Still blocked?" to the blocked ship waits for its next real wake.
+                    urgency = "low";
+                }
+            }
+        }
+    }
     if let Some(existing) = by_id(store, &id)? {
         let same = existing["from"] == from
             && existing["to"] == to
@@ -947,7 +1140,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
             && existing["task_id"] == json!(task_id)
             && existing["request_kind"] == json!(request_kind)
             && existing["body"] == body
-            && existing["payload"] == payload;
+            && without_topic(&existing["payload"]) == without_topic(&payload);
         ensure!(same, "message id already holds a different message");
         tx.commit()?;
         let mut existing = annotate(existing, Store::now_ms());
@@ -996,6 +1189,7 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
                     {
                         check_answer(decision, answer)?;
                     }
+                    crate::block_ask::check_answer(&thread, &payload)?;
                 }
             }
             // The captain's request may live in the home that asked it, not
@@ -1047,10 +1241,21 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
     if let Some(peer) = peer {
         flush_pending(store, 1, false, None, Some(&peer))?;
     }
-    Ok(annotate(
-        by_id(store, &id)?.context("message vanished")?,
-        Store::now_ms(),
-    ))
+    let stored = by_id(store, &id)?.context("message vanished")?;
+    if kind == "reply"
+        && let Some(correlation) = correlation
+    {
+        crate::block_ask::answered(store, correlation, &stored, true);
+    }
+    let mut result = annotate(stored, Store::now_ms());
+    if let Some((ask, ship)) = attached {
+        result["attached_to"] = json!(ask);
+        result["note"] = json!(format!(
+            "The captain already has this as {ask} ({ship}, {}). Your message was added to {ask}; you will get the captain's answer. Do not resend.",
+            crate::block_ask::rules_of(store, &ask).unwrap_or_default()
+        ));
+    }
+    Ok(result)
 }
 
 /// The envelope another home receives. Task ids are local to a home and do
@@ -1123,7 +1328,12 @@ pub(crate) fn applied_end(message: &Value, result: &Value) -> Option<String> {
 /// Try once to deliver a pending outgoing message; record the outcome.
 fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -> Result<Delivery> {
     let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
-    let envelope = envelope(&message);
+    let mut envelope = envelope(&message);
+    // A machine names itself to the one it delivers to, which checks the name
+    // against its link before trusting a captain reply's operator marker.
+    if let Some(name) = crate::machines::known_as_by_peer(peer) {
+        envelope["via"] = json!(name);
+    }
     let wire_bytes = envelope.to_string().len();
     if wire_bytes > MAX_MESSAGE_BYTES {
         quarantine(store, id, wire_bytes)?;
@@ -1658,10 +1868,39 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     ensure!(payload.is_object(), "payload must be an object");
     typed_payload(kind, &mut payload)?;
     hands_step(kind, to, &payload)?;
+    // The operator marker crosses a link only on a captain reply that the
+    // machine holding this machine's captain desk delivered.
+    let via = optional_str(args, "via")?;
+    if payload.get("operator").is_some()
+        && !(from == CAPTAIN && kind == "reply" && via.is_some_and(crate::machines::holds_desk))
+        && let Some(fields) = payload.as_object_mut()
+    {
+        fields.remove("operator");
+    }
     let urgency = optional_str(args, "urgency")?.unwrap_or("normal");
     ensure!(URGENCIES.contains(&urgency), "invalid urgency");
     let deadline_ms = args.get("deadline_ms").and_then(Value::as_i64);
     let tx = store.write_transaction()?;
+    // A desk copy is attached here, against the asks this machine holds.
+    if to == CAPTAIN && kind != "reply" && from != CAPTAIN && by_id(store, id)?.is_none() {
+        if let Some(fields) = payload.as_object_mut() {
+            fields.remove("attached_to");
+            fields.remove("attached_ship");
+        }
+        let topic = match payload["about"].as_str() {
+            Some(about) => Some(about.to_owned()),
+            None => crate::block_ask::fleet_key_primary(store, from, &payload)?,
+        };
+        if let Some(topic) = topic
+            && request_kind != Some("production_approval")
+            && payload.get("needs_hands").is_none()
+            && let Some((ask, ship)) = crate::block_ask::open_primary(store, &topic)?
+            && ask != id
+        {
+            payload["attached_to"] = json!(ask);
+            payload["attached_ship"] = json!(ship);
+        }
+    }
     if let Some(existing) = by_id(store, id)? {
         // Redelivery after a lost acknowledgement is a no-op.
         ensure!(
@@ -1761,6 +2000,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         &by_id(store, id)?.context("delivered mail disappeared")?,
     )?;
     tx.commit()?;
+    if answers_here && let Some(correlation) = correlation {
+        let stored = by_id(store, id)?.context("delivered mail disappeared")?;
+        crate::block_ask::answered(store, correlation, &stored, false);
+    }
     Ok(json!({"id": id, "duplicate": false, "request_end": receipt}))
 }
 

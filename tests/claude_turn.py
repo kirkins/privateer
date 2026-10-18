@@ -74,6 +74,26 @@ class ClaudeTurn(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertEqual(summary["reason"], "resume-identity")
 
+    def test_a_denied_run_fails_and_ends_with_a_short_denial_line(self):
+        # The stream Claude Code 2.1.300 printed for a curl it was not allowed to run.
+        fixture = (ROOT / "tests/fixtures/claude/denied-accept-edits.jsonl").read_bytes()
+        run, line = self.run_stream([], raw=fixture)
+        self.assertEqual(run.returncode, 2, run.stdout)
+        self.assertEqual(line["type"], "native.permission_blocked")
+        self.assertEqual(line["denials"], [{"tool_name":"Bash", "tool_input":{
+            "command":"curl -sS https://example.com/ -o /dev/null",
+            "description":"Fetch example.com and discard output"}}])
+        summary = json.loads(run.stdout.splitlines()[-2])
+        self.assertEqual(summary["type"], "native.turn.failed")
+        # A denied Write of a large file is clipped, and at most four are kept.
+        big = [{"tool_name":"Write", "tool_input":{"file_path":f"/x/{i}", "content":"y" * 100_000}}
+               for i in range(6)]
+        run, line = self.run_stream([INIT, {**RESULT, "permission_denials":big}])
+        self.assertEqual(len(line["denials"]), 4)
+        self.assertEqual(line["denied"], 6)
+        self.assertEqual(line["denials"][0]["tool_input"]["file_path"], "/x/0")
+        self.assertLess(len(run.stdout.splitlines()[-1]), 20_000)
+
     def test_truncated_and_malformed_streams_fail(self):
         good = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, RESULT])
         for raw, reason in ((good[:-1], "truncated-stream"), (good+b"not-json\n", "invalid-json")):

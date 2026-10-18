@@ -316,12 +316,29 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 format!("errand job {status}")
             ],
         )?;
+        let mut payload = json!({"errand": id, "focus": focus, "status": outcome});
+        let mut urgency = if outcome == "succeeded" {
+            "normal"
+        } else {
+            "high"
+        };
+        // An errand stopped by a tool denial: the captain has the ask, and its
+        // answer wakes the ship, so this verdict waits for that.
+        if outcome == "failed"
+            && let Some(ask) = crate::block_ask::ask_for_job(store, &id, &logs.join("stdout.log"))?
+        {
+            let ask_id = ask["id"].as_str().unwrap_or_default();
+            body.push_str(&format!(
+                "\nClaude was denied {}. The captain has decision {ask_id}; the task is not held meanwhile. Do not ask the captain again.",
+                crate::block_ask::rules_text(&ask["payload"]["block"])
+            ));
+            payload["about"] = json!(ask_id);
+            urgency = "low";
+        }
         crate::mail::record_crew(
             store.connection(),
             &json!({"id": format!("{id}-verdict"), "to": ship, "kind": "notice",
-                "task_id": task_id, "body": body,
-                "payload": {"errand": id, "focus": focus, "status": outcome},
-                "urgency": if outcome == "succeeded" { "normal" } else { "high" }}),
+                "task_id": task_id, "body": body, "payload": payload, "urgency": urgency}),
         )?;
         settled.push(json!({"errand": id, "status": outcome}));
     }

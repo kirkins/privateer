@@ -86,6 +86,26 @@ pub fn waiting() -> Result<Value> {
             waiting.push(item);
         }
     }
+    // Mail attached to an open ask is answered with it: the ask shows once,
+    // with how many items were added to it.
+    let primaries: Vec<String> = waiting
+        .iter()
+        .filter(|w| w["mail"]["payload"]["attached_to"].is_null())
+        .filter_map(|w| w["mail"]["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut attached: std::collections::HashMap<String, u64> = Default::default();
+    waiting.retain(|w| match w["mail"]["payload"]["attached_to"].as_str() {
+        Some(primary) if primaries.iter().any(|p| p == primary) => {
+            *attached.entry(primary.to_owned()).or_default() += 1;
+            false
+        }
+        _ => true,
+    });
+    for item in &mut waiting {
+        if let Some(count) = item["mail"]["id"].as_str().and_then(|id| attached.get(id)) {
+            item["attached"] = json!(count);
+        }
+    }
     // Every hands-on ask is also in `waiting`, placed before the oldest others
     // are cut to the cap, so the two lists never disagree about an ask. Ids are
     // chosen by each ship, so an ask is named by its home and id.
@@ -131,7 +151,7 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
         "{source_id} is more than a day old; ask the captain again"
     );
     for (ship, home) in fleet()? {
-        let mut target = Store::open(&home)?;
+        let target = Store::open(&home)?;
         let request: Option<(String, String, Option<String>, Option<String>)> = target
             .connection()
             .query_row(
@@ -156,10 +176,11 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
             "{request_id} is no longer open"
         );
         let quote: String = said.chars().take(QUOTE_CHARS).collect();
-        let reply = crate::mail::dispatch(
-            &mut target,
-            "mail.send",
-            json!({"from": crate::mail::CAPTAIN, "to": asker, "kind": "reply",
+        // A relay carries the captain's words but not the operator's marker,
+        // so it cannot grant a tool permission.
+        let reply = crate::mail::send_relayed(
+            &target,
+            &json!({"from": crate::mail::CAPTAIN, "to": asker, "kind": "reply",
                 "correlation": request_id, "body": body,
                 "payload": {"relayed_by": liaison, "source": source_id, "captain_said": quote}}),
         )?;
