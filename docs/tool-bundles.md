@@ -93,8 +93,15 @@ fixture verifies this behavior. Session-handler behavior remains trusted code.
 No real installation's integration paths have been approved by this change.
 
 Registry fields are strict. Refs must have a name and version (`name@version`).
-Names, roles, unknown/duplicate refs, conflicting selected skill names, hashes,
-unsupported resource fields and missing/unsafe paths fail before launch. A ref's
+`skills` is optional: a bundle that carries only `mcp_servers` omits the key,
+and an absent key reads as no skills. Every bundle needs at least one skill or
+one server; an empty bundle is refused. Names, roles, unknown/duplicate refs,
+conflicting selected skill names, hashes, unsupported resource fields and
+missing/unsafe paths fail before launch.
+
+A refused registry names the failing bundle and the field or rule, for example
+`bundle docs@1 refused: mcp_servers.url`. Messages never include a value from the
+registry: no URL query string, credential value, header, path or file content. A ref's
 path/content/roles cannot change, even after removal/re-addition: publish a new
 version instead. Removal revokes future selection. An already recorded agent-job
 replay returns that same job rather than planning another launch.

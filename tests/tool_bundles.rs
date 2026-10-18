@@ -712,3 +712,43 @@ fn credentials_are_the_captains_from_stdin_and_plans_carry_only_refs() {
         json!({"refs":[]})
     );
 }
+
+#[test]
+fn configure_accepts_mcp_only_bundle_and_refusals_name_field_not_value() {
+    let (_temp, mut store, config) = fixture();
+    let mut mcp_only = config.clone();
+    mcp_only["bundles"] = json!([{"ref":"docs@1","roles":["crew"],
+        "credentials":[{"name":"DOCS_TOKEN","ref":"docs-search"}],
+        "mcp_servers":[{"name":"docs","url":"https://mcp.example.test/mcp","credential":"DOCS_TOKEN","timeout":5}]}]);
+    let configured =
+        dispatch(&mut store, "bundle.configure", json!({"registry":mcp_only})).unwrap();
+    assert_eq!(configured["configured"], true);
+
+    let mut bad_pin = config.clone();
+    bad_pin["bundles"][0]["skills"][0]["sha256"] = json!("e".repeat(64));
+    let error = dispatch(&mut store, "bundle.configure", json!({"registry":bad_pin})).unwrap_err();
+    assert_eq!(error.to_string(), "bundle fixture@1 refused: skills.sha256");
+
+    let sentinel = "TOOL_BUNDLE_SENTINEL_4f1a";
+    let mut bad_url = mcp_only.clone();
+    bad_url["bundles"][0]["mcp_servers"][0]["url"] = json!(format!(
+        "http://{sentinel}.example.test/mcp?token={sentinel}"
+    ));
+    let error = dispatch(&mut store, "bundle.configure", json!({"registry":bad_url})).unwrap_err();
+    assert_eq!(error.to_string(), "bundle docs@1 refused: mcp_servers.url");
+    assert!(!format!("{error:#}").contains(sentinel));
+
+    let mut undeclared = mcp_only.clone();
+    undeclared["bundles"][0]["mcp_servers"][0]["credential"] = json!(sentinel);
+    let error = dispatch(
+        &mut store,
+        "bundle.configure",
+        json!({"registry":undeclared}),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bundle docs@1 refused: mcp_servers.credential"
+    );
+    assert!(!format!("{error:#}").contains(sentinel));
+}

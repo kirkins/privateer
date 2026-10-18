@@ -179,10 +179,20 @@ pub(crate) fn bundle_request(
     };
     let response = invoke(&manifest, directory, serde_json::to_vec(&request)?)?;
     ensure!(
-        response["id"] == id
-            && response["version"] == 1
-            && response["ok"] == true
-            && response["result"]["valid"] == true,
+        response["id"] == id && response["version"] == 1,
+        "bounded resource validation failed; inspect approved registry locally"
+    );
+    // A refusal carries the adapter's public message: the failing bundle and
+    // field or rule, never a value from the registry.
+    if response["ok"] != true {
+        let reason = response["error"]
+            .as_str()
+            .filter(|reason| reason.len() <= 200 && !reason.contains('\n'))
+            .unwrap_or("bounded resource validation failed; inspect approved registry locally");
+        bail!("{reason}");
+    }
+    ensure!(
+        response["result"]["valid"] == true,
         "bounded resource validation failed; inspect approved registry locally"
     );
     Ok(response["result"].clone())
