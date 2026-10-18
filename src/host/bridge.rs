@@ -29,6 +29,13 @@ struct Owner {
     directory: (u64, u64),
     origin: String,
     ship: String,
+    // The kernel boot that wrote this claim. No lease outlives a reboot, and
+    // device numbers need not survive one (btrfs subvolumes, APFS volumes).
+    // Absent on claims written before boots were recorded. Kept on the owner,
+    // which older binaries read without refusing unknown fields, so a claim
+    // stamped here never wedges an older release.
+    #[serde(default)]
+    boot: Option<String>,
 }
 impl Owner {
     fn read(store: &Store) -> Result<Self> {
@@ -52,6 +59,7 @@ impl Owner {
             },
             origin,
             ship,
+            boot: boot(),
         })
     }
     fn validate(&self) -> Result<()> {
@@ -89,6 +97,38 @@ struct Claim {
     adopted: bool,
     failures: i64,
     retry_ms: i64,
+}
+
+#[cfg(target_os = "linux")]
+fn boot() -> Option<String> {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(boot.trim().to_owned()).filter(|b| !b.is_empty())
+}
+#[cfg(target_os = "macos")]
+fn boot() -> Option<String> {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let raw = buf.get(..len).filter(|_| rc == 0)?;
+    let raw = raw.split(|&b| b == 0).next()?;
+    Some(String::from_utf8(raw.to_vec()).ok()?).filter(|b| !b.is_empty())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn boot() -> Option<String> {
+    None
+}
+/// The same inode under another device number: the filesystem was mounted
+/// again, not a different file swapped in under the path (a new inode).
+fn renumbered(then: (u64, u64), now: (u64, u64)) -> bool {
+    then.0 != now.0 && then.1 == now.1
 }
 
 fn identity(path: &Path) -> Result<(u64, u64)> {
@@ -223,6 +263,8 @@ impl Coordination {
         ensure!(active, "bridge hosting home is not an active fleet member");
         Ok(())
     }
+    /// None also for a claim its writer's boot has ended: its lease cannot be
+    /// held now, and callers still reclaim only while the live lease is free.
     fn read(&self) -> Result<Option<Claim>> {
         let path = self.dir.join("claim.json");
         if !path.try_exists()? {
@@ -233,12 +275,29 @@ impl Coordination {
         ensure!(raw.len() <= 65_536, "bridge claim exceeds 64 KiB");
         let claim: Claim = serde_json::from_slice(&raw)?;
         ensure!(
-            claim.registry == self.registry
-                && claim.guard == identity(&self.dir.join("guard"))?
-                && uuid::Uuid::parse_str(&claim.token).is_ok(),
+            uuid::Uuid::parse_str(&claim.token).is_ok(),
             "bridge claim scope changed"
         );
-        Ok(Some(claim))
+        if let (Some(then), Some(now)) = (&claim.owner.boot, boot())
+            && *then != now
+        {
+            return Ok(None);
+        }
+        let guard = identity(&self.dir.join("guard"))?;
+        if claim.registry == self.registry && claim.guard == guard {
+            return Ok(Some(claim));
+        }
+        // Within one boot a changed identity is a replaced file. A claim from
+        // before boots were recorded proves an earlier boot only when every
+        // file kept its inode on one renumbered device.
+        ensure!(
+            claim.owner.boot.is_none()
+                && renumbered(claim.registry, self.registry)
+                && renumbered(claim.guard, guard)
+                && identity(&self.dir.join("live")).is_ok_and(|live| renumbered(claim.live, live)),
+            "bridge claim scope changed"
+        );
+        Ok(None)
     }
     fn save(&self, claim: &Claim) -> Result<()> {
         self.validate()?;
@@ -297,6 +356,17 @@ pub(crate) fn maintain(store: &Store) -> Result<Value> {
     let coord = Coordination::open(true)?;
     let mut previous = coord.read()?;
     let (_live, free) = coord.live(previous.as_ref())?;
+    // A lease held now is held on this boot. Record it on a claim from before
+    // boots were recorded, so the next reboot retires the claim, not wedges it.
+    if let Some(claim) = previous
+        .as_mut()
+        .filter(|c| !free && c.adopted && c.owner.boot.is_none())
+    {
+        claim.owner.boot = boot();
+        if claim.owner.boot.is_some() {
+            coord.save(claim)?;
+        }
+    }
     if let Some(claim) = previous.as_ref() {
         if let Some(binding) = &claim.binding {
             let socket = super::socket().context("no Herdr socket configured")?;
