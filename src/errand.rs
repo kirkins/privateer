@@ -279,7 +279,6 @@ struct RunningErrand {
     ship: String,
     focus: String,
     task_id: String,
-    _route_name: Option<String>,
     route_why: Option<String>,
 }
 
@@ -287,7 +286,7 @@ struct RunningErrand {
 pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
     let running: Vec<RunningErrand> = {
         let mut statement = store.connection().prepare(
-            "SELECT id, ship, focus, task_id, route, route_why FROM errands WHERE status='running' ORDER BY created_ms",
+            "SELECT id, ship, focus, task_id, route_why FROM errands WHERE status='running' ORDER BY created_ms",
         )?;
         statement
             .query_map([], |r| {
@@ -296,8 +295,7 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                     ship: r.get(1)?,
                     focus: r.get(2)?,
                     task_id: r.get(3)?,
-                    _route_name: r.get(4)?,
-                    route_why: r.get(5)?,
+                    route_why: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?

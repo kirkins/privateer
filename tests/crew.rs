@@ -723,7 +723,9 @@ fn outcome_and_verdict_notices_name_the_route_and_why() {
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     let outcome_body = outcomes[0]["body"].as_str().unwrap();
     assert!(
-        outcome_body.contains("Route: first available on infra's crew list: work (no requirement)"),
+        outcome_body.contains(
+            "Route: first in allowance order on infra's crew list: work (no requirement)"
+        ),
         "{outcome_body}"
     );
 

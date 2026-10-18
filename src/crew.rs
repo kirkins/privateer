@@ -1067,10 +1067,17 @@ fn launch_resume(
             args[key] = launch[key].clone();
         }
     }
-    if route_ok && !crew_record["estimate"].is_null() {
-        // The estimate the crew was admitted under, memory included: the
-        // launch record has no route figure to size it again from.
-        args["_resume_estimate"] = crew_record["estimate"].clone();
+    if route_ok {
+        if !crew_record["estimate"].is_null() {
+            // The estimate the crew was admitted under, memory included: the
+            // launch record has no route figure to size it again from.
+            args["_resume_estimate"] = crew_record["estimate"].clone();
+        }
+        if let Some(why) = crew_record.get("route_why").and_then(Value::as_str) {
+            args["_resume_why"] = json!(why);
+        } else {
+            args["_resume_why"] = json!("");
+        }
     }
     // Each resume gets a fresh budget (see `supervise_inner`); the run time
     // carried here is recorded on the job for reporting and bearings only.

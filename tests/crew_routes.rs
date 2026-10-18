@@ -1140,3 +1140,52 @@ fn a_requirement_with_no_routes_file_is_refused() {
         "{refused_errand}"
     );
 }
+
+#[test]
+fn a_crew_launch_cannot_forge_its_route_why() {
+    let f = Fleet::new();
+    let mut steady = codex("model-steady", "credits");
+    steady["tier"] = json!(2);
+    steady["uses"] = json!(["implement"]);
+    f.routes(json!({
+        "routes": {"steady": steady},
+        "crew": ["steady"],
+    }));
+    let reply = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({
+            "task_id": "fix",
+            "route_why": "forged route why from caller",
+        }),
+    );
+    assert_ne!(reply["route"]["why"], "forged route why from caller");
+    assert_eq!(
+        reply["route"]["why"],
+        "first in allowance order on engineering's crew list: steady (no requirement)"
+    );
+}
+
+#[test]
+fn an_operator_passing_require_with_an_unlisted_manifest_is_refused_as_unlisted() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"steady": codex("model-steady", "credits")},
+        "crew": ["steady"],
+    }));
+    let unlisted = json!({
+        "task_id": "fix",
+        "manifest": "bundled:codex",
+        "options": {"model": "model-pricey"},
+        "require": {"tier": 1},
+    });
+    let refusal = f.refused(None, "agent.start", unlisted);
+    assert!(
+        refusal.contains("is not one of engineering's crew routes"),
+        "unexpected refusal: {refusal}"
+    );
+    assert!(
+        !refusal.contains("the captain has listed no routes to choose from"),
+        "must not say no routes to choose from: {refusal}"
+    );
+}

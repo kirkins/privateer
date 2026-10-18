@@ -546,6 +546,17 @@ impl Require {
             (None, None) => "no requirement".to_owned(),
         }
     }
+
+    pub fn to_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        if let Some(ref u) = self.r#use {
+            map.insert("use".to_string(), Value::String(u.clone()));
+        }
+        if let Some(t) = self.tier {
+            map.insert("tier".to_string(), Value::Number(t.into()));
+        }
+        Value::Object(map)
+    }
 }
 
 pub(crate) fn parse_require(val: Option<&Value>) -> Result<Option<Require>> {
@@ -563,7 +574,7 @@ pub(crate) fn parse_require(val: Option<&Value>) -> Result<Option<Require>> {
         );
     }
     let r_use = match obj.get("use") {
-        Some(u) => {
+        Some(u) if !u.is_null() => {
             let u = u.as_str().context("require use must be a string")?;
             ensure!(
                 USES.contains(&u),
@@ -572,10 +583,10 @@ pub(crate) fn parse_require(val: Option<&Value>) -> Result<Option<Require>> {
             );
             Some(u.to_owned())
         }
-        None => None,
+        _ => None,
     };
     let r_tier = match obj.get("tier") {
-        Some(t) => {
+        Some(t) if !t.is_null() => {
             let t = t
                 .as_u64()
                 .context("require tier must be a whole number from 1 (strongest) to 9")?;
@@ -585,7 +596,7 @@ pub(crate) fn parse_require(val: Option<&Value>) -> Result<Option<Require>> {
             );
             Some(t)
         }
-        None => None,
+        _ => None,
     };
     ensure!(
         r_use.is_some() || r_tier.is_some(),
@@ -708,6 +719,34 @@ pub(crate) fn first_mate_fallback(
     Ok(None)
 }
 
+fn check_requirement(
+    name: &str,
+    route: &Value,
+    require: Option<&Require>,
+    ship: &str,
+    kind: &str,
+    qualifying: &[String],
+) -> Result<()> {
+    if let Some(req) = require {
+        if !meets(route, Some(req)) {
+            let meeting = if qualifying.is_empty() {
+                format!("no routes on {ship}'s {kind} list meet it")
+            } else {
+                format!(
+                    "routes on {ship}'s {kind} list that meet it: {}",
+                    qualifying.join(", ")
+                )
+            };
+            bail!(
+                "route {name} is {}; this launch needs {}; {meeting}",
+                describe_strength(route),
+                req.summary()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The route a ship's crew or errand launch should use: the one it names, or
 /// the cheapest route meeting `require` that is not backing off in `rank`'s order.
 /// `None` means the captain lists no routes of this kind, so old defaults apply.
@@ -746,23 +785,7 @@ pub(crate) fn choose(
                 names.join(", ")
             );
             let route = &policy["routes"][name];
-            if let Some(req) = require {
-                if !meets(route, Some(req)) {
-                    let meeting = if qualifying.is_empty() {
-                        format!("no routes on {ship}'s {kind} list meet it")
-                    } else {
-                        format!(
-                            "routes on {ship}'s {kind} list that meet it: {}",
-                            qualifying.join(", ")
-                        )
-                    };
-                    bail!(
-                        "route {name} is {}; this launch needs {}; {meeting}",
-                        describe_strength(route),
-                        req.summary()
-                    );
-                }
-            }
+            check_requirement(name, route, require, ship, kind, &qualifying)?;
             vec![name.to_owned()]
         }
         None => {
@@ -811,7 +834,9 @@ pub(crate) fn choose(
                     "cheapest on {ship}'s {kind} list meeting {}: {name}",
                     req.summary()
                 ),
-                None => format!("first available on {ship}'s {kind} list: {name} (no requirement)"),
+                None => format!(
+                    "first in allowance order on {ship}'s {kind} list: {name} (no requirement)"
+                ),
             },
         };
         return Ok(Some(Choice {
@@ -839,6 +864,7 @@ pub(crate) fn check(
     manifest: &str,
     options: &Value,
     require: Option<&Require>,
+    resume_why: Option<&str>,
 ) -> Result<Option<Choice>> {
     if !matches!(store.caller(), Caller::Agent { .. }) {
         if let Some(policy) = for_store(store)? {
@@ -855,26 +881,16 @@ pub(crate) fn check(
                         .filter(|n| meets(&policy["routes"][n.as_str()], require))
                         .cloned()
                         .collect();
-                    if let Some(req) = require {
-                        if !meets(route, Some(req)) {
-                            let meeting = if qualifying.is_empty() {
-                                format!("no routes on {ship}'s {kind} list meet it")
-                            } else {
-                                format!(
-                                    "routes on {ship}'s {kind} list that meet it: {}",
-                                    qualifying.join(", ")
-                                )
-                            };
-                            bail!(
-                                "route {name} is {}; this launch needs {}; {meeting}",
-                                describe_strength(route),
-                                req.summary()
-                            );
-                        }
-                    }
-                    let why = match require {
-                        Some(req) => format!("explicit route meeting {}: {name}", req.summary()),
-                        None => format!("explicit route: {name}"),
+                    check_requirement(name, route, require, ship, kind, &qualifying)?;
+                    let why = match resume_why {
+                        Some(why) if !why.is_empty() => why.to_owned(),
+                        Some(_) => format!("resumed on {name}"),
+                        None => match require {
+                            Some(req) => {
+                                format!("explicit route meeting {}: {name}", req.summary())
+                            }
+                            None => format!("explicit route: {name}"),
+                        },
                     };
                     return Ok(Some(Choice {
                         name: name.clone(),
@@ -887,6 +903,17 @@ pub(crate) fn check(
                     }));
                 }
             }
+            if require.is_some() {
+                if names.is_empty() {
+                    bail!("the captain has listed no {kind} routes for {ship}");
+                }
+                bail!(
+                    "{} is not one of {ship}'s {kind} routes; pass \"route\" with one of: {}",
+                    wanted.as_deref().unwrap_or(manifest),
+                    names.join(", ")
+                );
+            }
+            return Ok(None);
         }
         if require.is_some() {
             bail!("the captain has listed no routes to choose from");
@@ -927,23 +954,7 @@ pub(crate) fn check(
         .filter(|n| meets(&policy["routes"][n.as_str()], require))
         .cloned()
         .collect();
-    if let Some(req) = require {
-        if !meets(route, Some(req)) {
-            let meeting = if qualifying.is_empty() {
-                format!("no routes on {ship}'s {kind} list meet it")
-            } else {
-                format!(
-                    "routes on {ship}'s {kind} list that meet it: {}",
-                    qualifying.join(", ")
-                )
-            };
-            bail!(
-                "route {name} is {}; this launch needs {}; {meeting}",
-                describe_strength(route),
-                req.summary()
-            );
-        }
-    }
+    check_requirement(name, route, require, ship, kind, &qualifying)?;
     let why = match require {
         Some(req) => format!("explicit route meeting {}: {name}", req.summary()),
         None => format!("explicit route: {name}"),
@@ -1578,5 +1589,38 @@ mod tests {
         );
         assert_eq!(span(26 * HOUR), "26h");
         assert_eq!(span(80 * 60_000), "1h20m");
+    }
+
+    #[test]
+    fn parse_require_treats_null_fields_as_missing() {
+        let req_tier = parse_require(Some(&json!({"tier": 1, "use": null})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            req_tier,
+            Require {
+                r#use: None,
+                tier: Some(1),
+            }
+        );
+        assert_eq!(req_tier.to_json(), json!({"tier": 1}));
+
+        let req_use = parse_require(Some(&json!({"tier": null, "use": "review"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            req_use,
+            Require {
+                r#use: Some("review".to_string()),
+                tier: None,
+            }
+        );
+        assert_eq!(req_use.to_json(), json!({"use": "review"}));
+
+        let err = parse_require(Some(&json!({"tier": null, "use": null}))).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("require must state at least 'use' or 'tier'")
+        );
     }
 }

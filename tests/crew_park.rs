@@ -1129,3 +1129,79 @@ fn a_crew_that_parks_six_times_keeps_its_ids_short_and_unique() {
     assert_eq!(rows[0].0, "park-crew-chain-1", "{rows:?}");
     assert_eq!(last, "crew-resume-park-crew-chain-6-1", "{rows:?}");
 }
+
+#[test]
+fn a_parked_crew_with_partial_require_tier_resumes() {
+    let f = Fleet::new();
+    f.set_mode("session");
+    let mut claude_route = json!({"manifest": "bundled:claude", "cost": "credits"});
+    claude_route["tier"] = json!(1);
+    claude_route["uses"] = json!(["review", "implement"]);
+    f.routes(json!({
+        "routes": {"claude-route": claude_route},
+        "crew": ["claude-route"],
+    }));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({
+            "task_id": "fix",
+            "id": "crew-tier-only",
+            "require": {"tier": 1},
+        }),
+    );
+    let parked = f.wait("crew-tier-only", &["parked", "resumed"]);
+    assert_eq!(parked["park"], "park-crew-tier-only-1", "{parked}");
+    let resume = f.wait("crew-resume-park-crew-tier-only-1-1", &["succeeded"]);
+    assert_eq!(resume["status"], "succeeded", "{resume}");
+    let job = f.json(
+        None,
+        "job.status",
+        json!({"id": "crew-resume-park-crew-tier-only-1-1"}),
+    );
+    assert!(
+        !job["route_why"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("explicit route"),
+        "route_why should carry original why or say resumed, not explicit route: {job}"
+    );
+}
+
+#[test]
+fn a_parked_crew_with_partial_require_use_resumes() {
+    let f = Fleet::new();
+    f.set_mode("session");
+    let mut claude_route = json!({"manifest": "bundled:claude", "cost": "credits"});
+    claude_route["tier"] = json!(1);
+    claude_route["uses"] = json!(["review", "implement"]);
+    f.routes(json!({
+        "routes": {"claude-route": claude_route},
+        "crew": ["claude-route"],
+    }));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({
+            "task_id": "fix",
+            "id": "crew-use-only",
+            "require": {"use": "review"},
+        }),
+    );
+    let parked = f.wait("crew-use-only", &["parked", "resumed"]);
+    assert_eq!(parked["park"], "park-crew-use-only-1", "{parked}");
+    let resume = f.wait("crew-resume-park-crew-use-only-1-1", &["succeeded"]);
+    assert_eq!(resume["status"], "succeeded", "{resume}");
+    let job = f.json(
+        None,
+        "job.status",
+        json!({"id": "crew-resume-park-crew-use-only-1-1"}),
+    );
+    assert!(
+        !job["route_why"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("explicit route"),
+        "route_why should carry original why or say resumed, not explicit route: {job}"
+    );
+}

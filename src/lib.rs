@@ -290,6 +290,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 match args.get("manifest").and_then(Value::as_str) {
                     Some(manifest) => {
                         anyhow::ensure!(requested.is_none(), "pass route or manifest, not both");
+                        let resume_why = args
+                            .get("_resume_why")
+                            .and_then(Value::as_str)
+                            .filter(|_| matches!(store.caller(), Caller::Operator));
                         route_choice = crew_routes::check(
                             store,
                             ship,
@@ -297,6 +301,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                             manifest,
                             &args["options"],
                             require.as_ref(),
+                            resume_why,
                         )?;
                     }
                     None => {
@@ -501,15 +506,24 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if let Some(route) = model_route {
                 job["model_route"] = serde_json::json!(route);
             }
+            let is_wake = workspace::is_wake(store, &args)?;
             let route_name = route_choice.as_ref().map(|c| c.name.clone()).or_else(|| {
-                args.get("route_name")
-                    .and_then(Value::as_str)
-                    .map(String::from)
+                if is_wake {
+                    args.get("route_name")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                } else {
+                    None
+                }
             });
             let route_why = route_choice.as_ref().map(|c| c.why.clone()).or_else(|| {
-                args.get("route_why")
-                    .and_then(Value::as_str)
-                    .map(String::from)
+                if is_wake {
+                    args.get("route_why")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                } else {
+                    None
+                }
             });
             if let Some(name) = &route_name {
                 job["route_name"] = serde_json::json!(name);
@@ -521,7 +535,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             // wake is not crew and stays outside admission. Errands are wakes
             // too, so they stay outside admission as well: they are short and
             // the first mate's own.
-            if !workspace::is_wake(store, &args)? {
+            if !is_wake {
                 // A resume reuses the estimate its crew was admitted under: the
                 // runtime's own resume only (see `crew::resume`).
                 let estimate = match args
@@ -538,7 +552,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     "config": args.get("config"), "tool_bundles": args.get("tool_bundles"),
                     "cwd": args.get("cwd"),
                     "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false)),
-                    "require": require.as_ref().map(|r| serde_json::json!({"use": r.r#use, "tier": r.tier})),
+                    "require": require.as_ref().map(|r| r.to_json()),
                 });
             }
             let mut started = jobs::start_agent(store, job.clone())?;
