@@ -291,6 +291,8 @@ fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
         "reset_at",
         "reset-at",
         "resets at",
+        "retry in ",
+        "retrydelay",
     ] {
         for (at, _) in lower.match_indices(marker) {
             let tail = &lower[at + marker.len()..];
@@ -588,20 +590,25 @@ enum Throttle {
 
 fn throttle_kind(failure: &RouteFailure) -> Throttle {
     let lower = failure.error.to_ascii_lowercase();
-    if failure.allowance
-        || [
-            "quota",
-            "usage limit",
-            "allowance",
-            "exhausted",
-            "hit your limit",
-            "limit reached",
-        ]
+    // A per-minute quota (Gemini's 429 RESOURCE_EXHAUSTED) passes in seconds;
+    // it is a rate limit, not a spent allowance.
+    let per_minute = ["per minute", "per_minute", "perminute"]
         .iter()
-        .any(|sign| lower.contains(sign))
-    {
+        .any(|sign| lower.contains(sign));
+    let spent_words = [
+        "quota",
+        "usage limit",
+        "allowance",
+        "exhausted",
+        "hit your limit",
+        "limit reached",
+    ]
+    .iter()
+    .any(|sign| lower.contains(sign));
+    if failure.allowance || (spent_words && !per_minute) {
         Throttle::Spent
-    } else if lower.starts_with("429")
+    } else if per_minute
+        || lower.starts_with("429")
         || lower.contains("rate limit")
         || lower.contains("rate_limit")
     {
@@ -771,7 +778,9 @@ fn record_job(
     shaped: Option<Shaped>,
 ) -> Result<()> {
     let now = Store::now_ms();
-    let tx = conn.unchecked_transaction()?;
+    // Immediate: the usage read and the write below must not interleave with
+    // another home's write to the shared ledger, or the scan fails as busy.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut usage = match &shaped {
         Some(_) => usage_of(&tx, route)?,
         None => Usage::default(),
@@ -1006,6 +1015,27 @@ pub fn list(conn: &Connection) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_per_minute_quota_is_a_rate_limit_with_its_stated_delay() {
+        let failure = |error: &str| RouteFailure {
+            error: error.to_owned(),
+            reset_ms: None,
+            allowance: false,
+            account: false,
+            ceiling_ms: None,
+            probe_step: None,
+        };
+        let gemini = "429 RESOURCE_EXHAUSTED: Quota exceeded for metric generate_content requests per minute. Please retry in 23.53s.";
+        assert!(matches!(throttle_kind(&failure(gemini)), Throttle::Plain));
+        assert_eq!(reset_delay_ms(gemini, 0), Some(23_000));
+        let detail = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded per_minute","details":[{"retryDelay":"41s"}]}}"#;
+        assert!(matches!(throttle_kind(&failure(detail)), Throttle::Plain));
+        assert_eq!(reset_delay_ms(detail, 0), Some(41_000));
+        // A daily quota is still a spent allowance.
+        let daily = "429 RESOURCE_EXHAUSTED: Quota exceeded for metric requests per day.";
+        assert!(matches!(throttle_kind(&failure(daily)), Throttle::Spent));
+    }
 
     fn error_log(message: &str) -> String {
         serde_json::to_string(&json!({"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":message}})).unwrap()
