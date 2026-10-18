@@ -60,6 +60,24 @@ impl Fleet {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+    /// Wait until a job has settled either way.
+    fn settled(&self, job: &str) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = self.json(None, "job.status", json!({"id":job}));
+            if matches!(
+                status["status"].as_str(),
+                Some("succeeded" | "failed" | "cancelled" | "timed_out")
+            ) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "{job} never settled: {status}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
     /// Wait until a job has stopped unsuccessfully, the only kind a retry takes.
     fn stopped(&self, job: &str) {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -77,6 +95,30 @@ impl Fleet {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+    /// One dispatcher pass: the route scan runs in it, so what a run reported
+    /// reaches the ledger before the next launch is judged.
+    fn tick(&self) {
+        let output = self
+            .command(None, &["serve", "--json", "{\"once\":true}"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "serve: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    /// Launch a crew on a route, wait for it and scan what it reported.
+    fn run_and_scan(&self, id: &str, route: Option<&str>) -> Value {
+        let mut start = json!({"task_id":"fix","id":id});
+        if let Some(route) = route {
+            start["route"] = json!(route);
+        }
+        let job = self.json(Some("engineering"), "agent.start", start);
+        self.settled(id);
+        self.tick();
+        job
     }
     fn command(&self, agent: Option<&str>, args: &[&str]) -> Command {
         let mut c = support::command(BIN);
@@ -620,6 +662,210 @@ fn a_retried_crew_waits_for_its_backed_off_route_and_a_fresh_crew_takes_the_firs
 
 fn claude(model: &str) -> Value {
     json!({"manifest":"bundled:claude","options":{"model":model},"cost":"plan"})
+}
+
+/// The route a Claude crew reads its plan from, refused for new crew once the
+/// account is past the share the route keeps for them, and left alone for a
+/// first mate until the higher share it keeps for itself.
+#[test]
+fn a_reported_window_keeps_new_crew_off_the_route_and_leaves_the_first_mate_room() {
+    let f = Fleet::new();
+    // A fake Claude Code: it states the share of each plan window the account
+    // has spent, the way the real one does on every run, and ends the run the
+    // way a real one does.
+    let script = |window: f64, week: f64| {
+        let resets = privateer::store::Store::now_ms() / 1000;
+        let session = "11111111-2222-3333-4444-555555555555";
+        let init = json!({"type": "system", "subtype": "init", "session_id": session,
+            "model": "claude-sonnet"});
+        let event = json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed",
+            "unifiedWindows": {
+                "five_hour": {"utilization": window, "resetsAt": resets + 3_600},
+                "seven_day": {"utilization": week, "resetsAt": resets + 604_800}}}});
+        let done = json!({"type": "result", "subtype": "success", "is_error": false,
+            "session_id": session, "result": "ok"});
+        let stream = format!("{init}\n{event}\n{done}\n");
+        fs::write(f.root.join("stream.jsonl"), &stream).unwrap();
+        fs::write(
+            f.root.join("bin/claude"),
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/../stream.jsonl\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(f.root.join("bin/claude"), fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"shared": shared, "other": codex("model-other", "plan")},
+        "crew": ["shared", "other"],
+        "first_mate": ["shared", "other"]
+    }));
+    // The first pass has nothing to read yet and leaves the scan cursor behind;
+    // every run after this one is read by it.
+    f.tick();
+    // Nothing is over the crew share yet: the route takes the crew.
+    script(0.5, 0.2);
+    assert_eq!(
+        f.model(&f.run_and_scan("crew-first", Some("shared"))),
+        "sonnet"
+    );
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("window 50% used, week 20% used"), "{text}");
+
+    // The weekly window passes the share kept for new crew. The next crew takes
+    // the next route in its list; the refusal names the window and the share.
+    script(0.5, 0.83);
+    f.run_and_scan("crew-second", Some("shared"));
+    assert_eq!(f.model(&f.run_and_scan("crew-third", None)), "model-other");
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert!(refusal.contains("83% of its weekly window"), "{refusal}");
+    assert!(refusal.contains("80% for crew"), "{refusal}");
+    assert!(
+        refusal.contains("take the next route in their list"),
+        "{refusal}"
+    );
+    // The snapshot says which window is furthest spent, so a route that is
+    // refused never looks simply clear.
+    rusqlite::Connection::open(f.root.join("ledger/resources.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE route_usage SET weekly_utilization=0.97 WHERE route='claude/-/sonnet'",
+            [],
+        )
+        .unwrap();
+    let snapshot = f.json(None, "fleet.snapshot", json!({}));
+    let routes = snapshot["machines"][0]["routes"].as_array().unwrap();
+    let shared: Vec<&Value> = routes.iter().filter(|r| r["name"] == "shared").collect();
+    assert_eq!(shared.len(), 1, "{snapshot}");
+    assert_eq!(shared[0]["used"]["share"], 0.97, "{snapshot}");
+    assert!(
+        shared[0]["used"]["window"]
+            .as_str()
+            .unwrap()
+            .starts_with("weekly window"),
+        "{snapshot}"
+    );
+}
+
+/// A route whose harness reports nothing is measured by the runs it counts
+/// against the budget the captain set for its window. No default: a route that
+/// states no budget is never refused on a share nobody knows.
+#[test]
+fn a_run_budget_refuses_new_crew_once_the_window_is_mostly_spent() {
+    let f = Fleet::new();
+    let mut budget = codex("model-budget", "plan");
+    budget["allowance"] = json!({"window_hours": 5, "runs": 3});
+    budget["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"budget": budget, "other": codex("model-other", "plan")},
+        "crew": ["budget", "other"]
+    }));
+    f.tick();
+    let ledger = || rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let runs = || {
+        ledger()
+            .query_row(
+                "SELECT runs FROM route_usage WHERE route='codex/-/model-budget'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+    };
+    // Two of three runs: inside the four fifths a route keeps, so the third
+    // still starts there and takes the route.
+    f.run_and_scan("crew-one", Some("budget"));
+    f.run_and_scan("crew-two", Some("budget"));
+    assert_eq!(runs(), 2);
+    assert_eq!(
+        f.model(&f.run_and_scan("crew-three", Some("budget"))),
+        "model-budget"
+    );
+    assert_eq!(runs(), 3);
+    // The window is spent: the next crew without a route takes the next one.
+    let next = f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert_eq!(f.model(&next), "model-other");
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"budget"}),
+    );
+    assert!(refusal.contains("run budget (3 of 3 runs)"), "{refusal}");
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    assert!(
+        bearings["text"].as_str().unwrap().contains("3 of 3 runs"),
+        "{bearings}"
+    );
+    // A new window counts from nothing: the count is not carried over.
+    ledger()
+        .execute(
+            "UPDATE route_usage SET runs_window_ends_ms=1 WHERE route='codex/-/model-budget'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        f.model(&f.run_and_scan("crew-four", Some("budget"))),
+        "model-budget"
+    );
+    assert_eq!(runs(), 1);
+}
+
+#[test]
+fn headroom_settings_and_run_budgets_are_bounded_and_agree_across_one_identity() {
+    let f = Fleet::new();
+    let file = f.root.join("bad-routes.json");
+    let refuse = |routes: Value, wanted: &str| {
+        fs::write(&file, routes.to_string()).unwrap();
+        let o = f.run(None, &["routes", "set", file.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            !o.status.success() && stderr.contains(wanted),
+            "{routes}: {stderr}"
+        );
+    };
+    let mut budget = codex("model-a", "plan");
+    budget["allowance"] = json!({"window_hours": 5, "runs": 3});
+    budget["tier"] = json!(1);
+    for (setting, value, wanted) in [
+        (
+            "crew_headroom_pct",
+            json!(0),
+            "must be a whole percent from 1 to 100",
+        ),
+        (
+            "first_mate_headroom_pct",
+            json!(101),
+            "must be a whole percent from 1 to 100",
+        ),
+        (
+            "first_mate_headroom_pct",
+            json!(95.5),
+            "must be a whole percent from 1 to 100",
+        ),
+    ] {
+        let mut route = codex("model-a", "plan");
+        route[setting] = value;
+        refuse(json!({"routes": {"a": route}}), wanted);
+    }
+    let mut none = budget.clone();
+    none["allowance"] = json!({"window_hours": 5, "runs": 0});
+    refuse(
+        json!({"routes": {"a": none}}),
+        "runs must be a whole number",
+    );
+    let mut other = budget.clone();
+    other["manifest"] = budget["manifest"].clone();
+    other["allowance"] = json!({"window_hours": 5, "runs": 4});
+    other["note"] = json!("same model, another budget");
+    refuse(
+        json!({"routes": {"a": budget, "b": other}}),
+        "with different allowance shapes",
+    );
 }
 
 /// A Claude crew's replay keeps the route its launch recorded, whose argv has

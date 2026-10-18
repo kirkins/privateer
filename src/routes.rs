@@ -62,7 +62,16 @@
 //! `seven_day` limit or a stated reset longer than the window. A later throttle
 //! never shortens a route's hold, so an outage from a run in flight cannot
 //! hand back a route that was capped for hours.
-use crate::crew_routes::{Allowance, Shape};
+//!
+//! Nothing acts before a limit, which is where this file also keeps the
+//! headroom. The ledger holds the latest usage per account: Claude's own
+//! reading of its windows, and the runs counted against the run budget the
+//! captain set on a route that reports nothing comparable. `spent` turns
+//! either into the share of the plan used, and `refusal_for` refuses new crew
+//! and errands once it passes the share this route keeps for them, and a first
+//! mate once it passes the higher share it keeps for itself. Running work is
+//! never stopped: what is already in flight is what spends the plan.
+use crate::crew_routes::{Allowance, Limits, Shape};
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -100,6 +109,22 @@ pub fn init(conn: &Connection) -> Result<()> {
            window_ends_ms INTEGER, window_utilization REAL, weekly_ends_ms INTEGER,
            weekly_utilization REAL, capped_until_ms INTEGER, updated_ms INTEGER NOT NULL);",
     )?;
+    // The run count, added after the ledger shipped. Checked and added under
+    // the write lock so concurrent homes cannot both add one.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for column in ["runs", "runs_window_ends_ms"] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_usage') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(&format!(
+                "ALTER TABLE route_usage ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -115,11 +140,16 @@ pub(crate) struct Usage {
     pub weekly_ends_ms: Option<i64>,
     pub weekly_utilization: Option<f64>,
     pub capped_until_ms: Option<i64>,
+    /// Runs counted against the budget for the window now open.
+    pub runs: i64,
+    /// When the window those runs were counted in closes.
+    pub runs_window_ends_ms: Option<i64>,
     pub updated_ms: i64,
 }
 
 const USAGE_COLUMNS: &str = "route, last_succeeded_ms, last_throttled_ms, last_throttle, strikes,
-    window_ends_ms, window_utilization, weekly_ends_ms, weekly_utilization, capped_until_ms, updated_ms";
+    window_ends_ms, window_utilization, weekly_ends_ms, weekly_utilization, capped_until_ms,
+    runs, runs_window_ends_ms, updated_ms";
 
 fn usage_row(r: &rusqlite::Row) -> rusqlite::Result<(String, Usage)> {
     Ok((
@@ -134,7 +164,9 @@ fn usage_row(r: &rusqlite::Row) -> rusqlite::Result<(String, Usage)> {
             weekly_ends_ms: r.get(7)?,
             weekly_utilization: r.get(8)?,
             capped_until_ms: r.get(9)?,
-            updated_ms: r.get(10)?,
+            runs: r.get(10)?,
+            runs_window_ends_ms: r.get(11)?,
+            updated_ms: r.get(12)?,
         },
     ))
 }
@@ -722,13 +754,164 @@ pub(crate) fn held(conn: &Connection, now: i64) -> Result<Vec<(String, i64, Stri
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// A refusal message for a backed-off or capped route, or None when it is clear.
-pub fn refusal(store: &Store, route: &str) -> Result<Option<String>> {
-    let conn = crate::jobs::host_ledger(store)?;
-    let Some((until, error)) = blocked(&conn, route)? else {
+/// Who a launch is. New crew and errands keep a share of a plan for the
+/// first mates that share it; a first mate keeps a larger one for itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    Crew,
+    FirstMate,
+}
+
+impl Who {
+    fn as_str(self) -> &'static str {
+        match self {
+            Who::Crew => "crew",
+            Who::FirstMate => "first_mate",
+        }
+    }
+}
+
+/// What a route's plan has left: the share of the window furthest spent, and
+/// which window that was, named for a refusal or a bearings line.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Spent {
+    pub share: f64,
+    pub what: String,
+}
+
+/// A window's name, and when it reopens when that is known and still ahead.
+fn window(name: &str, ends_ms: Option<i64>, now: i64) -> String {
+    match ends_ms.filter(|ends| *ends > now) {
+        Some(ends) => format!("{name}, clears {}", utc_time(ends)),
+        None => name.to_owned(),
+    }
+}
+
+/// The share of a route's plan spent, from the latest reading: the furthest
+/// spent of the windows Claude reported and of the runs counted against the
+/// captain's budget for the window now open. Nothing is reported for a route
+/// with neither, so an unshaped route that reports no usage is never refused on
+/// a share nobody knows.
+pub(crate) fn spent(usage: &Usage, budget: Option<u64>, now: i64) -> Option<Spent> {
+    let mut worst: Option<Spent> = None;
+    let mut consider = |share: f64, what: String| {
+        let share = share.clamp(0.0, 1.0);
+        if worst.as_ref().is_none_or(|worst| share > worst.share) {
+            worst = Some(Spent { share, what });
+        }
+    };
+    for (name, share, ends_ms) in [
+        (
+            "five-hour window",
+            usage.window_utilization,
+            usage.window_ends_ms,
+        ),
+        (
+            "weekly window",
+            usage.weekly_utilization,
+            usage.weekly_ends_ms,
+        ),
+    ] {
+        if let Some(share) = share {
+            consider(share, window(name, ends_ms, now));
+        }
+    }
+    // A run budget counts only while its window is open: a closed one lost its
+    // allowance at the plan's own rate, so nothing is owed against it.
+    if let Some(budget) = budget.filter(|budget| *budget > 0)
+        && let Some(ends) = usage.runs_window_ends_ms.filter(|ends| *ends > now)
+    {
+        let runs = usage.runs.max(0);
+        consider(
+            f64::from(u32::try_from(runs).unwrap_or(u32::MAX)) / budget as f64,
+            window(
+                &format!("run budget ({runs} of {budget} runs)"),
+                Some(ends),
+                now,
+            ),
+        );
+    }
+    worst
+}
+
+/// The share at which this kind of launch is refused a route.
+fn threshold(limits: &Limits, who: Who) -> f64 {
+    match who {
+        Who::Crew => limits.crew,
+        Who::FirstMate => limits.first_mate,
+    }
+}
+
+/// A refusal message for a route whose plan is past the share this launch
+/// keeps, or None when it is inside it. Running work is not named: a plan is
+/// spent by the runs already in flight, and stopping them wastes them.
+fn tight(
+    conn: &Connection,
+    route: &str,
+    who: Who,
+    limits: &Limits,
+    now: i64,
+) -> Result<Option<String>> {
+    let Some(spent) = spent(&usage_of(conn, route)?, limits.runs, now) else {
         return Ok(None);
     };
+    let limit = threshold(limits, who);
+    if spent.share < limit {
+        return Ok(None);
+    }
+    let move_on = match who {
+        Who::Crew => "new crew and errands on it take the next route in their list",
+        Who::FirstMate => {
+            "a first mate on it takes the next route in its first_mate list, in a fresh session"
+        }
+    };
+    Ok(Some(format!(
+        "model route {route} is at {:.0}% of its {} and this route keeps {:.0}% for {}; \
+         {move_on}. Record the wait (note.pin key waiting) and continue once it clears",
+        spent.share * 100.0,
+        spent.what,
+        limit * 100.0,
+        who.as_str().replace('_', " ")
+    )))
+}
+
+/// Whether a route cannot take a launch of this kind now: it is held off, or
+/// its plan is past the share this kind of launch keeps. The ledger only, so a
+/// caller already holding one asks without opening another.
+pub(crate) fn held_off(
+    conn: &Connection,
+    route: &str,
+    who: Who,
+    limits: &Limits,
+    now: i64,
+) -> Result<bool> {
+    Ok(blocked_at(conn, route, now)?.is_some() || tight(conn, route, who, limits, now)?.is_some())
+}
+
+/// A refusal message for a backed-off or capped route, or one whose plan is
+/// past the share new crew and errands keep, or None when it is clear.
+pub fn refusal(store: &Store, route: &str) -> Result<Option<String>> {
+    refusal_for(
+        store,
+        route,
+        Who::Crew,
+        crate::crew_routes::limits_of(store, route)?,
+    )
+}
+
+/// `refusal` for a launch of another kind, with the route's own limits the
+/// caller already holds rather than reading the routes file again.
+pub(crate) fn refusal_for(
+    store: &Store,
+    route: &str,
+    who: Who,
+    limits: Limits,
+) -> Result<Option<String>> {
+    let conn = crate::jobs::host_ledger(store)?;
     let now = Store::now_ms();
+    let Some((until, error)) = blocked_at(&conn, route, now)? else {
+        return tight(&conn, route, who, &limits, now);
+    };
     let wait = "new crew and errands on it wait. Record the wait (note.pin key waiting) and \
                 continue once it clears";
     Ok(Some(match capped_until(&conn, route, now)? {
@@ -776,12 +959,24 @@ pub(crate) fn utc_time(ms: i64) -> String {
     )
 }
 
-/// A finished job on a route with a declared allowance shape.
-struct Shaped<'a> {
-    allowance: &'a Allowance,
+/// A finished job's contribution to a route's usage row: the allowance the
+/// route declares, when it declares one, and the plan windows the harness
+/// reported on the run. A route that declares no allowance and reports no
+/// windows is not measured, and keeps no row.
+struct Measured<'a> {
+    allowance: Option<&'a Allowance>,
     created_ms: i64,
     finished_ms: i64,
     windows: Option<ClaudeWindows>,
+}
+
+/// When the window a run was counted in closes: the shape's own reopen, so the
+/// count and the backoff agree on when the allowance renews.
+fn window_ends(shape: Shape, created_ms: i64) -> i64 {
+    match shape {
+        Shape::Daily(minute) => crate::crew_routes::next_daily(minute, created_ms),
+        Shape::Rolling { window_ms, .. } => created_ms + window_ms,
+    }
 }
 
 #[cfg(test)]
@@ -795,20 +990,26 @@ fn record_job(
     conn: &Connection,
     route: &str,
     failure: Option<RouteFailure>,
-    shaped: Option<Shaped>,
+    measured: Option<Measured>,
 ) -> Result<()> {
     let now = Store::now_ms();
     // Immediate: the usage read and the write below must not interleave with
     // another home's write to the shared ledger, or the scan fails as busy.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let mut usage = match &shaped {
+    let mut usage = match &measured {
         Some(_) => usage_of(&tx, route)?,
         None => Usage::default(),
     };
-    let (failure, strike) = match (failure, &shaped) {
-        (Some(failure), Some(shaped)) => {
-            let (failure, strike) =
-                allowance_spent(failure, shaped.allowance, &usage, shaped.created_ms, now);
+    let (failure, strike) = match (failure, &measured) {
+        (
+            Some(failure),
+            Some(Measured {
+                allowance: Some(allowance),
+                created_ms,
+                ..
+            }),
+        ) => {
+            let (failure, strike) = allowance_spent(failure, allowance, &usage, *created_ms, now);
             (Some(failure), strike)
         }
         (failure, _) => (failure, false),
@@ -867,22 +1068,47 @@ fn record_job(
             )?;
         }
     }
-    if let Some(shaped) = shaped {
-        let at = shaped.finished_ms;
+    // A route is measured when it declares an allowance or reported its plan
+    // windows; nothing else about a run is worth a row.
+    if let Some(Measured {
+        allowance,
+        created_ms,
+        finished_ms,
+        windows,
+    }) = measured
+        && (allowance.is_some() || windows.is_some())
+    {
+        let at = finished_ms;
         let later = |old: Option<i64>| Some(old.map_or(at, |old| old.max(at)));
+        // A run that reached the provider is counted against the budget: every
+        // success, and every refusal the log reads as a limit or an outage. A
+        // run that failed before the model answered spends nothing, so it does
+        // not. The count opens its window at the run's own start, so it ends
+        // with the shape's reopen whether or not the run succeeded.
+        if let Some(budget) = allowance.and_then(|allowance| allowance.runs)
+            && budget > 0
+        {
+            let shape = allowance.map(|allowance| allowance.shape).unwrap();
+            if usage
+                .runs_window_ends_ms
+                .is_none_or(|ends| created_ms >= ends)
+            {
+                usage.runs = 0;
+                usage.runs_window_ends_ms = Some(window_ends(shape, created_ms));
+            }
+            usage.runs += 1;
+        }
         match &failure {
             None => {
                 usage.last_succeeded_ms = later(usage.last_succeeded_ms);
                 usage.strikes = 0;
                 usage.capped_until_ms = None;
-                if let Shape::Rolling { window_ms, .. } = shaped.allowance.shape
-                    && usage
-                        .window_ends_ms
-                        .is_none_or(|end| shaped.created_ms >= end)
+                if let Some(Shape::Rolling { window_ms, .. }) = allowance.map(|a| a.shape)
+                    && usage.window_ends_ms.is_none_or(|end| created_ms >= end)
                 {
-                    usage.window_ends_ms = Some(shaped.created_ms + window_ms);
+                    usage.window_ends_ms = Some(created_ms + window_ms);
                 }
-                if let Some(windows) = shaped.windows {
+                if let Some(windows) = windows {
                     usage.window_ends_ms = windows.window_ends_ms.or(usage.window_ends_ms);
                     usage.window_utilization = windows.window_utilization;
                     usage.weekly_ends_ms = windows.weekly_ends_ms;
@@ -902,7 +1128,7 @@ fn record_job(
         tx.execute(
             &format!(
                 "INSERT OR REPLACE INTO route_usage({USAGE_COLUMNS})
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             ),
             params![
                 route,
@@ -915,6 +1141,8 @@ fn record_job(
                 usage.weekly_ends_ms,
                 usage.weekly_utilization,
                 usage.capped_until_ms,
+                usage.runs,
+                usage.runs_window_ends_ms,
                 usage.updated_ms
             ],
         )?;
@@ -990,17 +1218,21 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
                 None => continue,
             }
         };
-        let shaped = allowance.map(|allowance| Shaped {
+        // Claude states its usage on every run, so its windows are read for
+        // every Claude route, shaped or not: the headroom a shared plan keeps
+        // is the one reading the ledger has.
+        let windows = (throttled.is_none() && route.starts_with("claude/"))
+            .then(|| claude_windows(&log_tail(&log)))
+            .flatten();
+        let measured = (allowance.is_some() || windows.is_some()).then(|| Measured {
             allowance,
             created_ms: job["created_ms"].as_i64().unwrap_or(finished_ms),
             finished_ms,
-            windows: (throttled.is_none() && route.starts_with("claude/"))
-                .then(|| claude_windows(&log_tail(&log)))
-                .flatten(),
+            windows,
         });
         let throttled_now = throttled.is_some();
         if let Some(conn) = &conn {
-            record_job(conn, &route, throttled, shaped)?;
+            record_job(conn, &route, throttled, measured)?;
         }
         seen.push(json!({"route": route, "throttled": throttled_now}));
     }
@@ -1533,6 +1765,7 @@ mod allowance_tests {
                 weekly: Some(0),
             },
             free: false,
+            runs: None,
         }
     }
 
@@ -1544,13 +1777,13 @@ mod allowance_tests {
         created_ms: i64,
         finished_ms: i64,
     ) {
-        let shaped = Shaped {
-            allowance,
+        let measured = Measured {
+            allowance: Some(allowance),
             created_ms,
             finished_ms,
             windows: None,
         };
-        record_job(conn, route, error.map(failure), Some(shaped)).unwrap();
+        record_job(conn, route, error.map(failure), Some(measured)).unwrap();
     }
 
     fn held(conn: &Connection, route: &str) -> i64 {
@@ -1740,6 +1973,7 @@ mod allowance_tests {
         let daily = Allowance {
             shape: Shape::Daily(minute),
             free: false,
+            runs: None,
         };
         job(
             &conn,
@@ -1780,16 +2014,155 @@ mod allowance_tests {
         assert!(claude_windows("{\"type\":\"result\"}").is_none());
         let conn = ledger();
         let now = Store::now_ms();
-        let shaped = Shaped {
-            allowance: &rolling(),
+        let measured = Measured {
+            allowance: Some(&rolling()),
             created_ms: now,
             finished_ms: now,
             windows: Some(windows),
         };
-        record_job(&conn, "claude/-/opus", None, Some(shaped)).unwrap();
+        record_job(&conn, "claude/-/opus", None, Some(measured)).unwrap();
         let usage = usage_of(&conn, "claude/-/opus").unwrap();
         assert_eq!(usage.window_ends_ms, Some(1_792_214_400_000));
         assert_eq!(usage.weekly_utilization, Some(0.03));
+    }
+
+    /// The share spent is the furthest spent of the windows reported and of
+    /// the runs counted, whichever reading exists, and a closed window or an
+    /// unstated budget counts for nothing.
+    #[test]
+    fn the_spent_share_is_the_furthest_window_and_names_it() {
+        let now = Store::now_ms();
+        let reading = Usage {
+            window_utilization: Some(0.4),
+            window_ends_ms: Some(now + HOUR),
+            weekly_utilization: Some(0.83),
+            weekly_ends_ms: Some(now + 7 * HOUR),
+            runs: 3,
+            runs_window_ends_ms: Some(now + HOUR),
+            ..Usage::default()
+        };
+        let share = spent(&reading, Some(10), now).unwrap();
+        assert_eq!(share.share, 0.83);
+        assert!(
+            share.what.starts_with("weekly window, clears "),
+            "{share:?}"
+        );
+        // The run budget is measured only while its window is open, and only
+        // when the captain states one.
+        let budgeted = Usage {
+            runs: 8,
+            runs_window_ends_ms: Some(now + HOUR),
+            ..Usage::default()
+        };
+        assert_eq!(spent(&budgeted, Some(10), now).unwrap().share, 0.8);
+        assert!(spent(&budgeted, None, now).is_none());
+        assert!(spent(&budgeted, Some(10), now + 2 * HOUR).is_none());
+        // Nothing reported at all is never refused on a share nobody knows.
+        assert!(spent(&Usage::default(), Some(10), now).is_none());
+    }
+
+    /// A run that reached the provider counts against the budget, whether it
+    /// succeeded or was refused, and the count opens its window with the run.
+    #[test]
+    fn runs_count_against_the_budget_and_the_count_resets_with_the_window() {
+        let conn = ledger();
+        let now = Store::now_ms();
+        let route = "opencode/deepseek/v4";
+        let budget = Allowance {
+            runs: Some(4),
+            ..rolling()
+        };
+        let counted = |at: i64| {
+            record_job(
+                &conn,
+                route,
+                None,
+                Some(Measured {
+                    allowance: Some(&budget),
+                    created_ms: at,
+                    finished_ms: at + 1,
+                    windows: None,
+                }),
+            )
+            .unwrap();
+            usage_of(&conn, route).unwrap()
+        };
+        counted(now - HOUR);
+        counted(now - HOUR + 1000);
+        assert_eq!(counted(now - HOUR + 2000).runs, 3);
+        // A window that has closed starts the count again.
+        assert_eq!(counted(now + 6 * HOUR).runs, 1);
+        // A run the provider refused spends the budget too.
+        record_job(
+            &conn,
+            route,
+            Some(failure("429 rate limit exceeded")),
+            Some(Measured {
+                allowance: Some(&budget),
+                created_ms: now + 6 * HOUR + 1000,
+                finished_ms: now + 6 * HOUR + 1100,
+                windows: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(usage_of(&conn, route).unwrap().runs, 2);
+        // A route with no budget is never measured this way.
+        record_job(
+            &conn,
+            "opencode/deepseek/other",
+            None,
+            Some(Measured {
+                allowance: Some(&rolling()),
+                created_ms: now,
+                finished_ms: now,
+                windows: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(usage_of(&conn, "opencode/deepseek/other").unwrap().runs, 0);
+    }
+
+    /// Claude reports its windows on every run, so they are recorded for a
+    /// route that declares no allowance: the headroom a shared plan keeps is
+    /// the one reading the ledger has.
+    #[test]
+    fn a_claude_windows_reading_is_kept_for_a_route_with_no_declared_allowance() {
+        let conn = ledger();
+        let now = Store::now_ms();
+        record_job(
+            &conn,
+            "claude/-/sonnet",
+            None,
+            Some(Measured {
+                allowance: None,
+                created_ms: now,
+                finished_ms: now,
+                windows: Some(ClaudeWindows {
+                    window_ends_ms: Some(now + HOUR),
+                    window_utilization: Some(0.97),
+                    weekly_ends_ms: Some(now + 7 * HOUR),
+                    weekly_utilization: Some(0.5),
+                }),
+            }),
+        )
+        .unwrap();
+        let read = usage_of(&conn, "claude/-/sonnet").unwrap();
+        assert_eq!(read.window_utilization, Some(0.97));
+        assert_eq!(read.runs, 0);
+        // A run that reported nothing and declares nothing keeps no row.
+        record_job(
+            &conn,
+            "opencode/deepseek/v4",
+            None,
+            Some(Measured {
+                allowance: None,
+                created_ms: now,
+                finished_ms: now,
+                windows: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(usage(&conn).unwrap().len(), 1);
     }
 
     #[test]

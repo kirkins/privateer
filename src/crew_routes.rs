@@ -10,6 +10,16 @@
 //! preference. Crew and errand launches try use-it-or-lose-it allowances first,
 //! nearest their refresh, then idle rolling windows, then carry-over routes in
 //! the captain's order. An explicit route is never re-ranked.
+//!
+//! A route may also declare how much of its plan to keep in reserve. Only
+//! Claude reports what it has spent, so a route on any other plan is measured
+//! by the runs Privateer counts for it: `allowance.runs` is the number of runs
+//! the window holds, with no default, because no runtime can guess one.
+//! `crew_headroom_pct` and `first_mate_headroom_pct` (both whole percents, 80
+//! and 95 by default) are the shares at which the route stops taking new
+//! crew and errands, and at which a first mate moves to its fallback. Running
+//! work is never stopped: it is what spends the reserve.
+use crate::routes::Who;
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
@@ -24,6 +34,63 @@ pub(crate) const KINDS: [&str; 3] = ["crew", "errand", "first_mate"];
 const COSTS: [&str; 3] = ["free", "plan", "credits"];
 /// The words a route's `uses` may name: what a route is strong enough to do.
 pub(crate) const USES: [&str; 4] = ["implement", "review", "diagnose", "design"];
+/// The share of a plan new crew and errands stop taking by default.
+pub(crate) const CREW_HEADROOM_PCT: f64 = 80.0;
+/// The larger share a first mate keeps for itself by default.
+pub(crate) const FIRST_MATE_HEADROOM_PCT: f64 = 95.0;
+/// The largest run budget a window may hold: far past any plan, so a
+/// mistyped figure refuses rather than refusing nothing.
+const MAX_RUNS: u64 = 10_000;
+
+/// What a route keeps in reserve: the share of its plan at which new crew and
+/// errands are refused, the share at which a first mate moves to its fallback,
+/// and the runs its window holds when the harness reports no usage of its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Limits {
+    pub crew: f64,
+    pub first_mate: f64,
+    pub runs: Option<u64>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            crew: CREW_HEADROOM_PCT / 100.0,
+            first_mate: FIRST_MATE_HEADROOM_PCT / 100.0,
+            runs: None,
+        }
+    }
+}
+
+/// The reserve a named route keeps: its own settings, or the defaults for the
+/// shares and no budget at all, since only the captain knows one.
+pub(crate) fn limits(route: &Value) -> Limits {
+    let pct = |name: &str, default: f64| route[name].as_f64().unwrap_or(default) / 100.0;
+    Limits {
+        crew: pct("crew_headroom_pct", CREW_HEADROOM_PCT),
+        first_mate: pct("first_mate_headroom_pct", FIRST_MATE_HEADROOM_PCT),
+        runs: allowance(route).and_then(|allowance| allowance.runs),
+    }
+}
+
+/// The reserve a route identity keeps in the fleet routes file, or the
+/// defaults for a route the captain has not named there, such as a ship's own
+/// first-mate profile.
+pub(crate) fn limits_of(store: &Store, route: &str) -> Result<Limits> {
+    Ok(for_store(store)?
+        .as_ref()
+        .map_or_else(Limits::default, |policy| named_limits(policy, route)))
+}
+
+/// The reserve the first named route of this identity keeps, or the defaults.
+fn named_limits(policy: &Value, route: &str) -> Limits {
+    policy["routes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .find(|(_, named)| identity(named).as_deref() == Some(route))
+        .map_or_else(Limits::default, |(_, named)| limits(named))
+}
 
 fn path() -> Result<PathBuf> {
     let path = crate::fleet::registry_path()?.with_extension("routes.json");
@@ -86,6 +153,8 @@ fn validate(value: &Value) -> Result<()> {
                         | "allowance"
                         | "tier"
                         | "uses"
+                        | "crew_headroom_pct"
+                        | "first_mate_headroom_pct"
                 ),
                 "unknown setting {key} on route {name}"
             );
@@ -124,6 +193,14 @@ fn validate(value: &Value) -> Result<()> {
                 .is_none_or(|t| t.as_u64().is_some_and(|t| (1..=9).contains(&t))),
             "route {name} tier must be a whole number from 1 (strongest) to 9"
         );
+        for key in ["crew_headroom_pct", "first_mate_headroom_pct"] {
+            ensure!(
+                route
+                    .get(key)
+                    .is_none_or(|p| p.as_u64().is_some_and(|p| (1..=100).contains(&p))),
+                "route {name} {key} must be a whole percent from 1 to 100"
+            );
+        }
         if let Some(uses) = route.get("uses") {
             ensure!(
                 route.get("tier").is_some(),
@@ -157,9 +234,12 @@ fn validate(value: &Value) -> Result<()> {
                 "route {name} declares an allowance, so it must state its tier (1-9)"
             );
             let shape = shape(allowance).with_context(|| format!("route {name} allowance"))?;
+            let runs = runs(allowance)
+                .map_err(|error| anyhow::anyhow!("route {name} allowance: {error:#}"))?;
             if let Some(id) = identity(route)
-                && let Some((other, earlier)) = shapes.insert(id.clone(), (name.clone(), shape))
-                && earlier != shape
+                && let Some((other, earlier)) =
+                    shapes.insert(id.clone(), (name.clone(), (shape, runs)))
+                && earlier != (shape, runs)
             {
                 bail!("routes {other} and {name} run {id} with different allowance shapes");
             }
@@ -366,6 +446,9 @@ pub(crate) enum Shape {
 pub(crate) struct Allowance {
     pub shape: Shape,
     pub free: bool,
+    /// The runs the window holds, when the captain states a budget. Only a
+    /// harness that reports nothing about its plan is measured this way.
+    pub runs: Option<u64>,
 }
 
 const DAY_MS: i64 = 86_400_000;
@@ -378,7 +461,10 @@ fn shape(value: &Value) -> Result<Shape> {
     let object = value.as_object().context("must be an object")?;
     for key in object.keys() {
         ensure!(
-            matches!(key.as_str(), "daily_utc" | "window_hours" | "weekly_utc"),
+            matches!(
+                key.as_str(),
+                "daily_utc" | "window_hours" | "weekly_utc" | "runs"
+            ),
             "unknown setting {key}"
         );
     }
@@ -409,6 +495,20 @@ fn shape(value: &Value) -> Result<Shape> {
             })
         }
         _ => bail!("must hold exactly one of daily_utc or window_hours"),
+    }
+}
+
+/// The runs a window holds, when the captain states a budget. It has no
+/// default: no runtime can tell what a plan allows, and a route that reports
+/// its own usage is never measured this way.
+fn runs(value: &Value) -> Result<Option<u64>> {
+    match value.get("runs") {
+        None => Ok(None),
+        Some(runs) => runs
+            .as_u64()
+            .filter(|runs| (1..=MAX_RUNS).contains(runs))
+            .map(Some)
+            .context("runs must be a whole number of runs from 1 to 10000"),
     }
 }
 
@@ -446,9 +546,11 @@ pub(crate) fn allowances(store: &Store) -> Result<std::collections::HashMap<Stri
 }
 
 fn allowance(route: &Value) -> Option<Allowance> {
+    let value = route.get("allowance")?;
     Some(Allowance {
-        shape: shape(route.get("allowance")?).ok()?,
+        shape: shape(value).ok()?,
         free: route["cost"] == "free",
+        runs: runs(value).ok()?,
     })
 }
 
@@ -680,29 +782,72 @@ pub(crate) fn first_mate_fallback(
     task: &str,
     profile: &Value,
 ) -> Result<Option<Choice>> {
+    fallback(store, ship, task, profile, false)
+}
+
+/// The route a retry of a failed wake takes: the first listed route that can
+/// take a first mate now, other than the one just tried. A wake that failed on
+/// a provider limit or an outage moves even when its own route is clear, so
+/// this never returns the route that just failed.
+pub(crate) fn retry_fallback(
+    store: &Store,
+    ship: &str,
+    task: &str,
+    profile: &Value,
+) -> Result<Option<Choice>> {
+    fallback(store, ship, task, profile, true)
+}
+
+/// A first mate's fallback route. Its own route is used while it can take the
+/// wake; once it cannot (held off, or past the share it keeps for first mates)
+/// the first listed route that can is taken instead. With `move_on`, the route
+/// just tried is passed over whatever its state, which is what a retry wants.
+fn fallback(
+    store: &Store,
+    ship: &str,
+    task: &str,
+    profile: &Value,
+    move_on: bool,
+) -> Result<Option<Choice>> {
     let Some(own_route) = identity(&json!({
         "manifest": profile["manifest"],
         "options": profile["options"]
     })) else {
         return Ok(None);
     };
-    let ledger = crate::jobs::host_ledger(store)?;
-    if crate::routes::blocked(&ledger, &own_route)?.is_none()
-        || store.authorize(task, "spawn")?["provider_plugin"]
-            .as_object()
-            .is_some()
+    // A charter-pinned provider adapter is the captain's route for this ship,
+    // and no list may move a first mate off it.
+    if store.authorize(task, "spawn")?["provider_plugin"]
+        .as_object()
+        .is_some()
     {
         return Ok(None);
     }
+    let ledger = crate::jobs::host_ledger(store)?;
+    let now = Store::now_ms();
     let Some(policy) = for_store(store)? else {
         return Ok(None);
     };
-    let names = order(&policy, ship, "first_mate");
-    for name in names {
+    if !move_on
+        && !crate::routes::held_off(
+            &ledger,
+            &own_route,
+            Who::FirstMate,
+            &named_limits(&policy, &own_route),
+            now,
+        )?
+    {
+        return Ok(None);
+    }
+    for name in order(&policy, ship, "first_mate") {
         let route = &policy["routes"][name.as_str()];
-        if let Some(route_id) = identity(route)
-            && crate::routes::blocked(&ledger, &route_id)?.is_none()
-        {
+        let Some(route_id) = identity(route) else {
+            continue;
+        };
+        if route_id == own_route {
+            continue;
+        }
+        if !crate::routes::held_off(&ledger, &route_id, Who::FirstMate, &limits(route), now)? {
             return Ok(Some(Choice {
                 name: name.clone(),
                 manifest: route["manifest"].clone(),
@@ -817,7 +962,7 @@ pub(crate) fn choose(
         let id = identity(route);
         if let Some(refusal) = id
             .as_ref()
-            .map(|id| crate::routes::refusal(store, id))
+            .map(|id| crate::routes::refusal_for(store, id, Who::Crew, limits(route)))
             .transpose()?
             .flatten()
         {
@@ -1023,7 +1168,7 @@ pub(crate) fn resume_route(
     };
     let route = &policy["routes"][name.as_str()];
     Ok(identity(route)
-        .map(|id| crate::routes::refusal(store, &id))
+        .map(|id| crate::routes::refusal_for(store, &id, Who::Crew, limits(route)))
         .transpose()?
         .flatten()
         .is_none())
@@ -1095,6 +1240,8 @@ pub(crate) struct RouteState {
     pub error: Option<String>,
     pub allowance: Option<Allowance>,
     pub usage: Option<crate::routes::Usage>,
+    /// The share of the plan spent, when a reading or a run budget gives one.
+    pub spent: Option<crate::routes::Spent>,
 }
 
 /// Every route the policy names, in name order, then each ledger hold that no
@@ -1133,6 +1280,9 @@ pub(crate) fn states(
         named.extend(id.clone());
         let (until_ms, error) = blocked.unzip();
         states.push(RouteState {
+            spent: used
+                .as_ref()
+                .and_then(|used| crate::routes::spent(used, declared.and_then(|a| a.runs), now)),
             name: Some(name.clone()),
             route: id,
             cost: route["cost"].as_str().map(str::to_owned),
@@ -1152,9 +1302,13 @@ pub(crate) fn states(
             Some(_) => State::Capped,
             None => State::BackingOff,
         };
+        let used = usage.get(&key).cloned();
         states.push(RouteState {
+            spent: used
+                .as_ref()
+                .and_then(|used| crate::routes::spent(used, None, now)),
             name: None,
-            usage: usage.get(&key).cloned(),
+            usage: used,
             route: Some(key),
             cost: None,
             tier: None,
@@ -1213,9 +1367,25 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                         about.push_str(&format!(", {window} {:.0}% used", share * 100.0));
                     }
                 }
+                if let Some((runs, budget)) = allowance.runs.and_then(|budget| {
+                    used.map(|used| (used.runs, budget))
+                        .filter(|(runs, _)| *runs > 0)
+                }) {
+                    about.push_str(&format!(", {runs} of {budget} runs"));
+                }
                 details.push(about);
             } else {
-                details.push(strength(route));
+                let mut about = strength(route);
+                // An unshaped route that reports its own usage still has a
+                // plan to keep in reserve, so its share is shown too.
+                if let Some(spent) = read.and_then(|read| read.spent.as_ref()) {
+                    about.push_str(&format!(
+                        ", {:.0}% of its {} used",
+                        spent.share * 100.0,
+                        spent.what
+                    ));
+                }
+                details.push(about);
             }
             let mut label = format!("{name} ({})", details.join("; "));
             match read.map_or((State::Available, None), |r| (r.state, r.until_ms)) {
@@ -1622,5 +1792,38 @@ mod tests {
             err.to_string()
                 .contains("require must state at least 'use' or 'tier'")
         );
+    }
+
+    #[test]
+    fn a_route_keeps_four_fifths_for_crew_and_nineteen_twentieths_for_a_first_mate() {
+        let plain = route("plain", json!({}));
+        assert_eq!(limits(&plain), Limits::default());
+        let default = Limits::default();
+        assert_eq!(default.crew, 0.8);
+        assert_eq!(default.first_mate, 0.95);
+        assert_eq!(default.runs, None, "no runtime can guess a run budget");
+        let mut own = route(
+            "own",
+            json!({"crew_headroom_pct": 60,
+            "first_mate_headroom_pct": 90,
+            "allowance": {"window_hours": 5, "runs": 12}, "tier": 1}),
+        );
+        assert_eq!(limits(&own).crew, 0.6);
+        assert_eq!(limits(&own).first_mate, 0.9);
+        assert_eq!(limits(&own).runs, Some(12));
+        // A run budget needs no share settings, and shares alone no budget.
+        own["allowance"] = json!({"window_hours": 5});
+        assert_eq!(limits(&own).runs, None);
+        assert_eq!(runs(&json!({"daily_utc": "07:00"})).unwrap(), None);
+        for bad in [
+            json!({"runs": 0}),
+            json!({"runs": -1}),
+            json!({"runs": "20"}),
+        ] {
+            assert!(
+                runs(&json!({"window_hours": 5, "runs": bad["runs"]})).is_err(),
+                "{bad}"
+            );
+        }
     }
 }
