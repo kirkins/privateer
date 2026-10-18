@@ -181,6 +181,18 @@ pub fn set(caller: &Caller, value: &Value) -> Result<Value> {
     Ok(value.clone())
 }
 
+/// Which list a ship's kind takes: its own list when it has one, else the
+/// fleet's. A ship's own list replaces the fleet's rather than adding to it.
+fn source(policy: &Value, ship: &str, kind: &str) -> &'static str {
+    if policy["ships"][ship].get(kind).is_some() {
+        "ship"
+    } else if policy.get(kind).is_some() {
+        "fleet"
+    } else {
+        "none"
+    }
+}
+
 fn order(policy: &Value, ship: &str, kind: &str) -> Vec<String> {
     let list = policy["ships"][ship]
         .get(kind)
@@ -370,6 +382,57 @@ pub(crate) fn check(
     Ok(())
 }
 
+/// A crew or errand replay on a route the captain no longer lists for the
+/// ship (removed, or never listed). Lists that are absent or empty restrict
+/// nothing, as they do for launches.
+pub(crate) fn retry_refusal(store: &Store, ship: &str, route: &str) -> Result<Option<String>> {
+    let Some(policy) = for_store(store)? else {
+        return Ok(None);
+    };
+    let names: Vec<String> = ["crew", "errand"]
+        .into_iter()
+        .flat_map(|kind| order(&policy, ship, kind))
+        .collect();
+    if names.is_empty()
+        || names
+            .iter()
+            .any(|n| identity(&policy["routes"][n.as_str()]).as_deref() == Some(route))
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "route {route} is no longer one of {ship}'s crew or errand routes ({}); \
+         start a fresh crew with agent.start to take the first available route",
+        names.join(", ")
+    )))
+}
+
+/// The routes file with, for each ship that has lists of its own, which list
+/// applies to each kind: the ship's own, or the fleet's.
+fn show(value: Option<Value>) -> Value {
+    let Some(mut value) = value else {
+        return Value::Null;
+    };
+    let ships: Vec<String> = value["ships"]
+        .as_object()
+        .into_iter()
+        .flat_map(|ships| ships.keys().cloned())
+        .collect();
+    let mut applied = Map::new();
+    for ship in ships {
+        let mut lists = Map::new();
+        for kind in KINDS {
+            let which = source(&value, &ship, kind);
+            if which != "none" {
+                lists.insert(kind.to_owned(), json!(which));
+            }
+        }
+        applied.insert(ship, Value::Object(lists));
+    }
+    value["applied"] = Value::Object(applied);
+    value
+}
+
 /// The bearings line: each list in order with the captain's notes, and
 /// routes backing off marked.
 pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
@@ -401,7 +464,11 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
             }
             shown.push(label);
         }
-        parts.push(format!("{kind}: {}", shown.join(", ")));
+        let list = match source(&policy, ship, kind) {
+            "ship" => " (ship's own list)",
+            _ => " (fleet list)",
+        };
+        parts.push(format!("{kind}: {}{list}", shown.join(", ")));
     }
     Ok((!parts.is_empty()).then(|| {
         format!(
@@ -413,8 +480,8 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
 
 pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
     let value = match args {
-        [] => load()?.unwrap_or(Value::Null),
-        [verb] if verb == "show" => load()?.unwrap_or(Value::Null),
+        [] => show(load()?),
+        [verb] if verb == "show" => show(load()?),
         [verb, file] if verb == "set" => {
             let raw = fs::read(file).with_context(|| format!("reading {file}"))?;
             ensure!(raw.len() <= 65_536, "routes file too large");
@@ -430,7 +497,7 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
-        "routes.show" => Ok(load()?.unwrap_or(Value::Null)),
+        "routes.show" => Ok(show(load()?)),
         "routes.set" => {
             let value = set(store.caller(), &args)?;
             store.audit(

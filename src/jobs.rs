@@ -3442,7 +3442,35 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
             );
             store.authorize(&old.task_id, "recovery")?;
+            // A crew's replay keeps the route its launch was given. While that
+            // route is backing off the replay would only fail again, so a fresh
+            // crew, which takes the captain's first available route, is the way on.
+            // The launch's own record names its route; argv is read only for
+            // records written before that field existed.
+            let route = old
+                .model_route
+                .clone()
+                .or_else(|| crate::routes::route_of_argv(&json!(old.command)));
+            if let (true, Some(ship), Some(route)) = (
+                old.action == "spawn" && old.agent_actor.is_some(),
+                old.agent_actor.as_deref(),
+                route.as_deref(),
+            ) {
+                let refusal = crate::routes::refusal(store, route)?
+                    .or(crate::crew_routes::retry_refusal(store, ship, route)?);
+                if let Some(refusal) = refusal {
+                    bail!(
+                        "{refusal}; start a fresh crew with agent.start to take the first available route"
+                    );
+                }
+            }
             let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate, "wait_for_capacity": old.wait_for_capacity, "max_wait_secs": old.max_wait_secs, "codex_read_only_crew": old.codex_read_only_crew});
+            if let Some(route) = &route {
+                next["model_route"] = json!(route);
+            }
+            if old.hosted {
+                next["hosted"] = json!(true);
+            }
             if let Some(id) = args.get("new_id") {
                 next["id"] = id.clone();
             }
