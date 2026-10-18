@@ -48,6 +48,21 @@
 //! day); knowing neither, or throttled just after that time, it probes again
 //! after an hour, then two, doubling to a day, so the allowance is used again
 //! soon after it returns.
+//!
+//! A route the captain gives an `allowance` shape (see `crew_routes`) also
+//! keeps a usage row (`route_usage`): when it last succeeded and was throttled,
+//! its open rolling window, Claude's reported window use, and whether it is
+//! capped. Its times come from the job record, so re-reading a job after a
+//! crash changes nothing. On a shaped route an outage stays on the short
+//! doubling; allowance wording (or any rate limit on a free route) caps it
+//! until the provider's stated reset or, failing that, the shape's own reopen;
+//! and a plain rate limit on a paid route is a strike, counted once per burst,
+//! whose third in a row moves the route to the hourly probes, capped at the
+//! shape's reopen. A weekly reset is used only on evidence: Claude's
+//! `seven_day` limit or a stated reset longer than the window. A later throttle
+//! never shortens a route's hold, so an outage from a run in flight cannot
+//! hand back a route that was capped for hours.
+use crate::crew_routes::{Allowance, Shape};
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -69,13 +84,119 @@ const MAX_TEXT_RESET_MS: i64 = 2 * FREE_ALLOWANCE_BACKOFF_MS;
 /// Claude windows that cover the whole account rather than one model.
 const ACCOUNT_WINDOWS: [&str; 2] = ["five_hour", "seven_day"];
 const CURSOR: &str = "routes_scanned_ms";
+/// A usage row not touched for this long belongs to a route no longer shaped.
+const USAGE_KEPT_MS: i64 = 30 * FREE_ALLOWANCE_BACKOFF_MS;
+/// Plain rate limits in a row, one per burst, that make a paid route a suspected cap.
+const STRIKES: i64 = 3;
+/// Only the end of a Claude log is read for its windows on success.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS model_routes(route TEXT PRIMARY KEY, failures INTEGER NOT NULL,
-           until_ms INTEGER NOT NULL, last_error TEXT, updated_ms INTEGER NOT NULL);",
+           until_ms INTEGER NOT NULL, last_error TEXT, updated_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS route_usage(route TEXT PRIMARY KEY, last_succeeded_ms INTEGER,
+           last_throttled_ms INTEGER, last_throttle TEXT, strikes INTEGER NOT NULL DEFAULT 0,
+           window_ends_ms INTEGER, window_utilization REAL, weekly_ends_ms INTEGER,
+           weekly_utilization REAL, capped_until_ms INTEGER, updated_ms INTEGER NOT NULL);",
     )?;
     Ok(())
+}
+
+/// A shaped route's usage row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Usage {
+    pub last_succeeded_ms: Option<i64>,
+    pub last_throttled_ms: Option<i64>,
+    pub last_throttle: Option<String>,
+    pub strikes: i64,
+    pub window_ends_ms: Option<i64>,
+    pub window_utilization: Option<f64>,
+    pub weekly_ends_ms: Option<i64>,
+    pub weekly_utilization: Option<f64>,
+    pub capped_until_ms: Option<i64>,
+    pub updated_ms: i64,
+}
+
+const USAGE_COLUMNS: &str = "route, last_succeeded_ms, last_throttled_ms, last_throttle, strikes,
+    window_ends_ms, window_utilization, weekly_ends_ms, weekly_utilization, capped_until_ms, updated_ms";
+
+fn usage_row(r: &rusqlite::Row) -> rusqlite::Result<(String, Usage)> {
+    Ok((
+        r.get(0)?,
+        Usage {
+            last_succeeded_ms: r.get(1)?,
+            last_throttled_ms: r.get(2)?,
+            last_throttle: r.get(3)?,
+            strikes: r.get(4)?,
+            window_ends_ms: r.get(5)?,
+            window_utilization: r.get(6)?,
+            weekly_ends_ms: r.get(7)?,
+            weekly_utilization: r.get(8)?,
+            capped_until_ms: r.get(9)?,
+            updated_ms: r.get(10)?,
+        },
+    ))
+}
+
+/// Every shaped route's usage, by route identity.
+pub(crate) fn usage(conn: &Connection) -> Result<std::collections::HashMap<String, Usage>> {
+    let mut statement = conn.prepare(&format!("SELECT {USAGE_COLUMNS} FROM route_usage"))?;
+    let rows = statement.query_map([], usage_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn usage_of(conn: &Connection, route: &str) -> Result<Usage> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {USAGE_COLUMNS} FROM route_usage WHERE route=?1"),
+            [route],
+            usage_row,
+        )
+        .optional()?
+        .map(|(_, usage)| usage)
+        .unwrap_or_default())
+}
+
+/// The windows a Claude run last reported as allowed: the five-hour window's
+/// end and use, and the seven-day window's.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ClaudeWindows {
+    window_ends_ms: Option<i64>,
+    window_utilization: Option<f64>,
+    weekly_ends_ms: Option<i64>,
+    weekly_utilization: Option<f64>,
+}
+
+fn claude_windows(log: &str) -> Option<ClaudeWindows> {
+    let info = crate::reply::events(log)
+        .filter(|event| {
+            event["type"] == "rate_limit_event" && event["rate_limit_info"]["status"] == "allowed"
+        })
+        .last()?;
+    let windows = &info["rate_limit_info"]["unifiedWindows"];
+    let ends = |window: &str| windows[window]["resetsAt"].as_i64().map(|at| at * 1000);
+    let used = |window: &str| windows[window]["utilization"].as_f64();
+    let found = ClaudeWindows {
+        window_ends_ms: ends("five_hour"),
+        window_utilization: used("five_hour"),
+        weekly_ends_ms: ends("seven_day"),
+        weekly_utilization: used("seven_day"),
+    };
+    (found != ClaudeWindows::default()).then_some(found)
+}
+
+/// The last bytes of a log, where a run's final events are.
+fn log_tail(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(length.saturating_sub(LOG_TAIL_BYTES)));
+    let mut raw = Vec::new();
+    let _ = file.take(LOG_TAIL_BYTES).read_to_end(&mut raw);
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 /// `harness/provider/model`, from a launch's manifest and options.
@@ -122,7 +243,7 @@ pub(crate) fn route_of_argv(command: &Value) -> Option<String> {
 }
 
 /// A provider throttle in how the run's last reply ended, if any.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RouteFailure {
     error: String,
     reset_ms: Option<i64>,
@@ -130,6 +251,12 @@ struct RouteFailure {
     allowance: bool,
     /// The limit covers every model on this harness and provider.
     account: bool,
+    /// The longest a spent allowance with no stated reset is probed for: its
+    /// shape's reopen.
+    ceiling_ms: Option<i64>,
+    /// Where on the hourly probe ladder a suspected cap starts, when not at
+    /// the route's failure count.
+    probe_step: Option<i64>,
 }
 
 /// The ledger key that stands for every model on a route's harness and provider.
@@ -150,6 +277,8 @@ fn claude_limit(info: &Value, now: i64) -> RouteFailure {
             .filter(|ms| *ms > 0),
         allowance: true,
         account: ACCOUNT_WINDOWS.contains(&window),
+        ceiling_ms: None,
+        probe_step: None,
     }
 }
 
@@ -404,6 +533,8 @@ fn classify(log: &str) -> Option<RouteFailure> {
         reset_ms: reset_delay_ms(&error, Store::now_ms()).map(|ms| ms.min(MAX_TEXT_RESET_MS)),
         allowance: free_allowance,
         account: false,
+        ceiling_ms: None,
+        probe_step: None,
     })
 }
 
@@ -444,6 +575,107 @@ fn free_allowance(mut failure: RouteFailure, resets_utc: Option<u32>, now: i64) 
     failure
 }
 
+/// How a throttle on a shaped route counts.
+#[derive(Debug, PartialEq, Eq)]
+enum Throttle {
+    /// The provider is down or overloaded: the short doubling, never a cap.
+    Outage,
+    /// A rate limit with no word of an allowance.
+    Plain,
+    /// The allowance is spent.
+    Spent,
+}
+
+fn throttle_kind(failure: &RouteFailure) -> Throttle {
+    let lower = failure.error.to_ascii_lowercase();
+    if failure.allowance
+        || [
+            "quota",
+            "usage limit",
+            "allowance",
+            "exhausted",
+            "hit your limit",
+            "limit reached",
+        ]
+        .iter()
+        .any(|sign| lower.contains(sign))
+    {
+        Throttle::Spent
+    } else if lower.starts_with("429") || lower.contains("rate limit") || lower.contains("rate_limit")
+    {
+        Throttle::Plain
+    } else {
+        Throttle::Outage
+    }
+}
+
+/// A throttle on a route with a declared allowance shape, judged against its
+/// usage: whether it caps the route and until when, and whether it is a new
+/// strike. A strike is a plain rate limit on a paid route from a job launched
+/// after the route's last throttle, so one burst of concurrent runs counts
+/// once.
+fn allowance_spent(
+    mut failure: RouteFailure,
+    allowance: &Allowance,
+    usage: &Usage,
+    created_ms: i64,
+    now: i64,
+) -> (RouteFailure, bool) {
+    const JUST_AFTER_MS: i64 = 15 * 60_000;
+    let kind = throttle_kind(&failure);
+    // When the shape reopens, if it can tell.
+    let reopen = match allowance.shape {
+        Shape::Daily(minute) => {
+            let next = crate::crew_routes::next_daily(minute, now);
+            // Throttled just after the declared reset: the time is off.
+            (next - now < FREE_ALLOWANCE_BACKOFF_MS - JUST_AFTER_MS).then_some(next - now)
+        }
+        Shape::Rolling { .. } => usage
+            .window_ends_ms
+            .filter(|end| *end > now)
+            .map(|end| end - now),
+    };
+    let ceiling = match allowance.shape {
+        Shape::Daily(_) => reopen,
+        Shape::Rolling { window_ms, .. } => Some(reopen.unwrap_or(window_ms)),
+    };
+    match kind {
+        Throttle::Outage => return (failure, false),
+        Throttle::Plain if !allowance.free => {
+            let strike = usage.last_throttled_ms.is_none_or(|at| created_ms > at);
+            let strikes = usage.strikes + i64::from(strike);
+            if strikes >= STRIKES && failure.reset_ms.is_none() {
+                failure.allowance = true;
+                failure.probe_step = Some(strikes - STRIKES);
+                failure.ceiling_ms = ceiling;
+            }
+            return (failure, strike);
+        }
+        Throttle::Plain | Throttle::Spent => {}
+    }
+    failure.allowance = true;
+    let weekly = match allowance.shape {
+        Shape::Rolling {
+            window_ms,
+            weekly: Some(minute),
+        } if failure.error.contains("seven_day")
+            || failure.reset_ms.is_some_and(|reset| reset > window_ms) =>
+        {
+            Some(crate::crew_routes::next_weekly(minute, now) - now)
+        }
+        _ => None,
+    };
+    if let Some(weekly) = weekly {
+        // The captain declared the weekly reset, so it is trusted past the
+        // two days a reset read from text may hold a route.
+        failure.reset_ms = Some(weekly.max(failure.reset_ms.unwrap_or(0)));
+    } else if failure.reset_ms.is_none() {
+        failure.reset_ms = reopen;
+        failure.ceiling_ms = ceiling;
+    }
+    (failure, false)
+}
+
 /// A provider throttle in how the run's last reply ended, if any.
 pub fn throttle(log: &str) -> Option<String> {
     classify(log).map(|failure| failure.error)
@@ -461,34 +693,109 @@ pub fn blocked(conn: &Connection, route: &str) -> Result<Option<(i64, String)>> 
         .optional()?)
 }
 
-/// A refusal message for a backed-off route, or None when it is clear.
+/// A refusal message for a backed-off or capped route, or None when it is clear.
 pub fn refusal(store: &Store, route: &str) -> Result<Option<String>> {
     let conn = crate::jobs::host_ledger(store)?;
-    Ok(blocked(&conn, route)?.map(|(until, error)| {
-        let secs = ((until - Store::now_ms()) / 1000).max(1);
-        format!(
-            "model route {route} is backing off for {secs}s after the provider throttled ({error}); \
-             new crew and errands on it wait. Record the wait (note.pin key waiting) and continue \
-             once it clears"
-        )
+    let Some((until, error)) = blocked(&conn, route)? else {
+        return Ok(None);
+    };
+    let now = Store::now_ms();
+    let wait = "new crew and errands on it wait. Record the wait (note.pin key waiting) and \
+                continue once it clears";
+    Ok(Some(match capped_until(&conn, route, now)? {
+        Some(_) => format!(
+            "model route {route} is capped until {} (allowance spent: {error}); {wait}",
+            utc_time(until)
+        ),
+        None => format!(
+            "model route {route} is backing off for {}s after the provider throttled ({error}); {wait}",
+            ((until - now) / 1000).max(1)
+        ),
     }))
 }
 
+/// When a shaped route's spent allowance reopens, while it has not.
+fn capped_until(conn: &Connection, route: &str, now: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT capped_until_ms FROM route_usage WHERE route=?1 AND capped_until_ms > ?2",
+            params![route, now],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// `YYYY-MM-DD HH:MM UTC`.
+pub(crate) fn utc_time(ms: i64) -> String {
+    let minutes = ms.div_euclid(60_000);
+    let days = minutes.div_euclid(1440);
+    // Civil date from days since the epoch (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let minute = minutes.rem_euclid(1440);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        minute / 60,
+        minute % 60
+    )
+}
+
+/// A finished job on a route with a declared allowance shape.
+struct Shaped<'a> {
+    allowance: &'a Allowance,
+    created_ms: i64,
+    finished_ms: i64,
+    windows: Option<ClaudeWindows>,
+}
+
+#[cfg(test)]
 fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Result<()> {
+    record_job(conn, route, failure.cloned(), None)
+}
+
+/// Back a route off or clear it, and for a shaped route update its usage, in
+/// one transaction. A hold is never shortened: the later `until_ms` stays.
+fn record_job(
+    conn: &Connection,
+    route: &str,
+    failure: Option<RouteFailure>,
+    shaped: Option<Shaped>,
+) -> Result<()> {
     let now = Store::now_ms();
-    match failure {
+    let tx = conn.unchecked_transaction()?;
+    let mut usage = match &shaped {
+        Some(_) => usage_of(&tx, route)?,
+        None => Usage::default(),
+    };
+    let (failure, strike) = match (failure, &shaped) {
+        (Some(failure), Some(shaped)) => {
+            let (failure, strike) =
+                allowance_spent(failure, shaped.allowance, &usage, shaped.created_ms, now);
+            (Some(failure), strike)
+        }
+        (failure, _) => (failure, false),
+    };
+    let mut held_until = None;
+    match &failure {
         Some(failure) => {
             let account = failure.account.then(|| account_key(route)).flatten();
-            let route = account.as_deref().unwrap_or(route);
-            let failures: i64 = conn
+            let key = account.as_deref().unwrap_or(route);
+            let (previous, held): (i64, i64) = tx
                 .query_row(
-                    "SELECT failures FROM model_routes WHERE route=?1",
-                    [route],
-                    |r| r.get(0),
+                    "SELECT failures, until_ms FROM model_routes WHERE route=?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?
-                .unwrap_or(0)
-                + 1;
+                .unwrap_or((0, 0));
+            let failures = previous + 1;
             let short = FIRST_BACKOFF_MS
                 .saturating_mul(1i64 << (failures - 1).min(10))
                 .min(MAX_BACKOFF_MS);
@@ -496,33 +803,92 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
             // it holds the route until then however plain the throttle looks;
             // the doubling only ever raises that floor, never lowers it. With no
             // stated reset a spent allowance is probed hourly, doubling to a
-            // day, and an ordinary throttle keeps doubling on the short window.
+            // day (and no later than its shape reopens), and an ordinary
+            // throttle keeps doubling on the short window.
             let probe = ALLOWANCE_PROBE_MS
-                .saturating_mul(1i64 << (failures - 1).min(10))
+                .saturating_mul(1i64 << failure.probe_step.unwrap_or(failures - 1).min(10))
                 .min(FREE_ALLOWANCE_BACKOFF_MS);
+            let probe = failure
+                .ceiling_ms
+                .map_or(probe, |ceiling| probe.min(ceiling.max(short)));
             let backoff = match (failure.reset_ms, failure.allowance) {
                 (Some(reset), _) => reset.max(short),
                 (None, true) => probe,
                 (None, false) => short,
             }
             .min(MAX_STATED_RESET_MS);
-            conn.execute(
+            let until = (now + backoff).max(held);
+            tx.execute(
                 "INSERT INTO model_routes(route, failures, until_ms, last_error, updated_ms)
                  VALUES(?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(route) DO UPDATE SET failures=excluded.failures,
                    until_ms=excluded.until_ms, last_error=excluded.last_error,
                    updated_ms=excluded.updated_ms",
-                params![route, failures, now + backoff, failure.error, now],
+                params![key, failures, until, failure.error, now],
             )?;
+            held_until = Some(until);
         }
         None => {
             // A success shows the whole account is usable again.
-            conn.execute(
+            tx.execute(
                 "DELETE FROM model_routes WHERE route IN (?1, ?2)",
                 params![route, account_key(route)],
             )?;
         }
     }
+    if let Some(shaped) = shaped {
+        let at = shaped.finished_ms;
+        let later = |old: Option<i64>| Some(old.map_or(at, |old| old.max(at)));
+        match &failure {
+            None => {
+                usage.last_succeeded_ms = later(usage.last_succeeded_ms);
+                usage.strikes = 0;
+                usage.capped_until_ms = None;
+                if let Shape::Rolling { window_ms, .. } = shaped.allowance.shape
+                    && usage
+                        .window_ends_ms
+                        .is_none_or(|end| shaped.created_ms >= end)
+                {
+                    usage.window_ends_ms = Some(shaped.created_ms + window_ms);
+                }
+                if let Some(windows) = shaped.windows {
+                    usage.window_ends_ms = windows.window_ends_ms.or(usage.window_ends_ms);
+                    usage.window_utilization = windows.window_utilization;
+                    usage.weekly_ends_ms = windows.weekly_ends_ms;
+                    usage.weekly_utilization = windows.weekly_utilization;
+                }
+            }
+            Some(failure) => {
+                usage.last_throttled_ms = later(usage.last_throttled_ms);
+                usage.last_throttle = Some(failure.error.clone());
+                usage.strikes += i64::from(strike);
+                if failure.allowance {
+                    usage.capped_until_ms = held_until;
+                }
+            }
+        }
+        usage.updated_ms = usage.updated_ms.max(at);
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO route_usage({USAGE_COLUMNS})
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            ),
+            params![
+                route,
+                usage.last_succeeded_ms,
+                usage.last_throttled_ms,
+                usage.last_throttle,
+                usage.strikes,
+                usage.window_ends_ms,
+                usage.window_utilization,
+                usage.weekly_ends_ms,
+                usage.weekly_utilization,
+                usage.capped_until_ms,
+                usage.updated_ms
+            ],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -549,15 +915,22 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
     drop(statement);
     let mut through = since;
     let mut seen = vec![];
-    let (conn, free) = if jobs.is_empty() {
-        (None, Default::default())
+    let (conn, free, shaped) = if jobs.is_empty() {
+        (None, Default::default(), Default::default())
     } else {
         // A routes file that cannot be read must not stop the backoff itself.
         let free = crate::crew_routes::free_allowances(store).unwrap_or_default();
-        (Some(crate::jobs::host_ledger(store)?), free)
+        let shaped = crate::crew_routes::allowances(store).unwrap_or_default();
+        let conn = crate::jobs::host_ledger(store)?;
+        conn.execute(
+            "DELETE FROM route_usage WHERE updated_ms < ?1",
+            [Store::now_ms() - USAGE_KEPT_MS],
+        )?;
+        (Some(conn), free, shaped)
     };
     for job in jobs {
-        through = through.max(job["finished_ms"].as_i64().unwrap_or(through));
+        let finished_ms = job["finished_ms"].as_i64().unwrap_or(through);
+        through = through.max(finished_ms);
         let route = job["model_route"]
             .as_str()
             .map(str::to_owned)
@@ -565,17 +938,19 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
         let Some(route) = route else {
             continue;
         };
+        let log = store
+            .home()
+            .join("jobs")
+            .join(job["id"].as_str().unwrap_or(""))
+            .join(job["incarnation"].as_str().unwrap_or(""))
+            .join("stdout.log");
+        let allowance = shaped.get(&route);
         let status = job["status"].as_str().unwrap_or("");
         let throttled = if status == "succeeded" {
             None
         } else {
-            let log = store
-                .home()
-                .join("jobs")
-                .join(job["id"].as_str().unwrap_or(""))
-                .join(job["incarnation"].as_str().unwrap_or(""))
-                .join("stdout.log");
-            match classify(&std::fs::read_to_string(log).unwrap_or_default()) {
+            match classify(&std::fs::read_to_string(&log).unwrap_or_default()) {
+                Some(failure) if allowance.is_some() => Some(failure),
                 Some(failure) => Some(match free.get(&route) {
                     Some(resets) => free_allowance(failure, *resets, Store::now_ms()),
                     None => failure,
@@ -584,10 +959,19 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
                 None => continue,
             }
         };
+        let shaped = allowance.map(|allowance| Shaped {
+            allowance,
+            created_ms: job["created_ms"].as_i64().unwrap_or(finished_ms),
+            finished_ms,
+            windows: (throttled.is_none() && route.starts_with("claude/"))
+                .then(|| claude_windows(&log_tail(&log)))
+                .flatten(),
+        });
+        let throttled_now = throttled.is_some();
         if let Some(conn) = &conn {
-            record(conn, &route, throttled.as_ref())?;
+            record_job(conn, &route, throttled, shaped)?;
         }
-        seen.push(json!({"route": route, "throttled": throttled.is_some()}));
+        seen.push(json!({"route": route, "throttled": throttled_now}));
     }
     store.connection().execute(
         "INSERT INTO metadata(key, value) VALUES(?1, ?2)
@@ -597,16 +981,22 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
     Ok(seen)
 }
 
-/// Backed-off routes, for status views.
+/// Backed-off routes, for status views; a capped one says until when.
 pub fn list(conn: &Connection) -> Result<Vec<Value>> {
+    let now = Store::now_ms();
     let mut statement = conn.prepare(
-        "SELECT route, failures, until_ms, last_error FROM model_routes WHERE until_ms > ?1 ORDER BY route",
+        "SELECT m.route, m.failures, m.until_ms, m.last_error, u.capped_until_ms
+         FROM model_routes m LEFT JOIN route_usage u
+           ON u.route = m.route AND u.capped_until_ms > ?1
+         WHERE m.until_ms > ?1 ORDER BY m.route",
     )?;
-    let rows = statement.query_map([Store::now_ms()], |r| {
-        Ok(
-            json!({"route": r.get::<_, String>(0)?, "failures": r.get::<_, i64>(1)?,
-            "until_ms": r.get::<_, i64>(2)?, "last_error": r.get::<_, Option<String>>(3)?}),
-        )
+    let rows = statement.query_map([now], |r| {
+        let mut row = json!({"route": r.get::<_, String>(0)?, "failures": r.get::<_, i64>(1)?,
+            "until_ms": r.get::<_, i64>(2)?, "last_error": r.get::<_, Option<String>>(3)?});
+        if let Some(capped) = r.get::<_, Option<i64>>(4)? {
+            row["capped_until_ms"] = json!(capped);
+        }
+        Ok(row)
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
