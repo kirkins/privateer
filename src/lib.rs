@@ -43,6 +43,7 @@ pub mod report;
 pub mod routes;
 pub mod scheduling;
 pub mod service;
+pub mod session;
 mod snapshot;
 pub mod store;
 pub mod stow;
@@ -99,6 +100,8 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "captain.reply",
     "captain.dismiss",
     "captain.send",
+    "session.read",
+    "session.send",
     "captain.feed",
     "ship.profile",
     "wake.transcript",
@@ -173,6 +176,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "grant" => grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
+        "session" => session::dispatch(store, command, args),
         "report" => report::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
         "ship" if command == "ship.move" => moves::dispatch(store, command, args),
