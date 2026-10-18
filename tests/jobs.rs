@@ -2404,7 +2404,7 @@ fn an_existing_ledger_that_cannot_be_opened_is_retried_not_settled() {
 fn a_live_supervised_job_whose_ledger_file_is_deleted_is_not_marked_foreign() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
-    start(&home, "live", &["sleep", "1"]);
+    start(&home, "live", &["sleep", "5"]);
     let running = wait(&home, "live", &["running"]);
     let ledger_path = PathBuf::from(running["ledger"].as_str().unwrap());
     assert!(ledger_path.exists());
