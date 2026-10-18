@@ -98,6 +98,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "stow.resume",
     "captain.reply",
     "captain.dismiss",
+    "captain.send",
     "captain.feed",
     "ship.profile",
     "wake.transcript",

@@ -2056,9 +2056,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "usage.summary" => crate::usage::local(args),
         // The captain's desk is here: answer from this machine's homes, and
         // never pass the command on again.
-        "captain.waiting" | "captain.feed" | "captain.reply" | "captain.dismiss" => {
-            crate::captain::serve(command, args)
-        }
+        "captain.waiting" | "captain.feed" | "captain.send" | "captain.reply"
+        | "captain.dismiss" => crate::captain::serve(command, args),
         // Activity for this machine's own homes only, read-only.
         "activity.list" => crate::activity::local(args),
         "fleet.link" => {

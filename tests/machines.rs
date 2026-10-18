@@ -2726,6 +2726,68 @@ fn the_captain_reads_and_answers_at_a_desk_on_another_machine() {
 }
 
 #[test]
+fn the_captain_writes_to_any_ship_from_any_folder_and_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let bodies = |machine: &Machine, ship: &str, kind: &str| -> Vec<String> {
+        messages(machine, ship, kind)
+            .iter()
+            .filter(|m| m["from"] == "captain")
+            .map(|m| m["body"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // A ship on this machine, from another ship's folder: written in its home.
+    let sent = laptop.ok(
+        "liaison",
+        "captain.send",
+        json!({"to": "scout", "body": "Rotate the key."}),
+    );
+    assert_eq!(sent["home"], "scout", "{sent}");
+    assert_eq!(bodies(&laptop, "scout", "notice"), ["Rotate the key."]);
+
+    // A ship on the linked machine: from the captain's home, over the link.
+    let sent = laptop.ok_over(
+        "scout",
+        "captain.send",
+        json!({"to": "fitforge", "kind": "request", "body": "Ship build 14?"}),
+        &ssh,
+    );
+    assert_eq!(sent["mail"]["delivery"], "delivered", "{sent}");
+    assert_eq!(bodies(&mac, "fitforge", "request"), ["Ship build 14?"]);
+
+    // With the desk on the Mac, the captain writes from there.
+    assert!(
+        laptop
+            .run("liaison", &["machine", "captain", "mac"], None)
+            .status
+            .success()
+    );
+    laptop.ok_over(
+        "scout",
+        "captain.send",
+        json!({"to": "fitforge", "body": "Build 14 is out."}),
+        &ssh,
+    );
+    assert_eq!(bodies(&mac, "fitforge", "notice"), ["Build 14 is out."]);
+
+    // Only notices and requests, and only to a ship that exists.
+    for args in [
+        json!({"to": "fitforge", "kind": "reply", "body": "x"}),
+        json!({"to": "nobody", "body": "x"}),
+        json!({"to": "scout", "body": "  "}),
+    ] {
+        let output = laptop.run(
+            "scout",
+            &["captain.send", "--json", &args.to_string()],
+            Some(&ssh),
+        );
+        assert!(!output.status.success(), "{args}: {}", text(&output));
+    }
+}
+
+#[test]
 fn a_machine_whose_desk_is_elsewhere_hands_its_captain_mail_only_there() {
     let (_temp, laptop, mac, ssh) = fixture();
     let server = Machine {
