@@ -2574,6 +2574,7 @@ fn arrive(home: &Path, id: &str, ledger: &Path, status: &str, supervisor: Value)
         )
         .unwrap();
 }
+#[cfg(target_os = "linux")]
 fn this_boot() -> String {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .unwrap()
