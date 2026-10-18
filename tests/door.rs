@@ -1084,3 +1084,39 @@ fn desk_copies_and_an_unreadable_home_do_not_spoil_the_digest() {
     assert!(text(&third).contains("ops news"), "{}", text(&third));
     stop(supervisor);
 }
+
+#[test]
+fn past_the_hourly_limit_requests_go_quietly_but_urgent_ones_still_sound() {
+    let fleet = Fleet::new();
+    fleet.digest_door(json!({"digest_every_mins": 600}));
+    fleet.ok(&["afk"]);
+    for n in 1..=4 {
+        fleet.tell("ops", &format!("decide {n}"), "request", "normal");
+    }
+    fleet.tell("ops", "the database is down: restore?", "request", "high");
+    let supervisor = fleet.supervise();
+    let mail = fleet.wait("five requests", |e| {
+        let mail = events(e, 0, "mail");
+        (mail.len() == 5).then_some(mail)
+    });
+    stop(supervisor);
+    let quiet: Vec<(String, bool)> = mail
+        .iter()
+        .map(|e| {
+            (
+                e["mail"]["body"].as_str().unwrap().to_owned(),
+                e["quiet"] == true,
+            )
+        })
+        .collect();
+    assert_eq!(
+        quiet,
+        [
+            ("decide 1".to_owned(), false),
+            ("decide 2".to_owned(), false),
+            ("decide 3".to_owned(), false),
+            ("decide 4".to_owned(), true),
+            ("the database is down: restore?".to_owned(), false),
+        ]
+    );
+}

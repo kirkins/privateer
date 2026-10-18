@@ -1332,7 +1332,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             crate::block_ask::rules_of(store, &ask).unwrap_or_default()
         ));
     } else if to == CAPTAIN
-        && let Some((delivery, note)) = crate::away::preview(&result)?
+        // The mail is stored: a preview that cannot read the registry must
+        // not report the send as failed, or the ship resends it.
+        && let Some((delivery, note)) = crate::away::preview(&result).ok().flatten()
     {
         result["delivery"] = json!(delivery);
         result["note"] = json!(note);

@@ -548,8 +548,11 @@ class Door:
             elif name == "held":
                 self.cmd_held()
             elif name == "digest":
-                self.runtime.call("digest", {})
-                self.say("📋 Sending what is held now.", quiet=True)
+                state = self.runtime.call("digest", {})
+                if state.get("away"):
+                    self.say("📋 Sending what is held now.", quiet=True)
+                else:
+                    self.say("📋 You are not away, so nothing is being held.", quiet=True)
             elif name == "voice":
                 import tts
                 self.say(tts.voice_reply(self.cfg, rest))

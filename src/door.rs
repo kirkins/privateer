@@ -758,8 +758,10 @@ impl<'a> Session<'a> {
             "held" => crate::away::held(),
             // `/digest`: what is held now, leaving the captain away.
             "digest" => {
-                self.digest_now = true;
-                Ok(json!({"digests": self.digests, "away": crate::away::active()?.is_some()}))
+                let away = crate::away::active()?.is_some();
+                // Present, nothing is held: no flag left for the next away period.
+                self.digest_now = away;
+                Ok(json!({"digests": self.digests, "away": away}))
             }
             "waiting" => self.waiting(),
             // The captain closes one item without answering it, wherever it waits.

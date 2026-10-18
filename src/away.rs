@@ -288,7 +288,9 @@ pub fn route(mail: &Value, ship: &str) -> Result<Option<Route>> {
                 quiet: seen["quiet"] == true,
             }
         } else {
-            let quiet = recent(&requests, Some(ship)) >= settings.loud_requests_per_hour;
+            // High urgency and production approvals always make a sound.
+            let urgent = mail["urgency"] == "high" || mail["request_kind"] == "production_approval";
+            let quiet = !urgent && recent(&requests, Some(ship)) >= settings.loud_requests_per_hour;
             requests.push(json!({"ms": now, "id": id, "ship": ship, "quiet": quiet}));
             tx.execute(
                 "UPDATE away SET requests=?2 WHERE started_ms=?1",
@@ -455,7 +457,11 @@ pub fn back() -> Result<Option<Value>> {
     // what reached the captain's mailbox while they were away.
     let doors = crate::door::names()?;
     for (_, home) in members()? {
-        let store = Store::open(&home)?;
+        // A home that cannot be opened keeps its cursor; at worst its held
+        // mail is shown again later. The catch-up must still be built.
+        let Ok(store) = Store::open(&home) else {
+            continue;
+        };
         let latest: i64 = store.connection().query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM mail WHERE recipient=?1",
             [crate::mail::CAPTAIN],
