@@ -2779,3 +2779,327 @@ fn a_locked_home_reads_unavailable_and_the_others_stay_complete() {
     );
     locker.execute_batch("ROLLBACK;").unwrap();
 }
+
+fn activity_ids(page: &Value) -> Vec<String> {
+    page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn activity_pages(machine: &Machine, folder: &Path, mut args: Value) -> Vec<Value> {
+    let mut pages = vec![];
+    loop {
+        let page = machine.json(folder, "activity.list", args.clone());
+        let more = page["more"].as_bool().expect("more is a bool");
+        assert_eq!(more, page["next"].is_string(), "{page}");
+        let next = page["next"].clone();
+        pages.push(page);
+        if !more {
+            return pages;
+        }
+        args["after"] = next;
+        assert!(pages.len() < 50, "activity.list never ended");
+    }
+}
+
+#[test]
+fn the_activity_list_merges_two_homes_interleaved_in_time_order() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+
+    let apps_store = Store::open(&apps.join(".privateer")).unwrap();
+    let web_store = Store::open(&web.join(".privateer")).unwrap();
+
+    let conn_a = apps_store.connection();
+    let conn_w = web_store.connection();
+
+    conn_a.execute("DELETE FROM audit;", []).unwrap();
+    conn_w.execute("DELETE FROM audit;", []).unwrap();
+    let _ = conn_a.execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+    let _ = conn_w.execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+
+    conn_a
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![100, "mail.received", r#"{"id":"m1","ship":"apps"}"#],
+        )
+        .unwrap();
+    conn_w
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![200, "mail.sent", r#"{"id":"m2","ship":"web"}"#],
+        )
+        .unwrap();
+    conn_a
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![300, "job.started", r#"{"job_id":"j1","ship":"apps"}"#],
+        )
+        .unwrap();
+    conn_w
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![400, "job.settled", r#"{"job_id":"j2","ship":"web"}"#],
+        )
+        .unwrap();
+
+    let all = machine.json(&apps, "activity.list", json!({}));
+    let ids = activity_ids(&all);
+    assert_eq!(ids, ["apps:1", "web:1", "apps:2", "web:2"], "{all}");
+    assert_eq!(all["more"], false, "{all}");
+    assert!(all["next"].is_null(), "{all}");
+
+    let entries = all["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[0]["at_ms"], 100);
+    assert_eq!(entries[0]["ship"], "apps");
+    assert_eq!(entries[0]["home"], "apps");
+    assert_eq!(entries[0]["kind"], "mail.received");
+
+    assert_eq!(entries[1]["at_ms"], 200);
+    assert_eq!(entries[1]["ship"], "web");
+    assert_eq!(entries[1]["home"], "web");
+    assert_eq!(entries[1]["kind"], "mail.sent");
+
+    assert_eq!(entries[2]["at_ms"], 300);
+    assert_eq!(entries[3]["at_ms"], 400);
+
+    let machine_name = entries[0]["machine"].as_str().unwrap();
+    assert!(!machine_name.is_empty());
+    assert_eq!(entries[1]["machine"], machine_name);
+}
+
+#[test]
+fn the_activity_list_paging_with_next_returns_each_entry_once() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+
+    let conn_a = Store::open(&apps.join(".privateer")).unwrap();
+    let conn_w = Store::open(&web.join(".privateer")).unwrap();
+
+    conn_a
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    conn_w
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    let _ = conn_a
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+    let _ = conn_w
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+
+    for i in 1..=3 {
+        conn_a
+            .connection()
+            .execute(
+                "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    i * 200 - 100,
+                    "event.a",
+                    format!(r#"{{"idx":{i},"ship":"apps"}}"#)
+                ],
+            )
+            .unwrap();
+        conn_w
+            .connection()
+            .execute(
+                "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![i * 200, "event.w", format!(r#"{{"idx":{i},"ship":"web"}}"#)],
+            )
+            .unwrap();
+    }
+
+    let all = machine.json(&apps, "activity.list", json!({"limit": 100}));
+    let expected_ids = activity_ids(&all);
+    assert_eq!(expected_ids.len(), 6);
+
+    let pages = activity_pages(&machine, &apps, json!({"limit": 2}));
+    assert_eq!(pages.len(), 3, "{pages:?}");
+
+    let mut paged_ids = vec![];
+    for page in pages {
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for e in entries {
+            paged_ids.push(e["id"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(paged_ids, expected_ids);
+}
+
+#[test]
+fn the_activity_list_filters_by_ship_and_kinds() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+
+    let conn_a = Store::open(&apps.join(".privateer")).unwrap();
+    let conn_w = Store::open(&web.join(".privateer")).unwrap();
+
+    conn_a
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    conn_w
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    let _ = conn_a
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+    let _ = conn_w
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+
+    conn_a
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![100, "mail.deliver", r#"{"ship":"apps"}"#],
+        )
+        .unwrap();
+    conn_a
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![200, "job.started", r#"{"ship":"apps"}"#],
+        )
+        .unwrap();
+    conn_w
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![300, "mail.withdraw", r#"{"ship":"web"}"#],
+        )
+        .unwrap();
+    conn_w
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![400, "job.settled", r#"{"ship":"web"}"#],
+        )
+        .unwrap();
+
+    // ship filter
+    let apps_only = machine.json(&apps, "activity.list", json!({"ship": "apps"}));
+    let apps_ids = activity_ids(&apps_only);
+    assert_eq!(apps_ids, ["apps:1", "apps:2"], "{apps_only}");
+
+    // kinds prefix filter
+    let mail_only = machine.json(&apps, "activity.list", json!({"kinds": ["mail."]}));
+    let mail_ids = activity_ids(&mail_only);
+    assert_eq!(mail_ids, ["apps:1", "web:1"], "{mail_only}");
+
+    // kinds exact and prefix filter combined with ship
+    let web_job = machine.json(
+        &apps,
+        "activity.list",
+        json!({"ship": "web", "kinds": ["job.settled"]}),
+    );
+    let web_job_ids = activity_ids(&web_job);
+    assert_eq!(web_job_ids, ["web:2"], "{web_job}");
+}
+
+#[test]
+fn the_activity_list_masks_secret_looking_values_in_audit_detail() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+
+    let conn_a = Store::open(&apps.join(".privateer")).unwrap();
+    conn_a
+        .connection()
+        .execute("DELETE FROM audit;", [])
+        .unwrap();
+    let _ = conn_a
+        .connection()
+        .execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
+    conn_a
+        .connection()
+        .execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                100,
+                "bundle.configure",
+                r#"{
+                    "api_key": "secret123",
+                    "auth_token": "token_abc",
+                    "session_secret": "sess_xyz",
+                    "nested": {
+                        "password": "pwd",
+                        "public_nested": "visible"
+                    },
+                    "argv": ["/bin/sh", "-c", "echo leak"],
+                    "env": {"LEAK": "val"},
+                    "public_field": "unmasked"
+                }"#
+            ],
+        )
+        .unwrap();
+
+    let all = machine.json(&apps, "activity.list", json!({}));
+    let entries = all["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+
+    let detail = &entries[0]["detail"];
+    assert_eq!(detail["api_key"], "<set>", "{detail}");
+    assert_eq!(detail["auth_token"], "<set>", "{detail}");
+    assert_eq!(detail["session_secret"], "<set>", "{detail}");
+    assert_eq!(detail["nested"]["password"], "<set>", "{detail}");
+    assert_eq!(detail["nested"]["public_nested"], "visible", "{detail}");
+    assert_eq!(detail["public_field"], "unmasked", "{detail}");
+    assert!(
+        detail.get("argv").is_none(),
+        "argv must be omitted: {detail}"
+    );
+    assert!(detail.get("env").is_none(), "env must be omitted: {detail}");
+}
+
+#[test]
+fn the_activity_list_refuses_agent_callers() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+
+    let out = machine.as_agent(&apps, "apps", "activity.list", json!({}));
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("operator command"),
+        "agents must be refused: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn the_activity_list_caps_limit_to_max() {
+    use privateer::store::Store;
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+
+    let conn_a = Store::open(&apps.join(".privateer")).unwrap();
+    let tx = conn_a.connection();
+    for i in 1..=210 {
+        tx.execute(
+            "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![i * 10, "job.run", r#"{"ship":"apps"}"#],
+        )
+        .unwrap();
+    }
+
+    let capped = machine.json(&apps, "activity.list", json!({"limit": 1000}));
+    let entries = capped["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 200, "limit must cap at 200");
+    assert_eq!(capped["more"], true);
+    assert!(capped["next"].is_string());
+}

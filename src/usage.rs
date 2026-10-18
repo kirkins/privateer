@@ -324,7 +324,7 @@ pub(crate) fn home_jobs_after(
 
 /// The ship a home answers for: the fleet's name for it, or the ship it
 /// hosts itself when the fleet does not list it.
-fn home_ship(store: &Store, members: &[crate::fleet::Member]) -> String {
+pub(crate) fn home_ship(store: &Store, members: &[crate::fleet::Member]) -> String {
     let same = |home: &std::path::Path| home.canonicalize().unwrap_or_else(|_| home.to_owned());
     let here = same(store.home());
     if let Some(member) = members.iter().find(|m| same(&m.home) == here) {
