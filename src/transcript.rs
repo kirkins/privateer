@@ -7,8 +7,11 @@
 //! and the word after a credential flag or label, `"name": "value"` pairs
 //! under a secret-looking name anywhere in text, and each line that is JSON
 //! on its own. The job's argv and environment are never returned. Masking
-//! is best effort: a short secret with no label or secret-looking name
-//! beside it (a bare password on its own line) is shown. A hosted first mate writes to its pane,
+//! is best effort. Still shown: a secret with no label or secret-looking name
+//! beside it (a bare password on its own line; prose such as "the password is
+//! X"; a .netrc `password X`; curl `-u user:pw` and mysql `-pX`); an array
+//! under a sensitive key on a pretty-printed line; Python `b'...'` values;
+//! JSON escaped twice inside text. A hosted first mate writes to its pane,
 //! not a log, so it has no transcript here yet.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail};
@@ -477,10 +480,50 @@ pub(crate) fn mask_value(value: &Value) -> Value {
             }
             Value::Object(shown)
         }
-        Value::Array(items) => Value::Array(items.iter().map(mask_value).collect()),
+        Value::Array(items) => {
+            // An argv: the element after a credential flag is its value.
+            let mut hide_next = false;
+            let mut shown = Vec::with_capacity(items.len());
+            for item in items {
+                let hidden = std::mem::replace(&mut hide_next, false);
+                match item {
+                    _ if hidden => shown.push(json!(MASK)),
+                    Value::String(flag) if credential_flag(flag) => {
+                        hide_next = true;
+                        shown.push(json!(mask_text(flag)));
+                    }
+                    _ => shown.push(mask_value(item)),
+                }
+            }
+            Value::Array(shown)
+        }
         Value::String(text) => json!(mask_text(text)),
         other => other.clone(),
     }
+}
+
+/// Whether a word is a credential flag, `--password` or `--api-key`, so the
+/// word after it is its value.
+fn credential_flag(word: &str) -> bool {
+    word.starts_with('-') && crate::block_ask::sensitive_name(word.trim_start_matches('-'))
+}
+
+/// In text, a quoted credential flag followed by `,` and a quoted value, as
+/// in `"--password","x"`: where the value's quote opens, the quote, and where
+/// it closes.
+fn flag_value(text: &str) -> Option<(usize, &'static str, usize)> {
+    let quote = QUOTES.iter().find(|q| text.starts_with(**q))?;
+    let end = quoted_end(text, quote, 128)?;
+    if !credential_flag(&text[quote.len()..end - quote.len()]) {
+        return None;
+    }
+    let after = text[end..]
+        .strip_prefix(',')?
+        .trim_start_matches([' ', '\t']);
+    let open = text.len() - after.len();
+    let value_quote = QUOTES.iter().find(|q| after.starts_with(**q))?;
+    let close = quoted_end(after, value_quote, usize::MAX)?;
+    Some((open, value_quote, open + close))
 }
 
 /// Whether a name reads as an environment variable: `API_KEY`, `HOME`.
@@ -503,6 +546,8 @@ pub(crate) fn mask_text(text: &str) -> String {
     let text = mask_pieces(&mask_pairs(&mask_json_lines(text)));
     let mut out = String::with_capacity(text.len());
     let mut hide_next = false;
+    // The last word was a secret-looking name, as in `password = x`.
+    let mut name_before = false;
     for word in text.split_inclusive(char::is_whitespace) {
         let trimmed = word.trim_end();
         let tail = &word[trimmed.len()..];
@@ -510,10 +555,16 @@ pub(crate) fn mask_text(text: &str) -> String {
             out.push_str(word);
             continue;
         }
+        let after_name = std::mem::take(&mut name_before);
         if hide_next {
             hide_next = false;
             out.push_str(MASK);
             out.push_str(tail);
+            continue;
+        }
+        if after_name && matches!(trimmed, "=" | ":") {
+            hide_next = true;
+            out.push_str(word);
             continue;
         }
         let bare = trimmed.trim_start_matches(['"', '\'', '`', '(', '{', '[', ',', ';']);
@@ -528,12 +579,14 @@ pub(crate) fn mask_text(text: &str) -> String {
             continue;
         }
         let label = bare.trim_end_matches(['"', '\'', '`']);
+        let name = label.trim_matches(|c: char| !c.is_alphanumeric());
         if !label.contains('=')
             && (label.ends_with(':') || label.starts_with('-'))
-            && crate::block_ask::sensitive_name(label.trim_matches(|c: char| !c.is_alphanumeric()))
+            && crate::block_ask::sensitive_name(name)
         {
             hide_next = true;
         }
+        name_before = !label.contains('=') && crate::block_ask::sensitive_name(name);
         out.push_str(word);
     }
     crate::block_ask::mask(&out)
@@ -606,6 +659,14 @@ fn mask_pairs(text: &str) -> String {
             at += c;
             continue;
         };
+        if let Some((open, value_quote, end)) = flag_value(rest) {
+            out.push_str(&rest[..open]);
+            out.push_str(value_quote);
+            out.push_str(MASK);
+            out.push_str(value_quote);
+            at += end;
+            continue;
+        }
         let pair = quoted_end(rest, quote, 128).and_then(|key_end| {
             let key = &rest[quote.len()..key_end - quote.len()];
             let after = rest[key_end..].trim_start_matches([' ', '\t']);
@@ -725,7 +786,8 @@ mod tests {
             r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":1792339332990,"scopes":["user:inference"]}}}}"#
         );
         let planted = [
-            access, refresh, openai, password, TOKEN, "hunter22", "s3cr3t",
+            access, refresh, openai, password, TOKEN, "hunter22", "hunter2", "s3cr3t", "short",
+            "abc",
         ];
         let texts = [
             // A Read result with Claude's and cat -n's line numbers.
@@ -742,6 +804,12 @@ mod tests {
             // JSON escaped inside a JSON string, and a secret used as a key.
             r#"payload "{\"api_key\":\"s3cr3t\",\"n\":1}" sent"#.to_owned(),
             format!(r#"keys {{"{TOKEN}":true}} end"#),
+            // A secret-looking name, then `=` or `:` as a separate word.
+            "password = \"Tr0ub4dor&3\"\nAPI_KEY = \"short\"\ntoken = \"abc\"".to_owned(),
+            // A credential flag and its value as separate argv elements.
+            r#"["mysql","--password","hunter2"]"#.to_owned(),
+            r#"ran {"command":["mysql","--password","hunter2"]} ok"#.to_owned(),
+            "  9\t[\"mysql\", \"--password\", \"hunter2\"]".to_owned(),
         ];
         for text in &texts {
             let shown = mask_text(text);
