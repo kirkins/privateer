@@ -197,9 +197,14 @@ class Door:
         kind = mail.get("kind", "notice")
         sender = mail.get("from") or ship
         body = mail.get("body") or ""
-        decision = (mail.get("payload") or {}).get("decision")
+        # Only a decision message carries a typed card; other mail may use the
+        # same payload key for its own data.
+        decision = (mail.get("payload") or {}).get("decision") if kind == "decision" else None
         if isinstance(decision, dict):
-            body = decision_text(decision, body)
+            try:
+                body = decision_text(decision, body)
+            except (AttributeError, TypeError, ValueError, KeyError) as exc:
+                tg.log(f"decision card of {mail.get('id')} could not be shown ({exc}); sending its text")
         elif not body:
             body = "```json\n" + json.dumps(mail.get("payload") or {}, indent=2) + "\n```"
         if event.get("step"):
@@ -224,7 +229,7 @@ class Door:
         reply_to = None
         if mail.get("correlation"):
             reply_to = tg.read_state(OUTGOING, {}).get(mail["correlation"])
-        typed = isinstance((mail.get("payload") or {}).get("decision"), dict)
+        typed = kind == "decision" and isinstance((mail.get("payload") or {}).get("decision"), dict)
         target = {"ship": ship, "mail": mail.get("id"), "kind": kind, "from": sender,
                   "typed": typed}
         markup = self.decision_markup(mail) if kind == "decision" else None
