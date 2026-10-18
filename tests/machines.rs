@@ -3260,3 +3260,66 @@ fn a_captain_answer_given_at_the_desk_closes_the_original_without_looping() {
     let again = laptop.pass("liaison", &ssh);
     assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
 }
+
+/// A typed approval granted or denied on the linked machine closes the desk's
+/// copy of its request, as the answer it is: the desk's waiting drops both.
+#[test]
+fn an_approval_outcome_on_the_linked_machine_closes_the_desk_copy() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    laptop.ok(
+        "scout",
+        "task.create",
+        json!({"id": "release", "charter_id": "scout", "owner": "scout", "title": "Release"}),
+    );
+    let granted = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "request_kind": "production_approval",
+               "task_id": "release", "body": "Release build A?",
+               "payload": {"artifact": "sha256:granted", "environment": "production"}}),
+    );
+    let denied = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "request_kind": "production_approval",
+               "task_id": "release", "body": "Release build B?",
+               "payload": {"artifact": "sha256:denied", "environment": "production"}}),
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 2, "{pass}");
+    assert_eq!(captain_requests(&mac, "fitforge", "open").len(), 2);
+
+    for (request, artifact, outcome) in [
+        (&granted, "sha256:granted", "approval.grant"),
+        (&denied, "sha256:denied", "approval.deny"),
+    ] {
+        let version = laptop.ok("scout", "mail.show", json!({"id": request["id"]}))["payload"]
+            ["charter_hash"]
+            .clone();
+        laptop.ok(
+            "scout",
+            outcome,
+            json!({"id": format!("grant-{artifact}"), "task_id": "release", "artifact": artifact,
+                   "environment": "production", "approver": "captain",
+                   "request_id": request["id"], "expected_version": version}),
+        );
+    }
+    assert_eq!(captain_requests(&mac, "fitforge", "open").len(), 2);
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 2, "{pass}");
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+    let approved = captain_requests(&mac, "fitforge", "approved");
+    assert_eq!(approved.len(), 1, "{approved:?}");
+    assert_eq!(approved[0]["id"], granted["id"]);
+    assert_eq!(approved[0]["end_reason"], "approved");
+    let refused = captain_requests(&mac, "fitforge", "denied");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["id"], denied["id"]);
+    assert_eq!(refused[0]["end_reason"], "denied");
+}

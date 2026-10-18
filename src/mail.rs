@@ -1401,7 +1401,7 @@ pub(crate) fn closed_captain(store: &Store, peer: &str, limit: usize) -> Result<
          JOIN machine_collected c ON c.peer=?1 AND c.id=m.id AND c.error IS NULL
          WHERE m.recipient=?2 AND m.kind IN ('request','decision')
            AND json_extract(s.record,'$.location')='here'
-           AND m.state IN ('answered','withdrawn','task_done','task_cancelled')
+           AND m.state IN ('answered','approved','denied','withdrawn','task_done','task_cancelled')
            AND NOT EXISTS (SELECT 1 FROM machine_closed d WHERE d.peer=?1 AND d.id=m.id)
          ORDER BY m.seq LIMIT ?3",
     )?;
@@ -1419,10 +1419,10 @@ pub(crate) fn closed_captain(store: &Store, peer: &str, limit: usize) -> Result<
     let mut closures = vec![];
     for row in rows {
         let (id, state, end_reason, answered_by, answered_ms, ended_by, ended_ms) = row?;
-        let (reason, by, ms) = if state == "answered" {
-            (String::new(), answered_by, answered_ms)
-        } else {
-            (end_reason.unwrap_or_default(), ended_by, ended_ms)
+        let (reason, by, ms) = match state.as_str() {
+            "answered" => (String::new(), answered_by, answered_ms),
+            "approved" | "denied" => (state.clone(), answered_by, answered_ms),
+            _ => (end_reason.unwrap_or_default(), ended_by, ended_ms),
         };
         closures.push(json!({"id": id, "state": state, "reason": reason, "by": by, "ms": ms}));
     }
@@ -1455,7 +1455,7 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
     ensure!(
         matches!(
             state,
-            "answered" | "withdrawn" | "task_done" | "task_cancelled"
+            "answered" | "approved" | "denied" | "withdrawn" | "task_done" | "task_cancelled"
         ),
         "invalid closure state"
     );
@@ -1472,6 +1472,16 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
                    AND sender IN ({from_peer})"
             ),
             params![id, peer, by, ms, CAPTAIN],
+        )?
+    } else if matches!(state, "approved" | "denied") {
+        // As approval_answer writes an approval outcome on the machine that granted it.
+        store.connection().execute(
+            &format!(
+                "UPDATE mail SET state=?3, answered_by=?4, answered_ms=?5, ended_by=?4, ended_ms=?5, end_reason=?3
+                 WHERE id=?1 AND state='open' AND recipient=?6 AND kind IN ('request','decision')
+                   AND sender IN ({from_peer})"
+            ),
+            params![id, peer, state, by, ms, CAPTAIN],
         )?
     } else {
         store.connection().execute(
