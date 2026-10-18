@@ -650,3 +650,120 @@ fn a_ships_own_crew_list_overrides_the_fleet_list_and_says_so() {
     assert_eq!(shown["applied"]["engineering"]["crew"], json!("ship"));
     assert_eq!(shown["applied"]["engineering"]["errand"], json!("fleet"));
 }
+
+/// A route the captain shapes as a daily allowance is launched ahead of a
+/// carry-over route while it is idle, a capped one is skipped and says until
+/// when, and once the cap has passed it is neither shown nor honoured.
+#[test]
+fn a_daily_allowance_goes_first_until_capped_and_returns_when_its_cap_passes() {
+    let f = Fleet::new();
+    let mut flash = codex("model-flash", "plan");
+    flash["allowance"] = json!({"daily_utc": "07:00"});
+    flash["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"steady": codex("model-steady", "plan"), "flash": flash},
+        "crew": ["steady", "flash"]
+    }));
+    let start = || f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert_eq!(f.model(&start()), "model-flash");
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("flash (plan; daily 07:00 UTC, tier 1)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("use-it-or-lose-it allowances nearest their refresh"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Idle allowances: flash (daily 07:00 UTC, refreshes in"),
+        "{text}"
+    );
+
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let route = "codex/-/model-flash";
+    let until = i64::MAX / 4;
+    ledger
+        .execute(
+            "INSERT INTO model_routes(route,failures,until_ms,last_error,updated_ms) VALUES(?1,1,?2,'quota exhausted',0)",
+            rusqlite::params![route, until],
+        )
+        .unwrap();
+    ledger
+        .execute(
+            "INSERT INTO route_usage(route,strikes,capped_until_ms,updated_ms) VALUES(?1,0,?2,?3)",
+            rusqlite::params![route, until, i64::MAX / 8],
+        )
+        .unwrap();
+    assert_eq!(f.model(&start()), "model-steady");
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"flash"}),
+    );
+    assert!(refusal.contains("is capped until"), "{refusal}");
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("tier 1) capped until"), "{text}");
+    assert!(!text.contains("Idle allowances"), "{text}");
+
+    // The hold passes: the stale cap is neither honoured nor shown.
+    ledger
+        .execute("UPDATE model_routes SET until_ms=1", [])
+        .unwrap();
+    ledger
+        .execute("UPDATE route_usage SET capped_until_ms=1", [])
+        .unwrap();
+    assert_eq!(f.model(&start()), "model-flash");
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    assert!(
+        !bearings["text"].as_str().unwrap().contains("capped"),
+        "{bearings}"
+    );
+    // The explicit route is honoured over the ranking.
+    let steady = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"steady"}),
+    );
+    assert_eq!(f.model(&steady), "model-steady");
+}
+
+#[test]
+fn allowance_shapes_need_a_tier_one_shape_per_model_and_no_legacy_reset() {
+    let f = Fleet::new();
+    let file = f.root.join("bad-routes.json");
+    let refuse = |routes: Value, wanted: &str| {
+        fs::write(&file, routes.to_string()).unwrap();
+        let o = f.run(None, &["routes", "set", file.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            !o.status.success() && stderr.contains(wanted),
+            "{routes}: {stderr}"
+        );
+    };
+    let mut untiered = codex("model-a", "plan");
+    untiered["allowance"] = json!({"daily_utc": "07:00"});
+    refuse(json!({"routes": {"a": untiered}}), "must state its tier");
+    let mut both = codex("model-a", "free");
+    both["allowance"] = json!({"daily_utc": "07:00"});
+    both["tier"] = json!(1);
+    both["allowance_resets_utc"] = json!("07:00");
+    refuse(
+        json!({"routes": {"a": both}}),
+        "move the time into allowance.daily_utc",
+    );
+    let mut daily = codex("model-a", "plan");
+    daily["allowance"] = json!({"daily_utc": "07:00"});
+    daily["tier"] = json!(1);
+    let mut rolling = daily.clone();
+    rolling["allowance"] = json!({"window_hours": 5});
+    refuse(
+        json!({"routes": {"a": daily, "b": rolling}}),
+        "with different allowance shapes",
+    );
+    let mut tiered = codex("model-a", "plan");
+    tiered["tier"] = json!(10);
+    refuse(json!({"routes": {"a": tiered}}), "tier must be");
+}

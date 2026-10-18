@@ -2,6 +2,13 @@
 //! order each ship tries them in. Launches without a route take the first one
 //! that is not backing off; agents launch nothing unlisted. Without a routes
 //! file, crew keep their first mate's route and errands the ship's own.
+//!
+//! A route may declare its `allowance` shape: a daily reset (`daily_utc`), or a
+//! rolling window (`window_hours`, with an optional `weekly_utc` cap), and then
+//! must state its `tier` (1 strongest to 9). Within a tier, crew and errand
+//! launches try use-it-or-lose-it allowances first, nearest their refresh, then
+//! idle rolling windows, then carry-over routes in the captain's order. A
+//! better tier is never passed, and an explicit route is never re-ranked.
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
@@ -52,6 +59,7 @@ fn validate(value: &Value) -> Result<()> {
         .as_object()
         .context("routes.routes must be an object of named routes")?;
     ensure!(routes.len() <= 32, "at most 32 routes");
+    let mut shapes = std::collections::HashMap::new();
     for (name, route) in routes {
         ensure!(
             (1..=40).contains(&name.len())
@@ -67,7 +75,13 @@ fn validate(value: &Value) -> Result<()> {
             ensure!(
                 matches!(
                     key.as_str(),
-                    "manifest" | "options" | "cost" | "note" | "allowance_resets_utc"
+                    "manifest"
+                        | "options"
+                        | "cost"
+                        | "note"
+                        | "allowance_resets_utc"
+                        | "allowance"
+                        | "tier"
                 ),
                 "unknown setting {key} on route {name}"
             );
@@ -100,6 +114,30 @@ fn validate(value: &Value) -> Result<()> {
                 .is_none_or(|at| utc_minute(at).is_some()),
             "route {name} allowance_resets_utc must be a UTC time of day, HH:MM"
         );
+        ensure!(
+            route
+                .get("tier")
+                .is_none_or(|t| t.as_u64().is_some_and(|t| (1..=9).contains(&t))),
+            "route {name} tier must be a whole number from 1 (strongest) to 9"
+        );
+        if let Some(allowance) = route.get("allowance") {
+            ensure!(
+                route.get("allowance_resets_utc").is_none(),
+                "route {name} states both allowance and allowance_resets_utc; \
+                 move the time into allowance.daily_utc"
+            );
+            ensure!(
+                route.get("tier").is_some(),
+                "route {name} declares an allowance, so it must state its tier (1-9)"
+            );
+            let shape = shape(allowance).with_context(|| format!("route {name} allowance"))?;
+            if let Some(id) = identity(route)
+                && let Some((other, earlier)) = shapes.insert(id.clone(), (name.clone(), shape))
+                && earlier != shape
+            {
+                bail!("routes {other} and {name} run {id} with different allowance shapes");
+            }
+        }
     }
     for kind in KINDS {
         if let Some(list) = value.get(kind) {
@@ -242,6 +280,148 @@ pub(crate) fn free_allowances(
         .collect())
 }
 
+/// How a route's allowance renews.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// Renews at this minute of the UTC day.
+    Daily(u32),
+    /// A window that opens at first use and closes this long after; an
+    /// optional weekly cap renews at this minute of the UTC week (Monday 00:00
+    /// is 0).
+    Rolling { window_ms: i64, weekly: Option<u32> },
+}
+
+/// A route's declared allowance, keyed by route identity in `allowances`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Allowance {
+    pub shape: Shape,
+    pub free: bool,
+}
+
+const DAY_MS: i64 = 86_400_000;
+const WEEK_MS: i64 = 7 * DAY_MS;
+/// The Unix epoch fell on a Thursday; the first Monday 00:00 UTC came four days later.
+const FIRST_MONDAY_MS: i64 = 4 * DAY_MS;
+const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+fn shape(value: &Value) -> Result<Shape> {
+    let object = value.as_object().context("must be an object")?;
+    for key in object.keys() {
+        ensure!(
+            matches!(key.as_str(), "daily_utc" | "window_hours" | "weekly_utc"),
+            "unknown setting {key}"
+        );
+    }
+    match (value.get("daily_utc"), value.get("window_hours")) {
+        (Some(at), None) => {
+            ensure!(
+                value.get("weekly_utc").is_none(),
+                "weekly_utc goes with window_hours"
+            );
+            Ok(Shape::Daily(
+                utc_minute(at).context("daily_utc must be a UTC time of day, HH:MM")?,
+            ))
+        }
+        (None, Some(hours)) => {
+            let hours = hours
+                .as_i64()
+                .filter(|h| (1..=168).contains(h))
+                .context("window_hours must be a whole number from 1 to 168")?;
+            let weekly = value
+                .get("weekly_utc")
+                .map(|at| {
+                    weekly_minute(at).context("weekly_utc must read like \"Mon 07:00\" (UTC)")
+                })
+                .transpose()?;
+            Ok(Shape::Rolling {
+                window_ms: hours * 3_600_000,
+                weekly,
+            })
+        }
+        _ => bail!("must hold exactly one of daily_utc or window_hours"),
+    }
+}
+
+/// `"Mon HH:MM"` in UTC, as the minute of the week from Monday 00:00.
+fn weekly_minute(value: &Value) -> Option<u32> {
+    let (day, time) = value.as_str()?.split_once(' ')?;
+    let day = WEEKDAYS.iter().position(|d| *d == day)? as u32;
+    Some(day * 1440 + utc_minute(&json!(time))?)
+}
+
+/// The next time at or after `now` past this minute of the UTC day (a full day
+/// on, if it is now).
+pub(crate) fn next_daily(minute: u32, now: i64) -> i64 {
+    let delay = (i64::from(minute) * 60_000 - now).rem_euclid(DAY_MS);
+    now + if delay == 0 { DAY_MS } else { delay }
+}
+
+/// The next time past this minute of the UTC week.
+pub(crate) fn next_weekly(minute: u32, now: i64) -> i64 {
+    let delay = (FIRST_MONDAY_MS + i64::from(minute) * 60_000 - now).rem_euclid(WEEK_MS);
+    now + if delay == 0 { WEEK_MS } else { delay }
+}
+
+/// The captain's shaped routes by route identity.
+pub(crate) fn allowances(store: &Store) -> Result<std::collections::HashMap<String, Allowance>> {
+    let Some(policy) = for_store(store)? else {
+        return Ok(Default::default());
+    };
+    Ok(policy["routes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, route)| Some((identity(route)?, allowance(route)?)))
+        .collect())
+}
+
+fn allowance(route: &Value) -> Option<Allowance> {
+    Some(Allowance {
+        shape: shape(route.get("allowance")?).ok()?,
+        free: route["cost"] == "free",
+    })
+}
+
+fn tier(route: &Value) -> u64 {
+    route["tier"].as_u64().unwrap_or(1)
+}
+
+/// The order to try a list in: by tier, best first; within a tier, shaped
+/// routes with a deadline nearest their loss, then idle rolling windows (by
+/// their weekly reset when known), then carry-over routes. Equal keys keep the
+/// captain's order. `usage` is keyed by route identity.
+pub(crate) fn rank(
+    names: &[String],
+    policy: &Value,
+    usage: &std::collections::HashMap<String, crate::routes::Usage>,
+    now: i64,
+) -> Vec<String> {
+    let mut keyed: Vec<((u64, u8, i64), &String)> = names
+        .iter()
+        .map(|name| {
+            let route = &policy["routes"][name.as_str()];
+            let used = identity(route).and_then(|id| usage.get(&id));
+            let (class, key) = match allowance(route).map(|a| a.shape) {
+                None => (2, 0),
+                Some(Shape::Daily(minute)) => (0, next_daily(minute, now)),
+                Some(Shape::Rolling { weekly, .. }) => {
+                    let weekly = used
+                        .and_then(|u| u.weekly_ends_ms)
+                        .filter(|end| *end > now)
+                        .or_else(|| weekly.map(|w| next_weekly(w, now)));
+                    match used.and_then(|u| u.window_ends_ms).filter(|end| *end > now) {
+                        Some(end) => (0, weekly.map_or(end, |w| w.min(end))),
+                        None => (1, weekly.unwrap_or(i64::MAX)),
+                    }
+                }
+            };
+            ((tier(route), class, key / 60_000), name)
+        })
+        .collect();
+    keyed.sort_by_key(|(key, _)| *key);
+    keyed.into_iter().map(|(_, name)| name.clone()).collect()
+}
+
 fn identity(route: &Value) -> Option<String> {
     crate::routes::route_of(route["manifest"].as_str()?, &route["options"])
 }
@@ -294,7 +474,7 @@ pub(crate) fn first_mate_fallback(
 }
 
 /// The route a ship's crew or errand launch should use: the one it names, or
-/// the first listed route that is not backing off. `None` means the captain
+/// the first route that is not backing off in `rank`'s order. `None` means the captain
 /// lists no routes of this kind, so the old defaults apply.
 pub(crate) fn choose(
     store: &Store,
@@ -317,16 +497,19 @@ pub(crate) fn choose(
         );
         return Ok(None);
     }
-    let candidates: Vec<&String> = match requested {
+    let candidates: Vec<String> = match requested {
         Some(name) => {
             ensure!(
                 names.iter().any(|n| n == name),
                 "route {name} is not one of {ship}'s {kind} routes: {}",
                 names.join(", ")
             );
-            names.iter().filter(|n| *n == name).collect()
+            vec![name.to_owned()]
         }
-        None => names.iter().collect(),
+        None => {
+            let usage = crate::routes::usage(&crate::jobs::host_ledger(store)?)?;
+            rank(&names, &policy, &usage, Store::now_ms())
+        }
     };
     let mut refusals = vec![];
     for name in candidates {
@@ -467,13 +650,19 @@ fn show(value: Option<Value>) -> Value {
     value
 }
 
-/// The bearings line: each list in order with the captain's notes, and
-/// routes backing off marked.
+/// The bearings lines: each list in order with the captain's notes and each
+/// allowance's shape, routes backing off or capped marked, and then any
+/// allowance that is going unused.
 pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
     let Some(policy) = for_store(store)? else {
         return Ok(None);
     };
+    let ledger = crate::jobs::host_ledger(store)?;
+    let usage = crate::routes::usage(&ledger)?;
+    let now = Store::now_ms();
     let mut parts = vec![];
+    let mut shaped = false;
+    let mut idle: Vec<String> = vec![];
     for kind in KINDS {
         let names = order(&policy, ship, kind);
         if names.is_empty() {
@@ -483,18 +672,58 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         for name in names {
             let route = &policy["routes"][name.as_str()];
             let cost = route["cost"].as_str().unwrap_or("?");
-            let note = route["note"].as_str().filter(|note| !note.is_empty());
-            let mut label = match note {
-                Some(note) => format!("{name} ({cost}; {note})"),
-                None => format!("{name} ({cost})"),
+            let id = identity(route);
+            let used = id.as_ref().and_then(|id| usage.get(id));
+            let mut details = vec![cost.to_owned()];
+            details.extend(
+                route["note"]
+                    .as_str()
+                    .filter(|note| !note.is_empty())
+                    .map(str::to_owned),
+            );
+            let declared = allowance(route);
+            if let Some(allowance) = declared {
+                shaped = true;
+                let mut about = format!("{}, tier {}", describe(allowance.shape), tier(route));
+                for (window, utilization) in [
+                    ("window", used.and_then(|u| u.window_utilization)),
+                    ("week", used.and_then(|u| u.weekly_utilization)),
+                ] {
+                    if let Some(share) = utilization {
+                        about.push_str(&format!(", {window} {:.0}% used", share * 100.0));
+                    }
+                }
+                details.push(about);
+            } else if route.get("tier").is_some() {
+                details.push(format!("tier {}", tier(route)));
+            }
+            let mut label = format!("{name} ({})", details.join("; "));
+            let blocked = match &id {
+                Some(id) => crate::routes::blocked(&ledger, id)?,
+                None => None,
             };
-            if identity(route)
-                .map(|id| crate::routes::refusal(store, &id))
-                .transpose()?
-                .flatten()
-                .is_some()
-            {
-                label.push_str(" backing off");
+            let capped = used
+                .and_then(|u| u.capped_until_ms)
+                .filter(|until| *until > now);
+            match (blocked, capped) {
+                (Some((until, _)), Some(_)) => {
+                    label.push_str(&format!(" capped until {}", clock(until, now)));
+                }
+                (Some(_), None) => label.push_str(" backing off"),
+                (None, _) => {
+                    if let Some(end) = used.and_then(|u| u.window_ends_ms).filter(|e| *e > now)
+                        && matches!(declared.map(|a| a.shape), Some(Shape::Rolling { .. }))
+                    {
+                        label.push_str(&format!(" window open until {}", clock(end, now)));
+                    }
+                    if kind != "first_mate"
+                        && let Some(allowance) = declared
+                        && let Some(line) = idle_line(&name, allowance.shape, used, now)
+                        && !idle.contains(&line)
+                    {
+                        idle.push(line);
+                    }
+                }
             }
             shown.push(label);
         }
@@ -504,12 +733,95 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         };
         parts.push(format!("{kind}: {}{list}", shown.join(", ")));
     }
-    Ok((!parts.is_empty()).then(|| {
-        format!(
-            "Routes ({}; the first available is used, or pass \"route\":\"<name>\").",
-            parts.join("; ")
-        )
-    }))
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let rule = if shaped {
+        "use-it-or-lose-it allowances nearest their refresh go first within a tier"
+    } else {
+        "the first available is used"
+    };
+    let mut text = format!(
+        "Routes ({}; {rule}, or pass \"route\":\"<name>\").",
+        parts.join("; ")
+    );
+    if !idle.is_empty() {
+        text.push_str(&format!("\nIdle allowances: {}.", idle.join(", ")));
+    }
+    Ok(Some(text))
+}
+
+fn describe(shape: Shape) -> String {
+    match shape {
+        Shape::Daily(minute) => format!("daily {:02}:{:02} UTC", minute / 60, minute % 60),
+        Shape::Rolling { window_ms, weekly } => {
+            let mut text = format!("{}h window", window_ms / 3_600_000);
+            if let Some(minute) = weekly {
+                let day = WEEKDAYS[(minute / 1440) as usize % 7];
+                let minute = minute % 1440;
+                text.push_str(&format!(
+                    ", weekly {day} {:02}:{:02} UTC",
+                    minute / 60,
+                    minute % 60
+                ));
+            }
+            text
+        }
+    }
+}
+
+/// An allowance with no use since it last renewed: a daily one not used since
+/// its last reset, a rolling one with no window open.
+fn idle_line(
+    name: &str,
+    shape: Shape,
+    used: Option<&crate::routes::Usage>,
+    now: i64,
+) -> Option<String> {
+    let last = used.and_then(|u| u.last_succeeded_ms);
+    let last_used = match last {
+        Some(at) => format!("last used {} ago", span(now - at)),
+        None => "no use recorded".to_owned(),
+    };
+    match shape {
+        Shape::Daily(minute) => {
+            let next = next_daily(minute, now);
+            (last.is_none_or(|at| at < next - DAY_MS)).then(|| {
+                format!(
+                    "{name} ({}, refreshes in {}, {last_used})",
+                    describe(shape),
+                    span(next - now)
+                )
+            })
+        }
+        Shape::Rolling { .. } => used
+            .and_then(|u| u.window_ends_ms)
+            .is_none_or(|end| end <= now)
+            .then(|| format!("{name} ({}, no window open, {last_used})", describe(shape))),
+    }
+}
+
+/// A UTC time of day, with its weekday when it is a day or more away.
+fn clock(at: i64, now: i64) -> String {
+    let minute = at.div_euclid(60_000);
+    let time = format!("{:02}:{:02} UTC", minute / 60 % 24, minute % 60);
+    if at - now < DAY_MS {
+        time
+    } else {
+        let day = (at - FIRST_MONDAY_MS).div_euclid(DAY_MS).rem_euclid(7) as usize;
+        format!("{} {time}", WEEKDAYS[day])
+    }
+}
+
+/// A duration as days, hours or minutes.
+fn span(ms: i64) -> String {
+    let minutes = (ms / 60_000).max(1);
+    match minutes {
+        m if m >= 2 * 1440 => format!("{}d", m / 1440),
+        m if m >= 60 && m % 60 != 0 && m < 600 => format!("{}h{}m", m / 60, m % 60),
+        m if m >= 60 => format!("{}h", m / 60),
+        m => format!("{m}m"),
+    }
 }
 
 pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
@@ -541,5 +853,132 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             Ok(value)
         }
         _ => bail!("unknown command {command}; try routes.show or routes.set"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::Usage;
+    use std::collections::HashMap;
+
+    const HOUR: i64 = 3_600_000;
+    // 2026-10-17 19:50 UTC, a Saturday.
+    const NOW: i64 = 1_792_266_600_000;
+
+    fn route(model: &str, extra: Value) -> Value {
+        let mut route = json!({"manifest":"bundled:codex","options":{"model":model},"cost":"plan"});
+        for (key, value) in extra.as_object().unwrap() {
+            route[key] = value.clone();
+        }
+        route
+    }
+
+    fn daily_in(hours: i64, now: i64) -> Value {
+        let minute = (now + hours * HOUR) / 60_000 % 1440;
+        json!({"daily_utc": format!("{:02}:{:02}", minute / 60, minute % 60)})
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn two_daily_allowances_both_drain_across_a_refresh() {
+        let policy = json!({"routes": {
+            "a": route("a", json!({"allowance": daily_in(2, NOW), "tier": 1})),
+            "b": route("b", json!({"allowance": daily_in(20, NOW), "tier": 1})),
+            "plan": route("plan", json!({})),
+        }});
+        let list = names(&["plan", "b", "a"]);
+        let usage = HashMap::new();
+        // A loses its headroom first, so it goes first, then B, then carry-over.
+        assert_eq!(
+            rank(&list, &policy, &usage, NOW),
+            names(&["a", "b", "plan"])
+        );
+        // Past A's refresh, A's next loss is a day away and B's is nearer.
+        let later = NOW + 3 * HOUR;
+        assert_eq!(
+            rank(&list, &policy, &usage, later),
+            names(&["b", "a", "plan"])
+        );
+    }
+
+    #[test]
+    fn a_better_tier_is_never_passed_and_idle_windows_wait_behind_deadlines() {
+        let policy = json!({"routes": {
+            "weak": route("weak", json!({"allowance": daily_in(1, NOW), "tier": 2})),
+            "steady": route("steady", json!({})),
+            "idle": route("idle", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+            "open": route("open", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+            "daily": route("daily", json!({"allowance": daily_in(8, NOW), "tier": 1})),
+        }});
+        let mut usage = HashMap::new();
+        usage.insert(
+            "codex/-/open".to_owned(),
+            Usage {
+                window_ends_ms: Some(NOW + 2 * HOUR),
+                ..Usage::default()
+            },
+        );
+        let list = names(&["steady", "weak", "idle", "daily", "open"]);
+        assert_eq!(
+            rank(&list, &policy, &usage, NOW),
+            names(&["open", "daily", "idle", "steady", "weak"])
+        );
+        // A list with no shapes and no tiers keeps the captain's order.
+        let plain = names(&["steady"]);
+        assert_eq!(rank(&plain, &policy, &usage, NOW), plain);
+    }
+
+    #[test]
+    fn idle_rolling_windows_rank_by_their_weekly_reset() {
+        let policy = json!({"routes": {
+            "late": route("late", json!({"allowance": {"window_hours": 5, "weekly_utc": "Fri 00:00"}, "tier": 1})),
+            "soon": route("soon", json!({"allowance": {"window_hours": 5, "weekly_utc": "Mon 00:00"}, "tier": 1})),
+            "none": route("none", json!({"allowance": {"window_hours": 5}, "tier": 1})),
+        }});
+        let list = names(&["none", "late", "soon"]);
+        assert_eq!(
+            rank(&list, &policy, &HashMap::new(), NOW),
+            names(&["soon", "late", "none"])
+        );
+    }
+
+    #[test]
+    fn shapes_and_reset_times_parse() {
+        assert_eq!(
+            shape(&json!({"daily_utc":"07:00"})).unwrap(),
+            Shape::Daily(420)
+        );
+        assert_eq!(
+            shape(&json!({"window_hours":5,"weekly_utc":"Tue 01:00"})).unwrap(),
+            Shape::Rolling {
+                window_ms: 5 * HOUR,
+                weekly: Some(1440 + 60)
+            }
+        );
+        for bad in [
+            json!({}),
+            json!({"daily_utc":"07:00","window_hours":5}),
+            json!({"daily_utc":"07:00","weekly_utc":"Mon 00:00"}),
+            json!({"window_hours":0}),
+            json!({"window_hours":5,"weekly_utc":"Monday 00:00"}),
+            json!({"window_hours":5,"pool":"go"}),
+        ] {
+            assert!(shape(&bad).is_err(), "{bad}");
+        }
+        // Monday 00:00 UTC after Saturday 2026-10-17 is 2026-10-19.
+        assert_eq!(
+            crate::routes::utc_time(next_weekly(0, NOW)),
+            "2026-10-19 00:00 UTC"
+        );
+        assert_eq!(
+            crate::routes::utc_time(next_daily(420, NOW)),
+            "2026-10-18 07:00 UTC"
+        );
+        assert_eq!(span(26 * HOUR), "26h");
+        assert_eq!(span(80 * 60_000), "1h20m");
     }
 }
