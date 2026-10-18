@@ -653,6 +653,18 @@ impl<'a> Session<'a> {
             },
             "held" => crate::away::held(),
             "waiting" => self.waiting(),
+            // The captain closes one item without answering it, wherever it waits.
+            "dismiss" => {
+                let (_, home) = members()?
+                    .into_iter()
+                    .next()
+                    .context("the fleet has no ships")?;
+                let mut request = json!({"id": args.get("id").cloned().unwrap_or(Value::Null)});
+                if let Some(note) = args.get("note").filter(|v| !v.is_null()) {
+                    request["note"] = note.clone();
+                }
+                crate::dispatch(self.store(&home)?, "captain.dismiss", request)
+            }
             // Registered front doors carry the captain's explicit commands.
             "permissions" if args.as_object().is_some_and(|a| a.is_empty()) => {
                 crate::permissions::load()

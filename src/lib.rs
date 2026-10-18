@@ -87,6 +87,8 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "stow.start",
     "stow.status",
     "stow.resume",
+    "captain.reply",
+    "captain.dismiss",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the

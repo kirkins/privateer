@@ -306,7 +306,7 @@ def main() -> int:
 
             # An ask only the captain's hands can clear comes first, under its own
             # heading, with the exact step beside it.
-            fleet.call("ops", "mail.send", {
+            hands = fleet.call("ops", "mail.send", {
                 "from": "ops", "to": "captain", "kind": "request",
                 "body": "The disk check finished.",
                 "payload": {"needs_hands": {"step": "Run `sudo privateer-unlock ops` on the Mac"}}})
@@ -331,6 +331,25 @@ def main() -> int:
             assert hands_at < ordinary_at, texts
             assert texts[hands_at - 1] == "Needs your hands:", texts
             assert "privateer-unlock ops" in texts[hands_at], texts[hands_at]
+
+            # /dismiss closes one ask without answering it, by the first
+            # characters of its id; the ship is told and it stops waiting.
+            before = len(telegram.sent())
+            telegram.message(f"/dismiss {hands['id'][:8]} done by hand")
+            done = wait_for("the dismissal", lambda: [
+                m for m in telegram.sent()[before:] if "Dismissed" in m["text"]])[0]
+            assert hands["id"] in done["text"] and "ops" in done["text"], done
+            closed = fleet.call("ops", "mail.show", {"id": hands["id"]})
+            assert closed["state"] == "dismissed", closed
+            assert closed["end_reason"] == "done by hand", closed
+            told = [m for m in fleet.inbox("ops", "ops") if m.get("correlation") == hands["id"]]
+            assert len(told) == 1 and told[0]["from"] == "captain", told
+            waiting = fleet.call("liaison", "captain.waiting", {})["waiting"]
+            assert all(w["mail"]["id"] != hands["id"] for w in waiting), waiting
+            before = len(telegram.sent())
+            telegram.message("/dismiss no-such-ask")
+            wait_for("the unknown-id refusal", lambda: [
+                m for m in telegram.sent()[before:] if "no-such-ask" in m["text"] and "⚠️" in m["text"]])
 
             # A stow names its machine. The Mac is linked (before the door
             # starts, so its calls can reach it), and its hold is its own: this

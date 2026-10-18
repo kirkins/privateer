@@ -476,6 +476,82 @@ fn withdraw(store: &Store, args: &Value) -> Result<Value> {
     Ok(result)
 }
 
+/// The captain ends one item addressed to them without answering it. An open
+/// request or decision ends as `dismissed` with the note, and its sender gets
+/// a notice saying so, carried to a ship behind a machine link like a reply;
+/// a notice is marked acknowledged. The operator's lookup (`captain.dismiss`)
+/// has chosen this home.
+pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
+    ensure!(
+        *store.caller() == Caller::Operator,
+        "only the operator speaks as the captain"
+    );
+    ensure!(note.len() <= 2000, "dismissal note exceeds 2000 bytes");
+    let tx = store.write_transaction()?;
+    let item = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
+    ensure!(
+        item["to"] == CAPTAIN,
+        "{id} is not addressed to the captain"
+    );
+    let now = Store::now_ms();
+    let mut peer = None;
+    match item["kind"].as_str() {
+        Some("notice") => {
+            ensure!(item["state"].is_null(), "{id} is already acknowledged");
+            tx.execute(
+                "UPDATE mail SET state='acknowledged',ended_by=?2,ended_ms=?3,end_reason=?4 WHERE id=?1 AND state IS NULL",
+                params![id, CAPTAIN, now, note],
+            )?;
+        }
+        Some("request" | "decision") => {
+            ensure!(item["state"] == "open", "{id} is no longer open");
+            let asker = item["from"].as_str().context("request sender")?;
+            peer = ship(store, asker)?
+                .as_ref()
+                .and_then(remote_peer)
+                .map(str::to_owned);
+            let notice = outcome_id(store, "dismiss")?;
+            let body = if note.is_empty() {
+                format!("The captain closed {id} without an answer.")
+            } else {
+                format!("The captain closed {id} without an answer: {note}")
+            };
+            let payload = json!({"request_end":{"version":1,"state":"dismissed","reason":note}});
+            tx.execute(
+                "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms,delivery)
+                 VALUES(?1,?2,?3,'notice',?4,?5,?6,?7,'normal',?8,?9)",
+                params![notice, CAPTAIN, asker, id, item["task_id"].as_str(), body,
+                    payload.to_string(), now, peer.as_ref().map(|_| "pending")],
+            )?;
+            tx.execute(
+                "UPDATE mail SET state='dismissed',ended_by=?2,ended_ms=?3,end_reason=?4 WHERE id=?1 AND state='open'",
+                params![id, notice, now, note],
+            )?;
+        }
+        other => bail!(
+            "{id} is a {}, which the captain cannot dismiss",
+            other.unwrap_or("message")
+        ),
+    }
+    store.audit("captain.dismiss", &json!({"id": id, "note": note}))?;
+    tx.commit()?;
+    // Items added to a dismissed block ask end with it.
+    if item["payload"]["type"] == "tool_permission" && item["kind"] != "notice" {
+        let why = if note.is_empty() { "dismissed" } else { note };
+        if let Err(error) = end_attachments(store, id, why) {
+            eprintln!("privateer: could not end the items added to {id}: {error:#}");
+        }
+    }
+    // Bounded and retryable, like mail.send: a failed attempt stays pending.
+    if let Some(peer) = peer.as_deref() {
+        flush_pending(store, 1, false, None, Some(peer))?;
+    }
+    Ok(annotate(
+        by_id(store, id)?.context("message vanished")?,
+        Store::now_ms(),
+    ))
+}
+
 /// A task's terminal state, not its current owner, ends its linked requests.
 /// Runs in task.update's transaction; never invents a reply or changes custody.
 pub(crate) fn close_task(store: &Store, task: &str, status: &str) -> Result<()> {
@@ -1622,7 +1698,7 @@ pub(crate) fn closed_captain(store: &Store, peer: &str, limit: usize) -> Result<
          JOIN machine_collected c ON c.peer=?1 AND c.id=m.id AND c.error IS NULL
          WHERE m.recipient=?2 AND m.kind IN ('request','decision')
            AND json_extract(s.record,'$.location')='here'
-           AND m.state IN ('answered','approved','denied','withdrawn','task_done','task_cancelled')
+           AND m.state IN ('answered','approved','denied','withdrawn','dismissed','task_done','task_cancelled')
            AND NOT EXISTS (SELECT 1 FROM machine_closed d WHERE d.peer=?1 AND d.id=m.id)
          ORDER BY m.seq LIMIT ?3",
     )?;
@@ -1673,7 +1749,13 @@ pub(crate) fn check_closure(closure: &Value) -> Result<()> {
     ensure!(
         matches!(
             state,
-            "answered" | "approved" | "denied" | "withdrawn" | "task_done" | "task_cancelled"
+            "answered"
+                | "approved"
+                | "denied"
+                | "withdrawn"
+                | "dismissed"
+                | "task_done"
+                | "task_cancelled"
         ),
         "invalid closure state"
     );
@@ -1977,12 +2059,6 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         );
         let request_id = correlation.context("closure requires correlation")?;
         let request = by_id(store, request_id)?.context("unknown closed request")?;
-        ensure!(
-            request["from"] == from
-                && request["to"] == to
-                && matches!(request["kind"].as_str(), Some("request" | "decision")),
-            "only the sender can close its request"
-        );
         let reason = end
             .get("reason")
             .and_then(Value::as_str)
@@ -1990,9 +2066,26 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         ensure!(reason.len() <= 2000, "closure reason exceeds 2000 bytes");
         let state = required(end, "state")?;
         ensure!(
-            matches!(state, "withdrawn" | "task_done" | "task_cancelled"),
-            "invalid closure state"
+            matches!(request["kind"].as_str(), Some("request" | "decision")),
+            "only requests and decisions are closed"
         );
+        // The captain's desk on another machine dismisses a request to the
+        // captain; only its sender ends it any other way.
+        if state == "dismissed" {
+            ensure!(
+                from == CAPTAIN && request["from"] == to && request["to"] == CAPTAIN,
+                "only the captain dismisses a request to the captain"
+            );
+        } else {
+            ensure!(
+                request["from"] == from && request["to"] == to,
+                "only the sender can close its request"
+            );
+            ensure!(
+                matches!(state, "withdrawn" | "task_done" | "task_cancelled"),
+                "invalid closure state"
+            );
+        }
         tx.execute("UPDATE mail SET state=?2,ended_by=?3,ended_ms=?4,end_reason=?5 WHERE id=?1 AND state='open'", params![request_id,state,id,now,reason])?;
     }
     let receipt = closure_receipt(
@@ -2031,14 +2124,20 @@ fn inbox(store: &Store, args: &Value) -> Result<Value> {
     local_address(store, address)?;
     let acknowledged = cursor(store, address)?;
     // By default only unacknowledged mail; after_seq pages through history.
-    let after = match args.get("after_seq").and_then(Value::as_i64) {
-        Some(after) => after.max(0),
-        None if args.get("all") == Some(&json!(true)) => 0,
-        None => acknowledged,
+    let (after, unread) = match args.get("after_seq").and_then(Value::as_i64) {
+        Some(after) => (after.max(0), false),
+        None if args.get("all") == Some(&json!(true)) => (0, false),
+        None => (acknowledged, true),
+    };
+    // A notice the captain dismissed one by one is read, though the cursor is behind it.
+    let dismissed = if unread {
+        " AND COALESCE(state,'') <> 'acknowledged'"
+    } else {
+        ""
     };
     let now = Store::now_ms();
     let mut statement = store.connection().prepare(&format!(
-        "SELECT {COLUMNS} FROM mail WHERE recipient=?1 AND seq>?2 ORDER BY seq LIMIT ?3"
+        "SELECT {COLUMNS} FROM mail WHERE recipient=?1 AND seq>?2{dismissed} ORDER BY seq LIMIT ?3"
     ))?;
     let messages = statement
         .query_map(params![address, after, limit(args, 40)], message)?

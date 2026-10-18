@@ -18,6 +18,10 @@ liaison in its own home, uses ordinary Store startup, and is not a bounded
 read-only Needs observation. A raw waiting request is not proof of an actionable
 typed Need or current approval authority. `captain.relay` cites a recent captain
 message to answer ordinary questions; it refuses typed production approvals.
+The operator's `captain.reply {id, body?, payload?}` and `captain.dismiss {id,
+note?}` find an item by id or unique prefix in whichever fleet home holds it
+and answer it, or close it without an answer (`dismissed`), there; a dismissed
+item leaves both lists (see [architecture](architecture.md)).
 Neither liaison desk permission nor cited prose permits `runtime.needs`, live
 bridge actions, or an approval grant. Unsupported facts remain unknown.
 
@@ -54,7 +58,11 @@ not be presented as independent origins. Item IDs are not mutation permission.
 Supported typed facts:
 
 * **decision**: any open request/decision addressed to captain. `source_id` and
-  `correlation` identify the request; `ship`, optional `task_id`, `created_ms`,
+  `correlation` identify the request; `mail_id` (the same id, to join with
+  `captain.waiting`), `mail_kind` (`request` or `decision`), `urgency`,
+  `deadline_ms` (null without a reply deadline), `asked_ms` and `needs_hands`
+  (whether the ask carries a hands-on step) describe the mail itself, for
+  sorting; `ship`, optional `task_id`, `created_ms`,
   `question` (max 2000 characters), `choices` (else empty/free text), and `version`
   accompany it. Reply with `mail.send` from captain to that ship, kind reply,
   correlation = source_id and a stable client-generated message ID. Existing

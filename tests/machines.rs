@@ -3573,3 +3573,106 @@ fn a_relay_on_the_other_machine_joins_the_ask_at_the_desk_and_only_the_desks_all
     let relayed = mac.ok("scout", "mail.show", json!({"id": relay["id"]}));
     assert_eq!(relayed["state"], "answered", "{relayed}");
 }
+
+#[test]
+fn the_captain_replies_to_and_dismisses_an_ask_from_the_other_machine_by_prefix() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let ask = |body: &str| {
+        mac.ok(
+            "fitforge",
+            "mail.send",
+            json!({"from": "fitforge", "to": "captain", "kind": "request", "body": body}),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let answered = ask("Upload build 12?");
+    let dismissed = ask("Upload build 11?");
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["delivered"], 2, "{pass}");
+
+    // The captain on the laptop answers from any folder, by prefix; the
+    // answer crosses the link and closes the request where it was asked.
+    let replied = laptop.ok_over(
+        "liaison",
+        "captain.reply",
+        json!({"id": &answered[..8], "body": "Yes, ship it"}),
+        &ssh,
+    );
+    assert_eq!(replied["id"], answered, "{replied}");
+    let there = mac.ok("fitforge", "mail.show", json!({"id": answered}));
+    assert_eq!(there["state"], "answered", "{there}");
+
+    // A dismissal crosses the same way: dismissed there, with one notice.
+    let closed = laptop.ok_over(
+        "liaison",
+        "captain.dismiss",
+        json!({"id": &dismissed[..8], "note": "build 11 is superseded"}),
+        &ssh,
+    );
+    assert_eq!(closed["state"], "dismissed", "{closed}");
+    let there = mac.ok("fitforge", "mail.show", json!({"id": dismissed}));
+    assert_eq!(there["state"], "dismissed", "{there}");
+    assert_eq!(there["end_reason"], "build 11 is superseded");
+    let told: Vec<Value> = messages(&mac, "fitforge", "notice")
+        .into_iter()
+        .filter(|m| m["correlation"] == dismissed.as_str())
+        .collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0]["from"], "captain");
+    let waiting = laptop.ok("liaison", "captain.waiting", json!({}));
+    assert_eq!(waiting["waiting"], json!([]), "{waiting}");
+}
+
+#[test]
+fn a_dismissal_closes_the_ask_on_the_desk_and_where_it_was_asked() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let ask = |body: &str| {
+        laptop.ok(
+            "scout",
+            "mail.send",
+            json!({"from": "scout", "to": "captain", "kind": "request", "body": body}),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let at_desk = ask("Rotate the deploy key?");
+    let at_home = ask("Rotate the signing key?");
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 2, "{pass}");
+
+    // Dismissed at the desk: the next collection closes it where it was asked.
+    let closed = mac.ok(
+        "fitforge",
+        "captain.dismiss",
+        json!({"id": &at_desk[..8], "note": "rotated already"}),
+    );
+    assert_eq!(closed["state"], "dismissed", "{closed}");
+    collect(&laptop, &ssh);
+    let request = laptop.ok("scout", "mail.show", json!({"id": at_desk}));
+    assert_eq!(request["state"], "dismissed", "{request}");
+    assert_eq!(request["end_reason"], "rotated already");
+
+    // Dismissed where it was asked: the desk's copy closes on the next pass.
+    laptop.ok(
+        "scout",
+        "captain.dismiss",
+        json!({"id": at_home, "note": "not needed"}),
+    );
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    // The ask dismissed at the desk is offered back too; its copy is already closed.
+    assert_eq!(pass["machines"][0]["captain_closed"], 2, "{pass}");
+    let copy = mac.ok("fitforge", "mail.show", json!({"id": at_home}));
+    assert_eq!(copy["state"], "dismissed", "{copy}");
+    assert_eq!(copy["end_reason"], "not needed");
+    let waiting = mac.ok("fitforge", "captain.waiting", json!({}));
+    assert_eq!(waiting["waiting"], json!([]), "{waiting}");
+}
