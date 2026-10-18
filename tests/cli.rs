@@ -669,6 +669,10 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
     // A captain's own hands are marked, with the exact step, never buried in a report.
     assert!(agents.contains(r#""needs_hands":{"step":"#), "{agents}");
     assert!(agents.contains("Never bury such an ask under a report"));
+    // A captain's choice between options is a typed decision, not a question in the body.
+    assert!(agents.contains(
+        "send it as `kind` `decision` with `payload.decision`, not as a question in the body"
+    ));
     assert!(agents.contains(&format!("{BIN} --home ")));
     // Issue 101: a ship that may publish owns its pull requests to merge.
     assert!(agents.contains("you own your pull requests end to end"));

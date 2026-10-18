@@ -342,6 +342,9 @@ fn observe(
                         .take(20)
                         .collect::<Vec<_>>()
                 );
+                if !payload["decision"].is_null() {
+                    item["decision"] = payload["decision"].clone();
+                }
                 item["correlation"] = json!(id);
                 item["created_ms"] = message["created_ms"].clone();
             }
