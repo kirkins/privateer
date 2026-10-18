@@ -826,7 +826,11 @@ fn uses_need_a_tier_and_known_words_and_strength_shows_in_bearings_and_profile()
         json!({"cost":"plan","tier":1,"uses":["review","implement"]}),
         "{profile}"
     );
-    assert_eq!(profile["routes"]["routes"]["plain"]["tier"], Value::Null, "{profile}");
+    assert_eq!(
+        profile["routes"]["routes"]["plain"]["tier"],
+        Value::Null,
+        "{profile}"
+    );
 }
 
 #[test]

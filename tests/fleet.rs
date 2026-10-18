@@ -2394,7 +2394,10 @@ fn the_ship_profile_shows_a_hosted_claude_ship_its_routes_and_fleet_permissions(
         profile["routes"],
         json!({"crew":{"list":"ship","names":["cheap","spare"]},
             "errand":{"list":"none","names":[]},
-            "first_mate":{"list":"fleet","names":["fast"]}})
+            "first_mate":{"list":"fleet","names":["fast"]},
+            "routes":{"cheap":{"cost":"plan","tier":null,"uses":[]},
+                "spare":{"cost":"plan","tier":null,"uses":[]},
+                "fast":{"cost":"plan","tier":null,"uses":[]}}})
     );
     assert!(
         profile["charter"]["actions"]
