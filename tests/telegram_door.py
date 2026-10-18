@@ -397,6 +397,54 @@ def main() -> int:
                 if m["kind"] == "reply" and m["correlation"] == decision["id"]
                 and m["body"] == "eu-west"])
 
+            # A typed decision shows its question, why, what is blocked and each
+            # option; one button per option. A tap answers with the option id.
+            typed = fleet.call("ops", "mail.send", {
+                "from": "ops", "to": "captain", "kind": "decision", "body": "",
+                "payload": {"decision": {
+                    "question": "Ship the release today?",
+                    "why": "The build is green but the notes are unreviewed.",
+                    "blocked": ["Store submission"],
+                    "options": [
+                        {"id": "ship", "label": "Ship it", "cost": "Notes unreviewed",
+                         "what_happens": "The release goes out now."},
+                        {"id": "wait", "label": "Wait for review", "recommended": True,
+                         "what_happens": "Nothing ships until review."},
+                        {"id": "split", "label": "Ship the core",
+                         "what_happens": "Only the core goes out."}]}}})
+            typed_card = wait_for("the typed decision card", lambda: [
+                m for m in telegram.sent() if "Ship the release today?" in m["text"]])[0]
+            for words in ("The build is green", "Store submission", "Notes unreviewed",
+                          "Nothing ships until review.", "(recommended)"):
+                assert words in typed_card["text"], typed_card["text"]
+            keyboard = json.loads(typed_card["reply_markup"])["inline_keyboard"]
+            assert [row[0]["text"] for row in keyboard] == [
+                "Ship it", "Wait for review", "Ship the core"], keyboard
+            telegram.update(callback={"id": "cb2", "from": {"id": CAPTAIN},
+                                      "data": keyboard[1][0]["callback_data"],
+                                      "message": {"message_id": 1, "chat": {"id": CHAT}}})
+            tapped = wait_for("the typed tap's answer", lambda: [
+                m for m in fleet.inbox("ops", "ops")
+                if m["kind"] == "reply" and m["correlation"] == typed["id"]])[0]
+            assert tapped["body"] == "Wait for review", tapped
+            assert tapped["payload"] == {"answer": {"option_id": "wait"}}, tapped
+            assert fleet.call("ops", "mail.show", {"id": typed["id"]})["state"] == "answered"
+
+            # Free text typed as a reply to the card answers it with text.
+            asked = fleet.call("ops", "mail.send", {
+                "from": "ops", "to": "captain", "kind": "decision", "body": "",
+                "payload": {"decision": {"question": "Which build goes out?", "options": [
+                    {"id": "b11", "label": "Build 11", "what_happens": "The older build."},
+                    {"id": "b12", "label": "Build 12", "what_happens": "The newer build."}]}}})
+            asked_card = wait_for("the text decision card", lambda: [
+                m for m in telegram.sent() if "Which build goes out?" in m["text"]])[0]
+            telegram.message("Build 12, with the notes fixed.", reply_to=asked_card["_message_id"])
+            written = wait_for("the typed text answer", lambda: [
+                m for m in fleet.inbox("ops", "ops")
+                if m["kind"] == "reply" and m["correlation"] == asked["id"]])[0]
+            assert written["payload"] == {"answer": {"text": "Build 12, with the notes fixed."}}, written
+            assert fleet.call("ops", "mail.show", {"id": asked["id"]})["state"] == "answered"
+
             for ship in ("liaison", "ops"):
                 for m in fleet.inbox(ship, ship):
                     assert "everything" not in m["body"] and "elsewhere" not in m["body"], m

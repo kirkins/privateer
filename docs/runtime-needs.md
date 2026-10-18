@@ -60,6 +60,13 @@ Supported typed facts:
   correlation = source_id and a stable client-generated message ID. Existing
   recipient/open-state checks run inside the write transaction; retries with the
   same message ID/content are idempotent. Acknowledgement never resolves it.
+  A decision may carry `payload.decision` (a `question` and two to eight
+  `options`, each with an `id`, `label` and `what_happens`, at most one
+  `recommended`). The runtime checks its shape when it is sent and delivered,
+  fills `choices` with the option labels when none are given, and reports the
+  decision unchanged as `decision`. The captain answers with a reply whose
+  `payload.answer` names an `option_id`, `text`, or both; the id must be one of
+  the decision's options, and text is always accepted.
 * **approval**: only a request with `request_kind:"production_approval"`, to
   captain, local `task_id`, and payload `{artifact,environment,choices?}`. Sending
   captures the current charter hash; obsolete/revoked authority is omitted.

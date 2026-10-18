@@ -11,6 +11,7 @@ use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 pub const CAPTAIN: &str = "captain";
@@ -584,6 +585,213 @@ fn confirm_stow(store: &Store, payload: &Value) -> Result<()> {
     Ok(())
 }
 
+const DECISION_FIELDS: &[&str] = &[
+    "question",
+    "why",
+    "blocked",
+    "options",
+    "free_text_ok",
+    "group",
+];
+const OPTION_FIELDS: &[&str] = &["id", "label", "what_happens", "cost", "recommended"];
+const MAX_DECISION_OPTIONS: usize = 8;
+
+/// A string whose length in characters is within `min..=max`. Errors name the
+/// field and its bounds, never the value.
+fn bounded_text<'a>(value: &'a Value, field: &str, min: usize, max: usize) -> Result<&'a str> {
+    let text = value
+        .as_str()
+        .with_context(|| format!("{field} must be a string"))?;
+    let len = text.chars().count();
+    ensure!(
+        (min..=max).contains(&len),
+        "{field} must be {min} to {max} characters"
+    );
+    Ok(text)
+}
+
+/// A short identifier: letters, digits, `-` and `_`.
+fn decision_identifier<'a>(value: &'a Value, field: &str, max: usize) -> Result<&'a str> {
+    let id = bounded_text(value, field, 1, max)?;
+    ensure!(
+        id.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "{field} takes letters, digits, - and _"
+    );
+    Ok(id)
+}
+
+/// The card a captain answers with one tap. Its shape is checked here, before
+/// anything is stored, so every reader gets the same well-formed decision.
+fn validate_decision(decision: &Value) -> Result<()> {
+    let fields = decision.as_object().context("decision must be an object")?;
+    ensure!(
+        fields.keys().all(|k| DECISION_FIELDS.contains(&k.as_str())),
+        "decision takes only {}",
+        DECISION_FIELDS.join(", ")
+    );
+    bounded_text(
+        decision
+            .get("question")
+            .context("decision.question is required")?,
+        "decision.question",
+        1,
+        200,
+    )?;
+    if let Some(why) = decision.get("why") {
+        bounded_text(why, "decision.why", 0, 500)?;
+    }
+    if let Some(blocked) = decision.get("blocked") {
+        let items = blocked
+            .as_array()
+            .context("decision.blocked must be a list")?;
+        ensure!(items.len() <= 10, "decision.blocked takes at most 10 items");
+        for item in items {
+            bounded_text(item, "decision.blocked items", 0, 200)?;
+        }
+    }
+    if let Some(free_text_ok) = decision.get("free_text_ok") {
+        ensure!(
+            free_text_ok.is_boolean(),
+            "decision.free_text_ok must be true or false"
+        );
+    }
+    if let Some(group) = decision.get("group") {
+        decision_identifier(group, "decision.group", 64)?;
+    }
+    let options = decision
+        .get("options")
+        .and_then(Value::as_array)
+        .context("decision.options must be a list")?;
+    ensure!(
+        (2..=MAX_DECISION_OPTIONS).contains(&options.len()),
+        "decision.options takes 2 to {MAX_DECISION_OPTIONS} options"
+    );
+    let mut ids = HashSet::new();
+    let mut recommended = 0;
+    for option in options {
+        let fields = option
+            .as_object()
+            .context("decision.options items must be objects")?;
+        ensure!(
+            fields.keys().all(|k| OPTION_FIELDS.contains(&k.as_str())),
+            "decision.options items take only {}",
+            OPTION_FIELDS.join(", ")
+        );
+        let id = decision_identifier(
+            option
+                .get("id")
+                .context("decision.options items need an id")?,
+            "decision.options id",
+            32,
+        )?;
+        ensure!(ids.insert(id), "decision.options ids must be unique");
+        bounded_text(
+            option
+                .get("label")
+                .context("decision.options items need a label")?,
+            "decision.options label",
+            1,
+            80,
+        )?;
+        bounded_text(
+            option
+                .get("what_happens")
+                .context("decision.options items need what_happens")?,
+            "decision.options what_happens",
+            1,
+            400,
+        )?;
+        if let Some(cost) = option.get("cost") {
+            bounded_text(cost, "decision.options cost", 0, 80)?;
+        }
+        if let Some(flag) = option.get("recommended") {
+            let flag = flag
+                .as_bool()
+                .context("decision.options recommended must be true or false")?;
+            recommended += usize::from(flag);
+        }
+    }
+    ensure!(
+        recommended <= 1,
+        "decision.options takes at most one recommended option"
+    );
+    Ok(())
+}
+
+/// Check the typed parts of a message's payload, and fill in what older doors
+/// read. Shared by sending and by delivery, so a home refuses the same shapes
+/// whichever way they arrive.
+fn typed_payload(kind: &str, payload: &mut Value) -> Result<()> {
+    // Only a decision message carries a typed decision. Other mail keeps any
+    // payload it had, including a key named decision or answer, as before.
+    if kind != "decision" {
+        return Ok(());
+    }
+    if let Some(decision) = payload.get("decision").cloned() {
+        validate_decision(&decision)?;
+        // Older doors show only plain choices, so the labels stand in for them.
+        if payload.get("choices").is_none() {
+            payload["choices"] = json!(
+                decision["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|option| option["label"].clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The typed decision a reply answers, if the thread is one.
+fn typed_decision(thread: &Value) -> Option<&Value> {
+    (thread["kind"] == "decision")
+        .then(|| thread["payload"].get("decision"))
+        .flatten()
+}
+
+/// The option ids a decision offers, in its own order.
+fn decision_option_ids(decision: &Value) -> Vec<&str> {
+    decision["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option["id"].as_str())
+        .collect()
+}
+
+/// A captain's typed answer to a decision: one of its option ids, free text, or
+/// both. Free text is always accepted, whatever the decision's `free_text_ok`.
+fn check_answer(decision: &Value, answer: &Value) -> Result<()> {
+    let fields = answer.as_object().context("answer must be an object")?;
+    ensure!(
+        fields
+            .keys()
+            .all(|k| matches!(k.as_str(), "option_id" | "text")),
+        "answer takes only option_id and text"
+    );
+    ensure!(
+        fields.contains_key("option_id") || fields.contains_key("text"),
+        "answer needs option_id, text or both"
+    );
+    if let Some(option_id) = fields.get("option_id") {
+        let option_id = option_id
+            .as_str()
+            .context("answer.option_id must be a string")?;
+        ensure!(
+            decision_option_ids(decision).contains(&option_id),
+            "answer.option_id must be one of the decision's option ids"
+        );
+    }
+    if let Some(text) = fields.get("text") {
+        // As long as a Telegram message, so a typed reply to a card always fits.
+        bounded_text(text, "answer.text", 1, 4096)?;
+    }
+    Ok(())
+}
+
 fn send(store: &Store, args: &Value) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
@@ -654,13 +862,14 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         let charter = store.active_charter(task)?;
         payload["charter_hash"] = json!(crate::core::hash(&charter));
     }
+    typed_payload(kind, &mut payload)?;
     if let Some(choices) = payload.get("choices") {
         let choices = choices.as_array().context("choices must be an array")?;
         ensure!(
             choices.len() <= 20
-                && choices
-                    .iter()
-                    .all(|v| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200)),
+                && choices.iter().all(|v| v
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty() && s.chars().count() <= 200)),
             "choices must contain at most 20 bounded strings"
         );
     }
@@ -770,6 +979,12 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
                         thread["state"] == "open",
                         "{correlation} was already answered"
                     );
+                    // Only an answer to a typed decision is checked against its options.
+                    if let (Some(answer), Some(decision)) =
+                        (payload.get("answer"), typed_decision(&thread))
+                    {
+                        check_answer(decision, answer)?;
+                    }
                 }
             }
             // The captain's request may live in the home that asked it, not
@@ -1311,8 +1526,9 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     let correlation = optional_str(args, "correlation")?;
     let request_kind = optional_str(args, "request_kind")?;
     let body = args.get("body").and_then(Value::as_str).unwrap_or("");
-    let payload = args.get("payload").cloned().unwrap_or(json!({}));
+    let mut payload = args.get("payload").cloned().unwrap_or(json!({}));
     ensure!(payload.is_object(), "payload must be an object");
+    typed_payload(kind, &mut payload)?;
     hands_step(kind, to, &payload)?;
     let urgency = optional_str(args, "urgency")?.unwrap_or("normal");
     ensure!(URGENCIES.contains(&urgency), "invalid urgency");
@@ -1355,6 +1571,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             ),
             "{correlation} was already answered"
         );
+        // Only an answer to a typed decision is checked against its options.
+        if let (Some(answer), Some(decision)) = (payload.get("answer"), typed_decision(&request)) {
+            check_answer(decision, answer)?;
+        }
     }
     let now = Store::now_ms();
     tx.execute(

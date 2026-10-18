@@ -2512,3 +2512,324 @@ fn needs_names_capacity_held_by_no_live_process_and_leaves_ordinary_waits_alone(
         .unwrap();
     assert_eq!(kept, 1);
 }
+
+/// The captain's reply to a decision, carrying one typed answer.
+fn answer(store: &mut Store, id: &str, correlation: &str, answer: Value) -> anyhow::Result<Value> {
+    dispatch(
+        store,
+        "mail.send",
+        json!({"id":id,"from":"captain","to":"apps","kind":"reply",
+            "correlation":correlation,"body":"Answered","payload":{"answer":answer}}),
+    )
+}
+
+fn two_options() -> Value {
+    json!([
+        {"id":"ship","label":"Ship it","what_happens":"The release goes out today."},
+        {"id":"wait","label":"Wait","what_happens":"Nothing ships until review.","cost":"A day","recommended":true}
+    ])
+}
+
+fn decision_with(id: &str, decision: Value) -> Value {
+    json!({"id":id,"from":"apps","to":"captain","kind":"decision","body":"Which path?",
+        "payload":{"decision":decision}})
+}
+
+fn valid_decision() -> Value {
+    json!({"question":"Which path?","options":two_options()})
+}
+
+#[test]
+fn a_typed_decision_round_trips_and_its_labels_fill_the_plain_choices() {
+    let (_temp, mut s) = fleet();
+    let sent = send(&mut s, decision_with("typed", valid_decision())).unwrap();
+    assert_eq!(sent["payload"]["choices"], json!(["Ship it", "Wait"]));
+    let shown = dispatch(&mut s, "mail.show", json!({"id":"typed"})).unwrap();
+    assert_eq!(shown["payload"]["decision"], valid_decision());
+    assert_eq!(shown["payload"]["choices"], json!(["Ship it", "Wait"]));
+    assert_eq!(shown["state"], "open");
+    let needs = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    let item = needs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["source_id"] == "typed")
+        .expect("the open decision is an item");
+    assert_eq!(item["decision"], valid_decision());
+    assert_eq!(item["choices"], json!(["Ship it", "Wait"]));
+}
+
+#[test]
+fn explicit_choices_stay_as_given_beside_a_typed_decision() {
+    let (_temp, mut s) = fleet();
+    let sent = send(
+        &mut s,
+        json!({"id":"explicit","from":"apps","to":"captain","kind":"decision","body":"Which?",
+            "payload":{"choices":["Ship","Hold"],"decision":valid_decision()}}),
+    )
+    .unwrap();
+    assert_eq!(sent["payload"]["choices"], json!(["Ship", "Hold"]));
+}
+
+/// The valid decision with one field edited.
+fn with(edit: impl FnOnce(&mut Value)) -> Value {
+    let mut decision = valid_decision();
+    edit(&mut decision);
+    decision
+}
+
+#[test]
+fn each_malformed_decision_field_is_refused_by_name_and_never_echoed() {
+    let (_temp, mut s) = fleet();
+    let marker = "SECRETVALUE";
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            with(|d| d["question"] = json!("")),
+            "decision.question must be 1 to 200",
+        ),
+        (
+            with(|d| d["question"] = json!("q".repeat(201))),
+            "decision.question must be 1 to 200",
+        ),
+        (
+            with(|d| d["question"] = json!(5)),
+            "decision.question must be a string",
+        ),
+        (
+            with(|d| {
+                d.as_object_mut().unwrap().remove("question");
+            }),
+            "decision.question is required",
+        ),
+        (
+            with(|d| d["why"] = json!("w".repeat(501))),
+            "decision.why must be 0 to 500",
+        ),
+        (
+            with(|d| d["blocked"] = json!(vec!["b"; 11])),
+            "decision.blocked takes at most 10",
+        ),
+        (
+            with(|d| d["blocked"] = json!(["b".repeat(201)])),
+            "decision.blocked items must be 0 to 200",
+        ),
+        (
+            with(|d| d["free_text_ok"] = json!("yes")),
+            "decision.free_text_ok must be true or false",
+        ),
+        (
+            with(|d| d["group"] = json!("bad group")),
+            "decision.group takes letters",
+        ),
+        (
+            with(|d| d["group"] = json!("g".repeat(65))),
+            "decision.group must be 1 to 64",
+        ),
+        (
+            with(|d| d["extra"] = json!(marker)),
+            "decision takes only question",
+        ),
+        (
+            with(|d| d["options"] = json!([two_options()[0]])),
+            "decision.options takes 2 to 8",
+        ),
+        (
+            with(|d| d["options"] = json!(vec![two_options()[0].clone(); 9])),
+            "decision.options takes 2 to 8",
+        ),
+        (
+            with(|d| d["options"][1]["id"] = json!("ship")),
+            "decision.options ids must be unique",
+        ),
+        (
+            with(|d| d["options"][1]["id"] = json!(format!("{marker} x"))),
+            "decision.options id takes letters",
+        ),
+        (
+            with(|d| d["options"][1]["id"] = json!("i".repeat(33))),
+            "decision.options id must be 1 to 32",
+        ),
+        (
+            with(|d| d["options"][1]["label"] = json!("")),
+            "decision.options label must be 1 to 80",
+        ),
+        (
+            with(|d| d["options"][1]["label"] = json!("l".repeat(81))),
+            "decision.options label must be 1 to 80",
+        ),
+        (
+            with(|d| d["options"][1]["what_happens"] = json!("h".repeat(401))),
+            "decision.options what_happens must be 1 to 400",
+        ),
+        (
+            with(|d| d["options"][1]["cost"] = json!("c".repeat(81))),
+            "decision.options cost must be 0 to 80",
+        ),
+        (
+            with(|d| d["options"][1]["recommended"] = json!("yes")),
+            "decision.options recommended must be true or false",
+        ),
+        (
+            with(|d| d["options"][0]["recommended"] = json!(true)),
+            "decision.options takes at most one recommended",
+        ),
+        (
+            with(|d| d["options"][1]["colour"] = json!(marker)),
+            "decision.options items take only id",
+        ),
+        (
+            with(|d| d["options"] = json!("ship")),
+            "decision.options must be a list",
+        ),
+    ];
+    for (n, (decision, expected)) in cases.into_iter().enumerate() {
+        let message = err(send(&mut s, decision_with(&format!("bad-{n}"), decision)));
+        assert!(message.contains(expected), "case {n}: {message}");
+        assert!(
+            !message.contains(marker),
+            "case {n} echoed a value: {message}"
+        );
+    }
+    // Other mail keeps a payload key named decision as it was: only a
+    // decision message carries a typed decision.
+    let plain = send(
+        &mut s,
+        json!({"id":"not-a-decision","from":"apps","to":"captain","kind":"request",
+        "body":"Which?","payload":{"decision":"repair-plan"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        plain["payload"],
+        json!({"decision":"repair-plan"}),
+        "{plain}"
+    );
+    let notice = send(
+        &mut s,
+        json!({"id":"fyi","from":"apps","to":"infra","kind":"notice","body":"done",
+        "payload":{"decision":"repair-plan","tested_head":"abc"}}),
+    )
+    .unwrap();
+    assert_eq!(notice["payload"]["decision"], "repair-plan", "{notice}");
+}
+
+#[test]
+fn a_captain_answers_by_option_text_or_both_and_a_bad_answer_leaves_the_decision_open() {
+    let (_temp, mut s) = fleet();
+    send(&mut s, decision_with("choose", valid_decision())).unwrap();
+    let refused = err(answer(
+        &mut s,
+        "unknown",
+        "choose",
+        json!({"option_id":"nope"}),
+    ));
+    assert!(
+        refused.contains("answer.option_id must be one of the decision's option ids"),
+        "{refused}"
+    );
+    assert!(!refused.contains("nope"), "{refused}");
+    for bad in [
+        json!({}),
+        json!({"option_id":5}),
+        json!({"option_id":"ship","extra":1}),
+        json!({"text":""}),
+        json!({"text":"t".repeat(4097)}),
+        json!("ship"),
+    ] {
+        assert!(answer(&mut s, "bad", "choose", bad).is_err());
+    }
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"choose"})).unwrap()["state"],
+        "open",
+        "a refused answer closes nothing"
+    );
+    assert!(answer(&mut s, "ok", "choose", json!({"option_id":"ship"})).is_ok());
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"choose"})).unwrap()["state"],
+        "answered"
+    );
+
+    send(&mut s, decision_with("free", valid_decision())).unwrap();
+    let text_only = dispatch(
+        &mut s,
+        "mail.send",
+        json!({"from":"captain","to":"apps","kind":"reply","correlation":"free",
+            "body":"Your call, ship the smaller part.","payload":{"answer":{"text":"Ship the smaller part."}}}),
+    );
+    assert!(text_only.is_ok(), "{text_only:?}");
+    send(&mut s, decision_with("both", valid_decision())).unwrap();
+    let both = dispatch(
+        &mut s,
+        "mail.send",
+        json!({"from":"captain","to":"apps","kind":"reply","correlation":"both",
+            "body":"Wait, with a note.","payload":{"answer":{"option_id":"wait","text":"Until Monday."}}}),
+    );
+    assert!(both.is_ok(), "{both:?}");
+    for id in ["free", "both"] {
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":id})).unwrap()["state"],
+            "answered",
+            "{id} is closed by its answer"
+        );
+    }
+}
+
+#[test]
+fn an_answer_is_checked_only_against_a_typed_decision() {
+    let (_temp, mut s) = fleet();
+    send(
+        &mut s,
+        json!({"id":"plain","from":"apps","to":"captain","kind":"decision","body":"Ship?"}),
+    )
+    .unwrap();
+    // A plain decision has no options to check against: the answer rides
+    // along and the reply closes it as before.
+    dispatch(
+        &mut s,
+        "mail.send",
+        json!({"from":"captain","to":"apps","kind":"reply","correlation":"plain",
+            "body":"Yes","payload":{"answer":{"text":"Yes"}}}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"plain"})).unwrap()["state"],
+        "answered"
+    );
+    // Other mail keeps a payload key named answer as it was.
+    send(
+        &mut s,
+        json!({"from":"apps","to":"infra","kind":"notice","body":"fyi","payload":{"answer":{"text":"x"}}}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_choice_is_bounded_in_characters_so_a_full_label_is_not_refused() {
+    let (_temp, mut s) = fleet();
+    // Eighty characters of CJK text: 240 bytes, which a byte count would refuse.
+    let label = "漢".repeat(80);
+    let plain = send(
+        &mut s,
+        json!({"id":"cjk-plain","from":"apps","to":"captain","kind":"decision","body":"Which?",
+            "payload":{"choices":[label.clone(), "Hold"]}}),
+    );
+    assert!(plain.is_ok(), "{plain:?}");
+    let typed = send(
+        &mut s,
+        decision_with(
+            "cjk-typed",
+            json!({"question":"Which?","options":[
+                {"id":"long","label":label,"what_happens":"Stays."},
+                {"id":"short","label":"Hold","what_happens":"Stays."}]}),
+        ),
+    );
+    assert!(typed.is_ok(), "{typed:?}");
+    let too_long = err(send(
+        &mut s,
+        json!({"id":"too-long","from":"apps","to":"captain","kind":"decision","body":"Which?",
+            "payload":{"choices":["x".repeat(201)]}}),
+    ));
+    assert!(
+        too_long.contains("choices must contain at most 20 bounded strings"),
+        "{too_long}"
+    );
+}

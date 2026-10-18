@@ -1424,3 +1424,41 @@ fn a_standing_grant_lets_a_ship_act_on_another_until_paused_or_revoked() {
     machine.ok(&liaison, &["grant", "revoke", &id]);
     assert!(!rescope("Revoked"));
 }
+
+#[test]
+fn a_typed_decision_reaches_the_liaison_with_its_options_whole() {
+    let machine = Machine::new();
+    let liaison = liaison(&machine);
+    let apps = machine.ship("apps");
+    let decision = machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"apps","to":"captain","kind":"decision","body":"Which path?",
+        "payload":{"decision":{"question":"Which path?","options":[
+            {"id":"a","label":"Path A","what_happens":"Work starts now."},
+            {"id":"b","label":"Path B","what_happens":"Nothing starts.","recommended":true}
+        ]}}}),
+    );
+    assert_eq!(decision["payload"]["choices"], json!(["Path A", "Path B"]));
+    let out = machine.as_agent(&liaison, "liaison", "captain.waiting", json!({}));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let read: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let item = read["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["mail"]["id"] == decision["id"])
+        .expect("the decision is waiting");
+    assert_eq!(
+        item["mail"]["payload"]["decision"]["question"],
+        "Which path?"
+    );
+    assert_eq!(
+        item["mail"]["payload"]["decision"]["options"][1]["recommended"],
+        true
+    );
+    assert_eq!(
+        item["mail"]["payload"]["choices"],
+        json!(["Path A", "Path B"])
+    );
+}
