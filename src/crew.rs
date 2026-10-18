@@ -103,7 +103,9 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
     let Some(ship) = owning_ship(store, task_id)? else {
         return Ok(());
     };
-    if parked_on(store, job_id)? || job["quiet"] == true {
+    // A task closed by its owner cancels its crew quietly; any other ending
+    // of a quiet job, such as an orphan still holding capacity, is reported.
+    if parked_on(store, job_id)? || (job["quiet"] == true && status == "cancelled") {
         return Ok(());
     }
     // A first mate is not told about its own wake: that would wake it again.
