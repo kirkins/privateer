@@ -46,6 +46,7 @@ mod snapshot;
 pub mod store;
 pub mod stow;
 mod tool_bundles;
+mod usage;
 pub mod watch;
 pub mod workspace;
 
@@ -98,6 +99,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "ship.profile",
     "fleet.snapshot",
     "report.get",
+    "usage.summary",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
@@ -153,6 +155,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             snapshot::snapshot(&args)
         }
         "fleet" => fleet::dispatch(store, command, args),
+        "usage" if command == "usage.summary" => {
+            store.caller().require_operator(command)?;
+            usage::summary(store, &args)
+        }
         "machine" => machines::dispatch(store, command, args),
         "grant" => grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),

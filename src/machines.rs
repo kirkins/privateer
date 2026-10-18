@@ -1068,6 +1068,16 @@ pub(crate) fn snapshot_of(name: &str, args: Value) -> Result<Value> {
     call(&machine, "fleet.snapshot", args, Some(SNAPSHOT_TIMEOUT))
 }
 
+/// Asking a machine this one reaches for its own homes' usage.
+const USAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn usage_of(name: &str, args: Value) -> Result<Value> {
+    let conn = crate::fleet::registry()?;
+    let machine = machine(&conn, name)?;
+    ensure!(machine.role == "collects", "{name} reaches this machine");
+    call(&machine, "usage.summary", args, Some(USAGE_TIMEOUT))
+}
+
 /// Asking a linked machine about its own stow, when it may be asleep.
 const STOW_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2002,6 +2012,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     match command {
         // Only this machine's own section: a gateway never asks its links.
         "fleet.snapshot" => crate::snapshot::own(&conn, args["since"].as_i64()),
+        // The same for usage: this machine's homes, read-only.
+        "usage.summary" => crate::usage::local(args),
         "fleet.link" => {
             let name = required(args, "machine")?;
             identifier(name)?;
