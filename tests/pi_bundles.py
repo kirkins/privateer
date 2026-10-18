@@ -436,7 +436,7 @@ class Bundles(unittest.TestCase):
         self.assertNotIn(sentinel, run.stdout + run.stderr)
 
 
-    # Selected MCP servers: remote streamable-HTTP, Pi only, Bearer by credential ref.
+    # Selected MCP servers: remote streamable-HTTP, Bearer by credential ref.
     def mcp_record(self, **change):
         record = {'name': 'docs', 'url': 'https://mcp.example.test/mcp', 'credential': 'DOCS_TOKEN', 'timeout': 5}
         record.update(change)
@@ -562,17 +562,17 @@ class Bundles(unittest.TestCase):
         tampered['mcp_servers'][0]['headers'] = {'Authorization': 'x'}
         with self.assertRaises(ValueError):
             bundles.validate_plan(tampered)
-        # Claude has no bounded MCP loader: refuse, never drop the server.
-        with self.assertRaises(ValueError):
-            bundles.plan(registry, ['docs@1'], 'crew', harness='claude')
-        # A forged Claude plan that carries servers refuses at validation.
+        # A Claude plan carries the same selected servers, and only those.
         # A Claude plan reads user settings; keep the developer's own out of it.
         (self.base / 'claude-config').mkdir(exist_ok=True)
         with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.base / 'claude-config')}):
-            claude = bundles.plan(dict(self.registry, claude_version='2.1.300'), ['selected@1'], 'crew', harness='claude')
+            claude = bundles.plan(dict(registry, claude_version='2.1.300'), ['docs@1'], 'crew', harness='claude')
+        self.assertEqual(claude['mcp_servers'], plan['mcp_servers'])
         bundles.validate_plan(claude)
+        tampered = copy.deepcopy(claude)
+        tampered['mcp_servers'][0]['headers'] = {'Authorization': 'x'}
         with self.assertRaises(ValueError):
-            bundles.validate_plan(dict(claude, mcp_servers=[self.mcp_record()]))
+            bundles.validate_plan(tampered)
 
     def test_selected_mcp_preflight_adds_only_the_runtime_gate(self):
         import native_launch

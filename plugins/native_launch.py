@@ -43,8 +43,14 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         # Check every selected ref's stored file before any native probe.
         # Paths only, never values: the plan and argv carry names and refs.
         secrets = credential_environment(bundles, env)
+        if bundles.get("mcp_servers"):
+            # Records only (names, URLs, credential names, limits): the token
+            # is read from its file inside the harness, never passed here.
+            # Pi's gate and the headless Claude check both read them.
+            env["PRIVATEER_MCP_SERVERS"] = json.dumps(bundles["mcp_servers"], separators=(",", ":"), sort_keys=True)
     if bundles is not None and harness == "claude":
-        from claude_bundles import preflight
+        from claude_bundles import check_headers, preflight
+        check_headers(bundles.get("mcp_servers", []), {**env, **secrets})
         # Privateer's attended mail adapter is the one runtime-owned plugin.
         plugins = [Path(__file__).resolve().parent / "attended-claude"] if attended else []
         argv = preflight(bundles, argv, env=env, runtime_plugins=plugins, attended=attended)
@@ -52,10 +58,6 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         if harness != "pi":
             raise ValueError("bounded resources support only Pi and Claude")
         from pi_bundles import preflight
-        if bundles.get("mcp_servers"):
-            # Records only (names, URLs, credential names, limits): the token
-            # is read from its file inside the Pi process, never passed here.
-            env["PRIVATEER_MCP_SERVERS"] = json.dumps(bundles["mcp_servers"], separators=(",", ":"), sort_keys=True)
         directory = Path(__file__).resolve().parent
         extensions = [directory / "attended/mail.ts"] if attended else []
         crew = str(directory / "attended/crew.ts")

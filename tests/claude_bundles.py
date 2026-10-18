@@ -334,5 +334,65 @@ class ClaudeBundles(unittest.TestCase):
         self.assertEqual(launch(plan)[1]['PRIVATEER_CREDENTIAL_BRAVE_API_KEY_FILE'], str(path))
 
 
+    def test_selected_mcp_servers_load_by_config_with_headers_from_their_files(self):
+        docs = {'name': 'docs', 'url': 'https://mcp.example.test/mcp', 'credential': 'DOCS_TOKEN', 'timeout': 5}
+        hidden = {'name': 'hidden', 'url': 'https://hidden.example.test/mcp', 'credential': 'HIDDEN', 'timeout': 5}
+        self.registry['bundles'] = [
+            {'ref': 'docs@1', 'roles': ['first_mate', 'crew'], 'mcp_servers': [docs],
+             'credentials': [{'name': 'DOCS_TOKEN', 'ref': 'docs-search'}]},
+            {'ref': 'hidden@1', 'roles': ['crew'], 'mcp_servers': [hidden],
+             'credentials': [{'name': 'HIDDEN', 'ref': 'hidden-ref'}]}]
+        self.store('docs-search', b'SENTINEL-MCP-TOKEN\n')
+        os.environ['PRIVATEER_MCP_SERVERS'] = '[{"name":"inherited"}]'
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan(['docs@1']))
+        argv, env = execute.call_args.args[1:]
+        configs = [a for a in argv if a.startswith('--mcp-config')]
+        self.assertEqual(len(configs), 1)
+        self.assertLess(argv.index(configs[0]), argv.index('--'))
+        self.assertIn('--strict-mcp-config', argv)
+        # A private file, not an argument: a URL may hold a secret and argv is world-readable.
+        config = Path(configs[0].split('=', 1)[1])
+        self.assertEqual((config.stat().st_mode & 0o777, config.parent.stat().st_mode & 0o777), (0o600, 0o700))
+        self.assertNotIn(docs['url'], json.dumps(argv))
+        servers = json.loads(config.read_text())['mcpServers']
+        self.assertEqual(list(servers), ['docs'])
+        self.assertEqual({k: servers['docs'][k] for k in ('type', 'url')}, {'type': 'http', 'url': docs['url']})
+        self.assertEqual([r['name'] for r in json.loads(env['PRIVATEER_MCP_SERVERS'])], ['docs'])
+        self.assertNotIn('SENTINEL-MCP-TOKEN', json.dumps([argv, env]) + config.read_text())
+        # Claude runs the helper through a shell with the launch's environment.
+        helper = servers['docs']['headersHelper']
+        header = subprocess.run(helper, shell=True, env=env, capture_output=True, text=True)
+        self.assertEqual(json.loads(header.stdout), {'Authorization': 'Bearer SENTINEL-MCP-TOKEN'})
+        # A malformed or missing token refuses, naming only the credential.
+        for value in (b'two words', b'x' * 4097, b''):
+            self.store('docs-search', value)
+            with self.subTest(value=value[:12]):
+                refused = subprocess.run(helper, shell=True, env=env, capture_output=True, text=True)
+                self.assertEqual((refused.returncode, refused.stdout), (78, ''))
+                self.assertEqual(refused.stderr, 'privateer: MCP credential DOCS_TOKEN is unavailable.\n')
+        refused = subprocess.run(helper, shell=True, capture_output=True, text=True,
+                                 env={k: v for k, v in env.items() if not k.startswith('PRIVATEER_CREDENTIAL_')})
+        self.assertEqual(refused.returncode, 78)
+        # Claude would connect without the header, so a bad token refuses before launch.
+        # (Not self.refuses: its probe fakes every subprocess, the helper's too.)
+        with patch.object(native_launch.os, 'execvpe') as execute, self.assertRaises(bundles.Refused) as bad:
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan(['docs@1']))
+        self.assertEqual(bad.exception.field, 'mcp_servers.credential')
+        execute.assert_not_called()
+        # No servers selected: no config, no records, and the earlier argv.
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan([]))
+        argv, env = execute.call_args.args[1:]
+        self.assertFalse([a for a in argv if a.startswith('--mcp-config')])
+        self.assertNotIn('PRIVATEER_MCP_SERVERS', env)
+
+    def test_a_pi_only_registry_refusal_names_claude_version(self):
+        registry = {k: v for k, v in self.registry.items() if k != 'claude_version'}
+        with self.assertRaises(bundles.Refused) as refused:
+            bundles.plan(registry, ['selected@1'], 'crew', 'claude')
+        self.assertEqual(str(refused.exception), 'registry refused: claude_version')
+
+
 if __name__ == '__main__':
     unittest.main()

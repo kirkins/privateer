@@ -330,7 +330,7 @@ def bundle_name(index, bundle):
 
 def bundle(value, refs):
     # Optional executable extensions are not silently discarded: not
-    # supported in this stage. MCP servers are remote HTTP only (Pi only).
+    # supported in this stage. MCP servers are remote HTTP only.
     at('fields', lambda: keys(value, ('ref', 'roles', *(('skills',) if 'skills' in value else ()),
                                       *(('credentials',) if 'credentials' in value else ()),
                                       *(('mcp_servers',) if 'mcp_servers' in value else ()))))
@@ -413,8 +413,6 @@ def plan(registry, selected, role, harness='pi'):
     credentials(secrets)
     server_keys(servers)
     if harness == 'claude':
-        # Claude has no bounded MCP loader yet: refuse rather than drop a server.
-        require(not servers)
         from claude_bundles import plan as claude_plan
         result = claude_plan(registry, selected, skills)
     else:
@@ -442,8 +440,7 @@ def validate_plan(value):
     selection(value['selection'])
     credentials(value.get('credentials', []))
     if 'mcp_servers' in value:
-        # Only a Pi plan carries servers, and only a non-empty list (plan() omits empty).
-        require(not claude)
+        # Only a non-empty list: plan() omits the key when no server is selected.
         mcp_servers(value['mcp_servers'], {item['name'] for item in value.get('credentials', [])}, 8)
         server_keys(value['mcp_servers'])
     # Reuse registry qualification without carrying unselected definitions.

@@ -94,6 +94,37 @@ class ClaudeTurn(unittest.TestCase):
         self.assertEqual(line["denials"][0]["tool_input"]["file_path"], "/x/0")
         self.assertLess(len(run.stdout.splitlines()[-1]), 20_000)
 
+    def test_selected_mcp_servers_must_all_connect_before_the_first_turn(self):
+        # Records as the launcher sets them for a bounded run that selects servers.
+        records = json.dumps([{"name":"apify", "url":"https://mcp.apify.com", "credential":"APIFY", "timeout":120}])
+
+        def run(servers, tools=("Bash", "mcp__apify__search-actors")):
+            stream = self.root / "stream.jsonl"
+            stream.write_bytes(b"".join((json.dumps(e)+"\n").encode()
+                                        for e in [{**INIT, "mcp_servers":servers, "tools":list(tools)}, RESULT]))
+            done = subprocess.run([sys.executable, str(ROOT / "plugins/claude_turn.py"), "--control", "{}",
+                                   str(self.root / "claude"), "--print", "--output-format", "stream-json", "--", "p"],
+                                  capture_output=True, timeout=5,
+                                  env={**os.environ, "PRIVATEER_MCP_SERVERS":records,
+                                       "CLAUDE_TEST_STREAM":str(stream), "CLAUDE_TEST_EXIT":"0"})
+            return done.returncode, json.loads(done.stdout.splitlines()[-1])
+
+        code, summary = run([{"name":"apify", "status":"connected", "source":"dynamic"}])
+        self.assertEqual((code, summary["type"]), (0, "turn.completed"))
+        connected = [{"name":"apify", "status":"connected"}]
+        for servers, tools, reason in (([{"name":"apify", "status":"failed"}], None, "mcp-unavailable:apify"),
+                                       ([], None, "mcp-unavailable:apify"),
+                                       (connected, ["Bash"], "mcp-unavailable:apify"),
+                                       (connected + [{"name":"personal", "status":"connected"}], None,
+                                        "mcp-foreign:personal"),
+                                       (connected + [{"name":["x"]}], None, "mcp-foreign:unknown")):
+            with self.subTest(servers=servers, tools=tools):
+                code, summary = run(servers, *([tools] if tools else []))
+                self.assertEqual((code, summary["type"], summary["reason"]), (2, "native.turn.failed", reason))
+        # A run that selects no server keeps whatever servers it has.
+        run_, summary = self.run_stream([{**INIT, "mcp_servers":[{"name":"personal", "status":"failed"}]}, RESULT])
+        self.assertEqual((run_.returncode, summary["type"]), (0, "turn.completed"))
+
     def test_truncated_and_malformed_streams_fail(self):
         good = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, RESULT])
         for raw, reason in ((good[:-1], "truncated-stream"), (good+b"not-json\n", "invalid-json")):

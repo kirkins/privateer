@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Confirm a headless Claude run and record its native permission denials for the runtime."""
 import json
+import os
 import subprocess
 import sys
 
@@ -14,12 +15,34 @@ USAGE_FIELDS = (("input_tokens", "input"), ("output_tokens", "output"),
 class ClaudeTurn(Turn):
     """Claude's init names the session and one final result ends the run."""
 
-    def __init__(self, argv):
+    def __init__(self, argv, servers=()):
         flags = argv[:argv.index("--")] if "--" in argv else argv
         super().__init__(flags[flags.index("--resume") + 1] if "--resume" in flags else None)
         self.result = None
         self.denied = False
         self.denials = []
+        self.servers = list(servers)
+
+    def check_servers(self, reported, tools):
+        """Every selected MCP server connected with tools, and no other: the Pi
+        gate's guarantee, checked at init, before any tool runs. A run
+        that selects none is not checked: unbounded runs keep the user's own
+        servers, and a bounded one has --strict-mcp-config with no config."""
+        if not self.servers:
+            return
+        reported = reported if isinstance(reported, list) else []
+        tools = [tool for tool in tools if isinstance(tool, str)] if isinstance(tools, list) else []
+        status = {}
+        for item in reported:
+            name = item.get("name") if isinstance(item, dict) else None
+            if not (isinstance(name, str) and name in self.servers):
+                shown = name if isinstance(name, str) and name.isascii() and name.isprintable() else "unknown"
+                raise ValueError("mcp-foreign:" + shown[:32])
+            status[name] = item.get("status")
+        for name in self.servers:
+            # Connected and listing tools, as the Pi gate requires.
+            if status.get(name) != "connected" or not any(t.startswith(f"mcp__{name}__") for t in tools):
+                raise ValueError("mcp-unavailable:" + name)
 
     def observe(self, value):
         if not isinstance(value, dict):
@@ -27,6 +50,7 @@ class ClaudeTurn(Turn):
         kind = value.get("type")
         if kind == "system" and value.get("subtype") == "init":
             super().observe({"type": "session", "id": value.get("session_id")})
+            self.check_servers(value.get("mcp_servers"), value.get("tools"))
         elif kind == "result":
             if self.result is not None:
                 raise ValueError("repeated-result")
@@ -81,8 +105,17 @@ def report_denial(denials):
                      separators=(",", ":")), flush=True)
 
 
+def selected_servers(env):
+    """Names of the run's selected MCP servers, from the launcher's records."""
+    records = json.loads(env.get("PRIVATEER_MCP_SERVERS") or "[]")
+    if not isinstance(records, list) or not all(isinstance(r, dict) and isinstance(r.get("name"), str)
+                                                for r in records):
+        raise ValueError("mcp-selection")
+    return [record["name"] for record in records]
+
+
 def run(argv, control):
-    turn = ClaudeTurn(argv)
+    turn = ClaudeTurn(argv, selected_servers(os.environ))
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              env=native_environment())
     reason = None
