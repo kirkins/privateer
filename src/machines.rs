@@ -1096,6 +1096,16 @@ pub(crate) fn usage_of(name: &str, args: Value) -> Result<Value> {
     call(&machine, "usage.summary", args, Some(USAGE_TIMEOUT))
 }
 
+/// Asking a machine this one reaches for its own homes' activity.
+const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn activity_of(name: &str, args: Value) -> Result<Value> {
+    let conn = crate::fleet::registry()?;
+    let machine = machine(&conn, name)?;
+    ensure!(machine.role == "collects", "{name} reaches this machine");
+    call(&machine, "activity.list", args, Some(ACTIVITY_TIMEOUT))
+}
+
 /// Asking a linked machine about its own stow, when it may be asleep.
 const STOW_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2049,6 +2059,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "captain.waiting" | "captain.feed" | "captain.reply" | "captain.dismiss" => {
             crate::captain::serve(command, args)
         }
+        // Activity for this machine's own homes only, read-only.
+        "activity.list" => crate::activity::local(args),
         "fleet.link" => {
             let name = required(args, "machine")?;
             identifier(name)?;

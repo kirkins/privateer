@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod activity;
 pub mod admission;
 pub mod attention;
 pub mod away;
@@ -103,6 +104,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "fleet.snapshot",
     "report.get",
     "usage.summary",
+    "activity.list",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
@@ -161,6 +163,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "usage" if command == "usage.summary" => {
             store.caller().require_operator(command)?;
             usage::summary(store, &args)
+        }
+        "activity" if command == "activity.list" => {
+            store.caller().require_operator(command)?;
+            activity::list(store, &args)
         }
         "machine" => machines::dispatch(store, command, args),
         "grant" => grants::dispatch(store, command, args),
