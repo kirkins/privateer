@@ -1974,7 +1974,8 @@ fn the_ship_profile_shows_a_hosted_claude_ship_its_routes_and_fleet_permissions(
         profile["host"] = json!("herdr");
         profile["sleep_after_secs"] = json!(600);
         profile["options"] = json!({"model":"opus","permission_mode":"auto",
-            "api_key":sentinel,"provider":{"auth_token":sentinel,"region":"us"}});
+            "api_key":sentinel,"provider":{"auth_token":sentinel,"region":"us"},
+            "credentials":{"github":sentinel}});
     });
     let route = |manifest: &str| json!({"manifest":manifest,"cost":"plan"});
     machine.json(
@@ -2005,7 +2006,8 @@ fn the_ship_profile_shows_a_hosted_claude_ship_its_routes_and_fleet_permissions(
     assert_eq!(
         profile["first_mate"],
         json!({"harness":"claude","options":{"model":"opus","permission_mode":"auto",
-            "api_key":"<set>","provider":{"auth_token":"<set>","region":"us"}}})
+            "api_key":"<set>","provider":{"auth_token":"<set>","region":"us"},
+            "credentials":"<set>"}})
     );
     // The ship's own crew list replaces the fleet's; the rest are the fleet's.
     assert_eq!(
@@ -2085,7 +2087,7 @@ fn the_ship_profile_lists_selected_skills_and_mcp_servers_with_credential_names_
             "bundles":[{"ref":"docs@1","roles":["first_mate"],
                 "credentials":[{"name":"DOCS_TOKEN","ref":"docs-search"}],
                 "skills":[{"name":"lookup","root":skill,"sha256":tree}],
-                "mcp_servers":[{"name":"docs","url":format!("https://mcp.example.test/mcp?key={sentinel}"),
+                "mcp_servers":[{"name":"docs","url":format!("https://mcp.example.test/api/mcp/s/{sentinel}/mcp?key={sentinel}"),
                     "credential":"DOCS_TOKEN","timeout":5,"description":"Docs search"}]}]}}),
     );
     put_first_mate(&machine, &docs, "docs", |profile| {
@@ -2107,7 +2109,7 @@ fn the_ship_profile_lists_selected_skills_and_mcp_servers_with_credential_names_
     );
     assert_eq!(
         profile["mcp_servers"],
-        json!([{"name":"docs","url":"https://mcp.example.test/mcp",
+        json!([{"name":"docs","url":"https://mcp.example.test",
             "description":"Docs search","credentials":["DOCS_TOKEN"]}])
     );
     let plugins: Vec<&str> = profile["plugins"]

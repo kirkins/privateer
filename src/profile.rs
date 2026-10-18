@@ -6,7 +6,7 @@
 //! permissions, the tool bundle plan the launch path computes, and the
 //! attended plugins `privateer start` loads for the harness. No secret value
 //! is returned: options whose names look secret read `"<set>"`, MCP servers
-//! carry credential names only and URLs lose their query, and no environment
+//! carry credential names only and URLs keep only scheme, host and port, and no environment
 //! value is read.
 use crate::store::{Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
@@ -25,7 +25,9 @@ fn masked(value: &Value) -> Value {
             fields
                 .iter()
                 .map(|(key, value)| {
-                    let shown = if crate::block_ask::sensitive_name(key) && !value.is_object() {
+                    // Everything under a secret-looking name is hidden, nested
+                    // maps included: their keys need not look secret themselves.
+                    let shown = if crate::block_ask::sensitive_name(key) {
                         json!(SET)
                     } else {
                         masked(value)
@@ -97,9 +99,18 @@ fn skill_description(root: &str) -> Option<String> {
     }
 }
 
-/// A URL without its query or fragment, which may carry a token.
-fn bare_url(url: &str) -> &str {
-    url.split(['?', '#']).next().unwrap_or(url)
+/// Only a URL's scheme, host and port: which server it is. Some services put
+/// the secret in the path, the query or the fragment.
+fn bare_url(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // The adapter refuses userinfo; drop it anyway.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    if scheme.is_empty() {
+        host.to_owned()
+    } else {
+        format!("{scheme}://{host}")
+    }
 }
 
 /// The skills and MCP servers a first mate's bounded launch plan selects.
