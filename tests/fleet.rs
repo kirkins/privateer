@@ -2779,3 +2779,191 @@ fn a_locked_home_reads_unavailable_and_the_others_stay_complete() {
     );
     locker.execute_batch("ROLLBACK;").unwrap();
 }
+
+/// A finished headless run written straight into a ship's home as the
+/// runtime records it: the wake or errand row, its job and the job's log.
+fn finished_run(folder: &Path, ship: &str, table: &str, id: &str, harness: &str, log: &str) {
+    let home = folder.join(".privateer");
+    let db = rusqlite::Connection::open(home.join("privateer.sqlite")).unwrap();
+    let usage = json!({"input": 4, "output": 102}).to_string();
+    if table == "wakes" {
+        db.execute(
+            "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms,
+               finished_ms, usage, harness)
+             VALUES(?1, ?2, 'thread:general', 1, ?1, 'fresh', 'succeeded', 1000, 2000, ?3, ?4)",
+            rusqlite::params![id, ship, usage, harness],
+        )
+        .unwrap();
+    } else {
+        db.execute(
+            "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms,
+               finished_ms, usage, harness)
+             VALUES(?1, ?2, 'thread:general', 'duty', 'review', 'fresh', 'succeeded', 1000, 2000,
+               ?3, ?4)",
+            rusqlite::params![id, ship, usage, harness],
+        )
+        .unwrap();
+    }
+    let record = json!({"id": id, "task_id": "duty", "incarnation": "inc-1", "status": "succeeded",
+        "action": "spawn", "agent_actor": ship, "created_ms": 1000,
+        "model_route": format!("{harness}/-/opus"),
+        "command": ["python3", "native_launch.py", harness, "--token", "ARGV-CANARY-2718"]});
+    db.execute(
+        "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+        rusqlite::params![id, record.to_string()],
+    )
+    .unwrap();
+    let logs = home.join("jobs").join(id).join("inc-1");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(logs.join("stdout.log"), log).unwrap();
+}
+
+#[test]
+fn a_wake_transcript_normalizes_its_log_and_masks_what_may_be_secret() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let claude = fs::read_to_string(fixtures.join("transcript/claude-wake.jsonl")).unwrap();
+    finished_run(&apps, "apps", "wakes", "wake-claude-1", "claude", &claude);
+
+    let transcript = machine.json(
+        &web,
+        "wake.transcript",
+        json!({"ship": "apps", "wake_id": "wake-claude-1"}),
+    );
+    let text = transcript.to_string();
+    assert!(!text.contains("PLANTED"), "{transcript:#}");
+    assert!(!text.contains("ARGV-CANARY"), "{transcript:#}");
+    assert!(
+        !text.contains("/tmp/scratch\""),
+        "the init line is not an event"
+    );
+    assert_eq!(transcript["ship"], "apps");
+    assert_eq!(transcript["wake_id"], "wake-claude-1");
+    assert_eq!(transcript["job_id"], "wake-claude-1");
+    assert_eq!(transcript["harness"], "claude");
+    assert_eq!(transcript["model_route"], "claude/-/opus");
+    assert_eq!(transcript["started_ms"], 1000);
+    assert_eq!(transcript["finished_ms"], 2000);
+    assert_eq!(transcript["status"], "succeeded");
+    assert_eq!(transcript["usage"], json!({"input": 4, "output": 102}));
+    assert_eq!(transcript["truncated"], false);
+    assert_eq!(transcript["more"], false);
+    assert_eq!(
+        transcript["events"],
+        json!([
+            {"kind": "assistant", "text": "Reading the inbox."},
+            {"kind": "tool_call", "tool": "Bash", "input_preview":
+                r#"{"command":"GH_TOKEN=••• gh pr list --repo kirkins/privateer","description":"List open pull requests"}"#},
+            {"kind": "tool_result", "tool": "Bash",
+                "output_preview": "#248 wake transcript\tOPEN\nAPI_KEY=•••"},
+            {"kind": "tool_call", "tool": "Read",
+                "input_preview": r#"{"file_path":"/tmp/scratch/Cargo.toml"}"#},
+            {"kind": "tool_result", "tool": "Read", "is_error": true,
+                "output_preview": "File does not exist."},
+            {"kind": "assistant", "text": "One PR is open; nothing to do."},
+            {"kind": "result", "text": "One PR is open; nothing to do."}
+        ])
+    );
+
+    // Compact JSON credentials inside text: a numbered Read of a credentials
+    // file, JSONL command output with text around it, a Write of the file
+    // and the assistant quoting it. No planted value appears anywhere.
+    let planted = [
+        "sk-ant-oat01-PLANTEDaccess0123456789abcdefghijklmnop",
+        "sk-ant-ort01-PLANTEDrefresh0123456789abcdefghijklmno",
+        "ghp_PLANTED9aZ3kQ7rT1mN5vB8xC2dF6hJ0l",
+        "sk-proj-PLANTEDopenai0123456789abcdefghij",
+        "Tr0ub4dor&3",
+    ];
+    let credentials = json!({"claudeAiOauth": {"accessToken": planted[0],
+        "refreshToken": planted[1], "expiresAt": 1792339332990_i64}})
+    .to_string();
+    let fragments = format!(
+        "reading\n{{\"token\":\"{}\"}}\n{{\"OPENAI_API_KEY\":\"{}\"}}\nsaw {{\"password\":\"{}\"}} ok\n",
+        planted[2], planted[3], planted[4]
+    );
+    let log = [
+        json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "w", "name": "Write",
+                "input": {"file_path": "/h/.credentials.json", "content": credentials}},
+            {"type": "tool_use", "id": "r", "name": "Read",
+                "input": {"file_path": "/h/.credentials.json"}},
+            {"type": "tool_use", "id": "b", "name": "Bash",
+                "input": {"command": "cat tokens.jsonl"}}]}}),
+        json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "r", "content": format!("     1→{credentials}\n")},
+            {"type": "tool_result", "tool_use_id": "b", "content": fragments}]}}),
+        json!({"type": "assistant", "message": {"content": [{"type": "text",
+            "text": format!("It holds {credentials} and {{\"password\":\"{}\"}}.", planted[4])}]}}),
+    ]
+    .map(|event| event.to_string())
+    .join("\n");
+    finished_run(&apps, "apps", "wakes", "wake-claude-2", "claude", &log);
+    let leaky = machine.json(
+        &web,
+        "wake.transcript",
+        json!({"ship": "apps", "wake_id": "wake-claude-2"}),
+    );
+    let text = leaky.to_string();
+    for secret in planted {
+        assert!(!text.contains(secret), "{secret} in {leaky:#}");
+    }
+    assert_eq!(leaky["events"].as_array().unwrap().len(), 6, "{leaky:#}");
+    assert_eq!(
+        leaky["events"][3]["output_preview"],
+        "     1→{\"claudeAiOauth\":\"•••\"}\n"
+    );
+
+    // An errand by its id, from a Pi log whose middle the job log dropped.
+    let rotated = fs::read_to_string(fixtures.join("errand-rotated-pi.log")).unwrap();
+    finished_run(&apps, "apps", "errands", "errand-pi-1", "pi", &rotated);
+    let errand = machine.json(
+        &apps,
+        "wake.transcript",
+        json!({"ship": "apps", "wake_id": "errand-pi-1"}),
+    );
+    assert_eq!(errand["job_id"], "errand-pi-1");
+    assert_eq!(errand["harness"], "pi");
+    assert_eq!(errand["truncated"], true);
+    assert_eq!(
+        errand["events"],
+        json!([{"kind": "assistant",
+            "text": "I'll start by gathering bearings and inspecting the key evidence."}])
+    );
+
+    // Unknown ids and ships, another ship's wake and agents are refused.
+    let refused = |args: Value| {
+        let output = machine.run(&web, &["wake.transcript", "--json", &args.to_string()]);
+        assert!(!output.status.success(), "{args}");
+        stderr(&output)
+    };
+    assert!(
+        refused(json!({"ship": "apps", "wake_id": "wake-nowhere"}))
+            .contains("unknown wake wake-nowhere for ship apps")
+    );
+    assert!(
+        refused(json!({"ship": "nowhere", "wake_id": "wake-claude-1"}))
+            .contains("unknown ship nowhere")
+    );
+    let db = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    db.execute("UPDATE wakes SET ship='web' WHERE id='wake-claude-1'", [])
+        .unwrap();
+    assert!(
+        refused(json!({"ship": "apps", "wake_id": "wake-claude-1"}))
+            .contains("wake wake-claude-1 is not ship apps's")
+    );
+    let agent = machine.as_agent(
+        &apps,
+        "apps",
+        "wake.transcript",
+        json!({"ship": "apps", "wake_id": "errand-pi-1"}),
+    );
+    assert!(!agent.status.success());
+    assert!(
+        stderr(&agent).contains("wake.transcript is an operator command"),
+        "{}",
+        stderr(&agent)
+    );
+}

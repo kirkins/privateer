@@ -46,6 +46,7 @@ mod snapshot;
 pub mod store;
 pub mod stow;
 mod tool_bundles;
+mod transcript;
 mod usage;
 mod usage_carry;
 pub mod watch;
@@ -98,6 +99,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "captain.dismiss",
     "captain.feed",
     "ship.profile",
+    "wake.transcript",
     "fleet.snapshot",
     "report.get",
     "usage.summary",
@@ -189,6 +191,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "note" | "focus" => context::dispatch(store, command, args),
         "ship" | "mail" => mail::dispatch(store, command, args),
+        "wake" if command == "wake.transcript" => {
+            store.caller().require_operator(command)?;
+            transcript::transcript(&args)
+        }
         "wake" => activation::dispatch(store, command, args),
         "errand" => errand::dispatch(store, command, args),
         "attention" => attention::dispatch(store, command, args),

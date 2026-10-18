@@ -165,7 +165,7 @@ pub(crate) fn narrow_rule(tool: &str, input: &Value, base: Option<&Path>) -> Opt
 
 /// Whether a run of characters looks like a key or token: long, and mixing
 /// letters with digits.
-fn secret_shaped(word: &str) -> bool {
+pub(crate) fn secret_shaped(word: &str) -> bool {
     let body: String = word
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || "+/=_-".contains(*c))
