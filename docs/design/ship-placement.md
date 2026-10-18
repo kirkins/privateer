@@ -201,8 +201,8 @@ all raised by `host_problems`:
 stuck behind an unhealthy holder or behind nothing, which is a runtime fault
 that moving an idle ship does not fix. `route:NAME` does not count: a
 provider backing off is not the machine's fault, and a move does not change
-its route. The `load` alert of finding 15 does not exist yet; whether it
-counts, and after how long, is decided when it does.
+its route. The `load` alert of finding 15 exists but does not count yet;
+whether it counts, and after how long, is decided when placement reads it.
 
 The clock lives with the machine, not the owner. Today a raised alert is a
 row in the owner's own `machine_alerts` table, which lives in the owner's
