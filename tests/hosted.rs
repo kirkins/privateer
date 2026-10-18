@@ -3132,3 +3132,85 @@ fn a_relaunch_refuses_a_second_harness_while_the_first_still_runs() {
         .unwrap();
     place.stop_native("infra");
 }
+
+/// A hosted Claude first mate "infra", set to sleep after one second, launched
+/// with the given model and permission mode in its pane. Its folder and the
+/// ship folder are trusted, as Claude asks for each folder with its own rules.
+fn hosted_claude_sleeper(model: &str, permission_mode: &str) -> (Place, Herdr) {
+    let place = Place::new();
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:claude");
+    first_mate["options"] = json!({"model": model, "permission_mode": permission_mode});
+    first_mate["sleep_after_secs"] = json!(1);
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let trust = json!({"projects": {
+        place.root.to_str().unwrap(): {"hasTrustDialogAccepted": true},
+        place.folder.to_str().unwrap(): {"hasTrustDialogAccepted": true},
+    }});
+    fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
+    hosted(place)
+}
+
+/// Mail the sleeping hosted first mate awake and wait for its relaunched argv.
+fn wake_hosted(place: &Place) -> String {
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
+    );
+    until("the woken harness", || place.root.join("pi-env").exists());
+    fs::read_to_string(place.root.join("pi-argv")).unwrap()
+}
+
+#[test]
+fn a_woken_hosted_claude_first_mate_relaunches_with_the_profile_read_at_the_wake() {
+    let (place, herdr) = hosted_claude_sleeper("claude-opus-5-5", "auto");
+    let launched = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(
+        launched
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w == ["--permission-mode", "auto"]),
+        "{launched}"
+    );
+    sleep_hosted(&place, &herdr);
+
+    // The captain changes the profile while the mate sleeps: the wake applies
+    // it, and the result says so.
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["options"] =
+        json!({"model":"claude-sonnet-5-5","permission_mode":"bypassPermissions"});
+    let put = place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    assert!(
+        put["first_mate_applies"]
+            .as_str()
+            .is_some_and(|m| m.contains("next wake")),
+        "{put}"
+    );
+    let argv = wake_hosted(&place);
+    let args: Vec<&str> = argv.lines().collect();
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--permission-mode", "bypassPermissions"]),
+        "{argv}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--model", "claude-sonnet-5-5"]),
+        "{argv}"
+    );
+    assert!(!args.contains(&"auto"), "{argv}");
+    assert!(!args.contains(&"claude-opus-5-5"), "{argv}");
+    place.stop_native("infra");
+}
+
+#[test]
+fn an_unchanged_hosted_claude_first_mate_relaunches_with_the_same_argv() {
+    let (place, herdr) = hosted_claude_sleeper("claude-opus-5-5", "auto");
+    let launched = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    sleep_hosted(&place, &herdr);
+    let argv = wake_hosted(&place);
+    assert_eq!(argv, launched);
+    place.stop_native("infra");
+}

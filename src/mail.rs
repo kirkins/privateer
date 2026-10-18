@@ -172,6 +172,13 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
         params![name, record.to_string()],
     )?;
     store.audit("ship.put", &json!({"name": name}))?;
+    // A first mate's profile is read again at each wake, so a running pane
+    // keeps its launch options until it sleeps and wakes or is relaunched.
+    if args.get("first_mate").is_some_and(|v| !v.is_null()) {
+        record["first_mate_applies"] = json!(
+            "at the next wake or launch; `privateer host relaunch NAME` applies it to a running hosted pane now"
+        );
+    }
     Ok(record)
 }
 
