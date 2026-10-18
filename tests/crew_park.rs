@@ -10,6 +10,8 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, tim
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 const SESSION: &str = "7d1b1f0e-1111-4222-8333-444455556666";
+/// See `Fleet::launch_budget`.
+const LAUNCH_BUDGET_SECS: u64 = 20;
 
 struct Fleet {
     _tmp: tempfile::TempDir,
@@ -24,13 +26,15 @@ impl Fleet {
         fs::create_dir(root.join("engineering")).unwrap();
         let fleet = Self { _tmp: tmp, root };
         // The fake claude. Its mode file picks what the crew does: park on a
-        // child (session, nosession, long), start a child and run out its
-        // budget (deadline), or run out with nothing outstanding (held). A
-        // resumed run is recognised by its job id, and completes its turn.
+        // child (session, nosession, long, gated), start a child and run out
+        // its budget (deadline), or run out with nothing outstanding (held). A
+        // resumed run is recognised by its job id, and completes its turn. A
+        // gated child runs until the test releases it (`release_child`).
         let script = format!(
             r#"#!/bin/sh
 ROOT='{root}'
 BIN='{bin}'
+gate="while [ ! -e $ROOT/release-child ]; do [ -d $ROOT ] || exit 1; sleep 0.1; done; echo built"
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
 MODE=$(cat "$ROOT/mode" 2>/dev/null)
 if [ "$MODE" = chain ]; then
@@ -64,12 +68,14 @@ case "$MODE" in
     "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 6; echo built"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
   deadline)
-    "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 30"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
+    "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
   *)
     child='sleep 2; echo built'
-    if [ "$MODE" = slow ] || [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then child='sleep 6; echo built'; fi
-    if [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then sleep 5; fi
+    if [ "$MODE" = slow ] || [ "$MODE" = aged ]; then child='sleep 6; echo built'; fi
+    if [ "$MODE" = gated ] || [ "$MODE" = aged_hold ]; then child=$gate; fi
+    if [ "$MODE" = aged ]; then sleep 5; fi
+    if [ "$MODE" = aged_hold ]; then sleep 8; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
@@ -108,6 +114,10 @@ esac
     fn set_mode(&self, mode: &str) {
         fs::write(self.root.join("mode"), mode).unwrap();
     }
+    /// Let a gated child finish.
+    fn release_child(&self) {
+        fs::write(self.root.join("release-child"), "").unwrap();
+    }
     /// Put a crew's park into a state a crash would leave it in.
     fn set_park(&self, crew: &str, state: &str, attempt: i64, retries: i64) {
         let conn =
@@ -143,10 +153,18 @@ esac
     /// Give the ship's charter an 8 second job budget, so a crew's budget runs
     /// out while its heavy job still runs.
     fn short_budget(&self) {
+        self.budget(8);
+    }
+    /// A crew budget long enough that a crew launched on a loaded machine
+    /// still starts its child well before its deadline.
+    fn launch_budget(&self) {
+        self.budget(LAUNCH_BUDGET_SECS);
+    }
+    fn budget(&self, secs: u64) {
         self.json(
             None,
             "charter.put",
-            json!({"id": "engineering", "job_timeout_secs": 8}),
+            json!({"id": "engineering", "job_timeout_secs": secs}),
         );
     }
     fn command(&self, agent: Option<&str>, args: &[&str]) -> Command {
@@ -353,13 +371,14 @@ fn cancelling_a_parked_crew_cancels_its_job_and_does_not_resume() {
 }
 
 /// The crew's budget runs out while its heavy job still runs: the crew parks
-/// on that job instead of timing out, and the job's outcome (which ends after
-/// the crew's deadline) resumes it. The first mate hears nothing of the child.
+/// on that job instead of timing out, and the job's outcome (it times out at
+/// its own deadline, after the crew's) resumes it. The first mate hears
+/// nothing of the child.
 #[test]
 fn a_crew_that_runs_out_of_budget_parks_on_its_job_and_resumes() {
     let f = Fleet::new();
     f.set_mode("deadline");
-    f.short_budget();
+    f.launch_budget();
     start_crew(&f, "crew-4");
     // The resume can follow at once, so the park may already be past.
     let parked = f.wait("crew-4", &["parked", "resumed"]);
@@ -834,10 +853,11 @@ fn a_spent_park_cap_at_the_deadline_ends_the_crew_and_its_job() {
 fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
     let f = Fleet::new();
     f.set_mode("deadline");
+    // The child must be running by the crew's deadline for it to be cancelled.
     f.json(
         None,
         "charter.put",
-        json!({"id": "engineering", "job_timeout_secs": 8, "crew_max_parks": 0}),
+        json!({"id": "engineering", "job_timeout_secs": LAUNCH_BUDGET_SECS, "crew_max_parks": 0}),
     );
     start_crew(&f, "crew-26");
     let crew = f.wait("crew-26", &["timed_out"]);
@@ -1007,7 +1027,8 @@ fn a_resume_that_does_not_start_after_its_retry_fails_the_crew() {
 #[test]
 fn a_parked_crew_whose_route_was_removed_resumes_as_a_fresh_crew() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    // The child waits for the routes to change before it settles.
+    f.set_mode("gated");
     let codex = |model: &str| json!({"manifest": "bundled:codex", "options": {"model": model}, "cost": "credits"});
     f.routes(json!({
         "routes": {"claude-route": {"manifest": "bundled:claude", "cost": "credits"}, "codex-route": codex("m")},
@@ -1016,6 +1037,7 @@ fn a_parked_crew_whose_route_was_removed_resumes_as_a_fresh_crew() {
     start_crew(&f, "crew-25");
     f.wait("crew-25", &["parked"]);
     f.routes(json!({"routes": {"codex-route": codex("m")}, "crew": ["codex-route"]}));
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     let resume = f.wait("crew-resume-park-crew-25-1-1", &["succeeded", "failed"]);
     assert!(
@@ -1026,23 +1048,31 @@ fn a_parked_crew_whose_route_was_removed_resumes_as_a_fresh_crew() {
 }
 
 /// A resumed crew gets a fresh budget for its run, not what its predecessor
-/// left: the first incarnation ran about five seconds and parked, and the
-/// resumed run lasts its full eight-second budget before it parks again at
-/// its deadline (the park cap, not the budget, bounds the total).
+/// left: the first incarnation works eight seconds and parks, and the resumed
+/// run lasts its full budget before it is held at its deadline (the park cap,
+/// not the budget, bounds the total). What its predecessor left would hold it
+/// at least eight seconds sooner.
 #[test]
 fn a_resumed_crew_gets_a_fresh_budget_for_its_run() {
     let f = Fleet::new();
     f.set_mode("aged_hold");
-    f.short_budget();
+    f.launch_budget();
     start_crew(&f, "crew-27");
     f.wait("crew-27", &["parked"]);
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
-    let resumed = Instant::now();
-    f.wait("crew-resume-park-crew-27-1-1", &["parked", "timed_out"]);
+    let resume = f.wait("crew-resume-park-crew-27-1-1", &["parked"]);
+    // The run is read from the records, not from when this test happened to
+    // notice the child settle: from its spawn to its park at the deadline.
+    let rusqlite::types::Value::Integer(parked_ms) =
+        f.park_field("crew-resume-park-crew-27-1-1", "created_ms")
+    else {
+        panic!("the resumed crew has no park: {resume}");
+    };
+    let ran_ms = parked_ms - resume["spawned_ms"].as_i64().unwrap();
     assert!(
-        resumed.elapsed() >= std::time::Duration::from_secs(7),
-        "the resumed crew ended before a fresh budget: {:?}",
-        resumed.elapsed()
+        ran_ms >= LAUNCH_BUDGET_SECS as i64 * 1000,
+        "the resumed crew ended before a fresh budget: {ran_ms} ms: {resume}"
     );
 }
 
