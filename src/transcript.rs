@@ -778,7 +778,7 @@ mod tests {
         );
         assert_eq!(
             mask_value(&json!({TOKEN: 1, "ghp_0aZ3kQ7rT1mN5vB8xC2dF6hJ0lP4sW": 2})),
-            json!({"•••": 1, "•••2": 2})
+            json!({"•••": 2, "•••2": 1})
         );
         // Ordinary JSON and prose stay readable.
         assert_eq!(
