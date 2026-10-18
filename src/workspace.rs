@@ -61,21 +61,27 @@ impl Lock {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Workspace {
-    task_id: String,
-    generation: String,
-    charter_repo: PathBuf,
-    repo: PathBuf,
-    git_repo: PathBuf,
-    pool: PathBuf,
-    binary: PathBuf,
-    holder: String,
-    branch: String,
-    base_branch: String,
-    state: String,
-    path: Option<PathBuf>,
-    lease_id: Option<String>,
-    archive_ref: Option<String>,
+pub(crate) struct Workspace {
+    pub(crate) task_id: String,
+    pub(crate) generation: String,
+    pub(crate) charter_repo: PathBuf,
+    pub(crate) repo: PathBuf,
+    pub(crate) git_repo: PathBuf,
+    pub(crate) pool: PathBuf,
+    pub(crate) binary: PathBuf,
+    pub(crate) holder: String,
+    pub(crate) branch: String,
+    pub(crate) base_branch: String,
+    pub(crate) state: String,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) lease_id: Option<String>,
+    pub(crate) archive_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) switched_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) current_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retained_reason: Option<String>,
 }
 
 pub(crate) struct Execution {
@@ -88,7 +94,8 @@ pub(crate) struct Execution {
 pub(crate) fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS workspaces (task_id TEXT PRIMARY KEY REFERENCES tasks(id), record TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS workspace_slot_use (path TEXT PRIMARY KEY, released_ms INTEGER NOT NULL);",
+         CREATE TABLE IF NOT EXISTS workspace_slot_use (path TEXT PRIMARY KEY, released_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS workspace_alerts (task_id TEXT PRIMARY KEY, raised_ms INTEGER NOT NULL, reason TEXT NOT NULL);",
     )?;
     Ok(())
 }
@@ -110,7 +117,7 @@ fn save(store: &Store, w: &Workspace) -> Result<()> {
     tx.execute("INSERT INTO workspaces(task_id,record) VALUES(?1,?2) ON CONFLICT(task_id) DO UPDATE SET record=excluded.record", params![w.task_id, serde_json::to_string(w)?])?;
     store.audit(
         "workspace.state",
-        &json!({"task_id":w.task_id,"generation":w.generation,"state":w.state,"path":w.path,"lease_id":w.lease_id,"archive_ref":w.archive_ref}),
+        &json!({"task_id":w.task_id,"generation":w.generation,"state":w.state,"path":w.path,"lease_id":w.lease_id,"archive_ref":w.archive_ref,"switched_branch":w.switched_branch,"retained_reason":w.retained_reason}),
     )?;
     tx.commit()?;
     Ok(())
@@ -189,14 +196,29 @@ fn validate_path(lock: &Lock, w: &Workspace) -> Result<()> {
         "workspace belongs to another Git clone"
     );
     ensure!(
-        git(lock, path, &["symbolic-ref", "--short", "HEAD"])? == w.branch,
-        "workspace branch changed; restore its recorded task branch before reuse or release"
-    );
-    ensure!(
         root(w)?.is_dir(),
         "charter directory is missing from the workspace"
     );
     Ok(())
+}
+pub(crate) fn sync_branch(lock: &Lock, w: &mut Workspace) -> bool {
+    let Some(path) = &w.path else {
+        return false;
+    };
+    if let Ok(head_branch) = git(lock, path, &["symbolic-ref", "--short", "HEAD"]) {
+        let switched = if head_branch != w.branch {
+            Some(head_branch.clone())
+        } else {
+            None
+        };
+        let current = Some(head_branch);
+        if w.switched_branch != switched || w.current_branch != current {
+            w.switched_branch = switched;
+            w.current_branch = current;
+            return true;
+        }
+    }
+    false
 }
 fn validate(lock: &Lock, w: &Workspace) -> Result<()> {
     ensure!(
@@ -347,6 +369,9 @@ fn acquire_locked(
             path: None,
             lease_id: None,
             archive_ref: None,
+            switched_branch: None,
+            current_branch: None,
+            retained_reason: None,
         };
         save(store, &w)?;
         w
@@ -609,12 +634,15 @@ pub(crate) fn validate_job(
 ) -> Result<Option<Lock>> {
     if let Some(lease) = lease {
         let lock = Lock::acquire(store)?;
-        let w = load(store, task)?.context("job workspace record missing")?;
+        let mut w = load(store, task)?.context("job workspace record missing")?;
         ensure!(
             w.charter_repo == repo && w.lease_id.as_deref() == Some(lease),
             "job workspace lease or charter changed"
         );
         validate(&lock, &w)?;
+        if sync_branch(&lock, &mut w) {
+            let _ = save(store, &w);
+        }
         ensure!(
             fs::canonicalize(cwd)? == cwd && cwd.starts_with(root(&w)?),
             "job cwd escaped its task workspace"

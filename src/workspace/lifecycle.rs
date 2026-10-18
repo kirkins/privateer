@@ -21,13 +21,19 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         return public(store, &w);
     }
     crate::jobs::workspace_idle(store, task, w.lease_id.as_deref().unwrap())?;
+    let all = slots(&lock, &w)?;
     if w.state == "releasing"
-        && !slots(&lock, &w)?
+        && !all
             .iter()
             .any(|s| s["lease_id"].as_str() == w.lease_id.as_deref())
     {
         w.state = "released".into();
+        w.retained_reason = None;
         save(store, &w)?;
+        let _ = store.connection().execute(
+            "DELETE FROM workspace_alerts WHERE task_id=?1",
+            [&w.task_id],
+        );
         return public(store, &w);
     }
     ensure!(
@@ -36,6 +42,7 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     );
     w.state = "ready".into();
     validate(&lock, &w)?;
+    sync_branch(&lock, &mut w);
     let path = w.path.clone().unwrap();
     ensure!(
         git(
@@ -78,24 +85,33 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         } else {
             local
         };
-        let merged = git(
+        let ahead: Result<u64> = git(
             &lock,
             &w.git_repo,
-            &["merge-tree", "--write-tree", &target, &head],
+            &["rev-list", "--count", &format!("{target}..{head}")],
         )
-        .context(
-            "workspace changes are not proven landed; use archive:true to preserve committed work",
-        )?;
-        ensure!(
-            merged.lines().next()
-                == Some(
-                    git(
+        .and_then(|s| s.trim().parse().map_err(Into::into));
+        let is_landed = if ahead.as_ref().is_ok_and(|&n| n == 0) {
+            true
+        } else {
+            let merged = git(
+                &lock,
+                &w.git_repo,
+                &["merge-tree", "--write-tree", &target, &head],
+            );
+            merged.is_ok_and(|m| {
+                m.lines().next()
+                    == git(
                         &lock,
                         &w.git_repo,
-                        &["rev-parse", &format!("{target}^{{tree}}")]
-                    )?
-                    .as_str()
-                ),
+                        &["rev-parse", &format!("{target}^{{tree}}")],
+                    )
+                    .ok()
+                    .as_deref()
+            })
+        };
+        ensure!(
+            is_landed,
             "workspace changes are not landed; use archive:true to preserve committed work"
         );
     }
@@ -124,7 +140,12 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         "Treehouse has not released the recorded lease"
     );
     w.state = "released".into();
+    w.retained_reason = None;
     save(store, &w)?;
+    let _ = store.connection().execute(
+        "DELETE FROM workspace_alerts WHERE task_id=?1",
+        [&w.task_id],
+    );
     cache::record_release(store, &path)?;
     // The release stands even if trimming fails; the failure is kept.
     let pool = cache::Pool {
@@ -139,6 +160,64 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         )?;
     }
     public(store, &w)
+}
+
+fn record_keep(store: &Store, w: &mut Workspace, reason: &str) -> Result<()> {
+    w.retained_reason = Some(reason.to_owned());
+    save(store, w)?;
+    store.audit(
+        "workspace.retained",
+        &json!({"task_id": w.task_id, "path": w.path, "reason": reason}),
+    )?;
+    Ok(())
+}
+
+fn alert_unreleasable(store: &Store, w: &Workspace, reason: &str) -> Result<()> {
+    let db = store.connection();
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_alerts (task_id TEXT PRIMARY KEY, raised_ms INTEGER NOT NULL, reason TEXT NOT NULL);",
+    )?;
+    let already: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_alerts WHERE task_id=?1)",
+        [&w.task_id],
+        |r| r.get(0),
+    )?;
+    if already {
+        return Ok(());
+    }
+    let now = Store::now_ms();
+    db.execute(
+        "INSERT INTO workspace_alerts (task_id, raised_ms, reason) VALUES (?1, ?2, ?3)",
+        params![w.task_id, now, reason],
+    )?;
+    store.audit(
+        "workspace.alert",
+        &json!({"task_id": w.task_id, "reason": reason, "path": w.path}),
+    )?;
+    let owner = match store.task(&w.task_id) {
+        Ok(t) => t["owner"].as_str().unwrap_or("").to_owned(),
+        Err(_) => String::new(),
+    };
+    if !owner.is_empty() {
+        let tx = store.write_transaction()?;
+        let notice = json!({
+            "id": format!("workspace-alert-{}-{}", w.task_id, now),
+            "from": "runtime",
+            "to": owner,
+            "kind": "notice",
+            "task_id": w.task_id,
+            "urgency": "normal",
+            "body": format!("Workspace for done task {} cannot be released: {}", w.task_id, reason),
+            "payload": {
+                "workspace_alert": w.task_id,
+                "reason": reason,
+                "path": w.path,
+            }
+        });
+        crate::mail::record_crew(&tx, &notice)?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 /// How often the dispatcher looks for landed workspaces, and how long a
@@ -177,10 +256,37 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
         .collect::<rusqlite::Result<_>>()?;
     let mut released = vec![];
     for record in records {
-        let w: Workspace = serde_json::from_str(&record)?;
+        let mut w: Workspace = serde_json::from_str(&record)?;
         let (Some(lease), Some(path)) = (w.lease_id.clone(), w.path.clone()) else {
             continue;
         };
+        let lock = match Lock::acquire(store) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if let Ok(all_slots) = slots(&lock, &w) {
+            let lease_held = all_slots.iter().any(|slot| {
+                slot["lease_id"].as_str() == Some(&lease)
+                    && slot["lease_holder"] == w.holder
+                    && slot["path"].as_str() == Some(path.to_str().unwrap_or_default())
+            });
+            if !lease_held {
+                w.state = "released".into();
+                w.retained_reason = None;
+                let _ = save(store, &w);
+                let _ = store.audit(
+                    "workspace.superseded",
+                    &json!({"task_id": w.task_id, "path": path, "lease_id": lease, "reason": "lease moved to another task"}),
+                );
+                let _ = store.connection().execute(
+                    "DELETE FROM workspace_alerts WHERE task_id=?1",
+                    [&w.task_id],
+                );
+                continue;
+            }
+        }
+        sync_branch(&lock, &mut w);
+
         let (unfinished, last_finished): (i64, Option<i64>) = store.connection().query_row(
             "SELECT COUNT(*) FILTER (WHERE json_extract(record,'$.finished_ms') IS NULL),
                     MAX(json_extract(record,'$.finished_ms'))
@@ -188,7 +294,8 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
             [&w.task_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if unfinished > 0 || last_finished.is_some_and(|at| now - at < SWEEP_GRACE_MS) {
+        if unfinished > 0 {
+            record_keep(store, &mut w, "jobs still running")?;
             continue;
         }
         let finished = matches!(
@@ -196,8 +303,11 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
             Some("done" | "cancelled")
         );
         if !finished {
+            if last_finished.is_some_and(|at| now - at < SWEEP_GRACE_MS) {
+                record_keep(store, &mut w, "jobs finished within grace period")?;
+                continue;
+            }
             let own = (|| -> Result<u64> {
-                let lock = Lock::acquire(store)?;
                 let target = if git(&lock, &w.git_repo, &["remote", "get-url", "origin"]).is_ok() {
                     git(&lock, &w.git_repo, &["fetch", "--quiet", "origin"])?;
                     format!("refs/remotes/origin/{}", w.base_branch)
@@ -212,13 +322,26 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 .parse()?)
             })();
             if !own.is_ok_and(|n| n > 0) {
+                record_keep(store, &mut w, "active task without branch commits")?;
                 continue;
             }
         }
-        if release(store, &json!({"task_id": w.task_id, "lease_id": lease})).is_ok() {
-            let entry = json!({"task_id": w.task_id, "path": path, "branch": w.branch});
-            store.audit("workspace.auto_released", &entry)?;
-            released.push(entry);
+        drop(lock);
+
+        match release(store, &json!({"task_id": w.task_id, "lease_id": lease})) {
+            Ok(_) => {
+                let current_branch = w.switched_branch.as_deref().unwrap_or(&w.branch);
+                let entry = json!({"task_id": w.task_id, "path": path, "branch": current_branch});
+                store.audit("workspace.auto_released", &entry)?;
+                released.push(entry);
+            }
+            Err(err) => {
+                let reason = format!("{err:#}");
+                record_keep(store, &mut w, &reason)?;
+                if finished {
+                    alert_unreleasable(store, &w, &reason)?;
+                }
+            }
         }
     }
     Ok(released)
@@ -315,10 +438,17 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "workspace.status" => {
             let task = required(&args, "task_id")?;
             owner(store, task)?;
-            match load(store, task)? {
-                Some(w) => public(store, &w),
-                None => Ok(Value::Null),
+            let Some(mut w) = load(store, task)? else {
+                return Ok(Value::Null);
+            };
+            if w.state == "ready" && w.path.as_ref().is_some_and(|p| p.is_dir()) {
+                if let Ok(lock) = Lock::acquire(store) {
+                    if sync_branch(&lock, &mut w) {
+                        let _ = save(store, &w);
+                    }
+                }
             }
+            public(store, &w)
         }
         "workspace.list" => {
             let limit = args
@@ -336,7 +466,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 Caller::Agent { actor } => Some(actor.as_str()),
                 Caller::Operator => None,
             };
-            let mut statement = store.connection().prepare("SELECT w.record FROM workspaces w JOIN tasks t ON t.id=w.task_id WHERE w.task_id>?1 AND (?2 IS NULL OR t.owner=?2) ORDER BY w.task_id LIMIT ?3")?;
+            let include_released = args.get("include_released") == Some(&json!(true))
+                || args.get("all") == Some(&json!(true));
+            let query = if include_released {
+                "SELECT w.record FROM workspaces w JOIN tasks t ON t.id=w.task_id WHERE w.task_id>?1 AND (?2 IS NULL OR t.owner=?2) ORDER BY w.task_id LIMIT ?3"
+            } else {
+                "SELECT w.record FROM workspaces w JOIN tasks t ON t.id=w.task_id WHERE w.task_id>?1 AND (?2 IS NULL OR t.owner=?2) AND json_extract(w.record,'$.state') != 'released' ORDER BY w.task_id LIMIT ?3"
+            };
+            let mut statement = store.connection().prepare(query)?;
             let raw =
                 statement.query_map(params![after, actor, limit], |r| r.get::<_, String>(0))?;
             raw.map(|r| public(store, &serde_json::from_str::<Workspace>(&r?)?))

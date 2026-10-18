@@ -61,6 +61,7 @@ impl Fixture {
             json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
         )
         .unwrap();
+        dispatch(&mut store, "ship.put", json!({"name":"ship"})).unwrap();
         for task in ["one", "two"] {
             dispatch(
                 &mut store,
@@ -1382,4 +1383,175 @@ fn trimming_never_touches_a_slot_with_untracked_work() {
         "keep me"
     );
     assert!(!path(&trimmed).join("target").exists());
+}
+
+fn commit_work(dir: &Path, file: &str, message: &str) {
+    fs::write(dir.join(file), "content\n").unwrap();
+    git(dir, &["add", file]);
+    git(
+        dir,
+        &[
+            "-c",
+            "user.name=F",
+            "-c",
+            "user.email=f@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
+}
+
+#[test]
+fn a_crew_switches_branches_lands_work_and_slot_comes_back_within_one_sweep() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+
+    git(&p, &["checkout", "-b", "fix/crew-feature"]);
+    commit_work(&p, "feature.txt", "crew feature commit");
+    commit_work(&f.repo, "feature.txt", "squash merge crew feature");
+
+    let status = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(status["switched_branch"], "fix/crew-feature");
+    assert_eq!(status["current_branch"], "fix/crew-feature");
+
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+
+    let report = f.ok("serve", json!({"once": true}));
+    let released: Vec<&str> = report["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["task_id"].as_str())
+        .collect();
+    assert!(released.contains(&"one"), "{report}");
+    let final_status = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(final_status["state"], "released");
+    assert_eq!(final_status["switched_branch"], "fix/crew-feature");
+}
+
+#[test]
+fn a_switched_branch_with_unlanded_commits_is_kept_and_alerts() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+
+    git(&p, &["checkout", "-b", "fix/unlanded-feature"]);
+    commit_work(&p, "unlanded.txt", "unlanded work");
+
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+
+    let report = f.ok("serve", json!({"once": true}));
+    let released: Vec<&str> = report["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["task_id"].as_str())
+        .collect();
+    assert!(!released.contains(&"one"), "{report}");
+
+    let status = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(status["state"], "ready");
+    assert_eq!(status["switched_branch"], "fix/unlanded-feature");
+    assert!(
+        status["retained_reason"]
+            .as_str()
+            .unwrap()
+            .contains("not landed")
+    );
+
+    let inbox = f.ok("mail.inbox", json!({"address":"ship"}));
+    let alerts: Vec<&Value> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["workspace_alert"] == "one")
+        .collect();
+    assert_eq!(alerts.len(), 1, "alert raised once: {inbox}");
+
+    // Clear sweep metadata to simulate next tick's sweep
+    let store = Store::open(&f.home).unwrap();
+    store
+        .connection()
+        .execute("DELETE FROM metadata WHERE key='workspace_sweep_ms'", [])
+        .unwrap();
+    drop(store);
+
+    f.ok("serve", json!({"once": true}));
+    let inbox2 = f.ok("mail.inbox", json!({"address":"ship"}));
+    let alerts2: Vec<&Value> = inbox2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["workspace_alert"] == "one")
+        .collect();
+    assert_eq!(alerts2.len(), 1, "alert not repeated every tick: {inbox2}");
+}
+
+#[test]
+fn a_stale_lease_moved_record_is_cleared() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    assert_eq!(w["state"], "ready");
+
+    let w_path = path(&w);
+    let pool = w_path.parent().unwrap().parent().unwrap();
+    let state_file = pool.join("fixture-state.json");
+    let mut slots: Vec<Value> = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    slots[0]["lease_holder"] = json!("privateer:other:gen999");
+    slots[0]["lease_id"] = json!("moved-lease-id");
+    fs::write(&state_file, serde_json::to_string(&slots).unwrap()).unwrap();
+
+    f.ok("serve", json!({"once": true}));
+
+    let status = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(status["state"], "released");
+
+    let list = f.ok("workspace.list", json!({}));
+    assert!(
+        !list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["task_id"] == "one")
+    );
+}
+
+#[test]
+fn release_with_archive_true_archives_switched_branch_and_releases() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+
+    git(&p, &["checkout", "-b", "fix/archive-branch"]);
+    commit_work(&p, "archive.txt", "archived work");
+    let head = git(&p, &["rev-parse", "HEAD"]);
+
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"],"archive":false})
+        )
+        .status
+        .success()
+    );
+
+    let released = f.release(&w, true);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["switched_branch"], "fix/archive-branch");
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        head
+    );
 }
