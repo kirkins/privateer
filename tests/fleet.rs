@@ -1665,3 +1665,244 @@ fn the_captain_replies_to_and_dismisses_asks_in_any_home_by_id_or_unique_prefix(
     let request = machine.json(&apps, "mail.show", json!({"id": again_id}));
     assert_eq!(request["state"], "answered", "{request}");
 }
+
+/// Every page of `captain.feed` from `args`, following `next` until `more` is false.
+fn feed_pages(machine: &Machine, folder: &Path, mut args: Value, direction: &str) -> Vec<Value> {
+    let mut pages = vec![];
+    loop {
+        let page = machine.json(folder, "captain.feed", args.clone());
+        let more = page["more"].as_bool().expect("more is a bool");
+        assert_eq!(more, page["next"].is_string(), "{page}");
+        let next = page["next"].clone();
+        pages.push(page);
+        if !more {
+            return pages;
+        }
+        args[direction] = next;
+        assert!(pages.len() < 50, "the feed never ended");
+    }
+}
+
+fn feed_ids(page: &Value) -> Vec<String> {
+    page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn the_captain_reads_one_time_ordered_feed_across_homes_a_page_at_a_time() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let send = |folder: &Path, args: Value| {
+        // Distinct milliseconds, so send order is feed order.
+        thread::sleep(Duration::from_millis(3));
+        machine.json(folder, "mail.send", args)
+    };
+    send(
+        &apps,
+        json!({"id":"a1","from":"apps","to":"captain","kind":"request","body":"Rotate the key?"}),
+    );
+    send(
+        &web,
+        json!({"id":"w1","from":"web","to":"captain","kind":"notice","body":"Build 7 is up","payload":{"report":{"build":7}}}),
+    );
+    send(
+        &apps,
+        json!({"id":"a2","from":"apps","to":"captain","kind":"request","body":"Deploy 12?"}),
+    );
+    send(
+        &web,
+        json!({"id":"s1","from":"web","to":"apps","kind":"request","body":"Ship mail"}),
+    );
+    send(
+        &web,
+        json!({"id":"w2","from":"web","to":"captain","kind":"request","body":"Merge 40?"}),
+    );
+    thread::sleep(Duration::from_millis(3));
+    let replied = machine.json(&web, "captain.reply", json!({"id": "a1", "body": "Yes"}));
+    let r1 = replied["reply"]["id"].as_str().unwrap().to_owned();
+    thread::sleep(Duration::from_millis(3));
+    machine.json(
+        &web,
+        "captain.dismiss",
+        json!({"id": "a2", "note": "done already"}),
+    );
+
+    // One feed, both homes, in time order, with bodies, payloads and state.
+    let all = machine.json(&apps, "captain.feed", json!({}));
+    let ids = feed_ids(&all);
+    let dismissal = ids.last().unwrap().clone();
+    assert_eq!(
+        ids,
+        ["a1", "w1", "a2", "w2", r1.as_str(), &dismissal],
+        "{all}"
+    );
+    assert_eq!(all["more"], false);
+    assert!(all["next"].is_null(), "{all}");
+    let entries = all["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["ship"], "apps");
+    assert_eq!(entries[0]["state"], "answered");
+    assert_eq!(entries[0]["answered_by"], r1.as_str());
+    assert_eq!(entries[1]["ship"], "web");
+    assert_eq!(entries[1]["home"], "web");
+    assert_eq!(entries[1]["body"], "Build 7 is up");
+    assert_eq!(entries[1]["payload"]["report"]["build"], 7);
+    assert_eq!(entries[2]["state"], "dismissed");
+    assert_eq!(entries[2]["end_reason"], "done already");
+    assert_eq!(entries[3]["state"], "open");
+    assert_eq!(entries[4]["from"], "captain");
+    assert_eq!(entries[4]["ship"], "apps");
+    assert_eq!(entries[4]["correlation"], "a1");
+    assert_eq!(entries[5]["correlation"], "a2");
+    assert_eq!(entries[5]["kind"], "notice");
+
+    // Paging forward with next returns each entry once and ends with more false.
+    let pages = feed_pages(&machine, &web, json!({"limit": 2}), "after");
+    assert_eq!(pages.len(), 3, "{pages:?}");
+    let paged: Vec<String> = pages.iter().flat_map(feed_ids).collect();
+    assert_eq!(paged, ids);
+    // Before pages backward, each page still oldest first.
+    let cursor = entries[4]["cursor"].clone();
+    let back = feed_pages(
+        &machine,
+        &web,
+        json!({"limit": 2, "before": cursor}),
+        "before",
+    );
+    let back: Vec<Vec<String>> = back.iter().map(feed_ids).collect();
+    assert_eq!(back, [vec!["a2", "w2"], vec!["a1", "w1"]]);
+    // A time bound reads the newest page.
+    let newest = machine.json(
+        &web,
+        "captain.feed",
+        json!({"limit": 2, "before": now_ms() + 1}),
+    );
+    assert_eq!(feed_ids(&newest), [r1.as_str(), &dismissal]);
+    assert_eq!(newest["more"], true);
+    let window = json!({"after": entries[0]["cursor"], "before": entries[3]["cursor"]});
+    assert_eq!(
+        feed_ids(&machine.json(&web, "captain.feed", window)),
+        ["w1", "a2"]
+    );
+
+    // A ship's mail to and from the captain, and its ship mail when asked.
+    let web_only = machine.json(&apps, "captain.feed", json!({"ship": "web"}));
+    assert_eq!(feed_ids(&web_only), ["w1", "w2"]);
+    let with_ship_mail = machine.json(&apps, "captain.feed", json!({"include_ship_mail": true}));
+    assert_eq!(
+        feed_ids(&with_ship_mail),
+        ["a1", "w1", "a2", "s1", "w2", r1.as_str(), &dismissal],
+        "s1 is held by both homes and listed once"
+    );
+    let s1 = &with_ship_mail["entries"][3];
+    assert_eq!(
+        (s1["home"].as_str(), s1["ship"].as_str()),
+        (Some("web"), Some("web"))
+    );
+    let apps_mail = machine.json(
+        &apps,
+        "captain.feed",
+        json!({"ship": "apps", "include_ship_mail": true}),
+    );
+    assert_eq!(
+        feed_ids(&apps_mail),
+        ["a1", "a2", "s1", r1.as_str(), &dismissal]
+    );
+    let one_by_one = feed_pages(
+        &machine,
+        &apps,
+        json!({"limit": 1, "include_ship_mail": true}),
+        "after",
+    );
+    let one_by_one: Vec<String> = one_by_one.iter().flat_map(feed_ids).collect();
+    assert_eq!(one_by_one, feed_ids(&with_ship_mail));
+
+    // What still waits on the captain, over the whole history.
+    let open = machine.json(&apps, "captain.feed", json!({"states": ["open"]}));
+    assert_eq!(feed_ids(&open), ["w2"]);
+    let open = machine.json(&apps, "captain.feed", json!({"open_only": true}));
+    assert_eq!(feed_ids(&open), ["w2"]);
+    let closed = machine.json(
+        &apps,
+        "captain.feed",
+        json!({"states": ["answered", "dismissed"]}),
+    );
+    assert_eq!(feed_ids(&closed), ["a1", "a2"]);
+    let bad = machine.run(&apps, &["captain.feed", "--json", r#"{"states":["gone"]}"#]);
+    assert!(
+        stderr(&bad).contains("unknown state gone"),
+        "{}",
+        stderr(&bad)
+    );
+
+    // A desk copy and its original are one entry: the open copy, else the original.
+    let copy = |into: &Path, id: &str, state: Option<&str>| {
+        let original = machine.json(&apps, "mail.show", json!({"id": id}));
+        let conn = rusqlite::Connection::open(into.join(".privateer/privateer.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state)
+             VALUES(?1,?2,?3,?4,?5,'{}','normal',?6,?7)",
+            rusqlite::params![
+                id,
+                original["from"].as_str(),
+                original["to"].as_str(),
+                original["kind"].as_str(),
+                original["body"].as_str(),
+                original["created_ms"].as_i64(),
+                state
+            ],
+        )
+        .unwrap();
+    };
+    copy(&web, "a1", Some("answered"));
+    copy(&web, "a2", Some("open"));
+    let deduplicated = machine.json(&apps, "captain.feed", json!({}));
+    assert_eq!(feed_ids(&deduplicated), ids, "{deduplicated}");
+    let entries = deduplicated["entries"].as_array().unwrap();
+    assert_eq!(
+        (entries[0]["home"].as_str(), entries[0]["state"].as_str()),
+        (Some("apps"), Some("answered"))
+    );
+    assert_eq!(
+        (entries[2]["home"].as_str(), entries[2]["state"].as_str()),
+        (Some("web"), Some("open"))
+    );
+    let paged: Vec<String> = feed_pages(&machine, &web, json!({"limit": 1}), "after")
+        .iter()
+        .flat_map(feed_ids)
+        .collect();
+    assert_eq!(paged, ids);
+    assert_eq!(
+        feed_ids(&machine.json(&apps, "captain.feed", json!({"open_only": true}))),
+        ["a2", "w2"]
+    );
+
+    // Only the operator reads the captain's feed.
+    let out = machine.as_agent(&apps, "apps", "captain.feed", json!({}));
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("operator command"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A page holds at most 200 entries.
+    let conn = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    for n in 0..205 {
+        conn.execute(
+            "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms)
+             VALUES(?1,'apps','captain','notice','bulk','{}','normal',?2)",
+            rusqlite::params![format!("bulk-{n}"), now_ms() + 10 + n],
+        )
+        .unwrap();
+    }
+    let capped = machine.json(&web, "captain.feed", json!({"limit": 1000}));
+    assert_eq!(capped["entries"].as_array().unwrap().len(), 200);
+    assert_eq!(capped["more"], true);
+    let default = machine.json(&web, "captain.feed", json!({}));
+    assert_eq!(default["entries"].as_array().unwrap().len(), 50);
+}

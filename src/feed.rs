@@ -8,9 +8,10 @@
 //! order in every home, and it stays valid as homes are added or retired.
 //!
 //! A message held in two homes (a delivered copy, a desk copy) is one entry.
-//! The copy chosen is the one still open, else the original, else the first by
-//! home name, decided from every copy and never from the page at hand, so a
-//! message cannot appear once per page.
+//! The copy shown is an open one if any copy is open; among those, the
+//! original (in the home of the ship that sent it, or that the captain wrote
+//! to), else the first by home name. It is decided from every copy, never from
+//! the page at hand, so a message cannot appear once per page.
 use crate::store::{Store, identifier};
 use anyhow::{Context, Result, ensure};
 use rusqlite::params;
@@ -203,10 +204,12 @@ fn shown_here(homes: &[Home], index: usize, row: &Value) -> Result<bool> {
     } else {
         &row["from"]
     };
-    let chosen = open
-        .first()
-        .or_else(|| holders.iter().find(|&&i| homes[i].ship == *origin))
-        .or(holders.first())
+    // Open copies first; among equals, the original, then the first home.
+    let candidates = if open.is_empty() { &holders } else { &open };
+    let chosen = candidates
+        .iter()
+        .find(|&&i| homes[i].ship == *origin)
+        .or(candidates.first())
         .copied();
     Ok(chosen == Some(index))
 }
