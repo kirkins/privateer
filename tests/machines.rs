@@ -3717,3 +3717,25 @@ fn the_other_machines_captain_mail_reaches_the_feed_through_the_desk() {
     assert_eq!(entries[1]["from"], "captain");
     assert_eq!(entries[1]["correlation"], asked["id"]);
 }
+
+#[test]
+fn the_ship_profile_of_a_ship_on_another_machine_is_asked_there() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let own = laptop.ok("liaison", "ship.profile", json!({"ship": "liaison"}));
+    assert_eq!(own["machine"], "laptop", "{own}");
+    // No gateway call: the profile is read on the machine holding the ship.
+    let elsewhere = laptop.run(
+        "liaison",
+        &["ship.profile", "--json", r#"{"ship":"fitforge"}"#],
+        Some(&ssh),
+    );
+    assert!(!elsewhere.status.success());
+    assert!(
+        text(&elsewhere).contains("ship fitforge is on machine mac; ask there"),
+        "{}",
+        text(&elsewhere)
+    );
+    let there = mac.ok("fitforge", "ship.profile", json!({"ship": "fitforge"}));
+    assert_eq!(there["first_mate"]["harness"], "codex", "{there}");
+}
