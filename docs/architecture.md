@@ -117,6 +117,10 @@ a liaison still holding the earlier contact-only preset (`inspect`, `spawn`,
 `message`) at its first revision, never one the captain has edited.
 Independently authored `AGENTS.md` files are preserved, while Privateer-managed
 instructions are refreshed with the checklist when the preset is active.
+Each `serve` start also rewrites a Privateer-managed `AGENTS.md` (the one that
+still begins with `<!-- privateer:generated -->`) when this build's
+instructions differ, so an upgrade reaches the first mate's next session
+without `privateer init`; a file the captain took over is never touched.
 A validated `agent.start` harness job runs under `spawn`
 authority; ordinary `job.start` requires an implementation/test/
 recovery/cleanup action and cannot request `spawn`, so a captain who narrows

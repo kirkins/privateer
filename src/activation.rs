@@ -959,6 +959,13 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
     // `serve --once` is a maintenance pass, not a restart: it must neither
     // destroy warmth on every tick nor change the epoch of adopted wakes.
     // Do this after taking serve.lock and validating arguments, before settle.
+    // A new build's instructions reach the first mate's next session. Only a
+    // changed file is written, so a maintenance pass costs one read.
+    match crate::cli::refresh_instructions(store) {
+        Ok(true) => eprintln!("updated AGENTS.md to this build's instructions"),
+        Ok(false) => {}
+        Err(error) => eprintln!("could not refresh AGENTS.md: {error:#}"),
+    }
     if !once {
         let tx = store.write_transaction()?;
         tx.execute("DELETE FROM sessions", [])?;

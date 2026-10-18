@@ -227,18 +227,51 @@ pub(crate) fn write_instructions(
     let agents = home.parent().context("ship folder")?.join("AGENTS.md");
     let ours = fs::read_to_string(&agents).map_or(true, |t| t.starts_with(GENERATED));
     if ours {
-        let cli = format!(
-            "{} --home {}",
-            shell_token(&crate::executable::installed()?.to_string_lossy()),
-            shell_token(&home.to_string_lossy())
-        );
-        let mut text = instructions(ship, scope, &cli);
-        if liaison {
-            text.push_str(&liaison_instructions(ship));
-        }
-        fs::write(&agents, text)?;
+        fs::write(&agents, generated_instructions(home, ship, scope, liaison)?)?;
     }
     Ok(ours)
+}
+
+fn generated_instructions(home: &Path, ship: &str, scope: &str, liaison: bool) -> Result<String> {
+    let cli = format!(
+        "{} --home {}",
+        shell_token(&crate::executable::installed()?.to_string_lossy()),
+        shell_token(&home.to_string_lossy())
+    );
+    let mut text = instructions(ship, scope, &cli);
+    if liaison {
+        text.push_str(&liaison_instructions(ship));
+    }
+    Ok(text)
+}
+
+/// Bring a ship's generated AGENTS.md up to this build's instructions, so an
+/// upgrade reaches the first mate without `privateer init`. A file the
+/// captain took over is left alone. Returns whether the file changed.
+pub(crate) fn refresh_instructions(store: &mut Store) -> Result<bool> {
+    let Some(ship) = crate::presence::folder_ship(store) else {
+        return Ok(false);
+    };
+    let agents = store
+        .home()
+        .parent()
+        .context("ship folder")?
+        .join("AGENTS.md");
+    let Ok(current) = fs::read_to_string(&agents) else {
+        return Ok(false);
+    };
+    if !current.starts_with(GENERATED) {
+        return Ok(false);
+    }
+    let record = crate::dispatch(store, "ship.show", json!({"name": ship}))?;
+    let scope = record["scope"].as_str().unwrap_or_default();
+    let liaison = crate::door::is_liaison(store.home());
+    let text = generated_instructions(store.home(), &ship, scope, liaison)?;
+    if text == current {
+        return Ok(false);
+    }
+    fs::write(&agents, text)?;
+    Ok(true)
 }
 
 fn instructions(ship: &str, scope: &str, cli: &str) -> String {
