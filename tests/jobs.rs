@@ -2309,3 +2309,93 @@ fn a_killed_job_keeps_the_lines_it_printed_before_the_kill() {
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
+
+/// Audit rows of one kind in a home, read the way the dispatcher writes them.
+fn audits(home: &Path, kind: &str) -> i64 {
+    Store::open(home)
+        .unwrap()
+        .connection()
+        .query_row("SELECT COUNT(*) FROM audit WHERE kind=?1", [kind], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_record_whose_ledger_is_not_on_this_machine_settles_once_as_foreign() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "done", &["true"]);
+    wait(&home, "done", &["succeeded"]);
+    start(&home, "live", &["true"]);
+    wait(&home, "live", &["succeeded"]);
+    // Both records name a ledger from another machine: its directory is absent
+    // here. The live one still reads as running, as a moved job would.
+    let missing = home.join("laptop-only/state/resources.sqlite");
+    let store = Store::open(&home).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.ledger', ?1) WHERE id IN ('done','live')",
+            [missing.to_string_lossy()],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.status', 'running') WHERE id='live'",
+            [],
+        )
+        .unwrap();
+    drop(store);
+
+    fixture.serve(&home);
+    fixture.serve(&home);
+
+    let done = ok(&home, "job.status", json!({"id":"done"}));
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(
+        done["foreign"]
+            .as_str()
+            .unwrap()
+            .contains("not on this machine")
+    );
+    let live = ok(&home, "job.status", json!({"id":"live"}));
+    assert_eq!(live["status"], "failed", "{live}");
+    assert!(
+        live["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not on this machine")
+    );
+    // Settled once: two passes, one audit row per record, and no outcome retry.
+    assert_eq!(audits(&home, "job.foreign"), 2);
+    assert!(!missing.exists());
+}
+
+#[test]
+fn an_existing_ledger_that_cannot_be_opened_is_retried_not_settled() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "kept", &["true"]);
+    wait(&home, "kept", &["succeeded"]);
+    // The path exists on this machine but is not a ledger file, so opening it
+    // fails for a reason that may pass; the record is left as it is.
+    let unopenable = home.join("not-a-ledger");
+    fs::create_dir(&unopenable).unwrap();
+    Store::open(&home)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.ledger', ?1) WHERE id='kept'",
+            [unopenable.to_string_lossy()],
+        )
+        .unwrap();
+
+    fixture.serve(&home);
+
+    let kept = ok(&home, "job.status", json!({"id":"kept"}));
+    assert_eq!(kept["status"], "succeeded", "{kept}");
+    assert!(kept["foreign"].is_null(), "{kept}");
+    assert_eq!(audits(&home, "job.foreign"), 0);
+}

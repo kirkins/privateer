@@ -116,6 +116,10 @@ struct Job {
     /// The supervised job whose agent started this one, when an agent did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started_by: Option<String>,
+    /// Why this record was settled as left behind by another machine: its
+    /// ledger is not here, so nothing on this machine can hold or release it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foreign: Option<String>,
     #[serde(default)]
     work_offer: Option<String>,
     /// Crew hosted in the terminal host: the supervisor runs in its own
@@ -2088,6 +2092,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         leader_result: None,
         cancelled_by: None,
         started_by,
+        foreign: None,
         work_offer: args
             .get("work_offer")
             .and_then(Value::as_str)
@@ -3438,6 +3443,20 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         let id = job.id.clone();
         let before = job.status.clone();
         let result = (|| -> Result<Option<Job>> {
+            // Settled records are final here, and their ledger is never opened.
+            if job.foreign.is_some() {
+                return Ok(None);
+            }
+            // A ledger absent from this machine means the record came from
+            // another one. Only a missing path counts: an existing ledger that
+            // cannot be opened right now is retried, not settled.
+            if ledger_missing(&job.ledger) {
+                let cause = format!(
+                    "left behind: its ledger {} is not on this machine",
+                    job.ledger.display()
+                );
+                return Ok(Some(settle_foreign(store, &job.id, &cause)?));
+            }
             // A live supervisor is checked cheaply and left to finish its job.
             let supervised = !terminal(&job.status)
                 && job.supervisor.as_ref().map(same_process).transpose()? == Some(true);
@@ -3455,6 +3474,56 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         }
     }
     Ok(settled)
+}
+
+/// Whether a job's ledger path is absent from this machine.
+fn ledger_missing(path: &Path) -> bool {
+    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+/// Settle a record that belongs to another machine, once. A live record
+/// becomes failed with `cause`, reported like any failure; a finished one
+/// keeps its status. The mark stops later ticks from opening its ledger, and
+/// one audit row records the settlement.
+fn settle_foreign(store: &Store, id: &str, cause: &str) -> Result<Job> {
+    let mut settled = false;
+    let job = alter(store, id, |j| {
+        if j.foreign.is_some() {
+            return;
+        }
+        settled = true;
+        j.foreign = Some(cause.into());
+        if !terminal(&j.status) {
+            j.status = "failed".into();
+            j.reason = Some(cause.into());
+            j.finished_ms = j.finished_ms.or(Some(Store::now_ms()));
+        }
+    })?;
+    if settled {
+        store.audit(
+            "job.foreign",
+            &json!({"job_id": job.id, "status": job.status, "ledger": job.ledger, "cause": cause}),
+        )?;
+    }
+    Ok(job)
+}
+/// A ship that moved here from `from`: work it left unfinished there cannot
+/// run here, so each unfinished record settles as failed, once.
+pub(crate) fn settle_left_behind(store: &Store, from: &str) -> Result<()> {
+    let ids: Vec<String> = store
+        .connection()
+        .prepare(&format!(
+            "SELECT id FROM jobs WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL}"
+        ))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        settle_foreign(
+            store,
+            &id,
+            &format!("left behind when the ship moved from {from}"),
+        )?;
+    }
+    Ok(())
 }
 
 /// A job's current durable record, for crew reports.

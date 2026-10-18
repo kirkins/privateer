@@ -2185,6 +2185,67 @@ fn a_ship_with_unpushed_work_stays_where_it_is() {
 }
 
 /// The captain's own mail written in a home on this machine, sent over the link.
+/// Opens a ship's database on one machine, as the move leaves it.
+fn ship_database(machine: &Machine, ship: &str) -> rusqlite::Connection {
+    rusqlite::Connection::open(machine.folder(ship).join(".privateer/privateer.sqlite")).unwrap()
+}
+
+#[test]
+fn a_ship_move_settles_its_unfinished_records_on_the_new_machine() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    ship_with_project(&laptop, &mac, "scout");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    // A crew parked on a job whose ledger is the laptop's. A park is not busy,
+    // so the ship moves with it, and the record must not look live on the Mac.
+    let laptop_ledger = laptop.root.join("laptop-state/resources.sqlite");
+    let parked = json!({"id": "parked", "task_id": "task", "incarnation": "inc-1",
+        "command": ["sleep", "1"], "cwd": laptop.folder("scout"), "action": "spawn",
+        "heavy": false, "heavy_declared": false, "timeout_secs": 30,
+        "ledger": laptop_ledger, "status": "parked", "created_ms": 1,
+        "cancel_requested": false, "group_anchors": [], "escaped": []});
+    ship_database(&laptop, "scout")
+        .execute(
+            "INSERT INTO jobs(id, record) VALUES('parked', ?1)",
+            [parked.to_string()],
+        )
+        .unwrap();
+
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&mac_ssh),
+    );
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    let record = mac.ok("scout", "job.status", json!({"id": "parked"}));
+    assert_eq!(record["status"], "failed", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("left behind when the ship moved from"),
+        "{record}"
+    );
+    let live: i64 = ship_database(&mac, "scout")
+        .query_row(
+            "SELECT COUNT(*) FROM jobs
+             WHERE json_extract(record,'$.status') NOT IN ('succeeded','failed','cancelled','timed_out','resumed')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0);
+    let audited: i64 = ship_database(&mac, "scout")
+        .query_row(
+            "SELECT COUNT(*) FROM audit WHERE kind='job.foreign'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(audited, 1);
+}
+
 fn captain_sends(machine: &Machine, ship: &str, ssh: &Path, mail: Value) -> Output {
     let mut mail = mail;
     mail["from"] = json!("captain");
