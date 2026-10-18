@@ -989,6 +989,28 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             "payload.{reserved} is set by the runtime"
         );
     }
+    // Block asks and their links are the runtime's own: a ship that could
+    // write them could hide a card behind a real one and have its rules
+    // granted by the captain's answer to that one. Only a runtime copy keeps
+    // what the reply it copies carried.
+    if !matches!(mark, Mark::Keep(_)) {
+        ensure!(
+            payload["type"] != "tool_permission",
+            "tool-permission asks are raised by the runtime"
+        );
+        for reserved in [
+            "block",
+            "about",
+            "fanned_from",
+            "block_notice",
+            "block_cleared",
+        ] {
+            ensure!(
+                payload.get(reserved).is_none(),
+                "payload.{reserved} is set by the runtime; pass about as an argument"
+            );
+        }
+    }
     // Only the operator's own answer to a block ask is marked; a relay or a
     // bridge is not. Other replies keep the payload they were given.
     let operator = from == CAPTAIN

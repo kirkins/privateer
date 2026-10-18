@@ -94,7 +94,7 @@ pub(crate) fn narrow_rule(tool: &str, input: &Value, base: Option<&Path>) -> Opt
             let mut words = command.split_whitespace();
             let first = words.next()?;
             // An assignment or a word the shell would expand is not a prefix.
-            if !shell_word(first) || first.contains('=') {
+            if !shell_word(first) || first.contains('=') || secret_shaped(first) {
                 return None;
             }
             match words.next() {
@@ -102,7 +102,9 @@ pub(crate) fn narrow_rule(tool: &str, input: &Value, base: Option<&Path>) -> Opt
                     if shell_word(second)
                         && !second.starts_with('-')
                         && !second.contains('/')
-                        && !second.contains('.') =>
+                        && !second.contains('.')
+                        // The rule is shown unmasked, so a key is no prefix.
+                        && !secret_shaped(second) =>
                 {
                     format!("Bash({first} {second} *)")
                 }
@@ -1183,6 +1185,12 @@ mod tests {
         );
         assert_eq!(bash("make ./target").as_deref(), Some("Bash(make *)"));
         assert_eq!(bash("ls").as_deref(), Some("Bash(ls *)"));
+        // A key in the command never reaches the unmasked rule.
+        assert_eq!(
+            bash("some-cli sk-proj-abc123def456ghi789jkl012 --x").as_deref(),
+            Some("Bash(some-cli *)")
+        );
+        assert_eq!(bash("ghp_abcdefghij1234567890klmn status"), None);
         for compound in [
             "cd x && apify run",
             "echo $HOME",
