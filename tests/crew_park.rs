@@ -72,9 +72,10 @@ case "$MODE" in
     sleep 60 ;;
   *)
     child='sleep 2; echo built'
-    if [ "$MODE" = slow ] || [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then child='sleep 6; echo built'; fi
-    if [ "$MODE" = gated ]; then child=$gate; fi
-    if [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then sleep 5; fi
+    if [ "$MODE" = slow ] || [ "$MODE" = aged ]; then child='sleep 6; echo built'; fi
+    if [ "$MODE" = gated ] || [ "$MODE" = aged_hold ]; then child=$gate; fi
+    if [ "$MODE" = aged ]; then sleep 5; fi
+    if [ "$MODE" = aged_hold ]; then sleep 8; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
@@ -1047,23 +1048,31 @@ fn a_parked_crew_whose_route_was_removed_resumes_as_a_fresh_crew() {
 }
 
 /// A resumed crew gets a fresh budget for its run, not what its predecessor
-/// left: the first incarnation ran about five seconds and parked, and the
-/// resumed run lasts its full eight-second budget before it parks again at
-/// its deadline (the park cap, not the budget, bounds the total).
+/// left: the first incarnation works eight seconds and parks, and the resumed
+/// run lasts its full budget before it is held at its deadline (the park cap,
+/// not the budget, bounds the total). What its predecessor left would hold it
+/// at least eight seconds sooner.
 #[test]
 fn a_resumed_crew_gets_a_fresh_budget_for_its_run() {
     let f = Fleet::new();
     f.set_mode("aged_hold");
-    f.short_budget();
+    f.launch_budget();
     start_crew(&f, "crew-27");
     f.wait("crew-27", &["parked"]);
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
-    let resumed = Instant::now();
-    f.wait("crew-resume-park-crew-27-1-1", &["parked", "timed_out"]);
+    let resume = f.wait("crew-resume-park-crew-27-1-1", &["parked"]);
+    // The run is read from the records, not from when this test happened to
+    // notice the child settle: from its spawn to its park at the deadline.
+    let rusqlite::types::Value::Integer(parked_ms) =
+        f.park_field("crew-resume-park-crew-27-1-1", "created_ms")
+    else {
+        panic!("the resumed crew has no park: {resume}");
+    };
+    let ran_ms = parked_ms - resume["spawned_ms"].as_i64().unwrap();
     assert!(
-        resumed.elapsed() >= std::time::Duration::from_secs(7),
-        "the resumed crew ended before a fresh budget: {:?}",
-        resumed.elapsed()
+        ran_ms >= LAUNCH_BUDGET_SECS as i64 * 1000,
+        "the resumed crew ended before a fresh budget: {ran_ms} ms: {resume}"
     );
 }
 
