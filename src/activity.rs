@@ -420,8 +420,10 @@ pub fn list(store: &Store, args: &Value) -> Result<Value> {
                                 let Ok(key) = Key::parse(&entry["cursor"], true) else {
                                     continue;
                                 };
-                                let entry = masked(entry);
-                                found.push((key, entry));
+                                // Mask only what the other machine recorded: a cursor or
+                                // id can look secret-shaped and must stay usable.
+                                entry["detail"] = masked(&entry["detail"]);
+                                found.push((key, entry.clone()));
                             }
                         }
                         if answered["more"].as_bool().unwrap_or(false) {
