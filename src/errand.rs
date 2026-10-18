@@ -26,7 +26,8 @@ pub fn init(store: &Store) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS errands(id TEXT PRIMARY KEY, ship TEXT NOT NULL,
            focus TEXT NOT NULL, task_id TEXT NOT NULL, brief TEXT NOT NULL, mode TEXT NOT NULL,
            status TEXT NOT NULL, created_ms INTEGER NOT NULL, finished_ms INTEGER,
-           harness TEXT, session_id TEXT, verdict TEXT, error TEXT, usage TEXT);
+           harness TEXT, session_id TEXT, verdict TEXT, error TEXT, usage TEXT,
+           route TEXT, route_why TEXT);
          CREATE INDEX IF NOT EXISTS errand_ship ON errands(ship, created_ms);",
     )?;
     let has_digest: bool = store.connection().query_row(
@@ -38,6 +39,16 @@ pub fn init(store: &Store) -> Result<()> {
         store
             .connection()
             .execute_batch("ALTER TABLE errands ADD COLUMN plan_digest TEXT;")?;
+    }
+    let has_route: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('errands') WHERE name='route')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_route {
+        store
+            .connection()
+            .execute_batch("ALTER TABLE errands ADD COLUMN route TEXT; ALTER TABLE errands ADD COLUMN route_why TEXT;")?;
     }
     crate::herdr::errands::init(store)?;
     Ok(())
@@ -151,13 +162,38 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
             .to_owned(),
     };
     // The captain's errand routes when listed, otherwise the ship's own.
+    let require = crate::crew_routes::parse_require(args.get("require"))?;
     let requested = args
         .get("route")
         .map(|r| r.as_str().context("route must be a route name"))
         .transpose()?;
-    let (manifest, options) = match crate::crew_routes::choose(store, &ship, "errand", requested)? {
-        Some(route) => (route.manifest, route.options),
-        None => (profile["manifest"].clone(), profile["options"].clone()),
+    let choice = crate::crew_routes::choose(store, &ship, "errand", requested, require.as_ref())?;
+    let (manifest, options, route_name, route_why, route_info) = match choice {
+        Some(choice) => {
+            let info = choice.to_route_json();
+            (
+                choice.manifest,
+                choice.options,
+                Some(choice.name),
+                Some(choice.why),
+                info,
+            )
+        }
+        None => {
+            let manifest = profile["manifest"].clone();
+            let options = profile["options"].clone();
+            let identity = manifest
+                .as_str()
+                .and_then(|m| crate::routes::route_of(m, &options));
+            let info = json!({
+                "name": Value::Null,
+                "identity": identity,
+                "tier": Value::Null,
+                "uses": [],
+                "why": Value::Null,
+            });
+            (manifest, options, None, None, info)
+        }
     };
     // Bundles and plugin config belong to the ship's own route.
     let own = manifest == profile["manifest"];
@@ -183,12 +219,18 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     // Recorded before its job exists, so launch planning treats it as the
     // first mate's own headless session rather than crew.
     store.connection().execute(
-        "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms, harness, session_id)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9)",
-        params![id, ship, focus, task_id, brief, mode, Store::now_ms(), harness, resume],
+        "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms, harness, session_id, route, route_why)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11)",
+        params![id, ship, focus, task_id, brief, mode, Store::now_ms(), harness, resume, route_name, route_why],
     )?;
     let mut launch = json!({"id": id, "task_id": task_id, "manifest": manifest,
         "options": options, "wake": text});
+    if let Some(name) = &route_name {
+        launch["route_name"] = json!(name);
+    }
+    if let Some(why) = &route_why {
+        launch["route_why"] = json!(why);
+    }
     if let Some(selected) = profile.get("tool_bundles").filter(|_| own) {
         launch["tool_bundles"] = selected.clone();
     }
@@ -211,7 +253,13 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
         "errand.start",
         &json!({"errand": id, "ship": ship, "focus": focus}),
     )?;
-    Ok(json!({"errand": id, "focus": focus, "mode": mode, "status": "running"}))
+    Ok(json!({
+        "errand": id,
+        "focus": focus,
+        "mode": mode,
+        "status": "running",
+        "route": route_info,
+    }))
 }
 
 /// The last assistant reply in a harness's JSON event log: Pi-family
@@ -226,18 +274,41 @@ pub(crate) fn last_reply(log: &str) -> Option<String> {
     reply
 }
 
+struct RunningErrand {
+    id: String,
+    ship: String,
+    focus: String,
+    task_id: String,
+    _route_name: Option<String>,
+    route_why: Option<String>,
+}
+
 /// Record errands whose job has ended and mail their verdicts.
 pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
-    let running: Vec<(String, String, String, String)> = {
+    let running: Vec<RunningErrand> = {
         let mut statement = store.connection().prepare(
-            "SELECT id, ship, focus, task_id FROM errands WHERE status='running' ORDER BY created_ms",
+            "SELECT id, ship, focus, task_id, route, route_why FROM errands WHERE status='running' ORDER BY created_ms",
         )?;
         statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .query_map([], |r| {
+                Ok(RunningErrand {
+                    id: r.get(0)?,
+                    ship: r.get(1)?,
+                    focus: r.get(2)?,
+                    task_id: r.get(3)?,
+                    _route_name: r.get(4)?,
+                    route_why: r.get(5)?,
+                })
+            })?
             .collect::<rusqlite::Result<_>>()?
     };
     let mut settled = vec![];
-    for (id, ship, focus, task_id) in running {
+    for errand in running {
+        let id = errand.id;
+        let ship = errand.ship;
+        let focus = errand.focus;
+        let task_id = errand.task_id;
+        let route_why = errand.route_why;
         let job = store
             .connection()
             .query_row("SELECT record FROM jobs WHERE id=?1", [&id], |r| {
@@ -303,6 +374,12 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 body.chars().take(VERDICT_CHARS).collect::<String>(),
                 logs.display()
             );
+        }
+        if let Some(why) = &route_why {
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&format!("Route: {why}\n"));
         }
         store.connection().execute(
             "UPDATE errands SET status=?2, finished_ms=?3, verdict=?4, usage=?5,

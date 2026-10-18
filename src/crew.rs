@@ -163,6 +163,9 @@ pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Resu
         " after {:.1} s, for task {task_id}.\n",
         duration_ms as f64 / 1000.0
     ));
+    if let Some(route_why) = job["route_why"].as_str() {
+        body.push_str(&format!("Route: {route_why}\n"));
+    }
     if let Some(reason) = &reason {
         body.push_str(&format!("Reason: {reason}\n"));
     }
@@ -1054,9 +1057,10 @@ fn launch_resume(
             "config",
             "tool_bundles",
             "cwd",
+            "require",
         ]
     } else {
-        &["heavy", "config", "tool_bundles", "cwd"]
+        &["heavy", "config", "tool_bundles", "cwd", "require"]
     };
     for key in keys {
         if !launch[key].is_null() {
