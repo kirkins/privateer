@@ -2690,14 +2690,26 @@ fn each_malformed_decision_field_is_refused_by_name_and_never_echoed() {
             "case {n} echoed a value: {message}"
         );
     }
-    assert!(
-        err(send(
-            &mut s,
-            json!({"id":"not-a-decision","from":"apps","to":"captain","kind":"request",
-            "body":"Which?","payload":{"decision":valid_decision()}})
-        ))
-        .contains("decision applies to decision messages")
+    // Other mail keeps a payload key named decision as it was: only a
+    // decision message carries a typed decision.
+    let plain = send(
+        &mut s,
+        json!({"id":"not-a-decision","from":"apps","to":"captain","kind":"request",
+        "body":"Which?","payload":{"decision":"repair-plan"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        plain["payload"],
+        json!({"decision":"repair-plan"}),
+        "{plain}"
     );
+    let notice = send(
+        &mut s,
+        json!({"id":"fyi","from":"apps","to":"infra","kind":"notice","body":"done",
+        "payload":{"decision":"repair-plan","tested_head":"abc"}}),
+    )
+    .unwrap();
+    assert_eq!(notice["payload"]["decision"], "repair-plan", "{notice}");
 }
 
 #[test]
@@ -2762,28 +2774,32 @@ fn a_captain_answers_by_option_text_or_both_and_a_bad_answer_leaves_the_decision
 }
 
 #[test]
-fn an_answer_is_only_for_a_reply_to_a_typed_decision() {
+fn an_answer_is_checked_only_against_a_typed_decision() {
     let (_temp, mut s) = fleet();
     send(
         &mut s,
         json!({"id":"plain","from":"apps","to":"captain","kind":"decision","body":"Ship?"}),
     )
     .unwrap();
-    let plain = err(dispatch(
+    // A plain decision has no options to check against: the answer rides
+    // along and the reply closes it as before.
+    dispatch(
         &mut s,
         "mail.send",
         json!({"from":"captain","to":"apps","kind":"reply","correlation":"plain",
             "body":"Yes","payload":{"answer":{"text":"Yes"}}}),
-    ));
-    assert!(
-        plain.contains("answer applies to replies to decisions"),
-        "{plain}"
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"plain"})).unwrap()["state"],
+        "answered"
     );
-    let outside = err(send(
+    // Other mail keeps a payload key named answer as it was.
+    send(
         &mut s,
         json!({"from":"apps","to":"infra","kind":"notice","body":"fyi","payload":{"answer":{"text":"x"}}}),
-    ));
-    assert!(outside.contains("answer applies to replies"), "{outside}");
+    )
+    .unwrap();
 }
 
 #[test]

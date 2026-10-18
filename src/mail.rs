@@ -723,8 +723,12 @@ fn validate_decision(decision: &Value) -> Result<()> {
 /// read. Shared by sending and by delivery, so a home refuses the same shapes
 /// whichever way they arrive.
 fn typed_payload(kind: &str, payload: &mut Value) -> Result<()> {
+    // Only a decision message carries a typed decision. Other mail keeps any
+    // payload it had, including a key named decision or answer, as before.
+    if kind != "decision" {
+        return Ok(());
+    }
     if let Some(decision) = payload.get("decision").cloned() {
-        ensure!(kind == "decision", "decision applies to decision messages");
         validate_decision(&decision)?;
         // Older doors show only plain choices, so the labels stand in for them.
         if payload.get("choices").is_none() {
@@ -738,11 +742,14 @@ fn typed_payload(kind: &str, payload: &mut Value) -> Result<()> {
             );
         }
     }
-    ensure!(
-        kind == "reply" || payload.get("answer").is_none(),
-        "answer applies to replies"
-    );
     Ok(())
+}
+
+/// The typed decision a reply answers, if the thread is one.
+fn typed_decision(thread: &Value) -> Option<&Value> {
+    (thread["kind"] == "decision")
+        .then(|| thread["payload"].get("decision"))
+        .flatten()
 }
 
 /// The option ids a decision offers, in its own order.
@@ -972,10 +979,10 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
                         thread["state"] == "open",
                         "{correlation} was already answered"
                     );
-                    if let Some(answer) = payload.get("answer") {
-                        let decision = thread["payload"]
-                            .get("decision")
-                            .context("answer applies to replies to decisions")?;
+                    // Only an answer to a typed decision is checked against its options.
+                    if let (Some(answer), Some(decision)) =
+                        (payload.get("answer"), typed_decision(&thread))
+                    {
                         check_answer(decision, answer)?;
                     }
                 }
@@ -1564,10 +1571,8 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             ),
             "{correlation} was already answered"
         );
-        if let Some(answer) = payload.get("answer") {
-            let decision = request["payload"]
-                .get("decision")
-                .context("answer applies to replies to decisions")?;
+        // Only an answer to a typed decision is checked against its options.
+        if let (Some(answer), Some(decision)) = (payload.get("answer"), typed_decision(&request)) {
             check_answer(decision, answer)?;
         }
     }
