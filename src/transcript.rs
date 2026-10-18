@@ -552,7 +552,7 @@ mod tests {
         assert!(!text.contains(TOKEN) && !text.contains("c=1") && !text.contains("PLAIN"));
         assert_eq!(value["path"], "/w/a.rs");
         assert_eq!(value["env"], MASK);
-        let output = mask_output(&format!(r#"{{"access_token":"short","ok":true}}"#));
+        let output = mask_output(r#"{"access_token":"short","ok":true}"#);
         assert!(
             !output.contains("short") && output.contains("\"ok\":true"),
             "{output}"
