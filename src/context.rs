@@ -419,6 +419,9 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             ));
         }
     }
+    if let Some(line) = crate::scheduling::backlog_line(store, ship)? {
+        text.push_str(&format!("{line}\n"));
+    }
     if !scheduling.is_empty() {
         text.push_str("Task scheduling (unscheduled tasks require explicit task.enqueue):\n");
         for work in scheduling.iter().take(20) {
@@ -461,7 +464,8 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
 }
 
 /// Tasks the ship marks running that nothing is moving: no live job on the
-/// task or any task beneath it, no open request the ship sent about them, and
+/// task or any task beneath it (a crew parked on its heavy job, or held, is
+/// live), no open request the ship sent about them, and
 /// no pinned `waiting` fact. A first mate that says it will carry on and then
 /// stops leaves exactly these behind. The duty task is ongoing by design.
 pub fn idle_tasks(store: &Store, ship: &str) -> Result<Vec<Value>> {
@@ -474,7 +478,9 @@ pub fn idle_tasks(store: &Store, ship: &str) -> Result<Vec<Value>> {
            AND NOT EXISTS (SELECT 1 FROM tree JOIN jobs j
              ON json_extract(j.record,'$.task_id') = tree.id
              WHERE tree.root = t.id AND json_extract(j.record,'$.status')
-               IN ('starting','queued','launching','running','orphaned'))
+               IN ('starting','queued','launching','running','orphaned','parked'))
+           AND NOT EXISTS (SELECT 1 FROM tree JOIN crew_parks p ON p.task_id = tree.id
+             WHERE tree.root = t.id AND p.state IN ('parked','held','resuming'))
            AND NOT EXISTS (SELECT 1 FROM tree JOIN mail m ON m.task_id = tree.id
              WHERE tree.root = t.id AND m.sender=?1 AND m.state='open')
            AND NOT EXISTS (SELECT 1 FROM pins p

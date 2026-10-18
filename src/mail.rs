@@ -184,7 +184,8 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
 
 /// Write a message from `crew` to a ship hosted here, inside the caller's
 /// transaction so it commits with the fact it reports. `message` holds id,
-/// to, kind (notice or request), task_id, body, payload and urgency. The id
+/// to, kind (notice or request), body, payload and urgency, and optionally
+/// task_id and correlation. The id
 /// is the idempotency key: an existing message under it is left as it is,
 /// and false is returned.
 pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Result<bool> {
@@ -194,15 +195,18 @@ pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Resul
         matches!(kind, "notice" | "request") && URGENCIES.contains(&urgency),
         "invalid crew message"
     );
+    // A notice may carry a correlation only to group a thread: it is never a
+    // reply, so it answers nothing.
     let written = conn.execute(
-        "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO NOTHING",
+        "INSERT INTO mail(id,sender,recipient,kind,task_id,correlation,body,payload,urgency,created_ms,state)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO NOTHING",
         params![
             text("id")?,
             CREW,
             text("to")?,
             kind,
-            text("task_id")?,
+            message["task_id"].as_str(),
+            message["correlation"].as_str(),
             text("body")?,
             message["payload"].to_string(),
             urgency,

@@ -1084,3 +1084,310 @@ fn failed_deliveries_fault_after_three_attempts_and_notify_the_owner_once() {
         .unwrap();
     assert_eq!(notices, 1);
 }
+
+/// The backlog alarm's report for infra in one dispatcher pass.
+fn backlog(report: &Value) -> Value {
+    report["backlog"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["ship"] == "infra")
+        .cloned()
+        .unwrap_or_else(|| panic!("no backlog report: {report}"))
+}
+
+/// As if `secs` passed: the alarm's last fire and the wake records move back.
+fn pass(fleet: &Fleet, secs: i64) {
+    let ms = secs * 1000;
+    let db = fleet.store.connection();
+    db.execute(
+        "UPDATE backlog_alarms SET fired_ms=fired_ms-?1, next_ms=next_ms-?1",
+        [ms],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE wakes SET created_ms=created_ms-?1, finished_ms=finished_ms-?1",
+        [ms],
+    )
+    .unwrap();
+}
+
+fn alarm(fleet: &mut Fleet) -> Value {
+    call(fleet, "work.status", json!({"ship":"infra"}))["backlog_alarm"].clone()
+}
+
+/// The backlog notices infra has been sent, oldest first.
+fn notices(fleet: &Fleet) -> Vec<Value> {
+    let db = fleet.store.connection();
+    let mut statement = db
+        .prepare(
+            "SELECT id, sender, kind, body, payload, task_id FROM mail
+             WHERE recipient='infra' AND correlation='backlog-infra' ORDER BY seq",
+        )
+        .unwrap();
+    statement
+        .query_map([], |r| {
+            Ok(
+                json!({"id": r.get::<_, String>(0)?, "from": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?, "body": r.get::<_, String>(3)?,
+                "payload": serde_json::from_str::<Value>(&r.get::<_, String>(4)?).unwrap(),
+                "task_id": r.get::<_, Option<String>>(5)?}),
+            )
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn audits(fleet: &mut Fleet, kind: &str) -> usize {
+    call(fleet, "audit.list", json!({"limit":1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == kind)
+        .count()
+}
+
+fn task(fleet: &mut Fleet, id: &str) {
+    call(
+        fleet,
+        "task.create",
+        json!({"id":id,"charter_id":"fleet","owner":"infra","title":format!("Draft {id}")}),
+    );
+}
+
+/// An upgrade never fires on its first pass: a ship with no alarm row counts
+/// as just fired, and its first notice comes one interval later.
+#[test]
+fn the_first_backlog_check_after_an_upgrade_fires_nothing() {
+    let mut fleet = Fleet::new(support::now_settings());
+    let first = fleet.tick();
+    assert_eq!(backlog(&first)["skipped"], "first backlog check", "{first}");
+    let again = fleet.tick();
+    assert_eq!(backlog(&again)["skipped"], "spaced", "{again}");
+    assert!(notices(&fleet).is_empty());
+    assert!(fleet.wakes().is_empty());
+    pass(&fleet, 1800);
+    assert_eq!(backlog(&fleet.tick())["skipped"], "spaced");
+    pass(&fleet, 1800);
+    assert_eq!(backlog(&fleet.tick())["fired"], "backlog-infra-1");
+}
+
+/// A quiet headless ship with an open, unscheduled task gets one backlog
+/// notice, which wakes its first mate on a stable backlog thread, and no
+/// second one within the hour.
+#[test]
+fn a_quiet_ship_is_woken_once_for_its_backlog_and_not_again_within_the_hour() {
+    let mut fleet = Fleet::new(support::now_settings());
+    fleet.tick();
+    pass(&fleet, 3600);
+    let report = fleet.tick();
+    let fired = backlog(&report);
+    assert_eq!(fired["fired"], "backlog-infra-1", "{report}");
+    assert_eq!(fired["considered"], json!(["infra-repair"]));
+    assert_eq!(fired["total"], 1);
+    // The notice is a crew notice on the ship's backlog thread, not a reply
+    // and not about one task, and the headless wake takes it this pass.
+    let sent = notices(&fleet);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["from"], "crew");
+    assert_eq!(sent[0]["kind"], "notice");
+    assert!(sent[0]["task_id"].is_null());
+    let body = sent[0]["body"].as_str().unwrap();
+    assert!(
+        body.contains("- infra-repair: infra duty [unscheduled]"),
+        "{body}"
+    );
+    assert!(body.contains("For each: write assignment:<id>"), "{body}");
+    assert!(!body.contains("Attention is high"), "{body}");
+    let wake = Fleet::infra(&report);
+    assert_eq!(wake["focus"], "thread:backlog-infra", "{wake}");
+    assert_eq!(wake["task_id"], "infra-duty");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    assert!(fleet.prompts()[0].contains("Backlog check"));
+    // The thread is a focus: its note carries to the next backlog wake.
+    let note = call(
+        &mut fleet,
+        "note.get",
+        json!({"ship":"infra","focus":"thread:backlog-infra"}),
+    );
+    assert_eq!(note["notes"].as_array().unwrap().len(), 1, "{note}");
+    // Within the hour, nothing more.
+    pass(&fleet, 1800);
+    let later = fleet.tick();
+    assert_eq!(backlog(&later)["skipped"], "spaced", "{later}");
+    assert_eq!(notices(&fleet).len(), 1);
+    assert_eq!(fleet.wakes().len(), 1);
+    assert_eq!(audits(&mut fleet, "backlog.alarm"), 1);
+    let state = alarm(&mut fleet);
+    assert_eq!(state["fires"], 1, "{state}");
+    assert_eq!(state["considered"], json!(["infra-repair"]));
+}
+
+/// A wake that changes nothing is evaluated once per fire and the next
+/// arrival fires: 0, 2, 6 and 14 hours, then every 8. Each pass is a fresh
+/// dispatcher process, so the backoff survives restarts.
+#[test]
+fn an_unproductive_backlog_wake_backs_off_to_2_6_and_14_hours() {
+    let mut fleet = Fleet::new(support::now_settings());
+    fleet.tick();
+    pass(&fleet, 3600);
+    let mut fired = vec![];
+    let mut backoffs = vec![];
+    for hour in 0..=15 {
+        if hour > 0 {
+            pass(&fleet, 3600);
+        }
+        let report = fleet.tick();
+        let check = backlog(&report);
+        if check["fired"].is_string() {
+            fired.push(hour);
+            backoffs.push(check["backoff_secs"].as_i64().unwrap());
+            assert_eq!(fleet.settle()["status"], "succeeded");
+        } else {
+            assert_eq!(check["skipped"], "spaced", "hour {hour}: {report}");
+        }
+    }
+    assert_eq!(fired, [0, 2, 6, 14]);
+    assert_eq!(backoffs, [3600, 7200, 14400, 28800]);
+    let state = alarm(&mut fleet);
+    assert_eq!(state["fires"], 4, "{state}");
+    assert_eq!(state["quiet"], 3, "{state}");
+    assert_eq!(state["evaluated"], false, "{state}");
+    assert_eq!(audits(&mut fleet, "backlog.unproductive"), 3);
+    assert_eq!(audits(&mut fleet, "backlog.productive"), 0);
+    assert_eq!(notices(&fleet).len(), 4);
+    assert_eq!(fleet.wakes().len(), 4);
+}
+
+/// Tasks something else will move are not a backlog: a deferred one with a
+/// wait, a blocked one, one handed off, the duty task and a running one
+/// waiting on a request it sent. A new open task is then listed alone.
+#[test]
+fn deferred_blocked_handed_off_and_asking_tasks_raise_no_backlog_alarm() {
+    let mut fleet = Fleet::new(support::now_settings());
+    enqueue(&mut fleet);
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"After the window",
+            "until_ms":privateer::store::Store::now_ms() + 86_400_000}}),
+    );
+    task(&mut fleet, "infra-blocked");
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"infra-blocked","actor":"infra","status":"blocked"}),
+    );
+    task(&mut fleet, "infra-offered");
+    call(
+        &mut fleet,
+        "task.handoff",
+        json!({"id":"infra-offered","actor":"infra","target":"apps"}),
+    );
+    task(&mut fleet, "infra-asking");
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"infra-asking","actor":"infra","status":"running"}),
+    );
+    fleet.send(json!({"from":"infra","to":"apps","kind":"request",
+        "body":"Which window is free?","task_id":"infra-asking"}));
+    fleet.tick();
+    pass(&fleet, 3600);
+    let report = fleet.tick();
+    assert_eq!(backlog(&report)["skipped"], "no candidates", "{report}");
+    assert!(notices(&fleet).is_empty());
+    // A new open task is the only candidate.
+    task(&mut fleet, "infra-new");
+    let report = fleet.tick();
+    let fired = backlog(&report);
+    assert_eq!(fired["fired"], "backlog-infra-1", "{report}");
+    assert_eq!(fired["considered"], json!(["infra-new"]));
+    assert_eq!(fired["total"], 1);
+}
+
+/// A stowed fleet wakes nobody and leaves the alarm's spacing as it was.
+#[test]
+fn a_stowed_ship_is_not_woken_for_its_backlog() {
+    let mut fleet = Fleet::new(support::now_settings());
+    fleet.tick();
+    pass(&fleet, 3600);
+    let ledger = rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
+    ledger
+        .execute(
+            "INSERT INTO stows(id, started_ms, ships) VALUES('stow-test', 1, '[]')",
+            [],
+        )
+        .unwrap();
+    let before = alarm(&mut fleet);
+    let report = fleet.tick();
+    assert_eq!(backlog(&report)["skipped"], "stowed", "{report}");
+    assert!(notices(&fleet).is_empty());
+    assert_eq!(alarm(&mut fleet), before);
+    ledger
+        .execute("UPDATE stows SET resumed_ms=2 WHERE id='stow-test'", [])
+        .unwrap();
+    assert_eq!(backlog(&fleet.tick())["fired"], "backlog-infra-1");
+    assert_eq!(notices(&fleet).len(), 1);
+}
+
+/// With more candidates than a notice lists, only a handled task resets the
+/// backoff: an untouched backlog keeps backing off, and the notice lists ten
+/// and counts the rest.
+#[test]
+fn a_large_backlog_backs_off_until_one_listed_task_is_handled() {
+    let mut fleet = Fleet::new(support::now_settings());
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"infra-repair","actor":"infra","status":"done"}),
+    );
+    for n in 1..=15 {
+        task(&mut fleet, &format!("infra-d{n:02}"));
+    }
+    fleet.tick();
+    pass(&fleet, 3600);
+    let first = backlog(&fleet.tick());
+    assert_eq!(first["fired"], "backlog-infra-1", "{first}");
+    assert_eq!(first["considered"].as_array().unwrap().len(), 10);
+    assert_eq!(first["total"], 15);
+    let body = notices(&fleet)[0]["body"].as_str().unwrap().to_owned();
+    assert!(body.contains("... and 5 more"), "{body}");
+    assert!(body.len() < 2048, "{}", body.len());
+    fleet.settle();
+    // Untouched: the evaluation backs off rather than seeing five "new" tasks.
+    pass(&fleet, 3600);
+    let check = backlog(&fleet.tick());
+    assert_eq!(check["skipped"], "spaced", "{check}");
+    assert_eq!(check["backoff_secs"], 7200);
+    pass(&fleet, 3600);
+    assert_eq!(backlog(&fleet.tick())["fired"], "backlog-infra-2");
+    fleet.settle();
+    // One listed task handled: productive, back to the hour, and it fires now.
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"infra-d01","actor":"infra","status":"blocked"}),
+    );
+    pass(&fleet, 7200);
+    let check = backlog(&fleet.tick());
+    assert_eq!(check["fired"], "backlog-infra-3", "{check}");
+    assert_eq!(check["backoff_secs"], 3600);
+    assert_eq!(check["total"], 14);
+    assert!(
+        !check["considered"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("infra-d01"))
+    );
+    let state = alarm(&mut fleet);
+    assert_eq!(state["quiet"], 0, "{state}");
+    assert_eq!(audits(&mut fleet, "backlog.productive"), 1);
+    fleet.settle();
+    // Untouched again: backing off again.
+    pass(&fleet, 3600);
+    let check = backlog(&fleet.tick());
+    assert_eq!(check["backoff_secs"], 7200, "{check}");
+    assert_eq!(alarm(&mut fleet)["quiet"], 1);
+}

@@ -159,7 +159,9 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "work.started" | "work.release" | "work.settled" => native_event(store, command, &args),
         "work.status" => {
             let ship = required(&args, "ship")?;
-            Ok(json!({"ship":ship,"tasks":snapshot(store,ship)?}))
+            Ok(
+                json!({"ship":ship,"tasks":snapshot(store,ship)?,"backlog_alarm":super::backlog::view(store,ship)?}),
+            )
         }
         _ => bail!("unknown scheduling command {command}"),
     }

@@ -515,6 +515,22 @@ fn a_failed_wake_backs_off_then_retries_the_same_mail() {
         Fleet::infra(&fleet.tick())["skipped"],
         "backing off after a failed wake"
     );
+    // A newer backlog alarm record (a hosted wake's budget row) is not a
+    // wake attempt and does not hide the failure.
+    fleet
+        .store
+        .connection()
+        .execute(
+            "INSERT INTO wakes(id, ship, focus, through_seq, mode, status, created_ms, finished_ms, reason)
+             VALUES('backlog-infra-1', 'infra', 'thread:backlog-infra', 0, 'hosted', 'succeeded',
+               ?1, ?1, 'backlog')",
+            [privateer::store::Store::now_ms() + 1],
+        )
+        .unwrap();
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "backing off after a failed wake"
+    );
     fleet.configure(now_settings());
     fleet.mode("normal");
     assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");

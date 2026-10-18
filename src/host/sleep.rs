@@ -3,8 +3,9 @@
 //! keeps it running) has its native harness stopped to free memory, while
 //! `start --hosted` keeps the pane, the ship's presence lease and its place in
 //! Herdr, where the pane stays listed as the ship's agent, asleep. New
-//! actionable mail, ready scheduled work, Enter in the pane or the captain
-//! moving to it in Herdr starts the harness again on the same conversation.
+//! actionable mail (a backlog notice included), ready scheduled work, Enter
+//! in the pane or the captain moving to it in Herdr starts the harness again
+//! on the same conversation.
 //! The dispatcher sees an attended, hosted ship throughout, so it neither
 //! opens another space nor starts a headless wake.
 use crate::store::Store;
@@ -103,15 +104,20 @@ pub(crate) fn sleep(
 
 /// What wakes a sleeping first mate, other than the captain at its pane:
 /// actionable mail that arrived after it slept, or scheduled work now ready.
+/// Mail that is only the dispatcher's backlog notices wakes it for "backlog".
 pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option<&'static str>> {
-    let mail: bool = store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2
-           AND COALESCE(delivery,'received')='received' AND (kind<>'notice' OR urgency<>'low'))",
-        params![ship, asleep.through_seq],
-        |r| r.get(0),
+    let (mail, backlog): (bool, bool) = store.connection().query_row(
+        "SELECT COALESCE(MAX(sender<>?3 OR correlation IS NOT 'backlog-'||?1), 0), COUNT(*)>0
+         FROM mail WHERE recipient=?1 AND seq>?2
+           AND COALESCE(delivery,'received')='received' AND (kind<>'notice' OR urgency<>'low')",
+        params![ship, asleep.through_seq, crate::mail::CREW],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     if mail {
         return Ok(Some("mail"));
+    }
+    if backlog {
+        return Ok(Some("backlog"));
     }
     Ok(crate::scheduling::has_ready(store, ship)?.then_some("scheduled work"))
 }
@@ -273,7 +279,7 @@ pub(crate) fn rest(
 ) -> Result<Option<&'static str>> {
     terminal.restore();
     println!(
-        "⚓ {ship}'s first mate is asleep to free memory. New mail or scheduled work wakes it.\n  Type a message and press Enter to mail it and wake the first mate, or just press Enter."
+        "⚓ {ship}'s first mate is asleep to free memory. New mail, scheduled work or a backlog check wakes it.\n  Type a message and press Enter to mail it and wake the first mate, or just press Enter."
     );
     // Herdr lists only panes it sees an agent in, so the sleeping pane reports
     // itself as one under PANE_AGENT. Herdr's own detection takes over once woken.

@@ -35,6 +35,15 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
         0,
         86_400,
     ),
+    // A quiet first mate with open tasks nothing will start is mailed a
+    // backlog notice at most this often, backing off when it moves nothing
+    // (0 turns it off).
+    (
+        "backlog_alarm_secs",
+        crate::scheduling::BACKLOG_ALARM_SECS,
+        0,
+        86_400,
+    ),
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;
@@ -248,7 +257,7 @@ fn setting(profile: &Value, name: &str) -> i64 {
 }
 
 /// Local ships with a first mate to wake.
-fn ships(store: &Store) -> Result<Vec<Value>> {
+pub(crate) fn ships(store: &Store) -> Result<Vec<Value>> {
     let mut statement = store
         .connection()
         .prepare("SELECT record FROM ships ORDER BY name")?;
@@ -446,7 +455,7 @@ fn job_status(store: &mut Store, job_id: &str) -> Result<Value> {
     crate::jobs::dispatch(store, "job.status", json!({"id": job_id}))
 }
 
-fn own_route_blocked(store: &Store, profile: &Value) -> Result<bool> {
+pub(crate) fn own_route_blocked(store: &Store, profile: &Value) -> Result<bool> {
     let Some(route) = profile["manifest"]
         .as_str()
         .and_then(|manifest| crate::routes::route_of(manifest, &profile["options"]))
@@ -721,7 +730,10 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let last: Option<(String, Option<i64>)> = store
         .connection()
         .query_row(
-            "SELECT status, finished_ms FROM wakes WHERE ship=?1 ORDER BY created_ms DESC LIMIT 1",
+            // A backlog alarm's record row is not a wake attempt; it must not
+            // hide a recent failure from the retry backoff.
+            "SELECT status, finished_ms FROM wakes WHERE ship=?1 AND reason<>'backlog'
+             ORDER BY created_ms DESC LIMIT 1",
             [&name],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -874,6 +886,8 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let errands = crate::errand::settle(store)?;
     let routes = crate::routes::scan(store)?;
     let work = crate::scheduling::tick(store)?;
+    // Before the wakes, so a headless ship's wake takes the notice this tick.
+    let backlog = crate::scheduling::backlog_tick(store)?;
     let mut considered = vec![];
     for ship in ships(store)? {
         considered.push(match consider(store, &ship) {
@@ -893,7 +907,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "reconciled": reconciled, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 
@@ -951,6 +965,9 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
                 .as_array()
                 .is_some_and(|s| !s.is_empty())
             || report["delivered"]["delivered"].as_u64().unwrap_or(0) > 0
+            || report["backlog"]
+                .as_array()
+                .is_some_and(|b| b.iter().any(|r| r.get("fired").is_some()))
             || report["workspaces"]
                 .as_array()
                 .is_some_and(|w| !w.is_empty())
