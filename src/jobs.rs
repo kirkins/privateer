@@ -129,6 +129,11 @@ struct Job {
     /// A harness job's `harness/provider/model`, for provider backoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_route: Option<String>,
+    /// The tokens a harness job reported, recorded once when it settles
+    /// (see `harness_usage`). None while it runs, and for a harness that
+    /// reported nothing: never zero for an unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<Value>,
     /// Bundled Codex read-only crew must leave a durable report; otherwise a
     /// sandboxed no-op would be indistinguishable from successful work.
     #[serde(default)]
@@ -339,6 +344,12 @@ pub fn init(store: &Store) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS jobs_live ON jobs(json_extract(record,'$.created_ms'))
          WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL};"
     ))?;
+    // Harness jobs by when they settled, so `usage.summary` reads a period's
+    // records without the rest.
+    store.connection().execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS jobs_finished ON jobs(json_extract(record,'$.finished_ms'))
+         WHERE {HARNESS_SQL};"
+    ))?;
     // The process that claimed a park's resume, so recovery leaves a launch
     // that is still in flight alone (added after the table first shipped).
     let claimer: bool = store.connection().query_row(
@@ -379,6 +390,11 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
         let mut job = load(store, id)?;
         let before = job.status.clone();
         f(&mut job);
+        // A harness job's usage is read from its log once, as it settles,
+        // and commits with the status that settled it.
+        if terminal(&job.status) && !terminal(&before) && job.usage.is_none() {
+            job.usage = harness_usage(store, &job);
+        }
         conn.execute(
             "UPDATE jobs SET record=?2 WHERE id=?1",
             params![id, serde_json::to_string(&job)?],
@@ -399,6 +415,60 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
         let _ = conn.execute_batch("ROLLBACK");
     }
     result
+}
+/// Whether a job runs a harness: crew, errands and wakes all start through
+/// `agent.start`, the only path that records the `spawn` action.
+fn is_harness(job: &Job) -> bool {
+    job.action == "spawn"
+}
+/// The tokens a settled harness job reported in its log, read with the
+/// parser wakes use and normalized to `input`, `output`, `cacheRead`,
+/// `cacheWrite` and `totalTokens`. A hosted job writes to its pane, not its
+/// log, so it reports nothing here.
+fn harness_usage(store: &Store, job: &Job) -> Option<Value> {
+    if !is_harness(job) {
+        return None;
+    }
+    let log = store
+        .home()
+        .join("jobs")
+        .join(&job.id)
+        .join(&job.incarnation)
+        .join("stdout.log");
+    // A bounded log can be cut inside a UTF-8 character; keep the rest.
+    let text = fs::read(log)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .ok()?;
+    normalize_usage(&crate::activation::usage(&text)?)
+}
+/// One usage shape for every harness. Native launchers already print it;
+/// Codex prints `input_tokens` with its cached tokens inside, so the cached
+/// part moves to `cacheRead` and `input` is what was not cached, as the
+/// others count it. A missing total is the sum of the four. None when no
+/// field is recognized: a harness that reports nothing records no usage.
+pub(crate) fn normalize_usage(raw: &Value) -> Option<Value> {
+    let field = |names: &[&str]| names.iter().find_map(|name| raw[*name].as_u64());
+    let mut input = field(&["input", "input_tokens"]);
+    let output = field(&["output", "output_tokens"]);
+    let mut cache_read = field(&["cacheRead", "cache_read_input_tokens"]);
+    let cache_write = field(&["cacheWrite", "cache_creation_input_tokens"]);
+    if let Some(cached) = raw["cached_input_tokens"].as_u64() {
+        input = input.map(|n| n.saturating_sub(cached));
+        cache_read = Some(cache_read.unwrap_or(0) + cached);
+    }
+    let total = field(&["totalTokens", "total_tokens"]);
+    if [input, output, cache_read, cache_write, total]
+        .iter()
+        .all(Option::is_none)
+    {
+        return None;
+    }
+    let (input, output) = (input.unwrap_or(0), output.unwrap_or(0));
+    let (cache_read, cache_write) = (cache_read.unwrap_or(0), cache_write.unwrap_or(0));
+    Some(json!({
+        "input": input, "output": output, "cacheRead": cache_read, "cacheWrite": cache_write,
+        "totalTokens": total.unwrap_or(input + output + cache_read + cache_write),
+    }))
 }
 fn config(store: &Store) -> Result<Value> {
     let path = store.home().join("config.json");
@@ -1577,6 +1647,8 @@ fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<(
 /// `terminal` as an SQL list. A query must repeat the `jobs_live` condition
 /// with it word for word for SQLite to use that index.
 pub(crate) const TERMINAL_SQL: &str = "('succeeded','failed','cancelled','timed_out','resumed')";
+/// `is_harness` in SQL, word for word as the `jobs_finished` index has it.
+pub(crate) const HARNESS_SQL: &str = "json_extract(record,'$.action')='spawn'";
 fn terminal(status: &str) -> bool {
     // `resumed`: a parked crew whose work moved to the job its park resumed.
     matches!(
@@ -2003,6 +2075,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .and_then(Value::as_str)
             .filter(|_| agent)
             .map(str::to_owned),
+        usage: None,
         codex_read_only_crew: args
             .get("codex_read_only_crew")
             .and_then(Value::as_bool)
@@ -2678,6 +2751,24 @@ mod reply_capture_tests {
         let sidecar = temp.path().join("reply");
         persist_reply(br#"{"type":"agent_settled","aborted":false}"#, &sidecar).unwrap();
         assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn every_harness_reports_usage_in_one_shape_and_nothing_stays_unknown() {
+        let native = json!({"input": 8, "output": 3366, "cacheRead": 308807, "cacheWrite": 4943,
+            "totalTokens": 317124});
+        assert_eq!(normalize_usage(&native), Some(native.clone()));
+        // Codex counts its cached tokens inside its input.
+        let codex = json!({"input_tokens": 1200, "cached_input_tokens": 1000, "output_tokens": 80});
+        assert_eq!(
+            normalize_usage(&codex),
+            Some(
+                json!({"input": 200, "output": 80, "cacheRead": 1000, "cacheWrite": 0,
+                "totalTokens": 1280})
+            )
+        );
+        assert_eq!(normalize_usage(&json!({"reasoning": 4})), None);
+        assert_eq!(normalize_usage(&json!({})), None);
     }
 }
 
