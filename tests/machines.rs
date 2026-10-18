@@ -4443,14 +4443,14 @@ fn the_reached_machine_sums_the_usage_a_reaching_machine_carries_on_collect() {
         .find(|m| m["name"] != "laptop")
         .map(|m| m["name"].clone())
         .unwrap();
-    assert_eq!(
-        by_machine["groups"],
-        json!([
-            {"key": "laptop", "jobs": 3, "usage": used(3), "gaps": ["pi"], "partial_jobs": 1},
-            {"key": here, "jobs": 1, "usage": used(10)},
-        ]),
-        "{by_machine}"
-    );
+    // Groups come sorted by key, and the host's name may sort either side
+    // of "laptop", so compare them in that same order.
+    let mut expected = vec![
+        json!({"key": "laptop", "jobs": 3, "usage": used(3), "gaps": ["pi"], "partial_jobs": 1}),
+        json!({"key": here, "jobs": 1, "usage": used(10)}),
+    ];
+    expected.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    assert_eq!(by_machine["groups"], json!(expected), "{by_machine}");
     let row = machine_entry(&by_machine, "laptop");
     assert_eq!(row["reached"], true, "{by_machine}");
     assert_eq!(row["via"], "collect", "{by_machine}");
