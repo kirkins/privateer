@@ -242,6 +242,7 @@ impl Store {
         crate::attention::init(&store)?;
         crate::presence::init(&store)?;
         crate::scheduling::init(&store)?;
+        crate::block_ask::init(&store)?;
         Ok(store)
     }
 

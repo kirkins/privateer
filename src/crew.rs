@@ -95,7 +95,9 @@ fn tail(path: &Path, limit: u64) -> String {
 
 /// Record a crew job's outcome for the ship that owns its task. Called by
 /// the jobs module inside the transaction that sets the reported status.
-pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
+/// `block` is the captain ask its denial raised or re-hit, if any: the
+/// captain has it, so the outcome waits for the next real wake.
+pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Result<()> {
     let job_id = job["id"].as_str().context("job id")?;
     let incarnation = job["incarnation"].as_str().context("job incarnation")?;
     let task_id = job["task_id"].as_str().context("job task")?;
@@ -122,8 +124,12 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
         }
         None => false,
     };
+    let asked = block.and_then(|b| b["ask"].as_str());
+    let declined = block.is_some_and(|b| b["declined"] == true);
     let urgency = match status {
         _ if crew_watching => "low",
+        _ if asked.is_some() => "low",
+        _ if declined => "normal",
         "succeeded" => "normal",
         // The ship stopped it itself; it can wait for the next real wake.
         "cancelled" if job["cancelled_by"] == ship.as_str() => "low",
@@ -159,6 +165,18 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
     ));
     if let Some(reason) = &reason {
         body.push_str(&format!("Reason: {reason}\n"));
+    }
+    if let Some(block) = block {
+        let rules = block["rules"].as_str().unwrap_or("a tool");
+        match asked {
+            Some(ask) => body.push_str(&format!(
+                "Claude was denied {rules}. The captain has decision {ask}{}; the task waits for the answer. Do not ask the captain again.\n",
+                if block["duplicate"] == true { " already" } else { "" }
+            )),
+            None => body.push_str(&format!(
+                "Claude was denied {rules}, which the captain declined for this task. Do it without them.\n"
+            )),
+        }
     }
     if let Some(leader) = job["leader_result"]["status"].as_str() {
         body.push_str(&format!(
@@ -200,6 +218,13 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
         "leader_result": job["leader_result"], "cancelled_by": job["cancelled_by"],
         "retry_of": job["retry_of"],
     });
+    let mut payload = payload;
+    if let Some(block) = block {
+        payload["block"] = block.clone();
+        if let Some(ask) = asked {
+            payload["about"] = json!(ask);
+        }
+    }
     record_crew(
         store.connection(),
         &json!({"id": format!("crew-{job_id}-{incarnation}"), "to": ship, "kind": "notice",

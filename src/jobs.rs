@@ -374,8 +374,13 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
             "UPDATE jobs SET record=?2 WHERE id=?1",
             params![id, serde_json::to_string(&job)?],
         )?;
+        // A harness denial becomes one captain ask when the job ends; any
+        // failure there leaves the ordinary outcome.
+        let block = (terminal(&job.status) && job.status != "resumed" && !terminal(&before))
+            .then(|| crate::block_ask::settle(store, &public_job(&job)))
+            .flatten();
         if reported(&job.status) && !reported(&before) {
-            crate::crew::outcome(store, &public_job(&job))?;
+            crate::crew::outcome(store, &public_job(&job), block.as_ref())?;
         }
         Ok(job)
     })();

@@ -52,6 +52,36 @@ profile/settings choices; it does not revoke custom rules or a profile that
 already requests permissive access. No native settings files, hooks, credentials,
 provider routes, model choices, or charter actions are rewritten.
 
+## When a tool is denied
+
+A headless Claude run that is denied a tool fails, and its last line,
+`native.permission_blocked`, lists up to four denials. When the job settles, the
+runtime turns them into one captain **decision** from the task's owner (see
+[one block, one ask](design/one-block-one-ask.md)):
+
+- The card names the ship, the task, the job, the narrowest rule that would have
+  allowed each denial (`Bash(apify run *)`, `Edit(./src/a.rs)`,
+  `WebFetch(domain:example.com)`, or the tool's name) and a preview of at most 160
+  characters with secret-looking values masked. The full input stays in the job log.
+- It offers **Allow** (adds the rules to this machine's fleet policy), **Continue
+  without it** (the task's first mate is told; a later denial of the same rules asks
+  nothing new) and **Stop the task**. Allow is applied only for the operator's own
+  answer: a liaison's `captain.relay`, or a reply from a machine that does not hold
+  the captain's desk, cannot grant it.
+- A crew's denial holds its task: another `agent.start` on it is refused until the
+  captain answers or the policy covers the rules (`replace: true` starts a crew that
+  works another way). A scheduled task waits on the decision. The crew's outcome is
+  a low notice, so the first mate is not woken to ask again. A first mate's own
+  denial pauses its ship's automatic wakes, as before. An errand's denial asks but
+  holds nothing.
+- A policy change ends the decisions it covers (`yolo`, or every rule allowed); an
+  unrelated change keeps them open.
+- Mail to the captain about an open decision (citing `about`, correlated to the
+  blocked ship's notice, or the same denial on another ship) is added to it rather
+  than shown again, and gets the captain's answer.
+- A hosted or attended first mate, whose harness result the runtime cannot read,
+  reports a denial with `permissions.blocked {"task_id","tool","input"}`.
+
 ## YOLO translations
 
 | Harness | Behavior |

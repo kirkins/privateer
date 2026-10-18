@@ -2,6 +2,7 @@ pub mod activation;
 pub mod admission;
 pub mod attention;
 pub mod away;
+mod block_ask;
 mod bundled;
 pub mod captain;
 pub mod cli;
@@ -207,6 +208,16 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         );
                     }
                 }
+            }
+            // A crew denied a tool waits on its captain ask; launching another
+            // into the same denial only repeats it. `replace` tries another way.
+            if !workspace::is_wake(store, &args)?
+                && !replace
+                && let Some((ask, rules)) = block_ask::crew_block(store, &task)?
+            {
+                anyhow::bail!(
+                    "task {task} waits on captain decision {ask} (Claude was denied {rules}); it resumes when the captain answers or the fleet policy covers it. Pass replace:true to start a crew that works another way; the ask stays open"
+                );
             }
             // The captain's routes come first: crew take the route they name
             // or the first listed one that is not backing off, and agents

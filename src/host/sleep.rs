@@ -106,6 +106,10 @@ pub(crate) fn sleep(
 /// actionable mail that arrived after it slept, or scheduled work now ready.
 /// Mail that is only the dispatcher's backlog notices wakes it for "backlog".
 pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option<&'static str>> {
+    // A ship held on its own tool denial wakes only for what `paused` lets through.
+    if crate::permissions::paused(store, ship)? {
+        return Ok(None);
+    }
     let (mail, backlog): (bool, bool) = store.connection().query_row(
         "SELECT COALESCE(MAX(sender<>?3 OR correlation IS NOT 'backlog-'||?1), 0), COUNT(*)>0
          FROM mail WHERE recipient=?1 AND seq>?2
