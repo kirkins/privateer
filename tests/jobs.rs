@@ -2263,17 +2263,25 @@ fn stdout_log(home: &Path, id: &str) -> PathBuf {
 fn a_killed_job_keeps_the_lines_it_printed_before_the_kill() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
-    // A slow harness prints a line every 100 ms and is killed at 2 s, part way.
-    let command = json!({"task_id":"task","id":"slow","heavy":true,"timeout_secs":2,
+    // A slow harness prints a line every 100 ms and is killed at 4 s, part way.
+    let command = json!({"task_id":"task","id":"slow","heavy":true,"timeout_secs":4,
         "command":["/bin/sh","-c","head -c 400000 /dev/zero | tr '\\0' x | fold -w 1023; echo; i=0; while :; do i=$((i+1)); echo line-$i; sleep 0.1; done"]});
     ok(&home, "job.start", command);
-    // Streamed lines reach the log while the harness is still running.
-    let until = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until {
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait(&home, "slow", &["running"]);
+    // Streamed lines reach the log while the harness is still running. The
+    // filler can take most of the run on a slow machine, so poll for the
+    // lines rather than reading once after a fixed sleep.
+    let until = Instant::now() + Duration::from_secs(10);
+    let live = loop {
+        let text = fs::read_to_string(stdout_log(&home, "slow")).unwrap_or_default();
+        let running = ok(&home, "job.status", json!({"id":"slow"}))["status"] == "running";
+        if text.contains("line-3\n") || !running || Instant::now() >= until {
+            assert!(running, "the job ended before its lines reached the log");
+            break text;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
     // The first lines come after 400 KB of filler, so they sit in the tail.
-    let live = fs::read_to_string(stdout_log(&home, "slow")).unwrap();
     assert!(
         live.contains("line-1\n") && live.contains("line-3\n"),
         "{} bytes",
