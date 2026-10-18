@@ -744,6 +744,31 @@ fn init_again_keeps_the_captains_edits() {
 }
 
 #[test]
+fn a_dispatcher_start_brings_generated_instructions_up_to_this_build() {
+    let folder = Folder::new("desk");
+    folder.ok(&["init", "--ship", "infra", "--scope", "Deploys"]);
+    let agents = folder.ship.join("AGENTS.md");
+    let current = fs::read_to_string(&agents).unwrap();
+    // As an older build wrote it, before the template learned decisions.
+    fs::write(
+        &agents,
+        "<!-- privateer:generated -->\n# Old instructions\n",
+    )
+    .unwrap();
+
+    folder.ok(&["serve", "--json", r#"{"once":true}"#]);
+    assert_eq!(fs::read_to_string(&agents).unwrap(), current);
+
+    // A file the captain took over is never rewritten.
+    fs::write(&agents, "# My own instructions\n").unwrap();
+    folder.ok(&["serve", "--json", r#"{"once":true}"#]);
+    assert_eq!(
+        fs::read_to_string(&agents).unwrap(),
+        "# My own instructions\n"
+    );
+}
+
+#[test]
 fn commands_find_the_ship_from_any_folder_inside_it() {
     let folder = Folder::new("infra");
     let outside = folder.run_in(&folder.root, &["status"]);
