@@ -1835,23 +1835,31 @@ fn collected_table(store: &Store) -> Result<()> {
 
 /// Mail from ships here to the captain, written since `since_ms`, that the
 /// machine behind `peer` has not collected yet: the captain reads it there.
-/// It stays in this home's captain mailbox as well.
+/// With `open_asks`, the desk push, still-open asks written earlier go too,
+/// so an ask from before the desk moved is not stranded. It stays in this
+/// home's captain mailbox as well.
 pub(crate) fn awaiting_captain(
     store: &Store,
     peer: &str,
     since_ms: i64,
+    open_asks: bool,
     limit: usize,
     max_bytes: usize,
 ) -> Result<Vec<Value>> {
     collected_table(store)?;
     let mut statement = store.connection().prepare(
         "SELECT m.id FROM mail m JOIN ships s ON s.name=m.sender
-         WHERE m.recipient=?1 AND json_extract(s.record, '$.location')='here' AND m.created_ms>=?2
+         WHERE m.recipient=?1 AND json_extract(s.record, '$.location')='here'
+           AND (m.created_ms>=?2
+                OR (?5 AND m.kind IN ('request','decision') AND m.state='open'))
            AND NOT EXISTS (SELECT 1 FROM machine_collected c WHERE c.peer=?3 AND c.id=m.id)
          ORDER BY m.seq LIMIT ?4",
     )?;
     let ids: Vec<String> = statement
-        .query_map(params![CAPTAIN, since_ms, peer, limit as i64], |r| r.get(0))?
+        .query_map(
+            params![CAPTAIN, since_ms, peer, limit as i64, open_asks],
+            |r| r.get(0),
+        )?
         .collect::<rusqlite::Result<_>>()?;
     let mut envelopes = vec![];
     let mut bytes = 0;
