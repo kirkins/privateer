@@ -2752,6 +2752,13 @@ fn a_captain_answers_by_option_text_or_both_and_a_bad_answer_leaves_the_decision
             "body":"Wait, with a note.","payload":{"answer":{"option_id":"wait","text":"Until Monday."}}}),
     );
     assert!(both.is_ok(), "{both:?}");
+    for id in ["free", "both"] {
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":id})).unwrap()["state"],
+            "answered",
+            "{id} is closed by its answer"
+        );
+    }
 }
 
 #[test]
@@ -2777,4 +2784,36 @@ fn an_answer_is_only_for_a_reply_to_a_typed_decision() {
         json!({"from":"apps","to":"infra","kind":"notice","body":"fyi","payload":{"answer":{"text":"x"}}}),
     ));
     assert!(outside.contains("answer applies to replies"), "{outside}");
+}
+
+#[test]
+fn a_choice_is_bounded_in_characters_so_a_full_label_is_not_refused() {
+    let (_temp, mut s) = fleet();
+    // Eighty characters of CJK text: 240 bytes, which a byte count would refuse.
+    let label = "漢".repeat(80);
+    let plain = send(
+        &mut s,
+        json!({"id":"cjk-plain","from":"apps","to":"captain","kind":"decision","body":"Which?",
+            "payload":{"choices":[label.clone(), "Hold"]}}),
+    );
+    assert!(plain.is_ok(), "{plain:?}");
+    let typed = send(
+        &mut s,
+        decision_with(
+            "cjk-typed",
+            json!({"question":"Which?","options":[
+                {"id":"long","label":label,"what_happens":"Stays."},
+                {"id":"short","label":"Hold","what_happens":"Stays."}]}),
+        ),
+    );
+    assert!(typed.is_ok(), "{typed:?}");
+    let too_long = err(send(
+        &mut s,
+        json!({"id":"too-long","from":"apps","to":"captain","kind":"decision","body":"Which?",
+            "payload":{"choices":["x".repeat(201)]}}),
+    ));
+    assert!(
+        too_long.contains("choices must contain at most 20 bounded strings"),
+        "{too_long}"
+    );
 }

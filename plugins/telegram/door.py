@@ -11,6 +11,9 @@ owns no fleet state; it translates.
   (the liaison) or to the ship chosen with /to.
 - Replying to a pushed message answers it: a request or decision gets the
   captain's reply; a notice or reply gets a follow-up request to its sender.
+- A typed decision (payload.decision) shows its question, why, what is blocked
+  and each option. A button answers with its option id; a typed reply to the
+  card answers with free text.
 - /status, /ships and /waiting answer from records, waking no one.
 
 Telegram is the trust boundary: only the configured chat, and when set only
@@ -194,7 +197,10 @@ class Door:
         kind = mail.get("kind", "notice")
         sender = mail.get("from") or ship
         body = mail.get("body") or ""
-        if not body:
+        decision = (mail.get("payload") or {}).get("decision")
+        if isinstance(decision, dict):
+            body = decision_text(decision, body)
+        elif not body:
             body = "```json\n" + json.dumps(mail.get("payload") or {}, indent=2) + "\n```"
         if event.get("step"):
             # The exact thing only the captain can do, ahead of the request's words.
@@ -218,7 +224,9 @@ class Door:
         reply_to = None
         if mail.get("correlation"):
             reply_to = tg.read_state(OUTGOING, {}).get(mail["correlation"])
-        target = {"ship": ship, "mail": mail.get("id"), "kind": kind, "from": sender}
+        typed = isinstance((mail.get("payload") or {}).get("decision"), dict)
+        target = {"ship": ship, "mail": mail.get("id"), "kind": kind, "from": sender,
+                  "typed": typed}
         markup = self.decision_markup(mail) if kind == "decision" else None
         pieces = tg.split_markdown(body, TEXT_LIMIT) or [body]
         markdown = self.cfg.get("markdown", True)
@@ -241,20 +249,30 @@ class Door:
         return ""
 
     def decision_markup(self, mail: dict) -> dict | None:
-        """Buttons for a decision whose payload lists its options."""
-        options = (mail.get("payload") or {}).get("options")
-        if not isinstance(options, list) or not 1 <= len(options) <= 8:
-            return None
-        if not all(isinstance(o, str) and 0 < len(o) <= 64 for o in options):
+        """Buttons for a decision: one per typed option, or one per plain choice."""
+        payload = mail.get("payload") or {}
+        if isinstance(payload.get("decision"), dict):
+            options = payload["decision"].get("options") or []
+            ids = [o.get("id") for o in options]
+            labels = [o.get("label", "") for o in options]
+        else:
+            labels = payload.get("options")
+            if not isinstance(labels, list) or not 1 <= len(labels) <= 8:
+                return None
+            if not all(isinstance(o, str) and 0 < len(o) <= 64 for o in labels):
+                return None
+            ids = [None] * len(labels)
+        if not 1 <= len(labels) <= 8:
             return None
         decisions = tg.read_state(DECISIONS, {})
         key = str(int(time.time() * 1000) % 10**10)
-        decisions[key] = {"mail": mail.get("id"), "from": mail.get("from"), "options": options}
+        decisions[key] = {"mail": mail.get("id"), "from": mail.get("from"),
+                          "options": labels, "ids": ids}
         while len(decisions) > 200:
             decisions.pop(next(iter(decisions)))
         tg.write_state(DECISIONS, decisions)
         return {"inline_keyboard": [[{"text": o, "callback_data": f"d:{key}:{i}"}]
-                                    for i, o in enumerate(options)]}
+                                    for i, o in enumerate(labels)]}
 
     # --- captain messages in ---------------------------------------------
 
@@ -266,8 +284,10 @@ class Door:
             result = self.runtime.call("send", args)
         except RuntimeError as e:
             if "already answered" in str(e) and args.get("kind") == "reply":
-                # Answered elsewhere already: follow up instead of failing.
+                # Answered elsewhere already: follow up instead of failing. A
+                # typed answer cannot go to a request, so it goes as plain words.
                 args = dict(args, kind="request")
+                args.pop("payload", None)
                 try:
                     result = self.runtime.call("send", args)
                 except RuntimeError as again:
@@ -308,8 +328,11 @@ class Door:
                          "remember). Send it without replying, or use /to SHIP.", reply_to=msg_id)
                 return None
             if target.get("kind") in ("request", "decision"):
-                return {"to": target["from"], "kind": "reply", "correlation": target["mail"],
+                args = {"to": target["from"], "kind": "reply", "correlation": target["mail"],
                         "body": text}
+                if target.get("typed"):
+                    args["payload"] = {"answer": {"text": text}}
+                return args
             return {"to": target.get("from") or target.get("ship"), "kind": "request",
                     "correlation": target.get("mail"), "body": text}
         to = tg.read_state(TARGET, {}).get("ship")
@@ -367,8 +390,12 @@ class Door:
                 self.say("⚠️ that decision is no longer known; reply to its message instead.")
                 return
             choice = decision["options"][int(index)]
-            self.send({"to": decision["from"], "kind": "reply", "correlation": decision["mail"],
-                       "body": choice}, msg.get("message_id"), f"decision: {choice}")
+            args = {"to": decision["from"], "kind": "reply", "correlation": decision["mail"],
+                    "body": choice}
+            option_id = (decision.get("ids") or [None] * len(decision["options"]))[int(index)]
+            if option_id:
+                args["payload"] = {"answer": {"option_id": option_id}}
+            self.send(args, msg.get("message_id"), f"decision: {choice}")
             tg.api(self.cfg, "editMessageReplyMarkup", {
                 "chat_id": tg.chat_id(self.cfg), "message_id": msg.get("message_id"),
                 "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
@@ -703,6 +730,29 @@ def suppress_noop_ack(cfg: dict, body: str) -> bool:
         return False
     import tts
     return tts.is_noop_acknowledgement(body)
+
+
+def decision_text(decision: dict, body: str) -> str:
+    """The card's words: the question, why and what is blocked, then each option
+    with what it does, its cost and the recommended one marked, then the ship's
+    own line of context."""
+    head = [f"**{decision.get('question', '')}**"]
+    if decision.get("why"):
+        head.append(decision["why"])
+    if decision.get("blocked"):
+        head.append("Blocked: " + "; ".join(decision["blocked"]))
+    options = []
+    for option in decision.get("options") or []:
+        line = f"- **{option.get('label', '')}**: {option.get('what_happens', '')}"
+        if option.get("cost"):
+            line += f" (cost: {option['cost']})"
+        if option.get("recommended"):
+            line += " (recommended)"
+        options.append(line)
+    parts = ["\n\n".join(head), "\n".join(options)]
+    if body:
+        parts.append(body)
+    return "\n\n".join(part for part in parts if part)
 
 
 def age_phrase(age_ms: int) -> str:

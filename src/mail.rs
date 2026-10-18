@@ -859,9 +859,9 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
         let choices = choices.as_array().context("choices must be an array")?;
         ensure!(
             choices.len() <= 20
-                && choices
-                    .iter()
-                    .all(|v| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200)),
+                && choices.iter().all(|v| v
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty() && s.chars().count() <= 200)),
             "choices must contain at most 20 bounded strings"
         );
     }

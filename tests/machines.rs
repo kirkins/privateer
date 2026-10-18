@@ -2845,3 +2845,75 @@ fn a_long_wait_with_no_live_holder_alerts_the_owner() {
         "{raised:?}"
     );
 }
+
+#[test]
+fn a_typed_decision_answered_from_the_other_machine_is_checked_where_it_lives() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let asked = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "decision", "body": "Which path?",
+        "payload": {"decision": {"question": "Which path?", "options": [
+            {"id": "ship", "label": "Ship it", "what_happens": "The release goes out today."},
+            {"id": "wait", "label": "Wait", "what_happens": "Nothing ships until review."}
+        ]}}}),
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["delivered"], 1, "{pass}");
+
+    // The captain answers from the laptop with an option the decision does not
+    // offer. The laptop holds the captain's copy of the decision, so it refuses
+    // the answer at once, naming the field; nothing reaches the Mac and the
+    // decision stays open there.
+    let bad = laptop.run(
+        "liaison",
+        &[
+            "mail.send",
+            "--json",
+            &json!({"from": "captain", "to": "fitforge", "kind": "reply",
+            "correlation": asked["id"], "body": "Neither.",
+            "payload": {"answer": {"option_id": "nope"}}})
+            .to_string(),
+        ],
+        Some(&ssh),
+    );
+    assert!(!bad.status.success(), "{}", text(&bad));
+    assert!(
+        text(&bad).contains("answer.option_id must be one of the decision's option ids"),
+        "{}",
+        text(&bad)
+    );
+    laptop.pass("liaison", &ssh);
+    let still_open = mac.ok("fitforge", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(still_open["state"], "open", "{still_open}");
+    assert!(
+        messages(&mac, "fitforge", "reply").is_empty(),
+        "a refused answer is not delivered"
+    );
+
+    // A good option id closes the decision on the Mac.
+    let good = laptop.run(
+        "liaison",
+        &[
+            "mail.send",
+            "--json",
+            &json!({"from": "captain", "to": "fitforge", "kind": "reply",
+            "correlation": asked["id"], "body": "Wait for review.",
+            "payload": {"answer": {"option_id": "wait"}}})
+            .to_string(),
+        ],
+        Some(&ssh),
+    );
+    assert!(good.status.success(), "{}", text(&good));
+    laptop.pass("liaison", &ssh);
+    let closed = mac.ok("fitforge", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(closed["state"], "answered", "{closed}");
+    let replies = messages(&mac, "fitforge", "reply");
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(
+        replies[0]["payload"]["answer"]["option_id"], "wait",
+        "{replies:?}"
+    );
+}
