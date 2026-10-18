@@ -4,8 +4,11 @@
 //!
 //! Only the operator reads it. Every text it returns is masked: values under
 //! secret-looking keys, secret-shaped words, environment-looking assignments
-//! and the word after a credential flag or label. The job's argv and
-//! environment are never returned. A hosted first mate writes to its pane,
+//! and the word after a credential flag or label, `"name": "value"` pairs
+//! under a secret-looking name anywhere in text, and each line that is JSON
+//! on its own. The job's argv and environment are never returned. Masking
+//! is best effort: a short secret with no label or secret-looking name
+//! beside it (a bare password on its own line) is shown. A hosted first mate writes to its pane,
 //! not a log, so it has no transcript here yet.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail};
@@ -164,8 +167,19 @@ fn read_log(path: &Path, job_id: &str, incarnation: &str) -> String {
     if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
         return String::new();
     }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
     let mut bytes = vec![];
-    if let Ok(file) = std::fs::File::open(path) {
+    // Opened without following a link swapped in after the check above,
+    // and read only when what was opened is a plain file.
+    if let Ok(file) = options.open(path)
+        && file.metadata().is_ok_and(|m| m.file_type().is_file())
+    {
         let _ = file.take(MAX_LOG_BYTES).read_to_end(&mut bytes);
     }
     // A bounded log can be cut inside a UTF-8 character; keep the rest.
@@ -437,22 +451,32 @@ fn hidden_key(key: &str) -> bool {
 }
 
 /// Every value under a hidden key replaced, maps included; other strings
-/// masked as text.
+/// masked as text; keys that are themselves secret-shaped hidden too.
 pub(crate) fn mask_value(value: &Value) -> Value {
     match value {
-        Value::Object(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(key, value)| {
-                    let shown = if hidden_key(key) {
-                        json!(MASK)
-                    } else {
-                        mask_value(value)
-                    };
-                    (key.clone(), shown)
-                })
-                .collect::<Map<_, _>>(),
-        ),
+        Value::Object(fields) => {
+            let mut shown = Map::new();
+            for (key, value) in fields {
+                let value = if hidden_key(key) {
+                    json!(MASK)
+                } else {
+                    mask_value(value)
+                };
+                let mut key = if crate::block_ask::secret_shaped(key) {
+                    MASK.to_owned()
+                } else {
+                    key.clone()
+                };
+                // Two hidden keys stay two entries.
+                let mut n = 1;
+                while shown.contains_key(&key) {
+                    n += 1;
+                    key = format!("{MASK}{n}");
+                }
+                shown.insert(key, value);
+            }
+            Value::Object(shown)
+        }
         Value::Array(items) => Value::Array(items.iter().map(mask_value).collect()),
         Value::String(text) => json!(mask_text(text)),
         other => other.clone(),
@@ -468,10 +492,15 @@ fn env_name(name: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Text with what may be secret hidden: every `NAME=value` whose name reads
-/// as an environment variable, the word after a credential flag or label
-/// (`--password x`, `token: x`), then what `block_ask::mask` hides.
+/// Text with what may be secret hidden: each line that is a JSON object or
+/// array on its own (after a line number, as a file read shows it) masked as
+/// JSON; then every quoted `"name": "value"` pair under a secret-looking
+/// name, every `NAME=value` whose name reads as an environment variable,
+/// the word after a credential flag or label (`--password x`, `token: x`),
+/// every secret-shaped piece between quotes, brackets and separators, and
+/// what `block_ask::mask` hides.
 pub(crate) fn mask_text(text: &str) -> String {
+    let text = mask_pieces(&mask_pairs(&mask_json_lines(text)));
     let mut out = String::with_capacity(text.len());
     let mut hide_next = false;
     for word in text.split_inclusive(char::is_whitespace) {
@@ -508,6 +537,133 @@ pub(crate) fn mask_text(text: &str) -> String {
         out.push_str(word);
     }
     crate::block_ask::mask(&out)
+}
+
+/// Each line that is a JSON object or array once a leading line number
+/// (`   12\t`, `12→`) is set aside, masked by `mask_value`.
+fn mask_json_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let end = &line[body.len()..];
+        let digits = body.trim_start();
+        let number = digits.trim_start_matches(|c: char| c.is_ascii_digit());
+        let start = match number.strip_prefix(['\t', '→']) {
+            Some(rest) if number.len() < digits.len() => body.len() - rest.len(),
+            _ => 0,
+        };
+        match serde_json::from_str::<Value>(&body[start..]) {
+            Ok(value @ (Value::Object(_) | Value::Array(_))) => {
+                out.push_str(&body[..start]);
+                out.push_str(&mask_value(&value).to_string());
+                out.push_str(end);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// The quotes a key or value may be written in: escaped inside a JSON
+/// string, double or single.
+const QUOTES: [&str; 3] = ["\\\"", "\"", "'"];
+
+/// Where the string opened by `quote` at the start of `text` ends: the byte
+/// after its closing quote, within one line and `limit` bytes.
+fn quoted_end(text: &str, quote: &str, limit: usize) -> Option<usize> {
+    let mut at = quote.len();
+    while at < text.len() && at <= limit {
+        let rest = &text[at..];
+        if rest.starts_with(quote) {
+            return Some(at + quote.len());
+        }
+        let c = rest.chars().next()?;
+        if c == '\n' {
+            return None;
+        }
+        // A backslash escapes the next character, unless it begins the
+        // escaped quote that closes this string.
+        at += if c == '\\' && quote == "\"" {
+            1 + rest[1..].chars().next().map_or(0, char::len_utf8)
+        } else {
+            c.len_utf8()
+        };
+    }
+    None
+}
+
+/// The value of every quoted `"name": "value"`, `'name': 'value'` or
+/// `"name"=value` pair whose name sounds secret, anywhere in text: JSON
+/// fragments inside log lines, tool output and prose.
+fn mask_pairs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let Some(quote) = QUOTES.iter().find(|q| rest.starts_with(**q)) else {
+            let c = rest.chars().next().map_or(1, char::len_utf8);
+            out.push_str(&rest[..c]);
+            at += c;
+            continue;
+        };
+        let pair = quoted_end(rest, quote, 128).and_then(|key_end| {
+            let key = &rest[quote.len()..key_end - quote.len()];
+            let after = rest[key_end..].trim_start_matches([' ', '\t']);
+            let after = after.strip_prefix([':', '='])?;
+            let value = after.trim_start_matches([' ', '\t']);
+            let value_at = rest.len() - value.len();
+            Some((key, value_at))
+        });
+        let Some((key, value_at)) = pair else {
+            out.push_str(quote);
+            at += quote.len();
+            continue;
+        };
+        out.push_str(&rest[..value_at]);
+        at += value_at;
+        let value = &text[at..];
+        if !crate::block_ask::sensitive_name(key) {
+            continue;
+        }
+        if let Some(open) = QUOTES.iter().find(|q| value.starts_with(**q)) {
+            if let Some(end) = quoted_end(value, open, usize::MAX) {
+                out.push_str(open);
+                out.push_str(MASK);
+                out.push_str(open);
+                at += end;
+            }
+        } else if !value.starts_with(['{', '[']) {
+            let end = value
+                .find(|c: char| c.is_whitespace() || ",;}])\"'\\".contains(c))
+                .unwrap_or(value.len());
+            if end > 0 {
+                out.push_str(MASK);
+                at += end;
+            }
+        }
+    }
+    out
+}
+
+/// Every secret-shaped piece between whitespace, quotes, brackets and
+/// separators hidden, so a token inside `{"t":"ghp_…"}` is judged alone.
+fn mask_pieces(text: &str) -> String {
+    let split = |c: char| c.is_whitespace() || "\"'`:,;{}[]()=\\".contains(c);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let cut = rest.find(split).unwrap_or(rest.len());
+        let piece = &rest[..cut];
+        if crate::block_ask::secret_shaped(piece) {
+            out.push_str(MASK);
+        } else {
+            out.push_str(piece);
+        }
+        let c = rest[cut..].chars().next().map_or(0, char::len_utf8);
+        out.push_str(&rest[cut..cut + c]);
+        rest = &rest[cut + c..];
+    }
+    out
 }
 
 /// At most `max` characters, with control characters other than newlines
@@ -560,6 +716,104 @@ mod tests {
     }
 
     #[test]
+    fn compact_json_inside_text_hides_its_secrets() {
+        let access = "sk-ant-oat01-PLANTEDaccess0123456789abcdefghijklmnop";
+        let refresh = "sk-ant-ort01-PLANTEDrefresh0123456789abcdefghijklmno";
+        let openai = "sk-proj-PLANTEDopenai0123456789abcdefghij";
+        let password = "Tr0ub4dor&3";
+        let credentials = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":1792339332990,"scopes":["user:inference"]}}}}"#
+        );
+        let planted = [
+            access, refresh, openai, password, TOKEN, "hunter22", "s3cr3t",
+        ];
+        let texts = [
+            // A Read result with Claude's and cat -n's line numbers.
+            format!("     1→{credentials}\n     2→"),
+            format!("     1\t{credentials}\n"),
+            // JSONL and a log tail.
+            format!("{{\"event\":\"login\",\"token\":\"{TOKEN}\"}}\n{{\"event\":\"ok\"}}\n"),
+            format!("12:00:01 loaded {credentials} from disk"),
+            // Fragments in prose, and an assistant quoting them.
+            format!(
+                r#"saw {{"token":"{TOKEN}"}}, then {{"OPENAI_API_KEY":"{openai}"}} and {{"password":"{password}"}}."#
+            ),
+            format!("It reads 'password': '{password}' and \"secret\"=hunter22 here."),
+            // JSON escaped inside a JSON string, and a secret used as a key.
+            r#"payload "{\"api_key\":\"s3cr3t\",\"n\":1}" sent"#.to_owned(),
+            format!(r#"keys {{"{TOKEN}":true}} end"#),
+        ];
+        for text in &texts {
+            let shown = mask_text(text);
+            for secret in planted {
+                assert!(!shown.contains(secret), "{secret} in {shown}");
+            }
+        }
+        assert_eq!(
+            mask_text(&texts[0]),
+            "     1→{\"claudeAiOauth\":\"•••\"}\n     2→"
+        );
+        assert_eq!(
+            mask_text(&texts[4]),
+            // `block_ask::mask` reads `{"token":"•••"},` as the word token
+            // and hides the word after it too.
+            r#"saw {"token":"•••"}, ••• {"OPENAI_API_KEY":"•••"} and {"password":"•••"}."#
+        );
+        assert_eq!(
+            mask_text(&texts[5]),
+            r#"It reads 'password': ••• and "secret"=••• here."#
+        );
+        assert_eq!(mask_text(&texts[7]), r#"keys {"•••":true} end"#);
+        assert_eq!(
+            mask_text(&format!(
+                "  7\t{{\"oauth\":{{\"accessToken\":\"{access}\",\"scopes\":[\"x\"]}}}}"
+            )),
+            "  7\t{\"oauth\":\"•••\"}"
+        );
+        assert_eq!(
+            mask_text(&format!(
+                "  7\t{{\"login\":{{\"accessToken\":\"{access}\",\"scopes\":[\"x\"]}}}}"
+            )),
+            "  7\t{\"login\":{\"accessToken\":\"•••\",\"scopes\":[\"x\"]}}"
+        );
+        assert_eq!(
+            mask_value(&json!({TOKEN: 1, "ghp_0aZ3kQ7rT1mN5vB8xC2dF6hJ0lP4sW": 2})),
+            json!({"•••": 1, "•••2": 2})
+        );
+        // Ordinary JSON and prose stay readable.
+        assert_eq!(
+            mask_text(r#"{"path":"/w/a.rs","ok":true} said "name": "ada""#),
+            r#"{"path":"/w/a.rs","ok":true} said "name": "ada""#
+        );
+
+        // The same through each harness's log: a Write of the file, its Read,
+        // a Codex command around it and the assistant quoting it.
+        let line = |event: Value| event.to_string();
+        let log = [
+            line(json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"w","name":"Write","input":
+                    {"file_path":"/h/.claude/.credentials.json","content":credentials}},
+                {"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/h/c.json"}}]}})),
+            line(json!({"type":"user","message":{"content":[{"type":"tool_result",
+                "tool_use_id":"r","content":format!("     1→{credentials}\n")}]}})),
+            line(json!({"type":"item.completed","item":{"type":"command_execution",
+                "command":"cat ~/.config/tokens.jsonl","exit_code":0,"aggregated_output":
+                format!("reading\n{{\"token\":\"{TOKEN}\"}}\n{{\"OPENAI_API_KEY\":\"{openai}\"}}\nwarning: {{\"password\":\"{password}\"}} kept\n")}})),
+            line(json!({"type":"item.completed","item":{"type":"agent_message",
+                "text":format!("The file holds {credentials} and {{\"password\":\"{password}\"}}.")}})),
+        ]
+        .join("\n");
+        let events = normalize(&log);
+        let text = serde_json::to_string(&events).unwrap();
+        for secret in planted {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(text.contains("cat ~/.config/tokens.jsonl"), "{text}");
+        assert!(text.contains("warning:"), "{text}");
+        assert_eq!(events.len(), 6, "{text}");
+    }
+
+    #[test]
     fn bounds_count_characters_and_mark_the_cut() {
         assert_eq!(bounded("abc", 3), "abc");
         let long = bounded(&"é".repeat(10), 5);
@@ -601,7 +855,7 @@ mod tests {
                 json!({"kind":"tool_call","tool":"command","input_preview":"bash -lc ls"}),
                 json!({"kind":"tool_result","tool":"command","output_preview":"Cargo.toml\nsrc\n"}),
                 json!({"kind":"tool_call","tool":"command",
-                    "input_preview":"bash -lc 'cargo test --token=•••"}),
+                    "input_preview":"bash -lc 'cargo test --token=•••'"}),
                 json!({"kind":"tool_result","tool":"command","is_error":true,
                     "output_preview":"error: unexpected argument\n"}),
                 json!({"kind":"assistant","text":"The repository has a Cargo.toml and src."}),

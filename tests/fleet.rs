@@ -2867,6 +2867,55 @@ fn a_wake_transcript_normalizes_its_log_and_masks_what_may_be_secret() {
         ])
     );
 
+    // Compact JSON credentials inside text: a numbered Read of a credentials
+    // file, JSONL command output with text around it, a Write of the file
+    // and the assistant quoting it. No planted value appears anywhere.
+    let planted = [
+        "sk-ant-oat01-PLANTEDaccess0123456789abcdefghijklmnop",
+        "sk-ant-ort01-PLANTEDrefresh0123456789abcdefghijklmno",
+        "ghp_PLANTED9aZ3kQ7rT1mN5vB8xC2dF6hJ0l",
+        "sk-proj-PLANTEDopenai0123456789abcdefghij",
+        "Tr0ub4dor&3",
+    ];
+    let credentials = json!({"claudeAiOauth": {"accessToken": planted[0],
+        "refreshToken": planted[1], "expiresAt": 1792339332990_i64}})
+    .to_string();
+    let fragments = format!(
+        "reading\n{{\"token\":\"{}\"}}\n{{\"OPENAI_API_KEY\":\"{}\"}}\nsaw {{\"password\":\"{}\"}} ok\n",
+        planted[2], planted[3], planted[4]
+    );
+    let log = [
+        json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "w", "name": "Write",
+                "input": {"file_path": "/h/.credentials.json", "content": credentials}},
+            {"type": "tool_use", "id": "r", "name": "Read",
+                "input": {"file_path": "/h/.credentials.json"}},
+            {"type": "tool_use", "id": "b", "name": "Bash",
+                "input": {"command": "cat tokens.jsonl"}}]}}),
+        json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "r", "content": format!("     1→{credentials}\n")},
+            {"type": "tool_result", "tool_use_id": "b", "content": fragments}]}}),
+        json!({"type": "assistant", "message": {"content": [{"type": "text",
+            "text": format!("It holds {credentials} and {{\"password\":\"{}\"}}.", planted[4])}]}}),
+    ]
+    .map(|event| event.to_string())
+    .join("\n");
+    finished_run(&apps, "apps", "wakes", "wake-claude-2", "claude", &log);
+    let leaky = machine.json(
+        &web,
+        "wake.transcript",
+        json!({"ship": "apps", "wake_id": "wake-claude-2"}),
+    );
+    let text = leaky.to_string();
+    for secret in planted {
+        assert!(!text.contains(secret), "{secret} in {leaky:#}");
+    }
+    assert_eq!(leaky["events"].as_array().unwrap().len(), 6, "{leaky:#}");
+    assert_eq!(
+        leaky["events"][3]["output_preview"],
+        "     1→{\"claudeAiOauth\":\"•••\"}\n"
+    );
+
     // An errand by its id, from a Pi log whose middle the job log dropped.
     let rotated = fs::read_to_string(fixtures.join("errand-rotated-pi.log")).unwrap();
     finished_run(&apps, "apps", "errands", "errand-pi-1", "pi", &rotated);
