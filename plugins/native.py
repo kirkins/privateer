@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 
 from protocol import context, option, serve
-from tool_permissions import options_for, claude_disallowed, claude_rules, policy
+from tool_permissions import options_for, claude_disallowed, claude_rules, policy, claude_auto_mode_settings
 
 
 PROFILES = {
@@ -273,8 +273,36 @@ def build(harness, request):
         # its trust dialog, which a new ship's folder never had. Grant the
         # Privateer CLI on the command line so the agent can reach its home.
         control = request["context"].get("control")
-        argv += ["--allowedTools", *claude_rules(tool_policy, control)]
-        argv += ["--disallowedTools", *claude_disallowed(request["context"].get("role"))]
+        role = request["context"].get("role")
+        errand = request["context"].get("errand", False)
+        actions = request["context"].get("actions")
+        forge = request["context"].get("forge") or request["context"].get("forges")
+        ship = request["context"].get("owner")
+        argv += ["--allowedTools", *claude_rules(tool_policy, control, actions=actions, forge=forge, role=role, errand=errand)]
+        argv += ["--disallowedTools", *claude_disallowed(role)]
+        auto_settings = claude_auto_mode_settings(actions, forge=forge, role=role, errand=errand, ship=ship)
+        if auto_settings:
+            settings_idx = None
+            for idx, arg in enumerate(argv):
+                if arg == "--settings" or arg.startswith("--settings="):
+                    settings_idx = idx
+                    break
+            if settings_idx is not None:
+                arg = argv[settings_idx]
+                if "=" in arg:
+                    raw = arg.split("=", 1)[1]
+                    existing = json.loads(raw)
+                    from tool_permissions import merge_auto_mode_settings
+                    merged = merge_auto_mode_settings(existing, auto_settings)
+                    argv[settings_idx] = f"--settings={json.dumps(merged)}"
+                elif settings_idx + 1 < len(argv):
+                    raw = argv[settings_idx + 1]
+                    existing = json.loads(raw)
+                    from tool_permissions import merge_auto_mode_settings
+                    merged = merge_auto_mode_settings(existing, auto_settings)
+                    argv[settings_idx + 1] = json.dumps(merged)
+            else:
+                argv += ["--settings", json.dumps(auto_settings)]
         # The home and the shared resource ledger hold the ship's records and
         # crew logs; a crew workspace is elsewhere, so name them for Claude's
         # file tools as Codex and Cursor do.

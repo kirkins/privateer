@@ -16,6 +16,16 @@ def policy(value=None):
     if len(rules) > 64 or any(not isinstance(r, str) or not r or len(r) > 512 or r != r.strip() or r.startswith("-")
                               or any(ord(c) < 32 for c in r) for r in rules):
         raise ValueError("invalid fleet tool rules")
+    if "forges" in value:
+        forges = value["forges"]
+        if not isinstance(forges, dict):
+            raise ValueError("invalid fleet forges")
+        for forge_name, actions in forges.items():
+            if not isinstance(forge_name, str) or not isinstance(actions, dict):
+                raise ValueError("invalid fleet forges")
+            for action, rule in actions.items():
+                if not isinstance(action, str) or not isinstance(rule, str):
+                    raise ValueError("invalid fleet forges")
     return value
 
 
@@ -62,19 +72,109 @@ CLAUDE_DETACHED = ["CronCreate", "ScheduleWakeup", "RemoteTrigger"]
 # A first mate delegates through crew jobs, not Claude's own agents or worktrees.
 CLAUDE_DELEGATION = ["Agent", "Task", "Workflow", "EnterWorktree"]
 
+BUILTIN_FORGE_RULES = {
+    "github": {
+        "publish_pr": "Bash(gh pr create *)",
+        "merge_green": "Bash(gh pr merge *)",
+    },
+}
+
+FORGE_ALIASES = {
+    "gh": "github",
+    "github": "github",
+}
+
+
+def charter_rules(actions, forge=None, role=None, errand=False, policy_value=None):
+    if role == "crew" or errand or not actions:
+        return []
+    if isinstance(forge, list):
+        forges = forge
+    elif forge:
+        forges = [forge]
+    else:
+        forges = ["github"]
+    custom_forges = (policy_value or {}).get("forges", {}) if isinstance(policy_value, dict) else {}
+    rules = []
+    for f in forges:
+        canonical = FORGE_ALIASES.get(f, f)
+        mapping = BUILTIN_FORGE_RULES.get(canonical) or custom_forges.get(canonical) or {}
+        for action in actions:
+            if action in mapping:
+                rule = mapping[action]
+                if not (rule.startswith("Bash(") and rule.endswith(")")):
+                    rule = f"Bash({rule})"
+                rules.append(rule)
+    return list(dict.fromkeys(rules))
+
+
+def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship=None):
+    if role == "crew" or errand or not actions:
+        return None
+    allow = ["$defaults"]
+    if "merge_green" in actions:
+        allow.append("Merging green PRs with passing CI and review is authorized by the ship's charter (merge_green).")
+    if "publish_pr" in actions:
+        allow.append("Creating and publishing pull requests is authorized by the ship's charter (publish_pr).")
+    env = ["$defaults", f"Charter actions granted: {', '.join(sorted(actions))}."]
+    if ship:
+        env.append(f"Ship {ship} operates under its active charter.")
+    return {
+        "autoMode": {
+            "allow": allow,
+            "environment": env,
+        }
+    }
+
+
+def merge_auto_mode_settings(target_settings, incoming_settings):
+    if not incoming_settings or "autoMode" not in incoming_settings:
+        return target_settings
+    res = dict(target_settings)
+    auto = dict(res.get("autoMode", {}))
+    incoming_auto = incoming_settings["autoMode"]
+    if not isinstance(incoming_auto, dict):
+        return target_settings
+    for key in ("allow", "environment"):
+        incoming_list = incoming_auto.get(key, [])
+        if not isinstance(incoming_list, list):
+            continue
+        if key in auto:
+            existing = list(auto[key])
+            if "$defaults" not in existing and "$defaults" in incoming_list:
+                existing.insert(0, "$defaults")
+            for item in incoming_list:
+                if item not in existing:
+                    existing.append(item)
+            auto[key] = existing
+        else:
+            auto[key] = list(incoming_list)
+    res["autoMode"] = auto
+    return res
+
 
 def claude_disallowed(role):
     return CLAUDE_DETACHED + (CLAUDE_DELEGATION if role == "first_mate" else [])
 
 
-def claude_rules(value, control=None):
-    value = policy(value)
+def claude_rules(value, control=None, actions=None, forge=None, role=None, errand=False):
+    pol = policy(value)
+    if actions is None and isinstance(value, dict):
+        actions = value.get("actions")
+    if forge is None and isinstance(value, dict):
+        forge = value.get("forge") or value.get("forges")
+    if role is None and isinstance(value, dict):
+        role = value.get("role")
+    if not errand and isinstance(value, dict):
+        errand = value.get("errand", False)
     cli = control["cli_argv"][0] if control else os.environ.get("PRIVATEER_CONTROL_CLI")
-    rules = ([f"Bash({cli}:*)"] if cli else []) + ["Bash(git *)", "Bash(gh *)"] + value.get("claude_allow", [])
+    extra_charter = charter_rules(actions, forge=forge, role=role, errand=errand, policy_value=pol)
+    rules = ([f"Bash({cli}:*)"] if cli else []) + ["Bash(git *)", "Bash(gh *)"] + extra_charter + pol.get("claude_allow", [])
     return list(dict.fromkeys(rules))
 
 
 def attended_argv(harness, argv, value):
+    import json
     value = policy(value)
     flags = {
         "claude": ["--permission-mode", "bypassPermissions"],
@@ -120,7 +220,31 @@ def attended_argv(harness, argv, value):
     if harness == "claude":
         if value["mode"] == "standard" and not any(x.split("=", 1)[0] == "--permission-mode" for x in prefix):
             extra += ["--permission-mode", "acceptEdits"]
-        extra += ["--allowedTools", *claude_rules(value)]
+        actions = value.get("actions")
+        forge = value.get("forge") or value.get("forges")
+        ship = value.get("ship")
+        extra += ["--allowedTools", *claude_rules(value, actions=actions, forge=forge, role="first_mate")]
         # An attended Claude session is the ship's first mate.
         extra += ["--disallowedTools", *claude_disallowed("first_mate")]
+        auto_settings = claude_auto_mode_settings(actions, forge=forge, role="first_mate", ship=ship)
+        if auto_settings:
+            settings_idx = None
+            for idx, arg in enumerate(prefix):
+                if arg == "--settings" or arg.startswith("--settings="):
+                    settings_idx = idx
+                    break
+            if settings_idx is not None:
+                arg = prefix[settings_idx]
+                if "=" in arg:
+                    raw = arg.split("=", 1)[1]
+                    existing = json.loads(raw)
+                    merged = merge_auto_mode_settings(existing, auto_settings)
+                    prefix[settings_idx] = f"--settings={json.dumps(merged)}"
+                elif settings_idx + 1 < len(prefix):
+                    raw = prefix[settings_idx + 1]
+                    existing = json.loads(raw)
+                    merged = merge_auto_mode_settings(existing, auto_settings)
+                    prefix[settings_idx + 1] = json.dumps(merged)
+            else:
+                extra += ["--settings", json.dumps(auto_settings)]
     return [prefix[0], *extra, *prefix[1:], *tail]

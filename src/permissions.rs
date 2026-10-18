@@ -25,7 +25,7 @@ fn validate(value: &Value) -> Result<()> {
     ensure!(
         object
             .keys()
-            .all(|k| matches!(k.as_str(), "mode" | "claude_allow")),
+            .all(|k| matches!(k.as_str(), "mode" | "claude_allow" | "forges")),
         "unknown permission setting"
     );
     ensure!(
@@ -47,7 +47,48 @@ fn validate(value: &Value) -> Result<()> {
             "invalid tool rule"
         );
     }
+    if let Some(forges) = value.get("forges") {
+        let forges_obj = forges.as_object().context("forges must be an object")?;
+        for (forge_name, actions) in forges_obj {
+            ensure!(
+                !forge_name.is_empty()
+                    && forge_name.len() <= 64
+                    && forge_name.trim() == forge_name
+                    && !forge_name.chars().any(char::is_control),
+                "invalid forge name"
+            );
+            let actions_obj = actions
+                .as_object()
+                .context("forge actions must be an object")?;
+            for (action, rule) in actions_obj {
+                ensure!(!action.is_empty(), "action name must not be empty");
+                let rule = rule.as_str().context("forge rule must be a string")?;
+                ensure!(
+                    !rule.is_empty()
+                        && rule.len() <= 512
+                        && rule.trim() == rule
+                        && !rule.starts_with('-')
+                        && !rule.chars().any(char::is_control),
+                    "invalid forge tool rule"
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+pub fn normalize_forge_name(forge: &str) -> Result<String> {
+    let lower = forge.trim().to_lowercase();
+    if lower == "gh" || lower == "github" {
+        return Ok("github".to_string());
+    }
+    let policy = load().unwrap_or_else(|_| defaults());
+    if let Some(forges) = policy.get("forges").and_then(Value::as_object) {
+        if forges.contains_key(&lower) {
+            return Ok(lower);
+        }
+    }
+    bail!("forge must be github or a configured fleet forge")
 }
 
 pub fn load() -> Result<Value> {
@@ -76,12 +117,137 @@ pub(crate) fn for_store(store: &Store) -> Result<Value> {
     }
 }
 
+fn read_git_config(folder: &std::path::Path) -> Option<String> {
+    let git = folder.join(".git");
+    let config_path = if git.is_file() {
+        let content = fs::read_to_string(&git).ok()?;
+        let gitdir_line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("gitdir:"))?;
+        let gitdir = gitdir_line.trim_start()["gitdir:".len()..].trim();
+        let p = std::path::Path::new(gitdir);
+        if p.is_absolute() {
+            p.join("config")
+        } else {
+            folder.join(p).join("config")
+        }
+    } else if git.is_dir() {
+        git.join("config")
+    } else if folder.join("config").is_file() && folder.join("HEAD").is_file() {
+        folder.join("config")
+    } else {
+        return None;
+    };
+    fs::read_to_string(config_path).ok()
+}
+
+fn detect_folder_forge(
+    folder: &std::path::Path,
+    custom_forges: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let content = read_git_config(folder)?;
+    let mut current_section = String::new();
+    let mut forge = None;
+    let mut origin_url = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = line[1..line.len() - 1].trim().to_lowercase();
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_lowercase();
+            let val = v.trim();
+            if current_section == "privateer" && key == "forge" {
+                forge = Some(val.to_string());
+            } else if current_section.starts_with("remote")
+                && (current_section.contains("\"origin\"") || current_section.contains("'origin'"))
+                && key == "url"
+            {
+                origin_url = Some(val.to_string());
+            }
+        }
+    }
+
+    if let Some(f) = forge {
+        let lower = f.to_lowercase();
+        if lower == "gh" || lower == "github" {
+            return Some("github".to_string());
+        }
+        if custom_forges.contains(&lower) {
+            return Some(lower);
+        }
+    }
+    if let Some(url) = origin_url {
+        if url.to_lowercase().contains("github.com") {
+            return Some("github".to_string());
+        }
+    }
+    None
+}
+
+pub(crate) fn detect_forges(store: &Store, _ship: &str, charter: &Value) -> Vec<String> {
+    let policy = for_store(store).unwrap_or_else(|_| defaults());
+    let custom_forges: std::collections::HashSet<String> = policy
+        .get("forges")
+        .and_then(Value::as_object)
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let mut forges = Vec::new();
+    if let Some(f) = charter.get("forge").and_then(Value::as_str) {
+        let lower = f.to_lowercase();
+        if lower == "gh" || lower == "github" {
+            forges.push("github".to_string());
+        } else if custom_forges.contains(&lower) {
+            forges.push(lower);
+        }
+    }
+
+    let folder = charter
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| store.home().parent().map(std::path::Path::to_path_buf));
+
+    if let Some(folder) = &folder {
+        let projects_dir = folder.join("projects");
+        if let Ok(entries) = fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
+                    if let Some(f) = detect_folder_forge(&path, &custom_forges) {
+                        if !forges.contains(&f) {
+                            forges.push(f);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(f) = detect_folder_forge(folder, &custom_forges) {
+            if !forges.contains(&f) {
+                forges.push(f);
+            }
+        }
+    }
+
+    if forges.is_empty() {
+        forges.push("github".to_string());
+    }
+    forges
+}
+
 pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     caller.require_operator("permissions.set")?;
     ensure!(
-        args.as_object().is_some_and(|o| o
-            .keys()
-            .all(|k| matches!(k.as_str(), "mode" | "claude_allow" | "claude_allow_add"))),
+        args.as_object().is_some_and(|o| o.keys().all(|k| matches!(
+            k.as_str(),
+            "mode" | "claude_allow" | "claude_allow_add" | "forges"
+        ))),
         "unknown permission setting"
     );
     // Use the fleet registry's write lock so two captain updates cannot lose
@@ -89,7 +255,7 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     let mut conn = crate::fleet::registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut value = load()?;
-    for key in ["mode", "claude_allow"] {
+    for key in ["mode", "claude_allow", "forges"] {
         if let Some(v) = args.get(key) {
             value[key] = v.clone();
         }
