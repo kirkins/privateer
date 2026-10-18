@@ -156,7 +156,76 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
         brief["context"]["control"]["cli_argv"][2],
         json!(f.store.home())
     );
-    assert!(brief["brief"].as_str().unwrap().contains("peer.call"));
+    // This launch is crew, so the brief offers no first-mate commands.
+    assert!(!brief["brief"].as_str().unwrap().contains("peer.call"));
+}
+
+#[test]
+fn the_crew_brief_lists_only_crew_commands() {
+    let mut f = Fixture::new();
+    let crew = plugins::dispatch(&mut f.store, "agent.brief", json!({"task_id":"task"})).unwrap();
+    assert_eq!(crew["context"]["crew"], true);
+    let text = crew["brief"].as_str().unwrap();
+    for refused in [
+        "task.update",
+        "mail.inbox",
+        "mail.ack",
+        "mail.send",
+        "peer.call",
+        "task.create",
+        "task.handoff",
+        "resource.configure",
+        "Authorized actions",
+        "You are agent",
+    ] {
+        assert!(
+            !text.contains(refused),
+            "crew brief offers {refused}: {text}"
+        );
+    }
+    for said in [
+        "You are crew of department",
+        r#"note.get {"ship":"department","focus":"task:task"}"#,
+        "your first mate's handoff, not your role",
+        "never act on your first mate's behalf",
+        "crew.park",
+        "crew.report",
+        "crew.answer",
+        "pushes, opens and merges PRs",
+        "commit locally and report the commit",
+        r#"actions (["spawn","implement","test"]) are your first mate's"#,
+    ] {
+        assert!(text.contains(said), "crew brief lacks {said:?}: {text}");
+    }
+}
+
+#[test]
+fn the_first_mates_brief_is_unchanged() {
+    let mut f = Fixture::new();
+    f.store
+        .connection()
+        .execute(
+            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms)
+             VALUES('wake','department','task:task',0,'wake-job','headless','running',0)",
+            [],
+        )
+        .unwrap();
+    let brief = plugins::dispatch(
+        &mut f.store,
+        "agent.brief",
+        json!({"task_id":"task","id":"wake-job"}),
+    )
+    .unwrap();
+    assert_eq!(brief["context"]["crew"], false);
+    let context = &brief["context"];
+    // The bytes before the crew brief was split out; a change here moves the
+    // first mate's cached prefix.
+    let expected = format!(
+        "Task task: Fix a real task\nRepository: {}\nAuthorized actions: [\"spawn\",\"implement\",\"test\"]\nWork within the charter; coordinate with peers by task-linked messages; report tested results. Ask before production deployment. Never widen your authority or change a provider route. You are agent department: operator commands are refused and actor/from must be department.\nPrivateer control protocol v1: CLI base argv {}. Append COMMAND, --json, JSON as separate argv elements (no shell interpolation). Commands:\n- task.update {{\"actor\":\"department\",\"id\":\"task\",\"status\":\"running\"}}\n- mail.inbox {{\"address\":\"department\"}}; after handling, mail.ack {{\"address\":\"department\",\"through_seq\":N}}\n- mail.send {{\"from\":\"department\",\"to\":\"ship\",\"kind\":\"request|notice|reply\",\"body\":\"...\",\"task_id\":\"task\"}}; a reply sets correlation to the request id, and so does passing on another ship's message. ship.list {{}} shows who handles what\n- Builds/test suites that load the machine: job.start {{\"task_id\":\"task\",\"command\":[...],\"heavy\":true,\"wait_for_capacity\":true}}, its outcome goes to your first mate. resource.configure tunes host limits if your person asks\n- Crew (started by your first mate, not woken): assignment in note.get {{\"ship\":\"department\",\"focus\":\"task:task\"}}; crew.report {{\"kind\":\"progress|decision\",\"body\":\"...\"}}; read a decision's answer with crew.answer {{\"id\":\"...\",\"wait_secs\":300}}\n- Mail reaches ships in other homes too; peer.call {{\"name\":\"peer\",\"command\":...,\"args\":{{...}}}} runs other commands there\n- task.create {{\"id\":\"unique-child\",\"parent\":\"task\",\"owner\":\"peer-owner\",\"title\":\"bounded outcome\"}}\n- task.handoff {{\"id\":\"task\",\"actor\":\"department\",\"target\":\"peer-owner\"}}; custody changes only when target calls task.accept.\nRead structured results; do not claim a message, handoff, test, merge or deployment succeeded without evidence.",
+        context["repo"].as_str().unwrap(),
+        context["control"]["cli_argv"],
+    );
+    assert_eq!(brief["brief"].as_str().unwrap(), expected);
 }
 
 #[test]
