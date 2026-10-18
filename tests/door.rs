@@ -746,3 +746,341 @@ fn away_holds_mail_lets_three_emergencies_through_and_summarizes_on_return() {
     assert_eq!(later[4..], ["after you returned"]);
     stop(supervisor);
 }
+
+// Logs every line, acknowledges mail, and acknowledges digests unless
+// `<log>.noack` exists, as a phone that cannot reach Telegram would not.
+const DIGEST_ADAPTER: &str = r#"import json, os, sys
+path = os.environ["FAKE_DOOR_LOG"]
+log = open(path, "a")
+def note(entry):
+    log.write(json.dumps(entry) + "\n"); log.flush()
+note({"hello": json.loads(sys.stdin.readline())})
+for line in sys.stdin:
+    message = json.loads(line)
+    note(message)
+    if message["type"] == "mail" or (message["type"] == "digest" and not os.path.exists(path + ".noack")):
+        print(json.dumps({"type": "delivered", "ref": message["ref"]}), flush=True)
+"#;
+
+impl Fleet {
+    fn digest_door(&self, settings: Value) {
+        fs::write(self.root.join("adapter/door.py"), DIGEST_ADAPTER).unwrap();
+        fs::write(
+            self.root.join("adapter/manifest.json"),
+            json!({"schema_version": 1, "kind": "front-door", "id": "fake",
+                "executable": ["python3", "door.py"], "digests": true})
+            .to_string(),
+        )
+        .unwrap();
+        self.settings(settings);
+        self.add();
+    }
+
+    fn settings(&self, settings: Value) {
+        fs::write(self.root.join("state/away.json"), settings.to_string()).unwrap();
+    }
+
+    fn tell(&self, ship: &str, body: &str, kind: &str, urgency: &str) -> Value {
+        self.call(
+            ship,
+            "mail.send",
+            json!({"from": ship, "to": "captain", "kind": kind, "urgency": urgency, "body": body}),
+        )
+    }
+
+    fn noack(&self, on: bool) {
+        let path = self.log.with_extension("jsonl.noack");
+        if on {
+            fs::write(path, "").unwrap();
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Events of one type the adapter was sent in its `session`th run (from 0).
+fn events(entries: &[Value], session: usize, kind: &str) -> Vec<Value> {
+    let Some((start, _)) = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.get("hello").is_some())
+        .nth(session)
+    else {
+        return vec![];
+    };
+    entries[start + 1..]
+        .iter()
+        .take_while(|e| e.get("hello").is_none())
+        .filter(|e| e["type"] == kind)
+        .cloned()
+        .collect()
+}
+
+fn text(digest: &Value) -> String {
+    digest["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn away_sends_requests_at_once_and_digests_the_rest_with_urgent_items_loud_and_early() {
+    let fleet = Fleet::new();
+    fleet.digest_door(
+        json!({"digest_every_mins": 600, "urgent_due_mins": 0, "ship_breakthroughs_per_hour": 1}),
+    );
+    // Present: a state that flips back, and generic words from two ships, are
+    // news; only the same words again on one key are marked a repeat.
+    let supervisor = fleet.supervise();
+    for (ship, body) in [
+        ("ops", "prod up"),
+        ("ops", "prod down"),
+        ("ops", "prod up"),
+        ("liaison", "Done."),
+        ("ops", "Done."),
+        ("ops", "before away"),
+        ("ops", "before away"),
+    ] {
+        fleet.tell(ship, body, "notice", "normal");
+    }
+    let present = fleet.wait("mail while present", |e| {
+        let mail = events(e, 0, "mail");
+        (mail.len() == 7).then_some(mail)
+    });
+    // Homes are read one after another, so compare each ship's own order.
+    let again = |ship: &str| -> Vec<(String, bool)> {
+        present
+            .iter()
+            .filter(|e| e["ship"] == ship)
+            .map(|e| {
+                (
+                    e["mail"]["body"].as_str().unwrap().to_owned(),
+                    e["again"] == true,
+                )
+            })
+            .collect()
+    };
+    let told = |pairs: &[(&str, bool)]| -> Vec<(String, bool)> {
+        pairs.iter().map(|(b, a)| (b.to_string(), *a)).collect()
+    };
+    assert_eq!(
+        again("ops"),
+        told(&[
+            ("prod up", false),
+            ("prod down", false),
+            ("prod up", false),
+            ("Done.", false),
+            ("before away", false),
+            ("before away", true)
+        ])
+    );
+    assert_eq!(again("liaison"), told(&[("Done.", false)]));
+    let repeat = present.iter().find(|e| e["again"] == true).unwrap();
+    assert_eq!(repeat["quiet"], true);
+    stop(supervisor);
+
+    fleet.ok(&["afk"]);
+    let first = fleet.tell("ops", "progress A", "notice", "normal");
+    assert!(
+        first["note"]
+            .as_str()
+            .unwrap()
+            .contains("goes in the next digest"),
+        "{first}"
+    );
+    fleet.tell("ops", "progress A", "notice", "normal");
+    let told = fleet.tell("ops", "before away", "notice", "normal");
+    assert!(
+        told["note"]
+            .as_str()
+            .unwrap()
+            .contains("The captain already has this"),
+        "{told}"
+    );
+    fleet.tell("ops", "routine bit", "notice", "low");
+    fleet.tell("ops", "decide the region", "request", "normal");
+    fleet.tell("ops", "fire 1", "notice", "high");
+    let over = fleet.tell("ops", "fire 2", "notice", "high");
+    assert!(over.get("note").is_none(), "{over}");
+
+    let supervisor = fleet.supervise();
+    let digest = fleet.wait("the urgent digest", |e| {
+        events(e, 1, "digest").first().cloned()
+    });
+    let lines = text(&digest);
+    assert_eq!(digest["loud"], true, "{lines}");
+    for wanted in [
+        "Urgent, over the hourly limit",
+        "fire 2",
+        "progress A ×2",
+        "before away",
+        "Routine: 1 low-urgency update from 1 ship",
+    ] {
+        assert!(lines.contains(wanted), "{wanted} missing from {lines}");
+    }
+    for unwanted in ["prod", "decide the region", "fire 1"] {
+        assert!(!lines.contains(unwanted), "{unwanted} in {lines}");
+    }
+    let mail = fleet.wait("mail sent at once", |e| {
+        let mail = events(e, 1, "mail");
+        (mail.len() >= 2).then_some(mail)
+    });
+    let at_once: Vec<(&str, bool, bool)> = mail
+        .iter()
+        .map(|e| {
+            (
+                e["mail"]["body"].as_str().unwrap(),
+                e["away"] == true,
+                e["breakthrough"] == true,
+            )
+        })
+        .collect();
+    assert_eq!(
+        at_once,
+        [("decide the region", true, false), ("fire 1", false, true)]
+    );
+    stop(supervisor);
+
+    // After a restart with the budget free again, the over-limit item stays
+    // in the digest: it is not also broken through, and the delivered digest
+    // is not sent again.
+    fleet.settings(json!({"digest_every_mins": 600, "ship_breakthroughs_per_hour": 5}));
+    let supervisor = fleet.supervise();
+    fleet.wait("the third session", |e| {
+        (e.iter().filter(|e| e.get("hello").is_some()).count() == 3).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    let entries = fleet.entries();
+    assert!(events(&entries, 2, "digest").is_empty());
+    assert!(
+        events(&entries, 2, "mail")
+            .iter()
+            .all(|e| e["mail"]["body"] != "fire 2")
+    );
+    stop(supervisor);
+}
+
+#[test]
+fn a_digest_and_the_catch_up_are_resent_until_delivered() {
+    let fleet = Fleet::new();
+    fleet.digest_door(json!({"digest_every_mins": 0}));
+    fleet.ok(&["afk"]);
+    fleet.tell("ops", "n1", "notice", "normal");
+    fleet.tell("ops", "decide the region", "request", "normal");
+    fleet.noack(true);
+    let supervisor = fleet.supervise();
+    let first = fleet.wait("the digest", |e| events(e, 0, "digest").first().cloned());
+    assert!(text(&first).contains("n1"));
+    assert_eq!(first["loud"], false);
+    stop(supervisor);
+
+    fleet.noack(false);
+    let supervisor = fleet.supervise();
+    let again = fleet.wait("the digest again", |e| {
+        events(e, 1, "digest").first().cloned()
+    });
+    assert_eq!(again["id"], first["id"]);
+    std::thread::sleep(Duration::from_secs(2));
+
+    // The return: one catch-up listing the open request by line, printed by
+    // `privateer back` and retried by the door until acknowledged.
+    fleet.noack(true);
+    let back = fleet.ok(&["back"]);
+    assert!(
+        back.contains("Waiting on you (1):") && back.contains("decide the region"),
+        "{back}"
+    );
+    let catch_up = fleet.wait("the catch-up", |e| {
+        events(e, 1, "digest")
+            .into_iter()
+            .find(|d| d["kind"] == "catch_up")
+    });
+    assert!(text(&catch_up).contains("decide the region"));
+    stop(supervisor);
+    fleet.noack(false);
+    let supervisor = fleet.supervise();
+    let resent = fleet.wait("the catch-up again", |e| {
+        events(e, 2, "digest").first().cloned()
+    });
+    assert_eq!(resent["id"], catch_up["id"]);
+    std::thread::sleep(Duration::from_secs(2));
+    stop(supervisor);
+
+    // Delivered: nothing is sent again. Mail delivered while present is
+    // not in the next away period's digest.
+    let supervisor = fleet.supervise();
+    fleet.tell("ops", "while present", "notice", "normal");
+    fleet.wait("mail while present", |e| {
+        events(e, 3, "mail")
+            .iter()
+            .any(|m| m["mail"]["body"] == "while present")
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    fleet.ok(&["afk"]);
+    fleet.tell("ops", "second away", "notice", "normal");
+    let second = fleet.wait("the second period's digest", |e| {
+        events(e, 3, "digest").first().cloned()
+    });
+    let lines = text(&second);
+    assert!(lines.contains("second away"), "{lines}");
+    assert!(
+        !lines.contains("while present") && !lines.contains("n1"),
+        "{lines}"
+    );
+    stop(supervisor);
+}
+
+#[test]
+fn desk_copies_and_an_unreadable_home_do_not_spoil_the_digest() {
+    let fleet = Fleet::new();
+    fleet.digest_door(json!({"digest_every_mins": 0}));
+    fleet.ok(&["afk"]);
+    for ship in ["ops", "liaison"] {
+        fleet.call(
+            ship,
+            "mail.send",
+            json!({"id": "desk-copy-1", "from": ship, "to": "captain", "kind": "notice",
+                "body": "one shared fact"}),
+        );
+    }
+    let supervisor = fleet.supervise();
+    let first = fleet.wait("the digest", |e| events(e, 0, "digest").first().cloned());
+    assert_eq!(
+        text(&first).matches("one shared fact").count(),
+        1,
+        "{}",
+        text(&first)
+    );
+    // No digest is due for hours, so ops's news waits; an over-the-limit
+    // urgent item from the liaison makes one due while ops cannot be read.
+    fleet.settings(
+        json!({"digest_every_mins": 600, "urgent_due_mins": 0, "ship_breakthroughs_per_hour": 0}),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    fleet.tell("ops", "ops news", "notice", "normal");
+    std::thread::sleep(Duration::from_secs(2));
+    // A store that refuses to open (its database became a symlink) is an
+    // unreadable home; `Store::open` repairs plain permission changes.
+    let database = fleet.home("ops").join("privateer.sqlite");
+    let aside = database.with_extension("sqlite.aside");
+    fs::rename(&database, &aside).unwrap();
+    std::os::unix::fs::symlink(&aside, &database).unwrap();
+    fleet.tell("liaison", "liaison news", "notice", "high");
+    let second = fleet.wait("a digest without ops", |e| {
+        events(e, 0, "digest").get(1).cloned()
+    });
+    fs::remove_file(&database).unwrap();
+    fs::rename(&aside, &database).unwrap();
+    assert!(text(&second).contains("liaison news"));
+    assert!(!text(&second).contains("ops news"), "{}", text(&second));
+    fleet.settings(json!({"digest_every_mins": 0}));
+    let third = fleet.wait("ops once readable", |e| {
+        events(e, 0, "digest").get(2).cloned()
+    });
+    assert!(text(&third).contains("ops news"), "{}", text(&third));
+    stop(supervisor);
+}
