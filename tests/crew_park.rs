@@ -708,8 +708,11 @@ fn a_resume_that_does_not_start_after_its_retry_fails_the_crew() {
     .unwrap();
     start_crew(&f, "crew-24");
     f.wait("crew-24", &["parked"]);
-    f.wait("child-1", &["succeeded"]);
+    // Mark the park `resuming` while the child still runs. Once the child
+    // settles, its settlement hook resumes only a `parked` park, so the resume
+    // is not launched behind the test's back.
     f.set_park("crew-24", "resuming", 1, 1);
+    f.wait("child-1", &["succeeded"]);
     f.service("start");
     let crew = f.wait("crew-24", &["failed"]);
     f.service("stop");
