@@ -14,6 +14,7 @@ pub mod crew_routes;
 pub mod cursor_mail;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+pub mod digest;
 pub mod door;
 pub mod errand;
 mod executable;

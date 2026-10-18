@@ -59,6 +59,9 @@ struct Manifest {
     /// The adapter cannot run without private configuration.
     #[serde(default)]
     config_required: bool,
+    /// The adapter renders `digest` events; others hold notices while away.
+    #[serde(default)]
+    digests: bool,
 }
 
 struct Door {
@@ -113,6 +116,15 @@ fn doors() -> Result<Vec<Door>> {
 /// Every registered front door's name.
 pub(crate) fn names() -> Result<Vec<String>> {
     Ok(doors()?.into_iter().map(|d| d.name).collect())
+}
+
+/// Registered doors whose adapters take away digests.
+pub(crate) fn digest_doors() -> Result<Vec<String>> {
+    Ok(doors()?
+        .into_iter()
+        .filter(|d| load_manifest(&d.manifest).is_ok_and(|m| m.digests))
+        .map(|d| d.name)
+        .collect())
 }
 
 /// Move a door's delivery cursor in one home forward to `through`, as if
@@ -307,9 +319,21 @@ struct Session<'a> {
     homes: HashMap<String, PathBuf>,
     /// Captain mail sent to the adapter this session, per ship.
     sent: HashMap<String, i64>,
+    /// The latest mail the adapter was actually sent this session, per ship;
+    /// unlike `sent`, a return does not reset it, so a late acknowledgement
+    /// of mail sent at once while away is still accepted.
+    carried: HashMap<String, i64>,
     failing: HashSet<String>,
     /// When the away period this session last saw began.
     away_since: Option<i64>,
+    /// The adapter renders digests.
+    digests: bool,
+    /// Digests and catch-ups sent to the adapter this session.
+    emitted: HashSet<String>,
+    /// When to look for held mail again after finding none due.
+    digest_check: Option<Instant>,
+    /// The captain asked for a digest now (`/digest`).
+    digest_now: bool,
 }
 
 impl<'a> Session<'a> {
@@ -409,8 +433,13 @@ impl<'a> Session<'a> {
             stores: HashMap::new(),
             homes: HashMap::new(),
             sent: HashMap::new(),
+            carried: HashMap::new(),
             failing: HashSet::new(),
             away_since: None,
+            digests: manifest.digests,
+            emitted: HashSet::new(),
+            digest_check: None,
+            digest_now: false,
         };
         let members = members()?;
         let hello = json!({"type": "hello", "version": VERSION, "door": door.name,
@@ -518,6 +547,21 @@ impl<'a> Session<'a> {
         self.away_since = since;
         let members = members()?;
         self.homes = members.iter().cloned().collect();
+        let settings = crate::away::settings();
+        // Where delivery stood when the period began: digests start after it,
+        // so mail delivered before the period is never digested.
+        if let Some(since) = since
+            && !crate::digest::has_baseline(&self.door.name, since)?
+        {
+            let door = self.door.name.clone();
+            let mut through = std::collections::BTreeMap::new();
+            for (ship, home) in &members {
+                if let Ok(seq) = self.store(home).and_then(|store| cursor(store, &door)) {
+                    through.insert(ship.clone(), seq);
+                }
+            }
+            crate::digest::baseline(&door, since, &through)?;
+        }
         for (ship, home) in members {
             let page = (|| -> Result<Value> {
                 let door = self.door.name.clone();
@@ -560,20 +604,73 @@ impl<'a> Session<'a> {
                 let seq = message["seq"].as_i64().context("mail without sequence")?;
                 let mut event = json!({"type": "mail", "ref": format!("{ship}:{seq}"),
                     "ship": ship, "mail": message});
-                // While the captain is away, only emergencies reach them; the
-                // rest stays in the mailbox for the return.
-                if away.is_some() {
-                    if !crate::away::breakthrough(message)? {
+                let repeat = crate::digest::told(message, away.is_some(), &settings)?;
+                // While the captain is away, requests, card edits and urgent
+                // mail within its budget reach them at once; the rest waits
+                // in the mailbox for a digest or the return.
+                match crate::away::route(message, &ship)? {
+                    None => {
+                        if repeat {
+                            event["again"] = json!(true);
+                            event["quiet"] = json!(true);
+                        }
+                    }
+                    Some(crate::away::Route::Card) => {}
+                    Some(crate::away::Route::Immediate { quiet }) => {
+                        event["away"] = json!(true);
+                        if quiet {
+                            event["quiet"] = json!(true);
+                        }
+                    }
+                    Some(crate::away::Route::Breakthrough) => event["breakthrough"] = json!(true),
+                    Some(crate::away::Route::Overflow | crate::away::Route::Digest) => {
                         self.sent.insert(ship.clone(), seq);
                         continue;
                     }
-                    event["breakthrough"] = json!(true);
                 }
                 if !self.emit(&event)? {
                     return Ok(());
                 }
                 self.sent.insert(ship.clone(), seq);
+                self.carried.insert(ship.clone(), seq);
             }
+        }
+        if self.digests {
+            self.digest(away.as_ref(), &settings)?;
+        }
+        Ok(())
+    }
+
+    /// Send pending digests and catch-ups, then build the next digest when
+    /// one is due. A built digest is re-sent verbatim until acknowledged.
+    fn digest(&mut self, away: Option<&Value>, settings: &crate::away::Settings) -> Result<()> {
+        let door = self.door.name.clone();
+        let mut pending = crate::digest::pending(&door)?;
+        let now = Instant::now();
+        if let Some(period) = away
+            && (self.digest_now || self.digest_check.is_none_or(|at| now >= at))
+        {
+            let due = crate::digest::due_ms(&door, period, settings)? <= Store::now_ms();
+            if self.digest_now || due {
+                self.digest_now = false;
+                match crate::digest::build(&door, period, settings)? {
+                    Some(row) => pending.push(row),
+                    None if due => self.digest_check = Some(now + Duration::from_secs(5)),
+                    None => {}
+                }
+            }
+        }
+        for row in pending {
+            let id = row["id"].as_str().unwrap_or_default().to_owned();
+            if self.emitted.contains(&id) {
+                continue;
+            }
+            let event = json!({"type": "digest", "ref": format!("digest:{id}"), "id": id,
+                "kind": row["kind"], "lines": row["lines"], "loud": row["loud"]});
+            if !self.emit(&event)? {
+                return Ok(());
+            }
+            self.emitted.insert(id);
         }
         Ok(())
     }
@@ -610,10 +707,17 @@ impl<'a> Session<'a> {
     /// A door acknowledges only mail it was sent.
     fn delivered(&mut self, reference: &Value) -> Result<()> {
         let reference = reference.as_str().context("delivered needs a ref")?;
+        if let Some(id) = reference.strip_prefix("digest:") {
+            ensure!(
+                self.emitted.contains(id),
+                "adapter acknowledged {reference}, which it was not sent"
+            );
+            return crate::digest::delivered(&self.door.name, id);
+        }
         let (ship, seq) = reference.rsplit_once(':').context("malformed mail ref")?;
         let seq: i64 = seq.parse().context("malformed mail ref")?;
         ensure!(
-            self.sent.get(ship).is_some_and(|sent| seq <= *sent),
+            self.carried.get(ship).is_some_and(|sent| seq <= *sent),
             "adapter acknowledged {reference}, which it was not sent"
         );
         let home = self.home(ship)?;
@@ -640,8 +744,8 @@ impl<'a> Session<'a> {
             {
                 "start" => {
                     let text = args.get("words").and_then(Value::as_str).unwrap_or("");
-                    let (until, words) = crate::away::parse(text);
-                    crate::away::enter(&words, until.as_deref())
+                    let afk = crate::away::parse(text);
+                    crate::away::enter(&afk.words, afk.until.as_deref(), afk.every_secs)
                 }
                 "back" => {
                     let returned = crate::away::back()?;
@@ -652,6 +756,11 @@ impl<'a> Session<'a> {
                 other => bail!("unknown away action {other:?}"),
             },
             "held" => crate::away::held(),
+            // `/digest`: what is held now, leaving the captain away.
+            "digest" => {
+                self.digest_now = true;
+                Ok(json!({"digests": self.digests, "away": crate::away::active()?.is_some()}))
+            }
             "waiting" => self.waiting(),
             // The captain closes one item without answering it, wherever it waits.
             "dismiss" => {

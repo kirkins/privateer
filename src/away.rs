@@ -11,7 +11,9 @@
 use crate::store::Store;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use std::fs;
 use std::path::PathBuf;
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
@@ -22,6 +24,56 @@ const HELD_LIMIT: usize = 200;
 const SUMMARY_BODY_CHARS: usize = 400;
 const SUMMARY_CHARS: usize = 24_000;
 
+/// Every away default in one place. An optional `away.json` beside the
+/// fleet registry overrides any of them; `/afk every 30m` overrides the
+/// digest period for one away period.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub digest_every_mins: f64,
+    /// A digest without urgent items is sent without a sound.
+    pub digest_quiet: bool,
+    pub digest_lines: usize,
+    pub line_chars: usize,
+    /// A digest with over-the-limit urgent items is due this soon after the first.
+    pub urgent_due_mins: f64,
+    pub breakthroughs_per_hour: usize,
+    pub ship_breakthroughs_per_hour: usize,
+    /// Requests from one ship that make a sound per hour; later ones go silently.
+    pub loud_requests_per_hour: usize,
+    pub repeat_hours: f64,
+    /// Bodies at least this long count as repeats across ships (a verbatim relay).
+    pub cross_ship_chars: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            digest_every_mins: 60.0,
+            digest_quiet: true,
+            digest_lines: 20,
+            line_chars: 120,
+            urgent_due_mins: 15.0,
+            breakthroughs_per_hour: BREAKTHROUGHS_PER_HOUR,
+            ship_breakthroughs_per_hour: 2,
+            loud_requests_per_hour: 3,
+            repeat_hours: 24.0,
+            cross_ship_chars: 200,
+        }
+    }
+}
+
+/// The away settings in force: the defaults, overridden by `away.json`.
+pub fn settings() -> Settings {
+    let path = crate::fleet::registry_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("away.json")));
+    path.and_then(|p| fs::read(p).ok())
+        .filter(|raw| raw.len() <= 65_536)
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
 fn registry() -> Result<rusqlite::Connection> {
     let conn = crate::fleet::registry()?;
     conn.execute_batch(
@@ -29,6 +81,21 @@ fn registry() -> Result<rusqlite::Connection> {
            until_text TEXT, returned_ms INTEGER, breakthroughs TEXT NOT NULL DEFAULT '[]',
            source TEXT);",
     )?;
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('away')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (column, definition) in [
+        ("overflow", "TEXT NOT NULL DEFAULT '[]'"),
+        ("requests", "TEXT NOT NULL DEFAULT '[]'"),
+        ("digest_every_secs", "INTEGER"),
+    ] {
+        if !columns.iter().any(|c| c == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE away ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
     Ok(conn)
 }
 
@@ -43,11 +110,15 @@ fn latest() -> Result<Option<Value>> {
 }
 
 fn period(filter: &str) -> Result<Option<Value>> {
-    let conn = registry()?;
+    period_in(&registry()?, filter)
+}
+
+fn period_in(conn: &rusqlite::Connection, filter: &str) -> Result<Option<Value>> {
     Ok(conn
         .query_row(
             &format!(
-                "SELECT started_ms, words, until_text, returned_ms, breakthroughs, source FROM away
+                "SELECT started_ms, words, until_text, returned_ms, breakthroughs, source, overflow,
+                   requests, digest_every_secs FROM away
                  {filter} ORDER BY started_ms DESC LIMIT 1"
             ),
             [],
@@ -58,7 +129,12 @@ fn period(filter: &str) -> Result<Option<Value>> {
                     "returned_ms": r.get::<_, Option<i64>>(3)?,
                     "breakthroughs": serde_json::from_str::<Value>(&r.get::<_, String>(4)?)
                         .unwrap_or(json!([])),
-                    "source": r.get::<_, Option<String>>(5)?}),
+                    "source": r.get::<_, Option<String>>(5)?,
+                    "overflow": serde_json::from_str::<Value>(&r.get::<_, String>(6)?)
+                        .unwrap_or(json!([])),
+                    "requests": serde_json::from_str::<Value>(&r.get::<_, String>(7)?)
+                        .unwrap_or(json!([])),
+                    "digest_every_secs": r.get::<_, Option<i64>>(8)?}),
                 )
             },
         )
@@ -103,7 +179,7 @@ pub(crate) fn clock(ms: i64) -> String {
 
 /// `/afk [words]`: the captain is away from now. Running it again while away
 /// replaces the words; with none, it leaves the period as it is.
-pub fn enter(words: &str, until: Option<&str>) -> Result<Value> {
+pub fn enter(words: &str, until: Option<&str>, every_secs: Option<i64>) -> Result<Value> {
     let words = words.trim();
     let conn = registry()?;
     let now = Store::now_ms();
@@ -111,19 +187,21 @@ pub fn enter(words: &str, until: Option<&str>) -> Result<Value> {
     let since = match &current {
         Some(period) => {
             let since = period["since_ms"].as_i64().unwrap_or(now);
-            if words.is_empty() && until.is_none() {
+            if words.is_empty() && until.is_none() && every_secs.is_none() {
                 return Ok(json!({"away": period, "refreshed": false}));
             }
             conn.execute(
-                "UPDATE away SET words=?2, until_text=COALESCE(?3, until_text) WHERE started_ms=?1",
-                params![since, words, until],
+                "UPDATE away SET words=?2, until_text=COALESCE(?3, until_text),
+                   digest_every_secs=COALESCE(?4, digest_every_secs) WHERE started_ms=?1",
+                params![since, words, until, every_secs],
             )?;
             since
         }
         None => {
             conn.execute(
-                "INSERT INTO away(started_ms, words, until_text) VALUES(?1, ?2, ?3)",
-                params![now, words, until],
+                "INSERT INTO away(started_ms, words, until_text, digest_every_secs)
+                 VALUES(?1, ?2, ?3, ?4)",
+                params![now, words, until, every_secs],
             )?;
             now
         }
@@ -131,7 +209,7 @@ pub fn enter(words: &str, until: Option<&str>) -> Result<Value> {
     // The liaison acts for the captain: it learns of the away period, and the
     // words are its standing instruction until the return.
     let mut note = format!(
-        "The captain is away from {}{}. Their mail is held until they return; only high-urgency messages reach them (at most {BREAKTHROUGHS_PER_HOUR} an hour).",
+        "The captain is away from {}{}. Requests and high-urgency messages reach them at once (high urgency at most {BREAKTHROUGHS_PER_HOUR} an hour); other notices go in a periodic digest.",
         clock(since),
         until
             .map(|u| format!(" (back about {u})"))
@@ -152,38 +230,162 @@ pub fn enter(words: &str, until: Option<&str>) -> Result<Value> {
     Ok(json!({"away": active()?, "refreshed": current.is_some()}))
 }
 
-/// Whether a message to the captain may reach the phone while away: a ship's
-/// high-urgency mail, within the hourly budget. A message that already broke
-/// through stays allowed, so redelivery after a restart costs nothing.
-pub fn breakthrough(mail: &Value) -> Result<bool> {
-    if mail["urgency"] != "high" || mail["from"] == crate::mail::CREW {
-        return Ok(false);
-    }
-    let Some(period) = active()? else {
-        return Ok(false);
+/// How a message to the captain travels while the captain is away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// An addition to, or the closure of, a card the captain already has.
+    Card,
+    /// A request or decision: at once, silently past the ship's hourly share.
+    Immediate {
+        quiet: bool,
+    },
+    /// High urgency within the hourly budgets: at once, with a sound.
+    Breakthrough,
+    /// High urgency over a budget: it leads the next digest, which comes early.
+    Overflow,
+    Digest,
+}
+
+/// Whether captain mail edits a card rather than posting: an attachment to an
+/// open ask (never high urgency, which must make a sound) or an ask's closure.
+pub fn card_edit(mail: &Value) -> bool {
+    let payload = &mail["payload"];
+    (payload["attached_to"].is_string() && mail["kind"] != "reply" && mail["urgency"] != "high")
+        || (mail["kind"] == "notice" && payload["request_end"].is_object())
+}
+
+fn decided<'a>(list: &'a [Value], id: &str) -> Option<&'a Value> {
+    list.iter().find(|b| b["id"] == id)
+}
+
+/// Route one message held in `ship`'s home while away, recording each budget
+/// decision on the away row first, so a restart repeats the same decision.
+/// Outside an away period everything is delivered as usual (`None`).
+pub fn route(mail: &Value, ship: &str) -> Result<Option<Route>> {
+    let mut conn = registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some(period) = period_in(&tx, "WHERE returned_ms IS NULL")? else {
+        return Ok(None);
     };
+    let settings = settings();
+    let since = period["since_ms"].as_i64().unwrap_or(0);
     let id = mail["id"].as_str().unwrap_or_default();
-    let mut through: Vec<Value> = period["breakthroughs"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if through.iter().any(|b| b["id"] == id) {
-        return Ok(true);
+    let now = Store::now_ms();
+    let list = |key: &str| period[key].as_array().cloned().unwrap_or_default();
+    let recent = |list: &[Value], ship: Option<&str>| {
+        list.iter()
+            .filter(|b| b["ms"].as_i64().unwrap_or(0) > now - HOUR_MS)
+            .filter(|b| ship.is_none_or(|s| b["ship"] == s))
+            .count()
+    };
+    let kind = mail["kind"].as_str().unwrap_or_default();
+    let route = if card_edit(mail) {
+        Route::Card
+    } else if matches!(kind, "request" | "decision") {
+        let mut requests = list("requests");
+        if let Some(seen) = decided(&requests, id) {
+            Route::Immediate {
+                quiet: seen["quiet"] == true,
+            }
+        } else {
+            let quiet = recent(&requests, Some(ship)) >= settings.loud_requests_per_hour;
+            requests.push(json!({"ms": now, "id": id, "ship": ship, "quiet": quiet}));
+            tx.execute(
+                "UPDATE away SET requests=?2 WHERE started_ms=?1",
+                params![since, json!(requests).to_string()],
+            )?;
+            Route::Immediate { quiet }
+        }
+    } else if mail["urgency"] == "high" && mail["from"] != crate::mail::CREW {
+        let mut through = list("breakthroughs");
+        let mut overflow = list("overflow");
+        if decided(&through, id).is_some() {
+            Route::Breakthrough
+        } else if decided(&overflow, id).is_some() {
+            Route::Overflow
+        } else if recent(&through, None) < settings.breakthroughs_per_hour
+            && recent(&through, Some(ship)) < settings.ship_breakthroughs_per_hour
+        {
+            through.push(json!({"ms": now, "id": id, "ship": ship}));
+            tx.execute(
+                "UPDATE away SET breakthroughs=?2 WHERE started_ms=?1",
+                params![since, json!(through).to_string()],
+            )?;
+            Route::Breakthrough
+        } else {
+            overflow.push(json!({"ms": now, "id": id, "ship": ship}));
+            tx.execute(
+                "UPDATE away SET overflow=?2 WHERE started_ms=?1",
+                params![since, json!(overflow).to_string()],
+            )?;
+            Route::Overflow
+        }
+    } else {
+        Route::Digest
+    };
+    tx.commit()?;
+    Ok(Some(route))
+}
+
+/// How captain mail is expected to travel while the captain is away, as a
+/// note for its sender: `None` when the captain is not away or the mail
+/// goes at once. A preview only; the door decides when it carries it.
+pub fn preview(mail: &Value) -> Result<Option<(&'static str, String)>> {
+    let Some(period) = active()? else {
+        return Ok(None);
+    };
+    let settings = settings();
+    let kind = mail["kind"].as_str().unwrap_or_default();
+    if card_edit(mail)
+        || matches!(kind, "request" | "decision")
+        || mail["from"] == crate::mail::CAPTAIN
+    {
+        return Ok(None);
     }
     let now = Store::now_ms();
-    let recent = through
-        .iter()
-        .filter(|b| b["ms"].as_i64().unwrap_or(0) > now - HOUR_MS)
-        .count();
-    if recent >= BREAKTHROUGHS_PER_HOUR {
-        return Ok(false);
+    if mail["urgency"] == "high" && mail["from"] != crate::mail::CREW {
+        let recent = period["breakthroughs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| b["ms"].as_i64().unwrap_or(0) > now - HOUR_MS)
+            .count();
+        if recent < settings.breakthroughs_per_hour {
+            return Ok(None);
+        }
+        return Ok(Some((
+            "urgent_digest",
+            format!(
+                "Urgent messages to the captain are over the hourly limit; this leads the next digest, due within {} minutes. Do not resend.",
+                settings.urgent_due_mins
+            ),
+        )));
     }
-    through.push(json!({"ms": now, "id": id}));
-    registry()?.execute(
-        "UPDATE away SET breakthroughs=?2 WHERE started_ms=?1",
-        params![period["since_ms"].as_i64(), json!(through).to_string()],
-    )?;
-    Ok(true)
+    if let Some((id, ms, held)) = crate::digest::last_told(mail, &settings)?
+        && mail["id"] != id.as_str()
+    {
+        let short: String = id.chars().take(8).collect();
+        return Ok(Some(if held {
+            (
+                "repeat",
+                format!(
+                    "The captain will get this in the digest already (as {short}); it is counted, not shown again. Do not resend."
+                ),
+            )
+        } else {
+            (
+                "repeat",
+                format!(
+                    "The captain already has this ({short} at {}); it is counted, not shown again. Do not resend.",
+                    clock(ms)
+                ),
+            )
+        }));
+    }
+    Ok(Some((
+        "digest",
+        "The captain is away; this goes in the next digest. Do not resend.".to_owned(),
+    )))
 }
 
 /// Captain mail held during the latest away period, oldest first: every
@@ -287,8 +489,47 @@ pub fn back() -> Result<Option<Value>> {
             if urgent_held == 1 { " was" } else { "s were" }
         ));
     }
+    // Each door that takes digests gets one catch-up, retried until delivered:
+    // what no delivered digest carried, and every request still waiting.
+    let settings = settings();
+    let waiting_items = crate::captain::waiting()?["waiting"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let digest_doors = crate::door::digest_doors()?;
+    let mut catch_up = vec![];
+    let mut catch_up_text = None;
+    let mut overflowed = false;
+    for door in &digest_doors {
+        let (row, cut) =
+            crate::digest::catch_up(door, &period, &digest, &waiting_items, &settings)?;
+        overflowed |= cut;
+        catch_up_text.get_or_insert_with(|| {
+            row["lines"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        catch_up.push(row["id"].clone());
+    }
+    if catch_up_text.is_none() && !digest_doors.is_empty() {
+        catch_up_text = Some(digest.clone());
+    }
     let mut summary = None;
-    if held.is_empty() && waiting > 0 {
+    if !digest_doors.is_empty() {
+        // The catch-up already lists what was held and what waits; the
+        // liaison's summary is worth its turn only when the catch-up was cut.
+        if overflowed {
+            let body = format!(
+                "I'm back after {} away and my catch-up was too long to read. Please summarize for me, in plain words, what reached my mailbox while I was away: first what needs me, then what finished, then what is still in progress (/held lists it). Then answer anything I write next.",
+                duration(now - since)
+            );
+            summary = tell_liaison(&format!("away-{since}-summary"), "request", &body)?;
+        }
+    } else if held.is_empty() && waiting > 0 {
         let body = format!(
             "I'm back after {} away. Nothing new reached my mailbox, but {waiting} request{} still wait{} on me: remind me of each in plain words, with its ship, then answer anything I write next.",
             duration(now - since),
@@ -337,7 +578,8 @@ pub fn back() -> Result<Option<Value>> {
     }
     Ok(Some(
         json!({"digest": digest, "held": held.len(), "waiting": waiting,
-        "breakthroughs": sent, "summary_requested": summary, "since_ms": since, "returned_ms": now}),
+        "breakthroughs": sent, "summary_requested": summary, "since_ms": since, "returned_ms": now,
+        "catch_up": catch_up, "catch_up_text": catch_up_text}),
     ))
 }
 
@@ -345,7 +587,7 @@ pub fn back() -> Result<Option<Value>> {
 pub fn bearings_line() -> Option<String> {
     let period = active().ok().flatten()?;
     Some(format!(
-        "Captain away since {}{}: only high-urgency messages reach them. Record waits and keep working rather than stopping on a question.",
+        "Captain away since {}{}: requests and high urgency reach them at once; notices go in a digest. Tell each outcome once. Record waits and keep working rather than stopping on a question.",
         clock(period["since_ms"].as_i64().unwrap_or(0)),
         period["until"]
             .as_str()
@@ -359,25 +601,56 @@ pub fn status() -> Result<Value> {
     Ok(json!({"away": active()?}))
 }
 
-/// Split `until 8am rest of words` into the expected return and the words.
-pub fn parse(text: &str) -> (Option<String>, String) {
-    let text = text.trim();
-    if let Some(rest) = text.strip_prefix("until ") {
-        let mut parts = rest.trim_start().splitn(2, char::is_whitespace);
-        let until = parts.next().map(str::to_owned).filter(|u| !u.is_empty());
-        return (until, parts.next().unwrap_or("").trim().to_owned());
+/// What `/afk` was given: when the captain expects to be back, how often
+/// they want a digest, and their words for the liaison.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Afk {
+    pub until: Option<String>,
+    pub every_secs: Option<i64>,
+    pub words: String,
+}
+
+/// A digest period such as `30m`, `2h` or `45`, kept between 10 minutes and 6 hours.
+fn every(text: &str) -> Option<i64> {
+    let (number, unit) = match text.strip_suffix('h') {
+        Some(n) => (n, 3600),
+        None => (text.strip_suffix('m').unwrap_or(text), 60),
+    };
+    let secs = number.parse::<i64>().ok()?.checked_mul(unit)?;
+    Some(secs.clamp(600, 6 * 3600))
+}
+
+/// Split `[until 8am] [every 30m] rest of words`, in either order.
+pub fn parse(text: &str) -> Afk {
+    let mut afk = Afk::default();
+    let mut rest = text.trim();
+    loop {
+        let mut parts = rest.splitn(3, char::is_whitespace);
+        let (head, value) = (parts.next().unwrap_or(""), parts.next());
+        let tail = parts.next().unwrap_or("").trim_start();
+        match (head, value) {
+            ("until", Some(value)) if afk.until.is_none() && !value.is_empty() => {
+                afk.until = Some(value.to_owned())
+            }
+            ("every", Some(value)) if afk.every_secs.is_none() && every(value).is_some() => {
+                afk.every_secs = every(value)
+            }
+            _ => break,
+        }
+        rest = tail;
     }
-    (None, text.to_owned())
+    afk.words = rest.trim().to_owned();
+    afk
 }
 
 /// `privateer afk [until TIME] [WORDS]`, `privateer back`, `privateer away`.
 pub fn cli(command: &str, args: &[String]) -> Result<()> {
     match command {
         "afk" => {
-            let (until, words) = parse(&args.join(" "));
-            let entered = enter(&words, until.as_deref())?;
+            let afk = parse(&args.join(" "));
+            let entered = enter(&afk.words, afk.until.as_deref(), afk.every_secs)?;
             println!(
-                "Away{}: the fleet holds your mail; only high-urgency messages reach you, at most {BREAKTHROUGHS_PER_HOUR} an hour.",
+                "Away{}: requests and high-urgency messages reach you at once (high urgency at most {BREAKTHROUGHS_PER_HOUR} an hour); other notices come in a digest.",
                 if entered["refreshed"] == true {
                     " (updated)"
                 } else {
@@ -389,7 +662,13 @@ pub fn cli(command: &str, args: &[String]) -> Result<()> {
             }
         }
         "back" => match back()? {
-            Some(returned) => println!("{}", returned["digest"].as_str().unwrap_or("")),
+            Some(returned) => println!(
+                "{}",
+                returned["catch_up_text"]
+                    .as_str()
+                    .or(returned["digest"].as_str())
+                    .unwrap_or("")
+            ),
             None => println!("You were not away."),
         },
         _ => match active()? {

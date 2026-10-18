@@ -185,8 +185,9 @@ impl Fleet {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {what}: {:#?}",
-                self.entries()
+                "timed out waiting for {what}: {:#?}\ndoor log:\n{}",
+                self.entries(),
+                fs::read_to_string(self.root.join("state/doors/fake/door.log")).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -601,10 +602,17 @@ for line in sys.stdin:
 fn away_holds_mail_lets_three_emergencies_through_and_summarizes_on_return() {
     let fleet = Fleet::new();
     fs::write(fleet.root.join("adapter/door.py"), AWAY_ADAPTER).unwrap();
+    // One place overrides the away defaults: here, one ship may spend the
+    // whole fleet's urgent budget.
+    fs::write(
+        fleet.root.join("state/away.json"),
+        json!({"ship_breakthroughs_per_hour": 3}).to_string(),
+    )
+    .unwrap();
     fleet.add();
     let out = fleet.ok(&["afk", "until", "8am", "merge #9 if CI is green"]);
     assert!(
-        out.contains("only high-urgency messages reach you"),
+        out.contains("requests and high-urgency messages reach you at once"),
         "{out}"
     );
     let bearings = fleet.call("ops", "ship.bearings", json!({"ship":"ops"}));
@@ -612,7 +620,7 @@ fn away_holds_mail_lets_three_emergencies_through_and_summarizes_on_return() {
         bearings["text"]
             .as_str()
             .unwrap()
-            .contains("Captain away since")
+            .contains("notices go in a digest")
     );
     let mail = |body: &str, kind: &str, urgency: &str| {
         fleet.call(
@@ -631,20 +639,27 @@ fn away_holds_mail_lets_three_emergencies_through_and_summarizes_on_return() {
     let entries = fleet.wait("the return and the second away period", |e| {
         response(e, "back").is_some().then(|| e.to_vec())
     });
-    // Three emergencies reached the phone, marked; the fourth and the rest waited.
-    let pushed: Vec<(&str, bool)> = entries
+    // Three emergencies reached the phone, marked, and the request went at
+    // once on a door without digests; the fourth emergency and notices waited.
+    let pushed: Vec<(&str, bool, bool)> = entries
         .iter()
         .filter(|e| e["type"] == "mail")
         .map(|e| {
             (
                 e["mail"]["body"].as_str().unwrap(),
                 e["breakthrough"] == true,
+                e["away"] == true,
             )
         })
         .collect();
     assert_eq!(
-        pushed,
-        [("fire 1", true), ("fire 2", true), ("fire 3", true)]
+        pushed[..4],
+        [
+            ("fire 1", true, false),
+            ("fire 2", true, false),
+            ("fire 3", true, false),
+            ("decide the region", false, true)
+        ]
     );
     // Peeking left the captain away.
     let held: Vec<&str> = response(&entries, "held").unwrap()["result"]["held"]
@@ -726,8 +741,8 @@ fn away_holds_mail_lets_three_emergencies_through_and_summarizes_on_return() {
             .filter(|e| e["type"] == "mail")
             .map(|e| e["mail"]["body"].as_str().unwrap().to_owned())
             .collect();
-        (bodies.len() > 3).then_some(bodies)
+        (bodies.len() > 4).then_some(bodies)
     });
-    assert_eq!(later[3..], ["after you returned"]);
+    assert_eq!(later[4..], ["after you returned"]);
     stop(supervisor);
 }
