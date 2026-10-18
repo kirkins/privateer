@@ -122,6 +122,10 @@ struct Job {
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     hosted: bool,
+    /// When the supervisor spawned the payload; absent for jobs recorded
+    /// before it was kept, and until the payload runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spawned_ms: Option<i64>,
     /// A harness job's `harness/provider/model`, for provider backoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_route: Option<String>,
@@ -706,12 +710,17 @@ fn longest_recorded_run(
 /// like ordinary work. Reads only the shared ledger and live processes, so
 /// any home on this machine may ask; nothing is released or changed.
 pub(crate) fn capacity_holders(store: &Store) -> Result<Vec<Holder>> {
+    capacity_holders_waiting(store, Duration::from_secs(5))
+}
+
+/// The same, waiting at most `busy` for a writer holding the ledger.
+pub(crate) fn capacity_holders_waiting(store: &Store, busy: Duration) -> Result<Vec<Holder>> {
     let path = ledger_dir(store)?.join("resources.sqlite");
     if !path.is_file() {
         return Ok(vec![]);
     }
     let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.busy_timeout(busy)?;
     let now = Store::now_ms();
     let mut holders = vec![];
     for r in reservations(&conn)? {
@@ -1972,6 +1981,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .and_then(Value::as_str)
             .map(str::to_owned),
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
+        spawned_ms: None,
         model_route: args
             .get("model_route")
             .and_then(Value::as_str)
@@ -2818,6 +2828,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     job = alter(store, id, |j| {
         j.payload = Some(payload.clone());
         j.status = "running".into();
+        j.spawned_ms = Some(Store::now_ms());
     })?;
     update_reservation(store, &job)?;
     drop(workspace_lock);

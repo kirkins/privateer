@@ -33,6 +33,19 @@ pub fn init(store: &Store) -> Result<()> {
     if !has_binding {
         tx.execute_batch("ALTER TABLE presence ADD COLUMN binding TEXT;")?;
     }
+    // A hosted pane asleep: the holder that slept and since when. Asleep only
+    // while that holder still holds the lease, so a holder change ends it.
+    let has_asleep: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('presence') WHERE name='asleep_holder')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_asleep {
+        tx.execute_batch(
+            "ALTER TABLE presence ADD COLUMN asleep_holder TEXT;
+             ALTER TABLE presence ADD COLUMN asleep_since_ms INTEGER;",
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }

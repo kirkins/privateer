@@ -1,6 +1,6 @@
 # Design: `fleet.snapshot`, one JSON of the fleet across machines
 
-Status: revised after the design review (round 2); implementation follows this note. Task `privateer-fleet-snapshot` (data side of issue 94, for quarterdeck's fleet map, its PR 7). Read with [cross-machine fleet](cross-machine-fleet.md) (links, the gateway), [runtime needs](../runtime-needs.md) and [architecture](../architecture.md#linked-machines). Names marked **new** do not exist yet; every other name was checked in the tree at b95363b.
+Status: revised after the design review (round 2) and implemented, except per-machine `routes` (the `crew_routes::states` refactor), the `jobs_live` and `tasks_owner` indexes, and `park` text on a parked job's `wait`, which remain for a later round. Task `privateer-fleet-snapshot` (data side of issue 94, for quarterdeck's fleet map, its PR 7). Read with [cross-machine fleet](cross-machine-fleet.md) (links, the gateway), [runtime needs](../runtime-needs.md) and [architecture](../architecture.md#linked-machines). Names marked **new** do not exist yet; every other name was checked in the tree at b95363b.
 
 ## Problem
 
@@ -141,7 +141,7 @@ Each home's typed `runtime.needs` items (`crate::needs::query`, operator, its ow
 
 ### since
 
-A per-machine token, not a time: `since` is an object `{"<machine>": <changed_ms as last returned>}`. A machine whose `changed_ms` **equals** its entry is returned as its row with `"unchanged": true` and none of its routes, ships or needs; the portal keeps what it had. Any other value, a machine missing from `since`, or a machine new to the portal returns the full section. Equality, never `<=`: each machine's `changed_ms` is on that machine's own clock, and a remote clock behind the portal's, or a step back, would otherwise hide a real change until the next one. The machine's entry is passed through the gateway as `since: {"<it>": n}`, so an unchanged remote section does not cross the link either. No deltas within a section.
+A per-machine token, not a time: `since` is an object `{"<machine>": <changed_ms as last returned>}`. A machine whose `changed_ms` **equals** its entry is returned as its row with `"unchanged": true` and none of its routes, ships or needs; the portal keeps what it had. Any other value, a machine missing from `since`, or a machine new to the portal returns the full section. Equality, never `<=`: each machine's `changed_ms` is on that machine's own clock, and a remote clock behind the portal's, or a step back, would otherwise hide a real change until the next one. Between machines, the asking machine passes the `changed_ms` of the section it has stored for the other as `since: n`; an equal one comes back without its section and only re-dates the stored one, so an unchanged remote section does not cross the link. No deltas within a section.
 
 ### Linked machines over the gateway
 

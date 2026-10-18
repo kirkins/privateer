@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 // Per-observation only: never shorten ordinary commands' writer wait policy.
 // SQLite callbacks bound VM work cooperatively, not OS/filesystem I/O.
-struct ObservationBudget<'a> {
+pub(crate) struct ObservationBudget<'a> {
     conn: &'a rusqlite::Connection,
     previous_busy_ms: u64,
     deadline: Instant,
@@ -17,7 +17,7 @@ struct ObservationBudget<'a> {
 }
 
 impl<'a> ObservationBudget<'a> {
-    fn new(conn: &'a rusqlite::Connection) -> Result<Self> {
+    pub(crate) fn new(conn: &'a rusqlite::Connection) -> Result<Self> {
         let previous_busy_ms = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
         conn.busy_timeout(Duration::from_millis(25))?;
         let deadline = Instant::now() + Duration::from_millis(250);
@@ -39,7 +39,7 @@ impl<'a> ObservationBudget<'a> {
 
     // VM progress callbacks may never fire across repeated small statements.
     // Bound Rust/statement work independently, across the whole observation.
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let checkpoints = self.checkpoints.get() + 1;
         self.checkpoints.set(checkpoints);
         ensure!(

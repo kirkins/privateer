@@ -3874,3 +3874,139 @@ fn the_ship_profile_of_a_ship_on_another_machine_is_asked_there() {
     let there = mac.ok("fitforge", "ship.profile", json!({"ship": "fitforge"}));
     assert_eq!(there["first_mate"]["harness"], "codex", "{there}");
 }
+
+fn machine_row<'a>(snapshot: &'a Value, name: &str) -> &'a Value {
+    snapshot["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == name)
+        .unwrap_or_else(|| panic!("{name} missing: {snapshot}"))
+}
+
+fn ships_on<'a>(snapshot: &'a Value, machine: &str) -> Vec<&'a Value> {
+    snapshot["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["machine"] == machine)
+        .collect()
+}
+
+#[test]
+fn the_snapshot_reads_a_reached_machine_and_keeps_its_last_section_when_it_is_down() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let asked = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "request", "body": "Ship build 9?"}),
+    );
+    let remote = remote_ssh(&mac);
+
+    let first = laptop.ok_over("liaison", "fleet.snapshot", json!({}), &remote);
+    let row = machine_row(&first, "mac");
+    assert_eq!(row["link"], "reaches", "{first}");
+    assert_eq!(row["reachable"], true, "{first}");
+    assert_eq!(row["via"], "direct");
+    let fitforge = ships_on(&first, "mac");
+    assert_eq!(fitforge.len(), 1, "{first}");
+    assert_eq!(fitforge[0]["name"], "fitforge");
+    assert_eq!(fitforge[0]["presence"], "absent");
+    let need = first["needs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["mail_id"] == asked["id"])
+        .unwrap_or_else(|| panic!("request missing: {first}"));
+    assert_eq!(need["machine"], "mac");
+    assert_eq!(need["actions"], json!(["mail.send"]));
+    assert_eq!(connections(&mac), 1);
+
+    // Asked again at once, the read is reused: no new connection.
+    let again = laptop.ok_over("liaison", "fleet.snapshot", json!({}), &remote);
+    assert_eq!(machine_row(&again, "mac")["via"], "reused", "{again}");
+    assert_eq!(
+        machine_row(&again, "mac")["as_of_ms"],
+        row["as_of_ms"],
+        "{again}"
+    );
+    assert_eq!(connections(&mac), 1);
+
+    // The mac goes down: its last section stays, dated, and cannot be acted on.
+    std::thread::sleep(std::time::Duration::from_millis(5_100));
+    let down = remote_ssh_with(&mac, "down-ssh", "| (cat >/dev/null; echo garbage)");
+    let cached = laptop.ok_over("liaison", "fleet.snapshot", json!({}), &down);
+    let row_down = machine_row(&cached, "mac");
+    assert_eq!(row_down["reachable"], false, "{cached}");
+    assert_eq!(row_down["via"], "cache");
+    assert!(row_down["error"].as_str().is_some(), "{cached}");
+    assert_eq!(row_down["as_of_ms"], row["as_of_ms"]);
+    assert_eq!(row_down["changed_ms"], row["changed_ms"]);
+    assert_eq!(ships_on(&cached, "mac").len(), 1, "{cached}");
+    let stale = cached["needs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["mail_id"] == asked["id"])
+        .unwrap_or_else(|| panic!("cached request missing: {cached}"));
+    assert_eq!(stale["as_of_ms"], row["as_of_ms"]);
+    assert_eq!(stale["actions"], json!([]));
+
+    // Once the captain answers the desk copy here, the cached need is gone.
+    laptop.pass("liaison", &remote);
+    laptop.ok(
+        "liaison",
+        "mail.send",
+        json!({"from": "captain", "to": "fitforge", "kind": "reply",
+            "correlation": asked["id"], "body": "Yes."}),
+    );
+    let answered = laptop.ok_over("liaison", "fleet.snapshot", json!({}), &down);
+    assert!(
+        !answered["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["mail_id"] == asked["id"]),
+        "{answered}"
+    );
+
+    // Removing the link forgets the cached section.
+    laptop.ok("liaison", "machine.remove", json!({"name": "mac"}));
+    let removed = laptop.ok("liaison", "fleet.snapshot", json!({}));
+    assert_eq!(
+        removed["machines"].as_array().unwrap().len(),
+        1,
+        "{removed}"
+    );
+}
+
+#[test]
+fn a_reaching_machine_carries_its_section_on_collect_to_the_machine_it_reaches() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+
+    // Before any collect the mac knows the laptop only from the directory,
+    // and never connects to it.
+    let before = mac.ok("fitforge", "fleet.snapshot", json!({}));
+    let row = machine_row(&before, "laptop");
+    assert_eq!(row["link"], "reached_by", "{before}");
+    assert_eq!(row["reachable"], false);
+    assert_eq!(row["via"], "directory");
+    let listed = ships_on(&before, "laptop");
+    assert_eq!(listed.len(), 1, "{before}");
+    assert_eq!(listed[0]["presence"], "unknown");
+
+    // The laptop's collect carries its own section.
+    collect_as(&laptop, "liaison", &remote_ssh(&mac));
+    let after = mac.ok("fitforge", "fleet.snapshot", json!({}));
+    let row = machine_row(&after, "laptop");
+    assert_eq!(row["via"], "collect", "{after}");
+    assert_eq!(row["reachable"], true, "{after}");
+    let liaison = ships_on(&after, "laptop");
+    assert_eq!(liaison.len(), 1, "{after}");
+    assert_eq!(liaison[0]["name"], "liaison");
+    assert_eq!(liaison[0]["presence"], "absent", "{after}");
+}

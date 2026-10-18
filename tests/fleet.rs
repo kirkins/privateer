@@ -2128,3 +2128,142 @@ fn the_ship_profile_lists_selected_skills_and_mcp_servers_with_credential_names_
     );
     assert_eq!(profile["routes"]["crew"], json!({"list":"none","names":[]}));
 }
+
+/// A live crew job written straight into a home, with progress reports as
+/// `crew.report` stores them, so the snapshot reads the same records.
+fn live_crew(folder: &Path, ship: &str, job: &str, status: &str, reports: &[&str]) {
+    let db = rusqlite::Connection::open(folder.join(".privateer/privateer.sqlite")).unwrap();
+    let record = json!({"id": job, "task_id": "t1", "incarnation": "i1", "status": status,
+        "action": "spawn", "agent_actor": ship, "heavy": false, "created_ms": now_ms(),
+        "command": ["claude", "--token", "CANARY-SECRET-3141"], "spawned_ms": now_ms()});
+    db.execute(
+        "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+        rusqlite::params![job, record.to_string()],
+    )
+    .unwrap();
+    for (n, report) in reports.iter().enumerate() {
+        db.execute(
+            "INSERT INTO mail(id, sender, recipient, kind, body, payload, urgency, created_ms)
+             VALUES(?1, 'crew', ?2, 'notice', ?3, ?4, 'low', ?5)",
+            rusqlite::params![
+                format!("crew-{job}-i1-{n}"),
+                ship,
+                format!("Crew job {job} reports progress:\n{report}"),
+                json!({"job_id": job, "incarnation": "i1", "report": "progress", "data": {}})
+                    .to_string(),
+                now_ms() + n as i64
+            ],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn the_fleet_snapshot_shows_live_jobs_with_what_they_are_doing_and_what_waits_on_the_captain() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let ops = machine.ship("ops");
+    live_crew(
+        &apps,
+        "apps",
+        "job-live",
+        "running",
+        &["read the code", "writing tests"],
+    );
+    live_crew(&apps, "apps", "job-done", "succeeded", &["finished"]);
+    let asked = machine.json(
+        &ops,
+        "mail.send",
+        json!({"from":"ops","to":"captain","kind":"request","body":"Deploy build 7?"}),
+    );
+
+    let snapshot = machine.json(&apps, "fleet.snapshot", json!({}));
+    let here = snapshot["machine"].as_str().unwrap();
+    let machines = snapshot["machines"].as_array().unwrap();
+    assert_eq!(machines.len(), 1, "{snapshot}");
+    assert_eq!(machines[0]["link"], "here");
+    assert_eq!(machines[0]["reachable"], true);
+    assert!(machines[0]["changed_ms"].as_i64().is_some(), "{snapshot}");
+
+    let ship = |name: &str| {
+        snapshot["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {snapshot}"))
+            .clone()
+    };
+    let apps_ship = ship("apps");
+    assert_eq!(apps_ship["machine"], here);
+    assert_eq!(apps_ship["presence"], "absent");
+    // Live jobs only: the finished one is gone, the running one says what it does.
+    let jobs = apps_ship["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1, "{apps_ship}");
+    assert_eq!(apps_ship["jobs_total"], 1);
+    assert_eq!(jobs[0]["id"], "job-live");
+    assert_eq!(jobs[0]["kind"], "crew");
+    assert_eq!(jobs[0]["state"], "running");
+    assert_eq!(jobs[0]["doing"]["text"], "writing tests", "{}", jobs[0]);
+    assert_eq!(jobs[0]["doing"]["report_id"], "crew-job-live-i1-1");
+    assert!(jobs[0]["spawned_ms"].as_i64().is_some());
+    assert!(ship("ops")["jobs"].as_array().unwrap().is_empty());
+
+    // The captain's request is a need pinned to the asking ship's machine.
+    let need = snapshot["needs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["mail_id"] == asked["id"])
+        .unwrap_or_else(|| panic!("request missing: {snapshot}"));
+    assert_eq!(need["machine"], here);
+    assert_eq!(need["ship"], "ops");
+    assert_eq!(need["asked_ms"], asked["created_ms"]);
+    assert_eq!(need["as_of_ms"], Value::Null);
+    assert_eq!(need["actions"], json!(["mail.send"]));
+    assert!(need.get("observed_ms").is_none(), "{need}");
+
+    // No argv or secret crosses into the snapshot, and an agent cannot ask.
+    assert!(!snapshot.to_string().contains("CANARY-SECRET-3141"));
+    let refused = machine.as_agent(&apps, "apps", "fleet.snapshot", json!({}));
+    assert!(!refused.status.success());
+}
+
+#[test]
+fn changed_ms_holds_while_nothing_changes_and_since_skips_an_unchanged_machine() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let first = machine.json(&apps, "fleet.snapshot", json!({}));
+    let here = first["machine"].as_str().unwrap().to_owned();
+    let changed = first["machines"][0]["changed_ms"].as_i64().unwrap();
+
+    // Time passes and nothing changes: the same change time, a later read.
+    thread::sleep(Duration::from_millis(1_100));
+    let second = machine.json(&apps, "fleet.snapshot", json!({}));
+    assert_eq!(second["machines"][0]["changed_ms"], changed, "{second}");
+    assert!(second["machines"][0]["as_of_ms"].as_i64().unwrap() > changed);
+
+    // The portal's token for this machine is that change time, compared for
+    // equality: equal is unchanged and carries nothing; anything else is full.
+    let skipped = machine.json(&apps, "fleet.snapshot", json!({"since": {&here: changed}}));
+    assert_eq!(skipped["machines"][0]["unchanged"], true, "{skipped}");
+    assert!(skipped["ships"].as_array().unwrap().is_empty());
+    let ahead = machine.json(
+        &apps,
+        "fleet.snapshot",
+        json!({"since": {&here: changed + 1}}),
+    );
+    assert_eq!(ahead["machines"][0]["unchanged"], false);
+    assert_eq!(ahead["ships"].as_array().unwrap().len(), 1);
+
+    // A change moves it, past the last one.
+    machine.json(
+        &apps,
+        "mail.send",
+        json!({"from":"captain","to":"apps","kind":"notice","body":"new mail"}),
+    );
+    let third = machine.json(&apps, "fleet.snapshot", json!({"since": {&here: changed}}));
+    assert_eq!(third["machines"][0]["unchanged"], false, "{third}");
+    assert!(third["machines"][0]["changed_ms"].as_i64().unwrap() > changed);
+    assert_eq!(third["ships"][0]["unread"], 1, "{third}");
+}
