@@ -342,24 +342,65 @@ If you are crew yourself (`PRIVATEER_JOB` is set and you were not woken as first
 /// The Claude hook events Privateer registers for an attended session.
 const CLAUDE_HOOK_EVENTS: [&str; 4] = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"];
 
+/// A shell word with its single quotes removed.
+fn unquote_word(word: &str) -> String {
+    match word.strip_prefix('\'').and_then(|w| w.strip_suffix('\'')) {
+        Some(inner) => inner.replace("'\"'\"'", "'"),
+        None => word.to_owned(),
+    }
+}
+
 /// Whether a shell word or rule path names a Privateer binary, whatever
 /// directory it was installed in.
 fn is_privateer_binary(word: &str) -> bool {
-    let unquoted = match word.strip_prefix('\'').and_then(|w| w.strip_suffix('\'')) {
-        Some(inner) => inner.replace("'\"'\"'", "'"),
-        None => word.to_owned(),
-    };
-    Path::new(&unquoted)
+    Path::new(&unquote_word(word))
         .file_name()
         .is_some_and(|f| f == "privateer")
 }
 
-/// Whether a Claude permission rule is Privateer's control-CLI allow rule.
+/// Whether a Claude permission rule is Privateer's control-CLI allow rule: an
+/// absolute path to a Privateer binary. A rule that names a bare or relative
+/// `privateer` was written by hand and is kept.
 fn is_privateer_rule(rule: &Value) -> bool {
     rule.as_str()
         .and_then(|r| r.strip_prefix("Bash("))
         .and_then(|r| r.strip_suffix(":*)"))
-        .is_some_and(is_privateer_binary)
+        .is_some_and(|word| {
+            Path::new(&unquote_word(word)).is_absolute() && is_privateer_binary(word)
+        })
+}
+
+/// Replace `path` with `bytes`, atomically. A symlinked file is written through
+/// to its target, which keeps the link; an existing file keeps its mode, and a
+/// new one gets `mode`.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let target = match fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error.into()),
+    };
+    let mode = fs::metadata(&target)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(mode);
+    let dir = target.parent().context("file has no folder")?;
+    let temp = dir.join(format!(".privateer-write-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, &target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Whether a Claude hook command is Privateer's hook for `event`: its binary
@@ -425,7 +466,8 @@ pub(crate) fn claude_settings(folder: &Path, binary: &str) -> Result<()> {
             .with_context(|| format!("hooks.{event} must be a list"))?;
         let mut kept_hook = false;
         entries.retain_mut(|entry| {
-            let Some(hs) = entry["hooks"].as_array_mut() else {
+            // A foreign entry is never changed: no hooks list, or not an object, is kept as it is.
+            let Some(hs) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
                 return true;
             };
             let listed = hs.len();
@@ -452,32 +494,22 @@ pub(crate) fn claude_settings(folder: &Path, binary: &str) -> Result<()> {
         return Ok(());
     }
     fs::create_dir_all(folder.join(".claude"))?;
-    let temp = folder
-        .join(".claude")
-        .join(format!(".privateer-settings-{}", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(&settings)?)?;
-        file.sync_all()?;
-        fs::rename(&temp, &path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    write_atomic(&path, &serde_json::to_vec_pretty(&settings)?, 0o644)
 }
 
 /// Bring a ship folder's Claude settings to the running binary, for the
-/// dispatcher that serves the ship whose state lives in `home`.
-pub(crate) fn refresh_claude_settings(home: &Path) -> Result<()> {
-    let folder = home.parent().context("ship folder")?;
-    let binary = crate::executable::installed()?;
-    claude_settings(folder, &binary.display().to_string())
+/// dispatcher that serves the ship whose state lives in `home`. Best effort:
+/// a settings file that cannot be read or written is warned about and left as
+/// it is, so starting or moving the ship still goes on.
+pub(crate) fn refresh_claude_settings(home: &Path) {
+    let result = (|| -> Result<()> {
+        let folder = home.parent().context("ship folder")?;
+        let binary = crate::executable::installed()?;
+        claude_settings(folder, &binary.display().to_string())
+    })();
+    if let Err(error) = result {
+        eprintln!("warning: could not update the ship's Claude settings: {error:#}");
+    }
 }
 
 fn ensure_lines(path: &Path, lines: &[&str]) -> Result<()> {
@@ -501,7 +533,6 @@ fn ensure_lines(path: &Path, lines: &[&str]) -> Result<()> {
 /// Add this optional adapter's hooks beside existing project hooks. No
 /// global Cursor config, credentials, provider route or trust store is changed.
 fn cursor_settings(folder: &Path, binary: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = folder.join(".cursor");
     let path = dir.join("hooks.json");
     for item in [&dir, &path] {
@@ -550,23 +581,7 @@ fn cursor_settings(folder: &Path, binary: &Path) -> Result<()> {
         entries.push(entry);
     }
     fs::create_dir_all(&dir)?;
-    let temp = dir.join(format!(".privateer-hooks-{}", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(&settings)?)?;
-        file.sync_all()?;
-        fs::rename(&temp, &path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    write_atomic(&path, &serde_json::to_vec_pretty(&settings)?, 0o600)
 }
 
 /// Turn the current folder into a ship. Safe to run again: it updates the
@@ -1104,7 +1119,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let mut profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
     let folder = home.parent().context("ship folder")?;
     // Claude reads the folder's hooks and rules as it starts; they must name this binary.
-    refresh_claude_settings(home)?;
+    refresh_claude_settings(home);
     let holder = if hosted {
         std::env::var("PRIVATEER_HOSTED_HOLDER")
             .ok()

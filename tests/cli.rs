@@ -832,6 +832,71 @@ fn a_moved_folder_points_privateers_claude_settings_at_this_binary() {
 }
 
 #[test]
+fn claude_settings_leave_foreign_entries_exactly_as_they_were() {
+    let folder = Folder::new("desk");
+    folder.ok(&["init", "--ship", "desk", "--scope", "Desk"]);
+    // Entries Privateer did not write: no hooks list, a non-list hooks, a bare
+    // string, and a hook of another tool. None may gain a key or change.
+    let foreign = json!([
+        {"matcher": "Bash"},
+        {"hooks": "not a list"},
+        "a bare string entry",
+        {"hooks": [{"type": "command", "command": "notify-send done"}]}
+    ]);
+    // Hand-written rules naming a bare or relative `privateer` are not ours.
+    let rules = json!([
+        "Bash(privateer:*)",
+        "Bash(./target/debug/privateer:*)",
+        format!("Bash({BIN}:*)")
+    ]);
+    fs::write(
+        folder.ship.join(".claude/settings.json"),
+        json!({"permissions": {"allow": rules}, "hooks": {"Stop": foreign}}).to_string(),
+    )
+    .unwrap();
+
+    folder.ok(&["init"]);
+    let settings: Value =
+        serde_json::from_slice(&fs::read(folder.ship.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!([
+            "Bash(privateer:*)",
+            "Bash(./target/debug/privateer:*)",
+            format!("Bash({BIN}:*)")
+        ])
+    );
+    let stop = settings["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop[..4], *foreign.as_array().unwrap());
+    assert_eq!(
+        stop[4]["hooks"][0]["command"],
+        format!("{BIN} hook claude Stop")
+    );
+    assert_eq!(stop.len(), 5, "{settings}");
+}
+
+#[test]
+fn a_malformed_claude_settings_file_does_not_stop_a_start() {
+    let folder = Folder::new("desk");
+    folder.ok(&["init", "--ship", "desk", "--scope", "Desk"]);
+    let path = folder.ship.join(".claude/settings.json");
+    for broken in ["{ not json", r#"{"permissions":{"allow":"Bash(git:*)"}}"#] {
+        fs::write(&path, broken).unwrap();
+        for args in [&["start"][..], &["service", "start"][..]] {
+            let out = folder.run_in(&folder.ship, args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("could not update the ship's Claude settings"),
+                "{stderr}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+    }
+}
+
+#[test]
 fn a_dispatcher_start_brings_generated_instructions_up_to_this_build() {
     let folder = Folder::new("desk");
     folder.ok(&["init", "--ship", "infra", "--scope", "Deploys"]);

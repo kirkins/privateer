@@ -812,7 +812,7 @@ fn activate(args: &Value) -> Result<Value> {
     let store = Store::open(&home)?;
     crate::fleet::link(&store, &ship)?;
     // The folder moved with its settings still naming the old machine's binary.
-    crate::cli::refresh_claude_settings(&home)?;
+    crate::cli::refresh_claude_settings(&home);
     // Work it left unfinished on the old machine cannot run here.
     let from = manifest["from"].as_str().unwrap_or("another machine");
     crate::jobs::settle_left_behind(&store, from)?;
