@@ -74,6 +74,10 @@ the adapter's stderr, `state/telegram.log` from the adapter).
 - **`/status`** shows what each ship is doing, **`/waiting`** re-shows what still
   waits on you, and **`/ships`** lists the fleet. These read records and wake no
   one.
+- **`/dismiss ID [reason]`** closes one waiting item without answering it: a
+  request or decision ends as dismissed and its ship is told so, a notice is
+  marked read. The first characters of the id, as `/waiting` shows them, are
+  enough when they name one item.
 - **Photos and files** are saved under the door's `state/inbox/` and the ship is
   told the path. **Voice notes** are transcribed when `[stt]` is configured,
   otherwise saved like files.

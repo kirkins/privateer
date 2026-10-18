@@ -3661,7 +3661,11 @@ fn a_dismissal_closes_the_ask_on_the_desk_and_where_it_was_asked() {
     assert_eq!(request["end_reason"], "rotated already");
 
     // Dismissed where it was asked: the desk's copy closes on the next pass.
-    laptop.ok("scout", "captain.dismiss", json!({"id": at_home, "note": "not needed"}));
+    laptop.ok(
+        "scout",
+        "captain.dismiss",
+        json!({"id": at_home, "note": "not needed"}),
+    );
     collect_now(&laptop);
     let pass = laptop.pass("liaison", &ssh);
     // The ask dismissed at the desk is offered back too; its copy is already closed.

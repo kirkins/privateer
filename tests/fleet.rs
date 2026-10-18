@@ -1541,7 +1541,10 @@ fn the_captain_replies_to_and_dismisses_asks_in_any_home_by_id_or_unique_prefix(
     assert_eq!(told[0]["kind"], "notice");
     assert_eq!(told[0]["payload"]["request_end"]["state"], "dismissed");
     assert!(
-        told[0]["body"].as_str().unwrap().contains("without an answer: deploy already happened"),
+        told[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("without an answer: deploy already happened"),
         "{}",
         told[0]
     );
@@ -1549,7 +1552,11 @@ fn the_captain_replies_to_and_dismisses_asks_in_any_home_by_id_or_unique_prefix(
     assert_eq!(waiting["waiting"], json!([]), "{waiting}");
     let needs = machine.json(&apps, "runtime.needs", json!({"address":"captain"}));
     assert!(
-        !needs["items"].as_array().unwrap().iter().any(|i| i["mail_id"] == stale_id),
+        !needs["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["mail_id"] == stale_id),
         "{needs}"
     );
     assert!(refused(&web, "captain.dismiss", json!({"id": stale_id})).contains(stale_id));
@@ -1563,31 +1570,56 @@ fn the_captain_replies_to_and_dismisses_asks_in_any_home_by_id_or_unique_prefix(
     assert_eq!(acked["state"], "acknowledged", "{acked}");
     let unread = machine.json(&apps, "mail.inbox", json!({"address":"captain"}));
     assert!(
-        !unread["messages"].as_array().unwrap().iter().any(|m| m["id"] == report["id"]),
+        !unread["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == report["id"]),
         "{unread}"
     );
 
     // Unknown ids are refused by name; a shared prefix lists its matches;
     // an exact id wins over a longer one it prefixes.
     assert!(refused(&web, "captain.dismiss", json!({"id": "no-such-ask"})).contains("no-such-ask"));
-    send(&apps, json!({"id":"same-1","from":"apps","to":"captain","kind":"request","body":"one"}));
-    send(&web, json!({"id":"same-12","from":"web","to":"captain","kind":"request","body":"two"}));
+    send(
+        &apps,
+        json!({"id":"same-1","from":"apps","to":"captain","kind":"request","body":"one"}),
+    );
+    send(
+        &web,
+        json!({"id":"same-12","from":"web","to":"captain","kind":"request","body":"two"}),
+    );
     let ambiguous = refused(&web, "captain.dismiss", json!({"id": "same-"}));
     assert!(
         ambiguous.contains("same-1 (apps)") && ambiguous.contains("same-12 (web)"),
         "{ambiguous}"
     );
     let exact = machine.json(&web, "captain.dismiss", json!({"id": "same-1"}));
-    assert_eq!((exact["id"].as_str(), exact["ship"].as_str()), (Some("same-1"), Some("apps")));
+    assert_eq!(
+        (exact["id"].as_str(), exact["ship"].as_str()),
+        (Some("same-1"), Some("apps"))
+    );
     let unique = machine.json(&apps, "captain.dismiss", json!({"id": "same-"}));
     assert_eq!(unique["id"], "same-12", "{unique}");
 
     // Only the operator answers or dismisses for the captain.
-    let open = send(&apps, json!({"from":"apps","to":"captain","kind":"request","body":"Merge?"}));
+    let open = send(
+        &apps,
+        json!({"from":"apps","to":"captain","kind":"request","body":"Merge?"}),
+    );
     for command in ["captain.reply", "captain.dismiss"] {
-        let out = machine.as_agent(&apps, "apps", command, json!({"id": open["id"], "body": "x"}));
+        let out = machine.as_agent(
+            &apps,
+            "apps",
+            command,
+            json!({"id": open["id"], "body": "x"}),
+        );
         assert!(!out.status.success());
-        assert!(stderr(&out).contains("operator command"), "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("operator command"),
+            "{}",
+            stderr(&out)
+        );
     }
 
     // The human CLI takes a prefix too.
@@ -1596,7 +1628,10 @@ fn the_captain_replies_to_and_dismisses_asks_in_any_home_by_id_or_unique_prefix(
     assert!(out.contains("Dismissed") && out.contains(open_id), "{out}");
     let request = machine.json(&apps, "mail.show", json!({"id": open_id}));
     assert_eq!(request["end_reason"], "not needed", "{request}");
-    let again = send(&apps, json!({"from":"apps","to":"captain","kind":"request","body":"Tag it?"}));
+    let again = send(
+        &apps,
+        json!({"from":"apps","to":"captain","kind":"request","body":"Tag it?"}),
+    );
     let again_id = again["id"].as_str().unwrap();
     let out = machine.ok(&web, &["reply", &again_id[..8], "Yes"]);
     assert!(out.contains("Sent reply to apps"), "{out}");

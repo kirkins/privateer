@@ -251,7 +251,11 @@ fn locate(query: &str, notices: bool) -> Result<Item> {
             let shown: Vec<_> = ids.into_iter().take(MATCHES_SHOWN).collect();
             bail!(
                 "{query} names {} open captain items; give more of the id: {}",
-                if n > MATCHES_SHOWN { format!("more than {MATCHES_SHOWN}") } else { n.to_string() },
+                if n > MATCHES_SHOWN {
+                    format!("more than {MATCHES_SHOWN}")
+                } else {
+                    n.to_string()
+                },
                 shown.join(", ")
             )
         }

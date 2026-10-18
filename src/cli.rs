@@ -744,6 +744,8 @@ with you, record it on the request: `captain.relay {{"request":"<request id>",
 "source":"<id of the captain's message to you>","body":"<the answer>"}}`. The
 reply keeps the captain's own words and says you relayed it. Relay only what
 the captain actually said; production deployment approvals are never relayed.
+The captain can close an item without answering it with `/dismiss ID [reason]`
+(`captain.dismiss`, theirs alone); you cannot dismiss for them.
 
 ## Onboarding the captain
 
@@ -1792,11 +1794,8 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             if address == crate::mail::CAPTAIN
                 && local.as_ref().map_or(true, |m| m["state"] == "open")
             {
-                let sent = crate::dispatch(
-                    &mut store,
-                    "captain.reply",
-                    json!({"id": id, "body": body}),
-                )?;
+                let sent =
+                    crate::dispatch(&mut store, "captain.reply", json!({"id": id, "body": body}))?;
                 println!(
                     "Sent reply to {} ({}).",
                     sent["to"].as_str().unwrap_or(""),
@@ -1819,9 +1818,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             println!("Sent {kind} to {}.", message["from"].as_str().unwrap_or(""));
         }
         "dismiss" => {
-            let id = p
-                .first()
-                .context("usage: privateer dismiss ID [REASON]")?;
+            let id = p.first().context("usage: privateer dismiss ID [REASON]")?;
             let note = p[1..].join(" ");
             let closed = crate::dispatch(
                 &mut store,

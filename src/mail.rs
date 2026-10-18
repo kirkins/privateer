@@ -489,7 +489,10 @@ pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
     ensure!(note.len() <= 2000, "dismissal note exceeds 2000 bytes");
     let tx = store.write_transaction()?;
     let item = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
-    ensure!(item["to"] == CAPTAIN, "{id} is not addressed to the captain");
+    ensure!(
+        item["to"] == CAPTAIN,
+        "{id} is not addressed to the captain"
+    );
     let now = Store::now_ms();
     let mut peer = None;
     match item["kind"].as_str() {
@@ -525,7 +528,10 @@ pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
                 params![id, notice, now, note],
             )?;
         }
-        other => bail!("{id} is a {}, which the captain cannot dismiss", other.unwrap_or("message")),
+        other => bail!(
+            "{id} is a {}, which the captain cannot dismiss",
+            other.unwrap_or("message")
+        ),
     }
     store.audit("captain.dismiss", &json!({"id": id, "note": note}))?;
     tx.commit()?;
@@ -540,7 +546,10 @@ pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
     if let Some(peer) = peer.as_deref() {
         flush_pending(store, 1, false, None, Some(peer))?;
     }
-    Ok(annotate(by_id(store, id)?.context("message vanished")?, Store::now_ms()))
+    Ok(annotate(
+        by_id(store, id)?.context("message vanished")?,
+        Store::now_ms(),
+    ))
 }
 
 /// A task's terminal state, not its current owner, ends its linked requests.
