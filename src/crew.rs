@@ -323,6 +323,9 @@ fn answer(store: &Store, args: &Value) -> Result<Value> {
 const MAX_PARKS: u64 = 6;
 const MAX_ELAPSED_SECS: u64 = 86_400;
 const NEXT_CHARS: usize = 300;
+/// How long a resume's launch may take before recovery stops waiting for its
+/// claimer: the longest workspace wait, and a generous margin.
+const LAUNCH_BOUND_MS: i64 = (crate::jobs::DEFAULT_MAX_WAIT_SECS as i64 + 900) * 1000;
 
 /// The crew job itself, then the crew jobs its resumes replaced, oldest last.
 /// A child started by any of them belongs to this crew.
@@ -657,11 +660,7 @@ pub(crate) fn settled(store: &mut Store, child: &str) -> Result<()> {
         if owns && matches!(status.as_str(), "launching" | "running") {
             continue;
         }
-        let claimed = store.connection().execute(
-            "UPDATE crew_parks SET state='resuming', updated_ms=?2 WHERE id=?1 AND state='parked'",
-            params![park, Store::now_ms()],
-        )?;
-        if claimed == 0 {
+        if !claim(store, &park, "parked")? {
             continue;
         }
         if !(owns && status == "parked") {
@@ -802,8 +801,10 @@ fn spent_cap_for_park(store: &Store, park: &str) -> Result<Option<String>> {
 
 /// A park whose resume was recorded `resuming`. The resumed job settles the
 /// park as resumed once it is no longer queued. A resume whose job never
-/// landed (the process died mid-launch) is retried once under its own id, and
-/// fails the crew with a notice if that does not land either.
+/// landed is left alone while its claimer still runs and is within a launch's
+/// time; once the claimer is gone (it died mid-launch) or overdue, the resume
+/// is retried once under its own id, and fails the crew with a notice if that
+/// does not land either.
 fn recover_resuming(store: &mut Store) -> Result<()> {
     let rows: Vec<(String, String, String, i64)> = {
         let mut stmt = store.connection().prepare(
@@ -841,6 +842,9 @@ fn recover_resuming(store: &mut Store) -> Result<()> {
             .optional()?;
         match status.as_deref() {
             Some("queued" | "starting") => {}
+            // Its claimer has not written the job yet: it may be waiting for
+            // a workspace inside agent.start.
+            None if launch_in_flight(store, &park)? => {}
             Some(_) => {
                 set_state(store, &park, "resumed")?;
                 crate::jobs::finish_resumed(store, &crew, &id)?;
@@ -871,6 +875,34 @@ fn recover_resuming(store: &mut Store) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Claim a park's resume for this process: `resuming`, with this process
+/// recorded as its claimer, only if the park is still in `from`. False when
+/// another claimed it first.
+fn claim(store: &Store, park: &str, from: &str) -> Result<bool> {
+    let claimed = store.connection().execute(
+        "UPDATE crew_parks SET state='resuming', claimer=?3, updated_ms=?4
+           WHERE id=?1 AND state=?2",
+        params![park, from, crate::jobs::own_identity()?, Store::now_ms()],
+    )?;
+    Ok(claimed == 1)
+}
+
+/// Whether a `resuming` park's launch may still be in flight: the process
+/// that claimed it is still running, and the claim is younger than a launch
+/// can take (it may wait for a workspace, up to its queue wait).
+fn launch_in_flight(store: &Store, park: &str) -> Result<bool> {
+    let (claimer, updated_ms): (Option<String>, i64) = store.connection().query_row(
+        "SELECT claimer, updated_ms FROM crew_parks WHERE id=?1",
+        [park],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let Some(claimer) = claimer else {
+        return Ok(false);
+    };
+    let young = Store::now_ms() - updated_ms < LAUNCH_BOUND_MS;
+    Ok(young && crate::jobs::identity_alive(&claimer)?)
 }
 
 fn set_state(store: &Store, park: &str, state: &str) -> Result<()> {
@@ -1008,9 +1040,17 @@ fn launch_resume(
              Your last actions before the park, from your log:\n{last}"
         ));
     }
+    // This process launches it, so it is the claimer recovery checks.
     store.connection().execute(
-        "UPDATE crew_parks SET attempt=?2, updated_ms=?3, retries=retries+?4 WHERE id=?1",
-        params![park, attempt, Store::now_ms(), i64::from(retry)],
+        "UPDATE crew_parks SET attempt=?2, updated_ms=?3, retries=retries+?4, claimer=?5
+           WHERE id=?1",
+        params![
+            park,
+            attempt,
+            Store::now_ms(),
+            i64::from(retry),
+            crate::jobs::own_identity()?
+        ],
     )?;
     // A resume is the runtime's own launch: a crew's agent caller would not
     // be allowed to set the budget it carries, nor would the first mate.
@@ -1078,11 +1118,7 @@ fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
     ensure!(!held.is_empty(), "task {task} has no held crew to resume");
     let mut resumed = vec![];
     for (park, crew) in held {
-        let claimed = store.connection().execute(
-            "UPDATE crew_parks SET state='resuming', updated_ms=?2 WHERE id=?1 AND state='held'",
-            params![park, Store::now_ms()],
-        )?;
-        if claimed == 0 {
+        if !claim(store, &park, "held")? {
             continue;
         }
         resume(

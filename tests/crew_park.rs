@@ -202,6 +202,28 @@ esac
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
+    /// Wait until a crew has opened its park. The park is open while the
+    /// crew's payload ends its turn (the park grace), before its job reads
+    /// `parked`, so this does not spend that grace.
+    fn wait_park(&self, crew: &str) {
+        let until = Instant::now() + std::time::Duration::from_secs(60);
+        while !self.json(None, "job.status", json!({"id": crew}))["park"].is_string() {
+            assert!(Instant::now() < until, "{crew} never parked");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    /// A column of a crew's park row.
+    fn park_field(&self, crew: &str, column: &str) -> rusqlite::types::Value {
+        let conn =
+            rusqlite::Connection::open(self.root.join("engineering/.privateer/privateer.sqlite"))
+                .unwrap();
+        conn.query_row(
+            &format!("SELECT {column} FROM crew_parks WHERE crew_job_id=?1"),
+            [crew],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
     fn steps(&self) -> String {
         fs::read_to_string(self.root.join("steps.log")).unwrap_or_default()
     }
@@ -539,13 +561,7 @@ fn a_heavy_job_that_ends_after_the_crew_deadline_resumes_without_a_duplicate() {
     // The crew starts a 6 second job at 3 seconds. Its 8 second budget runs
     // out while the job is still going, so it parks, and the job ends after
     // the crew's deadline.
-    // The park is open while the crew's payload ends its turn (the park grace),
-    // so wait for the park itself, not for the job's parked status.
-    let until = Instant::now() + std::time::Duration::from_secs(60);
-    while !f.json(None, "job.status", json!({"id": "crew-12"}))["park"].is_string() {
-        assert!(Instant::now() < until, "crew-12 never parked");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    f.wait_park("crew-12");
     let refused = f.run(
         Some("engineering"),
         &[
@@ -683,15 +699,94 @@ fn a_resume_stuck_in_resuming_is_retried_once_under_its_own_id() {
     )
     .unwrap();
     start_crew(&f, "crew-23");
-    f.wait("crew-23", &["parked"]);
-    f.wait("child-1", &["succeeded"]);
-    // The launch of attempt 1 died before its job was recorded.
+    f.wait_park("crew-23");
+    // The launch of attempt 1 died before its job was recorded. This is set
+    // while the child still runs, so its settlement (which resumes only a
+    // `parked` park) launches nothing, and no job exists under that id.
     f.set_park("crew-23", "resuming", 1, 0);
+    f.wait("child-1", &["succeeded"]);
+    assert!(
+        f.run(
+            None,
+            &[
+                "job.status",
+                "--json",
+                r#"{"id":"crew-resume-park-crew-23-1-1"}"#
+            ]
+        )
+        .status
+        .code()
+            != Some(0),
+        "the resume was launched before recovery"
+    );
     f.service("start");
     f.wait("crew-resume-park-crew-23-1-1", &["succeeded"]);
     f.wait("crew-23", &["resumed"]);
     f.service("stop");
+    // Recovery retried it once, under the same id.
+    assert_eq!(
+        f.park_field("crew-23", "retries"),
+        rusqlite::types::Value::Integer(1)
+    );
     assert_eq!(f.launches().len(), 2, "{:?}", f.launches());
+}
+
+/// A resume whose launch is still in flight (its claimer, the child's
+/// supervisor, waits on the workspace lock inside agent.start, before the
+/// resume job is recorded) is left alone by recovery: no retry and no failure,
+/// and the crew resumes once when the launch lands.
+#[test]
+fn recovery_leaves_a_resume_whose_launch_is_still_in_flight() {
+    let f = Fleet::new();
+    f.set_mode("slow");
+    let home = f.root.join("engineering/.privateer");
+    fs::write(
+        home.join("config.json"),
+        json!({"ship": "engineering", "resource_home": f.root.join("ledger")}).to_string(),
+    )
+    .unwrap();
+    start_crew(&f, "crew-28");
+    f.wait_park("crew-28");
+    // Hold the workspace lock, so the resume's launch blocks inside agent.start.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home.join("workspace.lock"))
+        .unwrap();
+    use std::os::fd::AsRawFd;
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    f.service("start");
+    f.wait("child-1", &["succeeded"]);
+    let until = Instant::now() + std::time::Duration::from_secs(30);
+    while f.park_field("crew-28", "state") != rusqlite::types::Value::Text("resuming".into()) {
+        assert!(Instant::now() < until, "the resume was never claimed");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Several dispatcher passes (one every 2 s) see it resuming with no job.
+    std::thread::sleep(std::time::Duration::from_secs(9));
+    assert_eq!(
+        f.park_field("crew-28", "retries"),
+        rusqlite::types::Value::Integer(0),
+        "recovery retried a launch that was still in flight"
+    );
+    drop(lock);
+    f.wait("crew-resume-park-crew-28-1-1", &["succeeded"]);
+    let crew = f.wait("crew-28", &["resumed"]);
+    f.service("stop");
+    assert_eq!(crew["reason"], "resumed as crew-resume-park-crew-28-1-1");
+    assert_eq!(
+        f.park_field("crew-28", "retries"),
+        rusqlite::types::Value::Integer(0)
+    );
+    assert_eq!(f.launches().len(), 2, "{:?}", f.launches());
+    let notices = f.ship_notices();
+    assert!(
+        !notices
+            .iter()
+            .any(|b| b.contains("crew-28") && b.to_lowercase().contains("fail")),
+        "the first mate was told of a failure: {notices:?}"
+    );
 }
 
 /// A resume that does not start even after its retry fails the crew, with a
@@ -707,7 +802,7 @@ fn a_resume_that_does_not_start_after_its_retry_fails_the_crew() {
     )
     .unwrap();
     start_crew(&f, "crew-24");
-    f.wait("crew-24", &["parked"]);
+    f.wait_park("crew-24");
     // Mark the park `resuming` while the child still runs. Once the child
     // settles, its settlement hook resumes only a `parked` park, so the resume
     // is not launched behind the test's back.

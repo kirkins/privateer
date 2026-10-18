@@ -32,7 +32,7 @@ const LOG_SEGMENT: usize = (LOG_LIMIT - LOG_HEAD) / 2;
 /// left under the limit holds the truncation marker.
 const TAIL_FULL: usize = 2 * LOG_SEGMENT - 256;
 const START_GRACE_MS: i64 = 30_000;
-const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
+pub(crate) const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
 const QUEUE_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +326,18 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);",
     )?;
+    // The process that claimed a park's resume, so recovery leaves a launch
+    // that is still in flight alone (added after the table first shipped).
+    let claimer: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_parks') WHERE name='claimer')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !claimer {
+        store
+            .connection()
+            .execute_batch("ALTER TABLE crew_parks ADD COLUMN claimer TEXT")?;
+    }
     Ok(())
 }
 fn valid_id(id: &str) -> bool {
@@ -1181,6 +1193,17 @@ fn identity(pid: u32) -> Result<Option<Process>> {
 /// that was reused for another process has a different identity.
 pub(crate) fn process_identity(pid: u32) -> Result<Option<String>> {
     Ok(identity(pid)?.filter(|p| !p.zombie).map(|p| p.started))
+}
+
+/// This process's identity, recorded with a claim another process may check.
+pub(crate) fn own_identity() -> Result<String> {
+    let me = identity(std::process::id())?.context("cannot identify this process")?;
+    Ok(serde_json::to_string(&me)?)
+}
+/// Whether the process an `own_identity` record names is still running. One
+/// in another PID namespace counts as running, since it cannot be checked.
+pub(crate) fn identity_alive(recorded: &str) -> Result<bool> {
+    same_process(&serde_json::from_str(recorded)?)
 }
 
 /// The PID namespace this process sees PID numbers in; constant for its life.
