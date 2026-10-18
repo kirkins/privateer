@@ -1007,7 +1007,12 @@ pub(crate) fn send_copy(store: &Store, args: &Value, operator: bool) -> Result<V
 fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
-        "message exceeds 64 KiB"
+        "message exceeds 64 KiB{}",
+        if args["payload"]["report"]["content"].is_string() {
+            "; put a report this large with report.put and send payload.report {report_id}"
+        } else {
+            ""
+        }
     );
     let from = required(args, "from")?;
     let to = required(args, "to")?;
@@ -1129,6 +1134,8 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         );
     }
     hands_step(kind, to, &payload)?;
+    crate::report::check_report(store, from, to, &mut payload)?;
+    crate::report::check_annotations(from, kind, &payload)?;
     ensure!(
         !body.is_empty() || payload.as_object().is_some_and(|p| !p.is_empty()),
         "a message needs a body or a payload"

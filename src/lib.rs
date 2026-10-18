@@ -38,6 +38,7 @@ mod profile;
 pub mod project;
 pub mod releases;
 mod reply;
+pub mod report;
 pub mod routes;
 pub mod scheduling;
 pub mod service;
@@ -96,6 +97,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "captain.feed",
     "ship.profile",
     "fleet.snapshot",
+    "report.get",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
@@ -155,6 +157,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "grant" => grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
+        "report" => report::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
         "ship" if command == "ship.move" => moves::dispatch(store, command, args),
         "ship" if command == "ship.profile" => {
