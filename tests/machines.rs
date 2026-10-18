@@ -4725,17 +4725,19 @@ fn the_activity_list_pages_across_reached_machine_and_after_time_keeps_reached()
     let _ = conn_l.execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
     let _ = conn_m.execute("DELETE FROM sqlite_sequence WHERE name='audit';", []);
 
+    // Real millisecond times, so cursors are as long as they are in use.
+    const T0: i64 = 1_760_802_000_000;
     conn_l
         .execute(
             "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
-            rusqlite::params![100, "laptop.event1", r#"{"ship":"liaison"}"#],
+            rusqlite::params![T0 + 100, "laptop.event1", r#"{"ship":"liaison"}"#],
         )
         .unwrap();
     conn_m
         .execute(
             "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
             rusqlite::params![
-                200,
+                T0 + 200,
                 "mac.event1",
                 r#"{"ship":"fitforge","secret_token":"leak123","error":"Bearer leaktoken456"}"#
             ],
@@ -4744,13 +4746,13 @@ fn the_activity_list_pages_across_reached_machine_and_after_time_keeps_reached()
     conn_l
         .execute(
             "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
-            rusqlite::params![300, "laptop.event2", r#"{"ship":"liaison"}"#],
+            rusqlite::params![T0 + 300, "laptop.event2", r#"{"ship":"liaison"}"#],
         )
         .unwrap();
     conn_m
         .execute(
             "INSERT INTO audit(time_ms, kind, payload) VALUES (?1, ?2, ?3)",
-            rusqlite::params![400, "mac.event2", r#"{"ship":"fitforge"}"#],
+            rusqlite::params![T0 + 400, "mac.event2", r#"{"ship":"fitforge"}"#],
         )
         .unwrap();
 
@@ -4782,8 +4784,20 @@ fn the_activity_list_pages_across_reached_machine_and_after_time_keeps_reached()
     // Every entry has a valid cursor
     for page in &pages {
         let e = &page["entries"][0];
-        assert!(e["cursor"].as_str().unwrap().starts_with("a1."));
+        let cursor = e["cursor"].as_str().unwrap();
+        assert!(
+            cursor.starts_with("a1.") && !cursor.contains('•'),
+            "{cursor}"
+        );
     }
+    // Resuming from the last entry, a remote one, returns nothing newer.
+    let tail = laptop.ok_over(
+        "liaison",
+        "activity.list",
+        json!({"after": pages[3]["entries"][0]["cursor"]}),
+        &remote,
+    );
+    assert_eq!(tail["entries"], json!([]), "{tail}");
 
     // Remote entry was masked on this side:
     let mac_detail = &pages[1]["entries"][0]["detail"];
@@ -4797,7 +4811,12 @@ fn the_activity_list_pages_across_reached_machine_and_after_time_keeps_reached()
     );
 
     // 2. after as a time with a reached machine keeps it reached:
-    let after_time = laptop.ok_over("liaison", "activity.list", json!({"after": 150}), &remote);
+    let after_time = laptop.ok_over(
+        "liaison",
+        "activity.list",
+        json!({"after": T0 + 150}),
+        &remote,
+    );
     let machines = after_time["machines"].as_array().unwrap();
     let mac_entry = machines.iter().find(|m| m["name"] == "mac").unwrap();
     assert_eq!(mac_entry["reached"], true, "{after_time}");
@@ -4806,9 +4825,9 @@ fn the_activity_list_pages_across_reached_machine_and_after_time_keeps_reached()
     let after_entries = after_time["entries"].as_array().unwrap();
     assert_eq!(after_entries.len(), 3, "{after_time}");
     assert_eq!(after_entries[0]["kind"], "mac.event1");
-    assert_eq!(after_entries[0]["at_ms"], 200);
+    assert_eq!(after_entries[0]["at_ms"], T0 + 200);
     assert_eq!(after_entries[1]["kind"], "laptop.event2");
-    assert_eq!(after_entries[1]["at_ms"], 300);
+    assert_eq!(after_entries[1]["at_ms"], T0 + 300);
     assert_eq!(after_entries[2]["kind"], "mac.event2");
-    assert_eq!(after_entries[2]["at_ms"], 400);
+    assert_eq!(after_entries[2]["at_ms"], T0 + 400);
 }
