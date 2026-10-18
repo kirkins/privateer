@@ -22,6 +22,7 @@ pub const VERBS: &[&str] = &[
     "tell",
     "inbox",
     "reply",
+    "dismiss",
     "wakes",
     "project",
     "start",
@@ -1785,7 +1786,25 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         "reply" => {
             let id = p.first().context("usage: privateer reply ID TEXT")?;
             let body = text(p, 1, "privateer reply ID TEXT")?;
-            let message = crate::dispatch(&mut store, "mail.show", json!({"id": id}))?;
+            let local = crate::dispatch(&mut store, "mail.show", json!({"id": id}));
+            // The captain answers an open ask in whichever home asked it, by
+            // its id or a unique prefix of it.
+            if address == crate::mail::CAPTAIN
+                && local.as_ref().map_or(true, |m| m["state"] == "open")
+            {
+                let sent = crate::dispatch(
+                    &mut store,
+                    "captain.reply",
+                    json!({"id": id, "body": body}),
+                )?;
+                println!(
+                    "Sent reply to {} ({}).",
+                    sent["to"].as_str().unwrap_or(""),
+                    sent["id"].as_str().unwrap_or("")
+                );
+                return Ok(());
+            }
+            let message = local?;
             let kind = if message["state"] == "open" {
                 "reply"
             } else {
@@ -1798,6 +1817,22 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     "correlation": id, "body": body}),
             )?;
             println!("Sent {kind} to {}.", message["from"].as_str().unwrap_or(""));
+        }
+        "dismiss" => {
+            let id = p
+                .first()
+                .context("usage: privateer dismiss ID [REASON]")?;
+            let note = p[1..].join(" ");
+            let closed = crate::dispatch(
+                &mut store,
+                "captain.dismiss",
+                json!({"id": id, "note": note}),
+            )?;
+            println!(
+                "Dismissed {} from {} without an answer.",
+                closed["id"].as_str().unwrap_or(""),
+                closed["ship"].as_str().unwrap_or("")
+            );
         }
         "backlog" => {
             let ship = crate::presence::folder_ship(&store)

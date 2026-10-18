@@ -193,6 +193,118 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
     bail!("no open captain request {request_id} in the fleet")
 }
 
+/// How many ids an ambiguous prefix lists.
+const MATCHES_SHOWN: usize = 10;
+
+/// One open captain item, found in the fleet home that holds it.
+struct Item {
+    ship: String,
+    home: PathBuf,
+    id: String,
+}
+
+/// The open captain item `query` names, in any fleet home on this machine: an
+/// exact id, or else a prefix that names exactly one item (as people quote the
+/// first characters `/waiting` shows). Asks only, or notices too.
+fn locate(query: &str, notices: bool) -> Result<Item> {
+    identifier(query)?;
+    let kinds = if notices {
+        "('request','decision','notice')"
+    } else {
+        "('request','decision')"
+    };
+    let mut found: Vec<Item> = vec![];
+    for (ship, home) in fleet()? {
+        let store = Store::open(&home)?;
+        let mut statement = store.connection().prepare(&format!(
+            "SELECT id FROM mail WHERE recipient=?1 AND kind IN {kinds}
+               AND (state='open' OR (kind='notice' AND state IS NULL))
+               AND substr(id,1,length(?2))=?2
+             ORDER BY seq LIMIT ?3"
+        ))?;
+        let ids = statement
+            .query_map(
+                params![crate::mail::CAPTAIN, query, MATCHES_SHOWN as i64 + 1],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        found.extend(ids.into_iter().map(|id| Item {
+            ship: ship.clone(),
+            home: home.clone(),
+            id,
+        }));
+    }
+    if let Some(at) = found.iter().position(|item| item.id == query) {
+        return Ok(found.swap_remove(at));
+    }
+    // One ask may be held in two homes (a desk copy): it is still one item.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|item| seen.insert(item.id.clone()));
+    let ids: Vec<String> = found
+        .iter()
+        .map(|item| format!("{} ({})", item.id, item.ship))
+        .collect();
+    match ids.len() {
+        0 => bail!("no open captain item {query} in the fleet"),
+        1 => Ok(found.swap_remove(0)),
+        n => {
+            let shown: Vec<_> = ids.into_iter().take(MATCHES_SHOWN).collect();
+            bail!(
+                "{query} names {} open captain items; give more of the id: {}",
+                if n > MATCHES_SHOWN { format!("more than {MATCHES_SHOWN}") } else { n.to_string() },
+                shown.join(", ")
+            )
+        }
+    }
+}
+
+fn operator(store: &Store) -> Result<()> {
+    ensure!(
+        *store.caller() == Caller::Operator,
+        "only the captain answers or dismisses what waits on the captain"
+    );
+    Ok(())
+}
+
+/// The captain answers an open ask by id, in whichever home asked it. A ship
+/// behind a machine link is answered through that link, as any captain reply
+/// from this home is. A typed decision's answer is checked by `mail.send`.
+fn reply(store: &Store, args: &Value) -> Result<Value> {
+    operator(store)?;
+    let item = locate(required(args, "id")?, false)?;
+    let mut target = Store::open(&item.home)?;
+    let ask = crate::mail::find(&target, &item.id)?.context("ask vanished")?;
+    ensure!(
+        ask["request_kind"] != "production_approval",
+        "{} is a production approval; answer it with approval.grant or approval.deny",
+        item.id
+    );
+    let mut message = json!({"from": crate::mail::CAPTAIN, "to": ask["from"],
+        "kind": "reply", "correlation": item.id});
+    for key in ["body", "payload"] {
+        if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
+            message[key] = value.clone();
+        }
+    }
+    let sent = crate::dispatch(&mut target, "mail.send", message)?;
+    let record = json!({"id": item.id, "ship": item.ship, "to": ask["from"], "reply": sent["id"]});
+    target.audit("captain.reply", &record)?;
+    Ok(json!({"id": item.id, "ship": item.ship, "to": ask["from"], "reply": sent}))
+}
+
+/// The captain ends one item without answering it, in whichever home holds it.
+fn dismiss(store: &Store, args: &Value) -> Result<Value> {
+    operator(store)?;
+    let note = match args.get("note").filter(|v| !v.is_null()) {
+        Some(note) => note.as_str().context("note must be a string")?,
+        None => "",
+    };
+    let item = locate(required(args, "id")?, true)?;
+    let target = Store::open(&item.home)?;
+    let mail = crate::mail::dismiss(&target, &item.id, note)?;
+    Ok(json!({"id": item.id, "ship": item.ship, "state": mail["state"], "mail": mail}))
+}
+
 pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value> {
     match command {
         "captain.waiting" => {
@@ -200,6 +312,8 @@ pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value>
             waiting()
         }
         "captain.relay" => relay(store, &_args),
+        "captain.reply" => reply(store, &_args),
+        "captain.dismiss" => dismiss(store, &_args),
         _ => bail!("unknown captain command {command}"),
     }
 }

@@ -44,6 +44,7 @@ HELP = (
     "/status — what each ship is doing, from records (wakes no one)\n"
     "/ships — the fleet's ships and what they handle\n"
     "/waiting — questions and decisions still waiting on you\n"
+    "/dismiss ID [reason] — close one without answering (the first characters of its id are enough)\n"
     "/yolo on|off|status — tool approval mode for every first mate\n"
     "/stow [status|resume] [machine] — checkpoint this machine and hold new jobs, e.g. before an update; a linked machine's name stows that machine, and `/stow resume all` lifts every linked machine first\n"
     "/afk [until 8am] [instructions] — away: hold mail, only emergencies 🚨 get through\n"
@@ -65,6 +66,7 @@ COMMANDS = [
     {"command": "held", "description": "What was held while you were away"},
     {"command": "ships", "description": "The fleet's ships"},
     {"command": "waiting", "description": "What is waiting on you"},
+    {"command": "dismiss", "description": "Close one item without answering"},
     {"command": "voice", "description": "Toggle spoken messages"},
     {"command": "help", "description": "How this works"},
 ]
@@ -506,6 +508,8 @@ class Door:
                 self.cmd_ships()
             elif name == "waiting":
                 self.cmd_waiting()
+            elif name == "dismiss":
+                self.cmd_dismiss(rest, msg_id)
             elif name == "yolo":
                 if rest not in ("", "status", "on", "off"):
                     self.say("Usage: /yolo on|off|status", reply_to=msg_id)
@@ -691,6 +695,19 @@ class Door:
             lines.append(f"• <b>{tg.escape_html(ship['name'])}</b>{tag} — {scope}")
         lines.append(f"\nPlain messages go to {tg.escape_html(self.recipient() or 'nobody yet')}.")
         self.say("\n".join(lines), html=True)
+
+    def cmd_dismiss(self, rest: str, msg_id) -> None:
+        ident, _, note = rest.partition(" ")
+        if not ident:
+            self.say("Usage: /dismiss ID [reason]", reply_to=msg_id)
+            return
+        closed = self.runtime.call("dismiss", {"id": ident, "note": note.strip()})
+        full = closed.get("id") or ident
+        # Its card, if this door showed one, stops offering answers.
+        if full in tg.read_state(CARDS, {}):
+            self.resolve(full, note.strip() or "dismissed")
+        self.say(f"Dismissed {full} from {closed.get('ship', 'its ship')} without an answer.",
+                 reply_to=msg_id)
 
     def cmd_waiting(self) -> None:
         listed = self.runtime.call("waiting")

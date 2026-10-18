@@ -348,6 +348,13 @@ fn observe(
                 }
                 item["correlation"] = json!(id);
                 item["created_ms"] = message["created_ms"].clone();
+                // The mail it is, to sort by and to join with captain.waiting.
+                item["mail_id"] = json!(id);
+                item["mail_kind"] = message["kind"].clone();
+                item["urgency"] = message["urgency"].clone();
+                item["deadline_ms"] = message["deadline_ms"].clone();
+                item["asked_ms"] = message["created_ms"].clone();
+                item["needs_hands"] = json!(payload.get("needs_hands").is_some());
             }
             "job" => {
                 let raw: String =
