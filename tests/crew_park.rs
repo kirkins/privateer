@@ -23,31 +23,37 @@ impl Fleet {
         fs::create_dir(root.join("bin")).unwrap();
         fs::create_dir(root.join("engineering")).unwrap();
         let fleet = Self { _tmp: tmp, root };
-        // The fake claude. Its mode file picks the child's length and whether
-        // the crew announces a session. A resume run carries --resume.
+        // The fake claude. Its mode file picks what the crew does: park on a
+        // child (session, nosession, long), start a child and run out its
+        // budget (deadline), or run out with nothing outstanding (held). A
+        // resumed run is recognised by its job id, and completes its turn.
         let script = format!(
             r#"#!/bin/sh
 ROOT='{root}'
 BIN='{bin}'
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
-case "$*" in
-  *--resume*|*"resuming crew work"*|*"heavy job has settled"*)
-    # A resumed run completes its turn, as the harness reports it.
+case "$PRIVATEER_JOB" in
+  crew-resume-*)
     printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
     printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"{session}"}}\n'
     exit 0 ;;
 esac
-if [ "$(cat "$ROOT/mode" 2>/dev/null)" != nosession ]; then
+MODE=$(cat "$ROOT/mode" 2>/dev/null)
+if [ "$MODE" != nosession ]; then
   printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
 fi
-if [ "$(cat "$ROOT/mode" 2>/dev/null)" = long ]; then
-  child='sleep 60'
-else
-  child='sleep 2; echo built'
-fi
-"$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
-"$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
-sleep 60
+case "$MODE" in
+  held) sleep 60 ;;
+  deadline)
+    "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 30"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
+    sleep 60 ;;
+  *)
+    child='sleep 2; echo built'
+    if [ "$MODE" = long ]; then child='sleep 60'; fi
+    "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
+    "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
+    sleep 60 ;;
+esac
 "#,
             root = fleet.root.display(),
             bin = BIN,
@@ -80,6 +86,15 @@ sleep 60
     }
     fn set_mode(&self, mode: &str) {
         fs::write(self.root.join("mode"), mode).unwrap();
+    }
+    /// Give the ship's charter an 8 second job budget, so a crew's budget runs
+    /// out while its heavy job still runs.
+    fn short_budget(&self) {
+        self.json(
+            None,
+            "charter.put",
+            json!({"id": "engineering", "job_timeout_secs": 8}),
+        );
     }
     fn command(&self, agent: Option<&str>, args: &[&str]) -> Command {
         let mut c = support::command(BIN);
@@ -258,4 +273,109 @@ fn cancelling_a_parked_crew_cancels_its_job_and_does_not_resume() {
     f.wait("child-1", &["cancelled"]);
     std::thread::sleep(std::time::Duration::from_millis(500));
     assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+}
+
+/// The crew's budget runs out while its heavy job still runs: the crew parks
+/// on that job instead of timing out, and the job's outcome (which ends after
+/// the crew's deadline) resumes it. The first mate hears nothing of the child.
+#[test]
+fn a_crew_that_runs_out_of_budget_parks_on_its_job_and_resumes() {
+    let f = Fleet::new();
+    f.set_mode("deadline");
+    f.short_budget();
+    start_crew(&f, "crew-4");
+    // The resume can follow at once, so the park may already be past.
+    let parked = f.wait("crew-4", &["parked", "resumed"]);
+    assert_eq!(parked["park"], "park-crew-4-1", "{parked}");
+    f.wait("crew-resume-park-crew-4-1-1", &["succeeded"]);
+    let resumed = f.wait("crew-4", &["resumed"]);
+    assert_eq!(resumed["reason"], "resumed as crew-resume-park-crew-4-1-1");
+    let launches = f.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert!(
+        launches[1].contains(&format!("--resume {SESSION}")),
+        "{launches:?}"
+    );
+    assert!(
+        launches[1].contains("Job child-1 timed_out"),
+        "{launches:?}"
+    );
+    let notices = f.ship_notices();
+    assert!(
+        !notices.iter().any(|b| b.contains("Crew job child-1")),
+        "the first mate must not hear the child's outcome: {notices:?}"
+    );
+}
+
+/// A crew at its budget with no heavy job outstanding is held. Its first mate
+/// sees it in bearings, and resumes it with crew.resume; a second resume finds
+/// nothing held.
+#[test]
+fn a_crew_with_no_job_outstanding_is_held_until_its_first_mate_resumes_it() {
+    let f = Fleet::new();
+    f.set_mode("held");
+    f.short_budget();
+    start_crew(&f, "crew-5");
+    f.wait("crew-5", &["parked"]);
+    let bearings = f.json(None, "ship.bearings", json!({"ship": "engineering"}));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("Crew crew-5 is held"),
+        "{bearings}"
+    );
+    let resumed = f.json(None, "crew.resume", json!({"task_id": "fix"}));
+    assert_eq!(resumed["resumed"][0]["park"], "park-crew-5-1", "{resumed}");
+    f.wait("crew-resume-park-crew-5-1-1", &["succeeded"]);
+    f.wait("crew-5", &["resumed"]);
+    let launches = f.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert!(
+        launches[1].contains(&format!("--resume {SESSION}")),
+        "{launches:?}"
+    );
+    let again = f.run(
+        None,
+        &[
+            "crew.resume",
+            "--json",
+            &json!({"task_id": "fix"}).to_string(),
+        ],
+    );
+    assert!(!again.status.success(), "a second resume found a held crew");
+}
+
+/// A task with a crew parked on its heavy job takes no second launch unless
+/// the launch replaces it, which cancels the crew and the job it waits on.
+#[test]
+fn a_launch_on_a_task_with_a_parked_crew_is_refused_unless_it_replaces_it() {
+    let f = Fleet::new();
+    f.set_mode("long");
+    start_crew(&f, "crew-6");
+    f.wait("crew-6", &["parked"]);
+    let refused = f.run(
+        Some("engineering"),
+        &[
+            "agent.start",
+            "--json",
+            &json!({"task_id": "fix", "id": "crew-7", "manifest": "bundled:claude"}).to_string(),
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a second crew launched beside a parked one"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("parked crew"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-8", "manifest": "bundled:claude", "replace": true}),
+    );
+    f.wait("crew-6", &["cancelled"]);
+    f.wait("child-1", &["cancelled"]);
 }

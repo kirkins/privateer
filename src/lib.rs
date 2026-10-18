@@ -167,13 +167,6 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let mut args = args;
-            // The crew run time a resume continues from is the runtime's to
-            // set: an agent or any other caller cannot reset a crew's budget.
-            let run_ms = args.as_object_mut().unwrap().remove("_run_ms");
-            let run_ms = match (store.caller(), run_ms) {
-                (Caller::Operator, Some(run_ms)) => run_ms.as_u64().unwrap_or(0),
-                _ => 0,
-            };
             let task = args
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -181,6 +174,29 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .to_owned();
             let charter = store.authorize(&task, "spawn")?;
             let owner = store.task(&task)?["owner"].clone();
+            // A task with a crew parked on a heavy job (or held) is not launched
+            // over: a second crew would run beside it. `replace` cancels it first.
+            let replace = match args.as_object_mut().unwrap().remove("replace") {
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("replace must be boolean"))?,
+                None => false,
+            };
+            if !workspace::is_wake(store, &args)? {
+                let parked = crew::parked_crews(store, &task)?;
+                if !parked.is_empty() {
+                    if replace {
+                        for crew_job in &parked {
+                            jobs::cancel_crew(store, crew_job)?;
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "task {task} has a parked crew ({}); it resumes when its heavy job settles, or crew.resume if it is held. Pass replace:true to cancel it and the jobs it waits on instead",
+                            parked.join(", ")
+                        );
+                    }
+                }
+            }
             // Plan against the task checkout; first-mate wakes have a durable
             // wake row and keep their existing ship repository.
             args.as_object_mut().unwrap().remove("_workspace_lease_id");
@@ -417,7 +433,6 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false)),
                 });
             }
-            job["run_ms"] = serde_json::json!(run_ms);
             let mut started = jobs::start_agent(store, job)?;
             if viewed {
                 // Presentation only: a refused space never stops the crew.

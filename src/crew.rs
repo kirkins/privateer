@@ -357,7 +357,8 @@ pub(crate) fn may_park(store: &Store) -> bool {
         Caller::Agent { actor } => actor.as_str(),
         Caller::Operator => return false,
     };
-    job["agent_actor"] == actor
+    job["action"] == "spawn"
+        && job["agent_actor"] == actor
         && job["hosted"] != json!(true)
         && matches!(job["status"].as_str(), Some("launching" | "running"))
         && !wake_job(store, &crew).unwrap_or(true)
@@ -422,9 +423,7 @@ fn settlement_text(store: &Store, job: &Value) -> String {
 }
 
 /// `crew.park`: a running crew ends its turn to wait on a heavy job it
-/// started, instead of polling. The job's outcome resumes the crew. The park
-/// record is written in the same transaction as the crew's park mark, after
-/// checking the child is still unfinished.
+/// started, instead of polling. The job's outcome resumes the crew.
 fn park(store: &Store, args: &Value) -> Result<Value> {
     let Caller::Agent { actor } = store.caller() else {
         bail!("crew.park is for crew, which run as their ship's agent");
@@ -441,12 +440,8 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
     );
     let job = crate::jobs::record(store, &crew)?;
     ensure!(
-        job["agent_actor"] == actor.as_str(),
+        job["action"] == "spawn" && job["agent_actor"] == actor.as_str(),
         "job {crew} is not crew of {actor}"
-    );
-    ensure!(
-        !wake_job(store, &crew)?,
-        "a first mate's own session cannot park"
     );
     ensure!(
         job["hosted"] != json!(true),
@@ -456,6 +451,10 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
         matches!(job["status"].as_str(), Some("launching" | "running")),
         "job {crew} is not running"
     );
+    ensure!(
+        !wake_job(store, &crew)?,
+        "a first mate's own session cannot park"
+    );
     let chain = lineage(store, &crew)?;
     let child_record = crate::jobs::record(store, child)?;
     ensure!(
@@ -464,8 +463,71 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
             .is_some_and(|parent| chain.iter().any(|c| c == parent)),
         "job {child} is not work that crew {crew} started"
     );
+    let park = open_park(store, &job, child, next, "parked")?;
+    Ok(json!({"id": park, "state": "parked", "job_id": crew, "child_job_id": child}))
+}
+
+/// The crew's budget ran out (see `supervise_inner`). A crew with an
+/// unfinished heavy job parks on it; a crew with none is held for its first
+/// mate to resume with `crew.resume`. `None` when it cannot park, in which
+/// case the job times out as before.
+pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<String>> {
+    let job = crate::jobs::record(store, crew)?;
+    // Only a crew (a spawned agent job) parks; an agent's own build does not.
+    if job["action"] != "spawn"
+        || job["agent_actor"].is_null()
+        || job["hosted"] == json!(true)
+        || !matches!(job["status"].as_str(), Some("launching" | "running"))
+        || wake_job(store, crew)?
+    {
+        return Ok(None);
+    }
+    let chain = lineage(store, crew)?;
+    let mut waiting = None;
+    for member in &chain {
+        let child: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT id FROM jobs WHERE json_extract(record,'$.started_by')=?1
+                   AND json_extract(record,'$.status') IN ('starting','queued','launching','running')
+                 ORDER BY json_extract(record,'$.created_ms') LIMIT 1",
+                [member],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if child.is_some() {
+            waiting = child;
+            break;
+        }
+    }
+    let parked = match &waiting {
+        Some(child) => (
+            child.as_str(),
+            "parked",
+            format!("its time budget ran out while job {child} runs"),
+        ),
+        None => (
+            "",
+            "held",
+            "its time budget ran out with no heavy job outstanding".to_owned(),
+        ),
+    };
+    // A cap that is spent leaves the job to time out as it always did.
+    Ok(open_park(store, &job, parked.0, &parked.2, parked.1).ok())
+}
+
+/// Open a park on `child` (empty for a held crew), in one transaction with
+/// the crew's own record: the crew is marked parked on it, and its ship is
+/// told: quietly for a park, and as a normal notice for a held crew.
+fn open_park(store: &Store, job: &Value, child: &str, next: &str, state: &str) -> Result<String> {
+    let crew = job["id"].as_str().context("crew job id")?.to_owned();
+    let actor = job["agent_actor"]
+        .as_str()
+        .context("crew agent")?
+        .to_owned();
     let task = job["task_id"].as_str().context("job task")?.to_owned();
     let charter = store.authorize(&task, "spawn")?;
+    let chain = lineage(store, &crew)?;
     let root = chain.last().context("crew lineage")?.clone();
     let root_record = crate::jobs::record(store, &root)?;
     let max_parks = charter
@@ -482,23 +544,33 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
         elapsed_ms <= (max_elapsed as i64).saturating_mul(1000),
         "crew {root} has run for more than {max_elapsed} seconds in total; it cannot park again"
     );
-    // The native session is read when the crew resumes, from its complete log:
-    // the park has stopped the payload, and its output was captured by then.
     let harness = job["launch"]["manifest"]
         .as_str()
         .and_then(crate::bundled::harness);
     let tx = store.write_transaction()?;
-    let child_status: String = tx.query_row(
+    if !child.is_empty() {
+        let child_status: String = tx.query_row(
+            "SELECT json_extract(record,'$.status') FROM jobs WHERE id=?1",
+            [child],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            matches!(
+                child_status.as_str(),
+                "starting" | "queued" | "launching" | "running"
+            ),
+            "job {child} already {child_status}; read its outcome instead of parking"
+        );
+    }
+    // Still the same running crew, checked again inside the transaction.
+    let crew_status: String = tx.query_row(
         "SELECT json_extract(record,'$.status') FROM jobs WHERE id=?1",
-        [child],
+        [&crew],
         |r| r.get(0),
     )?;
     ensure!(
-        matches!(
-            child_status.as_str(),
-            "starting" | "queued" | "launching" | "running"
-        ),
-        "job {child} already {child_status}; read its outcome instead of parking"
+        matches!(crew_status.as_str(), "launching" | "running"),
+        "job {crew} is {crew_status}, not running"
     );
     let parks: i64 = tx.query_row(
         "SELECT COUNT(*) FROM crew_parks WHERE root=?1",
@@ -513,18 +585,9 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
     tx.execute(
         "INSERT INTO crew_parks(id, root, crew_job_id, child_job_id, task_id, ship, state,
            next, harness, session, attempt, created_ms, updated_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'parked', ?7, ?8, ?9, 0, ?10, ?10)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 0, ?10, ?10)",
         params![
-            park_id,
-            root,
-            crew,
-            child,
-            task,
-            actor,
-            next,
-            harness,
-            Option::<String>::None,
-            now
+            park_id, root, crew, child, task, actor, state, next, harness, now
         ],
     )?;
     // Mark the crew parked in its own record, in this transaction.
@@ -535,14 +598,23 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
         "UPDATE jobs SET record=?2 WHERE id=?1",
         params![crew, record.to_string()],
     )?;
-    record_crew(
-        &tx,
-        &json!({"id": format!("crew-park-{park_id}"), "to": actor, "kind": "notice",
-            "task_id": task, "urgency": "low",
-            "body": format!("Crew job {crew} parked on job {child} and will resume when it settles. Next: {next}")}),
-    )?;
+    if state == "held" {
+        record_crew(
+            &tx,
+            &json!({"id": format!("crew-held-{park_id}"), "to": actor, "kind": "notice",
+                "task_id": task, "urgency": "normal",
+                "body": format!("Crew job {crew} is held: {next}. Resume it with crew.resume {{\"task_id\":\"{task}\"}}.")}),
+        )?;
+    } else {
+        record_crew(
+            &tx,
+            &json!({"id": format!("crew-park-{park_id}"), "to": actor, "kind": "notice",
+                "task_id": task, "urgency": "low",
+                "body": format!("Crew job {crew} parked on job {child} and will resume when it settles. Next: {next}")}),
+        )?;
+    }
     tx.commit()?;
-    Ok(json!({"id": park_id, "state": "parked", "job_id": crew, "child_job_id": child}))
+    Ok(park_id)
 }
 
 /// Called when a job reaches its final state: if a crew is parked on it, the
@@ -587,7 +659,13 @@ pub(crate) fn settled(store: &mut Store, child: &str) -> Result<()> {
             set_state(store, &park, "cancelled")?;
             continue;
         }
-        resume(store, &park, &crew, &job)?;
+        resume(
+            store,
+            &park,
+            &crew,
+            "Your heavy job has settled; its outcome:",
+            &settlement_text(store, &job),
+        )?;
     }
     Ok(())
 }
@@ -662,12 +740,13 @@ pub(crate) fn cancel_park(store: &Store, park: &str) -> Result<Option<String>> {
     Ok(child)
 }
 
-/// Resume a crew whose heavy job settled: a new launch through agent.start,
-/// so admission, the stow hold and the current routes all apply. The native
-/// session resumes when the route is the same harness; otherwise a fresh crew
-/// starts with the park's next step and the job's outcome as its handoff.
-fn resume(store: &mut Store, park: &str, crew: &str, child: &Value) -> Result<()> {
-    let row = store.connection().query_row(
+/// Resume a parked or held crew: a new launch through agent.start, so
+/// admission, the stow hold and the current routes all apply. The native
+/// session resumes when the launch still names the harness that wrote it;
+/// otherwise a fresh crew starts with the park's next step as its handoff.
+/// The launch runs as the runtime, so the budget carried over is kept.
+fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &str) -> Result<()> {
+    let (task, next, harness, attempt) = store.connection().query_row(
         "SELECT task_id, next, harness, attempt FROM crew_parks WHERE id=?1",
         [park],
         |r| {
@@ -679,14 +758,13 @@ fn resume(store: &mut Store, park: &str, crew: &str, child: &Value) -> Result<()
             ))
         },
     )?;
-    let (task, next, harness, attempt) = row;
     let attempt = attempt + 1;
     let crew_record = crate::jobs::record(store, crew)?;
     let launch = crew_record["launch"].clone();
-    let manifest = launch["manifest"].as_str().map(str::to_owned);
+    let launch_harness = launch["manifest"]
+        .as_str()
+        .and_then(crate::bundled::harness);
     let id = format!("crew-resume-{park}-{attempt}");
-    let settled = settlement_text(store, child);
-    let launch_harness = manifest.as_deref().and_then(crate::bundled::harness);
     // The native session the crew reported starting, from its complete log,
     // when the launch still names the same harness.
     let logs = store
@@ -702,13 +780,9 @@ fn resume(store: &mut Store, park: &str, crew: &str, child: &Value) -> Result<()
         None => None,
     };
     let same_session = session.is_some() && launch_harness == harness;
-    // The launch's own settings come back as they were given; the run time
-    // so far is what the resumed crew's budget continues from.
-    let mut args = json!({
-        "id": id,
-        "task_id": task,
-        "_run_ms": crew_record["run_ms"].as_u64().unwrap_or(0),
-    });
+    // The launch's own settings come back as they were given. The resumed
+    // crew gets a fresh budget; the parks and the elapsed cap bound the total.
+    let mut args = json!({"id": id, "task_id": task});
     for key in [
         "heavy",
         "manifest",
@@ -725,23 +799,22 @@ fn resume(store: &mut Store, park: &str, crew: &str, child: &Value) -> Result<()
         // The resumed session already holds the brief and its earlier turns.
         args["options"]["resume"] = json!(session);
         args["wake_only"] = json!(true);
-        args["wake"] = json!(format!(
-            "Your heavy job has settled; its outcome:\n{settled}\nContinue your task."
-        ));
+        args["wake"] = json!(format!("{lead}\n{settlement}\nContinue your task."));
     } else {
-        let logs = store
-            .home()
-            .join("jobs")
-            .join(crew)
-            .join(crew_record["incarnation"].as_str().unwrap_or_default());
         let last = tail(&logs.join("stdout.log"), 2 * TAIL_BYTES);
         args["wake"] = json!(format!(
             "You are resuming crew work after parking. Your next step was: {next}\n\
-             Its heavy job settled; its outcome:\n{settled}\n\
+             {lead}\n{settlement}\n\
              Your last actions before the park, from your log:\n{last}"
         ));
     }
-    match crate::dispatch(store, "agent.start", args) {
+    // A resume is the runtime's own launch: a crew's agent caller would not
+    // be allowed to set the budget it carries, nor would the first mate.
+    let caller = store.caller().clone();
+    store.set_caller(Caller::Operator);
+    let started = crate::dispatch(store, "agent.start", args);
+    store.set_caller(caller);
+    match started {
         Ok(started) => {
             store.connection().execute(
                 "UPDATE crew_parks SET state='resumed', resumed_job_id=?2, attempt=?3,
@@ -768,9 +841,100 @@ fn resume(store: &mut Store, park: &str, crew: &str, child: &Value) -> Result<()
     Ok(())
 }
 
+/// `crew.resume {"task_id":...}`: the task's first mate (or the operator)
+/// resumes its held crews, those whose budget ran out with no heavy job
+/// outstanding.
+fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
+    let task = required(args, "task_id")?.to_owned();
+    let owner = store.task(&task)?["owner"]
+        .as_str()
+        .context("task owner missing")?
+        .to_owned();
+    if let Caller::Agent { actor } = store.caller() {
+        ensure!(
+            actor == &owner,
+            "{actor} can resume only the crews of its own tasks"
+        );
+    }
+    let held: Vec<(String, String)> = {
+        let mut stmt = store.connection().prepare(
+            "SELECT p.id, p.crew_job_id FROM crew_parks p JOIN jobs j ON j.id=p.crew_job_id
+               WHERE p.task_id=?1 AND p.state='held' AND json_extract(j.record,'$.status')='parked'",
+        )?;
+        let rows = stmt.query_map([&task], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    ensure!(!held.is_empty(), "task {task} has no held crew to resume");
+    let mut resumed = vec![];
+    for (park, crew) in held {
+        let claimed = store.connection().execute(
+            "UPDATE crew_parks SET state='resuming', updated_ms=?2 WHERE id=?1 AND state='held'",
+            params![park, Store::now_ms()],
+        )?;
+        if claimed == 0 {
+            continue;
+        }
+        resume(
+            store,
+            &park,
+            &crew,
+            "Your crew was held at its time budget with no heavy job outstanding, and its first mate resumed it.",
+            "Continue your task from your last actions below.",
+        )?;
+        resumed.push(json!({"park": park, "crew_job_id": crew}));
+    }
+    Ok(json!({"task_id": task, "resumed": resumed}))
+}
+
+/// Crews of a ship that are parked on a heavy job or held, for bearings.
+pub(crate) fn parked_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
+    let mut stmt = store.connection().prepare(
+        "SELECT p.crew_job_id, p.child_job_id, p.next, p.state, p.task_id FROM crew_parks p
+           JOIN jobs j ON j.id=p.crew_job_id
+           WHERE p.ship=?1 AND p.state IN ('parked','held') AND json_extract(j.record,'$.status')='parked'
+           ORDER BY p.created_ms LIMIT 20",
+    )?;
+    let rows = stmt.query_map([ship], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut lines = vec![];
+    for row in rows {
+        let (crew, child, next, state, task) = row?;
+        lines.push(if state == "held" {
+            format!(
+                "Crew {crew} is held at its time budget with no heavy job outstanding; crew.resume {{\"task_id\":\"{task}\"}} continues it."
+            )
+        } else {
+            format!(
+                "Crew {crew} is parked on job {child} and resumes when it settles. Next: {}",
+                clip(&next, NEXT_CHARS)
+            )
+        });
+    }
+    Ok(lines)
+}
+
+/// The crews of a task that are parked or held: a launch on the task waits
+/// for them, unless it replaces them.
+pub(crate) fn parked_crews(store: &Store, task: &str) -> Result<Vec<String>> {
+    let mut stmt = store.connection().prepare(
+        "SELECT p.crew_job_id FROM crew_parks p JOIN jobs j ON j.id=p.crew_job_id
+           WHERE p.task_id=?1 AND p.state IN ('parked','held') AND json_extract(j.record,'$.status')='parked'",
+    )?;
+    let rows = stmt.query_map([task], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "crew.park" => park(store, &args),
+        "crew.resume" => resume_held(store, &args),
         "crew.report" => report(store, &args),
         "crew.answer" => answer(store, &args),
         _ => bail!("unknown crew command {command}"),
