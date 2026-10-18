@@ -1226,13 +1226,13 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     let held = claim();
     let write = |c: &Value| fs::write(&claim_path, c.to_string()).unwrap();
     let mut earlier = held.clone();
-    earlier["boot"] = json!("00000000-0000-0000-0000-000000000000");
+    earlier["owner"]["boot"] = json!("00000000-0000-0000-0000-000000000000");
     let mut moved = held.clone();
     for name in ["registry", "guard", "live"] {
         moved[name][0] = json!(moved[name][0].as_u64().unwrap().wrapping_add(1));
     }
     let mut legacy = moved.clone();
-    legacy.as_object_mut().unwrap().remove("boot");
+    legacy["owner"].as_object_mut().unwrap().remove("boot");
     for stale in [&earlier, &legacy] {
         write(stale);
         let error = tick(&apps)["bridge"]["error"].clone();
@@ -1241,11 +1241,11 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     }
     // A live claim from before boots were recorded learns this boot.
     let mut unstamped = held.clone();
-    unstamped.as_object_mut().unwrap().remove("boot");
+    unstamped["owner"].as_object_mut().unwrap().remove("boot");
     write(&unstamped);
     assert_eq!(tick(&apps)["bridge"]["status"], "live");
-    assert_eq!(claim()["boot"], held["boot"]);
-    assert!(held["boot"].is_string());
+    assert_eq!(claim()["owner"]["boot"], held["owner"]["boot"]);
+    assert!(held["owner"]["boot"].is_string());
     herdr.dashboards.lock().unwrap()[1].stop();
     // Within one boot a renumbered device is still a replaced scope.
     write(&moved);
@@ -1260,7 +1260,7 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
         assert_eq!(herdr.calls("workspace.create").len(), creates);
         let now = claim();
         assert_ne!(now["token"], held["token"]);
-        assert_eq!(now["boot"], held["boot"]);
+        assert_eq!(now["owner"]["boot"], held["owner"]["boot"]);
         assert_eq!(now["live"], held["live"]);
         assert_eq!(now["adopted"], false);
     }

@@ -29,6 +29,13 @@ struct Owner {
     directory: (u64, u64),
     origin: String,
     ship: String,
+    // The kernel boot that wrote this claim. No lease outlives a reboot, and
+    // device numbers need not survive one (btrfs subvolumes, APFS volumes).
+    // Absent on claims written before boots were recorded. Kept on the owner,
+    // which older binaries read without refusing unknown fields, so a claim
+    // stamped here never wedges an older release.
+    #[serde(default)]
+    boot: Option<String>,
 }
 impl Owner {
     fn read(store: &Store) -> Result<Self> {
@@ -52,6 +59,7 @@ impl Owner {
             },
             origin,
             ship,
+            boot: boot(),
         })
     }
     fn validate(&self) -> Result<()> {
@@ -89,11 +97,6 @@ struct Claim {
     adopted: bool,
     failures: i64,
     retry_ms: i64,
-    // The kernel boot that wrote this claim. No lease outlives a reboot, and
-    // device numbers need not survive one (btrfs subvolumes, APFS volumes).
-    // Absent on claims written before boots were recorded.
-    #[serde(default)]
-    boot: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -275,7 +278,7 @@ impl Coordination {
             uuid::Uuid::parse_str(&claim.token).is_ok(),
             "bridge claim scope changed"
         );
-        if let (Some(then), Some(now)) = (&claim.boot, boot())
+        if let (Some(then), Some(now)) = (&claim.owner.boot, boot())
             && *then != now
         {
             return Ok(None);
@@ -288,7 +291,7 @@ impl Coordination {
         // before boots were recorded proves an earlier boot only when every
         // file kept its inode on one renumbered device.
         ensure!(
-            claim.boot.is_none()
+            claim.owner.boot.is_none()
                 && renumbered(claim.registry, self.registry)
                 && renumbered(claim.guard, guard)
                 && identity(&self.dir.join("live")).is_ok_and(|live| renumbered(claim.live, live)),
@@ -357,10 +360,10 @@ pub(crate) fn maintain(store: &Store) -> Result<Value> {
     // boots were recorded, so the next reboot retires the claim, not wedges it.
     if let Some(claim) = previous
         .as_mut()
-        .filter(|c| !free && c.adopted && c.boot.is_none())
+        .filter(|c| !free && c.adopted && c.owner.boot.is_none())
     {
-        claim.boot = boot();
-        if claim.boot.is_some() {
+        claim.owner.boot = boot();
+        if claim.owner.boot.is_some() {
             coord.save(claim)?;
         }
     }
@@ -443,7 +446,6 @@ pub(crate) fn maintain(store: &Store) -> Result<Value> {
         adopted: false,
         failures,
         retry_ms: Store::now_ms() + super::delay(failures),
-        boot: boot(),
     };
     // Durable backoff also covers missing/unreachable Herdr, before host I/O.
     // Replacing this token fences delayed dashboard adoption under the guard.
