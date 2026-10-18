@@ -42,6 +42,7 @@ use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use std::cell::OnceCell;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::os::fd::AsRawFd;
@@ -1380,6 +1381,7 @@ fn remove(name: &str) -> Result<Value> {
 fn collect_now(name: Option<&str>) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     let mut out = vec![];
+    let carried = OnceCell::new();
     for machine in machines(&conn)?
         .into_iter()
         .filter(|m| m.role == "collects" && name.is_none_or(|n| n == m.name))
@@ -1388,6 +1390,7 @@ fn collect_now(name: Option<&str>) -> Result<Value> {
             &conn,
             &machine,
             Duration::from_millis(LINK_TIMEOUT_MS),
+            &carried,
         )?);
     }
     Ok(json!({"collected": out}))
@@ -1432,8 +1435,15 @@ fn refresh(name: Option<&str>) -> Result<Value> {
 }
 
 /// Collect mail waiting on a machine this one reaches, deliver it into the
-/// homes here, and acknowledge what was delivered or refused.
-fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Value> {
+/// homes here, and acknowledge what was delivered or refused. `carried` is
+/// this machine's own snapshot section, read once per contact pass by the
+/// first collect that carries it.
+fn collect(
+    conn: &Connection,
+    machine: &Machine,
+    timeout: Duration,
+    carried: &OnceCell<Option<Value>>,
+) -> Result<Value> {
     let known_as = machine
         .known_as
         .as_deref()
@@ -1443,8 +1453,8 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
     let mut args = with_stows(json!({"machine": known_as, "captain": captain}), conn);
     // This machine's own snapshot section rides along, so the machine it
     // reaches can show it: links are one way and that one cannot ask.
-    if let Some(section) = crate::snapshot::carried(conn) {
-        args["snapshot"] = section;
+    if let Some(section) = carried.get_or_init(|| crate::snapshot::carried(conn)) {
+        args["snapshot"] = section.clone();
     }
     let result = call(machine, "fleet.collect", args, Some(timeout))?;
     // What the peer reports about its stows travels with the mail: a request
@@ -1898,6 +1908,7 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             return Ok(vec![]);
         }
         let mut out = vec![];
+        let carried = OnceCell::new();
         for machine in reaching {
             let lock_path = path.with_file_name(format!("{}.lock", peer_name(&machine.name)));
             let lock = fs::OpenOptions::new()
@@ -1933,7 +1944,7 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
                 Err(error) if format!("{error:#}").contains("timed out") => Err(error),
                 _ => Ok(()),
             }
-            .and_then(|()| collect(&conn, &machine, timeout))
+            .and_then(|()| collect(&conn, &machine, timeout, &carried))
             .and_then(|collected| match desk(&conn)? {
                 Some((name, since)) if name == machine.name => {
                     let pushed = push_captain(&conn, &machine, since, timeout)?;
@@ -2050,8 +2061,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 &machine.name,
                 args.get("stows").unwrap_or(&Value::Null),
             )?;
+            // Best effort: a section that cannot be kept never stops the mail.
             if let Some(carried) = args.get("snapshot") {
-                crate::snapshot::absorb_carried(&conn, &machine.name, carried)?;
+                let _ = crate::snapshot::absorb_carried(&conn, &machine.name, carried);
             }
             // Mail to the captain from before the link stays here.
             let linked_ms: i64 = conn.query_row(

@@ -3958,6 +3958,23 @@ fn the_snapshot_reads_a_reached_machine_and_keeps_its_last_section_when_it_is_do
     assert_eq!(stale["as_of_ms"], row["as_of_ms"]);
     assert_eq!(stale["actions"], json!([]));
 
+    // A since naming the mac's changed_ms skips its ships and routes, never
+    // its needs: what waits on the captain is always returned in full.
+    let since = json!({"since": {"mac": row["changed_ms"]}});
+    let quiet = laptop.ok_over("liaison", "fleet.snapshot", since.clone(), &down);
+    let row_quiet = machine_row(&quiet, "mac");
+    assert_eq!(row_quiet["unchanged"], true, "{quiet}");
+    assert!(row_quiet.get("routes").is_none(), "{quiet}");
+    assert!(ships_on(&quiet, "mac").is_empty(), "{quiet}");
+    assert!(
+        quiet["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["mail_id"] == asked["id"] && n["actions"] == json!([])),
+        "{quiet}"
+    );
+
     // Once the captain answers the desk copy here, the cached need is gone.
     laptop.pass("liaison", &remote);
     laptop.ok(
@@ -3974,6 +3991,47 @@ fn the_snapshot_reads_a_reached_machine_and_keeps_its_last_section_when_it_is_do
             .iter()
             .any(|n| n["mail_id"] == asked["id"]),
         "{answered}"
+    );
+    // The mac's changed_ms has not moved, yet with since the need is gone too.
+    let answered_since = laptop.ok_over("liaison", "fleet.snapshot", since, &down);
+    assert_eq!(
+        machine_row(&answered_since, "mac")["unchanged"],
+        true,
+        "{answered_since}"
+    );
+    assert!(
+        !answered_since["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["mail_id"] == asked["id"]),
+        "{answered_since}"
+    );
+
+    // A home here that cannot be read for answers is named, not taken as
+    // an all-clear; the home that holds the answer still hides the need.
+    laptop.ship("spare");
+    let locker =
+        rusqlite::Connection::open(laptop.folder("spare").join(".privateer/privateer.sqlite"))
+            .unwrap();
+    locker
+        .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    let locked = laptop.ok_over("liaison", "fleet.snapshot", json!({}), &down);
+    locker.execute_batch("ROLLBACK;").unwrap();
+    drop(locker);
+    let unknown = machine_row(&locked, "laptop")["unknown"]
+        .as_array()
+        .unwrap();
+    assert!(unknown.contains(&json!("answered:spare")), "{locked}");
+    assert!(!unknown.contains(&json!("answered:liaison")), "{locked}");
+    assert!(
+        !locked["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["mail_id"] == asked["id"]),
+        "{locked}"
     );
 
     // Removing the link forgets the cached section.
@@ -4013,6 +4071,74 @@ fn a_reaching_machine_carries_its_section_on_collect_to_the_machine_it_reaches()
     assert_eq!(liaison.len(), 1, "{after}");
     assert_eq!(liaison[0]["name"], "liaison");
     assert_eq!(liaison[0]["presence"], "absent", "{after}");
+}
+
+#[test]
+fn a_carried_section_the_reached_machine_cannot_keep_never_stops_the_mail() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    // The mac's registry refuses to keep any section about the laptop.
+    rusqlite::Connection::open(mac.registry())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_laptop BEFORE INSERT ON fleet_snapshots
+             WHEN NEW.machine = 'laptop' BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+    let waiting = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "liaison", "kind": "notice", "body": "Built 9"}),
+    );
+    assert_eq!(waiting["delivery"], "pending", "{waiting}");
+
+    let collected = collect_as(&laptop, "liaison", &remote_ssh(&mac));
+    assert_eq!(collected["collected"][0]["delivered"], 1, "{collected}");
+    let notices = messages(&laptop, "liaison", "notice");
+    assert!(
+        notices.iter().any(|m| m["body"] == "Built 9"),
+        "{notices:?}"
+    );
+    // Nothing was kept: the mac still knows the laptop from its directory.
+    let snapshot = mac.ok("fitforge", "fleet.snapshot", json!({}));
+    assert_eq!(
+        machine_row(&snapshot, "laptop")["via"],
+        "directory",
+        "{snapshot}"
+    );
+}
+
+#[test]
+fn a_section_carried_under_a_name_that_does_not_reach_this_machine_is_refused() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let section = json!({"as_of_ms": 1, "changed_ms": 1,
+        "section": {"machine": {"name": "ghost"}, "ships": [{"name": "fake"}], "needs": []}});
+    let refused = mac.gateway(
+        "fleet.collect",
+        json!({"machine": "ghost", "captain": true, "snapshot": section}),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    let kept: i64 = rusqlite::Connection::open(mac.registry())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM fleet_snapshots WHERE machine='ghost'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 0, "nothing carried was kept");
+    let snapshot = mac.ok("fitforge", "fleet.snapshot", json!({}));
+    assert!(
+        !snapshot["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "fake"),
+        "{snapshot}"
+    );
 }
 
 #[test]

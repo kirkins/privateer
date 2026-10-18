@@ -35,8 +35,17 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS fleet_snapshots(machine TEXT PRIMARY KEY,
            digest TEXT NOT NULL, changed_ms INTEGER NOT NULL, as_of_ms INTEGER NOT NULL,
-           via TEXT NOT NULL, body TEXT NOT NULL);",
+           via TEXT NOT NULL, body TEXT NOT NULL, received_ms INTEGER);",
     )?;
+    // A table made before the receive time was kept lacks the column; a
+    // concurrent open adding it first is the same outcome.
+    if !column(conn, "fleet_snapshots", "received_ms")?
+        && let Err(error) =
+            conn.execute_batch("ALTER TABLE fleet_snapshots ADD COLUMN received_ms INTEGER")
+        && !error.to_string().contains("duplicate column name")
+    {
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -44,71 +53,85 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
 #[derive(Clone, Debug)]
 pub(crate) struct Stored {
     pub changed_ms: i64,
+    /// When the section was read, on the clock of the machine that read it.
     pub as_of_ms: i64,
+    /// When this registry recorded it, on this machine's clock: reuse and
+    /// freshness are judged by it, never by another machine's clock. None
+    /// for a row stored before it was kept.
+    pub received_ms: Option<i64>,
     pub via: String,
     pub section: Value,
 }
 
 fn stored(conn: &Connection, machine: &str) -> Result<Option<Stored>> {
-    let row: Option<(i64, i64, String, String)> = conn
+    let row: Option<(i64, i64, Option<i64>, String, String)> = conn
         .query_row(
-            "SELECT changed_ms, as_of_ms, via, body FROM fleet_snapshots WHERE machine=?1",
+            "SELECT changed_ms, as_of_ms, received_ms, via, body FROM fleet_snapshots
+             WHERE machine=?1",
             [machine],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
     // A body that does not parse reads as never read.
-    Ok(row.and_then(|(changed_ms, as_of_ms, via, body)| {
-        serde_json::from_str(&body).ok().map(|section| Stored {
-            changed_ms,
-            as_of_ms,
-            via,
-            section,
-        })
-    }))
+    Ok(
+        row.and_then(|(changed_ms, as_of_ms, received_ms, via, body)| {
+            serde_json::from_str(&body).ok().map(|section| Stored {
+                changed_ms,
+                as_of_ms,
+                received_ms,
+                via,
+                section,
+            })
+        }),
+    )
 }
 
-/// This machine's own section, recorded: `changed_ms` moves only when the
-/// content does, never backwards, and a read older than the stored one
-/// changes nothing (a concurrent call already wrote a later one).
+/// This machine's own section, recorded and returned as just read:
+/// `changed_ms` moves only when the content does, and never backwards, even
+/// when the clock steps back. Each read replaces the stored one in its write
+/// transaction; nothing is ordered by the clock, so a step back never freezes
+/// the stored section. Two reads racing may store the older one, a change
+/// with its own `changed_ms` that the next read replaces.
 fn record_own(conn: &Connection, machine: &str, section: &Value, now: i64) -> Result<Stored> {
     let digest = crate::core::hash(section);
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let previous: Option<(String, i64, i64)> = tx
+    let previous: Option<(String, i64)> = tx
         .query_row(
-            "SELECT digest, changed_ms, as_of_ms FROM fleet_snapshots WHERE machine=?1",
+            "SELECT digest, changed_ms FROM fleet_snapshots WHERE machine=?1",
             [machine],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     let changed_ms = match &previous {
-        Some((_, _, as_of)) if *as_of >= now => {
-            drop(tx);
-            return stored(conn, machine)?.context("snapshot row vanished");
-        }
-        Some((old, changed, _)) if *old == digest => *changed,
-        Some((_, changed, _)) => now.max(changed + 1),
+        Some((old, changed)) if *old == digest => *changed,
+        Some((_, changed)) => now.max(changed + 1),
         None => now,
     };
     tx.execute(
-        "INSERT INTO fleet_snapshots(machine, digest, changed_ms, as_of_ms, via, body)
-         VALUES(?1, ?2, ?3, ?4, 'direct', ?5)
+        "INSERT INTO fleet_snapshots(machine, digest, changed_ms, as_of_ms, via, body, received_ms)
+         VALUES(?1, ?2, ?3, ?4, 'direct', ?5, ?4)
          ON CONFLICT(machine) DO UPDATE SET digest=excluded.digest, changed_ms=excluded.changed_ms,
-           as_of_ms=excluded.as_of_ms, via=excluded.via, body=excluded.body",
+           as_of_ms=excluded.as_of_ms, via=excluded.via, body=excluded.body,
+           received_ms=excluded.received_ms",
         params![machine, digest, changed_ms, now, section.to_string()],
     )?;
     tx.commit()?;
     Ok(Stored {
         changed_ms,
         as_of_ms: now,
+        received_ms: Some(now),
         via: "direct".into(),
         section: section.clone(),
     })
 }
 
-/// A section another machine read about itself. It keeps that machine's
-/// `changed_ms`; only a read newer than the stored one replaces it. A reply
-/// without a section (unchanged since the stored one) only dates it.
+/// A section another machine read about itself, received here at
+/// `received_ms` on this clock. It keeps that machine's `changed_ms` and
+/// replaces the stored one: the last received wins, so neither clock's steps
+/// can hold an old section in place. A reply without a section (unchanged
+/// since the stored one) only dates it, when the stored one is still that
+/// `changed_ms`. Returns what to show: the section just received, or the
+/// stored one it confirmed; None when it confirmed nothing stored.
 fn record_remote(
     conn: &Connection,
     machine: &str,
@@ -116,47 +139,51 @@ fn record_remote(
     as_of_ms: i64,
     changed_ms: i64,
     section: Option<&Value>,
-) -> Result<()> {
+    received_ms: i64,
+) -> Result<Option<Stored>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let previous: Option<i64> = tx
-        .query_row(
-            "SELECT as_of_ms FROM fleet_snapshots WHERE machine=?1",
-            [machine],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if previous.is_some_and(|at| at >= as_of_ms) {
-        return Ok(());
-    }
     match section {
         Some(section) => {
             let body = section.to_string();
             ensure!(body.len() <= SECTION_BYTES, "section exceeds its bound");
             tx.execute(
-                "INSERT INTO fleet_snapshots(machine, digest, changed_ms, as_of_ms, via, body)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO fleet_snapshots(machine, digest, changed_ms, as_of_ms, via, body,
+                   received_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(machine) DO UPDATE SET digest=excluded.digest,
                    changed_ms=excluded.changed_ms, as_of_ms=excluded.as_of_ms,
-                   via=excluded.via, body=excluded.body",
+                   via=excluded.via, body=excluded.body, received_ms=excluded.received_ms",
                 params![
                     machine,
                     crate::core::hash(section),
                     changed_ms,
                     as_of_ms,
                     via,
-                    body
+                    body,
+                    received_ms
                 ],
             )?;
         }
         None => {
             tx.execute(
-                "UPDATE fleet_snapshots SET as_of_ms=?2, via=?3 WHERE machine=?1 AND changed_ms=?4",
-                params![machine, as_of_ms, via, changed_ms],
+                "UPDATE fleet_snapshots SET as_of_ms=?2, via=?3, received_ms=?5
+                 WHERE machine=?1 AND changed_ms=?4",
+                params![machine, as_of_ms, via, changed_ms, received_ms],
             )?;
         }
     }
+    let shown = match section {
+        Some(section) => Some(Stored {
+            changed_ms,
+            as_of_ms,
+            received_ms: Some(received_ms),
+            via: via.to_owned(),
+            section: section.clone(),
+        }),
+        None => stored(&tx, machine)?.filter(|s| s.changed_ms == changed_ms),
+    };
     tx.commit()?;
-    Ok(())
+    Ok(shown)
 }
 
 pub(crate) fn forget(conn: &Connection, machine: &str) -> Result<()> {
@@ -269,6 +296,9 @@ fn live_jobs() -> String {
     format!("FROM jobs WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL}")
 }
 
+/// Whether a job is a wake's, by the `wake_job` index.
+const WAKE_OF_JOB: &str = "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)";
+
 /// A stored lease: holder, started, expires, the holder that slept, since when.
 type Lease = (String, i64, i64, Option<String>, Option<i64>);
 
@@ -366,7 +396,8 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         let task_id = job["task_id"].as_str().unwrap_or("");
         let status = job["status"].as_str().unwrap_or("");
         let exists = |sql: &str| -> Result<bool> { Ok(conn.query_row(sql, [id], |r| r.get(0))?) };
-        let kind = if has_wakes && exists("SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)")? {
+        // By the `wake_job` index, and `errands` by its key.
+        let kind = if has_wakes && exists(WAKE_OF_JOB)? {
             "first_mate"
         } else if has_errands && exists("SELECT EXISTS(SELECT 1 FROM errands WHERE id=?1)")? {
             "errand"
@@ -618,7 +649,16 @@ pub(crate) fn absorb_carried(conn: &Connection, machine: &str, carried: &Value) 
     if section.is_some_and(|s| s.to_string().len() > CARRY_BYTES) {
         return Ok(());
     }
-    record_remote(conn, machine, "collect", as_of_ms, changed_ms, section)
+    record_remote(
+        conn,
+        machine,
+        "collect",
+        as_of_ms,
+        changed_ms,
+        section,
+        Store::now_ms(),
+    )?;
+    Ok(())
 }
 
 /// A section's ships and needs renamed to the machine this registry knows it
@@ -668,36 +708,47 @@ fn directory_only(name: &str, link: &str, error: &str, ships: &[(String, String)
     }
 }
 
+/// Whether a section received at `received_ms` on this clock is younger
+/// than `window` at `now`. A receive time ahead of `now` (this clock stepped
+/// back) is not young: the next receipt dates it again.
+fn received_within(received_ms: Option<i64>, now: i64, window: i64) -> bool {
+    received_ms.is_some_and(|at| at <= now && now - at < window)
+}
+
 /// Ask a machine this one reaches for its own section, or reuse a read
-/// younger than `REUSE_MS`; fall back to the stored one when it does not
-/// answer.
+/// received here less than `REUSE_MS` ago; fall back to the stored one when
+/// it does not answer. The answer just received is what is shown.
 fn reached(conn: &Connection, name: &str, ships: &[(String, String)], now: i64) -> Result<Shown> {
     let previous = stored(conn, name)?;
     if let Some(previous) = previous
         .as_ref()
-        .filter(|p| p.via != "collect" && now - p.as_of_ms < REUSE_MS && p.as_of_ms <= now)
+        .filter(|p| p.via != "collect" && received_within(p.received_ms, now, REUSE_MS))
     {
         let mut reused = previous.clone();
         reused.via = "reused".into();
         return Ok(shown(name, "reaches", &reused, true, None));
     }
     let since = previous.as_ref().map(|p| p.changed_ms);
-    match crate::machines::snapshot_of(name, json!({"since": since})) {
-        Ok(answer) => {
-            let (Some(as_of), Some(changed)) =
-                (answer["as_of_ms"].as_i64(), answer["changed_ms"].as_i64())
-            else {
-                anyhow::bail!("machine {name} answered without a section");
-            };
-            let section = answer["section"].as_object().map(|_| &answer["section"]);
-            ensure!(
-                section.is_some() || previous.is_some(),
-                "machine {name} answered without a section"
-            );
-            record_remote(conn, name, "direct", as_of, changed, section)?;
-            let now_stored = stored(conn, name)?.context("snapshot row vanished")?;
-            Ok(shown(name, "reaches", &now_stored, true, None))
-        }
+    let answered = crate::machines::snapshot_of(name, json!({"since": since})).and_then(|answer| {
+        let (Some(as_of), Some(changed)) =
+            (answer["as_of_ms"].as_i64(), answer["changed_ms"].as_i64())
+        else {
+            anyhow::bail!("machine {name} answered without a section");
+        };
+        let section = answer["section"].as_object().map(|_| &answer["section"]);
+        record_remote(
+            conn,
+            name,
+            "direct",
+            as_of,
+            changed,
+            section,
+            Store::now_ms(),
+        )?
+        .with_context(|| format!("machine {name} answered without a section"))
+    });
+    match answered {
+        Ok(answer) => Ok(shown(name, "reaches", &answer, true, None)),
         Err(error) => {
             let error: String = format!("{error:#}").chars().take(ERROR_CHARS).collect();
             Ok(match stored(conn, name)? {
@@ -712,11 +763,12 @@ fn reached(conn: &Connection, name: &str, ships: &[(String, String)], now: i64) 
     }
 }
 
-/// A machine that reaches this one, from what it carried on `fleet.collect`.
+/// A machine that reaches this one, from what it carried on `fleet.collect`,
+/// fresh while received here within two contacts.
 fn reaching(conn: &Connection, name: &str, ships: &[(String, String)], now: i64) -> Result<Shown> {
     Ok(match stored(conn, name)? {
         Some(carried) => {
-            let fresh = now - carried.as_of_ms < 2 * crate::machines::CONTACT_MS;
+            let fresh = received_within(carried.received_ms, now, 2 * crate::machines::CONTACT_MS);
             let error = (!fresh).then(|| format!("nothing carried from {name} lately"));
             shown(name, "reached_by", &carried, fresh, error)
         }
@@ -743,26 +795,50 @@ fn asking_machine(
     }
 }
 
-/// Whether a request held here was already answered or closed here.
-fn closed_here(conn: &Connection, mail_id: &str) -> bool {
+/// Which of the requests `ids` a home here holds no longer open: answered
+/// or closed here. One read per home for all of them, the whole pass under
+/// the local budget and each home under its observation budget; a home not
+/// read is named in `unknown`, and its copies count as open.
+fn closed_here(conn: &Connection, ids: &[&str], unknown: &mut Vec<String>) -> HashSet<String> {
+    let mut closed = HashSet::new();
+    if ids.is_empty() {
+        return closed;
+    }
     let Ok(members) = crate::fleet::members(conn) else {
-        return false;
+        unknown.push("answered".into());
+        return closed;
     };
-    members.iter().filter(|m| m.home.is_dir()).any(|m| {
-        Store::open_readonly(&m.home, Caller::Operator)
-            .ok()
-            .and_then(|store| {
-                store
-                    .connection()
-                    .query_row("SELECT state FROM mail WHERE id=?1", [mail_id], |r| {
-                        r.get::<_, Option<String>>(0)
-                    })
-                    .optional()
-                    .ok()
-                    .flatten()
-            })
-            .is_some_and(|state| state.as_deref() != Some("open"))
-    })
+    let started = Instant::now();
+    for member in members.iter().take(SHIP_LIMIT) {
+        if !member.home.is_dir() {
+            continue;
+        }
+        let read = || -> Result<Vec<String>> {
+            ensure!(started.elapsed() < LOCAL_BUDGET, "past the local budget");
+            let store = Store::open_readonly(&member.home, Caller::Operator)?;
+            let budget = ObservationBudget::new(store.connection())?;
+            let mut found = vec![];
+            for chunk in ids.chunks(500) {
+                budget.check()?;
+                let marks = vec!["?"; chunk.len()].join(",");
+                found.extend(
+                    store
+                        .connection()
+                        .prepare(&format!(
+                            "SELECT id FROM mail WHERE id IN ({marks}) AND state IS NOT 'open'"
+                        ))?
+                        .query_map(rusqlite::params_from_iter(chunk), |r| r.get(0))?
+                        .collect::<rusqlite::Result<Vec<String>>>()?,
+                );
+            }
+            Ok(found)
+        };
+        match read() {
+            Ok(found) => closed.extend(found),
+            Err(_) => unknown.push(format!("answered:{}", member.name)),
+        }
+    }
+    closed
 }
 
 pub fn snapshot(args: &Value) -> Result<Value> {
@@ -829,9 +905,10 @@ pub fn snapshot(args: &Value) -> Result<Value> {
         .collect();
     let mut machines = vec![];
     let mut ships = vec![];
-    // mail id -> (from the asking machine's own live read, item)
-    let mut needs: Vec<Value> = vec![];
-    let mut by_mail: HashMap<String, (bool, usize)> = HashMap::new();
+    // Needs are always returned in full: answering a need here, or a machine
+    // going from live to cached, changes them without moving its
+    // `changed_ms`. `since` skips only a machine's ships and routes.
+    let mut sections: Vec<(String, bool, Value, Vec<Value>)> = vec![];
     for shown in all {
         let mut row = shown.row;
         let name = row["name"].as_str().unwrap_or("").to_owned();
@@ -840,37 +917,46 @@ pub fn snapshot(args: &Value) -> Result<Value> {
             .and_then(Value::as_i64)
             .is_some_and(|s| row["changed_ms"].as_i64() == Some(s));
         row["unchanged"] = json!(unchanged);
-        if unchanged {
-            if let Some(fields) = row.as_object_mut() {
-                fields.remove("routes");
-            }
-            machines.push(row);
-            continue;
+        if unchanged && let Some(fields) = row.as_object_mut() {
+            fields.remove("routes");
         }
-        machines.push(row.clone());
-        let Some(section) = shown.section else {
-            continue;
-        };
-        ships.extend(section["ships"].as_array().cloned().unwrap_or_default());
-        let remote = name != here;
-        for mut need in section["needs"].as_array().cloned().unwrap_or_default() {
+        let section = shown.section.unwrap_or(Value::Null);
+        if !unchanged {
+            ships.extend(section["ships"].as_array().cloned().unwrap_or_default());
+        }
+        let needs = section["needs"].as_array().cloned().unwrap_or_default();
+        sections.push((name, shown.live, row["as_of_ms"].clone(), needs));
+        machines.push(row);
+    }
+    let remote_ids: Vec<&str> = sections
+        .iter()
+        .filter(|(name, ..)| *name != here)
+        .flat_map(|(_, _, _, needs)| needs.iter().filter_map(|n| n["mail_id"].as_str()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut unknown_here = vec![];
+    let closed = closed_here(&conn, &remote_ids, &mut unknown_here);
+    let mut needs: Vec<Value> = vec![];
+    // mail id -> (from the asking machine's own live read, index in needs)
+    let mut by_mail: HashMap<String, (bool, usize)> = HashMap::new();
+    for (name, live, as_of_ms, items) in &sections {
+        let remote = *name != here;
+        for mut need in items.iter().cloned() {
             let mail_id = need["mail_id"].as_str().map(str::to_owned);
-            if remote
-                && let Some(id) = &mail_id
-                && closed_here(&conn, id)
-            {
+            if remote && mail_id.as_ref().is_some_and(|id| closed.contains(id)) {
                 continue;
             }
-            if !shown.live {
-                need["as_of_ms"] = row["as_of_ms"].clone();
-                need["actions"] = json!([]);
-            } else {
+            if *live {
                 need["as_of_ms"] = Value::Null;
+            } else {
+                need["as_of_ms"] = as_of_ms.clone();
+                need["actions"] = json!([]);
             }
             let asker = need["ship"]
                 .as_str()
                 .and_then(|s| asking_machine(s, &here, &local, &directory));
-            let own_read = asker.as_deref().is_none_or(|a| a == name) && shown.live;
+            let own_read = asker.as_deref().is_none_or(|a| a == name) && *live;
             if let Some(asker) = asker {
                 need["machine"] = json!(asker);
             }
@@ -887,6 +973,11 @@ pub fn snapshot(args: &Value) -> Result<Value> {
                 None => needs.push(need),
             }
         }
+    }
+    if let Some(row) = machines.iter_mut().find(|m| m["name"] == here.as_str())
+        && let Some(listed) = row["unknown"].as_array_mut()
+    {
+        listed.extend(unknown_here.into_iter().map(Value::from));
     }
     Ok(json!({
         "schema_version": 1, "generated_ms": generated_ms, "machine": here,
@@ -917,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn live_jobs_and_open_tasks_are_read_through_their_indexes() {
+    fn live_jobs_open_tasks_and_wakes_are_read_through_their_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("home")).unwrap();
         let plan = |sql: &str| -> String {
@@ -942,6 +1033,8 @@ mod tests {
         let tasks =
             format!("SELECT id {OPEN_TASKS} ORDER BY rowid DESC LIMIT 20").replace("?1", "'a'");
         assert!(plan(&tasks).contains("tasks_owner"), "{}", plan(&tasks));
+        let wake = WAKE_OF_JOB.replace("?1", "'j'");
+        assert!(plan(&wake).contains("wake_job"), "{}", plan(&wake));
     }
 
     fn registry() -> (tempfile::TempDir, Connection) {
@@ -961,10 +1054,6 @@ mod tests {
         let later = record_own(&conn, "m", &quiet, 1_000 + 3_600_000).unwrap();
         assert_eq!(later.changed_ms, 1_000);
         assert_eq!(later.as_of_ms, 3_601_000);
-        // An older read than the stored one writes nothing.
-        let stale = record_own(&conn, "m", &json!({"ships": []}), 2_000).unwrap();
-        assert_eq!(stale.as_of_ms, 3_601_000);
-        assert_eq!(stale.changed_ms, 1_000);
         // A change moves it forward even when the stored time is ahead.
         conn.execute(
             "UPDATE fleet_snapshots SET changed_ms=9_000_000 WHERE machine='m'",
@@ -976,18 +1065,115 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_read_older_than_the_stored_one_is_ignored() {
+    fn a_local_clock_step_back_shows_and_keeps_the_section_just_read() {
         let (_dir, conn) = registry();
-        let section = json!({"machine": {"name": "mac"}, "ships": [], "needs": []});
-        record_remote(&conn, "mac", "collect", 2_000, 1_500, Some(&section)).unwrap();
-        record_remote(&conn, "mac", "direct", 1_000, 900, Some(&json!({}))).unwrap();
+        let before = json!({"ships": [{"name": "a", "presence": "hosted"}]});
+        record_own(&conn, "m", &before, 3_600_000).unwrap();
+        // The clock steps back an hour and the ship goes to sleep.
+        let after = json!({"ships": [{"name": "a", "presence": "asleep"}]});
+        let read = record_own(&conn, "m", &after, 1_000).unwrap();
+        assert_eq!(read.section, after, "the read just made is shown");
+        assert_eq!((read.as_of_ms, read.changed_ms), (1_000, 3_600_001));
+        let kept = stored(&conn, "m").unwrap().unwrap();
+        assert_eq!(kept.section, after, "and stored, not held behind the step");
+        assert_eq!(kept.changed_ms, 3_600_001);
+        // Still a step behind, nothing changed: the same changed_ms.
+        let again = record_own(&conn, "m", &after, 2_000).unwrap();
+        assert_eq!(again.changed_ms, 3_600_001);
+    }
+
+    #[test]
+    fn a_received_section_is_shown_and_kept_whatever_either_clock_says() {
+        let (_dir, conn) = registry();
+        let first = json!({"machine": {"name": "mac"}, "ships": [], "needs": []});
+        let shown = record_remote(&conn, "mac", "collect", 2_000, 1_500, Some(&first), 10_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!((shown.section, shown.received_ms), (first, Some(10_000)));
+        // The mac's clock steps back: its next answer is still the one shown
+        // and kept.
+        let second = json!({"machine": {"name": "mac"}, "ships": [{"name": "a"}], "needs": []});
+        let shown = record_remote(&conn, "mac", "direct", 1_000, 900, Some(&second), 11_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.section, second);
         let kept = stored(&conn, "mac").unwrap().unwrap();
-        assert_eq!((kept.as_of_ms, kept.changed_ms), (2_000, 1_500));
-        assert_eq!(kept.via, "collect");
+        assert_eq!((kept.as_of_ms, kept.changed_ms), (1_000, 900));
+        assert_eq!(
+            (kept.via.as_str(), kept.received_ms),
+            ("direct", Some(11_000))
+        );
         // An unchanged answer only dates the stored section.
-        record_remote(&conn, "mac", "direct", 3_000, 1_500, None).unwrap();
-        let dated = stored(&conn, "mac").unwrap().unwrap();
-        assert_eq!((dated.as_of_ms, dated.via.as_str()), (3_000, "direct"));
-        assert_eq!(dated.section, section);
+        let dated = record_remote(&conn, "mac", "direct", 3_000, 900, None, 12_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!((dated.as_of_ms, dated.received_ms), (3_000, Some(12_000)));
+        assert_eq!(dated.section, second);
+        // Unchanged since a section no longer stored confirms nothing.
+        assert!(
+            record_remote(&conn, "mac", "direct", 4_000, 1_500, None, 13_000)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            stored(&conn, "mac").unwrap().unwrap().received_ms,
+            Some(12_000)
+        );
+    }
+
+    #[test]
+    fn reuse_and_freshness_follow_this_clock_not_the_remote_one() {
+        let (_dir, conn) = registry();
+        let now = 1_800_000_000_000;
+        let section = json!({"machine": {"name": "mac"}, "ships": [], "needs": []});
+        // The mac's clock runs an hour ahead of this one.
+        let ahead = now + 3_600_000;
+        record_remote(&conn, "mac", "collect", ahead, ahead, Some(&section), now).unwrap();
+        let contact = crate::machines::CONTACT_MS;
+        assert_eq!(
+            reaching(&conn, "mac", &[], now + 1_000).unwrap().row["reachable"],
+            true
+        );
+        // Two contacts with nothing carried: stale, though its as_of_ms is
+        // still ahead of this clock.
+        let quiet = reaching(&conn, "mac", &[], now + 2 * contact).unwrap();
+        assert_eq!(quiet.row["reachable"], false);
+        assert_eq!(quiet.row["as_of_ms"], ahead);
+        // This clock steps back past the receipt: not fresh until the next.
+        assert_eq!(
+            reaching(&conn, "mac", &[], now - 60_000).unwrap().row["reachable"],
+            false
+        );
+
+        // A direct read from that clock is reused while received lately.
+        record_remote(&conn, "mac", "direct", ahead, ahead, Some(&section), now).unwrap();
+        let reused = reached(&conn, "mac", &[], now + 1_000).unwrap();
+        assert_eq!(reused.row["via"], "reused");
+        assert!(reused.live);
+        assert!(received_within(Some(now), now + REUSE_MS - 1, REUSE_MS));
+        assert!(!received_within(Some(now), now + REUSE_MS, REUSE_MS));
+        assert!(!received_within(Some(now), now - 1, REUSE_MS));
+        assert!(!received_within(None, now, REUSE_MS));
+    }
+
+    #[test]
+    fn an_older_table_gains_the_receive_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("fleet.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE fleet_snapshots(machine TEXT PRIMARY KEY,
+               digest TEXT NOT NULL, changed_ms INTEGER NOT NULL, as_of_ms INTEGER NOT NULL,
+               via TEXT NOT NULL, body TEXT NOT NULL);
+             INSERT INTO fleet_snapshots VALUES('mac', 'd', 1, 2, 'direct', '{}');",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        let old = stored(&conn, "mac").unwrap().unwrap();
+        assert_eq!(old.received_ms, None);
+        assert_eq!(
+            reaching(&conn, "mac", &[], 3).unwrap().row["reachable"],
+            false
+        );
     }
 }
