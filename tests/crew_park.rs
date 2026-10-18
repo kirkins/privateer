@@ -1159,12 +1159,10 @@ fn a_parked_crew_with_partial_require_tier_resumes() {
         "job.status",
         json!({"id": "crew-resume-park-crew-tier-only-1-1"}),
     );
+    assert_eq!(job["route_why"], parked["route_why"], "{job}");
     assert!(
-        !job["route_why"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("explicit route"),
-        "route_why should carry original why or say resumed, not explicit route: {job}"
+        job["route_why"].is_string(),
+        "route_why should be recorded: {job}"
     );
 }
 
@@ -1197,11 +1195,9 @@ fn a_parked_crew_with_partial_require_use_resumes() {
         "job.status",
         json!({"id": "crew-resume-park-crew-use-only-1-1"}),
     );
+    assert_eq!(job["route_why"], parked["route_why"], "{job}");
     assert!(
-        !job["route_why"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("explicit route"),
-        "route_why should carry original why or say resumed, not explicit route: {job}"
+        job["route_why"].is_string(),
+        "route_why should be recorded: {job}"
     );
 }
