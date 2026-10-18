@@ -1829,7 +1829,7 @@ fn push_captain(
         }
         let store = Store::open(&member.home)?;
         let (limit, room) = (COLLECT_LIMIT - messages.len(), COLLECT_BYTES - bytes);
-        for envelope in crate::mail::awaiting_captain(&store, &peer, since_ms, limit, room)? {
+        for envelope in crate::mail::awaiting_captain(&store, &peer, since_ms, true, limit, room)? {
             bytes += envelope.to_string().len();
             messages.push(envelope);
         }
@@ -2214,7 +2214,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     }
                     let (limit, room) = (COLLECT_LIMIT - messages.len(), COLLECT_BYTES - bytes);
                     let found = if captain {
-                        crate::mail::awaiting_captain(&store, &peer, linked_ms, limit, room)?
+                        crate::mail::awaiting_captain(&store, &peer, linked_ms, false, limit, room)?
                     } else {
                         crate::mail::awaiting(&store, &peer, limit, room)?
                     };
