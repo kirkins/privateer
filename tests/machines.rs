@@ -2788,6 +2788,36 @@ fn the_captain_writes_to_any_ship_from_any_folder_and_machine() {
 }
 
 #[test]
+fn the_captain_reads_a_report_stored_on_the_linked_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let stored = mac.ok(
+        "fitforge",
+        "report.put",
+        json!({"from": "fitforge", "title": "Backup audit", "format": "markdown",
+               "content": "# Backup audit\n\nExports omit photos."}),
+    );
+    let id = stored["report_id"].as_str().unwrap();
+
+    let report = laptop.ok_over("liaison", "report.get", json!({"id": id}), &ssh);
+    assert_eq!(report["ship"], "fitforge", "{report}");
+    assert_eq!(report["title"], "Backup audit");
+    assert!(report["content"].as_str().unwrap().contains("omit photos"));
+
+    let missing = laptop.run(
+        "liaison",
+        &["report.get", "--json", r#"{"id":"report-nowhere"}"#],
+        Some(&ssh),
+    );
+    assert!(!missing.status.success());
+    assert!(
+        text(&missing).contains("no report report-nowhere in the fleet"),
+        "{}",
+        text(&missing)
+    );
+}
+
+#[test]
 fn a_machine_whose_desk_is_elsewhere_hands_its_captain_mail_only_there() {
     let (_temp, laptop, mac, ssh) = fixture();
     let server = Machine {

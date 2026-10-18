@@ -1076,6 +1076,38 @@ pub(crate) fn at_desk(command: &str, args: &Value) -> Result<Option<Value>> {
     call(&machine, command, args.clone(), Some(DESK_TIMEOUT)).map(Some)
 }
 
+/// How long a linked machine has to find a stored report.
+const REPORT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A stored report from a machine this one reaches, for `report.get`: each is
+/// asked in turn, and the first that holds it answers. A machine that cannot
+/// be reached does not stop the others.
+pub(crate) fn report_from_linked(id: &str) -> Result<Option<Value>> {
+    let conn = crate::fleet::registry()?;
+    let mut unreachable = Vec::new();
+    for machine in machines(&conn)?
+        .into_iter()
+        .filter(|m| m.role == "collects")
+    {
+        match call(
+            &machine,
+            "report.get",
+            json!({"id": id}),
+            Some(REPORT_TIMEOUT),
+        ) {
+            Ok(found) => return Ok(Some(found)),
+            Err(error) if error.to_string().contains("no report") => {}
+            Err(error) => unreachable.push(format!("{error:#}")),
+        }
+    }
+    ensure!(
+        unreachable.is_empty(),
+        "no report {id} here, and a linked machine did not answer: {}",
+        unreachable.join("; ")
+    );
+    Ok(None)
+}
+
 /// Asking a machine this one reaches for its own snapshot section.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2054,6 +2086,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "fleet.snapshot" => crate::snapshot::own(&conn, args["since"].as_i64()),
         // The same for usage: this machine's homes, read-only.
         "usage.summary" => crate::usage::local(args),
+        // A stored report from this machine's homes; never asked further.
+        "report.get" => crate::report::serve(args),
         // The captain's desk is here: answer from this machine's homes, and
         // never pass the command on again.
         "captain.waiting" | "captain.feed" | "captain.send" | "captain.reply"
