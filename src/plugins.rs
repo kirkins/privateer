@@ -40,7 +40,7 @@ fn default_output() -> usize {
 const LAUNCH_FLOOR_MS: u64 = 15_000;
 /// Load can stretch the wait only this far, so a hung plugin still fails a
 /// launch within a minute and the launch's own backoff takes over.
-const LAUNCH_CEILING_MS: u64 = 60_000;
+pub(crate) const LAUNCH_CEILING_MS: u64 = 60_000;
 
 /// How long a plugin request may take.
 #[derive(Clone, Copy, Debug, PartialEq)]
