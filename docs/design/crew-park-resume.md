@@ -1,6 +1,6 @@
 # Design: crews park on their own heavy jobs and resume
 
-Status: design for review; nothing here is implemented yet. Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
+Status: round 1 implemented (`crew.park`, park record, resume through `agent.start`, run-time budget, cancel of a parked crew). Round 2 (deadline-kill park, held crews and `crew.resume`, `ship.bearings`, the `agent.start` refusal) is not yet implemented; see [Implementation notes](#implementation-notes). Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
 
 ## Problem
 
@@ -25,7 +25,6 @@ New table `crew_parks` (in the same transaction style as `wakes`):
 | `state` | `parked`, `resuming`, `resumed`, `held` (deadline with no child), `cancelled`, `failed` |
 | `next` | the one-line `next` from `crew.park` |
 | `harness`, `session` | the native session to resume (`session` null for Pi ephemeral, a terminal pane, or hosted crews without a log) |
-| `run_ms` | accumulated process run time of the crew across incarnations (the budget used) |
 | `parks`, `created_ms`, `updated_ms` | cap accounting and recovery |
 
 Counts toward caps: `parks` is compared with the park cap (6), `created_ms` with the elapsed cap (24 h). Both are configurable through charter/settings with bounds, like the existing `job_timeout_secs` (`src/core.rs:121`).
@@ -52,7 +51,7 @@ Trigger: the final settlement of a child job, at the same place `crew_outcome` i
 
 ### Deadline
 
-- The crew's clock is the **sum of its process run time** across incarnations. Queued time (`wait_in_queue`) and parked time are not charged. `run_ms` is written at each payload exit (park, final, or kill).
+- The crew's clock is the **sum of its process run time** across incarnations. Queued time (`wait_in_queue`) and parked time are not charged. `run_ms` is kept on the crew's job record (not the park row) and is written at each payload exit (park, final, or kill). A resume carries it into the new job through the runtime's own `_run_ms`, which only an operator-side caller can set.
 - Each incarnation's supervisor deadline is `spawn + (budget − run_ms)`, where budget is the charter's crew timeout. A budget overrun still times out as today.
 - Caps: 6 parks and 24 h elapsed in total, both configurable.
 
@@ -120,3 +119,18 @@ Tests prove behaviour through commands and durable state, not snapshots of layou
 ## Rounds
 
 Per the crew assignment: round 1 is `crew.park`, the resume path and the deadline accounting with their tests; round 2 is the deadline-kill park, heavy job policy, bearings and the `agent.start` refusal. Each round is committed only after `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings` and the affected tests (`--test-threads=1`) pass as supervised heavy jobs.
+
+## Implementation notes
+
+Decisions made while implementing round 1, where the text above was not exact:
+
+- `crew.park` takes the **child** job id as `job_id` (the heavy job the crew started) and the crew is the caller's `PRIVATEER_JOB`. The child must have been started by that crew or a crew it resumed.
+- A parked crew is job status `parked`: non-terminal, with no payload. Its park is named by the job's `park` field, and the park row is `crew_parks`.
+- A resumed crew is a new job `crew-resume-<park>-<attempt>`. The parked record ends as status `resumed` (terminal, not reported), so it reports nothing and its work is found through the park's `resumed_job_id`.
+- Child lineage: a child started by a resumed crew counts as the original crew's, through `crew_parks.resumed_job_id`.
+- Outcome suppression: a child's outcome is not mailed while a crew with status `parked` is parked on it. Its resume reads the outcome. A failed resume is a normal `failed` notice on the crew, carrying the resume error.
+- Resume runs in the supervisor's settlement hook (`supervise`), after the child's final status commits, through `agent.start`. The launch arguments (manifest, options, config, tool bundles, cwd, heavy) are recorded on the crew's job when it starts.
+- The native session is read from the crew's complete log when it resumes, not at `crew.park`: the park is finalised after the payload's output is captured, so that log is whole only then.
+- The job.start reply to a crew carries a `park` hint, since that is where the crew learns to park rather than poll; the crew brief only names `crew.park`, to stay within its size budget.
+- Hosted crews are refused `crew.park` for now.
+- Round 2 is not done: the deadline-kill park, `held` crews and `crew.resume`, `ship.bearings` listing parks, the `agent.start` refusal on a parked task, and the restart-recovery of a park whose child already settled.

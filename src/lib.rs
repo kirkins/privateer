@@ -167,6 +167,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let mut args = args;
+            // The crew run time a resume continues from is the runtime's to
+            // set: an agent or any other caller cannot reset a crew's budget.
+            let run_ms = args.as_object_mut().unwrap().remove("_run_ms");
+            let run_ms = match (store.caller(), run_ms) {
+                (Caller::Operator, Some(run_ms)) => run_ms.as_u64().unwrap_or(0),
+                _ => 0,
+            };
             let task = args
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -402,7 +409,15 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if !workspace::is_wake(store, &args)? {
                 let estimate = jobs::crew_estimate(store, &charter, &args, route_memory)?;
                 job["estimate"] = serde_json::to_value(estimate)?;
+                // What a park resumes: this launch again, through admission.
+                job["launch"] = serde_json::json!({
+                    "manifest": args.get("manifest"), "options": args.get("options"),
+                    "config": args.get("config"), "tool_bundles": args.get("tool_bundles"),
+                    "cwd": args.get("cwd"),
+                    "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false)),
+                });
             }
+            job["run_ms"] = serde_json::json!(run_ms);
             let mut started = jobs::start_agent(store, job)?;
             if viewed {
                 // Presentation only: a refused space never stops the crew.

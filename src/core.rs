@@ -68,6 +68,8 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
         "job_timeout_secs",
         "min_free_bytes",
         "max_heavy_jobs",
+        "crew_max_parks",
+        "crew_max_elapsed_secs",
         "provider_plugin",
         "active",
     ] {
@@ -121,9 +123,16 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
         ("job_timeout_secs", 1, 86400),
         ("max_heavy_jobs", 1, 1024),
         ("min_free_bytes", 0, u64::MAX),
+        ("crew_max_parks", 0, 64),
+        ("crew_max_elapsed_secs", 1, 7 * 86400),
     ] {
-        // An optional per-charter share of the host's heavy work.
-        if key == "max_heavy_jobs" && charter.get(key).is_none_or(Value::is_null) {
+        // Optional per-charter settings: a share of the host's heavy work, and
+        // the crew park caps, which default when absent.
+        if matches!(
+            key,
+            "max_heavy_jobs" | "crew_max_parks" | "crew_max_elapsed_secs"
+        ) && charter.get(key).is_none_or(Value::is_null)
+        {
             continue;
         }
         let n = charter[key]

@@ -869,6 +869,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
+    crate::crew::resume_pending(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
     let routes = crate::routes::scan(store)?;

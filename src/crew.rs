@@ -13,7 +13,9 @@
 use crate::mail::{CREW, find, record_crew};
 use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, bail, ensure};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -101,6 +103,9 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
     let Some(ship) = owning_ship(store, task_id)? else {
         return Ok(());
     };
+    if parked_on(store, job_id)? {
+        return Ok(());
+    }
     // A first mate is not told about its own wake: that would wake it again.
     if wake_job(store, job_id)? {
         return Ok(());
@@ -313,8 +318,459 @@ fn answer(store: &Store, args: &Value) -> Result<Value> {
     }
 }
 
+/// Parks allowed per crew lineage, and its elapsed cap, unless the charter says
+/// otherwise. A park resumes the crew; see docs/design/crew-park-resume.md.
+const MAX_PARKS: u64 = 6;
+const MAX_ELAPSED_SECS: u64 = 86_400;
+const NEXT_CHARS: usize = 300;
+
+/// The crew job itself, then the crew jobs its resumes replaced, oldest last.
+/// A child started by any of them belongs to this crew.
+fn lineage(store: &Store, crew: &str) -> Result<Vec<String>> {
+    let mut chain = vec![crew.to_owned()];
+    loop {
+        let previous: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT crew_job_id FROM crew_parks WHERE resumed_job_id=?1",
+                [chain.last()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match previous {
+            Some(previous) => chain.push(previous),
+            None => return Ok(chain),
+        }
+    }
+}
+
+/// Whether the running job is a crew that may park: a supervised crew job of
+/// its ship, not a first mate's wake and not hosted.
+pub(crate) fn may_park(store: &Store) -> bool {
+    let Ok(crew) = std::env::var("PRIVATEER_JOB") else {
+        return false;
+    };
+    let Ok(job) = crate::jobs::record(store, &crew) else {
+        return false;
+    };
+    let actor = match store.caller() {
+        Caller::Agent { actor } => actor.as_str(),
+        Caller::Operator => return false,
+    };
+    job["agent_actor"] == actor
+        && job["hosted"] != json!(true)
+        && matches!(job["status"].as_str(), Some("launching" | "running"))
+        && !wake_job(store, &crew).unwrap_or(true)
+}
+
+/// Whether a child job's outcome belongs to a crew parked on it, or about to
+/// park on it (the child can settle before the crew's payload has ended). Its
+/// resume reads the outcome, so the first mate is not told about it again.
+pub(crate) fn parked_on(store: &Store, child: &str) -> Result<bool> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM crew_parks p JOIN jobs j ON j.id=p.crew_job_id
+           WHERE p.child_job_id=?1 AND p.state='parked' AND p.crew_job_id=json_extract(j.record,'$.id')
+             AND json_extract(j.record,'$.park')=p.id
+             AND json_extract(j.record,'$.status') IN ('parked','launching','running'))",
+        [child],
+        |r| r.get(0),
+    )?)
+}
+
+/// What a crew reads of a job that settled: its status, exit, reason and the
+/// tail of its logs, bounded like an outcome notice.
+fn settlement_text(store: &Store, job: &Value) -> String {
+    let job_id = job["id"].as_str().unwrap_or_default();
+    let incarnation = job["incarnation"].as_str().unwrap_or_default();
+    let mut text = format!(
+        "Job {job_id} {}",
+        job["status"].as_str().unwrap_or_default()
+    );
+    if let Some(code) = job["exit_code"].as_i64() {
+        text.push_str(&format!(" with exit code {code}"));
+    }
+    text.push_str(".\n");
+    if let Some(reason) = job["reason"].as_str() {
+        text.push_str(&format!("Reason: {}\n", clip(reason, REASON_CHARS)));
+    }
+    let command = job["command"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let logs = store.home().join("jobs").join(job_id).join(incarnation);
+    text.push_str(&format!(
+        "Command: {}\nLogs: {}/{{stdout,stderr}}.log\n",
+        clip(&command, COMMAND_CHARS),
+        logs.display()
+    ));
+    let stderr = tail(&logs.join("stderr.log"), TAIL_BYTES);
+    let stdout = tail(
+        &logs.join("stdout.log"),
+        TAIL_BYTES.saturating_sub(stderr.len() as u64),
+    );
+    for (name, lines) in [("stderr", stderr), ("stdout", stdout)] {
+        if !lines.is_empty() {
+            text.push_str(&format!("--- end of {name} ---\n{lines}\n"));
+        }
+    }
+    clip(&text, BODY_CHARS)
+}
+
+/// `crew.park`: a running crew ends its turn to wait on a heavy job it
+/// started, instead of polling. The job's outcome resumes the crew. The park
+/// record is written in the same transaction as the crew's park mark, after
+/// checking the child is still unfinished.
+fn park(store: &Store, args: &Value) -> Result<Value> {
+    let Caller::Agent { actor } = store.caller() else {
+        bail!("crew.park is for crew, which run as their ship's agent");
+    };
+    let crew = std::env::var("PRIVATEER_JOB")
+        .ok()
+        .filter(|j| !j.is_empty())
+        .context("crew.park runs inside a crew job; PRIVATEER_JOB is not set")?;
+    let child = required(args, "job_id")?;
+    let next = required(args, "next")?;
+    ensure!(
+        !next.trim().is_empty() && next.chars().count() <= NEXT_CHARS && !next.contains('\n'),
+        "next must be one line of at most {NEXT_CHARS} characters"
+    );
+    let job = crate::jobs::record(store, &crew)?;
+    ensure!(
+        job["agent_actor"] == actor.as_str(),
+        "job {crew} is not crew of {actor}"
+    );
+    ensure!(
+        !wake_job(store, &crew)?,
+        "a first mate's own session cannot park"
+    );
+    ensure!(
+        job["hosted"] != json!(true),
+        "a hosted crew cannot park yet: its pane keeps the session, so wait in the job instead"
+    );
+    ensure!(
+        matches!(job["status"].as_str(), Some("launching" | "running")),
+        "job {crew} is not running"
+    );
+    let chain = lineage(store, &crew)?;
+    let child_record = crate::jobs::record(store, child)?;
+    ensure!(
+        child_record["started_by"]
+            .as_str()
+            .is_some_and(|parent| chain.iter().any(|c| c == parent)),
+        "job {child} is not work that crew {crew} started"
+    );
+    let task = job["task_id"].as_str().context("job task")?.to_owned();
+    let charter = store.authorize(&task, "spawn")?;
+    let root = chain.last().context("crew lineage")?.clone();
+    let root_record = crate::jobs::record(store, &root)?;
+    let max_parks = charter
+        .get("crew_max_parks")
+        .and_then(Value::as_u64)
+        .unwrap_or(MAX_PARKS);
+    let max_elapsed = charter
+        .get("crew_max_elapsed_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(MAX_ELAPSED_SECS);
+    let now = Store::now_ms();
+    let elapsed_ms = now - root_record["created_ms"].as_i64().unwrap_or(now);
+    ensure!(
+        elapsed_ms <= (max_elapsed as i64).saturating_mul(1000),
+        "crew {root} has run for more than {max_elapsed} seconds in total; it cannot park again"
+    );
+    // The native session is read when the crew resumes, from its complete log:
+    // the park has stopped the payload, and its output was captured by then.
+    let harness = job["launch"]["manifest"]
+        .as_str()
+        .and_then(crate::bundled::harness);
+    let tx = store.write_transaction()?;
+    let child_status: String = tx.query_row(
+        "SELECT json_extract(record,'$.status') FROM jobs WHERE id=?1",
+        [child],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        matches!(
+            child_status.as_str(),
+            "starting" | "queued" | "launching" | "running"
+        ),
+        "job {child} already {child_status}; read its outcome instead of parking"
+    );
+    let parks: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM crew_parks WHERE root=?1",
+        [&root],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        (parks as u64) < max_parks,
+        "crew {root} has parked {parks} times; the cap is {max_parks}"
+    );
+    let park_id = format!("park-{crew}-{}", parks + 1);
+    tx.execute(
+        "INSERT INTO crew_parks(id, root, crew_job_id, child_job_id, task_id, ship, state,
+           next, harness, session, attempt, created_ms, updated_ms)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'parked', ?7, ?8, ?9, 0, ?10, ?10)",
+        params![
+            park_id,
+            root,
+            crew,
+            child,
+            task,
+            actor,
+            next,
+            harness,
+            Option::<String>::None,
+            now
+        ],
+    )?;
+    // Mark the crew parked in its own record, in this transaction.
+    let raw: String = tx.query_row("SELECT record FROM jobs WHERE id=?1", [&crew], |r| r.get(0))?;
+    let mut record: Value = serde_json::from_str(&raw)?;
+    record["park"] = json!(park_id);
+    tx.execute(
+        "UPDATE jobs SET record=?2 WHERE id=?1",
+        params![crew, record.to_string()],
+    )?;
+    record_crew(
+        &tx,
+        &json!({"id": format!("crew-park-{park_id}"), "to": actor, "kind": "notice",
+            "task_id": task, "urgency": "low",
+            "body": format!("Crew job {crew} parked on job {child} and will resume when it settles. Next: {next}")}),
+    )?;
+    tx.commit()?;
+    Ok(json!({"id": park_id, "state": "parked", "job_id": crew, "child_job_id": child}))
+}
+
+/// Called when a job reaches its final state: if a crew is parked on it, the
+/// crew resumes. Its own park closes first if the crew is no longer parked.
+pub(crate) fn settled(store: &mut Store, child: &str) -> Result<()> {
+    let Ok(job) = crate::jobs::record(store, child) else {
+        return Ok(());
+    };
+    if !matches!(
+        job["status"].as_str(),
+        Some("succeeded" | "failed" | "cancelled" | "timed_out")
+    ) {
+        return Ok(());
+    }
+    let parks: Vec<(String, String)> = {
+        let mut stmt = store.connection().prepare(
+            "SELECT id, crew_job_id FROM crew_parks WHERE child_job_id=?1 AND state='parked'",
+        )?;
+        let rows = stmt.query_map([child], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (park, crew) in parks {
+        let record = crate::jobs::record(store, &crew);
+        let owns = record.as_ref().is_ok_and(|c| c["park"] == park.as_str());
+        let status = record
+            .as_ref()
+            .map(|c| c["status"].as_str().unwrap_or_default().to_owned())
+            .unwrap_or_default();
+        // Still parking: the crew's own settlement finds this child settled
+        // (see `settle_own_park`), so nothing is claimed here.
+        if owns && matches!(status.as_str(), "launching" | "running") {
+            continue;
+        }
+        let claimed = store.connection().execute(
+            "UPDATE crew_parks SET state='resuming', updated_ms=?2 WHERE id=?1 AND state='parked'",
+            params![park, Store::now_ms()],
+        )?;
+        if claimed == 0 {
+            continue;
+        }
+        if !(owns && status == "parked") {
+            set_state(store, &park, "cancelled")?;
+            continue;
+        }
+        resume(store, &park, &crew, &job)?;
+    }
+    Ok(())
+}
+
+/// A crew whose own payload has ended in its park: if its child already
+/// settled while it was still parking, that settlement resumes it now.
+pub(crate) fn settle_own_park(store: &mut Store, crew: &str) -> Result<()> {
+    let Ok(job) = crate::jobs::record(store, crew) else {
+        return Ok(());
+    };
+    if job["status"] != "parked" {
+        return Ok(());
+    }
+    let child: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT child_job_id FROM crew_parks WHERE id=?1 AND state='parked'",
+            [job["park"].as_str().unwrap_or_default()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match child {
+        Some(child) => settled(store, &child),
+        None => Ok(()),
+    }
+}
+
+/// Parks whose child settled while nothing was watching (the dispatcher was
+/// down, or a settlement was missed) resume now. Each is claimed once.
+pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
+    let children: Vec<String> = {
+        let mut stmt = store
+            .connection()
+            .prepare("SELECT DISTINCT child_job_id FROM crew_parks WHERE state='parked'")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for child in children {
+        if let Err(error) = settled(store, &child) {
+            store.audit(
+                "crew.resume_failed",
+                &json!({"job_id": child, "error": format!("{error:#}")}),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn set_state(store: &Store, park: &str, state: &str) -> Result<()> {
+    store.connection().execute(
+        "UPDATE crew_parks SET state=?2, updated_ms=?3 WHERE id=?1",
+        params![park, state, Store::now_ms()],
+    )?;
+    Ok(())
+}
+
+/// Close a park for cancellation. Returns the child job it waited on, if the
+/// park was still waiting, so the caller can cancel that job too.
+pub(crate) fn cancel_park(store: &Store, park: &str) -> Result<Option<String>> {
+    if park.is_empty() {
+        return Ok(None);
+    }
+    let child: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT child_job_id FROM crew_parks WHERE id=?1 AND state='parked'",
+            [park],
+            |r| r.get(0),
+        )
+        .optional()?;
+    set_state(store, park, "cancelled")?;
+    Ok(child)
+}
+
+/// Resume a crew whose heavy job settled: a new launch through agent.start,
+/// so admission, the stow hold and the current routes all apply. The native
+/// session resumes when the route is the same harness; otherwise a fresh crew
+/// starts with the park's next step and the job's outcome as its handoff.
+fn resume(store: &mut Store, park: &str, crew: &str, child: &Value) -> Result<()> {
+    let row = store.connection().query_row(
+        "SELECT task_id, next, harness, attempt FROM crew_parks WHERE id=?1",
+        [park],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
+    let (task, next, harness, attempt) = row;
+    let attempt = attempt + 1;
+    let crew_record = crate::jobs::record(store, crew)?;
+    let launch = crew_record["launch"].clone();
+    let manifest = launch["manifest"].as_str().map(str::to_owned);
+    let id = format!("crew-resume-{park}-{attempt}");
+    let settled = settlement_text(store, child);
+    let launch_harness = manifest.as_deref().and_then(crate::bundled::harness);
+    // The native session the crew reported starting, from its complete log,
+    // when the launch still names the same harness.
+    let logs = store
+        .home()
+        .join("jobs")
+        .join(crew)
+        .join(crew_record["incarnation"].as_str().unwrap_or_default());
+    let session = match &launch_harness {
+        Some(launch) => {
+            let log = fs::read_to_string(logs.join("stdout.log")).unwrap_or_default();
+            crate::activation::read_session(launch, &log)
+        }
+        None => None,
+    };
+    let same_session = session.is_some() && launch_harness == harness;
+    // The launch's own settings come back as they were given; the run time
+    // so far is what the resumed crew's budget continues from.
+    let mut args = json!({
+        "id": id,
+        "task_id": task,
+        "_run_ms": crew_record["run_ms"].as_u64().unwrap_or(0),
+    });
+    for key in [
+        "heavy",
+        "manifest",
+        "options",
+        "config",
+        "tool_bundles",
+        "cwd",
+    ] {
+        if !launch[key].is_null() {
+            args[key] = launch[key].clone();
+        }
+    }
+    if same_session {
+        // The resumed session already holds the brief and its earlier turns.
+        args["options"]["resume"] = json!(session);
+        args["wake_only"] = json!(true);
+        args["wake"] = json!(format!(
+            "Your heavy job has settled; its outcome:\n{settled}\nContinue your task."
+        ));
+    } else {
+        let logs = store
+            .home()
+            .join("jobs")
+            .join(crew)
+            .join(crew_record["incarnation"].as_str().unwrap_or_default());
+        let last = tail(&logs.join("stdout.log"), 2 * TAIL_BYTES);
+        args["wake"] = json!(format!(
+            "You are resuming crew work after parking. Your next step was: {next}\n\
+             Its heavy job settled; its outcome:\n{settled}\n\
+             Your last actions before the park, from your log:\n{last}"
+        ));
+    }
+    match crate::dispatch(store, "agent.start", args) {
+        Ok(started) => {
+            store.connection().execute(
+                "UPDATE crew_parks SET state='resumed', resumed_job_id=?2, attempt=?3,
+                   session=?4, updated_ms=?5 WHERE id=?1",
+                params![
+                    park,
+                    started["id"].as_str().unwrap_or(&id),
+                    attempt,
+                    session,
+                    Store::now_ms()
+                ],
+            )?;
+            // The crew's record now says where its work went; it reports nothing.
+            crate::jobs::finish_resumed(store, crew, &id)?;
+        }
+        Err(error) => {
+            store.connection().execute(
+                "UPDATE crew_parks SET state='failed', attempt=?2, updated_ms=?3 WHERE id=?1",
+                params![park, attempt, Store::now_ms()],
+            )?;
+            crate::jobs::fail_parked(store, crew, &format!("resume failed: {error:#}"))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
+        "crew.park" => park(store, &args),
         "crew.report" => report(store, &args),
         "crew.answer" => answer(store, &args),
         _ => bail!("unknown crew command {command}"),
