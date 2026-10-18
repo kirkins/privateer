@@ -1708,7 +1708,7 @@ fn the_captain_reads_one_time_ordered_feed_across_homes_a_page_at_a_time() {
     );
     send(
         &web,
-        json!({"id":"w1","from":"web","to":"captain","kind":"notice","body":"Build 7 is up","payload":{"report":{"build":7}}}),
+        json!({"id":"w1","from":"web","to":"captain","kind":"notice","body":"Build 7 is up","payload":{"report":{"title":"Build 7","format":"markdown","content":"# Build 7\n\nAll green."}}}),
     );
     send(
         &apps,
@@ -1750,7 +1750,11 @@ fn the_captain_reads_one_time_ordered_feed_across_homes_a_page_at_a_time() {
     assert_eq!(entries[1]["ship"], "web");
     assert_eq!(entries[1]["home"], "web");
     assert_eq!(entries[1]["body"], "Build 7 is up");
-    assert_eq!(entries[1]["payload"]["report"]["build"], 7);
+    assert_eq!(entries[1]["payload"]["report"]["title"], "Build 7");
+    assert_eq!(
+        entries[1]["payload"]["report"]["content"],
+        "# Build 7\n\nAll green."
+    );
     assert_eq!(entries[2]["state"], "dismissed");
     assert_eq!(entries[2]["end_reason"], "done already");
     assert_eq!(entries[3]["state"], "open");
@@ -1951,6 +1955,275 @@ fn the_captain_feed_keeps_unrelated_messages_that_share_an_id() {
         ],
         "{feed}"
     );
+}
+
+/// A refused command's stderr, checked never to repeat the text it was given.
+fn refused(output: &Output, says: &str, secret: &str) {
+    let error = stderr(output);
+    assert!(!output.status.success(), "{error}");
+    assert!(error.contains(says), "{error}");
+    assert!(
+        !error.contains(secret),
+        "the error repeats the text: {error}"
+    );
+}
+
+#[test]
+fn a_report_reaches_the_captain_inline_or_stored_and_the_captain_reads_it_from_any_home() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let secret = "SECRET-REPORT-TEXT";
+    let notice = |report: Value| json!({"from":"web","to":"captain","kind":"notice","body":"Audit done","payload":{"report": report}});
+
+    // Inline, as the whole message fits mail.
+    let inline = machine.as_agent(
+        &web,
+        "web",
+        "mail.send",
+        notice(json!({"title":"Audit","format":"html","content":format!("<h1>{secret}</h1>")})),
+    );
+    assert!(inline.status.success(), "{}", stderr(&inline));
+
+    // The shape is checked, and no refusal repeats the report.
+    for (report, says) in [
+        (
+            json!({"title":"T","format":"pdf","content":secret}),
+            "format must be markdown or html",
+        ),
+        (
+            json!({"title":"T","format":"markdown","content":""}),
+            "content must be a non-empty string",
+        ),
+        (
+            json!({"format":"markdown","content":secret,"script":secret}),
+            "payload.report takes only title, format, content",
+        ),
+        (
+            json!({"title":"","format":"markdown","content":secret}),
+            "title must be a string",
+        ),
+        // The captain's portal opens no report without a title.
+        (
+            json!({"format":"markdown","content":secret}),
+            "title must be a string",
+        ),
+        (json!(secret), "payload.report must be an object"),
+    ] {
+        refused(
+            &machine.as_agent(&web, "web", "mail.send", notice(report)),
+            says,
+            secret,
+        );
+    }
+    // Past what mail carries, the sender is told to store it first.
+    let large = format!("{secret}{}", "x".repeat(70_000));
+    refused(
+        &machine.as_agent(
+            &web,
+            "web",
+            "mail.send",
+            notice(json!({"title":"T","format":"markdown","content":large})),
+        ),
+        "put a report this large with report.put",
+        secret,
+    );
+
+    // Stored with report.put (from a file, past what one argument carries),
+    // then referenced; the runtime fills in what the reference carries.
+    let html = format!(
+        "<html><body><p>{secret}</p>{}</body></html>",
+        "<i>y</i>".repeat(30_000)
+    );
+    let file = machine.root.join("audit.html");
+    fs::write(&file, &html).unwrap();
+    let put = machine.as_agent(
+        &web,
+        "web",
+        "report.put",
+        json!({"from":"web","title":"Full audit","format":"html","content_file":file}),
+    );
+    assert!(put.status.success(), "{}", stderr(&put));
+    let put: Value = serde_json::from_slice(&put.stdout).unwrap();
+    let id = put["report_id"].as_str().unwrap().to_owned();
+    assert_eq!(put["bytes"], html.len());
+    let sent = machine.as_agent(
+        &web,
+        "web",
+        "mail.send",
+        json!({"id":"audit-ref","from":"web","to":"captain","kind":"request",
+            "body":"Read the audit?","payload":{"report":{"report_id": id}}}),
+    );
+    assert!(sent.status.success(), "{}", stderr(&sent));
+    let sent: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(
+        sent["payload"]["report"],
+        json!({"report_id": id, "title": "Full audit", "format": "html", "bytes": html.len()})
+    );
+
+    // Only the author's own report, held in its home, may be referenced.
+    refused(
+        &machine.as_agent(
+            &apps,
+            "apps",
+            "mail.send",
+            json!({"from":"apps","to":"captain","kind":"notice","payload":{"report":{"report_id": id}}}),
+        ),
+        &format!("apps has no report {id} in this home"),
+        secret,
+    );
+    // A ship stores only as itself, and only a bounded report.
+    refused(
+        &machine.as_agent(
+            &web,
+            "web",
+            "report.put",
+            json!({"from":"apps","format":"markdown","content":secret}),
+        ),
+        "agent web cannot act as",
+        secret,
+    );
+    let huge = machine.root.join("huge.md");
+    fs::write(&huge, format!("{secret}{}", "z".repeat(1024 * 1024))).unwrap();
+    refused(
+        &machine.as_agent(
+            &web,
+            "web",
+            "report.put",
+            json!({"from":"web","title":"T","format":"markdown","content_file":huge}),
+        ),
+        "report content must be 1 byte to 256 KiB",
+        secret,
+    );
+
+    // The captain reads it from another home, exactly as stored.
+    let got = machine.json(&apps, "report.get", json!({"id": id}));
+    assert_eq!(got["title"], "Full audit");
+    assert_eq!(got["format"], "html");
+    assert_eq!(got["content"], html);
+    assert_eq!(got["ship"], "web");
+    // Agents cannot, even the author.
+    refused(
+        &machine.as_agent(&web, "web", "report.get", json!({"id": id})),
+        "report.get is an operator command",
+        secret,
+    );
+    let unknown = machine.run(
+        &apps,
+        &[
+            "report.get",
+            "--json",
+            &json!({"id":"report-nope"}).to_string(),
+        ],
+    );
+    refused(&unknown, "no report report-nope in the fleet", secret);
+
+    // The feed carries the inline report whole and the reference as sent.
+    let feed = machine.json(&apps, "captain.feed", json!({}));
+    let entries = feed["entries"].as_array().unwrap();
+    let inline = entries
+        .iter()
+        .find(|e| e["payload"]["report"]["title"] == "Audit")
+        .expect("the inline report is in the feed");
+    assert_eq!(
+        inline["payload"]["report"]["content"],
+        format!("<h1>{secret}</h1>")
+    );
+    let reference = entries.iter().find(|e| e["id"] == "audit-ref").unwrap();
+    assert_eq!(reference["payload"]["report"]["report_id"], id.as_str());
+    assert!(reference["payload"]["report"]["content"].is_null());
+}
+
+#[test]
+fn the_captain_annotates_a_report_in_a_reply_and_the_feed_carries_the_annotations() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let secret = "SECRET-COMMENT";
+    machine.json(
+        &web,
+        "mail.send",
+        json!({"id":"review-1","from":"web","to":"captain","kind":"request","body":"Review?",
+            "payload":{"report":{"title":"Plan","format":"markdown","content":"Ship it on Friday."}}}),
+    );
+    let reply = |annotations: Value| {
+        machine.run(
+            &apps,
+            &[
+                "captain.reply",
+                "--json",
+                &json!({"id":"review-1","body":"Notes inline","payload":{"annotations": annotations}})
+                    .to_string(),
+            ],
+        )
+    };
+    let comment = |text: &str| json!({"anchor":{"quote":"Friday"},"comment":text});
+    for (annotations, says) in [
+        (json!(secret), "payload.annotations must be an array"),
+        (
+            json!(vec![comment(secret); 101]),
+            "payload.annotations holds at most 100",
+        ),
+        (
+            json!([
+                comment("ok"),
+                comment(&format!("{secret}{}", "c".repeat(4096)))
+            ]),
+            "payload.annotations[1].comment must be a string of 1 to 4096 characters",
+        ),
+        (
+            json!([{"anchor":{"prefix":"on ","selector":"#p1"},"comment":secret}]),
+            "payload.annotations[0].anchor is {quote, prefix?, suffix?} or {selector, quote?}",
+        ),
+        (
+            json!([{"anchor":{"prefix":"on "},"comment":secret}]),
+            "payload.annotations[0].anchor.quote must be a string",
+        ),
+        (
+            json!([{"anchor":{"selector":""},"comment":secret}]),
+            "payload.annotations[0].anchor.selector must be a string",
+        ),
+        (
+            json!([{"anchor":{"quote":"Friday"},"comment":secret,"author":secret}]),
+            "payload.annotations[0] takes only anchor and comment",
+        ),
+    ] {
+        refused(&reply(annotations), says, secret);
+    }
+    let request = machine.json(&web, "mail.show", json!({"id": "review-1"}));
+    assert_eq!(request["state"], "open", "a refused reply answers nothing");
+
+    // Annotations are the captain's: a ship cannot send them.
+    refused(
+        &machine.as_agent(
+            &web,
+            "web",
+            "mail.send",
+            json!({"from":"web","to":"captain","kind":"notice","body":"x",
+                "payload":{"annotations":[comment(secret)]}}),
+        ),
+        "payload.annotations are the captain's",
+        secret,
+    );
+
+    let annotations = json!([
+        {"anchor":{"quote":"Friday","prefix":"Ship it on ","suffix":"."},"comment":"Make it Monday."},
+        {"anchor":{"selector":"h1"},"comment":"Retitle."},
+        {"anchor":{"selector":"#p1","quote":"Ship it on Friday."},"comment":"A block the captain tapped."}
+    ]);
+    let sent = reply(annotations.clone());
+    assert!(sent.status.success(), "{}", stderr(&sent));
+    let sent: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    let reply_id = sent["reply"]["id"].as_str().unwrap();
+    let feed = machine.json(&apps, "captain.feed", json!({}));
+    let entry = feed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == reply_id)
+        .expect("the captain's reply is in the feed");
+    assert_eq!(entry["correlation"], "review-1");
+    assert_eq!(entry["payload"]["annotations"], annotations);
 }
 
 fn put_first_mate(machine: &Machine, folder: &Path, ship: &str, change: impl Fn(&mut Value)) {
