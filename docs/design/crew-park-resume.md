@@ -20,7 +20,7 @@ New table `crew_parks` (in the same transaction style as `wakes`):
 
 | column | meaning |
 |---|---|
-| `id` | `park-<crew job id>-<n>` where `n` is the park count, so a replay is idempotent |
+| `id` | `park-<root crew job id>-<n>` where `root` is the lineage's first crew job and `n` is the lineage's park count, so a replay is idempotent and the id does not grow with each resume |
 | `crew_job_id`, `child_job_id`, `task_id`, `ship` | what it parks, and who owns the result |
 | `state` | `parked`, `resuming`, `resumed`, `held` (deadline with no child), `cancelled`, `failed` |
 | `next` | the one-line `next` from `crew.park` |
