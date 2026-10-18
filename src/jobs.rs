@@ -3442,6 +3442,18 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
             );
             store.authorize(&old.task_id, "recovery")?;
+            // A crew's replay keeps the route its launch was given. While that
+            // route is backing off the replay would only fail again, so a fresh
+            // crew, which takes the captain's first available route, is the way on.
+            if old.action == "spawn"
+                && old.agent_actor.is_some()
+                && let Some(route) = crate::routes::route_of_argv(&json!(old.command))
+                && let Some(refusal) = crate::routes::refusal(store, &route)?
+            {
+                bail!(
+                    "{refusal}; start a fresh crew with agent.start to take the first available route"
+                );
+            }
             let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate, "wait_for_capacity": old.wait_for_capacity, "max_wait_secs": old.max_wait_secs, "codex_read_only_crew": old.codex_read_only_crew});
             if let Some(id) = args.get("new_id") {
                 next["id"] = id.clone();

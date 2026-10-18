@@ -90,8 +90,12 @@ pub fn route_of(manifest: &str, options: &Value) -> Option<String> {
 
 /// The same route, read back from a harness job's argv
 /// (`native_launch.py HARNESS BINARY … --provider P --model M …`).
-fn route_of_argv(command: &[Value]) -> Option<String> {
-    let args: Vec<&str> = command.iter().filter_map(Value::as_str).collect();
+pub(crate) fn route_of_argv(command: &Value) -> Option<String> {
+    let args: Vec<&str> = command
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
     let at = args.iter().position(|a| a.ends_with("native_launch.py"))?;
     let harness = args.get(at + 1)?;
     let flag = |names: &[&str]| {
@@ -547,7 +551,7 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
         let route = job["model_route"]
             .as_str()
             .map(str::to_owned)
-            .or_else(|| job["command"].as_array().and_then(|c| route_of_argv(c)));
+            .or_else(|| route_of_argv(&job["command"]));
         let Some(route) = route else {
             continue;
         };

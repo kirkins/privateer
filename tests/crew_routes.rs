@@ -60,6 +60,21 @@ impl Fleet {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+    /// Wait until a job has stopped, so a retry of it is allowed.
+    fn stopped(&self, job: &str) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = self.json(None, "job.status", json!({"id":job}));
+            if !matches!(status["status"].as_str(), Some("starting" | "running")) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "{job} never stopped: {status}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
     fn command(&self, agent: Option<&str>, args: &[&str]) -> Command {
         let mut c = support::command(BIN);
         c.current_dir(self.root.join("engineering"))
@@ -481,4 +496,73 @@ fn a_route_figure_beats_the_host_setting_which_beats_the_manifest() {
     f.json(None, "job.cancel", json!({"id":"crew-asked"}));
     f.queue_drained();
     f.json(None, "job.cancel", json!({"id":"crew-manifest"}));
+}
+
+/// A captain who moves a route to the front of the crew list changes where the
+/// next crew without a route starts, even when an earlier crew on the same task
+/// ran on the route that used to be first.
+#[test]
+fn a_reordered_crew_list_starts_the_next_crew_on_its_new_first_route() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"old": codex("model-old", "free"), "new": codex("model-new", "credits")},
+        "crew": ["old", "new"]
+    }));
+    let first = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-old"}),
+    );
+    assert_eq!(f.model(&first), "model-old");
+    f.queue_drained();
+    f.routes(json!({
+        "routes": {"old": codex("model-old", "free"), "new": codex("model-new", "credits")},
+        "crew": ["new", "old"]
+    }));
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("crew: new (credits), old (free)"),
+        "{bearings}"
+    );
+    let second = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-new"}),
+    );
+    assert_eq!(f.model(&second), "model-new", "{second}");
+}
+
+/// A crew that failed on a route now backing off is not replayed on it by
+/// job.retry; a fresh crew takes the captain's first available route.
+#[test]
+fn a_retried_crew_waits_for_its_backed_off_route_and_a_fresh_crew_takes_the_first_available() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/codex"), "#!/bin/sh\nexit 1\n").unwrap();
+    f.routes(json!({
+        "routes": {"old": codex("model-old", "free"), "new": codex("model-new", "credits")},
+        "crew": ["old", "new"]
+    }));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-first"}),
+    );
+    f.stopped("crew-first");
+    f.back_off("codex/-/model-old");
+    let refusal = f.refused(
+        None,
+        "job.retry",
+        json!({"id":"crew-first","new_id":"crew-second"}),
+    );
+    assert!(refusal.contains("backing off"), "{refusal}");
+    assert!(refusal.contains("start a fresh crew"), "{refusal}");
+    let fresh = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-third"}),
+    );
+    assert_eq!(f.model(&fresh), "model-new", "{fresh}");
 }
