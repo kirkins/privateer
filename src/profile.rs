@@ -120,7 +120,13 @@ fn bundles(store: &Store, first_mate: &Value, harness: &str) -> Value {
     let Some(selected) = first_mate.get("tool_bundles") else {
         return json!({"bounded": false, "selected": null, "skills": [], "mcp_servers": []});
     };
-    let plan = match crate::tool_bundles::resolve(store, selected, "first_mate", harness) {
+    let plan = match crate::tool_bundles::resolve(
+        store,
+        selected,
+        "first_mate",
+        harness,
+        crate::plugins::Wait::Declared,
+    ) {
         Ok(plan) => plan,
         // The adapter's refusal names a bundle and field, never a value.
         Err(error) => {

@@ -369,7 +369,7 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         profile.get("config").is_none(),
         "hosted native start cannot apply plugin config"
     );
-    crate::plugins::dispatch(
+    crate::plugins::plan_launch(
         store,
         "plugin.validate",
         json!({

@@ -34,7 +34,50 @@ fn default_output() -> usize {
     65_536
 }
 
+/// Launch planning waits at least this long for a plugin, whatever the
+/// manifest declares: under load, interpreter start-up alone can exceed a
+/// 2 s manifest timeout, and a busy machine should delay a launch, not fail it.
+const LAUNCH_FLOOR_MS: u64 = 15_000;
+/// Load can stretch the wait only this far, so a hung plugin still fails a
+/// launch within a minute and the launch's own backoff takes over.
+const LAUNCH_CEILING_MS: u64 = 60_000;
+
+/// How long a plugin request may take.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Wait {
+    /// The timeout the manifest (or built-in adapter) declares.
+    Declared,
+    /// Planning a launch: the validate before a hosted first mate starts, the
+    /// command plan `agent.start` runs, and the tool bundle check either needs.
+    Launch,
+}
+
+impl Wait {
+    fn millis(self, declared: u64) -> u64 {
+        match self {
+            Wait::Declared => declared,
+            Wait::Launch => launch_wait(declared, crate::admission::load_per_cpu().unwrap_or(1.0)),
+        }
+    }
+}
+
+/// The floor (or a longer declared timeout), scaled by the one-minute load
+/// per CPU admission gates on once that passes 1, and capped by the ceiling.
+fn launch_wait(declared: u64, load_per_cpu: f64) -> u64 {
+    let base = declared.max(LAUNCH_FLOOR_MS) as f64;
+    (base * load_per_cpu.max(1.0)).min(LAUNCH_CEILING_MS as f64) as u64
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+    request(store, command, args, Wait::Declared)
+}
+
+/// The same request as `dispatch`, made to plan a launch.
+pub(crate) fn plan_launch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+    request(store, command, args, Wait::Launch)
+}
+
+fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<Value> {
     match command {
         "agent.brief" => {
             let (context, _) = task_context(store, &args)?;
@@ -94,7 +137,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 let harness = harness.context(
                     "bounded tool bundles support only the bundled Pi and Claude adapters",
                 )?;
-                let plan = crate::tool_bundles::resolve(store, selected, role, harness)?;
+                let plan = crate::tool_bundles::resolve(store, selected, role, harness, wait)?;
                 if harness == "claude" && method == "command" {
                     let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
                     crate::tool_bundles::record_plan(
@@ -117,6 +160,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 &manifest,
                 manifest_path.parent().context("manifest needs parent")?,
                 request,
+                wait,
             )?;
             ensure!(
                 response["version"] == 1 && response["id"] == id,
@@ -158,6 +202,7 @@ pub(crate) fn bundle_request(
     directory: &Path,
     registry: &Value,
     selected: Option<(&Value, &str, &str)>,
+    wait: Wait,
 ) -> Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
     let mut request = json!({"id":id,"version":1,"method":"validate","registry":registry});
@@ -177,7 +222,7 @@ pub(crate) fn bundle_request(
         timeout_ms: 5_000,
         max_output_bytes: 32_768,
     };
-    let response = invoke(&manifest, directory, serde_json::to_vec(&request)?)?;
+    let response = invoke(&manifest, directory, serde_json::to_vec(&request)?, wait)?;
     ensure!(
         response["id"] == id && response["version"] == 1,
         "bounded resource validation failed; inspect approved registry locally"
@@ -459,7 +504,12 @@ fn reader<R: Read + Send + 'static>(mut pipe: R, stderr: bool, tx: mpsc::SyncSen
         }
     });
 }
-fn invoke(manifest: &Manifest, directory: &Path, mut request: Vec<u8>) -> Result<Value> {
+fn invoke(
+    manifest: &Manifest,
+    directory: &Path,
+    mut request: Vec<u8>,
+    wait: Wait,
+) -> Result<Value> {
     request.push(b'\n');
     let mut command = Command::new(&manifest.executable[0]);
     command
@@ -488,14 +538,15 @@ fn invoke(manifest: &Manifest, directory: &Path, mut request: Vec<u8>) -> Result
             let _ = tx.send(ReadEvent::Failure);
         }
     });
-    let deadline = Instant::now() + Duration::from_millis(manifest.timeout_ms);
+    let limit = wait.millis(manifest.timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(limit);
     let mut stdout = Vec::new();
     let mut bytes = 0;
     let mut ended = 0;
     let result = (|| -> Result<Value> {
         loop {
             if Instant::now() >= deadline {
-                bail!("plugin request timed out");
+                bail!("plugin request timed out after {limit} ms");
             }
             match rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(ReadEvent::Chunk(stderr, chunk)) => {
@@ -541,4 +592,59 @@ fn invoke(manifest: &Manifest, directory: &Path, mut request: Vec<u8>) -> Result
     }
     let _ = child.wait();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_wait_has_a_floor_grows_with_load_and_stays_under_the_ceiling() {
+        // A 2 s manifest still gets the floor on an idle machine.
+        assert_eq!(launch_wait(2_000, 0.2), LAUNCH_FLOOR_MS);
+        assert_eq!(launch_wait(2_000, f64::NAN), LAUNCH_FLOOR_MS);
+        // A longer declared timeout is the base the load scales.
+        assert_eq!(launch_wait(20_000, 1.0), 20_000);
+        assert_eq!(launch_wait(2_000, 2.0), 2 * LAUNCH_FLOOR_MS);
+        let mut last = 0;
+        for load in [1.0, 1.5, 2.5, 3.5, 8.0, 100.0, f64::INFINITY] {
+            let wait = launch_wait(2_000, load);
+            assert!(wait >= last && wait <= LAUNCH_CEILING_MS, "{load}: {wait}");
+            last = wait;
+        }
+        assert_eq!(last, LAUNCH_CEILING_MS);
+        assert_eq!(launch_wait(30_000, 100.0), LAUNCH_CEILING_MS);
+        assert_eq!(Wait::Declared.millis(2_000), 2_000);
+        assert!(Wait::Launch.millis(2_000) >= LAUNCH_FLOOR_MS);
+    }
+
+    /// A real subprocess that answers after its declared timeout but well
+    /// within the launch floor.
+    #[test]
+    fn a_slow_plugin_fails_an_ordinary_request_but_not_a_launch_plan() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let script = directory.path().join("slow.py");
+        fs::write(
+            &script,
+            "import json,sys,time\nr=json.loads(sys.stdin.readline())\ntime.sleep(1.5)\nprint(json.dumps({'id':r['id'],'version':1,'ok':True}))\n",
+        )
+        .unwrap();
+        let manifest = Manifest {
+            schema_version: 1,
+            id: "slow".into(),
+            kind: None,
+            executable: vec!["python3".into(), script.to_string_lossy().into()],
+            timeout_ms: 300,
+            max_output_bytes: 4_096,
+        };
+        let request = || serde_json::to_vec(&json!({"id": "r1", "version": 1})).unwrap();
+        let error = invoke(&manifest, directory.path(), request(), Wait::Declared).unwrap_err();
+        assert!(
+            error.to_string().contains("timed out after 300 ms"),
+            "{error}"
+        );
+        let response = invoke(&manifest, directory.path(), request(), Wait::Launch).unwrap();
+        assert_eq!(response["id"], "r1");
+        assert_eq!(response["ok"], true);
+    }
 }

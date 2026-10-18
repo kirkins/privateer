@@ -44,19 +44,30 @@ fn load(store: &Store) -> Result<Value> {
 
 /// Use the same bounded, redacting adapter protocol as harness planning. This
 /// does not run a harness or read any native credential store.
-fn qualify(registry: &Value, selected: Option<(&Value, &str, &str)>) -> Result<Value> {
+fn qualify(
+    registry: &Value,
+    selected: Option<(&Value, &str, &str)>,
+    wait: crate::plugins::Wait,
+) -> Result<Value> {
     let manifest = crate::bundled::resolve("bundled:pi")?;
     let directory = manifest
         .parent()
         .context("Pi plugin directory")?
         .parent()
         .context("plugin directory")?;
-    crate::plugins::bundle_request(directory, registry, selected)
+    crate::plugins::bundle_request(directory, registry, selected, wait)
 }
 
-pub(crate) fn resolve(store: &Store, selected: &Value, role: &str, harness: &str) -> Result<Value> {
+/// `wait` is `Launch` when the plan feeds a harness about to start.
+pub(crate) fn resolve(
+    store: &Store,
+    selected: &Value,
+    role: &str,
+    harness: &str,
+    wait: crate::plugins::Wait,
+) -> Result<Value> {
     selection(selected)?;
-    let result = qualify(&load(store)?, Some((selected, role, harness)))?;
+    let result = qualify(&load(store)?, Some((selected, role, harness)), wait)?;
     result
         .get("plan")
         .cloned()
@@ -75,9 +86,15 @@ fn digest(plan: &Value) -> String {
 pub(crate) fn session_digest(store: &Store, profile: &Value) -> Option<String> {
     let selected = profile.get("tool_bundles")?;
     (crate::activation::harness_id(profile) == "claude").then_some(())?;
-    resolve(store, selected, "first_mate", "claude")
-        .ok()
-        .map(|plan| digest(&plan))
+    resolve(
+        store,
+        selected,
+        "first_mate",
+        "claude",
+        crate::plugins::Wait::Launch,
+    )
+    .ok()
+    .map(|plan| digest(&plan))
 }
 
 /// Record a bounded Claude launch's plan digest with its wake or errand, so
@@ -125,7 +142,7 @@ pub(crate) fn configure(store: &mut Store, args: Value) -> Result<Value> {
         serde_json::to_vec(registry)?.len() <= 48 * 1024,
         "bundle registry too large"
     );
-    qualify(registry, None)?;
+    qualify(registry, None, crate::plugins::Wait::Declared)?;
     // A name/version cannot be retargeted. Operators must publish a new ref
     // when content, path or roles change, even if an old ref was deselected.
     let tx = store.connection().unchecked_transaction()?;
