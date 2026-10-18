@@ -1,7 +1,7 @@
 //! Reports for the captain, and the captain's annotations on them.
 //!
 //! A ship hands the captain a report on mail addressed to the captain, as
-//! `payload.report`: inline as `{title?, format, content}` while the whole
+//! `payload.report`: inline as `{title, format, content}` while the whole
 //! message fits mail's 64 KiB, or else stored first with `report.put` and
 //! referenced as `{report_id}`, which the runtime fills in with the stored
 //! title, format and size. `report.put` takes the content inline or, past what
@@ -21,8 +21,8 @@ use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 
 const FORMATS: &[&str] = &["markdown", "html"];
-/// A stored report's content.
-const MAX_CONTENT_BYTES: usize = 1024 * 1024;
+/// A stored report's content: what the captain's portal will show.
+const MAX_CONTENT_BYTES: usize = 256 * 1024;
 const MAX_TITLE_CHARS: usize = 200;
 /// Stored reports kept per ship; the oldest beyond this are removed.
 const KEEP_PER_SHIP: i64 = 200;
@@ -40,9 +40,10 @@ pub fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// A report's title: required, since the captain's portal opens none without one.
 fn title(report: &Value) -> Result<Option<&str>> {
     match report.get("title").filter(|v| !v.is_null()) {
-        None => Ok(None),
+        None => bail!("report title must be a string of 1 to {MAX_TITLE_CHARS} characters"),
         Some(title) => {
             let title = title
                 .as_str()
@@ -99,7 +100,7 @@ fn put(store: &Store, args: &Value) -> Result<Value> {
     };
     ensure!(
         !content.is_empty() && content.len() <= MAX_CONTENT_BYTES,
-        "report content must be 1 byte to 1 MiB"
+        "report content must be 1 byte to 256 KiB"
     );
     let id = format!("report-{}", uuid::Uuid::new_v4());
     let now = Store::now_ms();
@@ -146,7 +147,7 @@ fn read_content(path: &Value) -> Result<String> {
         .read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() <= MAX_CONTENT_BYTES,
-        "report content must be 1 byte to 1 MiB"
+        "report content must be 1 byte to 256 KiB"
     );
     String::from_utf8(bytes)
         .ok()
@@ -229,7 +230,7 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 /// Check `payload.report` on mail to the captain, and fill a stored report's
 /// reference with its title, format and size. A report is inline
-/// `{title?, format, content}` or a reference `{report_id}` to a report the
+/// `{title, format, content}` or a reference `{report_id}` to a report the
 /// sender put in this home. Mail to anyone else keeps its payload as given.
 pub(crate) fn check_report(store: &Store, from: &str, to: &str, payload: &mut Value) -> Result<()> {
     if to != crate::mail::CAPTAIN {
@@ -278,7 +279,7 @@ fn only(object: &Map<String, Value>, keys: &[&str]) -> Result<()> {
 }
 
 /// Check the captain's `payload.annotations`: at most 100, each
-/// `{anchor: {quote, prefix?, suffix?} | {selector}, comment}`. Errors name
+/// `{anchor: {quote, prefix?, suffix?} | {selector, quote?}, comment}`. Errors name
 /// the annotation by position and never repeat its text.
 pub(crate) fn check_annotations(from: &str, kind: &str, payload: &Value) -> Result<()> {
     let Some(annotations) = payload.get("annotations") else {
@@ -319,16 +320,17 @@ pub(crate) fn check_annotations(from: &str, kind: &str, payload: &Value) -> Resu
             .get("anchor")
             .and_then(Value::as_object)
             .with_context(|| format!("{at}.anchor must be an object"))?;
+        // A block the captain taps is its selector, with its text as the quote.
         let keys: &[&str] = if anchor.contains_key("selector") {
-            &["selector"]
+            &["selector", "quote"]
         } else {
             &["quote", "prefix", "suffix"]
         };
         ensure!(
             anchor.keys().all(|k| keys.contains(&k.as_str())),
-            "{at}.anchor is {{quote, prefix?, suffix?}} or {{selector}}"
+            "{at}.anchor is {{quote, prefix?, suffix?}} or {{selector, quote?}}"
         );
-        let first = if keys == ["selector"] {
+        let first = if anchor.contains_key("selector") {
             "selector"
         } else {
             "quote"
@@ -337,6 +339,14 @@ pub(crate) fn check_annotations(from: &str, kind: &str, payload: &Value) -> Resu
             bounded(anchor.get(first), MAX_ANCHOR_CHARS),
             "{at}.anchor.{first} must be a string of 1 to {MAX_ANCHOR_CHARS} characters"
         );
+        if first == "selector"
+            && let Some(quote) = anchor.get("quote")
+        {
+            ensure!(
+                bounded(Some(quote), MAX_ANCHOR_CHARS),
+                "{at}.anchor.quote must be a string of 1 to {MAX_ANCHOR_CHARS} characters"
+            );
+        }
         for optional in ["prefix", "suffix"] {
             if let Some(value) = anchor.get(optional) {
                 ensure!(

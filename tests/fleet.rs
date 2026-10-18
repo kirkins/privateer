@@ -1988,11 +1988,11 @@ fn a_report_reaches_the_captain_inline_or_stored_and_the_captain_reads_it_from_a
     // The shape is checked, and no refusal repeats the report.
     for (report, says) in [
         (
-            json!({"format":"pdf","content":secret}),
+            json!({"title":"T","format":"pdf","content":secret}),
             "format must be markdown or html",
         ),
         (
-            json!({"format":"markdown","content":""}),
+            json!({"title":"T","format":"markdown","content":""}),
             "content must be a non-empty string",
         ),
         (
@@ -2001,6 +2001,11 @@ fn a_report_reaches_the_captain_inline_or_stored_and_the_captain_reads_it_from_a
         ),
         (
             json!({"title":"","format":"markdown","content":secret}),
+            "title must be a string",
+        ),
+        // The captain's portal opens no report without a title.
+        (
+            json!({"format":"markdown","content":secret}),
             "title must be a string",
         ),
         (json!(secret), "payload.report must be an object"),
@@ -2018,7 +2023,7 @@ fn a_report_reaches_the_captain_inline_or_stored_and_the_captain_reads_it_from_a
             &web,
             "web",
             "mail.send",
-            notice(json!({"format":"markdown","content":large})),
+            notice(json!({"title":"T","format":"markdown","content":large})),
         ),
         "put a report this large with report.put",
         secret,
@@ -2085,9 +2090,9 @@ fn a_report_reaches_the_captain_inline_or_stored_and_the_captain_reads_it_from_a
             &web,
             "web",
             "report.put",
-            json!({"from":"web","format":"markdown","content_file":huge}),
+            json!({"from":"web","title":"T","format":"markdown","content_file":huge}),
         ),
-        "report content must be 1 byte to 1 MiB",
+        "report content must be 1 byte to 256 KiB",
         secret,
     );
 
@@ -2167,8 +2172,8 @@ fn the_captain_annotates_a_report_in_a_reply_and_the_feed_carries_the_annotation
             "payload.annotations[1].comment must be a string of 1 to 4096 characters",
         ),
         (
-            json!([{"anchor":{"quote":"Friday","selector":"#p1"},"comment":secret}]),
-            "payload.annotations[0].anchor is {quote, prefix?, suffix?} or {selector}",
+            json!([{"anchor":{"prefix":"on ","selector":"#p1"},"comment":secret}]),
+            "payload.annotations[0].anchor is {quote, prefix?, suffix?} or {selector, quote?}",
         ),
         (
             json!([{"anchor":{"prefix":"on "},"comment":secret}]),
@@ -2203,7 +2208,8 @@ fn the_captain_annotates_a_report_in_a_reply_and_the_feed_carries_the_annotation
 
     let annotations = json!([
         {"anchor":{"quote":"Friday","prefix":"Ship it on ","suffix":"."},"comment":"Make it Monday."},
-        {"anchor":{"selector":"h1"},"comment":"Retitle."}
+        {"anchor":{"selector":"h1"},"comment":"Retitle."},
+        {"anchor":{"selector":"#p1","quote":"Ship it on Friday."},"comment":"A block the captain tapped."}
     ]);
     let sent = reply(annotations.clone());
     assert!(sent.status.success(), "{}", stderr(&sent));
