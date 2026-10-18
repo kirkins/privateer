@@ -325,3 +325,86 @@ fn agent_role_travels_to_the_remote_home() {
         assert_eq!(call("message.inbox", json!({"actor":"apps"}))["ok"], true);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_correction_reaches_the_thread_its_sender_home_never_stored() {
+    let fixture = TempDir::new().unwrap();
+    let home = fixture.path().join("privateer");
+    let remote = fixture.path().join("fitforge");
+    // Each home reaches the other, as two machines on one machine do.
+    put(&home, &remote, None, 10_000, 1_048_576, Path::new(binary()));
+    put(&remote, &home, None, 10_000, 1_048_576, Path::new(binary()));
+    for (this, other) in [(&home, "forge"), (&remote, "rig")] {
+        ok(
+            this,
+            "ship.put",
+            json!({"name":"rig","scope":"deploys"}),
+            None,
+        );
+        ok(
+            this,
+            "ship.put",
+            json!({"name":"forge","scope":"forges"}),
+            None,
+        );
+        ok(
+            this,
+            "ship.put",
+            json!({"name":other,"scope":"other","location":{"peer":"infrastructure"}}),
+            None,
+        );
+    }
+    // rig asks the captain, so the parent request lives only in this home.
+    ok(
+        &home,
+        "mail.send",
+        json!({"id":"baf32096","from":"rig","to":"captain","kind":"request",
+        "body":"Which machine can I use?"}),
+        None,
+    );
+    // rig raises a follow-up on that answer, naming the request it grows from.
+    let follow_up = ok(
+        &home,
+        "mail.send",
+        json!({"id":"e376ceec","from":"rig","to":"forge","kind":"request",
+        "because_of":"baf32096","body":"Release the laptop"}),
+        None,
+    );
+    assert_eq!(follow_up["because_of"], "baf32096");
+    // The link carries the follow-up and its link, which is how the other
+    // home reads it.
+    let held = ok(&remote, "mail.show", json!({"id":"e376ceec"}), None);
+    assert_eq!(held["because_of"], "baf32096");
+    assert_eq!(held["correlation"], json!(null));
+    // fitforge corrects the thread it never stored: the parent request is in
+    // another home, and a low notice that names it is still delivered.
+    let correction = ok(
+        &remote,
+        "mail.send",
+        json!({"id":"correction","from":"forge","to":"rig","kind":"notice","urgency":"low",
+        "correlation":"baf32096","body":"Correction: the desktop is free"}),
+        None,
+    );
+    assert_eq!(correction["delivery"], "delivered");
+    // rig holds the correction in its own home, and it is actionable: the
+    // follow-up rig raised there is still open.
+    let pending = ok(&home, "mail.pending", json!({"address":"rig"}), None);
+    assert_eq!(pending["actionable"], 1);
+    let arrived = ok(&home, "mail.show", json!({"id":"correction"}), None);
+    assert_eq!(arrived["correlation"], "baf32096");
+    assert_eq!(arrived["urgency"], "low");
+    // A reply naming that same unknown thread is refused where it is written:
+    // the other home cannot judge an answer it holds no request for.
+    assert!(
+        !run(
+            &remote,
+            "mail.send",
+            json!({"id":"answer","from":"forge","to":"rig","kind":"reply",
+            "correlation":"baf32096","body":"Done"}),
+            None,
+        )
+        .status
+        .success()
+    );
+}

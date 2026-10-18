@@ -261,6 +261,128 @@ fn routine_notices_wait_for_the_next_real_wake() {
 }
 
 #[test]
+fn a_correction_in_the_thread_of_an_open_follow_up_wakes_the_ship_that_raised_it() {
+    // The stow incident, replayed: the machine is held for an update, a ship
+    // asks it something, this ship answers and raises a follow-up on the
+    // answer, and the asking ship corrects itself later in that thread. The
+    // correction is a low notice, and it must still reach a ship with the
+    // follow-up open: nothing else in its mailbox is wake-worthy.
+    let mut fleet = Fleet::new(now_settings());
+    // A stow is one machine's hold in the fleet registry, which the fixture
+    // does not write: name this home's ship there so the hold has someone to
+    // ask, exactly as `ship.create` would have.
+    rusqlite::Connection::open(fleet.root.join("fleet.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
+        )
+        .unwrap();
+    rusqlite::Connection::open(fleet.root.join("fleet.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO ships(name,home,created_by,created_ms) VALUES('infra',?1,'privateer',0)",
+            [fleet.home.to_str().unwrap()],
+        )
+        .unwrap();
+    fleet.send(json!({"id":"baf32096","from":"apps","to":"infra",
+        "kind":"request","body":"Which machine should I deploy on?"}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    let answered = fleet.ok("mail.show", json!({"id":"baf32096"}), None);
+    assert_eq!(answered["state"], "answered");
+    let stow = fleet.ok("stow.start", json!({}), None)["stow"].clone();
+    // The hold asks every ship to stow in its own mailbox, which is a wake of
+    // its own; settle that so the correction below is the only reason to wake.
+    let asked = fleet.wakes().len();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fleet.wakes().len() == asked {
+        fleet.tick();
+        assert!(
+            Instant::now() < deadline,
+            "the stow request never woke the first mate"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    let follow_up = fleet.send(
+        json!({"id":"e376ceec","from":"infra","to":"captain","kind":"request",
+            "because_of":"baf32096","body":"Can you release the laptop for the deploy?",
+            "payload":{"depends_on":{"stow":stow}}}),
+    );
+    assert_eq!(follow_up["because_of"], "baf32096");
+    // The follow-up waits on the captain, who is not this ship: quiet.
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "nothing wake-worthy"
+    );
+    // apps corrects itself in the thread it opened, as a low notice.
+    fleet.send(
+        json!({"id":"correction","from":"apps","to":"infra","kind":"notice","urgency":"low",
+            "correlation":"baf32096","body":"Correction: the desktop is free after all"}),
+    );
+    let woke = Fleet::infra(&fleet.tick());
+    assert_eq!(woke["status"], "running", "{woke}");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    let prompt = fleet.prompts().last().unwrap().clone();
+    assert!(prompt.contains("id correction"), "{prompt}");
+    // The wake says which open request the correction concerns.
+    assert!(prompt.contains("e376ceec"), "{prompt}");
+    assert!(prompt.contains("mail.withdraw"), "{prompt}");
+    // The ship withdraws the follow-up it no longer needs.
+    fleet.ok(
+        "mail.withdraw",
+        json!({"id":"e376ceec","reason":"the desktop was free"}),
+        Some("infra"),
+    );
+    assert_eq!(
+        fleet.ok("mail.show", json!({"id":"e376ceec"}), None)["state"],
+        "withdrawn"
+    );
+    // A later low notice in the same thread is background again.
+    fleet.send(
+        json!({"id":"later","from":"apps","to":"infra","kind":"notice","urgency":"low",
+            "correlation":"baf32096","body":"And the desktop is busy now"}),
+    );
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "nothing wake-worthy"
+    );
+}
+
+#[test]
+fn a_correction_still_waits_for_the_batch_window_and_the_wake_budget() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.send(json!({"id":"parent","from":"apps","to":"infra",
+        "kind":"request","body":"Which machine should I deploy on?"}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    fleet.settle();
+    fleet.send(
+        json!({"id":"follow-up","from":"infra","to":"captain","kind":"request",
+        "because_of":"parent","body":"Can you release the laptop?"}),
+    );
+    fleet.configure(json!({"batch_secs":3600,"max_delay_secs":3600}));
+    fleet.send(
+        json!({"id":"correction","from":"apps","to":"infra","kind":"notice","urgency":"low",
+        "correlation":"parent","body":"Correction: the desktop is free"}),
+    );
+    // Wake-worthy, but it is ordinary mail for the batch window.
+    assert_eq!(Fleet::infra(&fleet.tick())["skipped"], "batching");
+    // The budget still counts it: one wake has been spent on the parent.
+    fleet.configure(json!({"batch_secs":0,"max_delay_secs":0,"max_wakes_per_hour":2}));
+    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    fleet.settle();
+    fleet.send(
+        json!({"id":"later","from":"apps","to":"infra","kind":"notice","urgency":"low",
+        "correlation":"parent","body":"And the desktop is busy now"}),
+    );
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "hourly wake budget spent"
+    );
+}
+
+#[test]
 fn actionable_mail_after_a_full_routine_page_keeps_contiguous_wake_coverage() {
     let mut fleet = Fleet::new(json!({"batch_secs":0,"max_delay_secs":0,"max_wakes_per_hour":1}));
     for n in 0..205 {
