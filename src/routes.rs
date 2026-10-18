@@ -692,14 +692,34 @@ pub fn throttle(log: &str) -> Option<String> {
 
 /// When a route may be used again, and why it may not now.
 pub fn blocked(conn: &Connection, route: &str) -> Result<Option<(i64, String)>> {
+    blocked_at(conn, route, Store::now_ms())
+}
+
+/// `blocked` as of `now`.
+pub(crate) fn blocked_at(
+    conn: &Connection,
+    route: &str,
+    now: i64,
+) -> Result<Option<(i64, String)>> {
     Ok(conn
         .query_row(
             "SELECT until_ms, COALESCE(last_error,'') FROM model_routes
              WHERE route IN (?1, ?3) AND until_ms > ?2 ORDER BY until_ms DESC LIMIT 1",
-            params![route, Store::now_ms(), account_key(route)],
+            params![route, now, account_key(route)],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
+}
+
+/// Every ledger key held off as of `now`, a route or an account (`…/*`), with
+/// when it clears and its classified error, in key order.
+pub(crate) fn held(conn: &Connection, now: i64) -> Result<Vec<(String, i64, String)>> {
+    let mut statement = conn.prepare(
+        "SELECT route, until_ms, COALESCE(last_error,'') FROM model_routes
+         WHERE until_ms > ?1 ORDER BY route",
+    )?;
+    let rows = statement.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// A refusal message for a backed-off or capped route, or None when it is clear.

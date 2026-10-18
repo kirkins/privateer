@@ -777,6 +777,21 @@ pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
     recover_resuming(store)
 }
 
+/// `park N of M`: the parks a crew lineage has made against its charter's cap.
+pub(crate) fn park_count(store: &Store, root: &str, task: &str) -> Result<String> {
+    let parks: i64 = store.connection().query_row(
+        "SELECT COUNT(*) FROM crew_parks WHERE root=?1",
+        [root],
+        |r| r.get(0),
+    )?;
+    let max = store
+        .authorize(task, "spawn")
+        .ok()
+        .and_then(|charter| charter.get("crew_max_parks").and_then(Value::as_u64))
+        .unwrap_or(MAX_PARKS);
+    Ok(format!("park {parks} of {max}"))
+}
+
 /// Why a crew may no longer park: the elapsed cap, or the park count. A new
 /// park needs a count under the cap; a parked crew only ends when the charter
 /// has since lowered the cap below the parks it already has. `None` while it
@@ -1191,17 +1206,7 @@ pub(crate) fn parked_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     let mut lines = vec![];
     for row in rows {
         let (crew, child, next, state, task, root) = row?;
-        let parks: i64 = store.connection().query_row(
-            "SELECT COUNT(*) FROM crew_parks WHERE root=?1",
-            [&root],
-            |r| r.get(0),
-        )?;
-        let max = store
-            .authorize(&task, "spawn")
-            .ok()
-            .and_then(|charter| charter.get("crew_max_parks").and_then(Value::as_u64))
-            .unwrap_or(MAX_PARKS);
-        let count = format!("park {parks} of {max}");
+        let count = park_count(store, &root, &task)?;
         lines.push(if state == "held" {
             format!(
                 "Crew {crew} is held at its time budget with no heavy job outstanding ({count}); crew.resume {{\"task_id\":\"{task}\"}} continues it."

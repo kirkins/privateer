@@ -41,6 +41,7 @@ mod reply;
 pub mod routes;
 pub mod scheduling;
 pub mod service;
+mod snapshot;
 pub mod store;
 pub mod stow;
 mod tool_bundles;
@@ -94,6 +95,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "captain.dismiss",
     "captain.feed",
     "ship.profile",
+    "fleet.snapshot",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
@@ -144,6 +146,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "plugin" => plugins::dispatch(store, command, args),
         "workspace" => workspace::dispatch(store, command, args),
         "ship" if command == "ship.bearings" => context::dispatch(store, command, args),
+        "fleet" if command == "fleet.snapshot" => {
+            store.caller().require_operator(command)?;
+            snapshot::snapshot(&args)
+        }
         "fleet" => fleet::dispatch(store, command, args),
         "machine" => machines::dispatch(store, command, args),
         "grant" => grants::dispatch(store, command, args),

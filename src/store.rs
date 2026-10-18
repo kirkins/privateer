@@ -209,9 +209,11 @@ impl Store {
                 ))?;
             }
         }
-        // Inbox reads look messages up by recipient instead of scanning events.
+        // Inbox reads look messages up by recipient instead of scanning events;
+        // `fleet.snapshot` finds a ship's open tasks by owner and status.
         migrate.execute_batch(
-            "CREATE INDEX IF NOT EXISTS event_recipient ON events(json_extract(payload,'$.to'),seq) WHERE kind='message';",
+            "CREATE INDEX IF NOT EXISTS event_recipient ON events(json_extract(payload,'$.to'),seq) WHERE kind='message';
+             CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, status);",
         )?;
         migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;

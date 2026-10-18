@@ -122,6 +122,10 @@ struct Job {
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     hosted: bool,
+    /// When the supervisor spawned the payload; absent for jobs recorded
+    /// before it was kept, and until the payload runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spawned_ms: Option<i64>,
     /// A harness job's `harness/provider/model`, for provider backoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_route: Option<String>,
@@ -330,6 +334,11 @@ pub fn init(store: &Store) -> Result<()> {
            created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);",
     )?;
+    // Live jobs, newest first, without reading every record (`fleet.snapshot`).
+    store.connection().execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS jobs_live ON jobs(json_extract(record,'$.created_ms'))
+         WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL};"
+    ))?;
     // The process that claimed a park's resume, so recovery leaves a launch
     // that is still in flight alone (added after the table first shipped).
     let claimer: bool = store.connection().query_row(
@@ -706,12 +715,25 @@ fn longest_recorded_run(
 /// like ordinary work. Reads only the shared ledger and live processes, so
 /// any home on this machine may ask; nothing is released or changed.
 pub(crate) fn capacity_holders(store: &Store) -> Result<Vec<Holder>> {
+    capacity_holders_waiting(store, Duration::from_secs(5))
+}
+
+/// The host ledger opened read-only, waiting at most `busy` on a writer;
+/// None when the ledger has never been written.
+pub(crate) fn ledger_readonly(store: &Store, busy: Duration) -> Result<Option<Connection>> {
     let path = ledger_dir(store)?.join("resources.sqlite");
     if !path.is_file() {
-        return Ok(vec![]);
+        return Ok(None);
     }
     let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.busy_timeout(busy)?;
+    Ok(Some(conn))
+}
+/// `capacity_holders`, waiting at most `busy` for a writer holding the ledger.
+pub(crate) fn capacity_holders_waiting(store: &Store, busy: Duration) -> Result<Vec<Holder>> {
+    let Some(conn) = ledger_readonly(store, busy)? else {
+        return Ok(vec![]);
+    };
     let now = Store::now_ms();
     let mut holders = vec![];
     for r in reservations(&conn)? {
@@ -1552,6 +1574,9 @@ fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<(
     );
     Ok(())
 }
+/// `terminal` as an SQL list. A query must repeat the `jobs_live` condition
+/// with it word for word for SQLite to use that index.
+pub(crate) const TERMINAL_SQL: &str = "('succeeded','failed','cancelled','timed_out','resumed')";
 fn terminal(status: &str) -> bool {
     // `resumed`: a parked crew whose work moved to the job its park resumed.
     matches!(
@@ -1972,6 +1997,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .and_then(Value::as_str)
             .map(str::to_owned),
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
+        spawned_ms: None,
         model_route: args
             .get("model_route")
             .and_then(Value::as_str)
@@ -2818,6 +2844,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     job = alter(store, id, |j| {
         j.payload = Some(payload.clone());
         j.status = "running".into();
+        j.spawned_ms = Some(Store::now_ms());
     })?;
     update_reservation(store, &job)?;
     drop(workspace_lock);

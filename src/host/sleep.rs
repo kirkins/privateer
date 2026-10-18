@@ -77,8 +77,9 @@ pub(crate) fn sleep(
     }
     let asleep = format!("{}{}", crate::presence::HOSTED, uuid::Uuid::new_v4());
     tx.execute(
-        "UPDATE presence SET holder=?3 WHERE ship=?1 AND holder=?2",
-        params![ship, holder, asleep],
+        "UPDATE presence SET holder=?3, asleep_holder=?3, asleep_since_ms=?4
+         WHERE ship=?1 AND holder=?2",
+        params![ship, holder, asleep, crate::store::Store::now_ms()],
     )?;
     // Launch backoff follows the session from one holder to the next.
     tx.execute(
@@ -148,6 +149,10 @@ pub(crate) fn asleep_at_start(store: &Store, ship: &str, holder: &str) -> Result
             |r| r.get(0),
         )?,
     };
+    store.connection().execute(
+        "UPDATE presence SET asleep_holder=?2, asleep_since_ms=?3 WHERE ship=?1 AND holder=?2",
+        params![ship, holder, crate::store::Store::now_ms()],
+    )?;
     store.audit(
         "host.slept",
         &json!({"ship": ship, "idle_secs": 0, "through_seq": through_seq}),
@@ -164,6 +169,11 @@ pub(crate) fn woke(
     reason: &str,
     continuation: Option<crate::host::Conversation>,
 ) {
+    // The pane keeps its holder when it takes the harness back.
+    let _ = store.connection().execute(
+        "UPDATE presence SET asleep_holder=NULL, asleep_since_ms=NULL WHERE ship=?1",
+        [ship],
+    );
     let _ = store.audit(
         "host.woke",
         &json!({"ship": ship, "reason": reason,
