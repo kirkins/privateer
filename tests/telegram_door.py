@@ -306,6 +306,27 @@ def main() -> int:
             shown = fleet.call("ops", "mail.show", {"id": early["id"]})
             assert shown["state"] == "answered", shown
 
+            # A report shows its title and that it is in the portal; its
+            # content, inline or stored, never reaches the chat.
+            fleet.call("ops", "mail.send", {
+                "from": "ops", "to": "captain", "kind": "notice",
+                "payload": {"report": {"title": "Weekly audit", "format": "html",
+                                       "content": "<h1>SECRET-INLINE</h1><script>x()</script>"}}})
+            stored = fleet.call("ops", "report.put", {"from": "ops", "title": "Full audit",
+                                                      "format": "markdown",
+                                                      "content": "# SECRET-STORED"})
+            fleet.call("ops", "mail.send", {
+                "from": "ops", "to": "captain", "kind": "notice", "body": "Sign off the audit?",
+                "payload": {"report": {"report_id": stored["report_id"]}}})
+            inline = wait_for("the inline report's title", lambda: [
+                m for m in telegram.sent() if "Weekly audit" in m["text"]])[0]
+            assert "read it in the portal" in inline["text"], inline
+            referenced = wait_for("the stored report's title", lambda: [
+                m for m in telegram.sent() if "Sign off the audit?" in m["text"]])[0]
+            assert "Full audit" in referenced["text"] and "portal" in referenced["text"], referenced
+            for sent in telegram.sent():
+                assert "SECRET" not in sent["text"] and "script" not in sent["text"], sent
+
             # Strangers are not heard, even in the right chat.
             telegram.message("rm -rf everything", user=666)
             telegram.message("hello from elsewhere", chat=99)

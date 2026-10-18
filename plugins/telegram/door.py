@@ -14,6 +14,8 @@ owns no fleet state; it translates.
 - A typed decision (payload.decision) shows its question, why, what is blocked
   and each option. A button answers with its option id; a typed reply to the
   card answers with free text.
+- A report (payload.report) shows its title and that it is in the portal; its
+  content, inline or stored, is never sent to the chat.
 - /status, /ships and /waiting answer from records, waking no one.
 
 Telegram is the trust boundary: only the configured chat, and when set only
@@ -238,13 +240,19 @@ class Door:
         # Only a decision message carries a typed card; other mail may use the
         # same payload key for its own data.
         decision = (mail.get("payload") or {}).get("decision") if kind == "decision" else None
+        # A report is read in the captain's portal: the chat says it is there,
+        # by title, and never carries its content (HTML least of all).
+        report = payload.get("report") if isinstance(payload.get("report"), dict) else None
         if isinstance(decision, dict):
             try:
                 body = decision_text(decision, body)
             except (AttributeError, TypeError, ValueError, KeyError) as exc:
                 tg.log(f"decision card of {mail.get('id')} could not be shown ({exc}); sending its text")
-        elif not body:
-            body = "```json\n" + json.dumps(mail.get("payload") or {}, indent=2) + "\n```"
+        elif not body and report is None:
+            body = "```json\n" + json.dumps(payload, indent=2) + "\n```"
+        if report is not None:
+            line = report_line(report)
+            body = f"{body}\n\n{line}" if body else line
         if event.get("step"):
             # The exact thing only the captain can do, ahead of the request's words.
             body = f"**Your hands:** {event['step']}\n\n{body}"
@@ -893,6 +901,13 @@ def decision_text(decision: dict, body: str) -> str:
     if body:
         parts.append(body)
     return "\n\n".join(part for part in parts if part)
+
+
+def report_line(report: dict) -> str:
+    """Where a report is: its title, and that it is in the portal."""
+    title = report.get("title")
+    title = " ".join(title.split()) if isinstance(title, str) and title.strip() else "A report"
+    return f"📄 {title} (report; read it in the portal)"
 
 
 def age_phrase(age_ms: int) -> str:
