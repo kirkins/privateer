@@ -113,6 +113,10 @@ esac
     fn set_mode(&self, mode: &str) {
         fs::write(self.root.join("mode"), mode).unwrap();
     }
+    /// Let a gated child finish.
+    fn release_child(&self) {
+        fs::write(self.root.join("release-child"), "").unwrap();
+    }
     /// Put a crew's park into a state a crash would leave it in.
     fn set_park(&self, crew: &str, state: &str, attempt: i64, retries: i64) {
         let conn =
@@ -1022,7 +1026,8 @@ fn a_resume_that_does_not_start_after_its_retry_fails_the_crew() {
 #[test]
 fn a_parked_crew_whose_route_was_removed_resumes_as_a_fresh_crew() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    // The child waits for the routes to change before it settles.
+    f.set_mode("gated");
     let codex = |model: &str| json!({"manifest": "bundled:codex", "options": {"model": model}, "cost": "credits"});
     f.routes(json!({
         "routes": {"claude-route": {"manifest": "bundled:claude", "cost": "credits"}, "codex-route": codex("m")},
@@ -1031,6 +1036,7 @@ fn a_parked_crew_whose_route_was_removed_resumes_as_a_fresh_crew() {
     start_crew(&f, "crew-25");
     f.wait("crew-25", &["parked"]);
     f.routes(json!({"routes": {"codex-route": codex("m")}, "crew": ["codex-route"]}));
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     let resume = f.wait("crew-resume-park-crew-25-1-1", &["succeeded", "failed"]);
     assert!(
