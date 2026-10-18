@@ -1309,22 +1309,47 @@ fn identity(pid: u32) -> Result<Option<Process>> {
     let state = fields.first().context("kernel process state missing")?;
     let ticks = fields.get(19).context("kernel process start missing")?;
     // Start ticks count from boot; the boot id keeps them unique across reboots.
-    // It is constant until reboot; supervisors poll identity, so read it once.
-    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let boot = match BOOT.get() {
-        Some(boot) => boot,
-        None => {
-            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .context("inspect boot identity")?;
-            BOOT.get_or_init(|| boot.trim().to_owned())
-        }
-    };
+    let boot = boot_id()?;
     Ok(Some(Process {
         pid,
         started: format!("linux:{boot}:{ticks}"),
         pid_namespace: pid_namespace().map(str::to_owned),
         zombie: matches!(*state, "Z" | "X"),
     }))
+}
+/// This kernel's boot id. It is constant until reboot, shared by every PID
+/// namespace on the machine; supervisors poll identity, so read it once.
+#[cfg(target_os = "linux")]
+fn boot_id() -> Result<&'static str> {
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    Ok(match BOOT.get() {
+        Some(boot) => boot,
+        None => {
+            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .context("inspect boot identity")?;
+            BOOT.get_or_init(|| boot.trim().to_owned())
+        }
+    })
+}
+/// Whether a recorded identity names a process of another boot: a reboot of
+/// this machine, or another machine the record moved from. No such process
+/// runs here, whatever PID namespace recorded it. Identities without a boot
+/// id (legacy, or not Linux) cannot be placed and are not judged here.
+#[cfg(target_os = "linux")]
+fn other_boot(process: &Process) -> bool {
+    let Some((boot, _)) = process
+        .started
+        .strip_prefix("linux:")
+        .and_then(|rest| rest.rsplit_once(':'))
+    else {
+        return false;
+    };
+    boot_id().is_ok_and(|current| current != boot)
+}
+#[cfg(not(target_os = "linux"))]
+fn other_boot(process: &Process) -> bool {
+    // A Linux kernel's process cannot be running on this one.
+    process.started.starts_with("linux:")
 }
 #[cfg(not(target_os = "linux"))]
 fn identity(pid: u32) -> Result<Option<Process>> {
@@ -1370,7 +1395,8 @@ pub(crate) fn own_identity() -> Result<String> {
     Ok(serde_json::to_string(&me)?)
 }
 /// Whether the process an `own_identity` record names is still running. One
-/// in another PID namespace counts as running, since it cannot be checked.
+/// in another PID namespace of this boot counts as running, since it cannot
+/// be checked.
 pub(crate) fn identity_alive(recorded: &str) -> Result<bool> {
     same_process(&serde_json::from_str(recorded)?)
 }
@@ -1459,6 +1485,9 @@ fn leader_exited(pid: u32) -> Result<bool> {
     Ok(exited_unreaped(pid)?.is_some())
 }
 fn same_process(process: &Process) -> Result<bool> {
+    if other_boot(process) {
+        return Ok(false);
+    }
     // Probing the same number here could find an unrelated process, or none,
     // and falsely prove the recorded one gone: treat it as alive.
     if !addressable(process) {
@@ -1485,6 +1514,9 @@ fn group_members(group: u32) -> Result<Vec<u32>> {
     Ok(members)
 }
 fn group_alive(process: &Process) -> Result<bool> {
+    if other_boot(process) {
+        return Ok(false);
+    }
     if !addressable(process) {
         return Ok(true);
     }
@@ -3449,15 +3481,16 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
             if supervised {
                 return Ok(None);
             }
-            // Settled records are final while their ledger remains absent.
-            if job.foreign.is_some() && ledger_dir_missing(&job.ledger) {
+            // Settled records are final while their ledger remains elsewhere.
+            if job.foreign.is_some() && ledger_elsewhere(&job.ledger) {
                 return Ok(None);
             }
-            // A ledger directory absent from this machine means the record came
-            // from another one. Only a missing parent directory counts: a missing
-            // file alone is local and SQLite recreates it, while an existing ledger
-            // that cannot be opened right now is retried, not settled.
-            if ledger_dir_missing(&job.ledger) {
+            // A ledger directory this user cannot have here means the record
+            // came from another machine. Only the parent directory counts: a
+            // missing file alone is local and SQLite recreates it, while this
+            // user's own directory that cannot be opened right now (not
+            // writable, say) is retried, not settled.
+            if ledger_elsewhere(&job.ledger) {
                 let cause = format!(
                     "left behind: its ledger {} is not on this machine",
                     job.ledger.display()
@@ -3477,13 +3510,25 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
     Ok(settled)
 }
 
-/// Whether the directory holding a job's ledger is absent from this machine.
-fn ledger_dir_missing(path: &Path) -> bool {
+/// Whether the directory holding a job's ledger cannot be this user's on this
+/// machine: it is absent, this user cannot reach it (another user's home, as
+/// on a machine where the ship moved to another account), or another user
+/// owns it. This user's own ledger directory is one it created and owns
+/// (`ledger_path`), so none of these holds for it.
+fn ledger_elsewhere(path: &Path) -> bool {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => return false,
     };
-    matches!(fs::symlink_metadata(dir), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    match fs::metadata(dir) {
+        Ok(metadata) => metadata.uid() != unsafe { libc::geteuid() },
+        Err(error) => {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || error.raw_os_error() == Some(libc::ENOTDIR)
+        }
+    }
 }
 /// Settle a record that belongs to another machine, once. A live record
 /// becomes failed with `cause`, reported like any failure; a finished one
@@ -3718,7 +3763,7 @@ pub(crate) fn prune(
         if !terminal(&job.status) || job.finished_ms.is_none_or(|t| t >= cutoff_ms) {
             continue;
         }
-        let held = if job.foreign.is_some() && ledger_dir_missing(&job.ledger) {
+        let held = if job.foreign.is_some() && ledger_elsewhere(&job.ledger) {
             false
         } else {
             if !ledgers.contains_key(&job.ledger) {

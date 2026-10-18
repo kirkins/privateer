@@ -2543,3 +2543,248 @@ fn prune_succeeds_with_foreign_records() {
     let list = ok(&home, "job.list", json!({}));
     assert!(list["jobs"].as_array().unwrap().is_empty(), "{list}");
 }
+
+/// One dispatcher pass's reconciliation report: an entry per record it
+/// settled, and one per record it could not inspect.
+fn reconciled(fixture: &Fixture, home: &Path) -> Vec<Value> {
+    let output = support::isolated(&fixture.root)
+        .arg("--home")
+        .arg(home)
+        .args(["serve", "--json", r#"{"once":true}"#])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "serve: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    report["reconciled"].as_array().unwrap().clone()
+}
+/// Rewrite a record as a ship move brings it: its ledger and supervisor are
+/// the old machine's, and it still reads as `status`.
+fn arrive(home: &Path, id: &str, ledger: &Path, status: &str, supervisor: Value) {
+    Store::open(home)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.ledger', ?2, '$.status', ?3,
+               '$.supervisor', json(?4)) WHERE id=?1",
+            params![id, ledger.to_string_lossy(), status, supervisor.to_string()],
+        )
+        .unwrap();
+}
+fn this_boot() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+fn this_pid_namespace() -> String {
+    fs::read_link("/proc/self/ns/pid")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+/// A supervisor identity recorded on a machine with another boot. Its PID is
+/// one that is alive here, so only the boot id tells it apart.
+fn laptop_supervisor(namespace: &str) -> Value {
+    json!({"pid": std::process::id(), "started": "linux:00000000-0000-4000-8000-1a7709000000:4242",
+        "pid_namespace": namespace, "zombie": false})
+}
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_moved_record_whose_supervisor_ran_on_another_boot_settles_once_as_foreign() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "moved", &["true"]);
+    wait(&home, "moved", &["succeeded"]);
+    let missing = home.join("laptop-only/state/resources.sqlite");
+    arrive(
+        &home,
+        "moved",
+        &missing,
+        "running",
+        laptop_supervisor(&this_pid_namespace()),
+    );
+
+    let first = reconciled(&fixture, &home);
+    assert_eq!(
+        first,
+        vec![json!({"job_id": "moved", "status": "failed"})],
+        "{first:?}"
+    );
+    for _ in 0..2 {
+        let later = reconciled(&fixture, &home);
+        assert!(later.is_empty(), "{later:?}");
+    }
+    let moved = ok(&home, "job.status", json!({"id":"moved"}));
+    assert_eq!(moved["status"], "failed", "{moved}");
+    assert!(moved["foreign"].as_str().is_some(), "{moved}");
+    assert_eq!(audits(&home, "job.foreign"), 1);
+    assert!(!missing.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_moved_record_from_another_pid_namespace_and_boot_settles_once_as_foreign() {
+    // A namespace this dispatcher cannot inspect is no reason to call the
+    // supervisor alive once its boot id says it ran on another kernel.
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "moved", &["true"]);
+    wait(&home, "moved", &["succeeded"]);
+    let missing = home.join("laptop-only/state/resources.sqlite");
+    arrive(
+        &home,
+        "moved",
+        &missing,
+        "running",
+        laptop_supervisor("pid:[4026531999]"),
+    );
+
+    let first = reconciled(&fixture, &home);
+    assert_eq!(
+        first,
+        vec![json!({"job_id": "moved", "status": "failed"})],
+        "{first:?}"
+    );
+    for _ in 0..2 {
+        let later = reconciled(&fixture, &home);
+        assert!(later.is_empty(), "{later:?}");
+    }
+    let moved = ok(&home, "job.status", json!({"id":"moved"}));
+    assert_eq!(moved["status"], "failed", "{moved}");
+    assert_eq!(audits(&home, "job.foreign"), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_supervisor_in_another_pid_namespace_of_this_boot_is_still_left_alone() {
+    // Unchanged behaviour: this machine cannot inspect that namespace, and the
+    // same boot id means the supervisor may be running, so nothing is settled.
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "sandboxed", &["true"]);
+    wait(&home, "sandboxed", &["succeeded"]);
+    let missing = home.join("laptop-only/state/resources.sqlite");
+    let boot = this_boot();
+    arrive(
+        &home,
+        "sandboxed",
+        &missing,
+        "running",
+        json!({"pid": std::process::id(), "started": format!("linux:{boot}:4242"),
+            "pid_namespace": "pid:[4026531999]", "zombie": false}),
+    );
+
+    for _ in 0..2 {
+        let pass = reconciled(&fixture, &home);
+        assert!(pass.is_empty(), "{pass:?}");
+    }
+    let job = ok(&home, "job.status", json!({"id":"sandboxed"}));
+    assert_eq!(job["status"], "running", "{job}");
+    assert!(job["foreign"].is_null(), "{job}");
+    assert_eq!(audits(&home, "job.foreign"), 0);
+}
+
+#[test]
+fn a_ledger_in_a_directory_this_user_cannot_reach_settles_once_without_opening_it() {
+    // The server runs as another user than the laptop: the laptop's ledger
+    // directory lies under a home it cannot enter, so stat reports permission
+    // denied rather than absence, and opening the ledger fails with code 14.
+    if is_root() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "done", &["true"]);
+    wait(&home, "done", &["succeeded"]);
+    start(&home, "live", &["true"]);
+    let live = wait(&home, "live", &["succeeded"]);
+    let other_home = fixture.root.join("other-user");
+    fs::create_dir_all(other_home.join(".local/state/privateer-host")).unwrap();
+    let ledger = other_home.join(".local/state/privateer-host/resources.sqlite");
+    arrive(
+        &home,
+        "done",
+        &ledger,
+        "succeeded",
+        live["supervisor"].clone(),
+    );
+    arrive(
+        &home,
+        "live",
+        &ledger,
+        "running",
+        laptop_supervisor(&this_pid_namespace()),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&other_home, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let passes: Vec<Vec<Value>> = (0..3).map(|_| reconciled(&fixture, &home)).collect();
+    fs::set_permissions(&other_home, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(
+        passes[0],
+        vec![json!({"job_id": "live", "status": "failed"})],
+        "{passes:?}"
+    );
+    assert!(passes[1..].iter().all(Vec::is_empty), "{passes:?}");
+    let done = ok(&home, "job.status", json!({"id":"done"}));
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(done["foreign"].as_str().is_some(), "{done}");
+    let live = ok(&home, "job.status", json!({"id":"live"}));
+    assert_eq!(live["status"], "failed", "{live}");
+    assert!(live["foreign"].as_str().is_some(), "{live}");
+    assert_eq!(audits(&home, "job.foreign"), 2);
+    assert!(!ledger.exists());
+}
+
+#[test]
+fn a_ledger_directory_this_user_owns_but_cannot_write_is_retried_not_settled() {
+    // Opening fails with the same code 14, but the directory is this user's
+    // here: a local fault to report each pass until it is fixed, not a record
+    // from elsewhere.
+    if is_root() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "kept", &["true"]);
+    let kept = wait(&home, "kept", &["succeeded"]);
+    let read_only = fixture.root.join("read-only");
+    fs::create_dir(&read_only).unwrap();
+    let ledger = read_only.join("resources.sqlite");
+    arrive(
+        &home,
+        "kept",
+        &ledger,
+        "succeeded",
+        kept["supervisor"].clone(),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&read_only, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let passes: Vec<Vec<Value>> = (0..2).map(|_| reconciled(&fixture, &home)).collect();
+    fs::set_permissions(&read_only, fs::Permissions::from_mode(0o700)).unwrap();
+
+    for pass in &passes {
+        assert_eq!(pass.len(), 1, "{passes:?}");
+        assert_eq!(pass[0]["job_id"], "kept", "{passes:?}");
+        assert!(
+            pass[0]["error"].as_str().unwrap().contains("Error code 14"),
+            "{passes:?}"
+        );
+    }
+    let kept = ok(&home, "job.status", json!({"id":"kept"}));
+    assert_eq!(kept["status"], "succeeded", "{kept}");
+    assert!(kept["foreign"].is_null(), "{kept}");
+    assert_eq!(audits(&home, "job.foreign"), 0);
+    // Once writable again, the pass opens it and has nothing to report.
+    assert!(reconciled(&fixture, &home).is_empty());
+}
