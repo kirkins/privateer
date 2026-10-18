@@ -1997,9 +1997,14 @@ fn a_holder_that_lost_its_supervisor_looks_unhealthy_to_the_host() {
     ship(&home, "peer");
     start(&home, "running", &["sleep", "30"]);
     let until = Instant::now() + Duration::from_secs(12);
+    // Wait for the payload too, not only the supervisor: a job still
+    // starting has a supervisor but no payload to judge alive yet.
     let supervisor = loop {
         let job = ok(&home, "job.status", json!({"id":"running"}));
-        if let Some(pid) = job["supervisor"]["pid"].as_i64() {
+        if let (Some(pid), "running") = (
+            job["supervisor"]["pid"].as_i64(),
+            job["status"].as_str().unwrap_or_default(),
+        ) {
             break pid as i32;
         }
         assert!(Instant::now() < until, "supervisor never recorded");
