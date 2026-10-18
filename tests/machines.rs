@@ -633,6 +633,141 @@ fn a_falling_warning_is_not_cleared_while_the_floor_alarm_is_up() {
     assert!(cleared[3].contains("disk_trend"), "{cleared:?}");
 }
 
+/// One load reading a minute in the shared ledger, from `from` to `to`
+/// minutes ago, each at `load` on one CPU. The newest lands a second ago, so
+/// the dispatcher's own reading, at most one a minute, does not join them and
+/// the test decides what the machine's load has been.
+fn loads(ledger: &rusqlite::Connection, from: i64, to: i64, load: f64) {
+    let now = privateer::store::Store::now_ms() - 1_000;
+    for minutes in (to..=from).rev() {
+        ledger
+            .execute(
+                "INSERT OR REPLACE INTO load_samples(sampled_ms,load,cpus) VALUES(?1,?2,1)",
+                params![now - minutes * 60_000, load],
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn sustained_load_reaches_the_owner_once_and_clears_when_it_settles() {
+    let (_temp, laptop, _mac, ssh) = fixture();
+    laptop.ship("upkeep");
+    assert!(
+        laptop
+            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .status
+            .success()
+    );
+    // The gate is as loose as it goes, so the real machine is under it and
+    // the jobs below start however busy the runner is.
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"max_load_per_cpu":1024,"min_available_memory_bytes":0,"ramp_secs":0,
+            "heavy_estimate":{"memory_bytes":0,"disk_bytes":0}}),
+    );
+    let home = laptop.folder("upkeep").join(".privateer");
+    let repo = laptop.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    {
+        let store = privateer::store::Store::open(&home).unwrap();
+        let charter = json!({"id":"mission","objective":"load alert fixture","repo":repo,
+            "active":true,"actions":["implement","test","recovery","cleanup"],"min_free_bytes":0,
+            "job_timeout_secs":120});
+        store
+            .connection()
+            .execute(
+                "INSERT INTO charters(id,data) VALUES(?1,?2)",
+                params!["mission", charter.to_string()],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('task','mission','upkeep','fixture','open',0)",
+                [],
+            )
+            .unwrap();
+    }
+    // A heavy build, and a simulator run started as light work.
+    for (id, heavy) in [("build", true), ("sim-ui", false)] {
+        laptop.ok(
+            "upkeep",
+            "job.start",
+            json!({"task_id":"task","id":id,"command":["sleep","120"],"heavy":heavy}),
+        );
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    for id in ["build", "sim-ui"] {
+        while laptop.ok("upkeep", "job.status", json!({"id":id}))["status"] != "running" {
+            assert!(std::time::Instant::now() < until, "{id} never ran");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let notices = || -> Vec<String> {
+        messages(&laptop, "upkeep", "notice")
+            .iter()
+            .filter(|m| m["from"] == "crew")
+            .filter_map(|m| m["body"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let ledger = rusqlite::Connection::open(laptop.root.join("ledger/resources.sqlite")).unwrap();
+
+    // A burst of two minutes over a quiet machine is not an alarm.
+    loads(&ledger, 11, 3, 0.0);
+    loads(&ledger, 2, 0, 1e9);
+    laptop.pass("upkeep", &ssh);
+    assert!(notices().is_empty(), "{:?}", notices());
+
+    // Eleven minutes above the gate reach the owner, once.
+    ledger.execute("DELETE FROM load_samples", []).unwrap();
+    loads(&ledger, 11, 0, 1e9);
+    laptop.pass("upkeep", &ssh);
+    laptop.pass("upkeep", &ssh);
+    let raised = notices();
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    let body = &raised[0];
+    assert!(
+        body.contains("CPU load has stayed at or above the admission gate for 11 minutes"),
+        "{body}"
+    );
+    assert!(body.contains("on 1 CPUs"), "{body}");
+    assert!(body.contains("the gate is 1024 per CPU"), "{body}");
+    assert!(
+        body.contains("Heavy jobs running, by ship: upkeep 1."),
+        "{body}"
+    );
+    // The light run is named, so the owner can have it marked heavy; the
+    // heavy build is not among them.
+    assert!(body.contains("heavy:false"), "{body}");
+    assert!(body.contains("upkeep sim-ui"), "{body}");
+    assert!(!body.contains("upkeep build"), "{body}");
+    assert!(body.contains("max_heavy_jobs is unset"), "{body}");
+
+    // Two quiet minutes between jobs do not clear it.
+    ledger.execute("DELETE FROM load_samples", []).unwrap();
+    loads(&ledger, 11, 2, 1e9);
+    loads(&ledger, 1, 0, 0.0);
+    laptop.pass("upkeep", &ssh);
+    assert_eq!(notices().len(), 1, "{:?}", notices());
+
+    // Six quiet minutes do, once.
+    ledger.execute("DELETE FROM load_samples", []).unwrap();
+    loads(&ledger, 11, 7, 1e9);
+    loads(&ledger, 6, 0, 0.0);
+    laptop.pass("upkeep", &ssh);
+    laptop.pass("upkeep", &ssh);
+    let all = notices();
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(all[1].contains("Cleared"), "{all:?}");
+    assert!(all[1].contains("load"), "{all:?}");
+
+    for id in ["build", "sim-ui"] {
+        laptop.ok("upkeep", "job.cancel", json!({"id":id}));
+    }
+}
+
 #[test]
 fn a_machines_owner_hears_of_its_problems_and_may_stow_it() {
     let (_temp, laptop, _mac, ssh) = fixture();

@@ -779,6 +779,46 @@ pub(crate) fn capacity_holders(store: &Store) -> Result<Vec<Holder>> {
     holders.sort_by_key(|h| h.started_ms);
     Ok(holders)
 }
+/// A job a live process still runs on this host, as the ledger records it.
+pub(crate) struct Running {
+    pub ship: String,
+    pub job_id: String,
+    pub heavy: bool,
+    /// Admission counts it: heavy, or started with an estimate.
+    pub estimated: bool,
+}
+
+/// Every job on this host a live process still runs, from any home, oldest
+/// first. Only the ledger and live processes are read.
+pub(crate) fn running_jobs(store: &Store) -> Result<Vec<Running>> {
+    let path = ledger_dir(store)?.join("resources.sqlite");
+    if !path.is_file() {
+        return Ok(vec![]);
+    }
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let mut held = reservations(&conn)?;
+    held.sort_by_key(|r| r.created_ms);
+    let mut running = vec![];
+    for r in held {
+        let alive = match &r.supervisor {
+            Some(p) if same_process(p)? => true,
+            _ => match &r.payload {
+                Some(p) => group_alive(p)?,
+                None => false,
+            },
+        };
+        if alive {
+            running.push(Running {
+                ship: r.ship(),
+                estimated: r.heavy || r.demand.is_some(),
+                heavy: r.heavy,
+                job_id: r.job_id,
+            });
+        }
+    }
+    Ok(running)
+}
 /// This home's queued jobs and what they wait behind, as bearings show it:
 /// one entry per job still waiting for this machine's capacity. Each names
 /// the holder it waits for, the ship that holder belongs to, and whether

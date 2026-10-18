@@ -181,7 +181,9 @@ pub fn init(conn: &Connection) -> Result<()> {
            free_bytes INTEGER NOT NULL, trimmed_bytes INTEGER NOT NULL DEFAULT 0,
            PRIMARY KEY (path, sampled_ms));
          CREATE TABLE IF NOT EXISTS disk_trims (disk_key TEXT PRIMARY KEY,
-           total_bytes INTEGER NOT NULL, last_ms INTEGER NOT NULL);",
+           total_bytes INTEGER NOT NULL, last_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS load_samples (sampled_ms INTEGER PRIMARY KEY,
+           load REAL NOT NULL, cpus REAL NOT NULL);",
     )?;
     // A ledger made before trims were recorded has disk_samples without the
     // column; CREATE TABLE IF NOT EXISTS leaves it as it was.
@@ -928,6 +930,109 @@ pub fn disk_warning(
     (forecast.hours_to_floor * 3_600.0 <= reach).then_some(forecast)
 }
 
+/// Load is sampled at most this often, by the machine owner's alert pass.
+const LOAD_SAMPLE_EVERY_MS: i64 = 60_000;
+/// Readings further apart than this do not make one stretch: nothing was
+/// watching the machine in between, so nothing says the load held.
+const LOAD_SAMPLE_GAP_MS: i64 = 3 * 60_000;
+/// Readings older than this are dropped: an hour of one-minute readings at
+/// most, however long the ledger lives.
+const LOAD_SAMPLE_KEEP_MS: i64 = 60 * 60_000;
+/// Load per CPU must stay at or above the admission gate across readings
+/// spanning this long before the machine's owner hears of it, so a build's
+/// burst of a few minutes is not an alarm.
+pub const LOAD_SUSTAINED_MS: i64 = 10 * 60_000;
+/// A raised load alarm clears once load per CPU has stayed below the gate
+/// across readings spanning this long, so one quiet minute between jobs does
+/// not clear it and raise it again.
+pub const LOAD_SETTLED_MS: i64 = 5 * 60_000;
+
+/// A stretch of high load: the newest reading, and how long the readings
+/// before it have stayed at or above the gate.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct LoadSpell {
+    pub load: f64,
+    pub cpus: f64,
+    pub per_cpu: f64,
+    pub span_ms: i64,
+}
+
+/// Keep one reading of the load average, at most one every
+/// `LOAD_SAMPLE_EVERY_MS`, so a later pass can tell sustained load from a
+/// burst. Readings past the retention window are dropped.
+pub fn note_load(conn: &Connection, host: &Host, now_ms: i64) -> Result<()> {
+    let last: Option<i64> =
+        conn.query_row("SELECT MAX(sampled_ms) FROM load_samples", [], |r| r.get(0))?;
+    if last.is_some_and(|at| now_ms.saturating_sub(at) < LOAD_SAMPLE_EVERY_MS) {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO load_samples(sampled_ms,load,cpus) VALUES(?1,?2,?3)",
+        params![now_ms, host.load, host.cpus],
+    )?;
+    conn.execute(
+        "DELETE FROM load_samples WHERE sampled_ms < ?1",
+        [now_ms - LOAD_SAMPLE_KEEP_MS],
+    )?;
+    Ok(())
+}
+
+/// The load alarm worth raising or keeping. Load per CPU is the measure
+/// admission gates CPU-declaring jobs on (`max_load_per_cpu`), read from the
+/// raw load average. Not yet `raised`, it needs readings at or above `gate`
+/// spanning `LOAD_SUSTAINED_MS`, with no gap longer than
+/// `LOAD_SAMPLE_GAP_MS`, up to a fresh one. Once raised, it stays until the
+/// readings have stayed below the gate for `LOAD_SETTLED_MS`.
+pub fn load_alarm(
+    conn: &Connection,
+    gate: f64,
+    raised: bool,
+    now_ms: i64,
+) -> Result<Option<LoadSpell>> {
+    let mut statement = conn.prepare(
+        "SELECT sampled_ms,load,cpus FROM load_samples WHERE sampled_ms>=?1
+         ORDER BY sampled_ms DESC",
+    )?;
+    let readings = statement
+        .query_map([now_ms - LOAD_SAMPLE_KEEP_MS], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?.max(1.0),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let Some(&(newest_ms, load, cpus)) = readings.first() else {
+        return Ok(None);
+    };
+    if now_ms - newest_ms > LOAD_SAMPLE_GAP_MS {
+        return Ok(None);
+    }
+    // How long the newest readings have stayed on one side of the gate.
+    let stretch = |high: bool| -> i64 {
+        let mut oldest = newest_ms;
+        for &(ms, load, cpus) in &readings {
+            if (load / cpus >= gate) != high || oldest - ms > LOAD_SAMPLE_GAP_MS {
+                break;
+            }
+            oldest = ms;
+        }
+        newest_ms - oldest
+    };
+    let high = stretch(true);
+    let alarm = if raised {
+        stretch(false) < LOAD_SETTLED_MS
+    } else {
+        high >= LOAD_SUSTAINED_MS
+    };
+    Ok(alarm.then_some(LoadSpell {
+        load,
+        cpus,
+        per_cpu: load / cpus,
+        span_ms: high,
+    }))
+}
+
 /// Settings and live readings for resource.status.
 pub fn report(settings: &Settings, host: &Host) -> Value {
     json!({"settings": settings, "host": host})
@@ -1565,5 +1670,63 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    /// One load reading a minute from `from_min` to `to_min`, each at `load`
+    /// on 10 CPUs.
+    fn loads(conn: &Connection, from_min: i64, to_min: i64, load: f64) {
+        for minute in from_min..=to_min {
+            note_load(conn, &Host { load, ..host(0.0) }, minute * 60_000).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_load_held_above_the_gate_raises_the_alarm_and_only_settled_load_clears_it() {
+        let conn = ledger();
+        let at = |minute: i64| minute * 60_000;
+        // A burst of five minutes over a quiet machine is not an alarm.
+        loads(&conn, 0, 9, 1.0);
+        loads(&conn, 10, 14, 80.0);
+        assert_eq!(load_alarm(&conn, 1.0, false, at(14)).unwrap(), None);
+        // Held for ten minutes it is, with the load, CPUs and span.
+        loads(&conn, 15, 20, 80.0);
+        let spell = load_alarm(&conn, 1.0, false, at(20)).unwrap().unwrap();
+        assert_eq!(spell.load, 80.0);
+        assert_eq!(spell.cpus, 10.0);
+        assert_eq!(spell.per_cpu, 8.0);
+        assert_eq!(spell.span_ms, at(10));
+        // A raised alarm survives a quiet minute or two between jobs.
+        loads(&conn, 21, 23, 1.0);
+        assert!(load_alarm(&conn, 1.0, true, at(23)).unwrap().is_some());
+        // Five quiet minutes clear it.
+        loads(&conn, 24, 26, 1.0);
+        assert_eq!(load_alarm(&conn, 1.0, true, at(26)).unwrap(), None);
+        // The gate is the one admission uses now: a looser gate is no alarm.
+        loads(&conn, 27, 40, 80.0);
+        assert!(load_alarm(&conn, 1.0, false, at(40)).unwrap().is_some());
+        assert_eq!(load_alarm(&conn, 16.0, false, at(40)).unwrap(), None);
+        // A stale reading says nothing about the machine now.
+        assert_eq!(load_alarm(&conn, 1.0, true, at(44)).unwrap(), None);
+    }
+
+    #[test]
+    fn load_readings_across_a_gap_are_not_one_stretch_and_the_ring_is_bounded() {
+        let conn = ledger();
+        let at = |minute: i64| minute * 60_000;
+        // Nobody watched between minutes 6 and 12, so the load is not known
+        // to have held across them.
+        loads(&conn, 0, 6, 80.0);
+        loads(&conn, 12, 15, 80.0);
+        assert_eq!(load_alarm(&conn, 1.0, false, at(15)).unwrap(), None);
+        // Within the sampling interval a reading is not kept twice.
+        note_load(&conn, &host(80.0), at(15) + LOAD_SAMPLE_EVERY_MS - 1).unwrap();
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM load_samples", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&conn), 11);
+        // Readings past the retention window are dropped.
+        loads(&conn, 16, 200, 80.0);
+        assert_eq!(count(&conn), LOAD_SAMPLE_KEEP_MS / 60_000 + 1);
     }
 }

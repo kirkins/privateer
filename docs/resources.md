@@ -178,6 +178,23 @@ A falling rate is not an order to clean up: only the machine's owner and the
 captain decide what to remove. The runtime's part is to say so while there is
 still time.
 
+## Sustained CPU load
+
+The owner also hears when the machine stays busy. Its check keeps one reading of
+the one-minute load average a minute, for an hour, in the host ledger. When load
+per CPU, the measure admission gates CPU-declaring jobs on, has stayed at or
+above `max_load_per_cpu` across readings spanning ten minutes, with no gap of
+more than three minutes between them, the owner is mailed one `load` notice. It
+names the load, the CPU count, how long, the ships running heavy jobs, and any
+running jobs started as light work (`heavy:false`): neither `max_heavy_jobs`
+nor the load gate counts those, so the owner can ask for them to be started
+heavy. The runtime never guesses a job's weight from its command. The notice
+clears once load has stayed below the gate for five minutes, so a quiet minute
+between jobs does not clear it and raise it again. The alarm does not change
+admission. A job started without `heavy` is heavy by default; only
+`heavy:false` work escapes the heavy count, and `max_heavy_jobs` is unset unless
+someone sets it.
+
 ## Build output in released worktrees
 
 A task's worktree is returned to its pool when its work has landed, but the

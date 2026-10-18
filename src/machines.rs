@@ -558,6 +558,14 @@ fn host_problems(store: &Store, raised: &[String]) -> Result<Vec<(String, String
             ),
         ));
     }
+    let host = crate::admission::measure()?;
+    crate::admission::note_load(&ledger, &host, now)?;
+    let load_raised = raised.iter().any(|key| key == "load");
+    if let Some(spell) =
+        crate::admission::load_alarm(&ledger, settings.max_load_per_cpu, load_raised, now)?
+    {
+        problems.push(("load".into(), load_problem(store, &settings, &spell)?));
+    }
     // A capacity queue is only a problem when the job holding capacity looks
     // unhealthy, or when nothing holds it at all. A queue behind a healthy
     // heavy job is what the cap is for, and the waiting ship's bearings
@@ -602,6 +610,72 @@ fn host_problems(store: &Store, raised: &[String]) -> Result<Vec<(String, String
         }
     }
     Ok(problems)
+}
+
+/// Running jobs named in a load alarm before the rest are counted instead.
+const LOAD_NAMED_JOBS: usize = 8;
+
+/// The load alarm's sentence: the load, the CPUs, how long, which ships run
+/// heavy jobs, and which running jobs admission cannot count because they
+/// were started as light work.
+fn load_problem(
+    store: &Store,
+    settings: &crate::admission::Settings,
+    spell: &crate::admission::LoadSpell,
+) -> Result<String> {
+    let running = crate::jobs::running_jobs(store)?;
+    let mut by_ship: Vec<(String, usize)> = vec![];
+    for job in running.iter().filter(|j| j.heavy) {
+        match by_ship.iter_mut().find(|(ship, _)| *ship == job.ship) {
+            Some((_, count)) => *count += 1,
+            None => by_ship.push((job.ship.clone(), 1)),
+        }
+    }
+    by_ship.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut body = format!(
+        "CPU load has stayed at or above the admission gate for {} minutes: load {:.1} on {} CPUs is {:.2} per CPU, and the gate is {} per CPU, so new jobs that declare CPUs wait.",
+        spell.span_ms / 60_000,
+        spell.load,
+        spell.cpus,
+        spell.per_cpu,
+        settings.max_load_per_cpu
+    );
+    if by_ship.is_empty() {
+        body.push_str(" No heavy job is running.");
+    } else {
+        let ships: Vec<String> = by_ship
+            .iter()
+            .map(|(ship, count)| format!("{ship} {count}"))
+            .collect();
+        body.push_str(&format!(
+            " Heavy jobs running, by ship: {}.",
+            ships.join(", ")
+        ));
+    }
+    let light: Vec<String> = running
+        .iter()
+        .filter(|j| !j.estimated)
+        .map(|j| format!("{} {}", j.ship, j.job_id))
+        .collect();
+    if !light.is_empty() {
+        let more = light.len().saturating_sub(LOAD_NAMED_JOBS);
+        body.push_str(&format!(
+            " Running as light work (heavy:false), which neither max_heavy_jobs nor the load gate counts: {}{}; start such work with heavy:true.",
+            light[..light.len().min(LOAD_NAMED_JOBS)].join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    body.push_str(&match settings.max_heavy_jobs {
+        Some(cap) => format!(
+            " max_heavy_jobs is {cap}; lower it with resource.configure to run fewer at once."
+        ),
+        None => " max_heavy_jobs is unset, so only the load gate holds heavy jobs back; set it with resource.configure to run fewer at once.".into(),
+    });
+    Ok(body)
 }
 
 /// When this process last looked for host-level problems.
