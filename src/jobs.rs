@@ -3443,25 +3443,26 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         let id = job.id.clone();
         let before = job.status.clone();
         let result = (|| -> Result<Option<Job>> {
-            // Settled records are final here, and their ledger is never opened.
-            if job.foreign.is_some() {
-                return Ok(None);
-            }
-            // A ledger absent from this machine means the record came from
-            // another one. Only a missing path counts: an existing ledger that
-            // cannot be opened right now is retried, not settled.
-            if ledger_missing(&job.ledger) {
-                let cause = format!(
-                    "left behind: its ledger {} is not on this machine",
-                    job.ledger.display()
-                );
-                return Ok(Some(settle_foreign(store, &job.id, &cause)?));
-            }
             // A live supervisor is checked cheaply and left to finish its job.
             let supervised = !terminal(&job.status)
                 && job.supervisor.as_ref().map(same_process).transpose()? == Some(true);
             if supervised {
                 return Ok(None);
+            }
+            // Settled records are final while their ledger remains absent.
+            if job.foreign.is_some() && ledger_dir_missing(&job.ledger) {
+                return Ok(None);
+            }
+            // A ledger directory absent from this machine means the record came
+            // from another one. Only a missing parent directory counts: a missing
+            // file alone is local and SQLite recreates it, while an existing ledger
+            // that cannot be opened right now is retried, not settled.
+            if ledger_dir_missing(&job.ledger) {
+                let cause = format!(
+                    "left behind: its ledger {} is not on this machine",
+                    job.ledger.display()
+                );
+                return Ok(Some(settle_foreign(store, &job.id, &cause)?));
             }
             Ok(Some(reconcile(store, job, &mut reserved)?))
         })();
@@ -3476,9 +3477,13 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
     Ok(settled)
 }
 
-/// Whether a job's ledger path is absent from this machine.
-fn ledger_missing(path: &Path) -> bool {
-    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+/// Whether the directory holding a job's ledger is absent from this machine.
+fn ledger_dir_missing(path: &Path) -> bool {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => return false,
+    };
+    matches!(fs::symlink_metadata(dir), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 /// Settle a record that belongs to another machine, once. A live record
 /// becomes failed with `cause`, reported like any failure; a finished one
@@ -3713,14 +3718,18 @@ pub(crate) fn prune(
         if !terminal(&job.status) || job.finished_ms.is_none_or(|t| t >= cutoff_ms) {
             continue;
         }
-        if !ledgers.contains_key(&job.ledger) {
-            ledgers.insert(job.ledger.clone(), ledger(&job.ledger)?);
-        }
-        let held: bool = ledgers[&job.ledger].query_row(
-            "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
-            [reservation_key(store.home(), &job.id, &job.incarnation)],
-            |r| r.get(0),
-        )?;
+        let held = if job.foreign.is_some() && ledger_dir_missing(&job.ledger) {
+            false
+        } else {
+            if !ledgers.contains_key(&job.ledger) {
+                ledgers.insert(job.ledger.clone(), ledger(&job.ledger)?);
+            }
+            ledgers[&job.ledger].query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
+                [reservation_key(store.home(), &job.id, &job.incarnation)],
+                |r| r.get(0),
+            )?
+        };
         if held {
             reserved += 1;
             continue;

@@ -2399,3 +2399,147 @@ fn an_existing_ledger_that_cannot_be_opened_is_retried_not_settled() {
     assert!(kept["foreign"].is_null(), "{kept}");
     assert_eq!(audits(&home, "job.foreign"), 0);
 }
+
+#[test]
+fn a_live_supervised_job_whose_ledger_file_is_deleted_is_not_marked_foreign() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "live", &["sleep", "1"]);
+    let running = wait(&home, "live", &["running"]);
+    let ledger_path = PathBuf::from(running["ledger"].as_str().unwrap());
+    assert!(ledger_path.exists());
+
+    fs::remove_file(&ledger_path).unwrap();
+    assert!(!ledger_path.exists());
+    assert!(ledger_path.parent().unwrap().exists());
+
+    fixture.serve(&home);
+
+    let status = ok(&home, "job.status", json!({"id":"live"}));
+    assert_eq!(status["status"], "running", "{status}");
+    assert!(status["foreign"].is_null(), "{status}");
+    assert_eq!(audits(&home, "job.foreign"), 0);
+
+    let done = wait(&home, "live", &["succeeded"]);
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(done["foreign"].is_null(), "{done}");
+    assert!(ledger_path.exists());
+    assert_eq!(audits(&home, "job.foreign"), 0);
+}
+
+#[test]
+fn a_missing_ledger_directory_coming_back_resumes_reconcile_and_releases_reservation() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let missing_dir = home.join("remote/state");
+    let ledger_path = missing_dir.join("resources.sqlite");
+
+    start(&home, "held", &["true"]);
+    let held = wait(&home, "held", &["succeeded"]);
+    let inc = held["incarnation"].as_str().unwrap().to_string();
+
+    let store = Store::open(&home).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.ledger', ?1) WHERE id='held'",
+            [ledger_path.to_string_lossy()],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.status', 'running') WHERE id='held'",
+            [],
+        )
+        .unwrap();
+    drop(store);
+
+    fixture.serve(&home);
+    let foreign = ok(&home, "job.status", json!({"id":"held"}));
+    assert_eq!(foreign["status"], "failed", "{foreign}");
+    assert!(foreign["foreign"].as_str().is_some(), "{foreign}");
+    assert_eq!(audits(&home, "job.foreign"), 1);
+
+    fs::create_dir_all(&missing_dir).unwrap();
+    let conn = rusqlite::Connection::open(&ledger_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);
+         CREATE TABLE released (key TEXT PRIMARY KEY, cpus REAL NOT NULL, load REAL NOT NULL, released_ms INTEGER NOT NULL);
+         CREATE TABLE runs (key TEXT NOT NULL, work TEXT, task TEXT, duration_ms INTEGER NOT NULL, finished_ms INTEGER NOT NULL);",
+    )
+    .unwrap();
+    let key = format!("{}:held:{}", home.display(), inc);
+    conn.execute(
+        "INSERT INTO reservations(key, record) VALUES(?1, ?2)",
+        rusqlite::params![
+            key,
+            json!({"key": &key, "home": home, "job_id": "held", "incarnation": inc,
+                   "heavy": false, "state": "running", "created_ms": 0, "supervisor": null, "payload": null}).to_string()
+        ],
+    )
+    .unwrap();
+    let has_res: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has_res);
+    drop(conn);
+
+    fixture.serve(&home);
+
+    let conn = rusqlite::Connection::open(&ledger_path).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reservations WHERE key=?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "leftover reservation should be released");
+    drop(conn);
+
+    let after = ok(&home, "job.status", json!({"id":"held"}));
+    assert_eq!(after["status"], "failed", "{after}");
+    assert!(after["foreign"].as_str().is_some(), "{after}");
+    assert_eq!(audits(&home, "job.foreign"), 1);
+}
+
+#[test]
+fn prune_succeeds_with_foreign_records() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "done", &["true"]);
+    wait(&home, "done", &["succeeded"]);
+
+    let missing = home.join("remote-machine/resources.sqlite");
+    let store = Store::open(&home).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(json_set(record, '$.ledger', ?1), '$.foreign', 'left behind') WHERE id='done'",
+            [missing.to_string_lossy()],
+        )
+        .unwrap();
+    drop(store);
+
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 1000;
+
+    let pruned = ok(
+        &home,
+        "history.prune",
+        json!({"before_ms": cutoff, "dry_run": false}),
+    );
+    assert_eq!(pruned["jobs"], 1, "{pruned}");
+    assert_eq!(pruned["jobs_still_reserved"], 0, "{pruned}");
+
+    let list = ok(&home, "job.list", json!({}));
+    assert!(list["jobs"].as_array().unwrap().is_empty(), "{list}");
+}
