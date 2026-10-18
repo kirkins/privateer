@@ -198,18 +198,37 @@ fn get(store: &Store, args: &Value) -> Result<Value> {
     );
     let id = required(args, "id")?;
     identifier(id)?;
-    // This home first, then every other fleet home on this machine.
-    let mut homes: Vec<PathBuf> = vec![store.home().to_path_buf()];
+    if let Some(found) = here(Some(store), id)? {
+        return Ok(found);
+    }
+    // A ship on a linked machine keeps its reports there.
+    if let Some(found) = crate::machines::report_from_linked(id)? {
+        return Ok(found);
+    }
+    bail!("no report {id} in the fleet")
+}
+
+/// A stored report from this machine's homes, for a machine that links to
+/// this one and asks over the gateway. It never asks further.
+pub(crate) fn serve(args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    identifier(id)?;
+    here(None, id)?.with_context(|| format!("no report {id} on this machine"))
+}
+
+/// The report `id` from `store`'s home first, then every other fleet home on
+/// this machine.
+fn here(store: Option<&Store>, id: &str) -> Result<Option<Value>> {
+    let mut homes: Vec<PathBuf> = store.map(|s| s.home().to_path_buf()).into_iter().collect();
     for (_, home) in crate::captain::fleet()? {
         if !homes.iter().any(|h| same_dir(h, &home)) {
             homes.push(home);
         }
     }
     for home in homes {
-        let found = if home == store.home() {
-            stored(store, id)?
-        } else {
-            stored(&Store::open(&home)?, id)?
+        let found = match store {
+            Some(store) if home == store.home() => stored(store, id)?,
+            _ => stored(&Store::open(&home)?, id)?,
         };
         if let Some(report) = found {
             let mut result = json!({"id": id, "ship": report.author,
@@ -218,10 +237,10 @@ fn get(store: &Store, args: &Value) -> Result<Value> {
             if let Some(title) = report.title {
                 result["title"] = json!(title);
             }
-            return Ok(result);
+            return Ok(Some(result));
         }
     }
-    bail!("no report {id} in the fleet")
+    Ok(None)
 }
 
 fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
