@@ -1,6 +1,6 @@
 # Design: away digests
 
-Status: round 2, revised after the Opus design review; implemented on this branch. Task `privateer-away-digest` (captain finding 14, notice d8789f3d). Read with [away mode](away.md) (what `/afk` does today), [one block, one ask](one-block-one-ask.md) (PR 230: attachments to an open ask) and [architecture](../architecture.md) (the away paragraph). Names marked *new* do not exist yet; every other name was found in the tree at fc4f831.
+Status: round 2, revised after the Opus design review, and implemented on this branch (quiet mode stays deferred). Task `privateer-away-digest` (captain finding 14, notice d8789f3d). Read with [away mode](away.md) (what `/afk` does today), [one block, one ask](one-block-one-ask.md) (PR 230: attachments to an open ask) and [architecture](../architecture.md) (the away paragraph). Names marked *new* do not exist yet; every other name was found in the tree at fc4f831.
 
 ## Problem
 
