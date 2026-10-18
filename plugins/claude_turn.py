@@ -2,11 +2,121 @@
 """Confirm a headless Claude run and record its native permission denials for the runtime."""
 import json
 import os
+from pathlib import Path
+import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 
 from native_launch import native_environment
 from native_turn import MAX_LINE, Turn
+
+STARTUP_TIMEOUT_SECS = 300
+# The 1200 s default is twice the standard 10-minute maximum timeout for a Bash
+# tool call, ensuring Claude is not killed while awaiting a long tool execution.
+IDLE_TIMEOUT_SECS = 1200
+
+
+def startup_bound():
+    try:
+        return max(0.1, float(os.environ.get("PRIVATEER_CLAUDE_STARTUP_SECS", STARTUP_TIMEOUT_SECS)))
+    except ValueError:
+        return STARTUP_TIMEOUT_SECS
+
+
+def idle_bound():
+    try:
+        limit = float(os.environ.get("PRIVATEER_CLAUDE_IDLE_SECS", IDLE_TIMEOUT_SECS))
+    except ValueError:
+        limit = IDLE_TIMEOUT_SECS
+    bash_max_ms = os.environ.get("BASH_MAX_TIMEOUT_MS")
+    if bash_max_ms:
+        try:
+            limit = max(limit, (float(bash_max_ms) / 1000.0) * 2)
+        except ValueError:
+            pass
+    return max(0.1, limit)
+
+
+def is_mise_shim(path):
+    if not path:
+        return False
+    p = Path(path)
+    try:
+        real = p.resolve()
+        if real.name == "mise" or "mise/shims" in str(p) or "mise/shims" in str(real):
+            return True
+        target = real if real.is_file() else p
+        with open(target, "rb") as stream:
+            header = stream.read(512)
+            if header.startswith(b"#!") and (b"mise " in header or b"mise\n" in header or b"mise\t" in header):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def resolve_claude(binary="claude", env=None):
+    """Resolve the claude executable once instead of going through a mise shim.
+    Prefers a real binary on PATH over shims, falling back to the direct mise
+    install path, and finally any shim found on PATH."""
+    env = os.environ if env is None else env
+    if os.path.sep in binary:
+        path = Path(binary)
+        if path.is_file() and os.access(path, os.X_OK) and not is_mise_shim(path):
+            return str(path)
+
+    path_val = env.get("PATH", "")
+    first_shim = None
+    for entry in path_val.split(os.pathsep):
+        if not entry:
+            continue
+        candidate = Path(entry) / binary
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            if not is_mise_shim(candidate):
+                return str(candidate)
+            elif first_shim is None:
+                first_shim = str(candidate)
+
+    data_dir = env.get("MISE_DATA_DIR")
+    if not data_dir:
+        xdg_data = env.get("XDG_DATA_HOME")
+        if xdg_data:
+            data_dir = Path(xdg_data) / "mise"
+        else:
+            home = env.get("HOME")
+            data_dir = (Path(home) if home else Path.home()) / ".local/share/mise"
+    else:
+        data_dir = Path(data_dir)
+    installed = data_dir / "installs" / "claude" / "latest" / "claude"
+    if installed.is_file() and os.access(installed, os.X_OK):
+        return str(installed)
+
+    if os.path.sep in binary and Path(binary).is_file() and os.access(binary, os.X_OK):
+        return binary
+
+    return first_shim or binary
+
+
+def stop_process(child):
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
 
 USAGE_FIELDS = (("input_tokens", "input"), ("output_tokens", "output"),
                 ("cache_read_input_tokens", "cacheRead"), ("cache_creation_input_tokens", "cacheWrite"))
@@ -116,27 +226,94 @@ def selected_servers(env):
 
 def run(argv, control):
     turn = ClaudeTurn(argv, selected_servers(os.environ))
-    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             env=native_environment())
-    reason = None
-    try:
+    executable = resolve_claude(argv[0])
+    command = [executable, *argv[1:]]
+    child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             env=native_environment(), start_new_session=True)
+    state = {
+        "started": time.monotonic(),
+        "last_event": None,
+        "seen_lines": 0,
+        "reason": None,
+        "done": False,
+    }
+    lock = threading.Lock()
+
+    def read_stdout():
         try:
             while line := child.stdout.readline(MAX_LINE + 1):
                 if len(line) > MAX_LINE:
-                    raise ValueError("event-size")
+                    with lock:
+                        state["reason"] = "event-size"
+                    break
                 if not line.endswith(b"\n"):
-                    # A missing final LF is a truncated stream, not a completion fact.
-                    raise ValueError("truncated-stream")
+                    with lock:
+                        state["reason"] = "truncated-stream"
+                    break
                 sys.stdout.buffer.write(line)
                 sys.stdout.buffer.flush()
                 if line.strip():
-                    turn.observe(json.loads(line))
-        except json.JSONDecodeError:
-            reason = "invalid-json"
-        except ValueError as error:
-            reason = str(error)
+                    try:
+                        turn.observe(json.loads(line))
+                    except json.JSONDecodeError:
+                        with lock:
+                            state["reason"] = "invalid-json"
+                        break
+                    except ValueError as error:
+                        with lock:
+                            state["reason"] = str(error)
+                        break
+                with lock:
+                    state["seen_lines"] += 1
+                    state["last_event"] = time.monotonic()
+        except Exception as error:
+            with lock:
+                if not state["reason"]:
+                    state["reason"] = str(error)
+        finally:
+            with lock:
+                state["done"] = True
+
+    def end(signum, _frame):
+        stop_process(child)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, end)
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+
+    startup_limit = startup_bound()
+    idle_limit = idle_bound()
+    reason = None
+    try:
+        while child.poll() is None:
+            with lock:
+                seen = state["seen_lines"]
+            limit = startup_limit if seen == 0 else idle_limit
+            time.sleep(min(1.0, limit / 4))
+            now = time.monotonic()
+            with lock:
+                if state["done"] or state["reason"]:
+                    break
+                if state["seen_lines"] == 0:
+                    if now - state["started"] >= startup_limit:
+                        reason = "no-output"
+                        break
+                else:
+                    if now - state["last_event"] >= idle_limit:
+                        reason = "stalled"
+                        break
+        with lock:
+            if not reason:
+                reason = state["reason"]
         if reason:
-            child.terminate()
+            stop_process(child)
+        reader.join(timeout=5)
+        if not reason:
+            with lock:
+                reason = state["reason"]
+            if reason:
+                stop_process(child)
         status = child.wait()
         success = reason is None and status == 0 and turn.complete() and not turn.denied
         summary = {"type": "turn.completed" if success else "native.turn.failed",
@@ -150,14 +327,13 @@ def run(argv, control):
             report_denial(turn.denials)
         return 0 if success else 2
     finally:
-        child.stdout.close()
         if child.poll() is None:
-            child.terminate()
+            stop_process(child)
+        if not reader.is_alive():
             try:
-                child.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=2)
+                child.stdout.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
