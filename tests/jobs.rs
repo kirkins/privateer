@@ -2267,6 +2267,7 @@ fn a_killed_job_keeps_the_lines_it_printed_before_the_kill() {
     let command = json!({"task_id":"task","id":"slow","heavy":true,"timeout_secs":4,
         "command":["/bin/sh","-c","head -c 400000 /dev/zero | tr '\\0' x | fold -w 1023; echo; i=0; while :; do i=$((i+1)); echo line-$i; sleep 0.1; done"]});
     ok(&home, "job.start", command);
+    wait(&home, "slow", &["running"]);
     // Streamed lines reach the log while the harness is still running. The
     // filler can take most of the run on a slow machine, so poll for the
     // lines rather than reading once after a fixed sleep.
