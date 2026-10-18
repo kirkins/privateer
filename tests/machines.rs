@@ -4181,3 +4181,119 @@ fn a_gateway_too_old_to_serve_the_snapshot_reads_unreachable_with_its_refusal() 
     assert_eq!(machine_row(&snapshot, "laptop")["reachable"], true);
     assert_eq!(ships_on(&snapshot, "laptop").len(), 1, "{snapshot}");
 }
+
+/// Record a settled harness job in a ship's home, as its supervisor would.
+fn settled_job(machine: &Machine, ship: &str, id: &str, route: &str, usage: Value, at: i64) {
+    let home: String = rusqlite::Connection::open(machine.registry())
+        .unwrap()
+        .query_row("SELECT home FROM ships WHERE name=?1", [ship], |r| r.get(0))
+        .unwrap();
+    let record = json!({"id": id, "action": "spawn", "status": "succeeded", "agent_actor": ship,
+        "model_route": route, "usage": usage, "created_ms": at - 1_000, "finished_ms": at});
+    rusqlite::Connection::open(PathBuf::from(home).join("privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+            params![id, record.to_string()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn the_usage_summary_sums_a_reached_machine_and_lists_it_when_it_is_down() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let used = |n: u64| json!({"input": n, "output": n, "cacheRead": n, "cacheWrite": n, "totalTokens": 4 * n});
+    let day = 1_790_000_000_000_i64;
+    settled_job(&laptop, "liaison", "a", "claude/-/opus", used(1), day);
+    settled_job(&mac, "fitforge", "b", "claude/-/opus", used(10), day + 1);
+    settled_job(&mac, "fitforge", "c", "pi/zai/glm", Value::Null, day + 2);
+    // Outside the period.
+    settled_job(&mac, "fitforge", "d", "pi/zai/glm", used(100), day + 10_000);
+    let remote = remote_ssh(&mac);
+    let ask = |group_by: &str, ssh: &Path| {
+        laptop.ok_over(
+            "liaison",
+            "usage.summary",
+            json!({"since_ms": day, "until_ms": day + 10_000, "group_by": group_by}),
+            ssh,
+        )
+    };
+
+    let by_machine = ask("machine", &remote);
+    assert_eq!(
+        by_machine["groups"],
+        json!([
+            {"key": "laptop", "jobs": 1, "usage": used(1)},
+            {"key": "mac", "jobs": 2, "usage": used(10), "gaps": ["pi"]},
+        ]),
+        "{by_machine}"
+    );
+    let reached: Vec<_> = by_machine["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["name"].clone(), m["reached"].clone()))
+        .collect();
+    assert_eq!(
+        reached,
+        vec![(json!("laptop"), json!(true)), (json!("mac"), json!(true))]
+    );
+    let by_route = ask("route", &remote);
+    assert_eq!(
+        by_route["groups"],
+        json!([
+            {"key": "claude/-/opus", "jobs": 2, "usage": used(11)},
+            {"key": "pi/zai/glm", "jobs": 1, "usage": null, "gaps": ["pi"]},
+        ]),
+        "{by_route}"
+    );
+    let by_ship = ask("ship", &remote);
+    assert_eq!(by_ship["groups"][0]["key"], "fitforge", "{by_ship}");
+    assert_eq!(by_ship["groups"][1]["key"], "liaison", "{by_ship}");
+    assert_eq!(
+        ask("day", &remote)["groups"],
+        json!([{"key": "2026-09-21", "jobs": 3, "usage": used(11), "gaps": ["pi"]}])
+    );
+
+    // The gateway answers for its own homes only, and to the operator.
+    let own = mac.gateway(
+        "usage.summary",
+        json!({"since_ms": day, "until_ms": day + 10_000, "group_by": "machine"}),
+    );
+    assert_eq!(own["result"]["groups"][0]["jobs"], 2, "{own}");
+
+    // Down, the mac is listed as not reached; the laptop's own still counts.
+    let down = remote_ssh_with(&mac, "down-ssh", "| (cat >/dev/null; echo garbage)");
+    let partial = ask("machine", &down);
+    assert_eq!(
+        partial["groups"],
+        json!([{"key": "laptop", "jobs": 1, "usage": used(1)}]),
+        "{partial}"
+    );
+    let mac_row = partial["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "mac")
+        .cloned()
+        .unwrap_or_else(|| panic!("mac missing: {partial}"));
+    assert_eq!(mac_row["reached"], false, "{partial}");
+    assert!(mac_row["error"].as_str().is_some(), "{partial}");
+
+    // The reached side cannot ask back over a one-way link, and says so.
+    let other_side = mac.ok(
+        "fitforge",
+        "usage.summary",
+        json!({"since_ms": day, "until_ms": day + 10_000, "group_by": "machine"}),
+    );
+    let laptop_row = other_side["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "laptop")
+        .cloned()
+        .unwrap_or_else(|| panic!("laptop missing: {other_side}"));
+    assert_eq!(laptop_row["reached"], false, "{other_side}");
+}
