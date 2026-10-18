@@ -450,7 +450,7 @@ fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool) {
     (usage, log_cut(&text))
 }
 /// Whether a bounded log dropped bytes: its truncation marker is a line.
-fn log_cut(text: &str) -> bool {
+pub(crate) fn log_cut(text: &str) -> bool {
     text.lines().any(|line| {
         line.starts_with('{')
             && line.contains(TRUNCATED)
