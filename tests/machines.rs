@@ -2586,6 +2586,62 @@ fn the_captains_desk_can_sit_on_the_machine_this_one_reaches() {
 }
 
 #[test]
+fn the_captain_reads_and_answers_at_a_desk_on_another_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let ship = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "request", "body": "Ship build 14?"}),
+    );
+    let rename = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "request", "body": "Rename the scheme?"}),
+    );
+    let bodies = |listed: &Value| -> Vec<String> {
+        listed["waiting"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["mail"]["body"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // The laptop alone has not collected the Mac's asks.
+    assert!(bodies(&laptop.ok("liaison", "captain.waiting", json!({}))).is_empty());
+
+    assert!(
+        laptop
+            .run("liaison", &["machine", "captain", "mac"], None)
+            .status
+            .success()
+    );
+
+    // With the desk on the Mac, the captain's commands on the laptop run there.
+    let waiting = laptop.ok_over("liaison", "captain.waiting", json!({}), &ssh);
+    assert_eq!(bodies(&waiting), ["Ship build 14?", "Rename the scheme?"]);
+    laptop.ok_over(
+        "liaison",
+        "captain.reply",
+        json!({"id": ship["id"], "body": "Yes, ship it"}),
+        &ssh,
+    );
+    laptop.ok_over(
+        "liaison",
+        "captain.dismiss",
+        json!({"id": rename["id"]}),
+        &ssh,
+    );
+
+    let state = |id: &Value| mac.ok("fitforge", "mail.show", json!({"id": id}))["state"].clone();
+    assert_eq!(state(&ship["id"]), "answered");
+    assert_eq!(state(&rename["id"]), "dismissed");
+    assert!(bodies(&laptop.ok_over("liaison", "captain.waiting", json!({}), &ssh)).is_empty());
+    let feed = laptop.ok_over("liaison", "captain.feed", json!({}), &ssh);
+    assert!(feed.to_string().contains("Yes, ship it"), "{feed}");
+}
+
+#[test]
 fn a_machine_whose_desk_is_elsewhere_hands_its_captain_mail_only_there() {
     let (_temp, laptop, mac, ssh) = fixture();
     let server = Machine {

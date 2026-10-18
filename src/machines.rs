@@ -1060,6 +1060,22 @@ pub(crate) fn linked_for_snapshot(conn: &Connection) -> Result<Vec<Linked>> {
         .collect()
 }
 
+/// How long the captain's desk on another machine has to answer.
+const DESK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run one of the captain's own commands at the captain's desk, when
+/// `machine captain` keeps the desk on a machine this one reaches, so the
+/// captain sees and answers the same mail wherever they ask from. `None`
+/// when the desk is here.
+pub(crate) fn at_desk(command: &str, args: &Value) -> Result<Option<Value>> {
+    let conn = crate::fleet::registry()?;
+    let Some((name, _)) = desk(&conn)? else {
+        return Ok(None);
+    };
+    let machine = machine(&conn, &name)?;
+    call(&machine, command, args.clone(), Some(DESK_TIMEOUT)).map(Some)
+}
+
 /// Asking a machine this one reaches for its own snapshot section.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2028,6 +2044,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "fleet.snapshot" => crate::snapshot::own(&conn, args["since"].as_i64()),
         // The same for usage: this machine's homes, read-only.
         "usage.summary" => crate::usage::local(args),
+        // The captain's desk is here: answer from this machine's homes, and
+        // never pass the command on again.
+        "captain.waiting" | "captain.feed" | "captain.reply" | "captain.dismiss" => {
+            crate::captain::serve(command, args)
+        }
         "fleet.link" => {
             let name = required(args, "machine")?;
             identifier(name)?;

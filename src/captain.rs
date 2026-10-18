@@ -288,6 +288,23 @@ fn locate(query: &str, notices: bool) -> Result<Item> {
     }
 }
 
+/// Whether a home on this machine holds captain mail whose id starts with
+/// `query`, open or not.
+fn held_here(query: &str) -> Result<bool> {
+    identifier(query)?;
+    for (_, home) in fleet()? {
+        let held: bool = Store::open(&home)?.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND substr(id,1,length(?2))=?2)",
+            params![crate::mail::CAPTAIN, query],
+            |r| r.get(0),
+        )?;
+        if held {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn operator(store: &Store) -> Result<()> {
     ensure!(
         *store.caller() == Caller::Operator,
@@ -305,6 +322,10 @@ fn operator(store: &Store) -> Result<()> {
 /// the ship and leaves the report notice as it was.
 fn reply(store: &Store, args: &Value) -> Result<Value> {
     operator(store)?;
+    answer(args)
+}
+
+fn answer(args: &Value) -> Result<Value> {
     let item = locate(required(args, "id")?, true)?;
     let mut target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("ask vanished")?;
@@ -346,6 +367,10 @@ fn reply(store: &Store, args: &Value) -> Result<Value> {
 /// The captain ends one item without answering it, in whichever home holds it.
 fn dismiss(store: &Store, args: &Value) -> Result<Value> {
     operator(store)?;
+    end(args)
+}
+
+fn end(args: &Value) -> Result<Value> {
     let note = match args.get("note").filter(|v| !v.is_null()) {
         Some(note) => note.as_str().context("note must be a string")?,
         None => "",
@@ -362,7 +387,34 @@ fn dismiss(store: &Store, args: &Value) -> Result<Value> {
     Ok(json!({"id": item.id, "ship": item.ship, "state": mail["state"], "mail": mail}))
 }
 
+/// One of the captain's commands, sent by the operator over a machine link
+/// to this machine, which holds the captain's desk. The gateway has checked
+/// the caller is the operator.
+pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
+    match command {
+        "captain.waiting" => waiting(),
+        "captain.feed" => crate::feed::feed(args),
+        "captain.reply" => answer(args),
+        "captain.dismiss" => end(args),
+        _ => bail!("{command} is not served at the captain's desk"),
+    }
+}
+
 pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value> {
+    // The captain's mail gathers at the desk; when `machine captain` keeps it
+    // on another machine, the captain reads it there. An ask held here is
+    // still answered here (the desk's copy closes on the next pass); one only
+    // the desk holds is answered there. The liaison is at the desk already.
+    if *store.caller() == Caller::Operator {
+        let at_desk = match command {
+            "captain.waiting" | "captain.feed" => true,
+            "captain.reply" | "captain.dismiss" => !held_here(required(&_args, "id")?)?,
+            _ => false,
+        };
+        if at_desk && let Some(result) = crate::machines::at_desk(command, &_args)? {
+            return Ok(result);
+        }
+    }
     match command {
         "captain.waiting" => {
             desk(store)?;
