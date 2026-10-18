@@ -49,7 +49,8 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
             # Pi's gate and the headless Claude check both read them.
             env["PRIVATEER_MCP_SERVERS"] = json.dumps(bundles["mcp_servers"], separators=(",", ":"), sort_keys=True)
     if bundles is not None and harness == "claude":
-        from claude_bundles import preflight
+        from claude_bundles import check_headers, preflight
+        check_headers(bundles.get("mcp_servers", []), {**env, **secrets})
         # Privateer's attended mail adapter is the one runtime-owned plugin.
         plugins = [Path(__file__).resolve().parent / "attended-claude"] if attended else []
         argv = preflight(bundles, argv, env=env, runtime_plugins=plugins, attended=attended)

@@ -15,7 +15,12 @@ import shutil
 import sys
 import uuid
 
-from bundles import at, file_bytes, present, require, require_flags, safe_path, validate_plan
+import hashlib
+import stat
+import subprocess
+
+from bundles import (at, credential_directory, file_bytes, present, require, require_flags, safe_path,
+                     validate_plan)
 
 # Keep the project's .claude settings (Privateer's hooks and permissions) and
 # drop the user source; no MCP servers unless --mcp-config names them.
@@ -137,13 +142,20 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
     require_flags(str(binary), env, cwd or os.getcwd(), "Claude Code", NEEDED)
     carried = ["--settings", json.dumps(value["settings"], separators=(",", ":"))] if value["settings"] else []
     plugins = [arg for item in value["skills"] for arg in ("--plugin-dir", item["root"])]
-    return [argv[0], *FLAGS, *mcp_config(value.get("mcp_servers", [])), *carried, *plugins, *args]
+    return [argv[0], *FLAGS, *mcp_config(value.get("mcp_servers", []), env), *carried, *plugins, *args]
 
 
-def mcp_config(servers):
+def config_directory(env):
+    """Beside the credential store: fleet.mcp-configs, 0700."""
+    return credential_directory(env).with_suffix(".mcp-configs")
+
+
+def mcp_config(servers, env):
     """--mcp-config for the plan's selected servers, beside --strict-mcp-config,
     which keeps every other server out. Records only: each server's header comes
     from HEADERS reading its credential file, never from argv or env values.
+    The config is a 0600 file named by its content, not an argument, since a
+    URL may carry a secret in its path or query and argv is world-readable.
     One `=` argument, since --mcp-config takes several values and would
     swallow the next one."""
     if not servers:
@@ -152,4 +164,30 @@ def mcp_config(servers):
     config = {"mcpServers": {server["name"]: {"type": "http", "url": server["url"],
                                               "headersHelper": f"{helper} {server['credential']}"}
                              for server in servers}}
-    return ["--mcp-config=" + json.dumps(config, separators=(",", ":"), sort_keys=True)]
+    body = json.dumps(config, separators=(",", ":"), sort_keys=True).encode()
+    directory = config_directory(env)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    if not present(directory):
+        directory.mkdir(mode=0o700)
+    safe_path(str(directory), directory=True)
+    require(stat.S_IMODE(directory.lstat().st_mode) == 0o700)
+    path = directory / (hashlib.sha256(body).hexdigest()[:32] + ".json")
+    if not (present(path) and stat.S_IMODE(path.lstat().st_mode) == 0o600
+            and file_bytes(safe_path(str(path))) == body):
+        partial = path.with_name(path.name + f".{os.getpid()}")
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(body)
+        os.replace(partial, path)
+    return ["--mcp-config=" + str(path)]
+
+
+def check_headers(servers, env):
+    """Run each selected server's header helper once, its output discarded, so
+    a missing or malformed token refuses before launch: Claude itself would
+    connect without the header. The token stays in the helper's process."""
+    for server in servers:
+        done = subprocess.run([sys.executable, "-I", str(HEADERS), server["credential"]], env=env,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=10)
+        at("mcp_servers.credential", lambda: require(done.returncode == 0))

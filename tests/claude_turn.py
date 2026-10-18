@@ -98,10 +98,10 @@ class ClaudeTurn(unittest.TestCase):
         # Records as the launcher sets them for a bounded run that selects servers.
         records = json.dumps([{"name":"apify", "url":"https://mcp.apify.com", "credential":"APIFY", "timeout":120}])
 
-        def run(servers):
+        def run(servers, tools=("Bash", "mcp__apify__search-actors")):
             stream = self.root / "stream.jsonl"
             stream.write_bytes(b"".join((json.dumps(e)+"\n").encode()
-                                        for e in [{**INIT, "mcp_servers":servers}, RESULT]))
+                                        for e in [{**INIT, "mcp_servers":servers, "tools":list(tools)}, RESULT]))
             done = subprocess.run([sys.executable, str(ROOT / "plugins/claude_turn.py"), "--control", "{}",
                                    str(self.root / "claude"), "--print", "--output-format", "stream-json", "--", "p"],
                                   capture_output=True, timeout=5,
@@ -111,12 +111,15 @@ class ClaudeTurn(unittest.TestCase):
 
         code, summary = run([{"name":"apify", "status":"connected", "source":"dynamic"}])
         self.assertEqual((code, summary["type"]), (0, "turn.completed"))
-        for servers, reason in (([{"name":"apify", "status":"failed"}], "mcp-unavailable:apify"),
-                                ([], "mcp-unavailable:apify"),
-                                ([{"name":"apify", "status":"connected"}, {"name":"personal", "status":"connected"}],
-                                 "mcp-foreign:personal")):
-            with self.subTest(servers=servers):
-                code, summary = run(servers)
+        connected = [{"name":"apify", "status":"connected"}]
+        for servers, tools, reason in (([{"name":"apify", "status":"failed"}], None, "mcp-unavailable:apify"),
+                                       ([], None, "mcp-unavailable:apify"),
+                                       (connected, ["Bash"], "mcp-unavailable:apify"),
+                                       (connected + [{"name":"personal", "status":"connected"}], None,
+                                        "mcp-foreign:personal"),
+                                       (connected + [{"name":["x"]}], None, "mcp-foreign:unknown")):
+            with self.subTest(servers=servers, tools=tools):
+                code, summary = run(servers, *([tools] if tools else []))
                 self.assertEqual((code, summary["type"], summary["reason"]), (2, "native.turn.failed", reason))
         # A run that selects no server keeps whatever servers it has.
         run_, summary = self.run_stream([{**INIT, "mcp_servers":[{"name":"personal", "status":"failed"}]}, RESULT])

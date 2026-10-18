@@ -338,25 +338,29 @@ the server. Plans without servers are unchanged, and a run gets no MCP tool unle
 it selects one.
 
 A bounded Claude run gets the same records in `PRIVATEER_MCP_SERVERS` and one
-`--mcp-config=<json>` beside `--strict-mcp-config`, so no other server loads. Each
+`--mcp-config=<file>` beside `--strict-mcp-config`, so no other server loads. The file
+is 0600 in the 0700 `fleet.mcp-configs` directory beside the credential store, named by
+its content; a URL may carry a secret, and argv is readable by other local users. Each
 selected server is `{"type":"http","url":...,"headersHelper":...}`, where the helper
 is `plugins/claude_mcp_headers.py CREDENTIAL`, run as `python3 -I`. Claude runs it
 when it connects. It reads the token from the
 `PRIVATEER_CREDENTIAL_<NAME>_FILE` the launcher set, with the same token rules as
 Pi's reader, and prints only the `Authorization` header. On a missing or malformed
-token it exits 78, naming only the credential. The config holds no token and no
-path. A headless run (`claude_turn.py`) checks Claude's init event before the first
-model turn: every selected server must report `connected`, and any other server
-fails the run (`mcp-unavailable:<name>`, `mcp-foreign:<name>`). Hosted (attended)
-sessions have no such check; Claude's `/mcp` shows each server's state there. Claude
-has no per-server `timeout` or `description`, so both are Pi-only.
+token it exits 78, naming only the credential. The config holds no token. Because
+Claude connects without the header when its helper fails, the launcher first runs
+each helper once with its output discarded and refuses (`mcp_servers.credential`)
+unless it succeeds; the token stays in the helper's process. A headless run
+(`claude_turn.py`) also checks Claude's init event before any tool runs: every
+selected server must report `connected` and list tools, and any other server fails
+the run (`mcp-unavailable:<name>`, `mcp-foreign:<name>`). Hosted (attended) sessions
+get the pre-launch token check but no connection check; Claude's `/mcp` shows each
+server's state there. The record's `timeout` and `description` are not mapped into
+Claude's config.
 
 Limits: the token sits in the Pi process's memory; a same-user agent can still
 read the credential file; URLs are not content-pinned; stdio servers are not
-supported yet. When Claude's helper refuses, Claude still connects, without the
-header. A server that requires auth then fails and the headless check catches it,
-but one that also serves anonymous tools (Apify's search does) connects degraded,
-and the run finds out only when an authenticated tool fails.
+supported yet. A token that goes bad after launch (the file changed mid-run) makes
+Claude reconnect without the header; a hosted session has no connection check.
 
 - The agent can read its own credential file; this is an accepted limit.
 - Redirects are followed, but `Authorization` is dropped on a cross-origin redirect.

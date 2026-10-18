@@ -2,7 +2,7 @@
 
 This document qualifies the factory boundary. The implemented stage is the
 run-selected loader in `plugins/pi-mcp/selected.ts` and `selected.mjs`, described in
-[Selected MCP servers](tool-bundles.md#selected-mcp-servers-pi-http): remote
+[Selected MCP servers](tool-bundles.md#selected-mcp-servers-pi-and-claude-http): remote
 streamable-HTTP servers, Pi only, Bearer from a credential reference. The fixture
 below predates it and still uses its own inline configuration. No live profile,
 registry, provider route, permission policy or installation is changed by either.

@@ -351,11 +351,15 @@ class ClaudeBundles(unittest.TestCase):
         self.assertEqual(len(configs), 1)
         self.assertLess(argv.index(configs[0]), argv.index('--'))
         self.assertIn('--strict-mcp-config', argv)
-        servers = json.loads(configs[0].split('=', 1)[1])['mcpServers']
+        # A private file, not an argument: a URL may hold a secret and argv is world-readable.
+        config = Path(configs[0].split('=', 1)[1])
+        self.assertEqual((config.stat().st_mode & 0o777, config.parent.stat().st_mode & 0o777), (0o600, 0o700))
+        self.assertNotIn(docs['url'], json.dumps(argv))
+        servers = json.loads(config.read_text())['mcpServers']
         self.assertEqual(list(servers), ['docs'])
         self.assertEqual({k: servers['docs'][k] for k in ('type', 'url')}, {'type': 'http', 'url': docs['url']})
         self.assertEqual([r['name'] for r in json.loads(env['PRIVATEER_MCP_SERVERS'])], ['docs'])
-        self.assertNotIn('SENTINEL-MCP-TOKEN', json.dumps([argv, env]))
+        self.assertNotIn('SENTINEL-MCP-TOKEN', json.dumps([argv, env]) + config.read_text())
         # Claude runs the helper through a shell with the launch's environment.
         helper = servers['docs']['headersHelper']
         header = subprocess.run(helper, shell=True, env=env, capture_output=True, text=True)
@@ -370,6 +374,12 @@ class ClaudeBundles(unittest.TestCase):
         refused = subprocess.run(helper, shell=True, capture_output=True, text=True,
                                  env={k: v for k, v in env.items() if not k.startswith('PRIVATEER_CREDENTIAL_')})
         self.assertEqual(refused.returncode, 78)
+        # Claude would connect without the header, so a bad token refuses before launch.
+        # (Not self.refuses: its probe fakes every subprocess, the helper's too.)
+        with patch.object(native_launch.os, 'execvpe') as execute, self.assertRaises(bundles.Refused) as bad:
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan(['docs@1']))
+        self.assertEqual(bad.exception.field, 'mcp_servers.credential')
+        execute.assert_not_called()
         # No servers selected: no config, no records, and the earlier argv.
         with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
             native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan([]))

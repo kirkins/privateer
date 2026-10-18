@@ -23,20 +23,25 @@ class ClaudeTurn(Turn):
         self.denials = []
         self.servers = list(servers)
 
-    def check_servers(self, reported):
-        """Every selected MCP server connected, and no other: the Pi gate's
-        guarantee, checked at init, before Claude's first model turn. A run
+    def check_servers(self, reported, tools):
+        """Every selected MCP server connected with tools, and no other: the Pi
+        gate's guarantee, checked at init, before any tool runs. A run
         that selects none is not checked: unbounded runs keep the user's own
         servers, and a bounded one has --strict-mcp-config with no config."""
         if not self.servers:
             return
         reported = reported if isinstance(reported, list) else []
-        status = {item.get("name"): item.get("status") for item in reported if isinstance(item, dict)}
-        for name in status:
-            if name not in self.servers:
-                raise ValueError("mcp-foreign:" + (name if isinstance(name, str) and name.isascii() else "unknown")[:32])
+        tools = [tool for tool in tools if isinstance(tool, str)] if isinstance(tools, list) else []
+        status = {}
+        for item in reported:
+            name = item.get("name") if isinstance(item, dict) else None
+            if not (isinstance(name, str) and name in self.servers):
+                shown = name if isinstance(name, str) and name.isascii() and name.isprintable() else "unknown"
+                raise ValueError("mcp-foreign:" + shown[:32])
+            status[name] = item.get("status")
         for name in self.servers:
-            if status.get(name) != "connected":
+            # Connected and listing tools, as the Pi gate requires.
+            if status.get(name) != "connected" or not any(t.startswith(f"mcp__{name}__") for t in tools):
                 raise ValueError("mcp-unavailable:" + name)
 
     def observe(self, value):
@@ -45,7 +50,7 @@ class ClaudeTurn(Turn):
         kind = value.get("type")
         if kind == "system" and value.get("subtype") == "init":
             super().observe({"type": "session", "id": value.get("session_id")})
-            self.check_servers(value.get("mcp_servers"))
+            self.check_servers(value.get("mcp_servers"), value.get("tools"))
         elif kind == "result":
             if self.result is not None:
                 raise ValueError("repeated-result")
