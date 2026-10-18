@@ -1,6 +1,6 @@
 # Design: crews park on their own heavy jobs and resume
 
-Status: rounds 1 to 3 implemented. Round 3 adds the tests for parked time, dispatcher restart, stow-held resume and the incident replay, and the fix a stow-held resume needed: it now waits as `parked` instead of failing, and the next tick resumes it once the stow is lifted. Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
+Status: rounds 1 to 3 implemented; round 5 (PR 224 review) changes the resume path, the budget, the caps, task close and recovery as described under Rounds. Round 3 added the tests for parked time, dispatcher restart, stow-held resume and the incident replay: a stow-held resume waits as `parked` instead of failing, and the next tick resumes it once the stow is lifted. Task `privateer-crew-park-resume` (findings 11, 12, 14). Read with [crew outcomes](crew-outcomes.md) (the notice a first mate gets when a crew job ends) and [architecture](../architecture.md).
 
 ## Problem
 
@@ -43,17 +43,20 @@ Counts toward caps: `parks` is compared with the park cap (6), `created_ms` with
 
 Trigger: the final settlement of a child job, at the same place `crew_outcome` is called (end of `supervise_inner`, the supervisor-error path, `reconcile`, `cancel`, the queue endings in `wait_in_queue`). A helper `crew_resume_check(store, &child)` moves the park `parked → resuming` in a transaction, then starts the resume.
 
-- Resume is a new launch. It goes through `agent.start` admission and the stow hold, and uses the current release, routes and the fallback order if its route is backing off. It is never a bypass.
-- If the park's `harness` matches the current route's harness and `session` is set, the resume uses the existing session read and resume paths (`activation::read_session` at `src/activation.rs:151`, the `options.resume` path, `plugins/native.py`). The prompt is the job outcome.
+- Resume is a new launch. It goes through `agent.start` admission and the stow hold, and never bypasses the captain's routes. It is launched as the runtime (operator), so the route check that an agent start runs is repeated here (round 5).
+- **Route policy (round 5).** The parked route is still valid when the captain lists it for the crew's ship (or lists no crew routes) and it is not backing off (`crew_routes::resume_route`). If it is valid, the launch is the parked one. If not, the resume is a **fresh crew** on the first available route (`crew_routes::choose`, through `agent.start`'s own choice), with the handoff; no session is carried to a route the captain no longer offers.
+- **Session (round 5).** The session resumes only when the resume launches a harness equal to the park's `harness` (the harness the current route would launch, compared with the one the park recorded) and the session was read from the crew's log. Otherwise it starts fresh with the handoff. The prompt for a resumed session is the job outcome.
 - Otherwise (different harness, no session, Pi ephemeral, a terminal pane, hosted crew) it starts a **fresh crew** whose brief is the assignment plus a runtime handoff: the `next` line, the job outcome, and the last actions from the streamed job log (the live tail from PR 208).
+- **Admission (round 5).** The resume passes `wait_for_capacity: true`, so a busy host queues it rather than refusing. The park stays `resuming` until the launch is recorded (admitted or queued); a refusal other than a stow fails the crew.
+- **Memory (round 5).** A resume on the same route reuses the crew's recorded estimate (`_resume_estimate`, honoured only for the runtime's own resume), so the route's memory figure is not lost when the launch record strips it. A fresh crew on another route is estimated from that route.
 - Resume job ids are `crew-resume-<park id>-<attempt>`, so a restart that re-runs the step reuses the same id.
-- Recovery at boot (reconcile): a `parked` park whose child is already final is resumed; a `resuming` park whose start did not land is retried once with the same id.
+- **Recovery at boot and on each tick (round 5).** A `parked` park whose child is already final is resumed. A `resuming` park whose resumed job exists is `resumed`. A `resuming` park with no resumed job (the process died mid-launch) is retried **once** under the same resume id; if that also leaves no job, the park is `failed` and the crew gets a failed notice with the reason.
 
 ### Deadline
 
-- The crew's clock is the **sum of its process run time** across incarnations. Queued time (`wait_in_queue`) and parked time are not charged. `run_ms` is kept on the crew's job record (not the park row) and is written at each payload exit (park, final, or kill). A resume carries it into the new job through the runtime's own `_run_ms`, which only an operator-side caller can set.
-- Each incarnation's supervisor deadline is `spawn + (budget − run_ms)`, where budget is the charter's crew timeout. A budget overrun still times out as today.
-- Caps: 6 parks and 24 h elapsed in total, both configurable.
+- The crew's clock is **one budget summed across all its resumes**: the sum of its process run time over every incarnation. Queued time (`wait_in_queue`) and parked time are not charged. `run_ms` is kept on the crew's job record (not the park row) and is written at each payload exit (park, final, or kill). A resume carries it into the new job through the runtime's own `_run_ms`, which only an operator-side caller can set (round 5; this replaces the per-incarnation grant of round 2).
+- Each incarnation's supervisor deadline is `spawn + (budget − run_ms)` (saturating at zero), where budget is the charter's `job_timeout_secs`. A budget overrun still times out as today.
+- Caps: 6 parks and 24 h elapsed in total, both configurable. They are checked when a park opens, at the deadline (before the park is chosen), and on each tick while a crew is parked. A spent cap ends the crew: its waiting child is cancelled, and the crew ends `cancelled` (while parked) or `timed_out` with the reason (at the deadline), never as a silent stall.
 
 ### Deadline kill
 
@@ -72,12 +75,22 @@ Child jobs stay alive while the crew will read their result. They are cancelled 
 
 Cancelling uses the existing cancel path, so the wrapper and its payload are checked by process identity, not by the wrapper's exit.
 
+### Task close (round 5)
+
+Closing a task (`done` or `cancelled`) ends its parked and held crews quietly as `cancelled`, with the reason `task <id> is <status>`, and cancels the heavy job each one waits on. No crew-failed notice is sent. The park closes before the child is cancelled, so the child's settlement does not resume the crew.
+
+### Park grace (round 5)
+
+After `crew.park`, the supervisor gives the harness up to 5 seconds to end its own turn before it signals the payload. A payload that exits in that window is not signalled at all; one that does not is stopped as before.
+
 ### Notices and visibility
 
 - Park: a **low** notice from `crew` ("parked, will resume when X finishes"). It does not wake the first mate.
 - Failed resume: a normal notice with the failure reason. Resume that is held by a stow is not a failure.
 - Child final with the crew resumed: no notice from the child's outcome, since the crew reads it. The existing outcome notice for the child is still written for the first mate only when the crew is not parked on it (the duplicate-start fix).
-- `ship.bearings` lists parked crews, the child job each waits on, `next`, and the park count.
+- `ship.bearings` lists parked crews, the child job each waits on, `next`, and the park count (`park N of 6`).
+- The crew brief says where a heavy job's outcome goes for a crew only: a crew parks with `crew.park` and its outcome arrives as its resume prompt. A first mate's brief keeps "its outcome goes to your first mate".
+- An identical repeated `agent.start` (same id and request) for a task whose crew is already parked returns the existing job; the parked-task refusal applies only to a new launch.
 
 ### agent.start on a parked task
 
@@ -134,7 +147,7 @@ Decisions made while implementing round 1, where the text above was not exact:
 - The job.start reply to a crew carries a `park` hint, since that is where the crew learns to park rather than poll; the crew brief only names `crew.park`, to stay within its size budget.
 - Hosted crews are refused `crew.park` for now.
 - Round 2 is done in commit d8f7b6d: the deadline-kill park, `held` crews and `crew.resume`, `ship.bearings` listing parks, and the `agent.start` refusal on a parked task (`replace:true` cancels the crew and its jobs).
-- The budget is per incarnation: a resumed crew gets a fresh `timeout_secs` grant, and the park count and elapsed cap bound the total. This replaces the earlier `run_ms` carry-over in the Deadline section above.
+- The budget is summed across resumes (round 5, the approved design): a resumed crew carries the `run_ms` of the crew it resumes, so its deadline is `spawn + (budget − run_ms)`. Round 2 had granted a fresh `timeout_secs` per resume; that is replaced.
 - Restart recovery (Recovery at boot): a park whose child settled while the dispatcher was down resumes once, on the next tick. Tested by `a_park_survives_a_dispatcher_restart_and_resumes_once`.
 - A stow holds a resume like any launch. While stowed, `resume_pending` takes no park, and a resume refused by the stow leaves its park `parked` rather than failing the crew. Tested by `a_resume_held_by_a_stow_goes_through_admission`.
-- Still open: a resume whose start did not land (Recovery at boot, the one retry under the same id) is designed but not yet tested.
+- Round 5 (PR 224 review): the resume route policy, `wait_for_capacity` on resume, the recorded memory estimate, the summed budget, the caps at the deadline and while parked, task close, park grace, the `resuming` recovery (one retry under the same id), the bearings park count, the crew-only brief wording and the identical-repeat rule are as described above. Tests: `tests/crew_park.rs`, one per behaviour listed in the round 5 assignment.
