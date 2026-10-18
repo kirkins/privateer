@@ -3,5 +3,6 @@
   "kind": "front-door",
   "id": "telegram",
   "executable": ["python3", "door.py"],
-  "config_required": true
+  "config_required": true,
+  "digests": true
 }

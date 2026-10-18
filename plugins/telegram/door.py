@@ -50,6 +50,7 @@ HELP = (
     "/afk [until 8am] [instructions] — away: hold mail, only emergencies 🚨 get through\n"
     "/back — back from away (any ordinary message also brings you back)\n"
     "/held — what was held while you were away\n"
+    "/digest — send what is held now; /afk every 30m sets how often\n"
     "/voice [on|off] — speak messages as voice notes (needs [tts])\n"
     "/help — this message\n\n"
     "Photos and files are saved and the ship is handed their path. Voice notes are "
@@ -64,6 +65,7 @@ COMMANDS = [
     {"command": "afk", "description": "Away: hold mail, emergencies only"},
     {"command": "back", "description": "Back from away, with a summary"},
     {"command": "held", "description": "What was held while you were away"},
+    {"command": "digest", "description": "Send the away digest now"},
     {"command": "ships", "description": "The fleet's ships"},
     {"command": "waiting", "description": "What is waiting on you"},
     {"command": "dismiss", "description": "Close one item without answering"},
@@ -185,17 +187,28 @@ class Door:
         while self.pending:
             event = self.pending[0]
             mail = event.get("mail") or {}
-            if mail.get("id") not in self.sent:
-                err = self.push(event)
+            key = event.get("id") if event.get("type") == "digest" else mail.get("id")
+            if key not in self.sent:
+                err = self.push_digest(event) if event.get("type") == "digest" else self.push(event)
                 if err:
                     tg.log(f"push of {event.get('ref')} failed ({err}); retrying in {RETRY_SECONDS}s")
                     self.retry_at = time.monotonic() + RETRY_SECONDS
                     return
-                self.sent.append(mail.get("id"))
+                self.sent.append(key)
                 del self.sent[:-SENT_LIMIT]
                 tg.write_state(SENT, self.sent)
             self.runtime.delivered(event["ref"])
             self.pending.pop(0)
+
+    def push_digest(self, event: dict) -> str:
+        """An away digest or the return catch-up: one message, silent unless urgent."""
+        text = "\n".join(str(line) for line in event.get("lines") or [])
+        pieces = tg.split_markdown(text, TEXT_LIMIT) or [text]
+        for piece in pieces:
+            _, err = self.say(piece, quiet=not event.get("loud"))
+            if err:
+                return err
+        return ""
 
     def push(self, event: dict) -> str:
         """Send one message to the captain -> error, or ""."""
@@ -206,9 +219,12 @@ class Door:
         payload = mail.get("payload") or {}
         # One card per ask: mail the runtime attached to an open ask, and the
         # ask's closure, edit the card the captain already has.
-        if payload.get("attached_to") and kind != "reply":
-            self.attach(mail, payload)
-            return ""
+        # High urgency is never only a silent card edit.
+        if payload.get("attached_to") and kind != "reply" and mail.get("urgency") != "high":
+            if self.attach(mail, payload):
+                return ""
+            # The card is not known here: show the mail itself, quietly.
+            event = {**event, "quiet": True}
         if kind == "notice" and isinstance(payload.get("request_end"), dict):
             cards = tg.read_state(CARDS, {})
             ended = mail.get("correlation")
@@ -240,6 +256,10 @@ class Door:
             header = "🚨 " + header + " · while you're away"
         elif mail.get("urgency") == "high":
             header = "🔴 " + header
+        if event.get("away") and not event.get("breakthrough"):
+            header += " · while you're away"
+        if event.get("again"):
+            header += " · (again)"
         # /waiting shows what is already outstanding, so say how old it is.
         if event.get("note"):
             header += f" · {event['note']}"
@@ -263,7 +283,8 @@ class Door:
                 text = f"{header}\n{text}"
             last = index == len(pieces) - 1
             message_id, err = self.say(text, reply_to=reply_to if index == 0 else None,
-                                       html=True, markup=markup if last else None)
+                                       html=True, markup=markup if last else None,
+                                       quiet=bool(event.get("quiet")))
             if err:
                 return err
             if last and typed and markup:
@@ -303,13 +324,13 @@ class Door:
             "reply_markup": json.dumps(card.get("markup") or {"inline_keyboard": []})})
         return err
 
-    def attach(self, mail: dict, payload: dict) -> None:
+    def attach(self, mail: dict, payload: dict) -> bool:
         cards = tg.read_state(CARDS, {})
         card = cards.get(payload["attached_to"])
         if not card or card.get("resolved"):
-            # Its card was shown before this door kept cards: /waiting counts it.
+            # Its card was shown before this door kept cards: show it as mail.
             tg.log(f"{mail.get('id')} joins {payload['attached_to']}, whose card is not known here")
-            return
+            return False
         sender = mail.get("from") or "a ship"
         card.setdefault("members", []).append(mail.get("id"))
         if payload.get("type") == "tool_permission":
@@ -322,6 +343,7 @@ class Door:
         if err:
             tg.log(f"could not edit the card for {payload['attached_to']}: {err}")
         tg.write_state(CARDS, cards)
+        return True
 
     def resolve(self, mail_id: str, reason: str) -> None:
         # The card is kept, marked resolved, so the closures of the items
@@ -525,6 +547,12 @@ class Door:
                 self.welcome(self.runtime.call("away", {"action": "back"}).get("returned"), quiet=False)
             elif name == "held":
                 self.cmd_held()
+            elif name == "digest":
+                state = self.runtime.call("digest", {})
+                if state.get("away"):
+                    self.say("📋 Sending what is held now.", quiet=True)
+                else:
+                    self.say("📋 You are not away, so nothing is being held.", quiet=True)
             elif name == "voice":
                 import tts
                 self.say(tts.voice_reply(self.cfg, rest))
@@ -538,8 +566,8 @@ class Door:
         away = out.get("away") or {}
         since = time.strftime("%H:%M", time.localtime((away.get("since_ms") or 0) / 1000))
         until = f" (back about {away['until']})" if away.get("until") else ""
-        text = (f"🌙 Away from {since}{until}. I'll hold everything except emergencies 🚨, "
-                "at most three an hour. Any message brings you back.")
+        text = (f"🌙 Away from {since}{until}. Requests and emergencies 🚨 reach you at once; "
+                "other notices come in a digest. Any message brings you back.")
         if away.get("words"):
             text += f"\nYour instructions for the liaison: “{away['words']}”"
         self.say(text)
@@ -549,6 +577,9 @@ class Door:
         if not returned:
             if not quiet:
                 self.say("You weren't away.")
+            return
+        if returned.get("catch_up"):
+            # The catch-up follows as its own message, retried until delivered.
             return
         text = "🌅 " + returned.get("digest", "Welcome back.")
         if returned.get("summary_requested"):
@@ -957,7 +988,7 @@ def main() -> int:
         try:
             if source == "eof":
                 break
-            if source == "runtime" and item.get("type") == "mail":
+            if source == "runtime" and item.get("type") in ("mail", "digest"):
                 door.on_mail(item)
             elif source == "runtime":
                 tg.log(f"ignoring runtime message {item.get('type')!r}")

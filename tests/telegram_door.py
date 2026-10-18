@@ -134,6 +134,41 @@ def check_age_phrases() -> None:
                                       "2 min ago", "2 h ago", "3 d ago"], out.stdout
 
 
+CARD_PROBE = """
+import json, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+said = []
+d = door.Door({"door": "t"}, {"tts": {}}, None)
+d.say = lambda text, reply_to=None, html=False, markup=None, quiet=False: (
+    said.append({"text": text, "quiet": quiet}) or (len(said), ""))
+unknown = {"id": "m1", "from": "ops", "kind": "notice", "urgency": "normal",
+           "body": "joins an ask shown before cards were kept", "payload": {"attached_to": "gone"}}
+urgent = {"id": "m2", "from": "ops", "kind": "notice", "urgency": "high",
+          "body": "prod is down too", "payload": {"attached_to": "gone"}}
+digest = {"type": "digest", "ref": "digest:x", "id": "x", "lines": ["a", "b"], "loud": False}
+for event in ({"ref": "ops:1", "ship": "ops", "mail": unknown},
+              {"ref": "ops:2", "ship": "ops", "mail": urgent}):
+    assert d.push(event) == ""
+assert d.push_digest(digest) == ""
+print(json.dumps(said))
+"""
+
+
+def check_card_rendering() -> None:
+    """Mail attached to a card this door does not know is shown, quietly;
+    high urgency is never only a silent card edit; a digest is one message."""
+    out = subprocess.run([sys.executable, "-c", CARD_PROBE, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    said = json.loads(out.stdout)
+    assert len(said) == 3, said
+    assert "joins an ask" in said[0]["text"] and said[0]["quiet"], said
+    assert "prod is down too" in said[1]["text"] and not said[1]["quiet"], said
+    assert said[2] == {"text": "a\nb", "quiet": True}, said
+
+
 class Fleet:
     def __init__(self, binary: str, root: pathlib.Path):
         self.binary, self.root = binary, root
@@ -206,6 +241,7 @@ def main() -> int:
     binary = os.path.abspath(sys.argv[1])
     telegram = FakeTelegram()
     check_age_phrases()
+    check_card_rendering()
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp).resolve()
         fleet = Fleet(binary, root)
@@ -534,13 +570,22 @@ def main() -> int:
             wait_for("the held list", lambda: [
                 m for m in telegram.sent()[before:]
                 if m["text"].startswith("1 held:") and "Nightly build done." in m["text"]])
+            # /digest sends what is held now, as one quiet message.
+            telegram.message("/digest")
+            digest = wait_for("the digest", lambda: [
+                m for m in telegram.sent()[before:] if m["text"].startswith("📋 Away digest")])[0]
+            assert "Nightly build done." in digest["text"], digest
+            assert digest.get("disable_notification") == "true", digest
             telegram.message("good morning")
-            welcome = wait_for("the return digest", lambda: [
+            welcome = wait_for("the return catch-up", lambda: [
                 m for m in telegram.sent()[before:] if m["text"].startswith("🌅 Welcome back.")])[0]
             assert "1 emergency sent" in welcome["text"], welcome
+            assert welcome.get("disable_notification") is None, welcome
+            # The digest already told it, and the catch-up was not cut: no
+            # liaison summary is spent.
             summary = [m for m in fleet.inbox("liaison", "liaison")
                        if m["body"].startswith("I'm back after")]
-            assert summary and "Nightly build done." in summary[-1]["body"], summary
+            assert not summary, summary
             time.sleep(2)
             assert not cards(), "held mail was replayed after the return"
 
