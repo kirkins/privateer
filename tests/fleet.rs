@@ -1906,3 +1906,49 @@ fn the_captain_reads_one_time_ordered_feed_across_homes_a_page_at_a_time() {
     let default = machine.json(&web, "captain.feed", json!({}));
     assert_eq!(default["entries"].as_array().unwrap().len(), 50);
 }
+
+/// Ships choose their own ids, so two homes can hold unrelated messages
+/// under one id: the feed shows both, not one as a copy of the other.
+#[test]
+fn the_captain_feed_keeps_unrelated_messages_that_share_an_id() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    machine.json(
+        &web,
+        "mail.send",
+        json!({"id":"deploy-12","from":"web","to":"captain","kind":"request","body":"Deploy web 12?"}),
+    );
+    machine.json(
+        &web,
+        "captain.reply",
+        json!({"id": "deploy-12", "body": "Yes"}),
+    );
+    thread::sleep(Duration::from_millis(3));
+    machine.json(
+        &apps,
+        "mail.send",
+        json!({"id":"deploy-12","from":"apps","to":"captain","kind":"request","body":"Deploy apps 12?"}),
+    );
+    let feed = machine.json(&apps, "captain.feed", json!({}));
+    let asks: Vec<(String, String)> = feed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["id"] == "deploy-12")
+        .map(|e| {
+            (
+                e["from"].as_str().unwrap().to_owned(),
+                e["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        asks,
+        [
+            ("web".to_owned(), "answered".to_owned()),
+            ("apps".to_owned(), "open".to_owned())
+        ],
+        "{feed}"
+    );
+}

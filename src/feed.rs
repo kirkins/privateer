@@ -178,6 +178,10 @@ fn scan(homes: &[Home], index: usize, query: &Query) -> Result<(Rows, Option<Key
 /// Whether `homes[index]` holds the copy of this message the feed shows.
 fn shown_here(homes: &[Home], index: usize, row: &Value) -> Result<bool> {
     let id = row["id"].as_str().context("message id")?;
+    // Senders choose their own ids, so a copy is the same id between the
+    // same two mailboxes; an unrelated message that shares an id is not one.
+    let from = row["from"].as_str().context("message sender")?;
+    let to = row["to"].as_str().context("message recipient")?;
     let mut open = vec![];
     let mut holders = vec![];
     for (i, home) in homes.iter().enumerate() {
@@ -185,8 +189,8 @@ fn shown_here(homes: &[Home], index: usize, row: &Value) -> Result<bool> {
             Some(row["state"].as_str().map(str::to_owned))
         } else {
             rusqlite::OptionalExtension::optional(home.store.connection().query_row(
-                "SELECT state FROM mail WHERE id=?1",
-                [id],
+                "SELECT state FROM mail WHERE id=?1 AND sender=?2 AND recipient=?3",
+                [id, from, to],
                 |r| r.get(0),
             ))?
         };
