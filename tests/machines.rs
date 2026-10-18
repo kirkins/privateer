@@ -3330,3 +3330,163 @@ fn an_approval_outcome_on_the_linked_machine_closes_the_desk_copy() {
     assert_eq!(refused[0]["id"], denied["id"]);
     assert_eq!(refused[0]["end_reason"], "denied");
 }
+
+/// Make a ship's home refuse mail updates while still opening and reading, as
+/// a home whose database is busy does. `accept_mail_updates` lifts it. (A home
+/// that cannot be opened stops the desk's collection before closures, so it
+/// never reaches the closure path.)
+fn refuse_mail_updates(machine: &Machine, ship: &str) {
+    rusqlite::Connection::open(machine.folder(ship).join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_mail_updates BEFORE UPDATE ON mail
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+        )
+        .unwrap();
+}
+
+fn accept_mail_updates(machine: &Machine, ship: &str) {
+    rusqlite::Connection::open(machine.folder(ship).join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_mail_updates;")
+        .unwrap();
+}
+
+/// The audit events of a kind in a ship's home here.
+fn audited(laptop: &Machine, ship: &str, kind: &str) -> usize {
+    laptop.ok(ship, "audit.list", json!({"limit": 1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == kind)
+        .count()
+}
+
+/// A desk home that cannot take a closure right now is a transient failure,
+/// not a refusal: the closure is offered again, and the copy closes once the
+/// home can take it.
+#[test]
+fn a_closure_the_desk_cannot_write_yet_is_offered_again() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+
+    refuse_mail_updates(&mac, "fitforge");
+    laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 0, "{pass}");
+    assert_eq!(audited(&laptop, "liaison", "machine.closure_refused"), 0);
+
+    accept_mail_updates(&mac, "fitforge");
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+    let closed = captain_requests(&mac, "fitforge", "answered");
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["id"], asked["id"]);
+}
+
+/// A desk that predates closures answers without a closed list. Its closures
+/// go once, then not again until the link refreshes, with one audit of it.
+#[test]
+fn a_desk_predating_closures_is_sent_none_until_its_next_refresh() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+
+    // The older desk's reply, with its closed list removed.
+    let older = remote_ssh_with(&mac, "older-ssh", r#"| sed 's/"closed":\[[^]]*\],//'"#);
+    laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &older);
+    assert_eq!(pass["machines"][0]["captain_closed"], 0, "{pass}");
+    assert_eq!(captain_requests(&mac, "fitforge", "answered").len(), 1);
+    assert_eq!(
+        audited(&laptop, "liaison", "machine.closures_unsupported"),
+        1
+    );
+
+    collect_now(&laptop);
+    let again = laptop.pass("liaison", &older);
+    assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
+    assert_eq!(
+        audited(&laptop, "liaison", "machine.closures_unsupported"),
+        1
+    );
+}
+
+/// A closure the desk can never apply is refused once, reported, and not sent
+/// again. The stored reason is set past the limit directly, as no path writes one.
+#[test]
+fn a_malformed_closure_is_refused_once_and_not_sent_again() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Merge PR 9?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+    laptop.ok(
+        "scout",
+        "mail.withdraw",
+        json!({"id": asked["id"], "reason": "PR 9 closed"}),
+    );
+    rusqlite::Connection::open(laptop.folder("scout").join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE mail SET end_reason=?2 WHERE id=?1",
+            params![asked["id"].as_str().unwrap(), "x".repeat(2001)],
+        )
+        .unwrap();
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 0, "{pass}");
+    assert_eq!(audited(&laptop, "liaison", "machine.closure_refused"), 1);
+
+    collect_now(&laptop);
+    let again = laptop.pass("liaison", &ssh);
+    assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
+    assert_eq!(audited(&laptop, "liaison", "machine.closure_refused"), 1);
+}

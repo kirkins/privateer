@@ -1444,13 +1444,10 @@ pub(crate) fn collected_closed(store: &Store, peer: &str, ids: &[String]) -> Res
     Ok(changed)
 }
 
-/// Apply a closure a machine behind `peer` sent for a captain request this
-/// home holds from one of that machine's ships: the open copy closes with the
-/// same state and end reason, so the captain's waiting drops it. A copy that
-/// is already closed is left as it is. Returns whether a copy was closed.
-pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) -> Result<bool> {
-    let id = required(closure, "id")?;
-    identifier(id)?;
+/// Check the shape of a closure. A malformed one can never apply, so the desk
+/// refuses it for good; nothing else about applying it is permanent.
+pub(crate) fn check_closure(closure: &Value) -> Result<()> {
+    identifier(required(closure, "id")?)?;
     let state = required(closure, "state")?;
     ensure!(
         matches!(
@@ -1461,6 +1458,18 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
     );
     let reason = closure["reason"].as_str().unwrap_or("");
     ensure!(reason.len() <= 2000, "closure reason exceeds 2000 bytes");
+    Ok(())
+}
+
+/// Apply a closure a machine behind `peer` sent for a captain request this
+/// home holds from one of that machine's ships: the open copy closes with the
+/// same state and end reason, so the captain's waiting drops it. A copy that
+/// is already closed is left as it is. Returns whether a copy was closed.
+/// The closure must have passed `check_closure`.
+pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) -> Result<bool> {
+    let id = required(closure, "id")?;
+    let state = required(closure, "state")?;
+    let reason = closure["reason"].as_str().unwrap_or("");
     let by = closure["by"].as_str();
     let ms = closure["ms"].as_i64().unwrap_or_else(Store::now_ms);
     let from_peer = "SELECT s.name FROM ships s WHERE json_extract(s.record,'$.location.peer')=?2";

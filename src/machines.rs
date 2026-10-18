@@ -1726,15 +1726,21 @@ fn push_closures(
     Ok(closed.len())
 }
 
-/// End the desk's copies of one closure in every home that holds them.
+/// End the desk's copies of one closure in every home that holds them. A home
+/// that cannot be opened or written does not stop the others, but the closure
+/// then counts as not applied, so the sender offers it again.
 fn apply_closure(conn: &Connection, peer: &str, closure: &Value) -> Result<()> {
-    required(closure, "id")?;
+    let mut failure = None;
     for member in crate::fleet::members(conn)? {
         if member.home.is_dir() {
-            crate::mail::close_captain_request(&Store::open(&member.home)?, peer, closure)?;
+            let applied = Store::open(&member.home)
+                .and_then(|store| crate::mail::close_captain_request(&store, peer, closure));
+            if let Err(error) = applied {
+                failure.get_or_insert(error);
+            }
         }
     }
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 /// One dispatcher pass: for each machine this one reaches, refresh the
@@ -2008,16 +2014,18 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             }
             // A closure ends the desk's copy of a request it holds from a ship
             // of the sending machine; a copy it never held has nothing to end.
-            // One that cannot be applied is reported and skipped, so it cannot
-            // fail the closures after it.
+            // A malformed one is refused for good and reported. Any other one
+            // that fails is left out of both lists, so the sender offers it again.
+            // Neither kind can fail the closures after it.
             let peer = peer_name(&from.name);
             let mut closed = vec![];
             let mut closures_refused = vec![];
             for closure in args["closures"].as_array().into_iter().flatten() {
-                match apply_closure(&conn, &peer, closure) {
-                    Ok(()) => closed.push(closure["id"].clone()),
-                    Err(error) => closures_refused
-                        .push(json!({"id": closure["id"], "error": format!("{error:#}")})),
+                if let Err(error) = crate::mail::check_closure(closure) {
+                    closures_refused
+                        .push(json!({"id": closure["id"], "error": format!("{error:#}")}));
+                } else if apply_closure(&conn, &peer, closure).is_ok() {
+                    closed.push(closure["id"].clone());
                 }
             }
             Ok(
