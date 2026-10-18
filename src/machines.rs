@@ -1108,6 +1108,28 @@ pub(crate) fn report_from_linked(id: &str) -> Result<Option<Value>> {
     Ok(None)
 }
 
+/// How long a linked machine has to read or type into a session.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A session command for a ship on a machine this one reaches: each is
+/// asked in turn, and the one that hosts the ship answers.
+pub(crate) fn session_on_linked(command: &str, args: &Value) -> Result<Option<Value>> {
+    let conn = crate::fleet::registry()?;
+    let mut problems = Vec::new();
+    for machine in machines(&conn)?
+        .into_iter()
+        .filter(|m| m.role == "collects")
+    {
+        match call(&machine, command, args.clone(), Some(SESSION_TIMEOUT)) {
+            Ok(found) => return Ok(Some(found)),
+            Err(error) if error.to_string().contains("on this machine") => {}
+            Err(error) => problems.push(format!("{error:#}")),
+        }
+    }
+    ensure!(problems.is_empty(), "{}", problems.join("; "));
+    Ok(None)
+}
+
 /// Asking a machine this one reaches for its own snapshot section.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2086,6 +2108,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "fleet.snapshot" => crate::snapshot::own(&conn, args["since"].as_i64()),
         // The same for usage: this machine's homes, read-only.
         "usage.summary" => crate::usage::local(args),
+        // A ship's live session on this machine; never asked further.
+        "session.read" | "session.send" => crate::session::serve(command, args),
         // A stored report from this machine's homes; never asked further.
         "report.get" => crate::report::serve(args),
         // The captain's desk is here: answer from this machine's homes, and

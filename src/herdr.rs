@@ -545,6 +545,25 @@ impl Client {
         Ok(pane)
     }
 
+    /// A pane's recent screen, with its colours, and its revision.
+    pub(crate) fn read_screen(&mut self, pane: &str, lines: u32) -> Result<Value> {
+        let result = self.request(
+            "pane.read",
+            json!({"pane_id": pane, "source": "recent", "format": "ansi",
+                   "strip_ansi": false, "lines": lines}),
+        )?;
+        Ok(result["read"].clone())
+    }
+
+    /// Type into a pane: text, then keys such as `Enter`.
+    pub(crate) fn type_into(&mut self, pane: &str, text: &str, keys: &[String]) -> Result<()> {
+        self.request(
+            "pane.send_input",
+            json!({"pane_id": pane, "text": text, "keys": keys}),
+        )?;
+        Ok(())
+    }
+
     /// Navigation only. A second snapshot and socket incarnation check reject a
     /// stale selection; these checks do not authorize input or process control.
     /// Report a pane as an agent Privateer supervises: `agent` is its

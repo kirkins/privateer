@@ -127,6 +127,8 @@ recovery/cleanup action and cannot request `spawn`, so a captain who narrows
 a liaison to read/message/delegate still has it process mail headlessly.
 The instruction checklist is not proof of a model-driven onboarding outcome.
 
+The captain can look into a hosted first mate's live session and type into it from any of the fleet's machines, which is how a desktop client shows a ship's live session. `session.read {ship, lines?}` returns the pane's recent screen with its colours (`text`, ANSI), a `revision` that changes when the screen does, and the agent's state (`agent_status`: idle, working, blocked, done or unknown). `session.send {ship, text?, keys?}` types text and then keys such as `Enter` or `C-c` into the pane. Both are the operator's and act only on the ship's own lease binding, re-checked against the host first, so a pane reused for something else is never read or typed into; `session.send` is audited without its text. A ship on a machine this one reaches is reached over the gateway, which answers from its own homes only.
+
 ### Replacing the installed executable
 
 [Versioned releases](releases.md) keep each running binary paired with its own bundled plugins. In that layout, persisted command paths use `current/bin/privateer`, while internal supervisors retain the running image. `privateer upgrade status` reports the selected and running commits separately and reads recorded fleet outcomes; it does not perform an upgrade.

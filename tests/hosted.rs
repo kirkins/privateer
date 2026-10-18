@@ -620,6 +620,12 @@ impl Herdr {
                         }
                         json!({"type":"ok"})
                     }
+                    "pane.read" => {
+                        json!({"type":"pane_read","read":{"pane_id":params["pane_id"],
+                            "workspace_id":"w2","tab_id":"w2:t1","source":params["source"],
+                            "format":params["format"],"revision":7,"truncated":false,
+                            "text":"\u{1b}[1mpi\u{1b}[0m ready"}})
+                    }
                     "pane.get" => {
                         let live = live.lock().unwrap();
                         let pane = live.iter().find(|p| p["pane_id"] == params["pane_id"]);
@@ -1881,6 +1887,63 @@ fn ignored_reports(place: &Place) -> Vec<Value> {
         .filter(|event| event["kind"] == "host.report_ignored")
         .map(|event| event["payload"].clone())
         .collect()
+}
+
+#[test]
+fn the_captain_reads_and_types_into_a_hosted_first_mates_session() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"check CI"}),
+    );
+    assert_eq!(place.tick()["hosted"]["pane"], "w2:p1");
+    until("the hosted session's binding", || {
+        place.json("ship.presence", json!({"ship":"infra"}))["lease"]["binding"]["pane"]["pane_id"]
+            == "w2:p1"
+    });
+
+    // The screen, with its colours and revision, from the ship's own pane.
+    let read = place.json("session.read", json!({"ship":"infra","lines":50}));
+    assert_eq!(read["pane_id"], "w2:p1", "{read}");
+    assert_eq!(read["revision"], 7);
+    assert_eq!(read["text"], "\u{1b}[1mpi\u{1b}[0m ready");
+    let asked = &herdr.calls("pane.read")[0]["params"];
+    assert_eq!(
+        (asked["format"].as_str(), asked["lines"].as_u64()),
+        (Some("ansi"), Some(50))
+    );
+
+    // Typing goes into that pane, and is audited without the text.
+    place.json(
+        "session.send",
+        json!({"ship":"infra","text":"how is CI?","keys":["Enter"]}),
+    );
+    let typed = herdr.calls("pane.send_input").last().unwrap()["params"].clone();
+    assert_eq!(typed["pane_id"], "w2:p1");
+    assert_eq!(typed["text"], "how is CI?");
+    assert_eq!(typed["keys"], json!(["Enter"]));
+
+    // Nothing to send, or a ship with no live session, is refused.
+    for args in [json!({"ship":"infra"}), json!({"ship":"nobody","text":"x"})] {
+        let refused = place
+            .command(&["session.send", "--json", &args.to_string()])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success(), "{args}");
+    }
 }
 
 #[test]
