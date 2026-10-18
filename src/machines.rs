@@ -1578,13 +1578,27 @@ fn push_captain(
             messages.push(envelope);
         }
     }
-    if messages.is_empty() {
-        return Ok(json!({"machine": machine.name, "captain_pushed": 0}));
+    let mut pushed = 0;
+    if !messages.is_empty() {
+        pushed = push_messages(conn, machine, &peer, known_as, &messages, timeout)?;
     }
+    let closed = push_closures(conn, machine, &peer, known_as, timeout)?;
+    Ok(json!({"machine": machine.name, "captain_pushed": pushed, "captain_closed": closed}))
+}
+
+/// Send captain messages to the desk and record what it took or refused.
+fn push_messages(
+    conn: &Connection,
+    machine: &Machine,
+    peer: &str,
+    known_as: &str,
+    messages: &[Value],
+    timeout: Duration,
+) -> Result<usize> {
     let result = call(
         machine,
         "fleet.captain",
-        json!({"machine": known_as, "messages": &messages}),
+        json!({"machine": known_as, "messages": messages}),
         Some(timeout),
     )?;
     let mut taken: Vec<(String, Option<String>)> = result["delivered"]
@@ -1613,10 +1627,52 @@ fn push_captain(
     }
     for member in crate::fleet::members(conn)? {
         if member.home.is_dir() {
-            crate::mail::collected_captain(&Store::open(&member.home)?, &peer, &taken)?;
+            crate::mail::collected_captain(&Store::open(&member.home)?, peer, &taken)?;
         }
     }
-    Ok(json!({"machine": machine.name, "captain_pushed": taken.len()}))
+    Ok(taken.len())
+}
+
+/// Tell the desk which captain requests this machine's ships asked and were
+/// answered, withdrawn or ended here, so its copies close too. Each closure
+/// goes once, after its request has reached the desk.
+fn push_closures(
+    conn: &Connection,
+    machine: &Machine,
+    peer: &str,
+    known_as: &str,
+    timeout: Duration,
+) -> Result<usize> {
+    let mut closures = vec![];
+    for member in crate::fleet::members(conn)? {
+        if !member.home.is_dir() || closures.len() >= COLLECT_LIMIT {
+            continue;
+        }
+        let store = Store::open(&member.home)?;
+        let room = COLLECT_LIMIT - closures.len();
+        closures.extend(crate::mail::closed_captain(&store, peer, room)?);
+    }
+    if closures.is_empty() {
+        return Ok(0);
+    }
+    let result = call(
+        machine,
+        "fleet.captain",
+        json!({"machine": known_as, "messages": [], "closures": &closures}),
+        Some(timeout),
+    )?;
+    let closed: Vec<String> = result["closed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| Some(id.as_str()?.to_owned()))
+        .collect();
+    for member in crate::fleet::members(conn)? {
+        if member.home.is_dir() {
+            crate::mail::collected_closed(&Store::open(&member.home)?, peer, &closed)?;
+        }
+    }
+    Ok(closed.len())
 }
 
 /// One dispatcher pass: for each machine this one reaches, refresh the
@@ -1677,8 +1733,11 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             .and_then(|collected| match desk(&conn)? {
                 Some((name, since)) if name == machine.name => {
                     let pushed = push_captain(&conn, &machine, since, timeout)?;
-                    Ok(json!({"machine": machine.name, "delivered": collected["delivered"],
-                        "refused": collected["refused"], "captain_pushed": pushed["captain_pushed"]}))
+                    Ok(
+                        json!({"machine": machine.name, "delivered": collected["delivered"],
+                        "refused": collected["refused"], "captain_pushed": pushed["captain_pushed"],
+                        "captain_closed": pushed["captain_closed"]}),
+                    )
                 }
                 _ => Ok(collected),
             });
@@ -1854,7 +1913,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         }
         // Captain mail from the linking machine, whose captain's desk is here.
         "fleet.captain" => {
-            reaching_here(&conn, required(args, "machine")?)?;
+            let from = reaching_here(&conn, required(args, "machine")?)?;
             let (mut delivered, mut refused) = (vec![], vec![]);
             for envelope in args["messages"].as_array().into_iter().flatten() {
                 let id = required(envelope, "id")?;
@@ -1885,7 +1944,21 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     }
                 }
             }
-            Ok(json!({"delivered": delivered, "refused": refused}))
+            // A closure ends the desk's copy of a request it holds from a ship
+            // of the sending machine; a copy it never held has nothing to end.
+            let peer = peer_name(&from.name);
+            let mut closed = vec![];
+            for closure in args["closures"].as_array().into_iter().flatten() {
+                let id = required(closure, "id")?;
+                for member in crate::fleet::members(&conn)? {
+                    if member.home.is_dir() {
+                        let store = Store::open(&member.home)?;
+                        crate::mail::close_captain_request(&store, &peer, closure)?;
+                    }
+                }
+                closed.push(json!(id));
+            }
+            Ok(json!({"delivered": delivered, "refused": refused, "closed": closed}))
         }
         // A ship the linking machine asked for, in this machine's fleet. Only
         // ship.create crosses this way; managing that ship stays here.

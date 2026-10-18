@@ -1390,10 +1390,108 @@ pub(crate) fn collected(
     Ok(changed)
 }
 
+/// Captain requests from ships here, delivered to the machine behind `peer`,
+/// that have since been answered, withdrawn or ended here. Each is offered
+/// once: a closure the peer applies keeps its copy from staying open there.
+pub(crate) fn closed_captain(store: &Store, peer: &str, limit: usize) -> Result<Vec<Value>> {
+    collected_table(store)?;
+    let mut statement = store.connection().prepare(
+        "SELECT m.id, m.state, m.end_reason, m.answered_by, m.answered_ms, m.ended_by, m.ended_ms
+         FROM mail m JOIN ships s ON s.name=m.sender
+         JOIN machine_collected c ON c.peer=?1 AND c.id=m.id AND c.error IS NULL
+         WHERE m.recipient=?2 AND m.kind IN ('request','decision')
+           AND json_extract(s.record,'$.location')='here'
+           AND m.state IN ('answered','withdrawn','task_done','task_cancelled')
+           AND NOT EXISTS (SELECT 1 FROM machine_closed d WHERE d.peer=?1 AND d.id=m.id)
+         ORDER BY m.seq LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![peer, CAPTAIN, limit as i64], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+        ))
+    })?;
+    let mut closures = vec![];
+    for row in rows {
+        let (id, state, end_reason, answered_by, answered_ms, ended_by, ended_ms) = row?;
+        let (reason, by, ms) = if state == "answered" {
+            (String::new(), answered_by, answered_ms)
+        } else {
+            (end_reason.unwrap_or_default(), ended_by, ended_ms)
+        };
+        closures.push(json!({"id": id, "state": state, "reason": reason, "by": by, "ms": ms}));
+    }
+    Ok(closures)
+}
+
+/// Record the closures the machine behind `peer` applied, so none is sent twice.
+pub(crate) fn collected_closed(store: &Store, peer: &str, ids: &[String]) -> Result<usize> {
+    collected_table(store)?;
+    let tx = store.write_transaction()?;
+    let mut changed = 0;
+    for id in ids {
+        changed += tx.execute(
+            "INSERT OR IGNORE INTO machine_closed(peer, id, closed_ms) VALUES(?1, ?2, ?3)",
+            params![peer, id, Store::now_ms()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// Apply a closure a machine behind `peer` sent for a captain request this
+/// home holds from one of that machine's ships: the open copy closes with the
+/// same state and end reason, so the captain's waiting drops it. A copy that
+/// is already closed is left as it is. Returns whether a copy was closed.
+pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) -> Result<bool> {
+    let id = required(closure, "id")?;
+    identifier(id)?;
+    let state = required(closure, "state")?;
+    ensure!(
+        matches!(
+            state,
+            "answered" | "withdrawn" | "task_done" | "task_cancelled"
+        ),
+        "invalid closure state"
+    );
+    let reason = closure["reason"].as_str().unwrap_or("");
+    ensure!(reason.len() <= 2000, "closure reason exceeds 2000 bytes");
+    let by = closure["by"].as_str();
+    let ms = closure["ms"].as_i64().unwrap_or_else(Store::now_ms);
+    let from_peer = "SELECT s.name FROM ships s WHERE json_extract(s.record,'$.location.peer')=?2";
+    let changed = if state == "answered" {
+        store.connection().execute(
+            &format!(
+                "UPDATE mail SET state='answered', answered_by=?3, answered_ms=?4
+                 WHERE id=?1 AND state='open' AND recipient=?5 AND kind IN ('request','decision')
+                   AND sender IN ({from_peer})"
+            ),
+            params![id, peer, by, ms, CAPTAIN],
+        )?
+    } else {
+        store.connection().execute(
+            &format!(
+                "UPDATE mail SET state=?3, ended_by=?4, ended_ms=?5, end_reason=?6
+                 WHERE id=?1 AND state='open' AND recipient=?7 AND kind IN ('request','decision')
+                   AND sender IN ({from_peer})"
+            ),
+            params![id, peer, state, by, ms, reason, CAPTAIN],
+        )?
+    };
+    Ok(changed > 0)
+}
+
 fn collected_table(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS machine_collected(peer TEXT NOT NULL, id TEXT NOT NULL,
-           collected_ms INTEGER NOT NULL, error TEXT, PRIMARY KEY(peer, id));",
+           collected_ms INTEGER NOT NULL, error TEXT, PRIMARY KEY(peer, id));
+         CREATE TABLE IF NOT EXISTS machine_closed(peer TEXT NOT NULL, id TEXT NOT NULL,
+           closed_ms INTEGER NOT NULL, PRIMARY KEY(peer, id));",
     )?;
     Ok(())
 }
