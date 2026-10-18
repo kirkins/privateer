@@ -91,6 +91,35 @@ and cancelled/revoked authority govern eligibility. A manually stopped scheduled
 ancestor prevents new automatic descendant work. Manual parking does not kill
 an already admitted payload; use existing job/task cancellation for that.
 
+## Backlog alarm
+
+A draft nobody enqueues is invisible to delivery, so a first mate that goes
+quiet with drafts left would idle until someone looks. The dispatcher's
+backlog alarm closes that gap without starting anything: when a local ship is
+quiet (its hosted pane asleep or idle, or a headless ship unattended), nothing
+is live under it, no ready work or mail would wake it, its route is clear and
+the fleet is not stowed, it mails the ship one notice from `crew` listing its
+open, unblocked, unscheduled tasks, running tasks nothing is moving and faulted
+schedules, ten at most with a count of the rest. The notice is ordinary mail on
+the stable thread `thread:backlog-<ship>` (correlation `backlog-<ship>`), so the
+existing paths wake the first mate, and the first mate decides: enqueue,
+defer with a real wait, block with a reason, hand off or close. It never goes
+to the captain.
+
+`first_mate.backlog_alarm_secs` (default 3600, `0` turns it off) spaces the
+notices. A wake that moves none of the listed tasks doubles the spacing up to
+eight hours, so an untouched backlog costs three wakes in an eight-hour night
+(0, 2, 6 and 14 hours); one that moves a listed task, or a changed backlog,
+resets it. A ship first seen after an upgrade fires one interval later, not at
+once. A hosted alarm counts against `max_wakes_per_hour`. `work.status` shows
+the alarm's state under `backlog_alarm`, and bearings name its last fire.
+
+To leave a draft on purpose, say so in the record: `task.update` it to
+`blocked` with the reason in its task note, or enqueue it and `task.defer` it
+with a wait. A task waiting on a request the ship sent, a task offered to
+another ship and a task under a stopped or claimed scheduled parent are not
+listed. The design is in [the backlog alarm note](design/backlog-alarm.md).
+
 ## Context freshness and observation
 
 Attention reports bind to the current presence holder. The latest measured

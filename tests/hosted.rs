@@ -1902,6 +1902,89 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
     place.stop_native("infra");
 }
 
+/// A sleeping hosted first mate with an open, unscheduled task is woken by
+/// one backlog notice once its hour has passed, on the same conversation, and
+/// not again within the hour. The wake is recorded against the hourly budget.
+#[test]
+fn a_sleeping_hosted_first_mate_with_an_unscheduled_task_is_woken_once_for_its_backlog() {
+    let (place, herdr) = hosted_sleeper();
+    place.json(
+        "task.create",
+        json!({"id":"infra-draft","parent":"infra-duty","owner":"infra","title":"Draft the plan"}),
+    );
+    sleep_hosted(&place, &herdr);
+    let serve = || -> Value {
+        serde_json::from_str(&place.ok(&["serve", "--json", r#"{"once":true}"#])).unwrap()
+    };
+    let backlog_notices = || -> i64 {
+        place
+            .database()
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE recipient='infra' AND correlation='backlog-infra'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    // The alarm's first check was at the launch; its hour has not passed.
+    let early = serve();
+    assert_eq!(early["backlog"][0]["skipped"], "spaced", "{early}");
+    assert!(!place.root.join("pi-env").exists());
+    place
+        .database()
+        .execute(
+            "UPDATE backlog_alarms SET fired_ms=fired_ms-3600001, next_ms=next_ms-3600001",
+            [],
+        )
+        .unwrap();
+    let report = serve();
+    assert_eq!(report["backlog"][0]["fired"], "backlog-infra-1", "{report}");
+    assert_eq!(report["backlog"][0]["considered"], json!(["infra-draft"]));
+    until("the harness woken by the backlog notice", || {
+        place.root.join("pi-env").exists()
+    });
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    until("the backlog wake audited", || {
+        place.json("audit.list", json!({"limit":1000}))["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "host.woke" && e["payload"]["reason"] == "backlog")
+    });
+    let wakes: Vec<(String, String, String)> = {
+        let db = place.database();
+        let mut statement = db
+            .prepare("SELECT reason, status, focus FROM wakes WHERE ship='infra'")
+            .unwrap();
+        statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(
+        wakes,
+        [(
+            "backlog".to_owned(),
+            "succeeded".to_owned(),
+            "thread:backlog-infra".to_owned()
+        )]
+    );
+    // Asleep again with the task untouched: no second notice this hour.
+    sleep_hosted(&place, &herdr);
+    let again = serve();
+    assert_eq!(again["backlog"][0]["skipped"], "spaced", "{again}");
+    assert_eq!(backlog_notices(), 1);
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
+    );
+    until("the woken harness", || place.root.join("pi-env").exists());
+    place.stop_native("infra");
+}
+
 /// Type `text` into a pane, as Herdr does for a captain typing in it.
 fn type_into_pane(place: &Place, pane: &str, text: &str) {
     use std::os::unix::net::UnixStream;

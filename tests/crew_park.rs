@@ -409,6 +409,102 @@ fn a_crew_with_no_job_outstanding_is_held_until_its_first_mate_resumes_it() {
     assert!(!again.status.success(), "a second resume found a held crew");
 }
 
+/// A held crew is live work: its task is neither "running with nothing
+/// moving it" in bearings nor a backlog the dispatcher wakes the first mate
+/// about. Once the crew ends, the task is both.
+#[test]
+fn a_held_crew_keeps_its_task_off_the_backlog_until_it_ends() {
+    let f = Fleet::new();
+    f.set_mode("held");
+    f.short_budget();
+    start_crew(&f, "crew-6");
+    f.wait("crew-6", &["parked"]);
+    f.json(
+        None,
+        "task.update",
+        json!({"id":"fix","actor":"engineering","status":"running"}),
+    );
+    let db =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    let unfinished = || -> Vec<(String, String)> {
+        let mut statement = db
+            .prepare(
+                "SELECT json_extract(record,'$.id'), json_extract(record,'$.status') FROM jobs
+                 WHERE json_extract(record,'$.status') NOT IN ('succeeded','failed','cancelled','timed_out','resumed')",
+            )
+            .unwrap();
+        statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    // Nothing else runs: the held crew is the only unfinished job.
+    assert_eq!(unfinished(), [("crew-6".to_owned(), "parked".to_owned())]);
+    let idle = |f: &Fleet| {
+        f.json(None, "ship.bearings", json!({"ship": "engineering"}))["idle_tasks"].clone()
+    };
+    assert_eq!(idle(&f), json!([]));
+    // The first mate has read its mail, so no wake is due either.
+    let read_all = |f: &Fleet| {
+        let seq = f.json(
+            None,
+            "mail.inbox",
+            json!({"address": "engineering", "all": true, "limit": 1000}),
+        )["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["seq"].as_i64())
+            .max()
+            .unwrap_or(0);
+        f.json(
+            None,
+            "mail.ack",
+            json!({"address": "engineering", "through_seq": seq}),
+        );
+    };
+    read_all(&f);
+    let backlog = |f: &Fleet| -> Value {
+        let report: Value =
+            serde_json::from_str(&f.ok(None, &["serve", "--json", r#"{"once":true}"#])).unwrap();
+        report["backlog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["ship"] == "engineering")
+            .cloned()
+            .unwrap_or_else(|| panic!("{report}"))
+    };
+    assert_eq!(backlog(&f)["skipped"], "first backlog check");
+    db.execute(
+        "UPDATE backlog_alarms SET fired_ms=fired_ms-3600001, next_ms=next_ms-3600001",
+        [],
+    )
+    .unwrap();
+    let held = backlog(&f);
+    assert_eq!(held["skipped"], "work is live", "{held}");
+    // The crew ends; once its outcome is read, nothing moves the running task.
+    f.json(None, "job.cancel", json!({"id": "crew-6"}));
+    f.wait("crew-6", &["cancelled"]);
+    read_all(&f);
+    assert_eq!(idle(&f)[0]["id"], "fix");
+    let fired = backlog(&f);
+    assert_eq!(fired["fired"], "backlog-engineering-1", "{fired}");
+    assert_eq!(fired["considered"], json!(["fix"]));
+    let body: String = db
+        .query_row(
+            "SELECT body FROM mail WHERE id='backlog-engineering-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        body.contains("- fix: Fix it [running, nothing moving it]"),
+        "{body}"
+    );
+}
+
 /// A task with a crew parked on its heavy job takes no second launch unless
 /// the launch replaces it, which cancels the crew and the job it waits on.
 #[test]

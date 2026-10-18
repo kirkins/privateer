@@ -36,9 +36,13 @@ struct Scheduled {
     reason: Option<String>,
 }
 
+mod backlog;
 mod commands;
 mod delivery;
 mod observation;
+pub(crate) use backlog::{
+    DEFAULT_SECS as BACKLOG_ALARM_SECS, bearings_line as backlog_line, tick as backlog_tick,
+};
 pub use commands::dispatch;
 pub(crate) use delivery::tick;
 pub(crate) use observation::{fault_item, snapshot};
@@ -58,7 +62,7 @@ pub(crate) fn init(store: &Store) -> Result<()> {
         tx.execute_batch("ALTER TABLE work_sessions ADD COLUMN idle_since_ms INTEGER;")?;
     }
     tx.commit()?;
-    Ok(())
+    backlog::init(store)
 }
 
 /// Whether a ship has scheduled work ready for its first mate now.
