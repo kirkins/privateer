@@ -97,6 +97,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
         ("machines", "failures", "INTEGER NOT NULL DEFAULT 0"),
         ("machines", "stows", "TEXT NOT NULL DEFAULT '{}'"),
         ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
+        ("machines", "usage_cursor", "TEXT"),
     ] {
         let present: bool = migrate.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"),
@@ -111,6 +112,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     }
     migrate.commit()?;
     crate::snapshot::init(conn)?;
+    crate::usage_carry::init(conn)?;
     Ok(())
 }
 
@@ -1383,6 +1385,7 @@ fn remove(name: &str) -> Result<Value> {
     conn.execute("DELETE FROM machine_ships WHERE machine=?1", [name])?;
     conn.execute("DELETE FROM collect_waits WHERE machine=?1", [name])?;
     crate::snapshot::forget(&conn, name)?;
+    crate::usage_carry::forget(&conn, name)?;
     conn.execute("DELETE FROM machines WHERE name=?1", [name])?;
     Ok(json!({"removed": name}))
 }
@@ -1466,7 +1469,18 @@ fn collect(
     if let Some(section) = carried.get_or_init(|| crate::snapshot::carried(conn)) {
         args["snapshot"] = section.clone();
     }
+    // So do its jobs' usage since the cursor that machine stored, for its
+    // usage.summary. Best effort, like the section.
+    if let Ok(usage) = crate::usage_carry::sent_cursor(conn, &machine.name)
+        .and_then(|after| crate::usage_carry::outgoing(conn, after.as_ref()))
+    {
+        args["usage"] = usage;
+    }
     let result = call(machine, "fleet.collect", args, Some(timeout))?;
+    // It answers the cursor it stored only when it kept the rows.
+    if result["usage"].is_object() {
+        let _ = crate::usage_carry::advance(conn, &machine.name, &result["usage"]);
+    }
     // What the peer reports about its stows travels with the mail: a request
     // bound to a stow there ends on this exchange, not a later one.
     let ended = absorb(conn, &machine.name, &result["stows"])?;
@@ -2077,6 +2091,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             if let Some(carried) = args.get("snapshot") {
                 let _ = crate::snapshot::absorb_carried(&conn, &machine.name, carried);
             }
+            let usage = args
+                .get("usage")
+                .and_then(|carried| crate::usage_carry::absorb(&conn, &machine.name, carried).ok());
             // Mail to the captain from before the link stays here.
             let linked_ms: i64 = conn.query_row(
                 "SELECT added_ms FROM machines WHERE name=?1",
@@ -2113,10 +2130,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     }
                 }
             }
-            Ok(with_stows(
-                json!({"messages": messages, "requests_ended": ended}),
-                &conn,
-            ))
+            let mut answer = json!({"messages": messages, "requests_ended": ended});
+            if let Some(usage) = usage {
+                answer["usage"] = usage;
+            }
+            Ok(with_stows(answer, &conn))
         }
         "fleet.collected" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;

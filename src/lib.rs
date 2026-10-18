@@ -47,6 +47,7 @@ pub mod store;
 pub mod stow;
 mod tool_bundles;
 mod usage;
+mod usage_carry;
 pub mod watch;
 pub mod workspace;
 
