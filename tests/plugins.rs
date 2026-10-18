@@ -127,7 +127,23 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
     assert_eq!(command["argv"][3], "pi");
     assert_eq!(command["argv"][6], "fixture");
     let brief = plugins::dispatch(&mut f.store, "agent.brief", json!({"task_id":"task"})).unwrap();
-    assert!(brief["brief"].as_str().unwrap().len() < 2048);
+    // Lean means the fixed text: the executable, home and repository paths
+    // vary by machine (a macOS runner's are far longer than Linux's).
+    let text = brief["brief"].as_str().unwrap();
+    let paths: usize = brief["context"]["control"]["cli_argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain([&brief["context"]["repo"]])
+        .filter_map(Value::as_str)
+        .filter(|path| path.starts_with('/'))
+        .map(|path| path.len() * text.matches(path).count())
+        .sum();
+    assert!(
+        text.len() - paths < 1900,
+        "{} bytes besides paths",
+        text.len() - paths
+    );
     assert!(brief["context"].get("config_path").is_none());
     assert!(
         brief["brief"]
