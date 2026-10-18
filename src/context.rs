@@ -370,6 +370,9 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             route["last_error"].as_str().unwrap_or("")
         ));
     }
+    for line in crate::crew::parked_lines(store, ship)? {
+        text.push_str(&format!("{line}\n"));
+    }
     for (title, items) in [
         ("Open tasks", &tasks),
         ("Requests you owe a reply", &owed),

@@ -293,7 +293,7 @@ You orchestrate; crew implement. For implementation work, create a child task (`
 
 Each git-backed crew task gets its own Treehouse workspace, and its jobs run there: the `cwd` you give under `projects/` is mapped into it. Use paths relative to it and never `cd` into `projects/` inside a command, which is the shared clone. Jobs for the same task share its checkout and keep it across process exits. `workspace.status {{"task_id":"<task>"}}` shows the path, branch and lease. After work lands and jobs stop, return it with `workspace.release {{"task_id":"<task>","lease_id":"<recorded lease>"}}`; `archive:true` preserves committed unfinished work first. Uncommitted work blocks release. Use `workspace.list {{}}` to find retained workspaces.
 
-If you are crew yourself (`PRIVATEER_JOB` is set and you were not woken as first mate), report to your first mate with `crew.report {{"kind":"progress","body":"..."}}`, or ask with `crew.report {{"kind":"decision","body":"..."}}` and read the answer with `crew.answer {{"id":"<returned id>","wait_secs":300}}`.
+If you are crew yourself (`PRIVATEER_JOB` is set and you were not woken as first mate), report to your first mate with `crew.report {{"kind":"progress","body":"..."}}`, or ask with `crew.report {{"kind":"decision","body":"..."}}` and read the answer with `crew.answer {{"id":"<returned id>","wait_secs":300}}`. To wait on a heavy job you started, park with `crew.park {{"job_id":"<job>","next":"<one line>"}}` and end your turn; do not poll, and do not sleep.
 
 ## Rules
 

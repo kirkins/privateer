@@ -68,6 +68,8 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
         "job_timeout_secs",
         "min_free_bytes",
         "max_heavy_jobs",
+        "crew_max_parks",
+        "crew_max_elapsed_secs",
         "provider_plugin",
         "active",
     ] {
@@ -121,9 +123,16 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
         ("job_timeout_secs", 1, 86400),
         ("max_heavy_jobs", 1, 1024),
         ("min_free_bytes", 0, u64::MAX),
+        ("crew_max_parks", 0, 64),
+        ("crew_max_elapsed_secs", 1, 7 * 86400),
     ] {
-        // An optional per-charter share of the host's heavy work.
-        if key == "max_heavy_jobs" && charter.get(key).is_none_or(Value::is_null) {
+        // Optional per-charter settings: a share of the host's heavy work, and
+        // the crew park caps, which default when absent.
+        if matches!(
+            key,
+            "max_heavy_jobs" | "crew_max_parks" | "crew_max_elapsed_secs"
+        ) && charter.get(key).is_none_or(Value::is_null)
+        {
             continue;
         }
         let n = charter[key]
@@ -226,6 +235,7 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
     let actor = required(&args, "actor")?;
     let tx = store.write_transaction()?;
     let task = store.task(id)?;
+    let mut closed = None;
     if command == "task.accept" {
         if task["handoff_to"].as_str() != Some(actor) {
             bail!("no handoff offered to this actor");
@@ -265,11 +275,21 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
             )?;
             if matches!(status, "done" | "cancelled") {
                 crate::mail::close_task(store, id, status)?;
+                closed = Some(status.to_owned());
             }
         }
     }
     store.audit(command, &json!({"id":id,"actor":actor}))?;
     tx.commit()?;
+    // A closed task ends its parked crews, and the heavy jobs they wait on.
+    // This runs after the close commits, since it stops processes. When the
+    // owner closed it, their cancelled notices are not mailed back to it.
+    if let Some(status) = closed {
+        let quiet = store.task(id)?["owner"].as_str() == Some(actor);
+        for crew in crate::crew::parked_crews(store, id)? {
+            crate::jobs::end_parked(store, &crew, &format!("task {id} is {status}"), quiet)?;
+        }
+    }
     store.task(id)
 }
 

@@ -174,6 +174,14 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .to_owned();
             let charter = store.authorize(&task, "spawn")?;
             let owner = store.task(&task)?["owner"].clone();
+            // A task with a crew parked on a heavy job (or held) is not launched
+            // over: a second crew would run beside it. `replace` cancels it first.
+            let replace = match args.as_object_mut().unwrap().remove("replace") {
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("replace must be boolean"))?,
+                None => false,
+            };
             // Plan against the task checkout; first-mate wakes have a durable
             // wake row and keep their existing ship repository.
             args.as_object_mut().unwrap().remove("_workspace_lease_id");
@@ -182,6 +190,23 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let request_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&args)?));
             if let Some(existing) = jobs::agent_replay(store, &args, &request_hash)? {
                 return Ok(existing);
+            }
+            // A new launch is not made over a parked crew (an identical repeat
+            // above returns the job it already started instead).
+            if !workspace::is_wake(store, &args)? {
+                let parked = crew::parked_crews(store, &task)?;
+                if !parked.is_empty() {
+                    if replace {
+                        for crew_job in &parked {
+                            jobs::cancel_crew(store, crew_job)?;
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "task {task} has a parked crew ({}); it resumes when its heavy job settles, or crew.resume if it is held. Pass replace:true to cancel it and the jobs it waits on instead",
+                            parked.join(", ")
+                        );
+                    }
+                }
             }
             // The captain's routes come first: crew take the route they name
             // or the first listed one that is not backing off, and agents
@@ -386,6 +411,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if let Some(lease) = args.get("_workspace_lease_id") {
                 job["workspace_lease_id"] = lease.clone();
             }
+            // The budget a resumed crew has spent; only the runtime's resume sets it.
+            if let Some(spent) = args
+                .get("_run_ms")
+                .filter(|_| matches!(store.caller(), Caller::Operator))
+            {
+                job["_run_ms"] = spent.clone();
+            }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();
             }
@@ -400,8 +432,23 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             // too, so they stay outside admission as well: they are short and
             // the first mate's own.
             if !workspace::is_wake(store, &args)? {
-                let estimate = jobs::crew_estimate(store, &charter, &args, route_memory)?;
+                // A resume reuses the estimate its crew was admitted under: the
+                // runtime's own resume only (see `crew::resume`).
+                let estimate = match args
+                    .get("_resume_estimate")
+                    .filter(|_| matches!(store.caller(), Caller::Operator))
+                {
+                    Some(recorded) => serde_json::from_value(recorded.clone())?,
+                    None => jobs::crew_estimate(store, &charter, &args, route_memory)?,
+                };
                 job["estimate"] = serde_json::to_value(estimate)?;
+                // What a park resumes: this launch again, through admission.
+                job["launch"] = serde_json::json!({
+                    "manifest": args.get("manifest"), "options": args.get("options"),
+                    "config": args.get("config"), "tool_bundles": args.get("tool_bundles"),
+                    "cwd": args.get("cwd"),
+                    "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false)),
+                });
             }
             let mut started = jobs::start_agent(store, job)?;
             if viewed {

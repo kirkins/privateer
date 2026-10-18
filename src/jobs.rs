@@ -32,7 +32,7 @@ const LOG_SEGMENT: usize = (LOG_LIMIT - LOG_HEAD) / 2;
 /// left under the limit holds the truncation marker.
 const TAIL_FULL: usize = 2 * LOG_SEGMENT - 256;
 const START_GRACE_MS: i64 = 30_000;
-const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
+pub(crate) const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
 const QUEUE_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +129,22 @@ struct Job {
     /// sandboxed no-op would be indistinguishable from successful work.
     #[serde(default)]
     codex_read_only_crew: bool,
+    /// Process run time spent in this incarnation, for the record. Queued and
+    /// parked time is not in it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    run_ms: u64,
+    /// The crew is parked on a heavy job it started (`crew.park`): its payload
+    /// has exited, and its outcome resumes it. Names the park record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    park: Option<String>,
+    /// The agent launch that started this crew, so a park can resume its
+    /// native session or start it fresh. Set by the agent path only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch: Option<Value>,
+    /// Its outcome is not mailed: the one who ended it already knows (a task's
+    /// owner closing the task ends its parked crews and their jobs).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    quiet: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -303,9 +319,29 @@ impl Drop for WorkspaceQueueLease {
     }
 }
 pub fn init(store: &Store) -> Result<()> {
+    // A park outlives the dispatcher: it is what resumes the crew after restart.
     store.connection().execute_batch(
-        "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, record TEXT NOT NULL);",
+        "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, record TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS crew_parks (id TEXT PRIMARY KEY, root TEXT NOT NULL,
+           crew_job_id TEXT NOT NULL, child_job_id TEXT NOT NULL, task_id TEXT NOT NULL,
+           ship TEXT NOT NULL, state TEXT NOT NULL, next TEXT NOT NULL, harness TEXT,
+           session TEXT, resumed_job_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+           retries INTEGER NOT NULL DEFAULT 0,
+           created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);",
     )?;
+    // The process that claimed a park's resume, so recovery leaves a launch
+    // that is still in flight alone (added after the table first shipped).
+    let claimer: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_parks') WHERE name='claimer')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !claimer {
+        store
+            .connection()
+            .execute_batch("ALTER TABLE crew_parks ADD COLUMN claimer TEXT")?;
+    }
     Ok(())
 }
 fn valid_id(id: &str) -> bool {
@@ -1163,6 +1199,17 @@ pub(crate) fn process_identity(pid: u32) -> Result<Option<String>> {
     Ok(identity(pid)?.filter(|p| !p.zombie).map(|p| p.started))
 }
 
+/// This process's identity, recorded with a claim another process may check.
+pub(crate) fn own_identity() -> Result<String> {
+    let me = identity(std::process::id())?.context("cannot identify this process")?;
+    Ok(serde_json::to_string(&me)?)
+}
+/// Whether the process an `own_identity` record names is still running. One
+/// in another PID namespace counts as running, since it cannot be checked.
+pub(crate) fn identity_alive(recorded: &str) -> Result<bool> {
+    same_process(&serde_json::from_str(recorded)?)
+}
+
 /// The PID namespace this process sees PID numbers in; constant for its life.
 #[cfg(target_os = "linux")]
 fn pid_namespace() -> Option<&'static str> {
@@ -1461,13 +1508,18 @@ fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<(
     Ok(())
 }
 fn terminal(status: &str) -> bool {
-    matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out")
+    // `resumed`: a parked crew whose work moved to the job its park resumed.
+    matches!(
+        status,
+        "succeeded" | "failed" | "cancelled" | "timed_out" | "resumed"
+    )
 }
 /// Statuses a crew outcome reports. An orphan is no longer supervised (its
 /// deadline is not enforced), so its first mate hears about it then; the
-/// settlement that may follow is not reported again.
+/// settlement that may follow is not reported again. A parked crew reports
+/// nothing here: its park notice is quiet, and its resume carries on.
 fn reported(status: &str) -> bool {
-    terminal(status) || status == "orphaned"
+    (terminal(status) && status != "resumed") || status == "orphaned"
 }
 fn public_job(job: &Job) -> Value {
     let mut v = serde_json::to_value(job).unwrap_or(Value::Null);
@@ -1884,6 +1936,16 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .get("codex_read_only_crew")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // Only the agent path records a launch, and only the runtime's own
+        // resume carries an earlier run time: see `crew::resume`.
+        run_ms: if agent {
+            args.get("_run_ms").and_then(Value::as_u64).unwrap_or(0)
+        } else {
+            0
+        },
+        park: None,
+        launch: agent.then(|| args.get("launch").cloned()).flatten(),
+        quiet: false,
     };
     let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -2122,7 +2184,14 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         "job.started",
         &json!({"job_id": id, "task_id": task_id, "incarnation": job.incarnation}),
     )?;
-    Ok(public_job(&job))
+    let mut reply = public_job(&job);
+    // A crew waiting on its heavy job parks rather than polls for the outcome.
+    if crate::crew::may_park(store) {
+        reply["park"] = json!(format!(
+            "Do not poll for this job. Run crew.park with {{\"job_id\":\"{id}\",\"next\":\"<one line>\"}} and end your turn; the outcome resumes you."
+        ));
+    }
+    Ok(reply)
 }
 
 /// Wait at the capacity queue until admitted (Some, now launching) or until
@@ -2470,6 +2539,16 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
             }
         }
     }
+    // A crew parked on this job resumes once it settles, whichever path ended
+    // it, including a supervisor error that settled it above.
+    let settle =
+        crate::crew::settle_own_park(store, id).and_then(|()| crate::crew::settled(store, id));
+    if let Err(error) = settle {
+        let _ = store.audit(
+            "crew.resume_failed",
+            &json!({"job_id": id, "error": format!("{error:#}")}),
+        );
+    }
     result
 }
 
@@ -2719,9 +2798,19 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             )?),
         )
     };
-    let deadline = Instant::now() + Duration::from_secs(job.timeout_secs);
+    let spawned = Instant::now();
+    const PARK_GRACE: Duration = Duration::from_secs(5);
+    // Each incarnation gets a fresh grant of the charter's budget. Queued and
+    // parked time is not in it; the total is bounded by the park and 24 h caps
+    // (see `crew::park_at_deadline`), not by summing run time across resumes.
+    let deadline = spawned + Duration::from_secs(job.timeout_secs);
     let mut outcome = "succeeded";
     let mut reason = None;
+    // Why a crew at its deadline could not park: the job then times out with it.
+    let mut park_refused = None;
+    // When the crew's park was first seen: its harness has this long to end
+    // its turn before the payload is signalled.
+    let mut park_seen: Option<Instant> = None;
     let mut terminated_at = None;
     let mut leader_status = None;
     let mut killed = false;
@@ -2789,11 +2878,42 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             .and_then(|charter| check_plugin_binding(&job, &charter))
             .and_then(|()| check_workspace_owner(store, &job))
             .err();
+        // A parked crew's payload ends here: its work waits on a child job, and
+        // the harness has nothing left to say until that job settles. A crew
+        // whose budget runs out parks on the job it waits on, or is held for
+        // its first mate when no job is outstanding.
+        let parking = match job.park.clone() {
+            Some(park) => Some(park),
+            None if terminated_at.is_none() && Instant::now() >= deadline => {
+                // A park that cannot be opened leaves the job to time out, as
+                // it did before; the failure is audited, not a supervisor error.
+                match crate::crew::park_at_deadline(store, id) {
+                    Ok(park) => park,
+                    Err(error) => {
+                        store.audit(
+                            "crew.park_failed",
+                            &json!({"job_id": id, "error": format!("{error:#}")}),
+                        )?;
+                        park_refused = Some(format!("{error:#}"));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        if parking.is_some() && park_seen.is_none() {
+            park_seen = Some(Instant::now());
+        }
+        let grace = park_seen.is_some_and(|seen| seen.elapsed() < PARK_GRACE);
         if terminated_at.is_none()
-            && (job.cancel_requested || authority_error.is_some() || Instant::now() >= deadline)
+            && (job.cancel_requested
+                || authority_error.is_some()
+                || (!grace && (parking.is_some() || Instant::now() >= deadline)))
         {
             outcome = if job.cancel_requested || authority_error.is_some() {
                 "cancelled"
+            } else if parking.is_some() {
+                "parked"
             } else {
                 "timed_out"
             };
@@ -2801,21 +2921,33 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 format!("authority ended: {error}")
             } else if job.cancel_requested {
                 "cancellation requested".into()
+            } else if let Some(park) = &parking {
+                format!("crew parked: {park}")
+            } else if let Some(refused) = &park_refused {
+                format!("job deadline reached; {refused}")
             } else {
                 "job deadline reached".into()
             });
-            let anchors =
-                capture_anchors(&payload, leader_exited(payload.pid)?)?.context(UNPROVEN_LEADER)?;
-            let escaped = escaped_descendants(&payload, &job.escaped)?;
-            job = alter(store, id, |j| {
-                j.group_anchors = anchors;
-                j.escaped = escaped;
-            })?;
-            update_reservation(store, &job)?;
-            signal_group(&payload, libc::SIGTERM, &job.group_anchors)?;
-            // Killing the payload's group is not proof its work stopped.
-            signal_escaped(&job.escaped, libc::SIGTERM)?;
-            terminated_at = Some(Instant::now());
+            // A harness ends its turn after `crew.park`, so its payload often
+            // ends on its own just as the park is noticed. A group that is
+            // already gone is not signalled: refusing it as stale would fail
+            // a park that did what it should.
+            if outcome == "parked" && !payload_alive(&payload, &job.escaped)? {
+                terminated_at = Some(Instant::now());
+            } else {
+                let anchors = capture_anchors(&payload, leader_exited(payload.pid)?)?
+                    .context(UNPROVEN_LEADER)?;
+                let escaped = escaped_descendants(&payload, &job.escaped)?;
+                job = alter(store, id, |j| {
+                    j.group_anchors = anchors;
+                    j.escaped = escaped;
+                })?;
+                update_reservation(store, &job)?;
+                signal_group(&payload, libc::SIGTERM, &job.group_anchors)?;
+                // Killing the payload's group is not proof its work stopped.
+                signal_escaped(&job.escaped, libc::SIGTERM)?;
+                terminated_at = Some(Instant::now());
+            }
         }
         if let Some(at) = terminated_at {
             if !killed && at.elapsed() >= Duration::from_secs(2) {
@@ -2849,6 +2981,33 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("stderr capture panicked"))??,
         None => 0,
     };
+    // Process time is the crew's budget; the time it waited is not in it.
+    let spent = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
+    job = alter(store, id, |j| j.run_ms = j.run_ms.saturating_add(spent))?;
+    // A crew that parked is parked whatever its harness exited with, unless
+    // it was cancelled or ran out of budget first.
+    if let Some(park) = job
+        .park
+        .clone()
+        .filter(|_| matches!(outcome, "succeeded" | "failed" | "parked"))
+    {
+        job = alter(store, id, |j| {
+            j.status = "parked".into();
+            j.exit_code = status.code();
+            j.stdout_dropped_bytes = stdout_dropped;
+            j.stderr_dropped_bytes = stderr_dropped;
+            j.reason = Some(format!("crew parked: {park}"));
+        })?;
+        // Its capacity is given back while it waits; a group still running
+        // keeps its reservation, as for any job.
+        if group_remains {
+            update_reservation(store, &job)?;
+        } else {
+            release(store, &job)?;
+        }
+        store.audit("job.parked", &json!({"job_id": id, "park": park}))?;
+        return Ok(());
+    }
     if outcome == "succeeded" && !status.success() {
         outcome = "failed";
     }
@@ -2946,6 +3105,11 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         Some(p) => same_process(p)?,
         None => false,
     };
+    if job.status == "parked" {
+        // A park has no payload to supervise. Its record outlives the
+        // dispatcher, and it resumes when the job it waits on settles.
+        return Ok(job);
+    }
     if job.status == "queued" {
         // Nothing runs while queued, so a vanished supervisor ends the job.
         if !supervisor_alive
@@ -3088,6 +3252,73 @@ pub(crate) fn record(store: &Store, id: &str) -> Result<Value> {
     Ok(public_job(&load(store, id)?))
 }
 
+/// A parked crew whose work moved to `resumed`: final for this record, with no
+/// outcome of its own, since the resumed crew carries on.
+pub(crate) fn finish_resumed(store: &Store, crew: &str, resumed: &str) -> Result<()> {
+    alter(store, crew, |j| {
+        if j.status == "parked" {
+            j.status = "resumed".into();
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some(format!("resumed as {resumed}"));
+        }
+    })?;
+    Ok(())
+}
+
+/// A parked crew that could not resume: a failure, reported like any other.
+pub(crate) fn fail_parked(store: &Store, crew: &str, reason: &str) -> Result<()> {
+    alter(store, crew, |j| {
+        if j.status == "parked" {
+            j.status = "failed".into();
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some(reason.to_owned());
+        }
+    })?;
+    Ok(())
+}
+
+/// End a parked or held crew as cancelled, with `reason`. Nothing runs while
+/// parked, so the crew ends here, and so does the work it waits on. The park
+/// closes first, so the child's settlement does not resume the crew. Its first
+/// mate gets the usual cancelled notice for each, unless `quiet`: the task's
+/// owner closed the task, and already knows.
+pub(crate) fn end_parked(store: &Store, id: &str, reason: &str, quiet: bool) -> Result<Value> {
+    let parked = load(store, id)?;
+    let child = crate::crew::cancel_park(store, parked.park.as_deref().unwrap_or_default())?;
+    if quiet {
+        // Marked before any status change, so no outcome is written for either.
+        for job in std::iter::once(id).chain(child.as_deref()) {
+            alter(store, job, |j| j.quiet = true)?;
+        }
+    }
+    if matches!(parked.status.as_str(), "launching" | "running") {
+        // Still ending its turn (the park grace): the park is closed, so the
+        // payload's exit cannot park it again. It is cancelled as a running crew.
+        if let Some(child) = child {
+            cancel(store, &child)?;
+        }
+        return cancel(store, id);
+    }
+    let job = alter(store, id, |j| {
+        if j.status == "parked" {
+            j.status = "cancelled".into();
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some(reason.to_owned());
+        }
+    })?;
+    release(store, &job)?;
+    if let Some(child) = child {
+        cancel(store, &child)?;
+    }
+    Ok(public_job(&job))
+}
+
+/// Cancel a crew and what it waits on, for a launch that replaces it.
+pub(crate) fn cancel_crew(store: &Store, id: &str) -> Result<()> {
+    cancel(store, id)?;
+    Ok(())
+}
+
 fn cancel(store: &Store, id: &str) -> Result<Value> {
     let initial = load(store, id)?;
     // Stopping already-owned work never grants new execution authority and
@@ -3107,6 +3338,9 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
     })?;
     if terminal(&job.status) {
         return Ok(public_job(&job));
+    }
+    if job.status == "parked" {
+        return end_parked(store, id, "cancelled while parked", false);
     }
     let supervisor_alive = match &job.supervisor {
         Some(p) => same_process(p)?,
