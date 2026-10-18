@@ -19,6 +19,11 @@
 //! and on both commands, so a request bound to a peer's stow learns of its
 //! resume without a connection or a remote-control channel of its own.
 //!
+//! A ship made, moved or retired here is exchanged at once with every machine
+//! this one reaches. Mail collected from a machine that names a ship this one
+//! does not know yet is held, the directory is exchanged, and delivery is
+//! retried; only after `UNKNOWN_EXCHANGES` passes is it refused.
+//!
 //! The captain's mail gathers on one machine, the captain's desk, where the
 //! front door runs. By default that is the linking machine: mail the other
 //! machine's ships write to the captain after the link is made is collected
@@ -56,6 +61,14 @@ const COLLECT_BYTES: usize = 512 * 1024;
 /// SSH through a tunnel can be slow to start; links get more than a peer's
 /// ten-second default.
 const LINK_TIMEOUT_MS: u64 = 30_000;
+/// A directory exchange made as a ship is created, moved or retired waits
+/// this long, so a sleeping machine does not hold up the change.
+const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Collected mail that names a ship this machine does not yet know is held
+/// across this many directory exchanges, then refused.
+const UNKNOWN_EXCHANGES: i64 = 3;
+/// The error mail gives for a sender this machine does not know.
+const UNKNOWN_SHIP: &str = "unknown ship ";
 
 pub(crate) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -1089,6 +1102,49 @@ pub(crate) fn refresh_one(name: &str) -> Result<()> {
     refresh(Some(name)).map(|_| ())
 }
 
+/// Exchange directories now with every machine this one reaches, after a ship
+/// was created, moved or retired here, so the change is known there without
+/// waiting for the next refresh. Best effort: a machine that cannot be reached
+/// is skipped (and audited in `store`, when given), and never fails the change.
+pub(crate) fn announce(store: Option<&Store>) -> Vec<Value> {
+    let Ok(path) = crate::fleet::registry_path() else {
+        return vec![];
+    };
+    if !path.is_file() || !ever_linked(&path) {
+        return vec![];
+    }
+    let Ok(conn) = crate::fleet::registry() else {
+        return vec![];
+    };
+    let Ok(rows) = machines(&conn) else {
+        return vec![];
+    };
+    rows.into_iter()
+        .filter(|m| m.role == "collects")
+        .map(
+            |machine| match exchange(&conn, &machine, Some(ANNOUNCE_TIMEOUT)) {
+                Ok(ships) => json!({"machine": machine.name, "ships": ships.len()}),
+                Err(error) => {
+                    // Due at the next pass: its exchange runs before mail is collected or pushed.
+                    let _ = conn.execute(
+                        "UPDATE machines SET refreshed_ms=NULL WHERE name=?1",
+                        [&machine.name],
+                    );
+                    let error = format!("{error:#}");
+                    let mut skipped = json!({"machine": machine.name, "skipped": &error});
+                    if let Some(store) = store {
+                        let audit = json!({"machine": machine.name, "error": &error});
+                        if let Err(recorded) = store.audit("machine.skipped", &audit) {
+                            skipped["audit"] = json!(format!("{recorded:#}"));
+                        }
+                    }
+                    skipped
+                }
+            },
+        )
+        .collect()
+}
+
 pub(crate) fn hostname() -> String {
     let mut buffer = [0u8; 256];
     let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
@@ -1181,6 +1237,7 @@ fn remove(name: &str) -> Result<Value> {
         }
     }
     conn.execute("DELETE FROM machine_ships WHERE machine=?1", [name])?;
+    conn.execute("DELETE FROM collect_waits WHERE machine=?1", [name])?;
     conn.execute("DELETE FROM machines WHERE name=?1", [name])?;
     Ok(json!({"removed": name}))
 }
@@ -1261,12 +1318,36 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
     let messages = result["messages"]
         .as_array()
         .context("collected messages")?;
+    // Mail naming a ship this machine does not know yet waits for a directory
+    // exchange: one is made here, in this pass, before any of it is placed.
+    let mut stale = false;
+    for envelope in messages {
+        stale |= unknown_party(conn, envelope)?.is_some();
+    }
+    let refresh = if stale {
+        exchange(conn, machine, Some(timeout))
+            .err()
+            .map(|error| format!("{error:#}"))
+    } else {
+        None
+    };
     let homes: Vec<_> = crate::fleet::members(conn)?;
     let (mut delivered, mut refused) = (vec![], vec![]);
     for envelope in messages {
         let id = required(envelope, "id")?.to_owned();
         let to = envelope["to"].as_str().unwrap_or("");
         let mut envelope = envelope.clone();
+        if let Some(reason) = unknown_party(conn, &envelope)? {
+            refused.extend(hold_or_refuse(
+                conn,
+                machine,
+                &id,
+                &envelope,
+                &reason,
+                UNKNOWN_EXCHANGES,
+            )?);
+            continue;
+        }
         let home = if to == crate::mail::CAPTAIN {
             // A home that cannot be read now may hold the request; it is retried
             // on the next passes, then refused.
@@ -1283,6 +1364,7 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
                         &id,
                         &envelope,
                         &format!("{error:#}"),
+                        WAIT_PASSES,
                     )?);
                     continue;
                 }
@@ -1308,6 +1390,7 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
                         &id,
                         &envelope,
                         &format!("{error:#}"),
+                        WAIT_PASSES,
                     )?);
                 }
                 continue;
@@ -1336,7 +1419,42 @@ fn collect(conn: &Connection, machine: &Machine, timeout: Duration) -> Result<Va
     }
     Ok(
         json!({"machine": machine.name, "delivered": delivered.len(),
-        "refused": refused.len(), "requests_ended": ended}),
+        "refused": refused.len(), "requests_ended": ended, "refresh": refresh}),
+    )
+}
+
+/// Why a collected message cannot be placed yet: a ship it names is not in
+/// this machine's directory. A ship made, moved or retired elsewhere reaches
+/// the directory at the next exchange, so such mail waits for it.
+fn unknown_party(conn: &Connection, envelope: &Value) -> Result<Option<String>> {
+    let to = envelope["to"].as_str().unwrap_or("");
+    let from = envelope["from"].as_str().unwrap_or("");
+    let home = if to == crate::mail::CAPTAIN {
+        captain_home(conn)?.map(|(_, home)| home)
+    } else {
+        match crate::fleet::members(conn)?
+            .into_iter()
+            .find(|m| m.name == to && m.home.is_dir())
+        {
+            Some(member) => Some(member.home),
+            None => return Ok(Some(format!("no ship named {to} on this machine"))),
+        }
+    };
+    // A home that cannot be opened now is placed, or held, on a later pass.
+    let Some(home) = home.filter(|home| home.is_dir()) else {
+        return Ok(None);
+    };
+    if from == crate::mail::CAPTAIN {
+        return Ok(None);
+    }
+    let Ok(mut store) = Store::open(&home) else {
+        return Ok(None);
+    };
+    Ok(
+        match crate::mail::dispatch(&mut store, "ship.show", json!({"name": from})) {
+            Ok(_) => None,
+            Err(_) => Some(format!("unknown ship {from}")),
+        },
     )
 }
 
@@ -1393,15 +1511,16 @@ fn surface_captain_refusal(
 /// readable before it is refused.
 const WAIT_PASSES: i64 = 10;
 
-/// A captain's message this pass cannot place. It waits for the next passes
-/// until `WAIT_PASSES` have gone by, then is refused and put before the
-/// captain. Returns the refusal, if it was made now.
+/// A collected message this pass cannot place. It waits for the next passes
+/// until `limit` have gone by, then is refused; a captain's message is put
+/// before the captain. Returns the refusal, if it was made now.
 fn hold_or_refuse(
     conn: &Connection,
     machine: &Machine,
     id: &str,
     envelope: &Value,
     reason: &str,
+    limit: i64,
 ) -> Result<Option<Value>> {
     conn.execute(
         "INSERT INTO collect_waits(machine, id, passes) VALUES(?1, ?2, 1)
@@ -1413,11 +1532,13 @@ fn hold_or_refuse(
         params![machine.name, id],
         |r| r.get(0),
     )?;
-    if passes < WAIT_PASSES {
+    if passes < limit {
         return Ok(None);
     }
     forget_wait(conn, machine, id)?;
-    surface_captain_refusal(conn, id, envelope, reason)?;
+    if envelope["to"] == crate::mail::CAPTAIN || envelope["from"] == crate::mail::CAPTAIN {
+        surface_captain_refusal(conn, id, envelope, reason)?;
+    }
     Ok(Some(json!({"id": id, "error": reason})))
 }
 
@@ -1463,27 +1584,33 @@ fn push_captain(
     let result = call(
         machine,
         "fleet.captain",
-        json!({"machine": known_as, "messages": messages}),
+        json!({"machine": known_as, "messages": &messages}),
         Some(timeout),
     )?;
-    let taken: Vec<(String, Option<String>)> = result["delivered"]
+    let mut taken: Vec<(String, Option<String>)> = result["delivered"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|id| Some((id.as_str()?.to_owned(), None)))
-        .chain(
-            result["refused"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| {
-                    Some((
-                        r["id"].as_str()?.to_owned(),
-                        Some(r["error"].as_str().unwrap_or("refused").to_owned()),
-                    ))
-                }),
-        )
         .collect();
+    for refusal in result["refused"].as_array().into_iter().flatten() {
+        let (Some(id), error) = (refusal["id"].as_str(), refusal["error"].as_str()) else {
+            continue;
+        };
+        let error = error.unwrap_or("refused");
+        // A sender the desk does not know yet waits for a directory exchange,
+        // as collected mail does; it is refused only once that has had its passes.
+        if error.starts_with(UNKNOWN_SHIP) {
+            let envelope = messages
+                .iter()
+                .find(|e| e["id"] == id)
+                .unwrap_or(&Value::Null);
+            if hold_or_refuse(conn, machine, id, envelope, error, UNKNOWN_EXCHANGES)?.is_none() {
+                continue;
+            }
+        }
+        taken.push((id.to_owned(), Some(error.to_owned())));
+    }
     for member in crate::fleet::members(conn)? {
         if member.home.is_dir() {
             crate::mail::collected_captain(&Store::open(&member.home)?, &peer, &taken)?;
@@ -1532,12 +1659,19 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             let due = machine
                 .refreshed_ms
                 .is_none_or(|at| Store::now_ms() - at >= REFRESH_MS);
-            // A machine that cannot be refreshed is not collected from in the
-            // same pass, so an unreachable one stalls a pass only once.
-            let outcome = if due {
+            // A machine that timed out on its exchange is not collected from in
+            // the same pass, so an unreachable one stalls a pass only once. Any
+            // other exchange failure (an older peer, a refused directory) still
+            // lets the pass collect: a failed exchange stays due every pass and
+            // must not stop the mail.
+            let refreshed = if due {
                 exchange(&conn, &machine, Some(timeout)).map(|_| ())
             } else {
                 Ok(())
+            };
+            let outcome = match refreshed {
+                Err(error) if format!("{error:#}").contains("timed out") => Err(error),
+                _ => Ok(()),
             }
             .and_then(|()| collect(&conn, &machine, timeout))
             .and_then(|collected| match desk(&conn)? {
@@ -1743,7 +1877,10 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     Ok(_) => delivered.push(json!(id)),
                     Err(error) => {
                         let reason = format!("{error:#}");
-                        surface_captain_refusal(&conn, id, &envelope, &reason)?;
+                        // The sending machine holds a sender this one does not know yet.
+                        if !reason.starts_with(UNKNOWN_SHIP) {
+                            surface_captain_refusal(&conn, id, &envelope, &reason)?;
+                        }
                         refused.push(json!({"id": id, "error": reason}));
                     }
                 }

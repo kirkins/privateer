@@ -649,6 +649,8 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
         // Join the fleet: ships on this machine find and mail each other.
         crate::fleet::register(&ship, store.home(), &setup.created_by)?;
         crate::fleet::link(&store, &ship)?;
+        // Linked machines learn the ship now, not at their next refresh.
+        crate::machines::announce(Some(&store));
     }
     Ok((ship, harness, ours))
 }
@@ -1500,8 +1502,13 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                 for note in moved["notes"].as_array().into_iter().flatten() {
                     println!("  note: {}", note.as_str().unwrap_or(""));
                 }
-                if let Some(directory) = moved["directory"].as_str() {
-                    println!("  note: {directory}");
+                for directory in moved["directory"].as_array().into_iter().flatten() {
+                    if let Some(error) = directory["skipped"].as_str() {
+                        println!(
+                            "  note: directory not exchanged with {}: {error}",
+                            directory["machine"].as_str().unwrap_or("")
+                        );
+                    }
                 }
                 println!(
                     "  its old folder is kept at {}",
