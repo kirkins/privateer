@@ -1335,7 +1335,13 @@ fn launch_plan(
                 matches!(harness.as_str(), "pi" | "claude") && own_harness,
                 "bounded tool bundles require the configured Pi or Claude harness"
             );
-            crate::tool_bundles::resolve(store, selected, "first_mate", &harness)
+            crate::tool_bundles::resolve(
+                store,
+                selected,
+                "first_mate",
+                &harness,
+                crate::plugins::Wait::Launch,
+            )
         })
         .transpose()?;
     if hosted

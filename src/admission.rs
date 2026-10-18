@@ -572,10 +572,21 @@ pub fn admit(
     Ok(())
 }
 
-pub fn measure() -> Result<Host> {
-    let cpus = std::thread::available_parallelism()
+fn cpus() -> f64 {
+    std::thread::available_parallelism()
         .map(|n| n.get() as f64)
-        .unwrap_or(1.0);
+        .unwrap_or(1.0)
+}
+
+/// The one-minute load per CPU that admission gates on, without reading
+/// memory or disk; `None` if the load average cannot be read.
+pub fn load_per_cpu() -> Option<f64> {
+    let mut load = 0f64;
+    (unsafe { libc::getloadavg(&mut load, 1) } >= 1).then(|| load / cpus())
+}
+
+pub fn measure() -> Result<Host> {
+    let cpus = cpus();
     let mut loads = [0f64; 3];
     ensure!(
         unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) } >= 1,

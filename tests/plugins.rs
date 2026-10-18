@@ -924,6 +924,28 @@ fn timeout_bounds_blocked_stdin_and_inherited_output() {
 }
 
 #[test]
+fn launch_planning_outwaits_a_slow_plugin_that_an_ordinary_request_does_not() {
+    let mut f = Fixture::new();
+    let repo = f.repo.display().to_string();
+    // Answers well after its declared timeout, well inside the launch floor.
+    let body = response_script(&format!(
+        "{{'argv':['true'],'cwd':{repo:?},'env_names':[]}}"
+    ))
+    .replacen("\nprint(", "\nimport time; time.sleep(1.5)\nprint(", 1);
+    let path = manifest(&f, &body, 300, 65536);
+    let args = f.args(&path);
+    let error = plugins::dispatch(&mut f.store, "plugin.command", args).unwrap_err();
+    assert!(
+        error.to_string().contains("timed out after 300 ms"),
+        "{error}"
+    );
+    let mut args = f.args(&path);
+    args["id"] = json!("slow-plan");
+    let job = privateer::dispatch(&mut f.store, "agent.start", args).unwrap();
+    assert_eq!(job["command"], json!(["true"]));
+}
+
+#[test]
 fn stdout_stderr_and_response_identity_are_bounded() {
     let mut f = Fixture::new();
     for body in [

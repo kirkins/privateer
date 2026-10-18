@@ -380,7 +380,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .and_then(Value::as_object_mut)
                 .and_then(|options| options.remove("memory_bytes"));
             let route_memory = if route_options { caller_memory } else { None };
-            let mut plan = plugins::dispatch(store, "plugin.command", args.clone())?;
+            let mut plan = plugins::plan_launch(store, "plugin.command", args.clone())?;
             if hosted {
                 // The crew extension ends the session when its work settles.
                 let plugins = cli::plugins_dir()?;

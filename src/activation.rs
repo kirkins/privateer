@@ -230,7 +230,13 @@ pub fn profile(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
             Some("bundled:claude") => "claude",
             _ => bail!("bounded tool bundles require bundled:pi or bundled:claude"),
         };
-        crate::tool_bundles::resolve(store, selected, "first_mate", harness)?;
+        crate::tool_bundles::resolve(
+            store,
+            selected,
+            "first_mate",
+            harness,
+            crate::plugins::Wait::Declared,
+        )?;
         out.insert("tool_bundles".into(), selected.clone());
     }
     if let Some(host) = object.get("host").filter(|v| !v.is_null()) {

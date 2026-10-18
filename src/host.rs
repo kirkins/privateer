@@ -16,8 +16,12 @@ pub mod bridge;
 pub(crate) mod sleep;
 pub mod upgrade;
 
-/// How long a launch may take to adopt its lease before it lapses.
-const LAUNCH_TTL_SECS: u64 = 60;
+/// How long a launch may take to adopt its lease before it lapses. Before the
+/// pane adopts it, up to three launch-planning plugin calls run one after
+/// another (the dispatcher's validate_start, the pane's own, and its tool
+/// bundle plan), each allowed the launch ceiling on a loaded machine; the
+/// lease must outlast them all, or a slow launch is opened twice.
+const LAUNCH_TTL_SECS: u64 = 3 * crate::plugins::LAUNCH_CEILING_MS / 1000 + 60;
 
 /// Five minutes gives a brief permission/setup prompt or transient status time
 /// to clear without paging, while a pane stuck unable to handle mail is noticed
@@ -369,7 +373,7 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         profile.get("config").is_none(),
         "hosted native start cannot apply plugin config"
     );
-    crate::plugins::dispatch(
+    crate::plugins::plan_launch(
         store,
         "plugin.validate",
         json!({
