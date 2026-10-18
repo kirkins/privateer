@@ -2267,3 +2267,135 @@ fn changed_ms_holds_while_nothing_changes_and_since_skips_an_unchanged_machine()
     assert!(third["machines"][0]["changed_ms"].as_i64().unwrap() > changed);
     assert_eq!(third["ships"][0]["unread"], 1, "{third}");
 }
+
+/// A job record written straight into a home, as the supervisor keeps it.
+fn put_job(folder: &Path, record: Value) {
+    let db = rusqlite::Connection::open(folder.join(".privateer/privateer.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+        rusqlite::params![record["id"].as_str().unwrap(), record.to_string()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_parked_and_a_queued_job_say_what_they_wait_for() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let created = now_ms();
+    put_job(
+        &apps,
+        json!({"id": "job-queued", "task_id": "t1", "status": "queued", "heavy": true,
+            "created_ms": created, "command": ["cargo", "test"]}),
+    );
+    put_job(
+        &apps,
+        json!({"id": "job-disk", "task_id": "t1", "status": "queued", "heavy": true,
+            "created_ms": created + 1, "command": ["cargo", "build"],
+            "reason": "waiting for 2.0 GiB disk available"}),
+    );
+    put_job(
+        &apps,
+        json!({"id": "job-gate", "task_id": "t1", "status": "running", "heavy": true,
+            "created_ms": created + 2, "command": ["cargo", "clippy"]}),
+    );
+    put_job(
+        &apps,
+        json!({"id": "job-crew", "task_id": "t1", "incarnation": "i1", "status": "parked",
+            "action": "spawn", "agent_actor": "apps", "heavy": false,
+            "created_ms": created + 3, "command": ["claude"]}),
+    );
+    let db = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO crew_parks(id, root, crew_job_id, child_job_id, task_id, ship, state, next,
+           attempt, created_ms, updated_ms)
+         VALUES('park-job-crew-1', 'job-crew', 'job-crew', 'job-gate', 't1', 'apps', 'parked',
+           'report the gate results with crew.report', 0, ?1, ?1)",
+        [created + 4],
+    )
+    .unwrap();
+
+    let snapshot = machine.json(&apps, "fleet.snapshot", json!({}));
+    let jobs = snapshot["ships"][0]["jobs"].as_array().unwrap();
+    let job = |id: &str| {
+        jobs.iter()
+            .find(|j| j["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing: {snapshot}"))
+    };
+    assert_eq!(snapshot["ships"][0]["jobs_total"], 4, "{snapshot}");
+    let queued = job("job-queued");
+    assert_eq!(queued["state"], "queued");
+    assert_eq!(queued["started_ms"], Value::Null);
+    assert_eq!(
+        queued["wait"],
+        json!({"for": "capacity", "since_ms": created, "behind": []}),
+        "{queued}"
+    );
+    assert_eq!(job("job-disk")["wait"]["for"], "disk");
+    assert_eq!(job("job-gate")["wait"], Value::Null);
+    let parked = job("job-crew");
+    assert_eq!(parked["state"], "parked");
+    assert_eq!(parked["kind"], "crew");
+    assert_eq!(
+        parked["wait"],
+        json!({"for": "job", "job_id": "job-gate", "park": "park 1 of 6"}),
+        "{parked}"
+    );
+    assert_eq!(
+        parked["doing"],
+        json!({"text": "report the gate results with crew.report",
+            "at_ms": created + 4, "report_id": null})
+    );
+    // Newest first.
+    let order: Vec<&str> = jobs.iter().map(|j| j["id"].as_str().unwrap()).collect();
+    assert_eq!(order, ["job-crew", "job-gate", "job-disk", "job-queued"]);
+}
+
+#[test]
+fn a_locked_home_reads_unavailable_and_the_others_stay_complete() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let ops = machine.ship("ops");
+    live_crew(&ops, "ops", "job-ops", "running", &["deploying"]);
+    // Out of WAL, an exclusive transaction keeps every reader out.
+    let locker = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    locker
+        .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let snapshot = machine.json(&ops, "fleet.snapshot", json!({}));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
+    let ship = |name: &str| {
+        snapshot["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {snapshot}"))
+            .clone()
+    };
+    assert_eq!(
+        ship("apps"),
+        json!({"name": "apps", "presence": "unavailable", "machine": snapshot["machine"]}),
+        "{snapshot}"
+    );
+    let unknown = snapshot["machines"][0]["unknown"].as_array().unwrap();
+    assert!(unknown.contains(&json!("home:apps")), "{snapshot}");
+    let ops_ship = ship("ops");
+    assert_eq!(ops_ship["presence"], "absent");
+    assert_eq!(
+        ops_ship["jobs"][0]["doing"]["text"], "deploying",
+        "{ops_ship}"
+    );
+    assert!(
+        !unknown
+            .iter()
+            .any(|u| u.as_str().unwrap().ends_with(":ops"))
+    );
+    locker.execute_batch("ROLLBACK;").unwrap();
+}

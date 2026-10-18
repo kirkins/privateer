@@ -1,6 +1,6 @@
 # Design: `fleet.snapshot`, one JSON of the fleet across machines
 
-Status: revised after the design review (round 2) and implemented, except per-machine `routes` (the `crew_routes::states` refactor), the `jobs_live` and `tasks_owner` indexes, and `park` text on a parked job's `wait`, which remain for a later round. Task `privateer-fleet-snapshot` (data side of issue 94, for quarterdeck's fleet map, its PR 7). Read with [cross-machine fleet](cross-machine-fleet.md) (links, the gateway), [runtime needs](../runtime-needs.md) and [architecture](../architecture.md#linked-machines). Names marked **new** do not exist yet; every other name was checked in the tree at b95363b.
+Status: revised after the design review (round 2) and implemented in full (round 3 added per-machine `routes` through the shared `crew_routes::states`, the `jobs_live` and `tasks_owner` indexes, and `park` text on a parked job's `wait`). Task `privateer-fleet-snapshot` (data side of issue 94, for quarterdeck's fleet map, its PR 7). Read with [cross-machine fleet](cross-machine-fleet.md) (links, the gateway), [runtime needs](../runtime-needs.md) and [architecture](../architecture.md#linked-machines). Names marked **new** were added by this work; every other name was checked in the tree at b95363b.
 
 ## Problem
 
@@ -32,7 +32,8 @@ The answering machine reads its own homes (`crate::captain::fleet`, as `captain.
       "name": "opus", "route": "claude/anthropic/claude-opus-5-5", "cost": "paid", "tier": 1,
       "state": "backing_off", "until_ms": 1792330300000, "error": "429 rate limited",
       "allowance": {"shape": "5h window, weekly Mon 00:00 UTC", "window_ends_ms": null,
-                    "window_used": 0.42, "week_used": 0.18, "last_used_ms": 1792320000000}
+                    "weekly_ends_ms": null, "window_used": 0.42, "week_used": 0.18,
+                    "last_used_ms": 1792320000000}
     }]
   }],
   "ships": [{
@@ -64,7 +65,7 @@ The answering machine reads its own homes (`crate::captain::fleet`, as `captain.
 }
 ```
 
-Arrays are in name order (machines, ships, routes), jobs newest first, needs as `runtime.needs` orders them. Every time is an absolute `_ms`; the snapshot carries no durations (no `age_ms`, `waited_ms`, `observed_ms`), so it is identical while nothing changes and the portal derives ages from `generated_ms`.
+Arrays are in name order (machines, ships, routes, with unnamed ledger holds after the named routes in key order), jobs newest first, needs as `runtime.needs` orders them. Every time is an absolute `_ms`; the snapshot carries no durations (no `age_ms`, `waited_ms`, `observed_ms`), so it is identical while nothing changes and the portal derives ages from `generated_ms`.
 
 **Rule: no value inside a machine's section is computed from the current time.** The only way the passage of time changes a section is a state crossing an instant already stored in a record: a presence lease expiring, a route backoff or cap ending, an allowance window renewing. Those are real changes. Durations, "for N minutes" text and read times stay out of the section (`behind[].unhealthy` is a boolean, ships carry no `as_of_ms`; the machine row's `as_of_ms` is outside the hashed part). A test moves time forward across a quiet interval and checks the digest and `changed_ms` do not move.
 
@@ -88,7 +89,9 @@ Routes are a machine's: the captain's route file (`crate::crew_routes::load`) an
 - `idle`: not blocked, and its declared allowance has gone unused since it last renewed (the rule bearings print as "Idle allowances", `idle_line`).
 - `available`: otherwise.
 
-`allowance` is null for a route with no declared allowance. The classification now lives inline in `crate::crew_routes::summary`; it moves to a shared `crew_routes::states` (**new**) that both bearings and the snapshot call, so the two never disagree. No route is changed or probed.
+`allowance` is null for a route with no declared allowance; otherwise `shape` (as bearings describe it), the usage row's `window_ends_ms`, `weekly_ends_ms`, `window_used`, `week_used` (shares, 0 to 1) and `last_used_ms`. `tier` is the effective tier (1 when the route states none, as ranking reads it); an unnamed hold has null `cost`, `tier` and `allowance`, and its `route` is the ledger key held, which may be an account key (`claude/anthropic/*`) that also holds named routes. `error` is the hold's `model_routes.last_error`, the classified failure `routes::refusal` shows, never raw output, at most 500 chars.
+
+The classification is `crate::crew_routes::states(policy, ledger, now)`, which bearings' `summary` also calls, so the two never disagree. It reads only stored rows and compares them with `now`: a hold's `until_ms`, a cap's `capped_until_ms`, a window's `window_ends_ms` and a daily allowance's renewal minute. So a route's entry changes with time only when `now` crosses one of those instants, which the rule above counts as a real change; routes are inside the hashed section. A lib test reads the states at two times with no instant between them and gets the same answer, then one past several instants and gets the new states. The machine's routes file is the registry's (`crew_routes::load`, the same on every home here), and the ledger is read once per machine, read-only with a 100 ms busy timeout; a routes file or ledger that cannot be read leaves `routes` empty and names `"routes"` in `unknown`. No route is changed or probed.
 
 ### ships[]
 
@@ -117,7 +120,7 @@ One per active fleet member on its machine (`crate::fleet::members`), in its own
 - `doing` (the "doing now" line): the job's most recent `crew.report` of kind `progress`. Reports are mail from `crew` with id `crew-<job>-<incarnation>-<suffix>` and `payload.job_id`, so the read is a range on the unique `mail.id` index (`id >= 'crew-<job>-' AND id < 'crew-<job>.'`) filtered on `payload.job_id` and `payload.report = 'progress'`, newest `seq` first, `LIMIT 1`. `text` is the report body after the runtime's lead line ("Crew job … reports progress:"), first line, at most 200 chars. A parked crew's `doing` is its park's `next` line (`crew_parks.next`) with `at_ms` the park's `updated_ms`. Null when the crew never reported.
 - `wait`: null unless the job waits:
   - `queued`: `{"for": "capacity" | "disk", "since_ms": created_ms, "behind": [{"job_id", "ship", "unhealthy": bool}]}`. The holders are read **once per machine** (not once per ship as `capacity_waits` does), through a `capacity_holders` variant with a 100 ms busy timeout; a ledger busy past that leaves `behind` empty and names `"ledger"` in `unknown`. `unhealthy` is a boolean: the holder's text says "for N minutes" and would move the digest. `disk` by the same evidence rule `runtime.needs` uses (`reason` names "disk available").
-  - `parked`: `{"for": "job", "job_id": <child>, "park": "park N of 6"}` from `crew_parks`.
+  - `parked`: `{"for": "job", "job_id": <child>, "park": "park N of M"}` from `crew_parks`: N the parks the crew's lineage has made, M its charter's `crew_max_parks` (6 by default), the same text `crew::park_count` gives bearings.
 
 ### needs[]
 
@@ -164,8 +167,8 @@ A per-machine token, not a time: `since` is an object `{"<machine>": <changed_ms
 Bounded per home, per machine and in wall time; no unbounded scan:
 
 - **Homes:** every active member on the machine, each read in one deferred read transaction under an observation budget like `runtime.needs`' (`ObservationBudget`, made `pub(crate)`): 25 ms busy wait, 250 ms of statement work, after that home's `runtime.needs` read under its own budget (so up to about 500 ms per home in the worst case). A home over budget is `presence: "unavailable"` and is named in `unknown`; it does not fail the call. The machine's whole local read stops at 3 s (**new** `LOCAL_BUDGET_MS`); homes not reached by then are listed `unavailable`. **Known limit:** homes are read in name order, so on a slow machine the same last homes are the ones always cut off; a later round may rotate the start. They are named in `unknown`, never shown as empty.
-- **Jobs:** live jobs are found by status. The `jobs` table has no status column or index, and `job.list` reads every record; a partial expression index `jobs_live` (**new**) on `json_extract(record,'$.status')` for non-terminal statuses makes that a seek. At most 20 jobs per ship are expanded; each `doing` read is one index range with `LIMIT 1`.
-- **Tasks:** `SELECT … FROM tasks WHERE owner=? AND status IN ('open','running','blocked') LIMIT 21` and a `COUNT`. The table has only its primary key; an index `tasks_owner` (**new**) on `(owner, status)`.
+- **Jobs:** live jobs are found by status. The `jobs` table has no status column or index, and `job.list` reads every record; a partial expression index `jobs_live` on `json_extract(record,'$.created_ms')` over non-terminal statuses (`jobs::TERMINAL_SQL`, which the query repeats word for word so SQLite can use it) reads only live jobs, newest first. A lib test checks both job reads and the task read use their index (`EXPLAIN QUERY PLAN`). Indexes are created when a home is next opened for writing; a home not yet upgraded is read by scanning, as before. At most 20 jobs per ship are expanded; each `doing` read is one index range with `LIMIT 1`.
+- **Tasks:** `SELECT … FROM tasks WHERE owner=? AND status IN ('open','running','blocked') LIMIT 21` and a `COUNT`. The index `tasks_owner` on `(owner, status)` serves both.
 - **Needs:** `runtime.needs` with `limit` 40 per home; more is `truncated`.
 - **Ledger:** one read-only open of the host ledger per machine with a 100 ms busy timeout, for the holders and the route rows, read once and shared by every home; process identity checks are bounded by the number of reservations. Never `capacity_waits` per ship (it reopens the ledger with a 5 s busy timeout each time).
 - **Totals:** at most 200 ships per machine (`ROW_LIMIT`, as the dashboard caps), 768 KiB per machine section; past either, `truncated` and open tasks are dropped first, then jobs past 5 per ship.

@@ -767,3 +767,99 @@ fn allowance_shapes_need_a_tier_one_shape_per_model_and_no_legacy_reset() {
     tiered["tier"] = json!(10);
     refuse(json!({"routes": {"a": tiered}}), "tier must be");
 }
+
+/// The fleet snapshot lists the machine's routes in the states bearings show:
+/// available, idle, backing off and capped, each hold with its end and its
+/// classified error, and a hold no listed route names after them.
+#[test]
+fn the_fleet_snapshot_shows_each_route_in_the_state_bearings_show() {
+    let f = Fleet::new();
+    let mut flash = codex("model-flash", "free");
+    flash["allowance"] = json!({"daily_utc": "07:00"});
+    flash["tier"] = json!(1);
+    let mut capped = codex("model-capped", "plan");
+    capped["allowance"] = json!({"window_hours": 5});
+    capped["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"steady": codex("model-steady", "plan"), "flash": flash,
+            "busy": codex("model-busy", "credits"), "capped": capped},
+        "crew": ["steady", "flash", "busy", "capped"]
+    }));
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let until = i64::MAX / 4;
+    for (route, error) in [
+        ("codex/-/model-busy", "429 rate limited"),
+        ("codex/-/model-capped", "usage limit reached"),
+        ("codex/-/model-gone", "quota exhausted"),
+    ] {
+        ledger
+            .execute(
+                "INSERT INTO model_routes(route,failures,until_ms,last_error,updated_ms) VALUES(?1,1,?2,?3,0)",
+                rusqlite::params![route, until, error],
+            )
+            .unwrap();
+    }
+    ledger
+        .execute(
+            "INSERT INTO route_usage(route,strikes,window_utilization,capped_until_ms,updated_ms)
+             VALUES('codex/-/model-capped',0,0.97,?1,0)",
+            [until],
+        )
+        .unwrap();
+
+    let snapshot = f.json(None, "fleet.snapshot", json!({}));
+    let routes = snapshot["machines"][0]["routes"].as_array().unwrap();
+    let states: Vec<(Value, Value, Value)> = routes
+        .iter()
+        .map(|r| (r["name"].clone(), r["state"].clone(), r["until_ms"].clone()))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            (json!("busy"), json!("backing_off"), json!(until)),
+            (json!("capped"), json!("capped"), json!(until)),
+            (json!("flash"), json!("idle"), Value::Null),
+            (json!("steady"), json!("available"), Value::Null),
+            (Value::Null, json!("backing_off"), json!(until)),
+        ],
+        "{snapshot}"
+    );
+    assert_eq!(routes[0]["error"], "429 rate limited");
+    assert_eq!(routes[0]["route"], "codex/-/model-busy");
+    assert_eq!(routes[0]["cost"], "credits");
+    assert_eq!(routes[0]["allowance"], Value::Null);
+    assert_eq!(routes[1]["allowance"]["shape"], "5h window");
+    assert_eq!(routes[1]["allowance"]["window_used"], 0.97);
+    assert_eq!(routes[2]["allowance"]["shape"], "daily 07:00 UTC");
+    assert_eq!(routes[2]["allowance"]["last_used_ms"], Value::Null);
+    assert_eq!(routes[2]["tier"], 1);
+    assert_eq!(routes[4]["route"], "codex/-/model-gone");
+    assert_eq!(routes[4]["error"], "quota exhausted");
+
+    // Bearings read the same states.
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(text.contains("busy (credits) backing off"), "{text}");
+    assert!(
+        text.contains("tier 1, window 97% used) capped until"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Idle allowances: flash (daily 07:00 UTC"),
+        "{text}"
+    );
+
+    // The routes are part of the section: a hold ending is a change.
+    let changed = snapshot["machines"][0]["changed_ms"].as_i64().unwrap();
+    let again = f.json(None, "fleet.snapshot", json!({}));
+    assert_eq!(again["machines"][0]["changed_ms"], changed, "{again}");
+    ledger
+        .execute(
+            "UPDATE model_routes SET until_ms=1 WHERE route='codex/-/model-busy'",
+            [],
+        )
+        .unwrap();
+    let cleared = f.json(None, "fleet.snapshot", json!({}));
+    assert_eq!(cleared["machines"][0]["routes"][0]["state"], "available");
+    assert!(cleared["machines"][0]["changed_ms"].as_i64().unwrap() > changed);
+}

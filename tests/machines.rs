@@ -3910,6 +3910,10 @@ fn the_snapshot_reads_a_reached_machine_and_keeps_its_last_section_when_it_is_do
     assert_eq!(row["link"], "reaches", "{first}");
     assert_eq!(row["reachable"], true, "{first}");
     assert_eq!(row["via"], "direct");
+    assert!(
+        row["routes"].is_array(),
+        "the reached machine's routes: {first}"
+    );
     let fitforge = ships_on(&first, "mac");
     assert_eq!(fitforge.len(), 1, "{first}");
     assert_eq!(fitforge[0]["name"], "fitforge");
@@ -4009,4 +4013,45 @@ fn a_reaching_machine_carries_its_section_on_collect_to_the_machine_it_reaches()
     assert_eq!(liaison.len(), 1, "{after}");
     assert_eq!(liaison[0]["name"], "liaison");
     assert_eq!(liaison[0]["presence"], "absent", "{after}");
+}
+
+#[test]
+fn a_gateway_too_old_to_serve_the_snapshot_reads_unreachable_with_its_refusal() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    // An older gateway knows no fleet.snapshot: rename the command on its way
+    // in, so the real gateway refuses it as one that predates it would.
+    let old = mac.root.join("old-gateway-ssh");
+    fs::write(
+        &old,
+        format!(
+            "#!/bin/sh\nfor argument do remote=$argument; done\necho connected >> {root}/ssh.log\nsed -u 's/\"fleet.snapshot\"/\"fleet.snapshot.unknown\"/' | env HOME={root} PATH={root}/bin:/usr/bin:/bin PRIVATEER_FLEET={root}/fleet.sqlite PRIVATEER_RESOURCE_HOME={root}/ledger /bin/sh -c \"$remote\"\n",
+            root = mac.root.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let snapshot = laptop.ok_over("liaison", "fleet.snapshot", json!({}), &old);
+    assert_eq!(connections(&mac), 1, "the old gateway was asked");
+    let row = machine_row(&snapshot, "mac");
+    assert_eq!(row["reachable"], false, "{snapshot}");
+    assert_eq!(row["via"], "directory", "{snapshot}");
+    assert!(
+        row["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown gateway command fleet.snapshot"),
+        "{snapshot}"
+    );
+    assert_eq!(row["routes"], json!([]));
+    // Not an empty machine: its ships are listed from the directory, unknown.
+    let listed = ships_on(&snapshot, "mac");
+    assert_eq!(listed.len(), 1, "{snapshot}");
+    assert_eq!(listed[0]["name"], "fitforge");
+    assert_eq!(listed[0]["presence"], "unknown");
+    // This machine's own section is whole.
+    assert_eq!(machine_row(&snapshot, "laptop")["reachable"], true);
+    assert_eq!(ships_on(&snapshot, "laptop").len(), 1, "{snapshot}");
 }
