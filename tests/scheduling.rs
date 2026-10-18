@@ -1002,3 +1002,85 @@ call('task.update', {'id':'infra-repair','actor':ship,'status':'done'})"#,
         "done"
     );
 }
+
+#[test]
+fn a_taken_up_offer_that_defers_on_a_child_is_never_counted_as_an_attempt() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    for round in 0..4 {
+        let child = format!("infra-child-{round}");
+        call(
+            &mut fleet,
+            "task.create",
+            json!({"id":child,"parent":"infra-repair","owner":"infra","title":"child","actor":"infra"}),
+        );
+        let offer = poll(&mut fleet, true)["offer"].clone();
+        assert!(offer.is_object(), "round {round}: {offer}");
+        call(
+            &mut fleet,
+            "work.started",
+            json!({"ship":"infra","holder":"host:scheduler-test","offer_id":offer["id"]}),
+        );
+        call(
+            &mut fleet,
+            "task.defer",
+            json!({"id":"infra-repair","offer_id":offer["id"],
+            "wait":{"kind":"task","reason":"child correction","ref":child}}),
+        );
+        assert_eq!(status(&mut fleet, "infra-repair")["attempts"], 0);
+        call(
+            &mut fleet,
+            "task.update",
+            json!({"id":child,"actor":"infra","status":"done"}),
+        );
+    }
+    let state = status(&mut fleet, "infra-repair");
+    assert_ne!(state["state"], "fault", "{state}");
+}
+
+#[test]
+fn failed_deliveries_fault_after_three_attempts_and_notify_the_owner_once() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    for round in 0..3 {
+        let offer = poll(&mut fleet, true)["offer"].clone();
+        assert!(offer.is_object(), "round {round}: {offer}");
+        call(
+            &mut fleet,
+            "work.release",
+            json!({"ship":"infra","holder":"host:scheduler-test","offer_id":offer["id"]}),
+        );
+        fleet
+            .store
+            .connection()
+            .execute(
+                "UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0)",
+                [],
+            )
+            .unwrap();
+    }
+    assert!(poll(&mut fleet, true)["offer"].is_null());
+    let state = status(&mut fleet, "infra-repair");
+    assert_eq!(state["state"], "fault", "{state}");
+    assert!(
+        state["reason"]
+            .as_str()
+            .unwrap()
+            .contains("retry budget exhausted")
+    );
+    for _ in 0..2 {
+        poll(&mut fleet, true);
+    }
+    let notices: i64 = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM mail WHERE recipient='infra' AND kind='notice' AND task_id='infra-repair'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(notices, 1);
+}

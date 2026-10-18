@@ -127,6 +127,10 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
         "manual" => {}
         _ => bail!("wait.kind must be time, attention, task, request or manual"),
     }
+    // Deferring an offer that was taken up is handled work, not a retry.
+    if matches!(work.state.as_str(), "offered" | "claimed" | "executing") {
+        work.attempts = 0;
+    }
     work.state = if kind == "manual" {
         "stopped"
     } else {

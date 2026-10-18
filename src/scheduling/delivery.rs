@@ -140,7 +140,7 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
         work.job_id = (mode == "fresh").then(|| offer.clone());
         work.profile = Some(profile.clone());
         work.charter_hash = Some(crate::core::hash(&charter));
-        work.attempts += 1;
+        // An offer is not an attempt: only a failed or expired delivery counts.
         work.lease_until_ms = now + CLAIM_MS;
         work.reason = None;
         store.connection().execute(
@@ -294,6 +294,7 @@ pub(super) fn native_event(store: &Store, command: &str, args: &Value) -> Result
                 "only an unaccepted offer can be released"
             );
             finish_wake(store, &work, "failed", now)?;
+            work.attempts += 1;
             reopen(store, &mut work)?;
             work.not_before_ms = now + 60_000;
             work.reason = Some("Delivery failed; bounded retry after cooldown".into());
