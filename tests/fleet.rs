@@ -1462,3 +1462,144 @@ fn a_typed_decision_reaches_the_liaison_with_its_options_whole() {
         json!(["Path A", "Path B"])
     );
 }
+
+#[test]
+fn the_captain_replies_to_and_dismisses_asks_in_any_home_by_id_or_unique_prefix() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let send = |folder: &Path, args: Value| machine.json(folder, "mail.send", args);
+    let refused = |folder: &Path, command: &str, args: Value| {
+        let out = machine.run(folder, &[command, "--json", &args.to_string()]);
+        assert!(!out.status.success(), "{command} {args}");
+        stderr(&out)
+    };
+
+    // From web's folder, the captain answers an ask apps holds, by prefix.
+    let asked = send(
+        &apps,
+        json!({"from":"apps","to":"captain","kind":"request","body":"Rotate the key?"}),
+    );
+    let id = asked["id"].as_str().unwrap();
+    let replied = machine.json(
+        &web,
+        "captain.reply",
+        json!({"id": &id[..8], "body": "Yes, rotate it"}),
+    );
+    assert_eq!(replied["id"], id, "{replied}");
+    assert_eq!(replied["ship"], "apps");
+    let request = machine.json(&apps, "mail.show", json!({"id": id}));
+    assert_eq!(request["state"], "answered", "{request}");
+    let reply = machine.json(&apps, "mail.show", json!({"id": request["answered_by"]}));
+    assert_eq!(reply["from"], "captain");
+    assert_eq!(reply["body"], "Yes, rotate it");
+    // Answered is no longer open: neither command finds it.
+    assert!(refused(&web, "captain.reply", json!({"id": id, "body": "again"})).contains(id));
+
+    // runtime.needs carries the mail's own facts.
+    let stale = send(
+        &apps,
+        json!({"from":"apps","to":"captain","kind":"request","body":"Deploy build 12?",
+            "urgency":"high","reply_within_secs":3600}),
+    );
+    let stale_id = stale["id"].as_str().unwrap();
+    let needs = machine.json(&apps, "runtime.needs", json!({"address":"captain"}));
+    let item = needs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["mail_id"] == stale_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("{needs}"));
+    assert_eq!(item["kind"], "decision");
+    assert_eq!(item["mail_kind"], "request");
+    assert_eq!(item["urgency"], "high");
+    assert_eq!(item["deadline_ms"], stale["deadline_ms"]);
+    assert!(item["deadline_ms"].is_i64(), "{item}");
+    assert_eq!(item["asked_ms"], stale["created_ms"]);
+    assert_eq!(item["needs_hands"], false);
+
+    // Dismissed with a reason, from another home: the sender sees it and hears once.
+    let dismissed = machine.json(
+        &web,
+        "captain.dismiss",
+        json!({"id": &stale_id[..8], "note": "deploy already happened"}),
+    );
+    assert_eq!(dismissed["state"], "dismissed", "{dismissed}");
+    let request = machine.json(&apps, "mail.show", json!({"id": stale_id}));
+    assert_eq!(request["state"], "dismissed", "{request}");
+    assert_eq!(request["end_reason"], "deploy already happened");
+    let told: Vec<Value> = machine.json(&apps, "mail.inbox", json!({"address":"apps"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["correlation"] == stale_id)
+        .cloned()
+        .collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0]["from"], "captain");
+    assert_eq!(told[0]["kind"], "notice");
+    assert_eq!(told[0]["payload"]["request_end"]["state"], "dismissed");
+    assert!(
+        told[0]["body"].as_str().unwrap().contains("without an answer: deploy already happened"),
+        "{}",
+        told[0]
+    );
+    let waiting = machine.json(&web, "captain.waiting", json!({}));
+    assert_eq!(waiting["waiting"], json!([]), "{waiting}");
+    let needs = machine.json(&apps, "runtime.needs", json!({"address":"captain"}));
+    assert!(
+        !needs["items"].as_array().unwrap().iter().any(|i| i["mail_id"] == stale_id),
+        "{needs}"
+    );
+    assert!(refused(&web, "captain.dismiss", json!({"id": stale_id})).contains(stale_id));
+
+    // A notice is marked acknowledged and leaves the captain's unread mail.
+    let report = send(
+        &apps,
+        json!({"from":"apps","to":"captain","kind":"notice","body":"Build 12 is up"}),
+    );
+    let acked = machine.json(&web, "captain.dismiss", json!({"id": report["id"]}));
+    assert_eq!(acked["state"], "acknowledged", "{acked}");
+    let unread = machine.json(&apps, "mail.inbox", json!({"address":"captain"}));
+    assert!(
+        !unread["messages"].as_array().unwrap().iter().any(|m| m["id"] == report["id"]),
+        "{unread}"
+    );
+
+    // Unknown ids are refused by name; a shared prefix lists its matches;
+    // an exact id wins over a longer one it prefixes.
+    assert!(refused(&web, "captain.dismiss", json!({"id": "no-such-ask"})).contains("no-such-ask"));
+    send(&apps, json!({"id":"same-1","from":"apps","to":"captain","kind":"request","body":"one"}));
+    send(&web, json!({"id":"same-12","from":"web","to":"captain","kind":"request","body":"two"}));
+    let ambiguous = refused(&web, "captain.dismiss", json!({"id": "same-"}));
+    assert!(
+        ambiguous.contains("same-1 (apps)") && ambiguous.contains("same-12 (web)"),
+        "{ambiguous}"
+    );
+    let exact = machine.json(&web, "captain.dismiss", json!({"id": "same-1"}));
+    assert_eq!((exact["id"].as_str(), exact["ship"].as_str()), (Some("same-1"), Some("apps")));
+    let unique = machine.json(&apps, "captain.dismiss", json!({"id": "same-"}));
+    assert_eq!(unique["id"], "same-12", "{unique}");
+
+    // Only the operator answers or dismisses for the captain.
+    let open = send(&apps, json!({"from":"apps","to":"captain","kind":"request","body":"Merge?"}));
+    for command in ["captain.reply", "captain.dismiss"] {
+        let out = machine.as_agent(&apps, "apps", command, json!({"id": open["id"], "body": "x"}));
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains("operator command"), "{}", stderr(&out));
+    }
+
+    // The human CLI takes a prefix too.
+    let open_id = open["id"].as_str().unwrap();
+    let out = machine.ok(&web, &["dismiss", &open_id[..8], "not", "needed"]);
+    assert!(out.contains("Dismissed") && out.contains(open_id), "{out}");
+    let request = machine.json(&apps, "mail.show", json!({"id": open_id}));
+    assert_eq!(request["end_reason"], "not needed", "{request}");
+    let again = send(&apps, json!({"from":"apps","to":"captain","kind":"request","body":"Tag it?"}));
+    let again_id = again["id"].as_str().unwrap();
+    let out = machine.ok(&web, &["reply", &again_id[..8], "Yes"]);
+    assert!(out.contains("Sent reply to apps"), "{out}");
+    let request = machine.json(&apps, "mail.show", json!({"id": again_id}));
+    assert_eq!(request["state"], "answered", "{request}");
+}
