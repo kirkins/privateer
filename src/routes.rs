@@ -89,19 +89,29 @@ pub fn route_of(manifest: &str, options: &Value) -> Option<String> {
 }
 
 /// The same route, read back from a harness job's argv
-/// (`native_launch.py HARNESS BINARY … --provider P --model M …`).
+/// (`native_launch.py [PREFIX…] HARNESS BINARY … --provider P --model M …`).
+/// Prefixes are the launcher's own flags: `--control JSON` on every Claude
+/// launch, `--tool-bundles PLAN`, `--attended-policy JSON`, `--opencode-yolo`.
+/// OpenCode V2 appends `#effort` to the model, which is not part of the route.
 pub(crate) fn route_of_argv(command: &Value) -> Option<String> {
     let args: Vec<&str> = command
         .as_array()?
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    let at = args.iter().position(|a| a.ends_with("native_launch.py"))?;
-    let harness = args.get(at + 1)?;
+    let mut at = args.iter().position(|a| a.ends_with("native_launch.py"))? + 1;
+    while let Some(arg) = args.get(at) {
+        at += match *arg {
+            "--control" | "--tool-bundles" | "--attended-policy" => 2,
+            "--opencode-yolo" => 1,
+            _ => break,
+        };
+    }
+    let harness = args.get(at)?;
     let flag = |names: &[&str]| {
         args.windows(2)
             .find(|w| names.contains(&w[0]))
-            .map(|w| w[1])
+            .map(|w| w[1].split('#').next().unwrap_or(w[1]))
             .unwrap_or("-")
     };
     Some(format!(
@@ -607,6 +617,36 @@ mod tests {
 
     fn error_log(message: &str) -> String {
         serde_json::to_string(&json!({"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":message}})).unwrap()
+    }
+
+    #[test]
+    fn a_launch_argv_reads_back_its_route_past_the_launcher_prefixes() {
+        let argv = |items: &[&str]| json!(items);
+        let claude = argv(&[
+            "python3",
+            "/p/native_launch.py",
+            "--tool-bundles",
+            "{}",
+            "--control",
+            "{\"x\":1}",
+            "claude",
+            "/bin/claude",
+            "--model",
+            "haiku",
+        ]);
+        assert_eq!(route_of_argv(&claude).as_deref(), Some("claude/-/haiku"));
+        let yolo = argv(&[
+            "python3",
+            "/p/native_launch.py",
+            "--opencode-yolo",
+            "opencode",
+            "/bin/opencode",
+            "--provider",
+            "acme",
+            "--model",
+            "fast#high",
+        ]);
+        assert_eq!(route_of_argv(&yolo).as_deref(), Some("opencode/acme/fast"));
     }
 
     #[test]

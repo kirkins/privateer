@@ -60,12 +60,15 @@ impl Fleet {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-    /// Wait until a job has stopped, so a retry of it is allowed.
+    /// Wait until a job has stopped unsuccessfully, the only kind a retry takes.
     fn stopped(&self, job: &str) {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let status = self.json(None, "job.status", json!({"id":job}));
-            if !matches!(status["status"].as_str(), Some("starting" | "running")) {
+            if matches!(
+                status["status"].as_str(),
+                Some("failed" | "cancelled" | "timed_out")
+            ) {
                 return;
             }
             assert!(
@@ -565,4 +568,85 @@ fn a_retried_crew_waits_for_its_backed_off_route_and_a_fresh_crew_takes_the_firs
         json!({"task_id":"fix","id":"crew-third"}),
     );
     assert_eq!(f.model(&fresh), "model-new", "{fresh}");
+}
+
+fn claude(model: &str) -> Value {
+    json!({"manifest":"bundled:claude","options":{"model":model},"cost":"plan"})
+}
+
+/// A Claude crew's replay keeps the route its launch recorded, whose argv has
+/// launcher prefixes ahead of the harness. A replay is refused while that route
+/// backs off, and once the captain no longer lists it.
+#[test]
+fn a_retried_claude_crew_keeps_its_route_and_obeys_the_captain_lists() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/claude"), "#!/bin/sh\nexit 1\n").unwrap();
+    f.routes(json!({
+        "routes": {"haiku": claude("haiku"), "sonnet": claude("sonnet")},
+        "crew": ["haiku", "sonnet"]
+    }));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"claude-first"}),
+    );
+    f.stopped("claude-first");
+    f.json(
+        None,
+        "job.retry",
+        json!({"id":"claude-first","new_id":"claude-kept"}),
+    );
+    let kept = f.json(None, "job.status", json!({"id":"claude-kept"}));
+    assert_eq!(kept["model_route"], json!("claude/-/haiku"), "{kept}");
+    f.stopped("claude-kept");
+    f.routes(json!({
+        "routes": {"haiku": claude("haiku"), "sonnet": claude("sonnet")},
+        "crew": ["sonnet"]
+    }));
+    let unlisted = f.refused(
+        None,
+        "job.retry",
+        json!({"id":"claude-first","new_id":"claude-unlisted"}),
+    );
+    assert!(unlisted.contains("no longer one of"), "{unlisted}");
+    assert!(unlisted.contains("start a fresh crew"), "{unlisted}");
+    f.routes(json!({
+        "routes": {"haiku": claude("haiku"), "sonnet": claude("sonnet")},
+        "crew": ["haiku", "sonnet"]
+    }));
+    f.back_off("claude/-/haiku");
+    let backing_off = f.refused(
+        None,
+        "job.retry",
+        json!({"id":"claude-first","new_id":"claude-late"}),
+    );
+    assert!(backing_off.contains("backing off"), "{backing_off}");
+}
+
+/// A ship's own crew list replaces the fleet's, and the bearings and routes.show
+/// say which list each kind takes.
+#[test]
+fn a_ships_own_crew_list_overrides_the_fleet_list_and_says_so() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"cheap": codex("model-cheap", "free"), "steady": codex("model-steady", "credits")},
+        "crew": ["steady"],
+        "errand": ["steady"],
+        "ships": {"engineering": {"crew": ["cheap"]}}
+    }));
+    let crew = f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert_eq!(f.model(&crew), "model-cheap");
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("crew: cheap (free) (ship's own list)"),
+        "{bearings}"
+    );
+    assert!(
+        text.contains("errand: steady (credits) (fleet list)"),
+        "{bearings}"
+    );
+    let shown = f.json(None, "routes.show", json!({}));
+    assert_eq!(shown["applied"]["engineering"]["crew"], json!("ship"));
+    assert_eq!(shown["applied"]["engineering"]["errand"], json!("fleet"));
 }
