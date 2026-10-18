@@ -1713,7 +1713,12 @@ fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
     until("idle recovery native process", || {
         place.root.join("pi-env").exists()
     });
-    assert_eq!(place.launch_state().0, 0);
+    // The wrapper records the start once its spawn returns, which can be just
+    // after the native process has written pi-env; until then the launch's own
+    // pending count (the native failure's 1, plus this attempt) stands.
+    until("idle recovery recorded as started", || {
+        place.launch_state().0 == 0
+    });
     assert_eq!(place.wakes(), 1); // only the real mail fallback; idle uses no prompt
     assert_eq!(place.tick()["skipped"], "its live first mate has the mail");
     place.stop_native("infra");
