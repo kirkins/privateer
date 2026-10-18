@@ -620,7 +620,9 @@ fn open_park(store: &Store, job: &Value, child: &str, next: &str, state: &str) -
         (parks as u64) < max_parks,
         "crew {root} has parked {parks} times; the cap is {max_parks}"
     );
-    let park_id = format!("park-{crew}-{}", parks + 1);
+    // Named for the lineage root, not the crew job, which after a resume is
+    // itself a resume id: naming it by `crew` would nest one level per park.
+    let park_id = format!("park-{root}-{}", parks + 1);
     tx.execute(
         "INSERT INTO crew_parks(id, root, crew_job_id, child_job_id, task_id, ship, state,
            next, harness, session, attempt, created_ms, updated_ms)

@@ -33,6 +33,20 @@ ROOT='{root}'
 BIN='{bin}'
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
 MODE=$(cat "$ROOT/mode" 2>/dev/null)
+if [ "$MODE" = chain ]; then
+  # Every launch parks on its own child, up to six launches; the seventh (the
+  # sixth resume) finishes its turn.
+  N=$(wc -l < "$ROOT/launches.log" | tr -d ' ')
+  printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
+  if [ "$N" -gt 6 ]; then
+    printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"{session}"}}\n'
+    exit 0
+  fi
+  "$BIN" job.start --json "{{\"id\":\"child-$N\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"sleep 3; echo built\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
+  "$BIN" crew.park --json "{{\"job_id\":\"child-$N\",\"next\":\"check the build output\"}}" >>"$ROOT/steps.log" 2>&1 || exit 4
+  sleep 60
+  exit 0
+fi
 case "$PRIVATEER_JOB" in
   crew-resume-*)
     printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
@@ -1030,4 +1044,58 @@ fn a_resumed_crew_gets_a_fresh_budget_for_its_run() {
         "the resumed crew ended before a fresh budget: {:?}",
         resumed.elapsed()
     );
+}
+
+/// A crew that parks and resumes six times, the cap, keeps every job id and
+/// park id short and unique across its chain: a resume is named for the root
+/// crew, not for the resume before it. The sixth resume launches and finishes.
+#[test]
+fn a_crew_that_parks_six_times_keeps_its_ids_short_and_unique() {
+    let f = Fleet::new();
+    f.set_mode("chain");
+    start_crew(&f, "crew-chain");
+    let until = Instant::now() + std::time::Duration::from_secs(120);
+    while f.launches().len() < 7 {
+        assert!(
+            Instant::now() < until,
+            "only {} launches: {:?}\nsteps: {}",
+            f.launches().len(),
+            f.launches(),
+            f.steps()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let conn =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, crew_job_id, resumed_job_id FROM crew_parks
+             WHERE root='crew-chain' ORDER BY created_ms",
+        )
+        .unwrap();
+    let rows: Vec<(String, String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows.len(), 6, "{rows:?}");
+    let last = rows.last().unwrap().2.clone().expect("the sixth resume");
+    assert_eq!(f.wait(&last, &["succeeded"])["status"], "succeeded");
+    // Each resume is both one park's `resumed_job_id` and the next park's
+    // crew, so the jobs are the root crew and every resume, each once.
+    let parks: Vec<String> = rows.iter().map(|(park, _, _)| park.clone()).collect();
+    let mut jobs = vec![rows[0].1.clone()];
+    jobs.extend(rows.iter().filter_map(|(_, _, resumed)| resumed.clone()));
+    assert_eq!(jobs.len(), 7, "{jobs:?}");
+    for id in parks.iter().chain(&jobs) {
+        assert!(id.len() <= 120, "job or park id over the limit: {id}");
+    }
+    let unique: std::collections::HashSet<&String> = parks.iter().chain(&jobs).collect();
+    assert_eq!(
+        unique.len(),
+        parks.len() + jobs.len(),
+        "ids repeat: {jobs:?} {parks:?}"
+    );
+    assert_eq!(rows[0].0, "park-crew-chain-1", "{rows:?}");
+    assert_eq!(last, "crew-resume-park-crew-chain-6-1", "{rows:?}");
 }
