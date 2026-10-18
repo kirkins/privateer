@@ -1,6 +1,6 @@
 # Design: `fleet.snapshot`, one JSON of the fleet across machines
 
-Status: design only, for review. Task `privateer-fleet-snapshot` (data side of issue 94, for quarterdeck's fleet map, its PR 7). Read with [cross-machine fleet](cross-machine-fleet.md) (links, the gateway), [runtime needs](../runtime-needs.md) and [architecture](../architecture.md#linked-machines). Names marked **new** do not exist yet; every other name was checked in the tree at b95363b.
+Status: revised after the design review (round 2); implementation follows this note. Task `privateer-fleet-snapshot` (data side of issue 94, for quarterdeck's fleet map, its PR 7). Read with [cross-machine fleet](cross-machine-fleet.md) (links, the gateway), [runtime needs](../runtime-needs.md) and [architecture](../architecture.md#linked-machines). Names marked **new** do not exist yet; every other name was checked in the tree at b95363b.
 
 ## Problem
 
@@ -13,7 +13,7 @@ The captain's portal wants one live picture: every machine, every ship on it, wh
 
 ## Model
 
-`fleet.snapshot {since_ms?}` (**new**), operator-only, read-only. It is built from what the runtime already reads for bearings, `runtime.needs` and `ship.profile`; it adds one derived field per job (`doing`), one per ship (`presence`), and one cache table for change times and last-known state.
+`fleet.snapshot {since?}` (**new**), operator-only, read-only. It is built from what the runtime already reads for bearings, `runtime.needs` and `ship.profile`; it adds one derived field per job (`doing`), one per ship (`presence`), and one cache table for change times and last-known state.
 
 The answering machine reads its own homes (`crate::captain::fleet`, as `captain.feed` and `ship.profile` do), then asks each machine it reaches for that machine's own section over the gateway, and merges.
 
@@ -25,7 +25,7 @@ The answering machine reads its own homes (`crate::captain::fleet`, as `captain.
   "generated_ms": 1792330000000,
   "machine": "laptop",
   "machines": [{
-    "name": "laptop", "link": "here", "reachable": true, "error": null,
+    "name": "laptop", "link": "here", "reachable": true, "error": null, "via": "direct",
     "as_of_ms": 1792330000000, "changed_ms": 1792329950000, "unchanged": false,
     "desk": true, "stowed": false, "truncated": false, "unknown": [],
     "routes": [{
@@ -36,7 +36,7 @@ The answering machine reads its own homes (`crate::captain::fleet`, as `captain.
     }]
   }],
   "ships": [{
-    "name": "privateer", "machine": "laptop", "as_of_ms": 1792330000000,
+    "name": "privateer", "machine": "laptop",
     "liaison": false, "harness": "claude", "hosted": true,
     "presence": "asleep", "presence_since_ms": 1792328000000,
     "unread": 2, "open_requests": 1,
@@ -46,7 +46,7 @@ The answering machine reads its own homes (`crate::captain::fleet`, as `captain.
     "jobs": [{
       "id": "crew-…", "task_id": "privateer-fleet-snapshot", "task_title": "fleet.snapshot …",
       "kind": "crew", "state": "running", "heavy": false,
-      "created_ms": 1792323864223, "started_ms": 1792323864900,
+      "created_ms": 1792323864223, "spawned_ms": 1792323864900, "started_ms": 1792323864900,
       "model_route": "claude/anthropic/claude-opus-5-5",
       "doing": {"text": "design note drafted; mapping tests", "at_ms": 1792329000000,
                 "report_id": "crew-…-…"},
@@ -59,17 +59,20 @@ The answering machine reads its own homes (`crate::captain::fleet`, as `captain.
     "source": "mail", "source_id": "95173931…", "mail_id": "95173931…", "mail_kind": "request",
     "kind": "decision", "task_id": "…", "urgency": "normal", "deadline_ms": null,
     "asked_ms": 1792240000000, "question": "…", "choices": [], "version": "…",
-    "actions": ["mail.send"]
+    "as_of_ms": null, "actions": ["mail.send"]
   }]
 }
 ```
 
 Arrays are in name order (machines, ships, routes), jobs newest first, needs as `runtime.needs` orders them. Every time is an absolute `_ms`; the snapshot carries no durations (no `age_ms`, `waited_ms`, `observed_ms`), so it is identical while nothing changes and the portal derives ages from `generated_ms`.
 
+**Rule: no value inside a machine's section is computed from the current time.** The only way the passage of time changes a section is a state crossing an instant already stored in a record: a presence lease expiring, a route backoff or cap ending, an allowance window renewing. Those are real changes. Durations, "for N minutes" text and read times stay out of the section (`behind[].unhealthy` is a boolean, ships carry no `as_of_ms`; the machine row's `as_of_ms` is outside the hashed part). A test moves time forward across a quiet interval and checks the digest and `changed_ms` do not move.
+
 ### machines[]
 
 - `link`: `here` (the answering machine), `reaches` (this machine linked it and can call its gateway, registry role `collects`), `reached_by` (it linked this one; role `collected`; a link is one-way, so nothing here can ask it).
-- `reachable`: this call read the section live, from this machine or its gateway. `as_of_ms` is when the section shown was read: `generated_ms` when live, the cached read's time when not.
+- `reachable`: the section shown was read live by this call or within the reuse window below. `as_of_ms` is when the section shown was read, always set: `generated_ms` for this machine, the remote's own `generated_ms` for a reached one (live, reused or cached).
+- `via`: where the section came from: `direct` (read here, or asked over the gateway in this call), `reused` (a gateway read younger than `REUSE_MS`, 5 s, not asked again), `collect` (carried on the reaching machine's `fleet.collect`, see below), `cache` (the last section stored, the machine not answering), or `directory` (never read; ships from the directory only).
 - `error`: why a machine this one reaches did not answer (timeout, refusal, a gateway too old to serve `fleet.snapshot`), bounded to 500 chars.
 - `desk`: whether the captain's desk is on that machine (`crate::machines` `desk`, `holds_desk`).
 - `stowed`: from `crate::stow::state` (`active` non-empty); null when the ledger cannot be read, never false.
@@ -91,15 +94,15 @@ Routes are a machine's: the captain's route file (`crate::crew_routes::load`) an
 
 One per active fleet member on its machine (`crate::fleet::members`), in its own home.
 
-- `presence` (answer to question 2), one of:
+- `presence` (answer to question 2), one of (none of them is the `attended` boolean `crate::presence::presence` returns, which is true for hosted sessions too):
   - `hosted`: a Herdr-hosted pane holds the presence lease (holder starts with `crate::presence::HOSTED`) and its harness runs.
   - `asleep`: that pane holds the lease with its harness stopped (`crate::host::sleep::sleep` or `asleep_at_start`).
-  - `attended`: a live session that is not hosted holds the lease (the captain's own terminal, an attended adapter).
+  - `session`: a live session that is not hosted holds the lease (the captain's own terminal, an attended adapter).
   - `absent`: no live lease; mail starts a headless turn (`wakes`).
   - `unavailable`: the home could not be read within its budget; the ship has no other live fields.
   - `unknown`: the machine was not reached and nothing was ever cached for it (ships listed from the directory only).
 
-  Asleep is not readable today: `sleep` moves the lease to a fresh `host:` holder, the same shape as an awake hosted session, and records `host.slept` only as an audit event. A column `presence.asleep_since_ms` (**new**) is set in the same transaction as the holder change in `sleep` and in `asleep_at_start`, and cleared when the pane takes the harness back (where `woke` is called). `presence_since_ms` is that time, or the lease's `started_ms`.
+  Asleep is not readable today: `sleep` moves the lease to a fresh `host:` holder, the same shape as an awake hosted session, and records `host.slept` only as an audit event. Two columns (**new**) tie it to the holder: `presence.asleep_holder` and `presence.asleep_since_ms`, written with the holder change in `sleep` and by `asleep_at_start` for the holder it starts asleep. A ship is asleep only while `asleep_holder` equals the live `holder`, so any holder change (`attend` by a new session, `adopt`, `leave`, expiry) ends it without anyone clearing it; the pane clears both when it takes the harness back (where `woke` is called), since that keeps the same holder. `presence_since_ms` is `asleep_since_ms` when asleep, otherwise the lease's `started_ms`.
 - `hosted`: configured for a hosted pane (`crate::host::hosted` on the first-mate record), independent of presence, as `ship.profile` reports it.
 - `unread`, `open_requests`: the counts the dashboard reads (`ShipState.unread`, `ShipState.requests`).
 - `open_tasks`: tasks owned by the ship with status `open`, `running` or `blocked`, newest rowid first, at most 20; `open_tasks_total` is the full count.
@@ -107,56 +110,64 @@ One per active fleet member on its machine (`crate::fleet::members`), in its own
 
 ### jobs[]
 
-- `kind`: `first_mate` (a wake's job, `wakes.job_id`), `crew` (`action` spawn with `agent_actor` set), or `command`.
+- `kind`: `first_mate` (a wake's job, `wakes.job_id`), `errand` (the job of an `errands` row), `crew` (`action` spawn with `agent_actor` set), or `command`.
 - `heavy`, `created_ms`, `model_route` from the job record. No argv, cwd, environment or log is returned.
-- `started_ms`: when the job began holding host capacity, the reservation's `created_ms` (`crate::jobs::capacity_holders`, `Holder.started_ms`); null while queued, and for light work, which takes no reservation. The record has no spawn time in ms (see open question 3).
+- `spawned_ms` (**new** job field, question 3): set by the supervisor in the same `alter` that records the payload and moves the job to `running`. Null while queued or starting, and for jobs recorded before the upgrade.
+- `started_ms`: when the job began holding host capacity, the reservation's `created_ms` (`Holder.started_ms`); null while queued, and for light work, which takes no reservation.
 - `doing` (the "doing now" line): the job's most recent `crew.report` of kind `progress`. Reports are mail from `crew` with id `crew-<job>-<incarnation>-<suffix>` and `payload.job_id`, so the read is a range on the unique `mail.id` index (`id >= 'crew-<job>-' AND id < 'crew-<job>.'`) filtered on `payload.job_id` and `payload.report = 'progress'`, newest `seq` first, `LIMIT 1`. `text` is the report body after the runtime's lead line ("Crew job … reports progress:"), first line, at most 200 chars. A parked crew's `doing` is its park's `next` line (`crew_parks.next`) with `at_ms` the park's `updated_ms`. Null when the crew never reported.
 - `wait`: null unless the job waits:
-  - `queued`: `{"for": "capacity" | "disk", "since_ms": created_ms, "behind": [{"job_id", "ship", "unhealthy"}]}` from `crate::jobs::capacity_waits` (the bearings source), `disk` by the same evidence rule `runtime.needs` uses (`reason` names "disk available").
+  - `queued`: `{"for": "capacity" | "disk", "since_ms": created_ms, "behind": [{"job_id", "ship", "unhealthy": bool}]}`. The holders are read **once per machine** (not once per ship as `capacity_waits` does), through a `capacity_holders` variant with a 100 ms busy timeout; a ledger busy past that leaves `behind` empty and names `"ledger"` in `unknown`. `unhealthy` is a boolean: the holder's text says "for N minutes" and would move the digest. `disk` by the same evidence rule `runtime.needs` uses (`reason` names "disk available").
   - `parked`: `{"for": "job", "job_id": <child>, "park": "park N of 6"}` from `crew_parks`.
 
 ### needs[]
 
 Each home's typed `runtime.needs` items (`crate::needs::query`, operator, its own budget), with `machine` added and `observed_ms`, `waited_ms` dropped.
 
-- **Question 1, each need its machine:** `machine` is the machine of the asking ship's home. A request from a ship on another machine is held twice when the captain's desk collected it: the original in the ship's home there, a desk copy in the captain's home here. The merge keeps one item per `mail_id`, the original's (the ship's own machine), so the map pins it to the ship that asked.
+**Transactions do not nest.** `needs::query` opens its own deferred transaction and installs its own progress handler and busy timeout on the home's connection. The snapshot therefore reads each home in two steps on the same connection: `needs::query` first, which finishes and restores the connection, then the snapshot's own deferred read transaction under its own budget. The two reads are separate views of the home; a change between them shows in the next call.
+
+- **Question 1, each need its machine:** `machine` is the machine of the asking ship, from the asking ship's directory entry (`sender`: a ship hosted here is this machine; a ship in `machine_ships` is that machine), not the machine of the home holding the copy. A desk copy of a request from a machine never read or cached is still pinned to the right machine. A sender in no directory keeps the holding machine. A request is held twice when the captain's desk collected it: the original in the ship's home there, a desk copy in the captain's home here. The merge keeps one item per `mail_id`, preferring a live read of the asking machine.
+- **Answered needs are not shown from elsewhere.** A remote, reused, carried or cached need whose `mail_id` has a copy in any home here that is no longer `open` is dropped: the captain answered it here and the other machine has not heard yet.
+- **Cached needs** (from a `cache` or `collect` section) carry that section's `as_of_ms` and `actions: []`: the portal shows them, but must not offer to answer from a read that may be stale. Live needs carry `as_of_ms: null` and `runtime.needs`' own actions.
 - **Question 5, each need its mail_id:** every need sourced from mail (`source: "mail"`, kinds `decision` and `approval`) carries `mail_id`, `mail_kind`, `urgency`, `deadline_ms` and `asked_ms` (the merged fields). Blockers (`source` `job`, `schedule`, `workspace`) are not mail and carry `mail_id: null`; they are named by `source` and `source_id` (a job id or task id).
 
 ### changed_ms (question 3)
 
 `changed_ms` for a machine is **the `generated_ms` of the first snapshot that machine computed whose section had its current content**. The section is the machine's own row without `reachable`, `error`, `as_of_ms`, `changed_ms`, `unchanged`, plus its ships and its needs. Each machine computes it about itself, so every caller reads the same value:
 
-- The section is serialized in its stable order and hashed (`crate::core::hash`). A registry table `fleet_snapshots` (**new**) keeps, per machine, `digest`, `changed_ms`, `as_of_ms` and `body`. If the digest differs from the stored one, `changed_ms = generated_ms`; otherwise it is kept. One upsert, in one write transaction on the registry.
+- The section is serialized in its stable order and hashed (`crate::core::hash`). A registry table `fleet_snapshots` (**new**) keeps, per machine, `digest`, `changed_ms`, `as_of_ms`, `via` and `body`.
+- **Monotone, compare-and-set.** The row is read and written in one write transaction (`BEGIN IMMEDIATE`). If `generated_ms` is not newer than the stored `as_of_ms`, a concurrent call already wrote a later read: nothing is written and the stored row is returned. Otherwise, if the digest differs, `changed_ms = max(generated_ms, stored changed_ms + 1)`, so it never goes back or repeats even when the clock steps back; if it is equal, `changed_ms` is kept. Only `as_of_ms`, `digest`, `changed_ms`, `via` and `body` move.
 - A route's backoff ending changes its `state`, so time alone can change the digest; that is a real change.
 - Changes are seen only when someone calls: two changes between calls read as one, and a change undone before the next call reads as none. `changed_ms <= as_of_ms` always. The first call after upgrade sets `changed_ms` to its own time.
 
-### since_ms
+### since
 
-Accepted from the first round, because the digest makes it free. A machine whose `changed_ms <= since_ms` is returned as its row with `"unchanged": true` and none of its routes, ships or needs; the portal keeps what it had. `since_ms` is passed through the gateway, so an unchanged remote section does not cross the link either. No deltas within a section.
+A per-machine token, not a time: `since` is an object `{"<machine>": <changed_ms as last returned>}`. A machine whose `changed_ms` **equals** its entry is returned as its row with `"unchanged": true` and none of its routes, ships or needs; the portal keeps what it had. Any other value, a machine missing from `since`, or a machine new to the portal returns the full section. Equality, never `<=`: each machine's `changed_ms` is on that machine's own clock, and a remote clock behind the portal's, or a step back, would otherwise hide a real change until the next one. The machine's entry is passed through the gateway as `since: {"<it>": n}`, so an unchanged remote section does not cross the link either. No deltas within a section.
 
 ### Linked machines over the gateway
 
 - `serve_request` (`src/machines.rs`) gains a `"fleet.snapshot"` arm. Every gateway command but delivery already requires the operator (`caller.require_operator`), and `call` already sends as `Caller::Operator`: the linking operator's SSH access is the authority, as for `fleet.link` and `stow.*`. No new write power: the arm reads homes and writes only the answering machine's own `fleet_snapshots` row about itself.
 - A gateway answers **only its own section** (`machines` holding one `here` entry, its ships, its needs). It never asks its own links, so there is no recursion and no A→B→A loop.
 - The answering machine calls each `reaches` machine with a per-machine timeout `SNAPSHOT_TIMEOUT` (**new**, 10 s, as `STOW_TIMEOUT`), one thread per machine (`std::thread::scope`), so the whole call waits at most one timeout beyond the local read, however many machines are down.
+- **Polling cost.** Each gateway call is one SSH connection. A stored gateway read younger than `REUSE_MS` (**new**, 5 s) is reused instead of asked again, labelled `via: "reused"` with its own `as_of_ms`; a portal polling every second opens at most one connection per machine per 5 s. Quarterdeck should state its poll interval in its PR.
 - A reply is stored in this registry's `fleet_snapshots` row for that machine (`body`, `as_of_ms`, the remote's `changed_ms`) and merged with `reachable: true`. The remote's own `link: "here"` is rewritten to `reaches`.
 
 ### Unreachable machines (question 4)
 
-- A `reaches` machine that does not answer keeps its last-known section from `fleet_snapshots`: its ships and needs as last read, `reachable: false`, `error`, `as_of_ms` the time of that read, and its stored `changed_ms`. Each of its ships also carries `as_of_ms`.
+- A `reaches` machine that does not answer keeps its last-known section from `fleet_snapshots`: its ships and needs as last read, `reachable: false`, `error`, `as_of_ms` the time of that read, and its stored `changed_ms`. The machine row's `as_of_ms` dates every ship and need in it; ships carry none of their own.
 - Never reached since upgrade: its ships come from the cached directory (`crate::machines::remote_ships`, the dashboard's source) with `presence: "unknown"` and no live fields; `as_of_ms` is the directory's `refreshed_ms`.
-- A `reached_by` machine is never asked (links are one-way). Round 1 lists it with `reachable: false`, `error: "links one way; ask from <name>"` and its directory ships as above. Round 2 (open question 1) carries its section to this machine with each `fleet.collect` it makes, as stows ride along today.
+- A `reached_by` machine is never asked (links are one-way). It carries its own section to this machine on the `fleet.collect` call it already makes each contact (`CONTACT_MS`, 30 s), as stows ride along today: the collecting machine reads its local section (the same reader, its own `fleet_snapshots` row updated), and sends it as `snapshot` in the `fleet.collect` arguments when it is at most `CARRY_BYTES` (**new**, 256 KiB, inside the call's request bound); larger, it sends `{"truncated": true, "as_of_ms", "changed_ms"}` without ships. The reached machine stores it in its `fleet_snapshots` row for that machine with `via: "collect"` and the sender's `as_of_ms`, rewriting `link` to `reached_by`. It is shown `reachable: true` while younger than `2 * CONTACT_MS`, otherwise `reachable: false` with its `as_of_ms`; its needs are cached needs (above). A machine that has never sent one is listed with `reachable: false`, `error: "links one way; nothing carried from <name> yet"` and its directory ships. A peer too old to carry it sends no field, read as nothing new.
+- **Freshest wins.** When a machine has both a direct (or reused) read and a carried one (two machines linked both ways), the one with the larger `as_of_ms` is shown. The stored row is replaced only by a newer `as_of_ms` (the compare-and-set above).
 - Bounds: one row per linked machine, `body` at most 768 KiB (under the machine peer's 1 MiB `max_response_bytes` default), deleted with the link in `machine.remove`. A row whose body fails to parse is dropped and the machine reads as never reached.
 
 ### Cost per call
 
 Bounded per home, per machine and in wall time; no unbounded scan:
 
-- **Homes:** every active member on the machine, each read in one deferred read transaction under an observation budget like `runtime.needs`' (`ObservationBudget`, made `pub(crate)`): 25 ms busy wait, 250 ms of statement work. A home over budget is `presence: "unavailable"` and is named in `unknown`; it does not fail the call. The machine's whole local read stops at 3 s (**new** `LOCAL_BUDGET_MS`); homes not reached by then are listed `unavailable`.
+- **Homes:** every active member on the machine, each read in one deferred read transaction under an observation budget like `runtime.needs`' (`ObservationBudget`, made `pub(crate)`): 25 ms busy wait, 250 ms of statement work, after that home's `runtime.needs` read under its own budget (so up to about 500 ms per home in the worst case). A home over budget is `presence: "unavailable"` and is named in `unknown`; it does not fail the call. The machine's whole local read stops at 3 s (**new** `LOCAL_BUDGET_MS`); homes not reached by then are listed `unavailable`. **Known limit:** homes are read in name order, so on a slow machine the same last homes are the ones always cut off; a later round may rotate the start. They are named in `unknown`, never shown as empty.
 - **Jobs:** live jobs are found by status. The `jobs` table has no status column or index, and `job.list` reads every record; a partial expression index `jobs_live` (**new**) on `json_extract(record,'$.status')` for non-terminal statuses makes that a seek. At most 20 jobs per ship are expanded; each `doing` read is one index range with `LIMIT 1`.
 - **Tasks:** `SELECT … FROM tasks WHERE owner=? AND status IN ('open','running','blocked') LIMIT 21` and a `COUNT`. The table has only its primary key; an index `tasks_owner` (**new**) on `(owner, status)`.
 - **Needs:** `runtime.needs` with `limit` 40 per home; more is `truncated`.
-- **Ledger:** one read-only open of the host ledger per machine for `capacity_holders`, `capacity_waits` and the route rows; process identity checks are bounded by the number of reservations.
+- **Ledger:** one read-only open of the host ledger per machine with a 100 ms busy timeout, for the holders and the route rows, read once and shared by every home; process identity checks are bounded by the number of reservations. Never `capacity_waits` per ship (it reopens the ledger with a 5 s busy timeout each time).
 - **Totals:** at most 200 ships per machine (`ROW_LIMIT`, as the dashboard caps), 768 KiB per machine section; past either, `truncated` and open tasks are dropped first, then jobs past 5 per ship.
 
 ### Secrets
@@ -168,7 +179,9 @@ No value from configuration, environment, argv, credentials or logs is read into
 - `src/fleet.rs` (or a new `src/snapshot.rs`): `fleet.snapshot` command, the local section reader, the merge, the digest and `fleet_snapshots` upsert; added to `OPERATOR_COMMANDS` in `src/lib.rs`.
 - `src/machines.rs`: the `"fleet.snapshot"` gateway arm; parallel calls with `SNAPSHOT_TIMEOUT`; `fleet_snapshots` created in `init` and its row deleted in `remove`.
 - `src/crew_routes.rs`: `states` factored out of `summary`; `summary` calls it.
-- `src/presence.rs`, `src/host/sleep.rs`: `asleep_since_ms` column, set and cleared; a `presence::state` (**new**) returning the presence value.
+- `src/presence.rs`, `src/host/sleep.rs`: `asleep_holder` and `asleep_since_ms` columns, set in `sleep` and `asleep_at_start`, cleared on wake; a `presence::state` (**new**) returning the presence value.
+- `src/jobs.rs`: `spawned_ms` on the job record, set with `running`; a `capacity_holders` variant taking a busy timeout.
+- `src/machines.rs` `collect` and the `fleet.collect` arm: the carried `snapshot`.
 - `src/needs.rs`: `ObservationBudget` `pub(crate)`; no change to `runtime.needs` output.
 - `src/jobs.rs`: `jobs_live` index; a `live_jobs(store, ship, limit)` (**new**) reader returning the job fields above.
 - `src/store.rs`: `tasks_owner` index.
@@ -184,7 +197,7 @@ Isolated homes and registries (HOME, PRIVATEER_FLEET, PRIVATEER_RESOURCE_HOME), 
 2. A heavy job queued behind another: `state: "queued"`, `wait.for: "capacity"` naming the holder; a parked crew shows its `next` and child.
 3. Presence: a hosted lease reads `hosted`; after `sleep` it reads `asleep` with `presence_since_ms`; after waking `hosted` again; no lease reads `absent`.
 4. A captain request is a need with `mail_id`, `machine` and `asked_ms`; a capacity blocker has `mail_id: null` and `source_id`.
-5. `changed_ms` holds across two calls with nothing changed, moves on a new task, and survives a restart of the reading process; `since_ms` at that time returns the machine `unchanged` with no ships.
+5. `changed_ms` holds across two calls with nothing changed, even as time passes (a lib test builds the section at `now` and `now + 1 h`; the integration test waits across a second), moves on a new task, and survives a restart of the reading process; `since: {"<machine>": changed_ms}` returns the machine `unchanged` with no ships, and any other value returns it full. A stored `changed_ms` ahead of the clock still moves forward (`+1`) on a change.
 6. A route backed off in the ledger reads `backing_off` with `until_ms`, a capped one `capped`; bearings and the snapshot agree on both.
 7. The canary secret appears nowhere; an agent caller is refused.
 8. A home whose database is locked past the budget reads `unavailable` and is in `unknown`, and the others are complete.
@@ -193,17 +206,17 @@ Isolated homes and registries (HOME, PRIVATEER_FLEET, PRIVATEER_RESOURCE_HOME), 
 
 9. Laptop links mac; the snapshot on laptop lists both machines, mac's ships with live jobs and needs, `link: "reaches"`, `reachable: true`; one gateway connection per call.
 10. A request from a mac ship collected to the laptop desk is one need with `machine: "mac"`.
-11. Mac unreachable (`remote_ssh_with` an answer that fails, or one that sleeps past the timeout): mac keeps its last-known ships with `reachable: false`, `as_of_ms` of the earlier call, the same `changed_ms`, and the call returns within the timeout plus the local budget.
-12. On mac, the snapshot lists the laptop as `reached_by`, `reachable: false`, directory ships `unknown`, and opens no connection.
-13. A gateway that does not know `fleet.snapshot` (an older binary, faked by `remote_ssh_with`) reads as unreachable with that error, not as an empty machine.
-14. `machine remove` drops the cached row.
+11. A second call within `REUSE_MS` opens no new connection and shows mac `via: "reused"` with the first call's `as_of_ms`.
+12. Mac unreachable (`remote_ssh_with` an answer that fails, or one that sleeps past the timeout): mac keeps its last-known ships with `reachable: false`, `via: "cache"`, `as_of_ms` of the earlier call, the same `changed_ms`, its needs with `as_of_ms` and no actions, a need the desk here already answered is gone, and the call returns within the timeout plus the local budget.
+13. On mac, before any collect, the snapshot lists the laptop as `reached_by`, `reachable: false`, directory ships `unknown`, and opens no connection. After the laptop's dispatcher pass (`fleet.collect`), mac lists the laptop's ships and live jobs with `via: "collect"`.
+14. A gateway that does not know `fleet.snapshot` (an older binary, faked by `remote_ssh_with`) reads as unreachable with that error, not as an empty machine.
+15. `machine remove` drops the cached row.
 
 Tests prove behaviour through commands and durable state, not snapshots of layout.
 
-## Open questions
+## Decisions (round 2)
 
-1. **State of a machine that reaches this one.** Round 1 lists it as not reachable with directory ships only. Proposal for round 2: each `fleet.collect` carries the collector's section when its digest changed since it last sent one, at most once a minute, stored in the same `fleet_snapshots` row; it arrives within `CONTACT_MS` and adds no connection. Confirm, or accept directory-only for `reached_by` machines.
-2. **`asleep_since_ms`.** Asleep is not readable from presence today. Adding the column is the smallest fix; deriving it from a missing fresh `work_sessions` row is cheaper but cannot tell a sleeping pane from one still starting. Confirm the column.
-3. **Job start time.** `started_ms` is the capacity reservation's time, so light jobs have none. Should the supervisor record `spawned_ms` on the job when the payload spawns? It is one field, but a job record change.
-4. **`changed_ms` resolution.** It is only as fine as the calls. If the portal needs a change time without polling (a push or a long poll), that is a different command (a `fleet.watch`); out of scope here.
-5. **Which machine answers for the portal.** Quarterdeck should call the machine that reaches the others (the one with `reaches` links), usually the captain's desk. If the desk is on a `reached_by` machine, the map is partial until question 1 is done.
+1. **Machines that reach this one, and which machine answers for the portal** (questions 1 and 5, a first-mate decision): the captain's desk is on the server, which the laptop reaches, so the server's portal must see the laptop's live state now. Each reaching machine carries its own section on the `fleet.collect` exchange it already makes (bounded, with its `as_of_ms`), and the server's `fleet.snapshot` shows the freshest of that and any direct read. No new connection, no captain decision.
+2. **`asleep_since_ms`:** the column, tied to the holder (`asleep_holder`), as above.
+3. **Job start time:** `spawned_ms` is recorded on the job when the payload spawns.
+4. **`changed_ms` resolution:** a push or long-poll command (`fleet.watch`) is out of scope.
