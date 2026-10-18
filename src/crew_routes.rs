@@ -1037,7 +1037,8 @@ mod tests {
         usage(&id("open"), NOW - HOUR, Some(NOW + 3 * HOUR), None);
         // Daily `fresh` was last used before its last reset, a day ago: idle.
         usage(&id("fresh"), NOW - 22 * HOUR, None, None);
-        let read = |now: i64| -> Vec<(Option<String>, State, Option<i64>, Option<String>)> {
+        type Read = Vec<(Option<String>, State, Option<i64>, Option<String>)>;
+        let read = |now: i64| -> Read {
             states(&policy, &ledger, now)
                 .unwrap()
                 .into_iter()
