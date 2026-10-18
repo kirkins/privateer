@@ -72,13 +72,15 @@ runtime turns them into one captain **decision** from the task's owner (see
   captain answers or the policy covers the rules (`replace: true` starts a crew that
   works another way). A scheduled task waits on the decision. The crew's outcome is
   a low notice, so the first mate is not woken to ask again. A first mate's own
-  denial pauses its ship's automatic wakes, as before. An errand's denial asks but
-  holds nothing.
+  denial pauses its ship's automatic wakes, as before; a low notice such as another
+  ship's "still blocked?" does not lift that pause. An errand's denial asks but
+  holds nothing, and its failed verdict is a low notice naming the decision.
 - A policy change ends the decisions it covers (`yolo`, or every rule allowed); an
   unrelated change keeps them open.
 - Mail to the captain about an open decision (citing `about`, correlated to the
   blocked ship's notice, or the same denial on another ship) is added to it rather
-  than shown again, and gets the captain's answer.
+  than shown again, and gets the captain's answer. If the decision ends without an
+  answer (withdrawn, or its task closed), what was added to it ends with it.
 - A hosted or attended first mate, whose harness result the runtime cannot read,
   reports a denial with `permissions.blocked {"task_id","tool","input"}`.
 

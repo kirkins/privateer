@@ -207,10 +207,16 @@ class Door:
         if payload.get("attached_to") and kind != "reply":
             self.attach(mail, payload)
             return ""
-        if (kind == "notice" and isinstance(payload.get("request_end"), dict)
-                and mail.get("correlation") in tg.read_state(CARDS, {})):
-            self.resolve(mail["correlation"], payload["request_end"].get("reason") or "closed")
-            return ""
+        if kind == "notice" and isinstance(payload.get("request_end"), dict):
+            cards = tg.read_state(CARDS, {})
+            ended = mail.get("correlation")
+            if ended in cards:
+                if not cards[ended].get("resolved"):
+                    self.resolve(ended, payload["request_end"].get("reason") or "closed")
+                return ""
+            # An item added to a card ends with it; its card already says so.
+            if any(ended in (card.get("members") or []) for card in cards.values()):
+                return ""
         # Only a decision message carries a typed card; other mail may use the
         # same payload key for its own data.
         decision = (mail.get("payload") or {}).get("decision") if kind == "decision" else None
@@ -273,7 +279,7 @@ class Door:
         cards = tg.read_state(CARDS, {})
         cards.pop(mail_id, None)
         cards[mail_id] = {"message_id": message_id, "text": text, "markup": markup,
-                          "also": [], "blocked": []}
+                          "also": [], "blocked": [], "members": []}
         while len(cards) > CARD_LIMIT:
             cards.pop(next(iter(cards)))
         tg.write_state(CARDS, cards)
@@ -284,6 +290,8 @@ class Door:
         text = card["text"]
         if card.get("blocked"):
             text += "\n\n<b>Also blocked:</b> " + "; ".join(tg.escape_html(b) for b in card["blocked"])
+            if card.get("markup"):
+                text += "\nYour answer applies to every blocked task."
         if card.get("also"):
             text += "\n<b>Also:</b> " + ", ".join(tg.escape_html(a) for a in card["also"])
         text += extra
@@ -296,11 +304,12 @@ class Door:
     def attach(self, mail: dict, payload: dict) -> None:
         cards = tg.read_state(CARDS, {})
         card = cards.get(payload["attached_to"])
-        if not card:
+        if not card or card.get("resolved"):
             # Its card was shown before this door kept cards: /waiting counts it.
             tg.log(f"{mail.get('id')} joins {payload['attached_to']}, whose card is not known here")
             return
         sender = mail.get("from") or "a ship"
+        card.setdefault("members", []).append(mail.get("id"))
         if payload.get("type") == "tool_permission":
             card["also"].append(f"{sender} (same denial)")
             card["blocked"].extend(f"{sender} {item}" for item in
@@ -313,9 +322,12 @@ class Door:
         tg.write_state(CARDS, cards)
 
     def resolve(self, mail_id: str, reason: str) -> None:
+        # The card is kept, marked resolved, so the closures of the items
+        # added to it are recognised and send nothing.
         cards = tg.read_state(CARDS, {})
-        card = cards.pop(mail_id)
+        card = cards[mail_id]
         card["markup"] = None
+        card["resolved"] = reason
         err = self.edit_card(card, f"\n\n<b>Resolved:</b> {tg.escape_html(reason)}")
         if err:
             tg.log(f"could not mark the card for {mail_id} resolved: {err}")

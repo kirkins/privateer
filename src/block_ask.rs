@@ -194,16 +194,18 @@ pub(crate) fn mask(text: &str) -> String {
         let trimmed = word.trim_end();
         let tail = &word[trimmed.len()..];
         let lowered = trimmed.to_ascii_lowercase();
-        let masked = if hide_next && !trimmed.is_empty() {
-            hide_next = false;
-            MASK.to_owned()
-        } else if matches!(
+        let keyword = matches!(
             lowered.trim_matches(|c: char| !c.is_ascii_alphabetic()),
             "bearer" | "token" | "basic" | "authorization"
-        ) || lowered.ends_with("authorization:")
-        {
+        ) || lowered.ends_with("authorization:");
+        // In `Authorization: Bearer <token>` the scheme is shown and the
+        // token after it hidden.
+        let masked = if keyword {
             hide_next = true;
             trimmed.to_owned()
+        } else if hide_next && !trimmed.is_empty() {
+            hide_next = false;
+            MASK.to_owned()
         } else if let Some((name, _)) = trimmed.split_once('=')
             && sensitive_name(name)
         {
@@ -222,20 +224,50 @@ pub(crate) fn mask(text: &str) -> String {
     out.concat()
 }
 
+/// A tool input with every value under a sensitive key hidden and the other
+/// strings masked, for tools whose preview is their input as JSON.
+fn mask_json(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    let shown = if sensitive_name(key) && !value.is_object() {
+                        json!(MASK)
+                    } else {
+                        mask_json(value)
+                    };
+                    (key.clone(), shown)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(mask_json).collect()),
+        Value::String(text) => json!(mask(text)),
+        other => other.clone(),
+    }
+}
+
 /// A short, masked preview of a denied tool use, at most 160 characters.
 pub(crate) fn preview(tool: &str, input: &Value) -> String {
     let raw = match tool {
-        "Bash" => input["command"].as_str().map(str::to_owned),
-        "Edit" | "Write" | "Read" => input["file_path"].as_str().map(str::to_owned),
-        "WebFetch" => input["url"].as_str().map(str::to_owned),
+        "Bash" => input["command"].as_str(),
+        "Edit" | "Write" | "Read" => input["file_path"].as_str(),
+        "NotebookEdit" => input["notebook_path"].as_str(),
+        "WebFetch" => input["url"].as_str(),
         _ => None,
-    }
-    .unwrap_or_else(|| input.to_string());
-    let flat: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let masked = mask(&flat);
+    };
+    let masked = match raw {
+        Some(raw) => mask(
+            &raw.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>(),
+        ),
+        None => mask_json(input)
+            .to_string()
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect(),
+    };
     if masked.chars().count() <= PREVIEW_CHARS {
         masked
     } else {
@@ -634,6 +666,7 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
         |r| r.get(0),
     )?;
     if !any {
+        end_orphans(store)?;
         return Ok(vec![]);
     }
     let policy = crate::permissions::for_store(store)?;
@@ -677,7 +710,40 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
     for id in &ended {
         crate::mail::end_attachments(store, id, POLICY_CHANGED)?;
     }
+    end_orphans(store)?;
     Ok(ended)
+}
+
+/// End the items in this home still attached to an ask that ended without
+/// an answer (a task closed, a withdrawal elsewhere). An answered ask's
+/// items are answered by its fan-out, so they are left to it.
+fn end_orphans(store: &Store) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut statement = store.connection().prepare(
+            "SELECT id, json_extract(payload,'$.attached_to') FROM mail WHERE recipient='captain'
+             AND state='open' AND kind IN ('request','decision') AND COALESCE(delivery,'') <> 'received'
+             AND json_extract(payload,'$.attached_to') IS NOT NULL",
+        )?;
+        statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut primaries = std::collections::BTreeSet::new();
+    for (_, primary) in rows {
+        if let Some(ask) = find_ask(store, &primary)?
+            && !matches!(ask["state"].as_str(), Some("open" | "answered"))
+            && primaries.insert(primary.clone())
+        {
+            let reason = ask["end_reason"]
+                .as_str()
+                .filter(|r| !r.is_empty())
+                .or(ask["state"].as_str())
+                .unwrap_or("closed")
+                .to_owned();
+            crate::mail::end_attachments(store, &primary, &reason)?;
+        }
+    }
+    Ok(())
 }
 
 /// Sweep every fleet home on this machine after a policy change.
@@ -728,6 +794,27 @@ pub(crate) fn pausing_ask(store: &Store, ship: &str) -> Result<Option<(i64, Opti
         }
     }
     Ok(None)
+}
+
+/// The open block ask an ended job raised or re-hit: the ask its own denial
+/// line names, by the job or by the task it worked on.
+pub(crate) fn ask_for_job(store: &Store, job_id: &str, log: &Path) -> Result<Option<Value>> {
+    if logged_denials(log).is_empty() {
+        return Ok(None);
+    }
+    let task: Option<(String, String)> = store
+        .connection()
+        .query_row(
+            "SELECT t.owner, t.id FROM jobs j JOIN tasks t
+               ON t.id = json_extract(j.record,'$.task_id') WHERE j.id=?1",
+            [job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match task {
+        Some((ship, task)) => open_for_task(store, &ship, &task),
+        None => Ok(None),
+    }
 }
 
 /// Bearings lines for a ship's open block asks.
@@ -1154,6 +1241,21 @@ mod tests {
         assert!(!shown.contains("abc"), "{shown}");
         assert!(shown.starts_with("curl -H"), "{shown}");
         assert!(shown.contains("API_KEY=•••"), "{shown}");
+        let short = preview(
+            "Bash",
+            &json!({"command": "curl -H 'Authorization: Bearer abc12' x.io"}),
+        );
+        assert_eq!(short, "curl -H 'Authorization: Bearer ••• x.io");
+        let tool = preview(
+            "mcp__apify__run",
+            &json!({"actor": "x", "apiKey": "short1", "headers": {"cookie": "c=1"}}),
+        );
+        assert!(!tool.contains("short1") && !tool.contains("c=1"), "{tool}");
+        assert!(tool.contains(r#""actor":"x""#), "{tool}");
+        assert_eq!(
+            preview("NotebookEdit", &json!({"notebook_path": "/w/a.ipynb"})),
+            "/w/a.ipynb"
+        );
         let long = preview("Bash", &json!({"command": "echo ".repeat(100)}));
         assert_eq!(long.chars().count(), PREVIEW_CHARS);
         assert!(long.ends_with('…'));

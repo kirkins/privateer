@@ -231,12 +231,14 @@ pub(crate) fn paused(store: &Store, owner: &str) -> Result<bool> {
     };
     // Stop retries of already-observed blocked work, not fresh incoming mail.
     // A failed wake covers that new mail too, so it earns one attempt only.
+    // A low notice ("still blocked?", a requester's note) wakes nobody, so it
+    // is not fresh either.
     let through: i64 = store.connection().query_row(
         "SELECT COALESCE(MAX(through_seq),0) FROM wakes WHERE ship=?1",
         [owner],
         |r| r.get(0),
     )?;
-    let fresh: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2 AND (sender<>'crew' OR task_id IS NOT ?3))",rusqlite::params![owner,question.max(through),task],|r|r.get(0))?;
+    let fresh: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2 AND (sender<>'crew' OR task_id IS NOT ?3) AND (kind<>'notice' OR urgency<>'low'))",rusqlite::params![owner,question.max(through),task],|r|r.get(0))?;
     Ok(!fresh)
 }
 

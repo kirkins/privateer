@@ -289,6 +289,17 @@ fn a_first_mates_own_denial_is_one_decision_and_pauses_automatic_retries() {
     let before = f.jobs("liaison");
     f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
     assert_eq!(f.jobs("liaison"), before);
+    // Another ship asking whether it is still blocked is not fresh input.
+    f.init("storefront", "claude");
+    let nudge = f.json("storefront","mail.send",json!({"from":"storefront","to":"liaison","kind":"notice","about":asks[0]["id"],"body":"still blocked?"}));
+    assert_eq!(nudge["urgency"], "low", "{nudge}");
+    f.json("storefront", "mail.flush", json!({}));
+    f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
+    assert_eq!(
+        f.jobs("liaison"),
+        before,
+        "a still-blocked notice woke the ship"
+    );
     // A blocked outcome must not freeze fresh captain input. It earns one
     // new attempt, then pauses again rather than repeatedly spending inference.
     f.json("liaison","mail.send",json!({"id":"new-input","from":"captain","to":"liaison","kind":"request","body":"fresh guidance"}));
@@ -494,6 +505,17 @@ fn an_errand_denial_asks_without_parking_the_task() {
     let asks = f.asks("liaison");
     assert_eq!(asks.len(), 1);
     assert_eq!(asks[0]["payload"]["block"]["scope"], "errand");
+    // Its failed verdict names the ask and waits for the captain's answer.
+    f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
+    let verdict = f.json("liaison", "mail.inbox", json!({"address":"liaison"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["payload"]["errand"] == id.as_str())
+        .cloned()
+        .expect("the errand's verdict");
+    assert_eq!(verdict["urgency"], "low", "{verdict}");
+    assert_eq!(verdict["payload"]["about"], asks[0]["id"], "{verdict}");
     // The main task is not held: a crew still starts, and its own denial of
     // the same tool parks the task on the same ask.
     assert_eq!(f.crew("liaison", "crew-one", json!({}))["status"], "failed");

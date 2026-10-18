@@ -431,6 +431,17 @@ fn withdraw(store: &Store, args: &Value) -> Result<Value> {
         )?;
     }
     tx.commit()?;
+    // Items added to a withdrawn block ask end with it.
+    if request["payload"]["type"] == "tool_permission" && request["to"] == CAPTAIN {
+        let why = if reason.is_empty() {
+            "withdrawn"
+        } else {
+            reason
+        };
+        if let Err(error) = end_attachments(store, id, why) {
+            eprintln!("privateer: could not end the items added to {id}: {error:#}");
+        }
+    }
     // Bounded and retryable, like mail.send. Task closure only enqueues.
     // Preserve FIFO and retry delays even when this request is retried.
     let peer = ship(store, request["to"].as_str().context("request recipient")?)?
