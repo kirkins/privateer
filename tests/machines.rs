@@ -3144,3 +3144,189 @@ fn a_captain_reply_from_a_ship_the_desk_does_not_know_is_held_then_refused() {
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert_eq!(notices[0]["payload"]["refused"]["id"], asked["id"]);
 }
+
+/// The captain's requests in a state, as the desk's home lists them.
+fn captain_requests(machine: &Machine, ship: &str, state: &str) -> Vec<Value> {
+    machine.ok(
+        ship,
+        "mail.requests",
+        json!({"address": "captain", "state": state, "limit": 100}),
+    )["requests"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// A request asked on the laptop with the desk on the Mac, answered on the
+/// laptop: the desk's copy closes in one pass, and a repeat pass sends nothing.
+#[test]
+fn a_captain_request_answered_on_the_linked_machine_closes_the_desk_copy() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
+    assert_eq!(captain_requests(&mac, "fitforge", "open").len(), 1);
+
+    laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+    let closed = captain_requests(&mac, "fitforge", "answered");
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["id"], asked["id"]);
+
+    // Offered once: a repeated pass sends no closure again.
+    collect_now(&laptop);
+    let again = laptop.pass("liaison", &ssh);
+    assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
+}
+
+/// A request withdrawn on the laptop leaves the desk's copy with the same
+/// end reason, so the desk's waiting drops it.
+#[test]
+fn a_captain_request_withdrawn_on_the_linked_machine_closes_the_desk_copy() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Merge PR 9?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+
+    laptop.ok(
+        "scout",
+        "mail.withdraw",
+        json!({"id": asked["id"], "reason": "PR 9 closed"}),
+    );
+    collect_now(&laptop);
+    laptop.pass("liaison", &ssh);
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+    let closed = captain_requests(&mac, "fitforge", "withdrawn");
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["end_reason"], "PR 9 closed");
+}
+
+/// An answer given at the desk closes the laptop's original, and that closure
+/// goes back to the desk once: the desk's copy stays as it was answered there.
+#[test]
+fn a_captain_answer_given_at_the_desk_closes_the_original_without_looping() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Ship build 12?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+
+    let answered = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Ship it"}),
+    );
+    assert!(collect(&laptop, &ssh).contains("\"delivered\": 1"));
+    let request = laptop.ok("scout", "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(request["state"], "answered", "{request}");
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+    let closed = captain_requests(&mac, "fitforge", "answered");
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["answered_by"], answered["id"]);
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+    collect_now(&laptop);
+    let again = laptop.pass("liaison", &ssh);
+    assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
+}
+
+/// A typed approval granted or denied on the linked machine closes the desk's
+/// copy of its request, as the answer it is: the desk's waiting drops both.
+#[test]
+fn an_approval_outcome_on_the_linked_machine_closes_the_desk_copy() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    laptop.ok(
+        "scout",
+        "task.create",
+        json!({"id": "release", "charter_id": "scout", "owner": "scout", "title": "Release"}),
+    );
+    let granted = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "request_kind": "production_approval",
+               "task_id": "release", "body": "Release build A?",
+               "payload": {"artifact": "sha256:granted", "environment": "production"}}),
+    );
+    let denied = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "request_kind": "production_approval",
+               "task_id": "release", "body": "Release build B?",
+               "payload": {"artifact": "sha256:denied", "environment": "production"}}),
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 2, "{pass}");
+    assert_eq!(captain_requests(&mac, "fitforge", "open").len(), 2);
+
+    for (request, artifact, outcome) in [
+        (&granted, "sha256:granted", "approval.grant"),
+        (&denied, "sha256:denied", "approval.deny"),
+    ] {
+        let version = laptop.ok("scout", "mail.show", json!({"id": request["id"]}))["payload"]
+            ["charter_hash"]
+            .clone();
+        laptop.ok(
+            "scout",
+            outcome,
+            json!({"id": format!("grant-{artifact}"), "task_id": "release", "artifact": artifact,
+                   "environment": "production", "approver": "captain",
+                   "request_id": request["id"], "expected_version": version}),
+        );
+    }
+    assert_eq!(captain_requests(&mac, "fitforge", "open").len(), 2);
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 2, "{pass}");
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+    let approved = captain_requests(&mac, "fitforge", "approved");
+    assert_eq!(approved.len(), 1, "{approved:?}");
+    assert_eq!(approved[0]["id"], granted["id"]);
+    assert_eq!(approved[0]["end_reason"], "approved");
+    let refused = captain_requests(&mac, "fitforge", "denied");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["id"], denied["id"]);
+    assert_eq!(refused[0]["end_reason"], "denied");
+}

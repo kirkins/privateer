@@ -80,6 +80,8 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            scope TEXT NOT NULL, PRIMARY KEY(machine, name));
          CREATE TABLE IF NOT EXISTS collect_waits(machine TEXT NOT NULL, id TEXT NOT NULL,
            passes INTEGER NOT NULL, PRIMARY KEY(machine, id));
+         CREATE TABLE IF NOT EXISTS machine_closures_unsupported(machine TEXT PRIMARY KEY,
+           refreshed_ms INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS machine_owner(only INTEGER PRIMARY KEY CHECK(only=1),
            ship TEXT NOT NULL, set_ms INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS captain_desk(only INTEGER PRIMARY KEY CHECK(only=1),
@@ -1578,13 +1580,27 @@ fn push_captain(
             messages.push(envelope);
         }
     }
-    if messages.is_empty() {
-        return Ok(json!({"machine": machine.name, "captain_pushed": 0}));
+    let mut pushed = 0;
+    if !messages.is_empty() {
+        pushed = push_messages(conn, machine, &peer, known_as, &messages, timeout)?;
     }
+    let closed = push_closures(conn, machine, &peer, known_as, timeout)?;
+    Ok(json!({"machine": machine.name, "captain_pushed": pushed, "captain_closed": closed}))
+}
+
+/// Send captain messages to the desk and record what it took or refused.
+fn push_messages(
+    conn: &Connection,
+    machine: &Machine,
+    peer: &str,
+    known_as: &str,
+    messages: &[Value],
+    timeout: Duration,
+) -> Result<usize> {
     let result = call(
         machine,
         "fleet.captain",
-        json!({"machine": known_as, "messages": &messages}),
+        json!({"machine": known_as, "messages": messages}),
         Some(timeout),
     )?;
     let mut taken: Vec<(String, Option<String>)> = result["delivered"]
@@ -1613,10 +1629,112 @@ fn push_captain(
     }
     for member in crate::fleet::members(conn)? {
         if member.home.is_dir() {
-            crate::mail::collected_captain(&Store::open(&member.home)?, &peer, &taken)?;
+            crate::mail::collected_captain(&Store::open(&member.home)?, peer, &taken)?;
         }
     }
-    Ok(json!({"machine": machine.name, "captain_pushed": taken.len()}))
+    Ok(taken.len())
+}
+
+/// Tell the desk which captain requests this machine's ships asked and were
+/// answered, withdrawn or ended here, so its copies close too. Each closure
+/// goes once, after its request has reached the desk.
+fn push_closures(
+    conn: &Connection,
+    machine: &Machine,
+    peer: &str,
+    known_as: &str,
+    timeout: Duration,
+) -> Result<usize> {
+    // Read the refresh epoch fresh: an exchange earlier in this pass may have moved it.
+    let epoch = self::machine(conn, &machine.name)?
+        .refreshed_ms
+        .unwrap_or(0);
+    let gap: Option<i64> = conn
+        .query_row(
+            "SELECT refreshed_ms FROM machine_closures_unsupported WHERE machine=?1",
+            [&machine.name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if gap == Some(epoch) {
+        return Ok(0);
+    }
+    let mut closures = vec![];
+    for member in crate::fleet::members(conn)? {
+        if !member.home.is_dir() || closures.len() >= COLLECT_LIMIT {
+            continue;
+        }
+        let store = Store::open(&member.home)?;
+        let room = COLLECT_LIMIT - closures.len();
+        closures.extend(crate::mail::closed_captain(&store, peer, room)?);
+    }
+    if closures.is_empty() {
+        return Ok(0);
+    }
+    let result = call(
+        machine,
+        "fleet.captain",
+        json!({"machine": known_as, "messages": [], "closures": &closures}),
+        Some(timeout),
+    )?;
+    let Some(reported) = result.get("closed").and_then(Value::as_array) else {
+        // A desk that predates closures answers without a closed list: none
+        // goes to it until its link refreshes, when it may have been updated.
+        conn.execute(
+            "INSERT INTO machine_closures_unsupported(machine, refreshed_ms) VALUES(?1, ?2)
+             ON CONFLICT(machine) DO UPDATE SET refreshed_ms=excluded.refreshed_ms",
+            params![machine.name, epoch],
+        )?;
+        for member in crate::fleet::members(conn)? {
+            if member.home.is_dir() {
+                Store::open(&member.home)?.audit(
+                    "machine.closures_unsupported",
+                    &json!({"machine": machine.name, "count": closures.len()}),
+                )?;
+            }
+        }
+        return Ok(0);
+    };
+    let closed: Vec<String> = reported
+        .iter()
+        .filter_map(|id| Some(id.as_str()?.to_owned()))
+        .collect();
+    // A closure the desk refused is permanently unusable, so it is not sent again.
+    let refused: Vec<Value> = result["closures_refused"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let refused_ids: Vec<String> = refused
+        .iter()
+        .filter_map(|r| Some(r["id"].as_str()?.to_owned()))
+        .collect();
+    let offered: Vec<String> = closed.iter().chain(&refused_ids).cloned().collect();
+    for member in crate::fleet::members(conn)? {
+        if member.home.is_dir() {
+            let store = Store::open(&member.home)?;
+            crate::mail::collected_closed(&store, peer, &offered)?;
+            for refusal in &refused {
+                store.audit(
+                    "machine.closure_refused",
+                    &json!({"machine": machine.name, "closure": refusal}),
+                )?;
+            }
+        }
+    }
+    Ok(closed.len())
+}
+
+/// End the desk's copies of one closure in every home that holds them.
+fn apply_closure(conn: &Connection, peer: &str, closure: &Value) -> Result<()> {
+    required(closure, "id")?;
+    for member in crate::fleet::members(conn)? {
+        if member.home.is_dir() {
+            crate::mail::close_captain_request(&Store::open(&member.home)?, peer, closure)?;
+        }
+    }
+    Ok(())
 }
 
 /// One dispatcher pass: for each machine this one reaches, refresh the
@@ -1677,8 +1795,11 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             .and_then(|collected| match desk(&conn)? {
                 Some((name, since)) if name == machine.name => {
                     let pushed = push_captain(&conn, &machine, since, timeout)?;
-                    Ok(json!({"machine": machine.name, "delivered": collected["delivered"],
-                        "refused": collected["refused"], "captain_pushed": pushed["captain_pushed"]}))
+                    Ok(
+                        json!({"machine": machine.name, "delivered": collected["delivered"],
+                        "refused": collected["refused"], "captain_pushed": pushed["captain_pushed"],
+                        "captain_closed": pushed["captain_closed"]}),
+                    )
                 }
                 _ => Ok(collected),
             });
@@ -1854,7 +1975,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         }
         // Captain mail from the linking machine, whose captain's desk is here.
         "fleet.captain" => {
-            reaching_here(&conn, required(args, "machine")?)?;
+            let from = reaching_here(&conn, required(args, "machine")?)?;
             let (mut delivered, mut refused) = (vec![], vec![]);
             for envelope in args["messages"].as_array().into_iter().flatten() {
                 let id = required(envelope, "id")?;
@@ -1885,7 +2006,24 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     }
                 }
             }
-            Ok(json!({"delivered": delivered, "refused": refused}))
+            // A closure ends the desk's copy of a request it holds from a ship
+            // of the sending machine; a copy it never held has nothing to end.
+            // One that cannot be applied is reported and skipped, so it cannot
+            // fail the closures after it.
+            let peer = peer_name(&from.name);
+            let mut closed = vec![];
+            let mut closures_refused = vec![];
+            for closure in args["closures"].as_array().into_iter().flatten() {
+                match apply_closure(&conn, &peer, closure) {
+                    Ok(()) => closed.push(closure["id"].clone()),
+                    Err(error) => closures_refused
+                        .push(json!({"id": closure["id"], "error": format!("{error:#}")})),
+                }
+            }
+            Ok(
+                json!({"delivered": delivered, "refused": refused, "closed": closed,
+                "closures_refused": closures_refused}),
+            )
         }
         // A ship the linking machine asked for, in this machine's fleet. Only
         // ship.create crosses this way; managing that ship stays here.
