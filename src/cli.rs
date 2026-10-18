@@ -1729,12 +1729,19 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             );
             let wakes = crate::dispatch(&mut store, "wake.list", json!({"limit": 3}))?;
             for wake in wakes["wakes"].as_array().into_iter().flatten() {
+                let idle = wake["output_idle_ms"]
+                    .as_i64()
+                    .filter(|&ms| ms >= 60_000)
+                    .map(|ms| format!("no output for {}", crate::activation::idle_duration(ms)));
+                let mode = idle
+                    .as_deref()
+                    .unwrap_or(wake["mode"].as_str().unwrap_or(""));
                 println!(
                     "Wake {} for {}: {} ({})",
                     wake["id"].as_str().unwrap_or(""),
                     wake["ship"].as_str().unwrap_or(""),
                     wake["status"].as_str().unwrap_or(""),
-                    wake["mode"].as_str().unwrap_or("")
+                    mode
                 );
             }
         }
@@ -1940,11 +1947,18 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                             .join(", ")
                     })
                     .unwrap_or_default();
+                let idle = wake["output_idle_ms"]
+                    .as_i64()
+                    .filter(|&ms| ms >= 60_000)
+                    .map(|ms| format!("no output for {}", crate::activation::idle_duration(ms)));
+                let mode = idle
+                    .as_deref()
+                    .unwrap_or(wake["mode"].as_str().unwrap_or(""));
                 println!(
                     "{} {} {} {} {}{}",
                     wake["id"].as_str().unwrap_or(""),
                     wake["ship"].as_str().unwrap_or(""),
-                    wake["mode"].as_str().unwrap_or(""),
+                    mode,
                     wake["status"].as_str().unwrap_or(""),
                     wake["focus"].as_str().unwrap_or(""),
                     if usage.is_empty() {
