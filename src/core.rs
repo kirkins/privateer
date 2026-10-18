@@ -281,11 +281,13 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
     }
     store.audit(command, &json!({"id":id,"actor":actor}))?;
     tx.commit()?;
-    // A closed task ends its parked crews quietly, and the heavy jobs they
-    // wait on. This runs after the close commits, since it stops processes.
+    // A closed task ends its parked crews, and the heavy jobs they wait on.
+    // This runs after the close commits, since it stops processes. When the
+    // owner closed it, their cancelled notices are not mailed back to it.
     if let Some(status) = closed {
+        let quiet = store.task(id)?["owner"].as_str() == Some(actor);
         for crew in crate::crew::parked_crews(store, id)? {
-            crate::jobs::end_parked(store, &crew, &format!("task {id} is {status}"))?;
+            crate::jobs::end_parked(store, &crew, &format!("task {id} is {status}"), quiet)?;
         }
     }
     store.task(id)

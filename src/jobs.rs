@@ -141,6 +141,10 @@ struct Job {
     /// native session or start it fresh. Set by the agent path only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launch: Option<Value>,
+    /// Its outcome is not mailed: the one who ended it already knows (a task's
+    /// owner closing the task ends its parked crews and their jobs).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    quiet: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -1941,6 +1945,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         },
         park: None,
         launch: agent.then(|| args.get("launch").cloned()).flatten(),
+        quiet: false,
     };
     let mut reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -3272,13 +3277,20 @@ pub(crate) fn fail_parked(store: &Store, crew: &str, reason: &str) -> Result<()>
     Ok(())
 }
 
-/// End a parked crew as cancelled, with `reason`, and quietly: no notice goes
-/// to its first mate. Nothing runs while parked, so the crew ends here, and so
-/// does the work it waits on. The park closes first, so the child's settlement
-/// does not resume the crew.
-pub(crate) fn end_parked(store: &Store, id: &str, reason: &str) -> Result<Value> {
+/// End a parked or held crew as cancelled, with `reason`. Nothing runs while
+/// parked, so the crew ends here, and so does the work it waits on. The park
+/// closes first, so the child's settlement does not resume the crew. Its first
+/// mate gets the usual cancelled notice for each, unless `quiet`: the task's
+/// owner closed the task, and already knows.
+pub(crate) fn end_parked(store: &Store, id: &str, reason: &str, quiet: bool) -> Result<Value> {
     let parked = load(store, id)?;
     let child = crate::crew::cancel_park(store, parked.park.as_deref().unwrap_or_default())?;
+    if quiet {
+        // Marked before any status change, so no outcome is written for either.
+        for job in std::iter::once(id).chain(child.as_deref()) {
+            alter(store, job, |j| j.quiet = true)?;
+        }
+    }
     if matches!(parked.status.as_str(), "launching" | "running") {
         // Still ending its turn (the park grace): the park is closed, so the
         // payload's exit cannot park it again. It is cancelled as a running crew.
@@ -3328,7 +3340,7 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
         return Ok(public_job(&job));
     }
     if job.status == "parked" {
-        return end_parked(store, id, "cancelled while parked");
+        return end_parked(store, id, "cancelled while parked", false);
     }
     let supervisor_alive = match &job.supervisor {
         Some(p) => same_process(p)?,

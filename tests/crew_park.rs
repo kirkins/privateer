@@ -617,12 +617,13 @@ fn closing_the_task_ends_a_parked_crew_and_its_job_quietly() {
     let crew = f.wait("crew-20", &["cancelled"]);
     assert_eq!(crew["reason"], "task fix is cancelled", "{crew}");
     f.wait("child-1", &["cancelled"]);
+    // The owner closed the task, so neither cancellation is mailed back to it.
     let notices = f.ship_notices();
     assert!(
-        !notices
-            .iter()
-            .any(|b| b.contains("crew-20") && b.to_lowercase().contains("fail")),
-        "a closed task's crew reported a failure: {notices:?}"
+        !notices.iter().any(|b| b.contains("crew-20 cancelled")
+            || b.contains("child-1 cancelled")
+            || b.to_lowercase().contains("fail")),
+        "the owner that closed the task was sent a notice: {notices:?}"
     );
 }
 

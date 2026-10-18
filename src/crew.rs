@@ -103,7 +103,7 @@ pub(crate) fn outcome(store: &Store, job: &Value) -> Result<()> {
     let Some(ship) = owning_ship(store, task_id)? else {
         return Ok(());
     };
-    if parked_on(store, job_id)? {
+    if parked_on(store, job_id)? || job["quiet"] == true {
         return Ok(());
     }
     // A first mate is not told about its own wake: that would wake it again.
@@ -723,7 +723,7 @@ pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
                 "crew.park_cap_spent",
                 &json!({"job_id": crew, "park": park, "reason": reason}),
             )?;
-            crate::jobs::end_parked(store, &crew, &format!("{reason}; the park ends"))?;
+            crate::jobs::end_parked(store, &crew, &format!("{reason}; the park ends"), false)?;
         }
     }
     // A stowed fleet starts nothing, so parks wait for `stow resume`.
