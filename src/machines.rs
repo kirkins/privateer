@@ -36,7 +36,8 @@
 //! `privateer machine captain NAME` moves the desk to a machine this one
 //! reaches, such as an always-on server while this one sleeps: each pass then
 //! pushes this machine's captain mail into the captain's home there instead,
-//! and leaves the other machine's captain mail where it is. The captain's
+//! along with any still-open requests and decisions written earlier, and
+//! leaves the other machine's captain mail where it is. The captain's
 //! answers come back as ordinary collected mail.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
@@ -480,7 +481,9 @@ pub(crate) fn known_as_by_peer(peer: &str) -> Option<String> {
 }
 
 /// Keep the captain's mail on a machine this one reaches, or here again.
-/// Captain mail written before the change stays where it is.
+/// Still-open requests and decisions written before the change reach the
+/// desk on the next pass; answered, withdrawn and ended ones and old notices
+/// stay where they are.
 fn set_desk(machine: Option<&str>) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     match machine {
@@ -1803,9 +1806,10 @@ fn forget_wait(conn: &Connection, machine: &Machine, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Hand this machine's captain mail written since the desk moved to the
-/// machine holding it, and record what it took or refused, so nothing is
-/// sent twice and a refusal is not retried.
+/// Hand this machine's captain mail written since the desk moved (along with
+/// any still-open requests and decisions) to the machine holding it, and
+/// record what it took or refused, so nothing is sent twice and a refusal
+/// is not retried.
 fn push_captain(
     conn: &Connection,
     machine: &Machine,

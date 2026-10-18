@@ -3636,6 +3636,79 @@ fn a_captain_request_withdrawn_on_the_linked_machine_closes_the_desk_copy() {
     assert_eq!(closed[0]["end_reason"], "PR 9 closed");
 }
 
+/// An open captain request written before the desk moved to another machine is
+/// pushed to the desk on the next pass; an answered request and a notice from
+/// before the move stay behind. Running `set_desk` again does not strand an open
+/// request, and a second pass sends no duplicates.
+#[test]
+fn open_captain_requests_written_before_the_desk_moved_reach_the_desk() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+
+    // 1. An open request written before the desk moves
+    let open_req = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Merge PR 1?"}),
+    );
+    // 2. An answered request from before the move
+    let answered_req = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Merge PR 2?"}),
+    );
+    laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": answered_req["id"], "body": "Already merged"}),
+    );
+    // 3. A notice from before the move
+    let notice = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "notice", "body": "CI passed"}),
+    );
+
+    // Move the desk to mac
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    // Running set_desk again does not strand the open request
+    let moved_again = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved_again.status.success(), "{}", text(&moved_again));
+
+    // Next pass pushes the open request to the desk; answered request and notice are not pushed
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
+
+    // The open request is on the desk
+    let desk_open = captain_requests(&mac, "fitforge", "open");
+    assert_eq!(desk_open.len(), 1, "{desk_open:?}");
+    assert_eq!(desk_open[0]["id"], open_req["id"]);
+
+    // The answered request and notice from before the move are not on the desk
+    let desk_all = captain_mail(&mac, "fitforge");
+    assert!(
+        desk_all
+            .iter()
+            .all(|m| m["id"] != answered_req["id"] && m["id"] != notice["id"]),
+        "{desk_all:?}"
+    );
+
+    // No duplicate on a second pass
+    collect_now(&laptop);
+    let second_pass = laptop.pass("liaison", &ssh);
+    assert_eq!(
+        second_pass["machines"][0]["captain_pushed"], 0,
+        "{second_pass}"
+    );
+    let desk_open_again = captain_requests(&mac, "fitforge", "open");
+    assert_eq!(desk_open_again.len(), 1, "{desk_open_again:?}");
+}
+
 /// An answer given at the desk closes the laptop's original, and that closure
 /// goes back to the desk once: the desk's copy stays as it was answered there.
 #[test]
