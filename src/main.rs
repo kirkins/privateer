@@ -100,7 +100,7 @@ fn run() -> Result<()> {
     let home = home
         .or_else(|| std::env::var_os("PRIVATEER_HOME").map(PathBuf::from))
         .or_else(privateer::cli::discover_home);
-    let caller = Caller::from_env(role.as_deref(), actor.as_deref());
+    let caller = Caller::from_env_at(home.as_deref(), role.as_deref(), actor.as_deref());
     // Harness hooks must never fail the harness: they exit with the code
     // the harness expects and log their own errors.
     if command.as_deref() == Some("hook") {
