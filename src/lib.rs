@@ -33,6 +33,7 @@ pub mod peers;
 pub mod permissions;
 pub mod plugins;
 pub mod presence;
+mod profile;
 pub mod project;
 pub mod releases;
 mod reply;
@@ -91,6 +92,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "captain.reply",
     "captain.dismiss",
     "captain.feed",
+    "ship.profile",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
@@ -148,6 +150,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "captain" => captain::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
         "ship" if command == "ship.move" => moves::dispatch(store, command, args),
+        "ship" if command == "ship.profile" => {
+            store.caller().require_operator(command)?;
+            profile::profile(&args)
+        }
         "ship"
             if matches!(
                 command,

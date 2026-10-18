@@ -1952,3 +1952,179 @@ fn the_captain_feed_keeps_unrelated_messages_that_share_an_id() {
         "{feed}"
     );
 }
+
+fn put_first_mate(machine: &Machine, folder: &Path, ship: &str, change: impl Fn(&mut Value)) {
+    let mut profile = machine.json(folder, "ship.show", json!({"name":ship}))["first_mate"].take();
+    change(&mut profile);
+    machine.json(
+        folder,
+        "ship.put",
+        json!({"name":ship,"first_mate":profile}),
+    );
+}
+
+#[test]
+fn the_ship_profile_shows_a_hosted_claude_ship_its_routes_and_fleet_permissions() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let sentinel = "sk-PROFILE-SENTINEL-8c21f0aa93";
+    put_first_mate(&machine, &apps, "apps", |profile| {
+        profile["manifest"] = json!("bundled:claude");
+        profile["host"] = json!("herdr");
+        profile["sleep_after_secs"] = json!(600);
+        profile["options"] = json!({"model":"opus","permission_mode":"auto",
+            "api_key":sentinel,"provider":{"auth_token":sentinel,"region":"us"},
+            "credentials":{"github":sentinel}});
+    });
+    let route = |manifest: &str| json!({"manifest":manifest,"cost":"plan"});
+    machine.json(
+        &apps,
+        "routes.set",
+        json!({"routes":{"fast":route("bundled:claude"),"cheap":route("bundled:pi"),
+                "spare":route("bundled:codex")},
+            "crew":["fast","cheap"],"first_mate":["fast"],
+            "ships":{"apps":{"crew":["cheap","spare"]}}}),
+    );
+    machine.json(
+        &apps,
+        "permissions.set",
+        json!({"mode":"yolo","claude_allow":["Bash(cargo test:*)"]}),
+    );
+
+    let profile = machine.json(&web, "ship.profile", json!({"ship":"apps"}));
+    let text = profile.to_string();
+    assert!(!text.contains(sentinel), "{profile}");
+    assert!(!text.contains("PROFILE-SENTINEL"), "{profile}");
+    assert_eq!(profile["ship"], "apps");
+    assert!(profile["machine"].as_str().is_some_and(|m| !m.is_empty()));
+    assert_eq!(profile["hosted"], true);
+    assert_eq!(
+        profile["sleep"],
+        json!({"policy":"after_idle","idle_minutes":10})
+    );
+    assert_eq!(
+        profile["first_mate"],
+        json!({"harness":"claude","options":{"model":"opus","permission_mode":"auto",
+            "api_key":"<set>","provider":{"auth_token":"<set>","region":"us"},
+            "credentials":"<set>"}})
+    );
+    // The ship's own crew list replaces the fleet's; the rest are the fleet's.
+    assert_eq!(
+        profile["routes"],
+        json!({"crew":{"list":"ship","names":["cheap","spare"]},
+            "errand":{"list":"none","names":[]},
+            "first_mate":{"list":"fleet","names":["fast"]}})
+    );
+    assert!(
+        profile["charter"]["actions"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "{profile}"
+    );
+    assert_eq!(
+        profile["permissions"],
+        json!({"fleet_mode":"yolo","fleet_rules":["Bash(cargo test:*)"],"ship_rules":[]})
+    );
+    // Unbounded: the native harness loads its own resources, not listed here.
+    assert_eq!(profile["tool_bundles"]["bounded"], false);
+    assert_eq!(profile["skills"], json!([]));
+    assert_eq!(profile["mcp_servers"], json!([]));
+    assert_eq!(profile["plugins"][0]["name"], "privateer-mail");
+
+    // Another ship takes the fleet's crew list; standard mode, no rules.
+    machine.json(
+        &apps,
+        "permissions.set",
+        json!({"mode":"standard","claude_allow":[]}),
+    );
+    let web_profile = machine.json(&apps, "ship.profile", json!({"ship":"web"}));
+    assert_eq!(
+        web_profile["routes"]["crew"],
+        json!({"list":"fleet","names":["fast","cheap"]})
+    );
+    assert_eq!(
+        web_profile["permissions"],
+        json!({"fleet_mode":"standard","fleet_rules":[],"ship_rules":[]})
+    );
+    assert_eq!(web_profile["hosted"], false);
+    assert_eq!(web_profile["sleep"]["policy"], "not_hosted");
+
+    // Unknown ships are refused by name; agents are refused outright.
+    let unknown = machine.run(&apps, &["ship.profile", "--json", r#"{"ship":"nowhere"}"#]);
+    assert!(!unknown.status.success());
+    assert!(
+        stderr(&unknown).contains("unknown ship nowhere"),
+        "{}",
+        stderr(&unknown)
+    );
+    let agent = machine.as_agent(&apps, "apps", "ship.profile", json!({"ship":"apps"}));
+    assert!(!agent.status.success());
+    assert!(
+        stderr(&agent).contains("ship.profile is an operator command"),
+        "{}",
+        stderr(&agent)
+    );
+}
+
+#[test]
+fn the_ship_profile_lists_selected_skills_and_mcp_servers_with_credential_names_only() {
+    use sha2::{Digest, Sha256};
+    let machine = Machine::new();
+    let docs = machine.ship("docs");
+    let skill = machine.root.join("skills/lookup");
+    fs::create_dir_all(&skill).unwrap();
+    let text = "---\nname: lookup\ndescription: Look things up in the docs index.\n---\nUse it.\n";
+    fs::write(skill.join("SKILL.md"), text).unwrap();
+    let hash = format!("{:x}", Sha256::digest(text));
+    let tree = format!("{:x}", Sha256::digest(format!("SKILL.md\0{hash}\n")));
+    let sentinel = "PROFILE_QUERY_SENTINEL_77";
+    machine.json(
+        &docs,
+        "bundle.configure",
+        json!({"registry":{"schema_version":1,"pi_version":"1.2.0",
+            "integrations":{"reviewed":true,"extensions":[]},
+            "bundles":[{"ref":"docs@1","roles":["first_mate"],
+                "credentials":[{"name":"DOCS_TOKEN","ref":"docs-search"}],
+                "skills":[{"name":"lookup","root":skill,"sha256":tree}],
+                "mcp_servers":[{"name":"docs","url":format!("https://mcp.example.test/api/mcp/s/{sentinel}/mcp?key={sentinel}"),
+                    "credential":"DOCS_TOKEN","timeout":5,"description":"Docs search"}]}]}}),
+    );
+    put_first_mate(&machine, &docs, "docs", |profile| {
+        profile["manifest"] = json!("bundled:pi");
+        profile["options"] = json!({"provider":"acme","model":"m1"});
+        profile["tool_bundles"] = json!(["docs@1"]);
+    });
+
+    let profile = machine.json(&docs, "ship.profile", json!({"ship":"docs"}));
+    assert!(!profile.to_string().contains(sentinel), "{profile}");
+    assert!(!profile.to_string().contains("docs-search"), "{profile}");
+    assert_eq!(
+        profile["tool_bundles"],
+        json!({"bounded":true,"selected":["docs@1"],"error":null})
+    );
+    assert_eq!(
+        profile["skills"],
+        json!([{"name":"lookup","description":"Look things up in the docs index."}])
+    );
+    assert_eq!(
+        profile["mcp_servers"],
+        json!([{"name":"docs","url":"https://mcp.example.test",
+            "description":"Docs search","credentials":["DOCS_TOKEN"]}])
+    );
+    let plugins: Vec<&str> = profile["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        plugins,
+        [
+            "attended/mail.ts",
+            "attended/captain.ts",
+            "attended/calm.ts"
+        ]
+    );
+    assert_eq!(profile["routes"]["crew"], json!({"list":"none","names":[]}));
+}
