@@ -2237,6 +2237,48 @@ fn a_captain_reply_reaches_the_home_that_asked_across_the_link() {
 }
 
 #[test]
+fn the_captain_annotates_a_report_notice_from_the_other_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let reported = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "notice", "body": "Audit done",
+            "payload": {"report": {"title": "Audit", "format": "markdown",
+                "content": "Ship it on Friday."}}}),
+    );
+    let id = reported["id"].as_str().unwrap();
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["delivered"], 1, "{pass}");
+
+    // The captain annotates the collected copy by prefix; the notice crosses
+    // back to the ship's own home, in the report's thread.
+    let annotations = json!([{"anchor": {"quote": "Friday"}, "comment": "Make it Monday."}]);
+    let sent = laptop.ok_over(
+        "liaison",
+        "captain.reply",
+        json!({"id": &id[..8], "payload": {"annotations": annotations}}),
+        &ssh,
+    );
+    assert_eq!(sent["id"], id, "{sent}");
+    assert_eq!(sent["to"], "fitforge");
+    assert_eq!(sent["reply"]["kind"], "notice");
+    let received: Vec<Value> = messages(&mac, "fitforge", "notice")
+        .into_iter()
+        .filter(|m| m["from"] == "captain")
+        .collect();
+    assert_eq!(received.len(), 1, "{received:?}");
+    assert_eq!(received[0]["correlation"], id);
+    assert_eq!(received[0]["payload"]["annotations"], annotations);
+    // Neither copy of the report notice is changed by it.
+    for (machine, ship) in [(&laptop, "liaison"), (&mac, "fitforge")] {
+        let report = machine.ok(ship, "mail.show", json!({"id": id}));
+        assert!(report["state"].is_null(), "{report}");
+    }
+}
+
+#[test]
 fn a_ship_reply_to_a_request_this_machine_never_held_still_reaches_the_captain() {
     let (_temp, laptop, mac, ssh) = fixture();
     let linked = link(&laptop, &mac, &ssh);

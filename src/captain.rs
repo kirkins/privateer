@@ -299,9 +299,13 @@ fn operator(store: &Store) -> Result<()> {
 /// The captain answers an open ask by id, in whichever home asked it. A ship
 /// behind a machine link is answered through that link, as any captain reply
 /// from this home is. A typed decision's answer is checked by `mail.send`.
+///
+/// A notice is not answered, but one that carries a report takes the
+/// captain's annotations: they go back as a notice in its thread, which wakes
+/// the ship and leaves the report notice as it was.
 fn reply(store: &Store, args: &Value) -> Result<Value> {
     operator(store)?;
-    let item = locate(required(args, "id")?, false)?;
+    let item = locate(required(args, "id")?, true)?;
     let mut target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("ask vanished")?;
     ensure!(
@@ -309,8 +313,25 @@ fn reply(store: &Store, args: &Value) -> Result<Value> {
         "{} is a production approval; answer it with approval.grant or approval.deny",
         item.id
     );
+    let kind = if ask["kind"] == "notice" {
+        ensure!(
+            !ask["payload"]["report"].is_null(),
+            "{} is a notice, which takes no reply; only a notice carrying a report takes the captain's annotations",
+            item.id
+        );
+        ensure!(
+            args["payload"]
+                .as_object()
+                .is_some_and(|p| p.len() == 1 && p.contains_key("annotations")),
+            "{} is a report notice; the captain answers it only with payload.annotations",
+            item.id
+        );
+        "notice"
+    } else {
+        "reply"
+    };
     let mut message = json!({"from": crate::mail::CAPTAIN, "to": ask["from"],
-        "kind": "reply", "correlation": item.id});
+        "kind": kind, "correlation": item.id});
     for key in ["body", "payload"] {
         if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
             message[key] = value.clone();
