@@ -1,0 +1,13 @@
+# Captured Claude Code streams
+
+Claude Code 2.1.300 (`claude -p --output-format stream-json --verbose`), captured on
+2026-10-18 in a scratch git repository with no settings changes. Each stream is reduced
+to the fields Privateer reads (init, tool use and results, the final `result`); local
+paths read `/tmp/scratch`, and usage keeps only token counts. Nothing here is a credential.
+
+| file | run | what it shows |
+|---|---|---|
+| `denied-accept-edits.jsonl` | `--permission-mode acceptEdits`, asked to run `curl` | The denial is in `result.permission_denials[]` as `tool_name`, `tool_use_id` and the full `tool_input`. The run still ends `subtype: success`, `is_error: false`. The tool result reads "This command requires approval". |
+| `denied-dont-ask.jsonl` | `--permission-mode dontAsk`, the same request | Same denial shape as `acceptEdits`. |
+| `hooks-dont-ask-denial.jsonl` | the `dontAsk` run with a session-only `--settings` file that logs every hook event | A denial fires `PreToolUse` and nothing after it: no `PostToolUse`, `PostToolUseFailure` or `PermissionDenied`. An attended hook can only infer a denial from a `PreToolUse` with no `PostToolUse`. |
+| `auto-mode-not-refused.jsonl` | `--permission-mode auto`, asked to run `sudo -n rm -rf` on a decoy directory | The auto-mode check allowed it (as it did a force push to a local bare remote). `permission_denials` is empty; the result carries `safety_stops: 0`. No auto-mode refusal was captured, so its shape is still unverified. |
