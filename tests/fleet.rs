@@ -2226,6 +2226,113 @@ fn the_captain_annotates_a_report_in_a_reply_and_the_feed_carries_the_annotation
     assert_eq!(entry["payload"]["annotations"], annotations);
 }
 
+#[test]
+fn the_captain_annotates_a_report_notice_in_another_home_by_prefix() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let secret = "SECRET-COMMENT";
+    let notice = |id: &str, payload: Value| {
+        machine.json(
+            &web,
+            "mail.send",
+            json!({"id":id,"from":"web","to":"captain","kind":"notice","body":"Done",
+                "payload":payload}),
+        )
+    };
+    notice(
+        "report-notice-1",
+        json!({"report":{"title":"Plan","format":"markdown","content":"Ship it on Friday."}}),
+    );
+    notice("plain-notice-1", json!({}));
+    let reply = |args: Value| machine.run(&apps, &["captain.reply", "--json", &args.to_string()]);
+    let annotations = json!([{"anchor":{"quote":"Friday"},"comment":"Make it Monday."}]);
+
+    // A notice takes no reply; one without a report takes no annotations.
+    refused(
+        &reply(json!({"id":"plain-notice-1","body":secret})),
+        "plain-notice-1 is a notice, which takes no reply",
+        secret,
+    );
+    refused(
+        &reply(json!({"id":"plain-notice-1","payload":{"annotations": annotations}})),
+        "only a notice carrying a report takes the captain's annotations",
+        secret,
+    );
+    // A report notice takes annotations only, and they are checked.
+    for args in [
+        json!({"id":"report-notice-1","body":secret}),
+        json!({"id":"report-notice-1","payload":{"annotations":annotations,"answer":secret}}),
+    ] {
+        refused(
+            &reply(args),
+            "report-notice-1 is a report notice; the captain answers it only with payload.annotations",
+            secret,
+        );
+    }
+    refused(
+        &reply(
+            json!({"id":"report-notice-1","payload":{"annotations":[{"anchor":{},"comment":secret}]}}),
+        ),
+        "payload.annotations[0].anchor.quote must be a string",
+        secret,
+    );
+    // The captain's annotations are the operator's: an agent is refused.
+    let out = machine.as_agent(
+        &apps,
+        "apps",
+        "captain.reply",
+        json!({"id":"report-notice-1","payload":{"annotations": annotations}}),
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("captain.reply is an operator command; agents cannot run it"),
+        "{}",
+        stderr(&out)
+    );
+    let inbox = |address: &str| {
+        machine.json(&web, "mail.inbox", json!({"address": address}))["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["from"] == "captain")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(inbox("web").is_empty(), "a refusal writes nothing");
+
+    // From apps' folder, by prefix, the annotations reach web in the thread.
+    let sent = reply(json!({"id":"report-n","payload":{"annotations": annotations}}));
+    assert!(sent.status.success(), "{}", stderr(&sent));
+    let sent: Value = serde_json::from_slice(&sent.stdout).unwrap();
+    assert_eq!(sent["id"], "report-notice-1", "{sent}");
+    assert_eq!(sent["ship"], "web");
+    assert_eq!(sent["reply"]["kind"], "notice");
+    let received = inbox("web");
+    assert_eq!(received.len(), 1, "{received:?}");
+    assert_eq!(received[0]["kind"], "notice");
+    assert_eq!(received[0]["correlation"], "report-notice-1");
+    assert_eq!(received[0]["payload"]["annotations"], annotations);
+    assert_eq!(received[0]["id"], sent["reply"]["id"]);
+    // The report notice is left as it was, and the feed returns it by id.
+    let report = machine.json(&web, "mail.show", json!({"id":"report-notice-1"}));
+    assert!(report["state"].is_null(), "{report}");
+    assert!(report["answered_by"].is_null(), "{report}");
+    let feed = machine.json(&apps, "captain.feed", json!({}));
+    let entries = feed["entries"].as_array().unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e["id"] == "report-notice-1")
+        .expect("the report notice is in the feed");
+    assert_eq!(entry["payload"]["report"]["title"], "Plan");
+    let note = entries
+        .iter()
+        .find(|e| e["id"] == sent["reply"]["id"])
+        .expect("the captain's notice is in the feed");
+    assert_eq!(note["correlation"], "report-notice-1");
+    assert_eq!(note["payload"]["annotations"], annotations);
+}
+
 fn put_first_mate(machine: &Machine, folder: &Path, ship: &str, change: impl Fn(&mut Value)) {
     let mut profile = machine.json(folder, "ship.show", json!({"name":ship}))["first_mate"].take();
     change(&mut profile);
