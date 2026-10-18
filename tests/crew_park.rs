@@ -10,6 +10,8 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, tim
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 const SESSION: &str = "7d1b1f0e-1111-4222-8333-444455556666";
+/// See `Fleet::launch_budget`.
+const LAUNCH_BUDGET_SECS: u64 = 20;
 
 struct Fleet {
     _tmp: tempfile::TempDir,
@@ -24,13 +26,15 @@ impl Fleet {
         fs::create_dir(root.join("engineering")).unwrap();
         let fleet = Self { _tmp: tmp, root };
         // The fake claude. Its mode file picks what the crew does: park on a
-        // child (session, nosession, long), start a child and run out its
-        // budget (deadline), or run out with nothing outstanding (held). A
-        // resumed run is recognised by its job id, and completes its turn.
+        // child (session, nosession, long, gated), start a child and run out
+        // its budget (deadline), or run out with nothing outstanding (held). A
+        // resumed run is recognised by its job id, and completes its turn. A
+        // gated child runs until the test releases it (`release_child`).
         let script = format!(
             r#"#!/bin/sh
 ROOT='{root}'
 BIN='{bin}'
+gate="while [ ! -e $ROOT/release-child ]; do [ -d $ROOT ] || exit 1; sleep 0.1; done; echo built"
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
 MODE=$(cat "$ROOT/mode" 2>/dev/null)
 if [ "$MODE" = chain ]; then
@@ -64,11 +68,12 @@ case "$MODE" in
     "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 6; echo built"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
   deadline)
-    "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 30"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
+    "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
   *)
     child='sleep 2; echo built'
     if [ "$MODE" = slow ] || [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then child='sleep 6; echo built'; fi
+    if [ "$MODE" = gated ]; then child=$gate; fi
     if [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then sleep 5; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
@@ -143,10 +148,18 @@ esac
     /// Give the ship's charter an 8 second job budget, so a crew's budget runs
     /// out while its heavy job still runs.
     fn short_budget(&self) {
+        self.budget(8);
+    }
+    /// A crew budget long enough that a crew launched on a loaded machine
+    /// still starts its child well before its deadline.
+    fn launch_budget(&self) {
+        self.budget(LAUNCH_BUDGET_SECS);
+    }
+    fn budget(&self, secs: u64) {
         self.json(
             None,
             "charter.put",
-            json!({"id": "engineering", "job_timeout_secs": 8}),
+            json!({"id": "engineering", "job_timeout_secs": secs}),
         );
     }
     fn command(&self, agent: Option<&str>, args: &[&str]) -> Command {
@@ -353,13 +366,14 @@ fn cancelling_a_parked_crew_cancels_its_job_and_does_not_resume() {
 }
 
 /// The crew's budget runs out while its heavy job still runs: the crew parks
-/// on that job instead of timing out, and the job's outcome (which ends after
-/// the crew's deadline) resumes it. The first mate hears nothing of the child.
+/// on that job instead of timing out, and the job's outcome (it times out at
+/// its own deadline, after the crew's) resumes it. The first mate hears
+/// nothing of the child.
 #[test]
 fn a_crew_that_runs_out_of_budget_parks_on_its_job_and_resumes() {
     let f = Fleet::new();
     f.set_mode("deadline");
-    f.short_budget();
+    f.launch_budget();
     start_crew(&f, "crew-4");
     // The resume can follow at once, so the park may already be past.
     let parked = f.wait("crew-4", &["parked", "resumed"]);
@@ -834,10 +848,11 @@ fn a_spent_park_cap_at_the_deadline_ends_the_crew_and_its_job() {
 fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
     let f = Fleet::new();
     f.set_mode("deadline");
+    // The child must be running by the crew's deadline for it to be cancelled.
     f.json(
         None,
         "charter.put",
-        json!({"id": "engineering", "job_timeout_secs": 8, "crew_max_parks": 0}),
+        json!({"id": "engineering", "job_timeout_secs": LAUNCH_BUDGET_SECS, "crew_max_parks": 0}),
     );
     start_crew(&f, "crew-26");
     let crew = f.wait("crew-26", &["timed_out"]);
