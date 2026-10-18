@@ -3214,3 +3214,20 @@ fn an_unchanged_hosted_claude_first_mate_relaunches_with_the_same_argv() {
     assert_eq!(argv, launched);
     place.stop_native("infra");
 }
+
+#[test]
+fn fleet_yolo_set_while_a_hosted_first_mate_sleeps_applies_at_its_wake() {
+    let (place, herdr) = hosted_claude_sleeper("claude-opus-5-5", "auto");
+    sleep_hosted(&place, &herdr);
+    // The captain turns on fleet YOLO while the pane sleeps; the wake reads
+    // the fleet policy again rather than the one from the pane's launch.
+    place.ok(&["permissions", "yolo"]);
+    let argv = wake_hosted(&place);
+    let args: Vec<&str> = argv.lines().collect();
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--permission-mode", "bypassPermissions"]),
+        "{argv}"
+    );
+    place.stop_native("infra");
+}

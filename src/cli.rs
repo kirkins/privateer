@@ -977,7 +977,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let home = canonical_home.as_path();
     let ship = crate::presence::folder_ship(&store)
         .context("this folder's ship is unknown; run `privateer init` here")?;
-    let profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
+    let mut profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
     let folder = home.parent().context("ship folder")?;
     let holder = if hosted {
         std::env::var("PRIVATEER_HOSTED_HOLDER")
@@ -1006,7 +1006,6 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     let mut launch = launch_plan(&store, &profile, ours.first().copied(), passthrough, hosted)?;
     let control = crate::executable::installed()?;
     let plugins = fs::canonicalize(plugins_dir()?)?;
-    let policy = serde_json::to_string(&crate::permissions::load()?)?;
     prepare_harness(&launch.harness, &plugins, folder, &control)?;
     // Bounded live starts are fresh: old history can retain facts from
     // resources no longer selected, and --continue cannot name the exact
@@ -1032,6 +1031,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                  holder: &str,
                  continuation: Option<crate::host::Conversation>|
      -> Result<std::process::Command> {
+        // Read at every launch, so fleet YOLO set while a pane sleeps applies
+        // at its wake.
+        let policy = serde_json::to_string(&crate::permissions::load()?)?;
         let mut command = std::process::Command::new("python3");
         command.arg(plugins.join("native_launch.py"));
         if let Some(plan) = &launch.bundle_plan {
@@ -1109,13 +1111,16 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
     // Ships recorded before the setting existed sleep by default too.
-    let sleep_after = if hosted {
-        profile["first_mate"]["sleep_after_secs"]
-            .as_u64()
-            .unwrap_or(crate::host::sleep::DEFAULT_AFTER_SECS)
-    } else {
-        0
+    let sleep_after_for = |profile: &Value| {
+        if hosted {
+            profile["first_mate"]["sleep_after_secs"]
+                .as_u64()
+                .unwrap_or(crate::host::sleep::DEFAULT_AFTER_SECS)
+        } else {
+            0
+        }
     };
+    let mut sleep_after = sleep_after_for(&profile);
     let terminal = crate::host::sleep::Terminal::save();
     let mut holder = holder;
     // A pane an upgrade relaunched while asleep, or catching up while idle,
@@ -1182,7 +1187,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 }
                 // What admitted the first launch may have been revoked since.
                 let mut check = Store::open(home)?;
-                let profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
+                profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
                 if let Err(error) =
                     crate::host::validate_start(&mut check, &ship, &profile["first_mate"])
                 {
@@ -1206,6 +1211,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                         }
                     };
                 continuation = continuation_for(&launch)?;
+                sleep_after = sleep_after_for(&profile);
                 // Only a relaunch that is admitted again is a wake.
                 crate::host::sleep::woke(&store, &ship, reason, continuation);
             }
