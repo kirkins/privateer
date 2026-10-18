@@ -61,10 +61,12 @@ fn sleep(first_mate: &Value, hosted: bool) -> Value {
     json!({"policy": "after_idle", "idle_minutes": minutes})
 }
 
-/// Each kind's list in the order launches try it, and whose list it is.
+/// Each kind's list in the order launches try it, whose list it is, and the
+/// cost, tier and uses of each route listed.
 fn routes(ship: &str) -> Result<Value> {
     let policy = crate::crew_routes::load()?;
     let mut out = Map::new();
+    let mut facts = Map::new();
     for kind in crate::crew_routes::KINDS {
         let (list, names) = match &policy {
             Some(policy) => (
@@ -73,8 +75,17 @@ fn routes(ship: &str) -> Result<Value> {
             ),
             None => ("none", vec![]),
         };
+        if let Some(policy) = &policy {
+            for name in &names {
+                facts.insert(
+                    name.clone(),
+                    crate::crew_routes::facts(&policy["routes"][name.as_str()]),
+                );
+            }
+        }
         out.insert(kind.to_owned(), json!({"list": list, "names": names}));
     }
+    out.insert("routes".to_owned(), Value::Object(facts));
     Ok(Value::Object(out))
 }
 
