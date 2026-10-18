@@ -176,10 +176,9 @@ fn launches_take_the_first_available_listed_route_and_errands_their_own_list() {
     assert_eq!(f.model(&start()), "model-steady");
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
     assert!(
-        bearings["text"]
-            .as_str()
-            .unwrap()
-            .contains("cheap (free; trial runs only) backing off, steady (credits)"),
+        bearings["text"].as_str().unwrap().contains(
+            "cheap (free; trial runs only; unranked) backing off, steady (credits; unranked)"
+        ),
         "{bearings}"
     );
     f.back_off("codex/-/model-steady");
@@ -527,7 +526,7 @@ fn a_reordered_crew_list_starts_the_next_crew_on_its_new_first_route() {
         bearings["text"]
             .as_str()
             .unwrap()
-            .contains("crew: new (credits), old (free)"),
+            .contains("crew: new (credits; unranked), old (free; unranked)"),
         "{bearings}"
     );
     let second = f.json(
@@ -639,11 +638,11 @@ fn a_ships_own_crew_list_overrides_the_fleet_list_and_says_so() {
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
     let text = bearings["text"].as_str().unwrap();
     assert!(
-        text.contains("crew: cheap (free) (ship's own list)"),
+        text.contains("crew: cheap (free; unranked) (ship's own list)"),
         "{bearings}"
     );
     assert!(
-        text.contains("errand: steady (credits) (fleet list)"),
+        text.contains("errand: steady (credits; unranked) (fleet list)"),
         "{bearings}"
     );
     let shown = f.json(None, "routes.show", json!({}));
@@ -669,7 +668,7 @@ fn a_daily_allowance_goes_first_until_capped_and_returns_when_its_cap_passes() {
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
     let text = bearings["text"].as_str().unwrap();
     assert!(
-        text.contains("flash (plan; daily 07:00 UTC, tier 1)"),
+        text.contains("flash (plan; daily 07:00 UTC, tier 1, no uses)"),
         "{text}"
     );
     assert!(
@@ -705,7 +704,7 @@ fn a_daily_allowance_goes_first_until_capped_and_returns_when_its_cap_passes() {
     assert!(refusal.contains("is capped until"), "{refusal}");
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
     let text = bearings["text"].as_str().unwrap();
-    assert!(text.contains("tier 1) capped until"), "{text}");
+    assert!(text.contains("tier 1, no uses) capped until"), "{text}");
     assert!(!text.contains("Idle allowances"), "{text}");
 
     // The hold passes: the stale cap is neither honoured nor shown.
@@ -766,6 +765,107 @@ fn allowance_shapes_need_a_tier_one_shape_per_model_and_no_legacy_reset() {
     let mut tiered = codex("model-a", "plan");
     tiered["tier"] = json!(10);
     refuse(json!({"routes": {"a": tiered}}), "tier must be");
+}
+
+#[test]
+fn uses_need_a_tier_and_known_words_and_strength_shows_in_bearings_and_profile() {
+    let f = Fleet::new();
+    let file = f.root.join("bad-routes.json");
+    let refuse = |routes: Value, wanted: &str| {
+        fs::write(&file, routes.to_string()).unwrap();
+        let o = f.run(None, &["routes", "set", file.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            !o.status.success() && stderr.contains(wanted),
+            "{routes}: {stderr}"
+        );
+    };
+    let with = |uses: Value| {
+        let mut opus = codex("model-opus", "plan");
+        opus["tier"] = json!(1);
+        opus["uses"] = uses;
+        json!({"routes": {"opus": opus}})
+    };
+    let mut untiered = codex("model-a", "plan");
+    untiered["uses"] = json!(["review"]);
+    refuse(json!({"routes": {"a": untiered}}), "must state its tier");
+    refuse(with(json!([])), "non-empty list");
+    refuse(with(json!(["chat"])), "uses chat is not one of");
+    refuse(with(json!(["review", "review"])), "lists use review twice");
+
+    let mut opus = codex("model-opus", "plan");
+    opus["tier"] = json!(1);
+    opus["uses"] = json!(["review", "implement"]);
+    opus["note"] = json!("Claude Code");
+    let mut luna = codex("model-luna", "credits");
+    luna["tier"] = json!(4);
+    luna["uses"] = json!(["implement"]);
+    let mut plain = codex("model-plain", "free");
+    plain["note"] = json!("no tier at all");
+    f.routes(json!({
+        "routes": {"opus": opus, "luna": luna, "plain": plain},
+        "crew": ["plain", "luna", "opus"]
+    }));
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("plain (free; no tier at all; unranked)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("luna (credits; tier 4, uses implement)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("opus (plan; Claude Code; tier 1, uses review/implement)"),
+        "{text}"
+    );
+    let profile = f.json(None, "ship.profile", json!({"ship":"engineering"}));
+    assert_eq!(
+        profile["routes"]["routes"]["opus"],
+        json!({"cost":"plan","tier":1,"uses":["review","implement"]}),
+        "{profile}"
+    );
+    assert_eq!(profile["routes"]["routes"]["plain"]["tier"], Value::Null, "{profile}");
+}
+
+#[test]
+fn routes_set_warns_about_strength_prefixes_and_errand_routes_without_review() {
+    let f = Fleet::new();
+    let mut opus = codex("model-opus", "plan");
+    opus["tier"] = json!(1);
+    opus["uses"] = json!(["review", "implement"]);
+    opus["note"] = json!("STRENGTH 1/top; Claude Code");
+    let mut luna = codex("model-luna", "credits");
+    luna["tier"] = json!(4);
+    luna["uses"] = json!(["implement"]);
+    let reply = f.json(
+        None,
+        "routes.set",
+        json!({
+            "routes": {"opus": opus, "luna": luna},
+            "errand": ["opus", "luna"]
+        }),
+    );
+    let warnings: Vec<&str> = reply["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert_eq!(warnings.len(), 2, "{reply}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("route opus note starts with STRENGTH")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("route luna is on an errand list but has no review use")),
+        "{warnings:?}"
+    );
 }
 
 /// The fleet snapshot lists the machine's routes in the states bearings show:
@@ -839,9 +939,12 @@ fn the_fleet_snapshot_shows_each_route_in_the_state_bearings_show() {
     // Bearings read the same states.
     let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
     let text = bearings["text"].as_str().unwrap();
-    assert!(text.contains("busy (credits) backing off"), "{text}");
     assert!(
-        text.contains("tier 1, window 97% used) capped until"),
+        text.contains("busy (credits; unranked) backing off"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tier 1, no uses, window 97% used) capped until"),
         "{text}"
     );
     assert!(

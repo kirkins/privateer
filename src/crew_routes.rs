@@ -5,10 +5,11 @@
 //!
 //! A route may declare its `allowance` shape: a daily reset (`daily_utc`), or a
 //! rolling window (`window_hours`, with an optional `weekly_utc` cap), and then
-//! must state its `tier` (1 strongest to 9). Within a tier, crew and errand
-//! launches try use-it-or-lose-it allowances first, nearest their refresh, then
-//! idle rolling windows, then carry-over routes in the captain's order. A
-//! better tier is never passed, and an explicit route is never re-ranked.
+//! must state its `tier` (1 strongest to 9). A route states its `tier` and the
+//! `uses` it is strong enough for; a tier is a floor a launch requires, never a
+//! preference. Crew and errand launches try use-it-or-lose-it allowances first,
+//! nearest their refresh, then idle rolling windows, then carry-over routes in
+//! the captain's order. An explicit route is never re-ranked.
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
@@ -21,6 +22,8 @@ use std::{
 
 pub(crate) const KINDS: [&str; 3] = ["crew", "errand", "first_mate"];
 const COSTS: [&str; 3] = ["free", "plan", "credits"];
+/// The words a route's `uses` may name: what a route is strong enough to do.
+pub(crate) const USES: [&str; 4] = ["implement", "review", "diagnose", "design"];
 
 fn path() -> Result<PathBuf> {
     let path = crate::fleet::registry_path()?.with_extension("routes.json");
@@ -82,6 +85,7 @@ fn validate(value: &Value) -> Result<()> {
                         | "allowance_resets_utc"
                         | "allowance"
                         | "tier"
+                        | "uses"
                 ),
                 "unknown setting {key} on route {name}"
             );
@@ -120,6 +124,28 @@ fn validate(value: &Value) -> Result<()> {
                 .is_none_or(|t| t.as_u64().is_some_and(|t| (1..=9).contains(&t))),
             "route {name} tier must be a whole number from 1 (strongest) to 9"
         );
+        if let Some(uses) = route.get("uses") {
+            ensure!(
+                route.get("tier").is_some(),
+                "route {name} states uses, so it must state its tier (1-9)"
+            );
+            let words = uses
+                .as_array()
+                .filter(|words| !words.is_empty())
+                .with_context(|| format!("route {name} uses must be a non-empty list"))?;
+            let mut seen = std::collections::HashSet::new();
+            for word in words {
+                let word = word
+                    .as_str()
+                    .with_context(|| format!("route {name} uses holds words"))?;
+                ensure!(
+                    USES.contains(&word),
+                    "route {name} uses {word} is not one of {}",
+                    USES.join(", ")
+                );
+                ensure!(seen.insert(word), "route {name} lists use {word} twice");
+            }
+        }
         if let Some(allowance) = route.get("allowance") {
             ensure!(
                 route.get("allowance_resets_utc").is_none(),
@@ -189,10 +215,13 @@ fn for_store(store: &Store) -> Result<Option<Value>> {
     }
 }
 
-/// Replace the whole routes file. Captain only.
+/// Replace the whole routes file. Captain only. The reply carries `warnings`
+/// for what the runtime cannot refuse: notes still prefixed with a STRENGTH
+/// label, and errand routes with no `review` use.
 pub fn set(caller: &Caller, value: &Value) -> Result<Value> {
     caller.require_operator("routes.set")?;
     validate(value)?;
+    let warnings = warnings(value);
     // The fleet registry's write lock serializes captain updates; the private
     // temporary file is atomically renamed into place.
     let mut conn = crate::fleet::registry()?;
@@ -216,7 +245,48 @@ pub fn set(caller: &Caller, value: &Value) -> Result<Value> {
     }
     result?;
     tx.commit()?;
-    Ok(value.clone())
+    let mut reply = value.clone();
+    reply["warnings"] = json!(warnings);
+    Ok(reply)
+}
+
+fn warnings(value: &Value) -> Vec<String> {
+    let mut warnings = vec![];
+    for (name, route) in value["routes"].as_object().into_iter().flatten() {
+        if route["note"]
+            .as_str()
+            .is_some_and(|note| note.trim_start().starts_with("STRENGTH"))
+        {
+            warnings.push(format!(
+                "route {name} note starts with STRENGTH; its tier and uses now carry that, so remove the prefix"
+            ));
+        }
+    }
+    let mut errand: Vec<String> = names_of(&value["errand"]);
+    if let Some(ships) = value["ships"].as_object() {
+        for lists in ships.values() {
+            errand.extend(names_of(&lists["errand"]));
+        }
+    }
+    for name in errand {
+        let route = &value["routes"][name.as_str()];
+        if !uses(route).iter().any(|word| word == "review") {
+            warnings.push(format!(
+                "route {name} is on an errand list but has no review use"
+            ));
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+fn names_of(list: &Value) -> Vec<String> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Which list a ship's kind takes: its own list when it has one, else the
@@ -386,17 +456,52 @@ fn tier(route: &Value) -> u64 {
     route["tier"].as_u64().unwrap_or(1)
 }
 
-/// The order to try a list in: by tier, best first; within a tier, shaped
-/// routes with a deadline nearest their loss, then idle rolling windows (by
-/// their weekly reset when known), then carry-over routes. Equal keys keep the
-/// captain's order. `usage` is keyed by route identity.
+/// A route's cost, tier and uses as `ship.profile` reports them. A route with
+/// no tier reports a null tier.
+pub(crate) fn facts(route: &Value) -> Value {
+    json!({
+        "cost": route["cost"],
+        "tier": route.get("tier").map(|_| tier(route)),
+        "uses": uses(route),
+    })
+}
+
+/// The words in a route's `uses`, as declared.
+fn uses(route: &Value) -> Vec<String> {
+    route["uses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|word| word.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A route's strength as bearings and profiles show it: its tier and uses, or
+/// `unranked` when it states no tier.
+fn strength(route: &Value) -> String {
+    if route.get("tier").is_none() {
+        return "unranked".to_owned();
+    }
+    let words = uses(route);
+    if words.is_empty() {
+        format!("tier {}, no uses", tier(route))
+    } else {
+        format!("tier {}, uses {}", tier(route), words.join("/"))
+    }
+}
+
+/// The order to try a list in: shaped routes with a deadline nearest their
+/// loss, then idle rolling windows (by their weekly reset when known), then
+/// carry-over routes. Equal keys keep the captain's order. A tier is a floor a
+/// launch requires, so it never reorders a list. `usage` is keyed by route
+/// identity.
 pub(crate) fn rank(
     names: &[String],
     policy: &Value,
     usage: &std::collections::HashMap<String, crate::routes::Usage>,
     now: i64,
 ) -> Vec<String> {
-    let mut keyed: Vec<((u64, u8, i64), &String)> = names
+    let mut keyed: Vec<((u8, i64), &String)> = names
         .iter()
         .map(|name| {
             let route = &policy["routes"][name.as_str()];
@@ -415,7 +520,7 @@ pub(crate) fn rank(
                     }
                 }
             };
-            ((tier(route), class, key / 60_000), name)
+            ((class, key / 60_000), name)
         })
         .collect();
     keyed.sort_by_key(|(key, _)| *key);
@@ -799,7 +904,7 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
             let declared = allowance(route);
             if let Some(allowance) = declared {
                 shaped = true;
-                let mut about = format!("{}, tier {}", describe(allowance.shape), tier(route));
+                let mut about = format!("{}, {}", describe(allowance.shape), strength(route));
                 for (window, utilization) in [
                     ("window", used.and_then(|u| u.window_utilization)),
                     ("week", used.and_then(|u| u.weekly_utilization)),
@@ -809,8 +914,8 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                     }
                 }
                 details.push(about);
-            } else if route.get("tier").is_some() {
-                details.push(format!("tier {}", tier(route)));
+            } else {
+                details.push(strength(route));
             }
             let mut label = format!("{name} ({})", details.join("; "));
             match read.map_or((State::Available, None), |r| (r.state, r.until_ms)) {
@@ -846,7 +951,7 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let rule = if shaped {
-        "use-it-or-lose-it allowances nearest their refresh go first within a tier"
+        "use-it-or-lose-it allowances nearest their refresh go first"
     } else {
         "the first available is used"
     };
@@ -1109,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn a_better_tier_is_never_passed_and_idle_windows_wait_behind_deadlines() {
+    fn tier_filters_and_never_orders_and_idle_windows_wait_behind_deadlines() {
         let policy = json!({"routes": {
             "weak": route("weak", json!({"allowance": daily_in(1, NOW), "tier": 2})),
             "steady": route("steady", json!({})),
@@ -1125,12 +1230,13 @@ mod tests {
                 ..Usage::default()
             },
         );
+        // A tier-2 route with a deadline goes first: tier is a floor, not a sort.
         let list = names(&["steady", "weak", "idle", "daily", "open"]);
         assert_eq!(
             rank(&list, &policy, &usage, NOW),
-            names(&["open", "daily", "idle", "steady", "weak"])
+            names(&["weak", "open", "daily", "idle", "steady"])
         );
-        // A list with no shapes and no tiers keeps the captain's order.
+        // A list with no shapes keeps the captain's order.
         let plain = names(&["steady"]);
         assert_eq!(rank(&plain, &policy, &usage, NOW), plain);
     }
