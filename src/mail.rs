@@ -79,7 +79,7 @@ fn remote_peer(ship: &Value) -> Option<&str> {
     ship["location"]["peer"].as_str()
 }
 
-fn ship(store: &Store, name: &str) -> Result<Option<Value>> {
+pub(crate) fn ship(store: &Store, name: &str) -> Result<Option<Value>> {
     let raw: Option<String> = store
         .connection()
         .query_row("SELECT record FROM ships WHERE name=?1", [name], |r| {

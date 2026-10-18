@@ -176,7 +176,7 @@ fn secret_shaped(word: &str) -> bool {
         && body.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-fn sensitive_name(name: &str) -> bool {
+pub(crate) fn sensitive_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     [
         "key", "token", "secret", "pass", "auth", "cred", "cookie", "session",

@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-const KINDS: [&str; 3] = ["crew", "errand", "first_mate"];
+pub(crate) const KINDS: [&str; 3] = ["crew", "errand", "first_mate"];
 const COSTS: [&str; 3] = ["free", "plan", "credits"];
 
 fn path() -> Result<PathBuf> {
@@ -183,7 +183,7 @@ pub fn set(caller: &Caller, value: &Value) -> Result<Value> {
 
 /// Which list a ship's kind takes: its own list when it has one, else the
 /// fleet's. A ship's own list replaces the fleet's rather than adding to it.
-fn source(policy: &Value, ship: &str, kind: &str) -> &'static str {
+pub(crate) fn source(policy: &Value, ship: &str, kind: &str) -> &'static str {
     if policy["ships"][ship].get(kind).is_some() {
         "ship"
     } else if policy.get(kind).is_some() {
@@ -193,7 +193,7 @@ fn source(policy: &Value, ship: &str, kind: &str) -> &'static str {
     }
 }
 
-fn order(policy: &Value, ship: &str, kind: &str) -> Vec<String> {
+pub(crate) fn order(policy: &Value, ship: &str, kind: &str) -> Vec<String> {
     let list = policy["ships"][ship]
         .get(kind)
         .or_else(|| policy.get(kind))
