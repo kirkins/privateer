@@ -202,6 +202,7 @@ fn run() -> Result<()> {
         Store::open_as(&home, caller)?
     };
     if command == "_job-supervise" {
+        store.as_runtime();
         return privateer::jobs::supervise(
             &mut store,
             &internal_job.context("job ID is required")?,

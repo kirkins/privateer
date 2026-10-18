@@ -277,6 +277,11 @@ impl Store {
     pub fn crew(&self) -> Option<&crate::crew_scope::CrewCaller> {
         self.crew.as_ref()
     }
+    /// The runtime acting for a job, such as its supervisor resuming a parked
+    /// crew, is not held to the crew's commands.
+    pub fn as_runtime(&mut self) {
+        self.crew = None;
+    }
     pub fn set_caller(&mut self, caller: Caller) {
         self.caller = caller;
     }

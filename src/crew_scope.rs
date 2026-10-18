@@ -85,8 +85,11 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller) -> Result<Caller> {
             let conn = open_readonly(&home)?;
             let crew = classify(&conn, &job, &actor)?;
             drop(conn);
+            // A supervisor's PRIVATEER_JOB is its starter's, not a job it runs
+            // in, and lineage it records keeps using it as before.
+            let supervisor = supervisor_argv(&std::env::args().collect::<Vec<_>>()).is_some();
             let refusal = match (&caller, &env_job) {
-                (_, Some(named)) if named != &job => Some(format!(
+                (_, Some(named)) if named != &job && !supervisor => Some(format!(
                     "this process runs in job {job}; PRIVATEER_JOB cannot name job {named}"
                 )),
                 (Caller::Operator, _) => Some(format!(
@@ -112,7 +115,7 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller) -> Result<Caller> {
                 bail!("{refusal}");
             }
             let _ = RESOLVED.set(Resolved {
-                job: Some(job),
+                job: if supervisor { env_job } else { Some(job) },
                 crew,
             });
             return Ok(Caller::Agent { actor });
@@ -450,7 +453,7 @@ pub(crate) fn check(store: &Store, command: &str, args: &Value) -> Result<()> {
         "crew.refused",
         &json!({"job_id": crew.job, "crew_job_id": crew.crew, "command": command}),
     )?;
-    notice(store, &crew, command)?;
+    notice(store, crew, command)?;
     bail!("{refusal}")
 }
 
