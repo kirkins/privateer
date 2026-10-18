@@ -13,7 +13,7 @@
 //! asked is not restated to the captain as if it had just arrived.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -196,6 +196,9 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
 /// How many ids an ambiguous prefix lists.
 const MATCHES_SHOWN: usize = 10;
 
+/// The shortest prefix that may stand for an id, so a typo names nothing.
+const MIN_PREFIX: usize = 4;
+
 /// One open captain item, found in the fleet home that holds it.
 struct Item {
     ship: String,
@@ -214,8 +217,24 @@ fn locate(query: &str, notices: bool) -> Result<Item> {
         "('request','decision')"
     };
     let mut found: Vec<Item> = vec![];
+    let mut closed: Option<String> = None;
     for (ship, home) in fleet()? {
         let store = Store::open(&home)?;
+        // An exact id names that item even once it has closed: a retried or
+        // double-tapped dismiss must not fall through to a longer id.
+        let state: Option<Option<String>> = store
+            .connection()
+            .query_row(
+                "SELECT state FROM mail WHERE recipient=?1 AND id=?2",
+                params![crate::mail::CAPTAIN, query],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(Some(state)) = state
+            && state != "open"
+        {
+            closed.get_or_insert(state);
+        }
         let mut statement = store.connection().prepare(&format!(
             "SELECT id FROM mail WHERE recipient=?1 AND kind IN {kinds}
                AND (state='open' OR (kind='notice' AND state IS NULL))
@@ -237,6 +256,13 @@ fn locate(query: &str, notices: bool) -> Result<Item> {
     if let Some(at) = found.iter().position(|item| item.id == query) {
         return Ok(found.swap_remove(at));
     }
+    if let Some(state) = closed {
+        bail!("{query} is no longer open ({state})");
+    }
+    ensure!(
+        query.len() >= MIN_PREFIX,
+        "give at least {MIN_PREFIX} characters of the id, or all of it"
+    );
     // One ask may be held in two homes (a desk copy): it is still one item.
     let mut seen = std::collections::HashSet::new();
     found.retain(|item| seen.insert(item.id.clone()));
@@ -305,6 +331,12 @@ fn dismiss(store: &Store, args: &Value) -> Result<Value> {
     };
     let item = locate(required(args, "id")?, true)?;
     let target = Store::open(&item.home)?;
+    let ask = crate::mail::find(&target, &item.id)?.context("item vanished")?;
+    ensure!(
+        ask["request_kind"] != "production_approval",
+        "{} is a production approval; deny it with approval.deny",
+        item.id
+    );
     let mail = crate::mail::dismiss(&target, &item.id, note)?;
     Ok(json!({"id": item.id, "ship": item.ship, "state": mail["state"], "mail": mail}))
 }

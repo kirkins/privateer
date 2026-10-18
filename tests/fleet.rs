@@ -1599,8 +1599,35 @@ fn the_captain_replies_to_and_dismisses_asks_in_any_home_by_id_or_unique_prefix(
         (exact["id"].as_str(), exact["ship"].as_str()),
         (Some("same-1"), Some("apps"))
     );
+    // A retried or double-tapped dismiss names the closed item, never the
+    // open one its id prefixes.
+    let again = refused(&web, "captain.dismiss", json!({"id": "same-1"}));
+    assert!(
+        again.contains("same-1 is no longer open (dismissed)"),
+        "{again}"
+    );
+    let again = refused(&web, "captain.reply", json!({"id": "same-1", "body": "x"}));
+    assert!(again.contains("no longer open"), "{again}");
+    assert!(refused(&web, "captain.dismiss", json!({"id": "sam"})).contains("at least 4"));
     let unique = machine.json(&apps, "captain.dismiss", json!({"id": "same-"}));
     assert_eq!(unique["id"], "same-12", "{unique}");
+
+    // A production approval is denied through the approval path, not dismissed.
+    machine.json(
+        &apps,
+        "task.create",
+        json!({"id":"release","charter_id":"apps","owner":"apps","title":"Release"}),
+    );
+    let production = send(
+        &apps,
+        json!({"id":"prod-ask","from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"release","body":"Release exact build?","payload":{"artifact":"sha256:exact","environment":"production"}}),
+    );
+    let kept = refused(&web, "captain.dismiss", json!({"id": production["id"]}));
+    assert!(kept.contains("approval.deny"), "{kept}");
+    assert_eq!(
+        machine.json(&apps, "mail.show", json!({"id": production["id"]}))["state"],
+        "open"
+    );
 
     // Only the operator answers or dismisses for the captain.
     let open = send(
