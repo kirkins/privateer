@@ -3055,3 +3055,85 @@ fn mail_for_a_ship_no_longer_known_here_is_refused_only_after_it_waits() {
     let last = laptop.pass("liaison", &link_down);
     assert_eq!(last["machines"][0]["refused"], 1, "{last}");
 }
+
+/// An ssh that cannot reach the linked machine, so its calls fail at once.
+fn asleep_ssh(machine: &Machine) -> PathBuf {
+    let asleep = machine.root.join("asleep-ssh");
+    fs::write(&asleep, "#!/bin/sh\nexit 255\n").unwrap();
+    fs::set_permissions(&asleep, fs::Permissions::from_mode(0o755)).unwrap();
+    asleep
+}
+
+/// Marks this machine's directory as refreshed just now, and its contact due,
+/// so the next pass collects and pushes without exchanging directories first.
+fn refreshed_now(machine: &Machine) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    rusqlite::Connection::open(machine.registry())
+        .unwrap()
+        .execute(
+            "UPDATE machines SET refreshed_ms=?1, next_contact_ms=0",
+            params![i64::try_from(now.as_millis()).unwrap()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_captain_reply_from_a_ship_made_while_the_desk_was_unreachable_is_delivered_after_one_pass() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    // Made while the Mac is asleep: its directory exchange is skipped.
+    let asleep = asleep_ssh(&laptop);
+    assert!(init_over(&laptop, "rig", &asleep).status.success());
+    laptop.ok(
+        "rig",
+        "mail.send",
+        json!({"from": "rig", "to": "captain", "kind": "request", "body": "Ship build 12?"}),
+    );
+
+    // The Mac is reachable again. The next pass exchanges directories before
+    // it pushes, so the Mac knows rig and takes the reply.
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
+    assert_eq!(captain_bodies(&mac, "fitforge"), ["Ship build 12?"]);
+}
+
+#[test]
+fn a_captain_reply_from_a_ship_the_desk_does_not_know_is_held_then_refused() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asleep = asleep_ssh(&laptop);
+    assert!(init_over(&laptop, "rig", &asleep).status.success());
+    let asked = laptop.ok(
+        "rig",
+        "mail.send",
+        json!({"from": "rig", "to": "captain", "kind": "request", "body": "Ship build 12?"}),
+    );
+
+    // The directory here is fresh, so no pass exchanges it: the Mac keeps not
+    // knowing rig. The reply is held for the passes it may still be exchanged.
+    for pass in 1..=2 {
+        refreshed_now(&laptop);
+        let held = laptop.pass("liaison", &ssh);
+        assert_eq!(
+            held["machines"][0]["captain_pushed"], 0,
+            "pass {pass}: {held}"
+        );
+        assert!(captain_bodies(&mac, "fitforge").is_empty());
+    }
+    refreshed_now(&laptop);
+    let last = laptop.pass("liaison", &ssh);
+    assert_eq!(last["machines"][0]["captain_pushed"], 1, "{last}");
+    let notices: Vec<Value> = captain_mail(&laptop, "liaison")
+        .into_iter()
+        .filter(|m| m["kind"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["payload"]["refused"]["id"], asked["id"]);
+}
