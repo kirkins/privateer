@@ -118,10 +118,20 @@ fn finish_wake(store: &Store, work: &Scheduled, status: &str, now: i64) -> Resul
     Ok(())
 }
 
+/// Faults are recorded in the caller's transaction. The owner's notice has a
+/// per-revision id, so a repeated fault of the same schedule sends nothing new.
 fn fault(store: &Store, work: &mut Scheduled, reason: impl Into<String>, now: i64) -> Result<()> {
     work.state = "fault".into();
     work.reason = Some(reason.into().chars().take(1000).collect());
-    finish_wake(store, work, "failed", now)
+    finish_wake(store, work, "failed", now)?;
+    crate::mail::record_crew(
+        store.connection(),
+        &json!({"id": format!("scheduling-fault-{}-{}", work.task_id, work.revision),
+            "to": work.owner, "kind": "notice", "task_id": work.task_id, "urgency": "high",
+            "body": format!("Scheduled task {} faulted: {}", work.task_id, work.reason.as_deref().unwrap_or("")),
+            "payload": {"scheduling_fault": work.task_id, "revision": work.revision}}),
+    )?;
+    Ok(())
 }
 
 fn reopen(store: &Store, work: &mut Scheduled) -> Result<()> {
