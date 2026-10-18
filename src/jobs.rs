@@ -116,6 +116,10 @@ struct Job {
     /// The supervised job whose agent started this one, when an agent did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     started_by: Option<String>,
+    /// Why this record was settled as left behind by another machine: its
+    /// ledger is not here, so nothing on this machine can hold or release it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foreign: Option<String>,
     #[serde(default)]
     work_offer: Option<String>,
     /// Crew hosted in the terminal host: the supervisor runs in its own
@@ -2088,6 +2092,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         leader_result: None,
         cancelled_by: None,
         started_by,
+        foreign: None,
         work_offer: args
             .get("work_offer")
             .and_then(Value::as_str)
@@ -3444,6 +3449,21 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
             if supervised {
                 return Ok(None);
             }
+            // Settled records are final while their ledger remains absent.
+            if job.foreign.is_some() && ledger_dir_missing(&job.ledger) {
+                return Ok(None);
+            }
+            // A ledger directory absent from this machine means the record came
+            // from another one. Only a missing parent directory counts: a missing
+            // file alone is local and SQLite recreates it, while an existing ledger
+            // that cannot be opened right now is retried, not settled.
+            if ledger_dir_missing(&job.ledger) {
+                let cause = format!(
+                    "left behind: its ledger {} is not on this machine",
+                    job.ledger.display()
+                );
+                return Ok(Some(settle_foreign(store, &job.id, &cause)?));
+            }
             Ok(Some(reconcile(store, job, &mut reserved)?))
         })();
         match result {
@@ -3455,6 +3475,60 @@ pub(crate) fn reconcile_unsupervised(store: &Store) -> Result<Vec<Value>> {
         }
     }
     Ok(settled)
+}
+
+/// Whether the directory holding a job's ledger is absent from this machine.
+fn ledger_dir_missing(path: &Path) -> bool {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => return false,
+    };
+    matches!(fs::symlink_metadata(dir), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+/// Settle a record that belongs to another machine, once. A live record
+/// becomes failed with `cause`, reported like any failure; a finished one
+/// keeps its status. The mark stops later ticks from opening its ledger, and
+/// one audit row records the settlement.
+fn settle_foreign(store: &Store, id: &str, cause: &str) -> Result<Job> {
+    let mut settled = false;
+    let job = alter(store, id, |j| {
+        if j.foreign.is_some() {
+            return;
+        }
+        settled = true;
+        j.foreign = Some(cause.into());
+        if !terminal(&j.status) {
+            j.status = "failed".into();
+            j.reason = Some(cause.into());
+            j.finished_ms = j.finished_ms.or(Some(Store::now_ms()));
+        }
+    })?;
+    if settled {
+        store.audit(
+            "job.foreign",
+            &json!({"job_id": job.id, "status": job.status, "ledger": job.ledger, "cause": cause}),
+        )?;
+    }
+    Ok(job)
+}
+/// A ship that moved here from `from`: work it left unfinished there cannot
+/// run here, so each unfinished record settles as failed, once.
+pub(crate) fn settle_left_behind(store: &Store, from: &str) -> Result<()> {
+    let ids: Vec<String> = store
+        .connection()
+        .prepare(&format!(
+            "SELECT id FROM jobs WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL}"
+        ))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        settle_foreign(
+            store,
+            &id,
+            &format!("left behind when the ship moved from {from}"),
+        )?;
+    }
+    Ok(())
 }
 
 /// A job's current durable record, for crew reports.
@@ -3644,14 +3718,18 @@ pub(crate) fn prune(
         if !terminal(&job.status) || job.finished_ms.is_none_or(|t| t >= cutoff_ms) {
             continue;
         }
-        if !ledgers.contains_key(&job.ledger) {
-            ledgers.insert(job.ledger.clone(), ledger(&job.ledger)?);
-        }
-        let held: bool = ledgers[&job.ledger].query_row(
-            "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
-            [reservation_key(store.home(), &job.id, &job.incarnation)],
-            |r| r.get(0),
-        )?;
+        let held = if job.foreign.is_some() && ledger_dir_missing(&job.ledger) {
+            false
+        } else {
+            if !ledgers.contains_key(&job.ledger) {
+                ledgers.insert(job.ledger.clone(), ledger(&job.ledger)?);
+            }
+            ledgers[&job.ledger].query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
+                [reservation_key(store.home(), &job.id, &job.incarnation)],
+                |r| r.get(0),
+            )?
+        };
         if held {
             reserved += 1;
             continue;

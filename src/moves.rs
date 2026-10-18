@@ -366,7 +366,8 @@ fn export(args: &Value) -> Result<Value> {
             total / (1024 * 1024)
         );
         Ok(
-            json!({"id": id, "ship": ship, "created_by": member.created_by,
+            json!({"id": id, "ship": ship, "from": crate::machines::this_machine(),
+            "created_by": member.created_by,
             "folder": folder, "files": listed, "projects": projects, "links_left": links,
             "first_mate": profile["first_mate"]}),
         )
@@ -810,6 +811,9 @@ fn activate(args: &Value) -> Result<Value> {
     crate::fleet::register(&ship, &home, &created_by)?;
     let store = Store::open(&home)?;
     crate::fleet::link(&store, &ship)?;
+    // Work it left unfinished on the old machine cannot run here.
+    let from = manifest["from"].as_str().unwrap_or("another machine");
+    crate::jobs::settle_left_behind(&store, from)?;
     // Ships it knew through peers this machine does not have stay unknown
     // here until a link brings them.
     let forgotten = store.connection().execute(

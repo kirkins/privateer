@@ -2309,3 +2309,237 @@ fn a_killed_job_keeps_the_lines_it_printed_before_the_kill() {
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
+
+/// Audit rows of one kind in a home, read the way the dispatcher writes them.
+fn audits(home: &Path, kind: &str) -> i64 {
+    Store::open(home)
+        .unwrap()
+        .connection()
+        .query_row("SELECT COUNT(*) FROM audit WHERE kind=?1", [kind], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_record_whose_ledger_is_not_on_this_machine_settles_once_as_foreign() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "done", &["true"]);
+    wait(&home, "done", &["succeeded"]);
+    start(&home, "live", &["true"]);
+    wait(&home, "live", &["succeeded"]);
+    // Both records name a ledger from another machine: its directory is absent
+    // here. The live one still reads as running, as a moved job would.
+    let missing = home.join("laptop-only/state/resources.sqlite");
+    let store = Store::open(&home).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.ledger', ?1) WHERE id IN ('done','live')",
+            [missing.to_string_lossy()],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.status', 'running') WHERE id='live'",
+            [],
+        )
+        .unwrap();
+    drop(store);
+
+    fixture.serve(&home);
+    fixture.serve(&home);
+
+    let done = ok(&home, "job.status", json!({"id":"done"}));
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(
+        done["foreign"]
+            .as_str()
+            .unwrap()
+            .contains("not on this machine")
+    );
+    let live = ok(&home, "job.status", json!({"id":"live"}));
+    assert_eq!(live["status"], "failed", "{live}");
+    assert!(
+        live["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not on this machine")
+    );
+    // Settled once: two passes, one audit row per record, and no outcome retry.
+    assert_eq!(audits(&home, "job.foreign"), 2);
+    assert!(!missing.exists());
+}
+
+#[test]
+fn an_existing_ledger_that_cannot_be_opened_is_retried_not_settled() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "kept", &["true"]);
+    wait(&home, "kept", &["succeeded"]);
+    // The path exists on this machine but is not a ledger file, so opening it
+    // fails for a reason that may pass; the record is left as it is.
+    let unopenable = home.join("not-a-ledger");
+    fs::create_dir(&unopenable).unwrap();
+    Store::open(&home)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.ledger', ?1) WHERE id='kept'",
+            [unopenable.to_string_lossy()],
+        )
+        .unwrap();
+
+    fixture.serve(&home);
+
+    let kept = ok(&home, "job.status", json!({"id":"kept"}));
+    assert_eq!(kept["status"], "succeeded", "{kept}");
+    assert!(kept["foreign"].is_null(), "{kept}");
+    assert_eq!(audits(&home, "job.foreign"), 0);
+}
+
+#[test]
+fn a_live_supervised_job_whose_ledger_file_is_deleted_is_not_marked_foreign() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "live", &["sleep", "5"]);
+    let running = wait(&home, "live", &["running"]);
+    let ledger_path = PathBuf::from(running["ledger"].as_str().unwrap());
+    assert!(ledger_path.exists());
+
+    fs::remove_file(&ledger_path).unwrap();
+    assert!(!ledger_path.exists());
+    assert!(ledger_path.parent().unwrap().exists());
+
+    fixture.serve(&home);
+
+    let status = ok(&home, "job.status", json!({"id":"live"}));
+    assert_eq!(status["status"], "running", "{status}");
+    assert!(status["foreign"].is_null(), "{status}");
+    assert_eq!(audits(&home, "job.foreign"), 0);
+
+    let done = wait(&home, "live", &["succeeded"]);
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(done["foreign"].is_null(), "{done}");
+    assert!(ledger_path.exists());
+    assert_eq!(audits(&home, "job.foreign"), 0);
+}
+
+#[test]
+fn a_missing_ledger_directory_coming_back_resumes_reconcile_and_releases_reservation() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let missing_dir = home.join("remote/state");
+    let ledger_path = missing_dir.join("resources.sqlite");
+
+    start(&home, "held", &["true"]);
+    let held = wait(&home, "held", &["succeeded"]);
+    let inc = held["incarnation"].as_str().unwrap().to_string();
+
+    let store = Store::open(&home).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.ledger', ?1) WHERE id='held'",
+            [ledger_path.to_string_lossy()],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record, '$.status', 'running') WHERE id='held'",
+            [],
+        )
+        .unwrap();
+    drop(store);
+
+    fixture.serve(&home);
+    let foreign = ok(&home, "job.status", json!({"id":"held"}));
+    assert_eq!(foreign["status"], "failed", "{foreign}");
+    assert!(foreign["foreign"].as_str().is_some(), "{foreign}");
+    assert_eq!(audits(&home, "job.foreign"), 1);
+
+    fs::create_dir_all(&missing_dir).unwrap();
+    let conn = rusqlite::Connection::open(&ledger_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);
+         CREATE TABLE released (key TEXT PRIMARY KEY, cpus REAL NOT NULL, load REAL NOT NULL, released_ms INTEGER NOT NULL);
+         CREATE TABLE runs (key TEXT NOT NULL, work TEXT, task TEXT, duration_ms INTEGER NOT NULL, finished_ms INTEGER NOT NULL);",
+    )
+    .unwrap();
+    let key = format!("{}:held:{}", home.display(), inc);
+    conn.execute(
+        "INSERT INTO reservations(key, record) VALUES(?1, ?2)",
+        rusqlite::params![
+            key,
+            json!({"key": &key, "home": home, "job_id": "held", "incarnation": inc,
+                   "heavy": false, "state": "running", "created_ms": 0, "supervisor": null, "payload": null}).to_string()
+        ],
+    )
+    .unwrap();
+    let has_res: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has_res);
+    drop(conn);
+
+    fixture.serve(&home);
+
+    let conn = rusqlite::Connection::open(&ledger_path).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reservations WHERE key=?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "leftover reservation should be released");
+    drop(conn);
+
+    let after = ok(&home, "job.status", json!({"id":"held"}));
+    assert_eq!(after["status"], "failed", "{after}");
+    assert!(after["foreign"].as_str().is_some(), "{after}");
+    assert_eq!(audits(&home, "job.foreign"), 1);
+}
+
+#[test]
+fn prune_succeeds_with_foreign_records() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "done", &["true"]);
+    wait(&home, "done", &["succeeded"]);
+
+    let missing = home.join("remote-machine/resources.sqlite");
+    let store = Store::open(&home).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(json_set(record, '$.ledger', ?1), '$.foreign', 'left behind') WHERE id='done'",
+            [missing.to_string_lossy()],
+        )
+        .unwrap();
+    drop(store);
+
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 1000;
+
+    let pruned = ok(
+        &home,
+        "history.prune",
+        json!({"before_ms": cutoff, "dry_run": false}),
+    );
+    assert_eq!(pruned["jobs"], 1, "{pruned}");
+    assert_eq!(pruned["jobs_still_reserved"], 0, "{pruned}");
+
+    let list = ok(&home, "job.list", json!({}));
+    assert!(list["jobs"].as_array().unwrap().is_empty(), "{list}");
+}
