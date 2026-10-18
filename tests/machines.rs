@@ -4184,12 +4184,36 @@ fn a_gateway_too_old_to_serve_the_snapshot_reads_unreachable_with_its_refusal() 
 
 /// Record a settled harness job in a ship's home, as its supervisor would.
 fn settled_job(machine: &Machine, ship: &str, id: &str, route: &str, usage: Value, at: i64) {
+    settled_job_with(
+        machine,
+        ship,
+        id,
+        route,
+        usage,
+        at,
+        json!({"agent_actor": ship}),
+    );
+}
+
+/// The same, with fields of the record replaced by `extra`.
+fn settled_job_with(
+    machine: &Machine,
+    ship: &str,
+    id: &str,
+    route: &str,
+    usage: Value,
+    at: i64,
+    extra: Value,
+) {
     let home: String = rusqlite::Connection::open(machine.registry())
         .unwrap()
         .query_row("SELECT home FROM ships WHERE name=?1", [ship], |r| r.get(0))
         .unwrap();
-    let record = json!({"id": id, "action": "spawn", "status": "succeeded", "agent_actor": ship,
+    let mut record = json!({"id": id, "action": "spawn", "status": "succeeded",
         "model_route": route, "usage": usage, "created_ms": at - 1_000, "finished_ms": at});
+    for (key, value) in extra.as_object().unwrap() {
+        record[key] = value.clone();
+    }
     rusqlite::Connection::open(PathBuf::from(home).join("privateer.sqlite"))
         .unwrap()
         .execute(
@@ -4296,4 +4320,249 @@ fn the_usage_summary_sums_a_reached_machine_and_lists_it_when_it_is_down() {
         .cloned()
         .unwrap_or_else(|| panic!("laptop missing: {other_side}"));
     assert_eq!(laptop_row["reached"], false, "{other_side}");
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn machine_entry(summary: &Value, name: &str) -> Value {
+    summary["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} missing: {summary}"))
+}
+
+#[test]
+fn the_reached_machine_sums_the_usage_a_reaching_machine_carries_on_collect() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let used = |n: u64| json!({"input": n, "output": n, "cacheRead": n, "cacheWrite": n, "totalTokens": 4 * n});
+    // Settled a minute ago: past the margin a carry leaves for records still
+    // committing.
+    let at = now_ms() - 60_000;
+    settled_job(&laptop, "liaison", "a", "claude/-/opus", used(1), at);
+    settled_job_with(
+        &laptop,
+        "liaison",
+        "b",
+        "opencode/zai/glm",
+        used(2),
+        at + 1,
+        json!({"agent_actor": "crew-1", "usage_partial": true}),
+    );
+    settled_job(&laptop, "liaison", "c", "pi/zai/glm", Value::Null, at + 2);
+    // Too recent to carry yet.
+    settled_job(
+        &laptop,
+        "liaison",
+        "late",
+        "claude/-/opus",
+        used(50),
+        now_ms(),
+    );
+    // The mac's own job, with no actor: keyed by the asking home's ship.
+    settled_job_with(
+        &mac,
+        "fitforge",
+        "m",
+        "claude/-/opus",
+        used(10),
+        at + 3,
+        json!({"agent_actor": null}),
+    );
+    let ask = |group_by: &str| {
+        mac.ok(
+            "fitforge",
+            "usage.summary",
+            json!({"since_ms": at - 1_000, "group_by": group_by}),
+        )
+    };
+    // Before any collect the laptop is listed, not reached, with nothing carried.
+    let before = ask("machine");
+    let row = machine_entry(&before, "laptop");
+    assert_eq!(row["reached"], false, "{before}");
+    assert_eq!(row["as_of_ms"], Value::Null, "{before}");
+
+    collect_as(&laptop, "liaison", &remote_ssh(&mac));
+    let by_machine = ask("machine");
+    // The reached side gave itself no name: it goes by its host's.
+    let here = by_machine["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] != "laptop")
+        .map(|m| m["name"].clone())
+        .unwrap();
+    assert_eq!(
+        by_machine["groups"],
+        json!([
+            {"key": "laptop", "jobs": 3, "usage": used(3), "gaps": ["pi"], "partial_jobs": 1},
+            {"key": here, "jobs": 1, "usage": used(10)},
+        ]),
+        "{by_machine}"
+    );
+    let row = machine_entry(&by_machine, "laptop");
+    assert_eq!(row["reached"], true, "{by_machine}");
+    assert_eq!(row["via"], "collect", "{by_machine}");
+    let as_of = row["as_of_ms"].as_i64().unwrap();
+    assert!(as_of >= at + 2 && as_of <= now_ms(), "{by_machine}");
+    assert_eq!(
+        ask("route")["groups"],
+        json!([
+            {"key": "claude/-/opus", "jobs": 2, "usage": used(11)},
+            {"key": "opencode/zai/glm", "jobs": 1, "usage": used(2), "partial_jobs": 1},
+            {"key": "pi/zai/glm", "jobs": 1, "usage": null, "gaps": ["pi"]},
+        ])
+    );
+    let ships: Vec<Value> = ask("ship")["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| json!([g["key"], g["jobs"]]))
+        .collect();
+    assert_eq!(
+        ships,
+        vec![
+            json!(["crew-1", 1]),
+            json!(["fitforge", 1]),
+            json!(["liaison", 2])
+        ]
+    );
+    let days = ask("day");
+    assert_eq!(
+        days["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["jobs"].as_u64().unwrap())
+            .sum::<u64>(),
+        4,
+        "{days}"
+    );
+
+    // Carried again from the start, the same jobs count once.
+    let registry = rusqlite::Connection::open(laptop.registry()).unwrap();
+    let cursor: Option<String> = registry
+        .query_row(
+            "SELECT usage_cursor FROM machines WHERE name='mac'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let cursor: Value = serde_json::from_str(&cursor.expect("the cursor the mac stored")).unwrap();
+    assert_eq!(cursor["job_id"], "c", "{cursor}");
+    registry
+        .execute("UPDATE machines SET usage_cursor=NULL", [])
+        .unwrap();
+    collect_as(&laptop, "liaison", &remote_ssh(&mac));
+    let again = ask("machine");
+    assert_eq!(again["groups"], by_machine["groups"]);
+    let as_of = machine_entry(&again, "laptop")["as_of_ms"]
+        .as_i64()
+        .unwrap();
+
+    // Silent for long, the laptop is not reached; what it carried still counts.
+    rusqlite::Connection::open(mac.registry())
+        .unwrap()
+        .execute(
+            "UPDATE fleet_usage_contacts SET received_ms=received_ms-600000",
+            [],
+        )
+        .unwrap();
+    let quiet = ask("machine");
+    let row = machine_entry(&quiet, "laptop");
+    assert_eq!(row["reached"], false, "{quiet}");
+    assert_eq!(row["as_of_ms"].as_i64(), Some(as_of), "{quiet}");
+    assert!(row["error"].as_str().unwrap().contains("lately"), "{quiet}");
+    assert_eq!(quiet["groups"], by_machine["groups"]);
+
+    // Its link removed here, nothing it carried is kept.
+    let removed = mac.run("fitforge", &["machine", "remove", "laptop"], None);
+    assert!(removed.status.success(), "{}", text(&removed));
+    let kept: i64 = rusqlite::Connection::open(mac.registry())
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM fleet_usage) + (SELECT COUNT(*) FROM fleet_usage_contacts)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 0);
+}
+
+#[test]
+fn usage_the_reached_machine_cannot_keep_never_stops_the_mail_or_moves_the_cursor() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    settled_job(
+        &laptop,
+        "liaison",
+        "a",
+        "claude/-/opus",
+        json!({"input": 1}),
+        now_ms() - 60_000,
+    );
+    rusqlite::Connection::open(mac.registry())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_usage BEFORE INSERT ON fleet_usage
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+    let waiting = mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "liaison", "kind": "notice", "body": "Built 9"}),
+    );
+    assert_eq!(waiting["delivery"], "pending", "{waiting}");
+
+    let collected = collect_as(&laptop, "liaison", &remote_ssh(&mac));
+    assert_eq!(collected["collected"][0]["delivered"], 1, "{collected}");
+    let notices = messages(&laptop, "liaison", "notice");
+    assert!(
+        notices.iter().any(|m| m["body"] == "Built 9"),
+        "{notices:?}"
+    );
+    let cursor: Option<String> = rusqlite::Connection::open(laptop.registry())
+        .unwrap()
+        .query_row(
+            "SELECT usage_cursor FROM machines WHERE name='mac'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursor, None, "nothing kept, so nothing passed");
+    let summary = mac.ok(
+        "fitforge",
+        "usage.summary",
+        json!({"since_ms": 0, "group_by": "machine"}),
+    );
+    assert_eq!(
+        machine_entry(&summary, "laptop")["reached"],
+        false,
+        "{summary}"
+    );
+
+    // Once the mac can keep it, the next collect carries it.
+    rusqlite::Connection::open(mac.registry())
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_usage")
+        .unwrap();
+    collect_as(&laptop, "liaison", &remote_ssh(&mac));
+    let summary = mac.ok(
+        "fitforge",
+        "usage.summary",
+        json!({"since_ms": 0, "group_by": "machine"}),
+    );
+    assert_eq!(summary["groups"][0]["key"], "laptop", "{summary}");
+    assert_eq!(summary["groups"][0]["jobs"], 1, "{summary}");
 }

@@ -134,6 +134,10 @@ struct Job {
     /// reported nothing: never zero for an unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     usage: Option<Value>,
+    /// The job's stdout dropped bytes from the middle of its log, so its
+    /// usage may be short of what the harness used.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    usage_partial: bool,
     /// Bundled Codex read-only crew must leave a durable report; otherwise a
     /// sandboxed no-op would be indistinguishable from successful work.
     #[serde(default)]
@@ -393,7 +397,9 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
         // A harness job's usage is read from its log once, as it settles,
         // and commits with the status that settled it.
         if terminal(&job.status) && !terminal(&before) && job.usage.is_none() {
-            job.usage = harness_usage(store, &job);
+            let (usage, cut) = harness_usage(store, &job);
+            job.usage = usage;
+            job.usage_partial = is_harness(&job) && (cut || job.stdout_dropped_bytes > 0);
         }
         conn.execute(
             "UPDATE jobs SET record=?2 WHERE id=?1",
@@ -424,10 +430,11 @@ fn is_harness(job: &Job) -> bool {
 /// The tokens a settled harness job reported in its log, read with the
 /// parser wakes use and normalized to `input`, `output`, `cacheRead`,
 /// `cacheWrite` and `totalTokens`. A hosted job writes to its pane, not its
-/// log, so it reports nothing here.
-fn harness_usage(store: &Store, job: &Job) -> Option<Value> {
+/// log, so it reports nothing here. Also whether the log was cut: a
+/// truncation marker stands where bytes were dropped.
+fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool) {
     if !is_harness(job) {
-        return None;
+        return (None, false);
     }
     let log = store
         .home()
@@ -436,20 +443,37 @@ fn harness_usage(store: &Store, job: &Job) -> Option<Value> {
         .join(&job.incarnation)
         .join("stdout.log");
     // A bounded log can be cut inside a UTF-8 character; keep the rest.
-    let text = fs::read(log)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .ok()?;
-    normalize_usage(&crate::activation::usage(&text)?)
+    let Ok(text) = fs::read(log).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()) else {
+        return (None, false);
+    };
+    let usage = crate::activation::usage(&text).and_then(|raw| normalize_usage(&raw));
+    (usage, log_cut(&text))
+}
+/// Whether a bounded log dropped bytes: its truncation marker is a line.
+fn log_cut(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.starts_with('{')
+            && line.contains(TRUNCATED)
+            && serde_json::from_str::<Value>(line).is_ok_and(|v| v["type"] == TRUNCATED)
+    })
 }
 /// One usage shape for every harness. Native launchers already print it;
 /// Codex prints `input_tokens` with its cached tokens inside, so the cached
 /// part moves to `cacheRead` and `input` is what was not cached, as the
-/// others count it. A missing total is the sum of the four. None when no
-/// field is recognized: a harness that reports nothing records no usage.
+/// others count it. Reasoning tokens a harness reports apart from its output
+/// (OpenCode, agy) are output, as providers bill them. A missing total is the
+/// sum of the four. None when no field is recognized: a harness that reports
+/// nothing records no usage.
 pub(crate) fn normalize_usage(raw: &Value) -> Option<Value> {
     let field = |names: &[&str]| names.iter().find_map(|name| raw[*name].as_u64());
     let mut input = field(&["input", "input_tokens"]);
-    let output = field(&["output", "output_tokens"]);
+    let output = match (
+        field(&["output", "output_tokens"]),
+        raw["reasoning"].as_u64(),
+    ) {
+        (None, None) => None,
+        (output, reasoning) => Some(output.unwrap_or(0) + reasoning.unwrap_or(0)),
+    };
     let mut cache_read = field(&["cacheRead", "cache_read_input_tokens"]);
     let cache_write = field(&["cacheWrite", "cache_creation_input_tokens"]);
     if let Some(cached) = raw["cached_input_tokens"].as_u64() {
@@ -2076,6 +2100,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .filter(|_| agent)
             .map(str::to_owned),
         usage: None,
+        usage_partial: false,
         codex_read_only_crew: args
             .get("codex_read_only_crew")
             .and_then(Value::as_bool)
@@ -2609,10 +2634,11 @@ fn capture(
 
 /// The line between head and tail that says how many bytes were dropped. It
 /// is its own line, so JSON-lines readers skip the cut edges.
+const TRUNCATED: &str = "privateer.log.truncated";
 fn truncation_marker(dropped: u64) -> Vec<u8> {
     format!(
         "\n{}\n",
-        json!({"type": "privateer.log.truncated", "dropped_bytes": dropped})
+        json!({"type": TRUNCATED, "dropped_bytes": dropped})
     )
     .into_bytes()
 }
@@ -2767,8 +2793,29 @@ mod reply_capture_tests {
                 "totalTokens": 1280})
             )
         );
-        assert_eq!(normalize_usage(&json!({"reasoning": 4})), None);
+        // OpenCode reports its reasoning apart from its output.
+        let opencode =
+            json!({"input": 3, "output": 2, "reasoning": 1, "cacheRead": 4, "cacheWrite": 0});
+        assert_eq!(
+            normalize_usage(&opencode),
+            Some(
+                json!({"input": 3, "output": 3, "cacheRead": 4, "cacheWrite": 0,
+                "totalTokens": 10})
+            )
+        );
+        assert_eq!(normalize_usage(&json!({"thinking": 4})), None);
         assert_eq!(normalize_usage(&json!({})), None);
+    }
+
+    #[test]
+    fn a_log_that_dropped_bytes_says_so_where_they_were() {
+        let marker = String::from_utf8(truncation_marker(4096)).unwrap();
+        assert!(log_cut(&format!(
+            "{{\"type\":\"turn.started\"}}{marker}tail"
+        )));
+        assert!(!log_cut(
+            "{\"type\":\"turn.completed\",\"note\":\"privateer.log.truncated\"}\n"
+        ));
     }
 }
 
