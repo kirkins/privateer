@@ -398,6 +398,14 @@ fn a_caller_memory_figure_cannot_shrink_an_explicit_manifest_crew() {
     assert_eq!(started["id"], "crew-explicit", "{started}");
     let job = f.json(None, "job.status", json!({"id":"crew-explicit"}));
     assert_eq!(job["estimate"]["memory_bytes"], 1u64 << 50, "{job}");
+    // Cancel once the supervisor has recorded the payload: a job still
+    // starting has no identity to signal yet.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while f.json(None, "job.status", json!({"id":"crew-explicit"}))["status"] == "starting"
+        && std::time::Instant::now() < until
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     f.json(None, "job.cancel", json!({"id":"crew-explicit"}));
 }
 

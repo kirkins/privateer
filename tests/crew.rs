@@ -372,7 +372,10 @@ fn a_crew_decision_reaches_the_first_mate_and_the_crew_reads_its_reply() {
     loop {
         fleet.tick();
         let status = fleet.ok("job.status", json!({"id": "asker"}), None);
-        if status["status"] != "running" && status["status"] != "launching" {
+        // A job passes through queued and starting before it runs.
+        if !["running", "launching", "starting", "queued"]
+            .contains(&status["status"].as_str().unwrap())
+        {
             assert_eq!(status["status"], "succeeded", "{status}");
             break;
         }
