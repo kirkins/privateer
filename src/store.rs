@@ -182,6 +182,7 @@ impl Store {
               PRIMARY KEY(task_id,issue_key));
             CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT,time_ms INTEGER NOT NULL,
               kind TEXT NOT NULL,payload TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS audit_time ON audit(time_ms,seq);
             CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),
               artifact TEXT NOT NULL,environment TEXT NOT NULL,charter_hash TEXT NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);")?;
         // Columns added after 0.1.0. Check and add them under the write lock
