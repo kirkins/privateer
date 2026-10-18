@@ -32,13 +32,14 @@ impl Fleet {
 ROOT='{root}'
 BIN='{bin}'
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
+MODE=$(cat "$ROOT/mode" 2>/dev/null)
 case "$PRIVATEER_JOB" in
   crew-resume-*)
     printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
     printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"{session}"}}\n'
+    if [ "$MODE" = aged_hold ]; then sleep 60; fi
     exit 0 ;;
 esac
-MODE=$(cat "$ROOT/mode" 2>/dev/null)
 if [ "$MODE" != nosession ]; then
   printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
 fi
@@ -53,8 +54,8 @@ case "$MODE" in
     sleep 60 ;;
   *)
     child='sleep 2; echo built'
-    if [ "$MODE" = slow ] || [ "$MODE" = aged ]; then child='sleep 6; echo built'; fi
-    if [ "$MODE" = aged ]; then sleep 5; fi
+    if [ "$MODE" = slow ] || [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then child='sleep 6; echo built'; fi
+    if [ "$MODE" = aged ] || [ "$MODE" = aged_hold ]; then sleep 5; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
@@ -92,6 +93,38 @@ esac
     }
     fn set_mode(&self, mode: &str) {
         fs::write(self.root.join("mode"), mode).unwrap();
+    }
+    /// Put a crew's park into a state a crash would leave it in.
+    fn set_park(&self, crew: &str, state: &str, attempt: i64, retries: i64) {
+        let conn =
+            rusqlite::Connection::open(self.root.join("engineering/.privateer/privateer.sqlite"))
+                .unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE crew_parks SET state=?2, attempt=?3, retries=?4 WHERE crew_job_id=?1",
+                rusqlite::params![crew, state, attempt, retries],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "no park for {crew}");
+    }
+    /// Start or stop the dispatcher service, whose passes run the recovery.
+    fn service(&self, verb: &str) {
+        let out = self
+            .command(None, &["service", verb])
+            .env("PRIVATEER_SERVICE", "detached")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "service {verb}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    /// The task's routes, as the captain lists them.
+    fn routes(&self, routes: Value) {
+        let file = self.root.join("routes.json");
+        fs::write(&file, routes.to_string()).unwrap();
+        self.ok(None, &["routes", "set", file.to_str().unwrap()]);
     }
     /// Give the ship's charter an 8 second job budget, so a crew's budget runs
     /// out while its heavy job still runs.
@@ -210,7 +243,8 @@ fn a_parked_crew_resumes_its_session_with_the_outcome() {
     let f = Fleet::new();
     f.set_mode("session");
     start_crew(&f, "crew-1");
-    let parked = f.wait("crew-1", &["parked"]);
+    // The resume can follow at once, so the park may already be past.
+    let parked = f.wait("crew-1", &["parked", "resumed"]);
     assert_eq!(parked["park"], "park-crew-1-1", "{parked}");
     f.wait("crew-resume-park-crew-1-1-1", &["succeeded"]);
     let resumed = f.wait("crew-1", &["resumed"]);
@@ -251,7 +285,8 @@ fn a_parked_crew_without_a_session_starts_fresh_with_a_handoff() {
     let f = Fleet::new();
     f.set_mode("nosession");
     start_crew(&f, "crew-2");
-    f.wait("crew-2", &["parked"]);
+    // The resume can follow at once, so the park may already be past.
+    f.wait("crew-2", &["parked", "resumed"]);
     f.wait("crew-resume-park-crew-2-1-1", &["succeeded"]);
     let launches = f.launches();
     assert_eq!(launches.len(), 2, "{launches:?}");
@@ -474,8 +509,9 @@ fn a_resume_held_by_a_stow_goes_through_admission() {
     f.wait("child-1", &["succeeded"]);
     std::thread::sleep(std::time::Duration::from_millis(2500));
     assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
-    let parked = f.json(None, "job.status", json!({"id": "crew-11"}));
-    assert_eq!(parked["status"], "parked", "{parked}");
+    // The resume joins the queue behind the stow: it is recorded, not launched.
+    f.wait("crew-resume-park-crew-11-1-1", &["queued"]);
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
     f.ok(None, &["stow", "resume"]);
     f.ok(
         None,
@@ -503,7 +539,13 @@ fn a_heavy_job_that_ends_after_the_crew_deadline_resumes_without_a_duplicate() {
     // The crew starts a 6 second job at 3 seconds. Its 8 second budget runs
     // out while the job is still going, so it parks, and the job ends after
     // the crew's deadline.
-    f.wait("crew-12", &["parked"]);
+    // The park is open while the crew's payload ends its turn (the park grace),
+    // so wait for the park itself, not for the job's parked status.
+    let until = Instant::now() + std::time::Duration::from_secs(60);
+    while !f.json(None, "job.status", json!({"id": "crew-12"}))["park"].is_string() {
+        assert!(Instant::now() < until, "crew-12 never parked");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let refused = f.run(
         Some("engineering"),
         &[
@@ -540,5 +582,186 @@ fn a_heavy_job_that_ends_after_the_crew_deadline_resumes_without_a_duplicate() {
     assert!(
         !notices.iter().any(|b| b.contains("crew-dup")),
         "a duplicate start reached the first mate: {notices:?}"
+    );
+}
+
+/// Closing a task ends its parked crew as cancelled, and cancels the heavy job
+/// it waits on. The first mate hears no crew failure.
+#[test]
+fn closing_the_task_ends_a_parked_crew_and_its_job_quietly() {
+    let f = Fleet::new();
+    f.set_mode("long");
+    start_crew(&f, "crew-20");
+    f.wait("crew-20", &["parked"]);
+    f.json(
+        None,
+        "task.update",
+        json!({"actor": "engineering", "id": "fix", "status": "cancelled"}),
+    );
+    let crew = f.wait("crew-20", &["cancelled"]);
+    assert_eq!(crew["reason"], "task fix is cancelled", "{crew}");
+    f.wait("child-1", &["cancelled"]);
+    let notices = f.ship_notices();
+    assert!(
+        !notices
+            .iter()
+            .any(|b| b.contains("crew-20") && b.to_lowercase().contains("fail")),
+        "a closed task's crew reported a failure: {notices:?}"
+    );
+}
+
+/// A spent park cap at the deadline ends the crew with the reason, and a
+/// crew with a heavy job outstanding has that job cancelled too.
+#[test]
+fn a_spent_park_cap_at_the_deadline_ends_the_crew_and_its_job() {
+    let f = Fleet::new();
+    f.set_mode("held");
+    f.json(
+        None,
+        "charter.put",
+        json!({"id": "engineering", "job_timeout_secs": 8, "crew_max_parks": 0}),
+    );
+    start_crew(&f, "crew-21");
+    let crew = f.wait("crew-21", &["timed_out"]);
+    assert!(
+        crew["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("the cap is 0"),
+        "{crew}"
+    );
+}
+
+#[test]
+fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
+    let f = Fleet::new();
+    f.set_mode("deadline");
+    f.json(
+        None,
+        "charter.put",
+        json!({"id": "engineering", "job_timeout_secs": 8, "crew_max_parks": 0}),
+    );
+    start_crew(&f, "crew-26");
+    let crew = f.wait("crew-26", &["timed_out"]);
+    assert!(
+        crew["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("the cap is 0"),
+        "{crew}"
+    );
+    f.wait("child-1", &["cancelled"]);
+}
+
+/// An identical repeat of a parked crew's start returns the job it already
+/// started; only a new launch on the task is refused.
+#[test]
+fn an_identical_repeat_of_a_parked_crews_start_returns_its_job() {
+    let f = Fleet::new();
+    f.set_mode("long");
+    start_crew(&f, "crew-22");
+    f.wait("crew-22", &["parked"]);
+    let again = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-22", "manifest": "bundled:claude"}),
+    );
+    assert_eq!(again["id"], "crew-22", "{again}");
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+}
+
+/// A resume that died mid-launch is recovered by the dispatcher: its one
+/// retry runs under the same resume id, and the crew resumes.
+#[test]
+fn a_resume_stuck_in_resuming_is_retried_once_under_its_own_id() {
+    let f = Fleet::new();
+    f.set_mode("slow");
+    let home = f.root.join("engineering/.privateer");
+    fs::write(
+        home.join("config.json"),
+        json!({"ship": "engineering", "resource_home": f.root.join("ledger")}).to_string(),
+    )
+    .unwrap();
+    start_crew(&f, "crew-23");
+    f.wait("crew-23", &["parked"]);
+    f.wait("child-1", &["succeeded"]);
+    // The launch of attempt 1 died before its job was recorded.
+    f.set_park("crew-23", "resuming", 1, 0);
+    f.service("start");
+    f.wait("crew-resume-park-crew-23-1-1", &["succeeded"]);
+    f.wait("crew-23", &["resumed"]);
+    f.service("stop");
+    assert_eq!(f.launches().len(), 2, "{:?}", f.launches());
+}
+
+/// A resume that does not start even after its retry fails the crew, with a
+/// reason the first mate can act on.
+#[test]
+fn a_resume_that_does_not_start_after_its_retry_fails_the_crew() {
+    let f = Fleet::new();
+    f.set_mode("slow");
+    let home = f.root.join("engineering/.privateer");
+    fs::write(
+        home.join("config.json"),
+        json!({"ship": "engineering", "resource_home": f.root.join("ledger")}).to_string(),
+    )
+    .unwrap();
+    start_crew(&f, "crew-24");
+    f.wait("crew-24", &["parked"]);
+    f.wait("child-1", &["succeeded"]);
+    f.set_park("crew-24", "resuming", 1, 1);
+    f.service("start");
+    let crew = f.wait("crew-24", &["failed"]);
+    f.service("stop");
+    assert!(
+        crew["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("did not start, even after one retry"),
+        "{crew}"
+    );
+}
+
+/// A parked crew whose route the captain has since removed resumes as a fresh
+/// crew on the first route still listed, not on the removed one.
+#[test]
+fn a_parked_crew_whose_route_was_removed_resumes_as_a_fresh_crew() {
+    let f = Fleet::new();
+    f.set_mode("slow");
+    let codex = |model: &str| json!({"manifest": "bundled:codex", "options": {"model": model}, "cost": "credits"});
+    f.routes(json!({
+        "routes": {"claude-route": {"manifest": "bundled:claude", "cost": "credits"}, "codex-route": codex("m")},
+        "crew": ["claude-route", "codex-route"]
+    }));
+    start_crew(&f, "crew-25");
+    f.wait("crew-25", &["parked"]);
+    f.routes(json!({"routes": {"codex-route": codex("m")}, "crew": ["codex-route"]}));
+    f.wait("child-1", &["succeeded"]);
+    let resume = f.wait("crew-resume-park-crew-25-1-1", &["succeeded", "failed"]);
+    assert!(
+        resume["command"].to_string().contains("codex"),
+        "the resume did not take the route left: {resume}"
+    );
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+}
+
+/// A resumed crew gets a fresh budget for its run, not what its predecessor
+/// left: the first incarnation ran about five seconds and parked, and the
+/// resumed run lasts its full eight-second budget before it parks again at
+/// its deadline (the park cap, not the budget, bounds the total).
+#[test]
+fn a_resumed_crew_gets_a_fresh_budget_for_its_run() {
+    let f = Fleet::new();
+    f.set_mode("aged_hold");
+    f.short_budget();
+    start_crew(&f, "crew-27");
+    f.wait("crew-27", &["parked"]);
+    f.wait("child-1", &["succeeded"]);
+    let resumed = Instant::now();
+    f.wait("crew-resume-park-crew-27-1-1", &["parked", "timed_out"]);
+    assert!(
+        resumed.elapsed() >= std::time::Duration::from_secs(7),
+        "the resumed crew ended before a fresh budget: {:?}",
+        resumed.elapsed()
     );
 }

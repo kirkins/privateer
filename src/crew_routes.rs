@@ -407,6 +407,40 @@ pub(crate) fn retry_refusal(store: &Store, ship: &str, route: &str) -> Result<Op
     )))
 }
 
+/// Whether a parked crew may resume on the route it was launched on: the
+/// captain lists it for the crew's ship (or lists no crew routes, which
+/// restricts nothing), and it is not backing off. A resume is a runtime
+/// launch, so it is checked here as an agent start is in `check`.
+pub(crate) fn resume_route(
+    store: &Store,
+    ship: &str,
+    manifest: &str,
+    options: &Value,
+) -> Result<bool> {
+    let Some(policy) = for_store(store)? else {
+        return Ok(true);
+    };
+    let names = order(&policy, ship, "crew");
+    if names.is_empty() {
+        return Ok(true);
+    }
+    let Some(wanted) = crate::routes::route_of(manifest, options) else {
+        return Ok(false);
+    };
+    let listed = names
+        .iter()
+        .find(|n| identity(&policy["routes"][n.as_str()]).as_deref() == Some(wanted.as_str()));
+    let Some(name) = listed else {
+        return Ok(false);
+    };
+    let route = &policy["routes"][name.as_str()];
+    Ok(identity(route)
+        .map(|id| crate::routes::refusal(store, &id))
+        .transpose()?
+        .flatten()
+        .is_none())
+}
+
 /// The routes file with, for each ship that has lists of its own, which list
 /// applies to each kind: the ship's own, or the fleet's.
 fn show(value: Option<Value>) -> Value {

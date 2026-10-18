@@ -500,6 +500,16 @@ pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<Strin
             break;
         }
     }
+    // A spent cap ends the crew at its deadline: the job it would wait on is
+    // cancelled, and the job times out with the reason.
+    let task = job["task_id"].as_str().context("job task")?.to_owned();
+    let root = chain.last().context("crew lineage")?.clone();
+    if let Some(reason) = spent_cap(store, &root, &task, true)? {
+        if let Some(child) = &waiting {
+            crate::jobs::cancel_crew(store, child)?;
+        }
+        bail!("{reason}; the crew ends at its deadline");
+    }
     let parked = match &waiting {
         Some(child) => (
             child.as_str(),
@@ -512,8 +522,7 @@ pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<Strin
             "its time budget ran out with no heavy job outstanding".to_owned(),
         ),
     };
-    // A cap that is spent leaves the job to time out as it always did.
-    Ok(open_park(store, &job, parked.0, &parked.2, parked.1).ok())
+    Ok(Some(open_park(store, &job, parked.0, &parked.2, parked.1)?))
 }
 
 /// Open a park on `child` (empty for a held crew), in one transaction with
@@ -701,6 +710,23 @@ fn stowed(store: &Store) -> Result<bool> {
 /// Parks whose child settled while nothing was watching (the dispatcher was
 /// down, or a settlement was missed) resume now. Each is claimed once.
 pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
+    // A spent cap ends a parked crew even while the fleet is stowed.
+    let parked: Vec<(String, String)> = {
+        let mut stmt = store
+            .connection()
+            .prepare("SELECT id, crew_job_id FROM crew_parks WHERE state='parked'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (park, crew) in parked {
+        if let Some(reason) = spent_cap_for_park(store, &park)? {
+            store.audit(
+                "crew.park_cap_spent",
+                &json!({"job_id": crew, "park": park, "reason": reason}),
+            )?;
+            crate::jobs::end_parked(store, &crew, &format!("{reason}; the park ends"))?;
+        }
+    }
     // A stowed fleet starts nothing, so parks wait for `stow resume`.
     if stowed(store)? {
         return Ok(());
@@ -718,6 +744,130 @@ pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
                 "crew.resume_failed",
                 &json!({"job_id": child, "error": format!("{error:#}")}),
             )?;
+        }
+    }
+    recover_resuming(store)
+}
+
+/// Why a crew may no longer park: the elapsed cap, or the park count. A new
+/// park needs a count under the cap; a parked crew only ends when the charter
+/// has since lowered the cap below the parks it already has. `None` while it
+/// may.
+fn spent_cap(store: &Store, root: &str, task: &str, new_park: bool) -> Result<Option<String>> {
+    let charter = store.authorize(task, "spawn").unwrap_or(Value::Null);
+    let max_parks = charter
+        .get("crew_max_parks")
+        .and_then(Value::as_u64)
+        .unwrap_or(MAX_PARKS);
+    let max_elapsed = charter
+        .get("crew_max_elapsed_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(MAX_ELAPSED_SECS);
+    let created = crate::jobs::record(store, root)?["created_ms"]
+        .as_i64()
+        .unwrap_or_else(Store::now_ms);
+    let elapsed_ms = Store::now_ms() - created;
+    if elapsed_ms > (max_elapsed as i64).saturating_mul(1000) {
+        return Ok(Some(format!(
+            "crew {root} has run for more than {max_elapsed} seconds in total; its park ends"
+        )));
+    }
+    let parks: i64 = store.connection().query_row(
+        "SELECT COUNT(*) FROM crew_parks WHERE root=?1",
+        [root],
+        |r| r.get(0),
+    )?;
+    let over = if new_park {
+        parks as u64 >= max_parks
+    } else {
+        parks as u64 > max_parks
+    };
+    if over {
+        return Ok(Some(format!(
+            "crew {root} has parked {parks} times; the cap is {max_parks}"
+        )));
+    }
+    Ok(None)
+}
+
+/// `spent_cap` for a park that is already open.
+fn spent_cap_for_park(store: &Store, park: &str) -> Result<Option<String>> {
+    let (root, task): (String, String) = store.connection().query_row(
+        "SELECT root, task_id FROM crew_parks WHERE id=?1",
+        [park],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    spent_cap(store, &root, &task, false)
+}
+
+/// A park whose resume was recorded `resuming`. The resumed job settles the
+/// park as resumed once it is no longer queued. A resume whose job never
+/// landed (the process died mid-launch) is retried once under its own id, and
+/// fails the crew with a notice if that does not land either.
+fn recover_resuming(store: &mut Store) -> Result<()> {
+    let rows: Vec<(String, String, String, i64)> = {
+        let mut stmt = store.connection().prepare(
+            "SELECT id, crew_job_id, child_job_id, retries FROM crew_parks WHERE state='resuming'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (park, crew, child, retries) in rows {
+        // A park waits on its child: its outcome is what the resume reads.
+        if !child.is_empty() {
+            let settled = crate::jobs::record(store, &child).is_ok_and(|job| {
+                matches!(
+                    job["status"].as_str(),
+                    Some("succeeded" | "failed" | "cancelled" | "timed_out")
+                )
+            });
+            if !settled {
+                continue;
+            }
+        }
+        let attempt: i64 = store.connection().query_row(
+            "SELECT attempt FROM crew_parks WHERE id=?1",
+            [&park],
+            |r| r.get(0),
+        )?;
+        let id = format!("crew-resume-{park}-{attempt}");
+        let status: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT json_extract(record,'$.status') FROM jobs WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match status.as_deref() {
+            Some("queued" | "starting") => {}
+            Some(_) => {
+                set_state(store, &park, "resumed")?;
+                crate::jobs::finish_resumed(store, &crew, &id)?;
+            }
+            None if retries == 0 => {
+                let (lead, settlement) = if child.is_empty() {
+                    (
+                        "Your crew was held at its time budget with no heavy job outstanding, and its first mate resumed it.".to_owned(),
+                        "Continue your task from your last actions below.".to_owned(),
+                    )
+                } else {
+                    let job = crate::jobs::record(store, &child)?;
+                    (
+                        "Your heavy job has settled; its outcome:".to_owned(),
+                        settlement_text(store, &job),
+                    )
+                };
+                launch_resume(store, &park, &crew, &lead, &settlement, true)?;
+            }
+            None => {
+                set_state(store, &park, "failed")?;
+                crate::jobs::fail_parked(
+                    store,
+                    &crew,
+                    &format!("resume {id} did not start, even after one retry"),
+                )?;
+            }
         }
     }
     Ok(())
@@ -750,32 +900,60 @@ pub(crate) fn cancel_park(store: &Store, park: &str) -> Result<Option<String>> {
 }
 
 /// Resume a parked or held crew: a new launch through agent.start, so
-/// admission, the stow hold and the current routes all apply. The native
-/// session resumes when the launch still names the harness that wrote it;
-/// otherwise a fresh crew starts with the park's next step as its handoff.
-/// The launch runs as the runtime, so the budget carried over is kept.
+/// admission, the stow hold and the current routes all apply. The park's
+/// route resumes only while the captain still lists it for the ship and it is
+/// not backing off; otherwise the crew starts fresh on the first available
+/// route. The native session resumes only when the launch that would run
+/// names the harness that wrote it. The launch runs as the runtime, so it
+/// carries the crew's recorded estimate and the budget it has spent.
 fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &str) -> Result<()> {
-    let (task, next, harness, attempt) = store.connection().query_row(
-        "SELECT task_id, next, harness, attempt FROM crew_parks WHERE id=?1",
+    launch_resume(store, park, crew, lead, settlement, false)
+}
+
+/// A resume launch. A retry (`retry`) keeps the attempt that did not land, so
+/// it runs under the same resume id.
+fn launch_resume(
+    store: &mut Store,
+    park: &str,
+    crew: &str,
+    lead: &str,
+    settlement: &str,
+    retry: bool,
+) -> Result<()> {
+    let (task, ship, next, harness, attempt) = store.connection().query_row(
+        "SELECT task_id, ship, next, harness, attempt FROM crew_parks WHERE id=?1",
         [park],
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, i64>(3)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         },
     )?;
-    let attempt = attempt + 1;
+    let attempt = if retry { attempt } else { attempt + 1 };
     let crew_record = crate::jobs::record(store, crew)?;
     let launch = crew_record["launch"].clone();
     let launch_harness = launch["manifest"]
         .as_str()
         .and_then(crate::bundled::harness);
     let id = format!("crew-resume-{park}-{attempt}");
-    // The native session the crew reported starting, from its complete log,
-    // when the launch still names the same harness.
+    let route_ok = crate::crew_routes::resume_route(
+        store,
+        &ship,
+        launch["manifest"].as_str().unwrap_or_default(),
+        &launch["options"],
+    )?;
+    // The harness the launch would run. A route the captain no longer offers
+    // runs nothing of the old session: that resume starts fresh.
+    let current = if route_ok {
+        launch_harness.clone()
+    } else {
+        None
+    };
+    // The native session the crew reported starting, from its complete log.
     let logs = store
         .home()
         .join("jobs")
@@ -788,22 +966,35 @@ fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &st
         }
         None => None,
     };
-    let same_session = session.is_some() && launch_harness == harness;
-    // The launch's own settings come back as they were given. The resumed
-    // crew gets a fresh budget; the parks and the elapsed cap bound the total.
-    let mut args = json!({"id": id, "task_id": task});
-    for key in [
-        "heavy",
-        "manifest",
-        "options",
-        "config",
-        "tool_bundles",
-        "cwd",
-    ] {
+    let same_session = session.is_some() && current.is_some() && current == harness;
+    // The launch's own settings come back as they were given, on the parked
+    // route or, when that route is gone, on the first one still offered.
+    let mut args = json!({"id": id, "task_id": task, "wait_for_capacity": true});
+    let keys: &[&str] = if route_ok {
+        &[
+            "heavy",
+            "manifest",
+            "options",
+            "config",
+            "tool_bundles",
+            "cwd",
+        ]
+    } else {
+        &["heavy", "config", "tool_bundles", "cwd"]
+    };
+    for key in keys {
         if !launch[key].is_null() {
             args[key] = launch[key].clone();
         }
     }
+    if route_ok && !crew_record["estimate"].is_null() {
+        // The estimate the crew was admitted under, memory included: the
+        // launch record has no route figure to size it again from.
+        args["_resume_estimate"] = crew_record["estimate"].clone();
+    }
+    // Each resume gets a fresh budget (see `supervise_inner`); the run time
+    // carried here is recorded on the job for reporting and bearings only.
+    args["_run_ms"] = json!(crew_record["run_ms"].as_u64().unwrap_or(0));
     if same_session {
         // The resumed session already holds the brief and its earlier turns.
         args["options"]["resume"] = json!(session);
@@ -817,6 +1008,10 @@ fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &st
              Your last actions before the park, from your log:\n{last}"
         ));
     }
+    store.connection().execute(
+        "UPDATE crew_parks SET attempt=?2, updated_ms=?3, retries=retries+?4 WHERE id=?1",
+        params![park, attempt, Store::now_ms(), i64::from(retry)],
+    )?;
     // A resume is the runtime's own launch: a crew's agent caller would not
     // be allowed to set the budget it carries, nor would the first mate.
     let caller = store.caller().clone();
@@ -825,19 +1020,21 @@ fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &st
     store.set_caller(caller);
     match started {
         Ok(started) => {
+            let resumed = started["id"].as_str().unwrap_or(&id).to_owned();
+            let admitted = !matches!(started["status"].as_str(), Some("queued" | "starting"));
             store.connection().execute(
-                "UPDATE crew_parks SET state='resumed', resumed_job_id=?2, attempt=?3,
-                   session=?4, updated_ms=?5 WHERE id=?1",
+                "UPDATE crew_parks SET state=?2, resumed_job_id=?3, session=?4, updated_ms=?5
+                   WHERE id=?1",
                 params![
                     park,
-                    started["id"].as_str().unwrap_or(&id),
-                    attempt,
-                    session,
+                    if admitted { "resumed" } else { "resuming" },
+                    resumed,
+                    session.filter(|_| same_session),
                     Store::now_ms()
                 ],
             )?;
             // The crew's record now says where its work went; it reports nothing.
-            crate::jobs::finish_resumed(store, crew, &id)?;
+            crate::jobs::finish_resumed(store, crew, &resumed)?;
         }
         Err(_) if stowed(store)? => {
             // A stow holds the resume like any launch: it is not a failure. The
@@ -846,8 +1043,8 @@ fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &st
         }
         Err(error) => {
             store.connection().execute(
-                "UPDATE crew_parks SET state='failed', attempt=?2, updated_ms=?3 WHERE id=?1",
-                params![park, attempt, Store::now_ms()],
+                "UPDATE crew_parks SET state='failed', updated_ms=?2 WHERE id=?1",
+                params![park, Store::now_ms()],
             )?;
             crate::jobs::fail_parked(store, crew, &format!("resume failed: {error:#}"))?;
         }
@@ -903,9 +1100,10 @@ fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
 /// Crews of a ship that are parked on a heavy job or held, for bearings.
 pub(crate) fn parked_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     let mut stmt = store.connection().prepare(
-        "SELECT p.crew_job_id, p.child_job_id, p.next, p.state, p.task_id FROM crew_parks p
+        "SELECT p.crew_job_id, p.child_job_id, p.next, p.state, p.task_id, p.root FROM crew_parks p
            JOIN jobs j ON j.id=p.crew_job_id
-           WHERE p.ship=?1 AND p.state IN ('parked','held') AND json_extract(j.record,'$.status')='parked'
+           WHERE p.ship=?1 AND p.state IN ('parked','held')
+             AND json_extract(j.record,'$.status') IN ('parked','launching','running')
            ORDER BY p.created_ms LIMIT 20",
     )?;
     let rows = stmt.query_map([ship], |r| {
@@ -915,18 +1113,30 @@ pub(crate) fn parked_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
         ))
     })?;
     let mut lines = vec![];
     for row in rows {
-        let (crew, child, next, state, task) = row?;
+        let (crew, child, next, state, task, root) = row?;
+        let parks: i64 = store.connection().query_row(
+            "SELECT COUNT(*) FROM crew_parks WHERE root=?1",
+            [&root],
+            |r| r.get(0),
+        )?;
+        let max = store
+            .authorize(&task, "spawn")
+            .ok()
+            .and_then(|charter| charter.get("crew_max_parks").and_then(Value::as_u64))
+            .unwrap_or(MAX_PARKS);
+        let count = format!("park {parks} of {max}");
         lines.push(if state == "held" {
             format!(
-                "Crew {crew} is held at its time budget with no heavy job outstanding; crew.resume {{\"task_id\":\"{task}\"}} continues it."
+                "Crew {crew} is held at its time budget with no heavy job outstanding ({count}); crew.resume {{\"task_id\":\"{task}\"}} continues it."
             )
         } else {
             format!(
-                "Crew {crew} is parked on job {child} and resumes when it settles. Next: {}",
+                "Crew {crew} is parked on job {child} ({count}) and resumes when it settles. Next: {}",
                 clip(&next, NEXT_CHARS)
             )
         });
@@ -939,7 +1149,8 @@ pub(crate) fn parked_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
 pub(crate) fn parked_crews(store: &Store, task: &str) -> Result<Vec<String>> {
     let mut stmt = store.connection().prepare(
         "SELECT p.crew_job_id FROM crew_parks p JOIN jobs j ON j.id=p.crew_job_id
-           WHERE p.task_id=?1 AND p.state IN ('parked','held') AND json_extract(j.record,'$.status')='parked'",
+           WHERE p.task_id=?1 AND p.state IN ('parked','held')
+             AND json_extract(j.record,'$.status') IN ('parked','launching','running')",
     )?;
     let rows = stmt.query_map([task], |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

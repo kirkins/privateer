@@ -345,7 +345,8 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
     } else {
         source_repo.clone()
     };
-    let mut context = json!({"task_id": id, "title": title, "repo": repo,"source_repo":source_repo,"owner": task["owner"], "actions": charter["actions"], "control":{"version":1,"cli_argv":[executable,"--home",store.home()],"writable":writable}});
+    let crew = !crate::workspace::is_wake(store, args)?;
+    let mut context = json!({"task_id": id, "title": title, "repo": repo,"source_repo":source_repo,"owner": task["owner"], "actions": charter["actions"], "crew": crew, "control":{"version":1,"cli_argv":[executable,"--home",store.home()],"writable":writable}});
     // Wake-specific text goes after the stable brief, so the brief's bytes
     // stay identical across wakes and its prefix keeps hitting the cache.
     let mut text = brief(&context);
@@ -366,8 +367,15 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
 fn brief(context: &Value) -> String {
     let task = context["task_id"].as_str().unwrap_or("");
     let owner = context["owner"].as_str().unwrap_or("");
+    // Where a heavy job's outcome goes depends on who runs the job: a crew
+    // parks on it and resumes with the outcome; a first mate's goes to mail.
+    let outcome = if context["crew"] == json!(true) {
+        "Its outcome arrives as your resume prompt: do not poll for it; run crew.park with its job_id and a one-line next, then end your turn"
+    } else {
+        "Its outcome goes to your first mate"
+    };
     format!(
-        "Task {task}: {}\nRepository: {}\nAuthorized actions: {}\nWork within the charter; coordinate with peers by task-linked messages; report tested results. Ask before production deployment. Never widen your authority or change a provider route. You are agent {owner}: operator commands are refused and actor/from must be {owner}.\nPrivateer control protocol v1: CLI base argv {}. Append COMMAND, --json, JSON as separate argv elements (no shell interpolation). Commands:\n- task.update {}\n- mail.inbox {{\"address\":\"{owner}\"}}; after handling, mail.ack {{\"address\":\"{owner}\",\"through_seq\":N}}\n- mail.send {{\"from\":\"{owner}\",\"to\":\"ship\",\"kind\":\"request|notice|reply\",\"body\":\"...\",\"task_id\":\"{task}\"}}; a reply sets correlation to the request id. ship.list {{}} shows who handles what\n- Builds/test suites that load the machine: job.start {{\"task_id\":\"{task}\",\"command\":[...],\"heavy\":true,\"wait_for_capacity\":true}}, its outcome goes to your first mate; crews park instead (crew.park). resource.configure tunes host limits if your person asks\n- Crew (started by your first mate, not woken): assignment in note.get {{\"ship\":\"{owner}\",\"focus\":\"task:{task}\"}}; crew.report {{\"kind\":\"progress|decision\",\"body\":\"...\"}}; read a decision's answer with crew.answer {{\"id\":\"...\",\"wait_secs\":300}}\n- Mail reaches ships in other homes too; peer.call {{\"name\":\"peer\",\"command\":...,\"args\":{{...}}}} runs other commands there\n- task.create {{\"id\":\"unique-child\",\"parent\":\"{task}\",\"owner\":\"peer-owner\",\"title\":\"bounded outcome\"}}\n- task.handoff {{\"id\":\"{task}\",\"actor\":\"{owner}\",\"target\":\"peer-owner\"}}; custody changes only when target calls task.accept.\nRead structured results; do not claim a message, handoff, test, merge or deployment succeeded without evidence.",
+        "Task {task}: {}\nRepository: {}\nAuthorized actions: {}\nWork within the charter; coordinate with peers by task-linked messages; report tested results. Ask before production deployment. Never widen your authority or change a provider route. You are agent {owner}: operator commands are refused and actor/from must be {owner}.\nPrivateer control protocol v1: CLI base argv {}. Append COMMAND, --json, JSON as separate argv elements (no shell interpolation). Commands:\n- task.update {}\n- mail.inbox {{\"address\":\"{owner}\"}}; after handling, mail.ack {{\"address\":\"{owner}\",\"through_seq\":N}}\n- mail.send {{\"from\":\"{owner}\",\"to\":\"ship\",\"kind\":\"request|notice|reply\",\"body\":\"...\",\"task_id\":\"{task}\"}}; a reply sets correlation to the request id. ship.list {{}} shows who handles what\n- Builds/test suites that load the machine: job.start {{\"task_id\":\"{task}\",\"command\":[...],\"heavy\":true,\"wait_for_capacity\":true}}, {outcome}. resource.configure tunes host limits if your person asks\n- Crew (started by your first mate, not woken): assignment in note.get {{\"ship\":\"{owner}\",\"focus\":\"task:{task}\"}}; crew.report {{\"kind\":\"progress|decision\",\"body\":\"...\"}}; read a decision's answer with crew.answer {{\"id\":\"...\",\"wait_secs\":300}}\n- Mail reaches ships in other homes too; peer.call {{\"name\":\"peer\",\"command\":...,\"args\":{{...}}}} runs other commands there\n- task.create {{\"id\":\"unique-child\",\"parent\":\"{task}\",\"owner\":\"peer-owner\",\"title\":\"bounded outcome\"}}\n- task.handoff {{\"id\":\"{task}\",\"actor\":\"{owner}\",\"target\":\"peer-owner\"}}; custody changes only when target calls task.accept.\nRead structured results; do not claim a message, handoff, test, merge or deployment succeeded without evidence.",
         context["title"].as_str().unwrap_or(""),
         context["repo"].as_str().unwrap_or(""),
         context["actions"],

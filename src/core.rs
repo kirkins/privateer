@@ -235,6 +235,7 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
     let actor = required(&args, "actor")?;
     let tx = store.write_transaction()?;
     let task = store.task(id)?;
+    let mut closed = None;
     if command == "task.accept" {
         if task["handoff_to"].as_str() != Some(actor) {
             bail!("no handoff offered to this actor");
@@ -274,11 +275,19 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
             )?;
             if matches!(status, "done" | "cancelled") {
                 crate::mail::close_task(store, id, status)?;
+                closed = Some(status.to_owned());
             }
         }
     }
     store.audit(command, &json!({"id":id,"actor":actor}))?;
     tx.commit()?;
+    // A closed task ends its parked crews quietly, and the heavy jobs they
+    // wait on. This runs after the close commits, since it stops processes.
+    if let Some(status) = closed {
+        for crew in crate::crew::parked_crews(store, id)? {
+            crate::jobs::end_parked(store, &crew, &format!("task {id} is {status}"))?;
+        }
+    }
     store.task(id)
 }
 

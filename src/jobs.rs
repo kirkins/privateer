@@ -322,6 +322,7 @@ pub fn init(store: &Store) -> Result<()> {
            crew_job_id TEXT NOT NULL, child_job_id TEXT NOT NULL, task_id TEXT NOT NULL,
            ship TEXT NOT NULL, state TEXT NOT NULL, next TEXT NOT NULL, harness TEXT,
            session TEXT, resumed_job_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+           retries INTEGER NOT NULL DEFAULT 0,
            created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);",
     )?;
@@ -1910,7 +1911,11 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .unwrap_or(false),
         // Only the agent path records a launch, and only the runtime's own
         // resume carries an earlier run time: see `crew::resume`.
-        run_ms: 0,
+        run_ms: if agent {
+            args.get("_run_ms").and_then(Value::as_u64).unwrap_or(0)
+        } else {
+            0
+        },
         park: None,
         launch: agent.then(|| args.get("launch").cloned()).flatten(),
     };
@@ -2766,11 +2771,18 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         )
     };
     let spawned = Instant::now();
-    // The budget is this incarnation's process time: queued and parked time is
-    // not in it, and a resume is a fresh grant (see `crew::resume`).
+    const PARK_GRACE: Duration = Duration::from_secs(5);
+    // Each incarnation gets a fresh grant of the charter's budget. Queued and
+    // parked time is not in it; the total is bounded by the park and 24 h caps
+    // (see `crew::park_at_deadline`), not by summing run time across resumes.
     let deadline = spawned + Duration::from_secs(job.timeout_secs);
     let mut outcome = "succeeded";
     let mut reason = None;
+    // Why a crew at its deadline could not park: the job then times out with it.
+    let mut park_refused = None;
+    // When the crew's park was first seen: its harness has this long to end
+    // its turn before the payload is signalled.
+    let mut park_seen: Option<Instant> = None;
     let mut terminated_at = None;
     let mut leader_status = None;
     let mut killed = false;
@@ -2854,17 +2866,21 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                             "crew.park_failed",
                             &json!({"job_id": id, "error": format!("{error:#}")}),
                         )?;
+                        park_refused = Some(format!("{error:#}"));
                         None
                     }
                 }
             }
             None => None,
         };
+        if parking.is_some() && park_seen.is_none() {
+            park_seen = Some(Instant::now());
+        }
+        let grace = park_seen.is_some_and(|seen| seen.elapsed() < PARK_GRACE);
         if terminated_at.is_none()
             && (job.cancel_requested
                 || authority_error.is_some()
-                || parking.is_some()
-                || Instant::now() >= deadline)
+                || (!grace && (parking.is_some() || Instant::now() >= deadline)))
         {
             outcome = if job.cancel_requested || authority_error.is_some() {
                 "cancelled"
@@ -2879,6 +2895,8 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 "cancellation requested".into()
             } else if let Some(park) = &parking {
                 format!("crew parked: {park}")
+            } else if let Some(refused) = &park_refused {
+                format!("job deadline reached; {refused}")
             } else {
                 "job deadline reached".into()
             });
@@ -3231,6 +3249,35 @@ pub(crate) fn fail_parked(store: &Store, crew: &str, reason: &str) -> Result<()>
     Ok(())
 }
 
+/// End a parked crew as cancelled, with `reason`, and quietly: no notice goes
+/// to its first mate. Nothing runs while parked, so the crew ends here, and so
+/// does the work it waits on. The park closes first, so the child's settlement
+/// does not resume the crew.
+pub(crate) fn end_parked(store: &Store, id: &str, reason: &str) -> Result<Value> {
+    let parked = load(store, id)?;
+    let child = crate::crew::cancel_park(store, parked.park.as_deref().unwrap_or_default())?;
+    if matches!(parked.status.as_str(), "launching" | "running") {
+        // Still ending its turn (the park grace): the park is closed, so the
+        // payload's exit cannot park it again. It is cancelled as a running crew.
+        if let Some(child) = child {
+            cancel(store, &child)?;
+        }
+        return cancel(store, id);
+    }
+    let job = alter(store, id, |j| {
+        if j.status == "parked" {
+            j.status = "cancelled".into();
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some(reason.to_owned());
+        }
+    })?;
+    release(store, &job)?;
+    if let Some(child) = child {
+        cancel(store, &child)?;
+    }
+    Ok(public_job(&job))
+}
+
 /// Cancel a crew and what it waits on, for a launch that replaces it.
 pub(crate) fn cancel_crew(store: &Store, id: &str) -> Result<()> {
     cancel(store, id)?;
@@ -3258,22 +3305,7 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
         return Ok(public_job(&job));
     }
     if job.status == "parked" {
-        // Nothing runs while parked: the crew ends here, and so does the work
-        // it waits on. The park closes first, so the child's settlement does
-        // not resume the crew.
-        let child = crate::crew::cancel_park(store, job.park.as_deref().unwrap_or_default())?;
-        job = alter(store, id, |j| {
-            if j.status == "parked" {
-                j.status = "cancelled".into();
-                j.finished_ms = Some(Store::now_ms());
-                j.reason = Some("cancelled while parked".into());
-            }
-        })?;
-        release(store, &job)?;
-        if let Some(child) = child {
-            cancel(store, &child)?;
-        }
-        return Ok(public_job(&job));
+        return end_parked(store, id, "cancelled while parked");
     }
     let supervisor_alive = match &job.supervisor {
         Some(p) => same_process(p)?,
