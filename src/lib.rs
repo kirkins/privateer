@@ -17,6 +17,7 @@ pub mod dashboard;
 pub mod door;
 pub mod errand;
 mod executable;
+mod feed;
 pub mod fleet;
 pub mod grants;
 pub mod herdr;
@@ -89,6 +90,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "stow.resume",
     "captain.reply",
     "captain.dismiss",
+    "captain.feed",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
