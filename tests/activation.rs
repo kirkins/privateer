@@ -1353,3 +1353,136 @@ print(json.dumps({"id":r["id"],"version":1,"ok":True,"result":{"argv":[sys.execu
         String::from_utf8_lossy(&malformed.stderr)
     );
 }
+
+#[test]
+fn wakes_errands_and_crew_record_their_usage_and_route_and_the_summary_sums_them() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    let job = |fleet: &Fleet, id: &Value| fleet.ok("job.status", json!({"id": id}), None);
+    let wait_job = |fleet: &Fleet, id: &str| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let record = fleet.ok("job.status", json!({"id": id}), None);
+            if matches!(
+                record["status"].as_str(),
+                Some("succeeded" | "failed" | "cancelled" | "timed_out")
+            ) {
+                return record;
+            }
+            assert!(std::time::Instant::now() < until, "job {id} never ended");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    // A wake: Codex counts its cached tokens inside its input.
+    fleet.send(json!({"id":"q","from":"apps","to":"infra","kind":"request","body":"Healthy?"}));
+    fleet.tick();
+    let wake = fleet.settle();
+    let woke = job(&fleet, &wake["job_id"]);
+    assert_eq!(
+        woke["usage"],
+        json!({"input":200,"output":80,"cacheRead":1000,"cacheWrite":0,"totalTokens":1280}),
+        "{woke}"
+    );
+    let route = woke["model_route"].as_str().unwrap().to_owned();
+    let harness = route.split('/').next().unwrap().to_owned();
+
+    // An errand.
+    let started = fleet.ok(
+        "errand.start",
+        json!({"focus":"task:infra-repair","brief":"Review the cache rebuild."}),
+        Some("infra"),
+    );
+    let errand = started["errand"].as_str().unwrap().to_owned();
+    assert_eq!(errand_settled(&mut fleet, &errand)["status"], "succeeded");
+    let reviewed = job(&fleet, &json!(errand));
+    assert_eq!(
+        reviewed["usage"],
+        json!({"input":900,"output":40,"cacheRead":0,"cacheWrite":0,"totalTokens":940}),
+        "{reviewed}"
+    );
+    assert_eq!(reviewed["model_route"], route.as_str());
+    // Its verdict mail may have woken the first mate; let that wake end first.
+    fleet.settle();
+
+    // Crew, with no dispatcher pass between them, so no wake joins them: one
+    // reports usage, one reports nothing and records none, not zero.
+    let crews_from = privateer::store::Store::now_ms();
+    fleet.mode("crew");
+    let start = |fleet: &Fleet, id: &str| {
+        fleet.ok(
+            "agent.start",
+            json!({"id":id,"task_id":"infra-repair"}),
+            Some("infra"),
+        )
+    };
+    start(&fleet, "counted");
+    let counted = wait_job(&fleet, "counted");
+    assert_eq!(counted["status"], "succeeded", "{counted}");
+    assert_eq!(
+        counted["usage"],
+        json!({"input":200,"output":30,"cacheRead":100,"cacheWrite":0,"totalTokens":330}),
+        "{counted}"
+    );
+    assert_eq!(counted["model_route"], route.as_str());
+    fleet.mode("fail");
+    start(&fleet, "silent");
+    let silent = wait_job(&fleet, "silent");
+    assert_eq!(silent["status"], "failed", "{silent}");
+    assert!(silent["usage"].is_null(), "{silent}");
+    assert_eq!(silent["model_route"], route.as_str());
+    let crews_until = privateer::store::Store::now_ms() + 1;
+
+    // The summary reads the records: grouped any way, the two crew are one
+    // group here, with the silent one's harness named as a gap.
+    let summary = |group_by: &str, since: i64, until: Value| {
+        fleet.ok(
+            "usage.summary",
+            json!({"since_ms": since, "until_ms": until, "group_by": group_by}),
+            None,
+        )
+    };
+    let crew_usage =
+        json!({"input":200,"output":30,"cacheRead":100,"cacheWrite":0,"totalTokens":330});
+    for (group_by, key) in [("route", json!(route)), ("ship", json!("infra"))] {
+        let read = summary(group_by, crews_from, json!(crews_until));
+        assert_eq!(read["group_by"], group_by);
+        assert_eq!(
+            read["groups"],
+            json!([{"key": key, "jobs": 2, "usage": crew_usage, "gaps": [harness]}]),
+            "{read}"
+        );
+    }
+    let by_day = summary("day", crews_from, json!(crews_until));
+    let day = by_day["groups"][0]["key"].as_str().unwrap();
+    assert_eq!(day.len(), 10, "{by_day}");
+    assert_eq!(by_day["groups"][0]["jobs"], 2, "{by_day}");
+    let by_machine = summary("machine", crews_from, json!(crews_until));
+    assert_eq!(by_machine["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(by_machine["machines"][0]["reached"], true, "{by_machine}");
+
+    // The whole period counts the wake and the errand too, summed.
+    let all = summary("route", 0, Value::Null);
+    assert!(all["until_ms"].is_null());
+    let group = &all["groups"][0];
+    assert!(group["jobs"].as_u64().unwrap() >= 4, "{all}");
+    assert!(
+        group["usage"]["totalTokens"].as_u64().unwrap() >= 1280 + 940 + 330,
+        "{all}"
+    );
+    // Bounds: a period that ends before the crew began holds nothing of theirs.
+    let before = summary("route", crews_from - 1, json!(crews_from));
+    assert_eq!(before["groups"], json!([]), "{before}");
+
+    // The operator's alone.
+    let refused = fleet.refused(
+        "usage.summary",
+        json!({"since_ms": 0, "group_by": "route"}),
+        Some("infra"),
+    );
+    assert!(refused.contains("operator command"), "{refused}");
+}

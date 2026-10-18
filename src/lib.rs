@@ -157,7 +157,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "fleet" => fleet::dispatch(store, command, args),
         "usage" if command == "usage.summary" => {
             store.caller().require_operator(command)?;
-            usage::summary(&args)
+            usage::summary(store, &args)
         }
         "machine" => machines::dispatch(store, command, args),
         "grant" => grants::dispatch(store, command, args),

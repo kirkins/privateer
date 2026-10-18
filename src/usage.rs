@@ -126,10 +126,11 @@ fn harness_of(route: Option<&str>) -> String {
         .to_owned()
 }
 
-/// One home's harness jobs settled in the period, grouped.
+/// One home's harness jobs settled in the period, grouped. A job's ship is
+/// the one it ran as; `home_ship` names the home's own for a job without.
 fn read_home(
     store: &Store,
-    ship: &str,
+    home_ship: &str,
     machine: &str,
     period: &Period,
     groups: &mut BTreeMap<String, Group>,
@@ -138,7 +139,7 @@ fn read_home(
     // them, so SQLite reads the period through it.
     let sql = format!(
         "SELECT json_extract(record,'$.finished_ms'), json_extract(record,'$.model_route'),
-                json_extract(record,'$.usage')
+                json_extract(record,'$.usage'), json_extract(record,'$.agent_actor')
          FROM jobs WHERE {HARNESS_SQL}
            AND json_extract(record,'$.finished_ms') >= ?1
            AND json_extract(record,'$.finished_ms') < ?2"
@@ -151,14 +152,15 @@ fn read_home(
                 r.get::<_, i64>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         },
     )?;
     for row in rows {
-        let (finished_ms, route, usage) = row?;
+        let (finished_ms, route, usage, actor) = row?;
         let key = match period.group_by.as_str() {
             "route" => route.clone().unwrap_or_else(|| "unknown".into()),
-            "ship" => ship.to_owned(),
+            "ship" => actor.unwrap_or_else(|| home_ship.to_owned()),
             "day" => crate::routes::utc_time(finished_ms)[..10].to_owned(),
             _ => machine.to_owned(),
         };
@@ -191,25 +193,36 @@ fn read_home(
 pub(crate) fn local(args: &Value) -> Result<Value> {
     let period = period(args)?;
     let machine = crate::machines::this_machine();
-    let groups = local_groups(&period, &machine)?;
+    let (groups, unknown) = local_groups(&period, &machine, None)?;
     Ok(answer(
         &period,
-        &groups.0,
-        json!([{
-            "name": machine, "reached": true, "unknown": groups.1,
-        }]),
+        &groups,
+        json!([{"name": machine, "reached": true, "unknown": unknown}]),
     ))
 }
 
-fn local_groups(period: &Period, machine: &str) -> Result<(BTreeMap<String, Group>, Vec<String>)> {
+/// Every fleet home on this machine, and the asking home when given (it may
+/// not be in the registry), each read once.
+fn local_groups(
+    period: &Period,
+    machine: &str,
+    asking: Option<&Store>,
+) -> Result<(BTreeMap<String, Group>, Vec<String>)> {
     let conn = crate::fleet::registry()?;
     let started = Instant::now();
     let mut groups = BTreeMap::new();
     let mut unknown = vec![];
     let mut seen = BTreeSet::new();
+    let same = |home: &std::path::Path| home.canonicalize().unwrap_or_else(|_| home.to_owned());
+    if let Some(store) = asking {
+        seen.insert(same(store.home()));
+        if read_home(store, "unknown", machine, period, &mut groups).is_err() {
+            unknown.push("home:here".to_owned());
+        }
+    }
     for member in crate::fleet::members(&conn)? {
         // Two ships sharing a home share its jobs: read them once.
-        if !member.home.is_dir() || !seen.insert(member.home.clone()) {
+        if !member.home.is_dir() || !seen.insert(same(&member.home)) {
             continue;
         }
         if started.elapsed() >= LOCAL_BUDGET {
@@ -273,10 +286,10 @@ fn absorb(
 
 /// The fleet's usage over the period: this machine's homes, and each machine
 /// this one reaches asked for its own in parallel under the gateway timeout.
-pub fn summary(args: &Value) -> Result<Value> {
+pub fn summary(store: &Store, args: &Value) -> Result<Value> {
     let period = period(args)?;
     let here = crate::machines::this_machine();
-    let (mut groups, unknown) = local_groups(&period, &here)?;
+    let (mut groups, unknown) = local_groups(&period, &here, Some(store))?;
     let mut machines = vec![json!({"name": here, "reached": true, "unknown": unknown})];
     let conn = crate::fleet::registry()?;
     let linked = crate::machines::linked_for_snapshot(&conn)?;
