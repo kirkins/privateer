@@ -569,7 +569,26 @@ fn queued_jobs_hold_their_own_workspace_until_cancelled() {
     );
     f.ok("job.cancel", json!({"id":"queued"}));
     assert_eq!(f.wait("queued")["status"], "cancelled");
-    assert_eq!(f.release(&w, false)["state"], "released");
+    // The queued supervisor records the cancellation and then exits; until it
+    // has, release refuses for that reason alone.
+    let until = Instant::now() + Duration::from_secs(12);
+    let released = loop {
+        let out = f.run(
+            "workspace.release",
+            json!({"task_id":"two","lease_id":w["lease_id"],"archive":false}),
+        );
+        if out.status.success() {
+            break parse(out);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("workspace supervisor is still running"),
+            "{stderr}"
+        );
+        assert!(Instant::now() < until, "the queued supervisor never exited");
+        thread::sleep(Duration::from_millis(30));
+    };
+    assert_eq!(released["state"], "released");
     f.wait("heavy");
 }
 
