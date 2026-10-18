@@ -177,8 +177,17 @@ impl Fleet {
             .collect()
     }
 
-    fn wait<T>(&self, what: &str, mut found: impl FnMut(&[Value]) -> Option<T>) -> T {
-        let deadline = Instant::now() + Duration::from_secs(30);
+    fn wait<T>(&self, what: &str, found: impl FnMut(&[Value]) -> Option<T>) -> T {
+        self.wait_within(30, what, found)
+    }
+
+    fn wait_within<T>(
+        &self,
+        secs: u64,
+        what: &str,
+        mut found: impl FnMut(&[Value]) -> Option<T>,
+    ) -> T {
+        let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
             if let Some(value) = found(&self.entries()) {
                 return value;
@@ -188,6 +197,38 @@ impl Fleet {
                 "timed out waiting for {what}: {:#?}\ndoor log:\n{}",
                 self.entries(),
                 fs::read_to_string(self.root.join("state/doors/fake/door.log")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Wait until the door's delivery cursor in each ship's home covers the
+    /// mail events given. The adapter's `delivered` lines are read by the
+    /// supervisor after the mail events it answers, so a supervisor stopped
+    /// as soon as the events appear can exit with the cursor still behind.
+    fn wait_delivered(&self, mail: &[Value]) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let covered = mail.iter().all(|e| {
+                let seq = e["mail"]["seq"].as_i64().unwrap();
+                let path = self.home(e["ship"].as_str().unwrap()).join("privateer.sqlite");
+                let conn = rusqlite::Connection::open(path).unwrap();
+                conn.busy_timeout(Duration::from_secs(5)).unwrap();
+                let through: i64 = conn
+                    .query_row(
+                        "SELECT COALESCE((SELECT through_seq FROM door_cursor WHERE door='fake'), 0)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                through >= seq
+            });
+            if covered {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "door cursor never covered {mail:#?}"
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -846,10 +887,14 @@ fn away_sends_requests_at_once_and_digests_the_rest_with_urgent_items_loud_and_e
     ] {
         fleet.tell(ship, body, "notice", "normal");
     }
-    let present = fleet.wait("mail while present", |e| {
+    // Bounded but generous: seven mails through a supervisor under CI load.
+    let present = fleet.wait_within(60, "mail while present", |e| {
         let mail = events(e, 0, "mail");
         (mail.len() == 7).then_some(mail)
     });
+    // The away baseline is the door's cursor, so let the adapter's delivery
+    // acks land before the supervisor stops.
+    fleet.wait_delivered(&present);
     // Homes are read one after another, so compare each ship's own order.
     let again = |ship: &str| -> Vec<(String, bool)> {
         present
