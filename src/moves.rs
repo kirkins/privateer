@@ -1160,9 +1160,7 @@ fn run(args: &Value) -> Result<Value> {
         put(&conn, &id, "run", ship, "released", &record)?;
     }
     // Both machines learn where it lives now rather than at the next refresh.
-    let directory = crate::machines::refresh_one(&machine)
-        .err()
-        .map(|error| format!("directories refresh on the next pass: {error:#}"));
+    let directory = crate::machines::announce(None);
     put(&conn, &id, "run", ship, "done", &record)?;
     Ok(json!({"ship": ship, "move": id,
         "from": if to == "here" { machine.as_str() } else { "here" },

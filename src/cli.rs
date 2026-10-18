@@ -649,6 +649,8 @@ fn setup_inner(home: &Path, setup: &Setup, join_fleet: bool) -> Result<(String, 
         // Join the fleet: ships on this machine find and mail each other.
         crate::fleet::register(&ship, store.home(), &setup.created_by)?;
         crate::fleet::link(&store, &ship)?;
+        // Linked machines learn the ship now, not at their next refresh.
+        crate::machines::announce(Some(&store));
     }
     Ok((ship, harness, ours))
 }

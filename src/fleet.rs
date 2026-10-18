@@ -524,13 +524,16 @@ fn create_here(
     register(&ship, &home, &created_by)?;
     let child = Store::open(&home)?;
     link(&child, &ship)?;
+    // Linked machines learn the ship now, not at their next refresh.
+    let directory = crate::machines::announce(Some(&*store));
     let dispatcher = match service_path {
         Some(path) => crate::service::ensure_with_path(&home, &ship, &path)?,
         None => crate::service::ensure(&home, &ship)?,
     };
     let charter = child.charter(&ship)?;
     Ok(json!({"ship": ship, "folder": folder, "harness": harness,
-        "actions": charter["actions"], "created_by": created_by, "dispatcher": dispatcher}))
+        "actions": charter["actions"], "created_by": created_by, "dispatcher": dispatcher,
+        "directory": directory}))
 }
 
 /// Retire a ship: revoke its charter, stop its dispatcher, unlink it from
@@ -576,9 +579,10 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
         }
     }
     store.audit("ship.retired", &json!({"ship": name}))?;
+    let directory = crate::machines::announce(Some(&*store));
     Ok(
         json!({"ship": name, "retired": true, "dispatcher": dispatcher,
-        "folder_kept": member.home.parent()}),
+        "folder_kept": member.home.parent(), "directory": directory}),
     )
 }
 
