@@ -213,6 +213,27 @@ class ClaudeBundles(unittest.TestCase):
         self.binary.write_text('#!/bin/bash\nmise use -g claude\n')
         self.refuses(self.preflight)
 
+    def test_the_official_installer_layout_is_claude_and_other_names_are_not(self):
+        # ~/.local/bin/claude links to ~/.local/share/claude/versions/<version>.
+        versions = self.base / 'share/claude/versions'
+        versions.mkdir(parents=True)
+        for name, accepted in (('2.1.302', True), ('latest', False)):
+            target = versions / name
+            target.write_bytes(b'\x7fELFfixture')
+            target.chmod(0o700)
+            self.binary.unlink()
+            self.binary.symlink_to(target)
+            with self.subTest(name=name):
+                if accepted:
+                    with self.probe():
+                        self.assertEqual(self.preflight()[0], 'claude')
+                else:
+                    self.refuses(self.preflight)
+        (self.base / 'bin/claude').unlink()
+        (self.base / 'bin/claude').symlink_to(self.base / 'bin/other')
+        (self.base / 'bin/other').write_bytes(b'\x7fELFfixture')
+        self.refuses(self.preflight)
+
     def test_version_is_a_record_not_a_pin_flags_are(self):
         # The registry's claude_version no longer has to match what is installed.
         for version in (b'2.1.300 (Claude Code)\n', b'2.1.301 (Claude Code)\n', b'3.0.0 (Claude Code)\n'):

@@ -19,7 +19,7 @@ import hashlib
 import stat
 import subprocess
 
-from bundles import (at, credential_directory, file_bytes, present, require, require_flags, safe_path,
+from bundles import (SEMVER, at, credential_directory, file_bytes, present, require, require_flags, safe_path,
                      validate_plan)
 
 # Keep the project's .claude settings (Privateer's hooks and permissions) and
@@ -74,6 +74,14 @@ def settings(env):
     # autoMode can hold a whole environment description and its allow rules.
     require(len(json.dumps(carried)) <= MAX_CARRIED_BYTES)
     return carried
+
+
+def installed_claude(binary):
+    """A resolved Claude Code executable: named claude (npm, mise), or the
+    official installer's claude/versions/<version>, which ~/.local/bin/claude
+    links to."""
+    return binary.name == "claude" or (binary.parent.name == "versions" and binary.parent.parent.name == "claude"
+                                       and SEMVER.fullmatch(binary.name) is not None)
 
 
 def skills_only(skills):
@@ -135,7 +143,7 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
     binary = shutil.which(argv[0], path=env.get("PATH"))
     require(binary is not None)
     binary = Path(binary).resolve(strict=True)
-    require(binary.name == "claude" and binary.is_file())
+    require(binary.is_file() and installed_claude(binary))
     # Refuse activation wrappers (for example mise) rather than run them.
     with open(binary, "rb") as stream:
         require(stream.read(2) != b"#!")
