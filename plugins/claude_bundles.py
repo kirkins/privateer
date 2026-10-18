@@ -1,4 +1,5 @@
-"""Claude Code bounded loader: selected skills only, through supported flags.
+"""Claude Code bounded loader: selected skills and HTTP MCP servers only,
+through supported flags.
 
 Exposure hygiene, not an OS/credential sandbox. Personal hooks, skills,
 plugins and claude.ai connectors are dropped; a few harmless personal settings
@@ -9,10 +10,12 @@ route or widen the launch. Registry, selection and pins live in bundles.py.
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
+import sys
 import uuid
 
-from bundles import file_bytes, present, require, require_flags, safe_path, validate_plan
+from bundles import at, file_bytes, present, require, require_flags, safe_path, validate_plan
 
 # Keep the project's .claude settings (Privateer's hooks and permissions) and
 # drop the user source; no MCP servers unless --mcp-config names them.
@@ -42,6 +45,9 @@ PLUGIN_PARTS = ("hooks", ".mcp.json", ".lsp.json", "agents", "commands", "skills
                 "monitors", "output-styles", ".claude-plugin")
 # Claude also loads these from --add-dir folders, which are not the project.
 FOLDER_PARTS = (".claude/skills", ".claude/commands", ".claude/agents", ".mcp.json")
+# Claude runs this to get a selected server's Authorization header, so the
+# token is read from its credential file only when Claude connects.
+HEADERS = Path(__file__).resolve().with_name("claude_mcp_headers.py")
 # Flags a bounded Claude launch passes, plus --print for the headless runs
 # that use it. Any installed Claude declaring these will do.
 NEEDED = ["--setting-sources", "--strict-mcp-config", "--settings", "--plugin-dir", "--print"]
@@ -71,8 +77,9 @@ def skills_only(skills):
 
 
 def plan(registry, selected, skills):
+    at("claude_version", lambda: require("claude_version" in registry))
     # Pi extension integrations cannot load into Claude.
-    require("claude_version" in registry and registry["integrations"]["extensions"] == [])
+    at("integrations.extensions", lambda: require(registry["integrations"]["extensions"] == []))
     skills_only(skills)
     return {"schema_version": 1, "claude_version": registry["claude_version"], "selection": selected,
             "skills": skills, "settings": settings(os.environ)}
@@ -130,4 +137,19 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
     require_flags(str(binary), env, cwd or os.getcwd(), "Claude Code", NEEDED)
     carried = ["--settings", json.dumps(value["settings"], separators=(",", ":"))] if value["settings"] else []
     plugins = [arg for item in value["skills"] for arg in ("--plugin-dir", item["root"])]
-    return [argv[0], *FLAGS, *carried, *plugins, *args]
+    return [argv[0], *FLAGS, *mcp_config(value.get("mcp_servers", [])), *carried, *plugins, *args]
+
+
+def mcp_config(servers):
+    """--mcp-config for the plan's selected servers, beside --strict-mcp-config,
+    which keeps every other server out. Records only: each server's header comes
+    from HEADERS reading its credential file, never from argv or env values.
+    One `=` argument, since --mcp-config takes several values and would
+    swallow the next one."""
+    if not servers:
+        return []
+    helper = shlex.join([sys.executable, "-I", str(HEADERS)])
+    config = {"mcpServers": {server["name"]: {"type": "http", "url": server["url"],
+                                              "headersHelper": f"{helper} {server['credential']}"}
+                             for server in servers}}
+    return ["--mcp-config=" + json.dumps(config, separators=(",", ":"), sort_keys=True)]

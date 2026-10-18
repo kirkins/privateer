@@ -7,8 +7,8 @@ install packages, edit native configuration, replace `HOME`/the agent directory,
 search credential stores, or infer which personal extensions are required.
 
 The first stage supports named/versioned **local skills and their supporting
-scripts/files**. Remote streamable-HTTP MCP servers load for Pi runs that select
-them, see [Selected MCP servers](#selected-mcp-servers-pi-http). stdio MCP servers
+scripts/files**. Remote streamable-HTTP MCP servers load for Pi and Claude runs that
+select them, see [Selected MCP servers](#selected-mcp-servers-pi-and-claude-http). stdio MCP servers
 and optional executable tool extensions are deferred: definitions containing
 those fields fail validation, rather than silently dropping them. The separate
 [stage-two offline MCP factory qualification](pi-mcp-stage2-qualification.md)
@@ -263,8 +263,9 @@ integrations cannot load into Claude, so a Claude plan needs `extensions:[]`.
 ```
 
 Dropping the user setting source drops personal hooks, skills and plugins;
-`--strict-mcp-config` without `--mcp-config` drops personal and claude.ai MCP
-connectors. The working folder's `.claude` settings (Privateer's own hooks and
+`--strict-mcp-config` drops personal and claude.ai MCP connectors, and only the
+run's selected servers load, through Privateer's own `--mcp-config` (see
+[Selected MCP servers](#selected-mcp-servers-pi-and-claude-http)). The working folder's `.claude` settings (Privateer's own hooks and
 permissions), its project instructions and its own `.claude/skills` still
 load. Each selected skill root is passed straight to `--plugin-dir`, where
 Claude loads it as `<name>:<name>`. Claude's built-in skills and plugins load in
@@ -309,7 +310,7 @@ This is exposure hygiene, not credential isolation; whether a personal
 `~/.claude/CLAUDE.md` or auto-memory follows the setting sources is not yet
 qualified.
 
-## Selected MCP servers (Pi, HTTP)
+## Selected MCP servers (Pi and Claude, HTTP)
 
 A bundle may hold `mcp_servers`, at most four, each with exactly `name` (a lowercase
 slug, at most 32 characters), `url`, `credential` (a name the same bundle declares
@@ -323,7 +324,7 @@ needs a skill or a server. Any other key (`headers`, `command`, `env`, `oauth`,
 `exposure`...) refuses, as does any string holding `$`, a leading `!` or a control
 character.
 
-Only a Pi run that selects the bundle loads its servers. The launcher sets
+Only a run that selects the bundle loads its servers. For Pi, the launcher sets
 `PRIVATEER_MCP_SERVERS` to the selected records (names, URLs, credential names,
 timeouts, descriptions; no paths or values) and adds Privateer's
 `plugins/pi-mcp/selected.ts` gate. Each Bearer token is read from its
@@ -333,12 +334,29 @@ when every selected server lists tools and no other `mcp__` tool exists. It
 refuses, before any model turn, when another extension registered a server, a
 token file is missing or malformed, a server is refused (401) or lists no tools
 within `min(30, timeout)` seconds. A refusal exits 78 with one line naming only
-the server. Claude refuses any plan with servers. Plans without servers are unchanged,
-and a run gets no MCP tool unless it selects one.
+the server. Plans without servers are unchanged, and a run gets no MCP tool unless
+it selects one.
+
+A bounded Claude run gets the same records in `PRIVATEER_MCP_SERVERS` and one
+`--mcp-config=<json>` beside `--strict-mcp-config`, so no other server loads. Each
+selected server is `{"type":"http","url":...,"headersHelper":...}`, where the helper
+is `plugins/claude_mcp_headers.py CREDENTIAL`, run as `python3 -I`. Claude runs it
+when it connects. It reads the token from the
+`PRIVATEER_CREDENTIAL_<NAME>_FILE` the launcher set, with the same token rules as
+Pi's reader, and prints only the `Authorization` header. On a missing or malformed
+token it exits 78, naming only the credential. The config holds no token and no
+path. A headless run (`claude_turn.py`) checks Claude's init event before the first
+model turn: every selected server must report `connected`, and any other server
+fails the run (`mcp-unavailable:<name>`, `mcp-foreign:<name>`). Hosted (attended)
+sessions have no such check; Claude's `/mcp` shows each server's state there. Claude
+has no per-server `timeout` or `description`, so both are Pi-only.
 
 Limits: the token sits in the Pi process's memory; a same-user agent can still
 read the credential file; URLs are not content-pinned; stdio servers are not
-supported yet; Claude refuses servers.
+supported yet. When Claude's helper refuses, Claude still connects, without the
+header. A server that requires auth then fails and the headless check catches it,
+but one that also serves anonymous tools (Apify's search does) connects degraded,
+and the run finds out only when an authenticated tool fails.
 
 - The agent can read its own credential file; this is an accepted limit.
 - Redirects are followed, but `Authorization` is dropped on a cross-origin redirect.
