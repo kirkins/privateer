@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_privateer");
@@ -28,6 +29,7 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     let fleet = std::env::temp_dir().join(format!("privateer-test-fleet-{}", std::process::id()));
     command
         .env("PRIVATEER_FLEET", fleet.join("fleet.sqlite"))
+        .env("PATH", fixture_path())
         .env_remove("XDG_STATE_HOME");
     command
 }
@@ -47,24 +49,38 @@ pub fn isolated(root: &Path) -> Command {
         .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"))
         .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
         .env("PRIVATEER_SERVICE", "none")
+        .env("PATH", fixture_path())
         .env_remove("XDG_STATE_HOME");
     command
 }
 
-/// Resolve the interpreter before changing HOME for a fixture. A shebang
-/// through `env python3` can otherwise enter a version-manager shim which
-/// refuses the isolated HOME's untrusted configuration instead of the script.
+/// The interpreter every fixture runs, resolved once. A version-manager shim
+/// on PATH (mise) refuses the isolated HOME's untrusted configuration rather
+/// than run the script, so the first `python3` on PATH that is not a shim is
+/// used, falling back to the system interpreter.
 pub fn python() -> PathBuf {
-    let output = command("python3")
-        .args(["-c", "import sys; print(sys.executable)"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+    static PYTHON: OnceLock<PathBuf> = OnceLock::new();
+    PYTHON.get_or_init(resolve_python).clone()
+}
+
+fn resolve_python() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("python3"))
+        .find(|candidate| candidate.is_file() && !candidate.to_string_lossy().contains("/shims/"))
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"))
+}
+
+/// PATH with the interpreter's directory first, so `#!/usr/bin/env python3`
+/// fakes and bare `python3` manifests in a fixture reach the same interpreter.
+fn fixture_path() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = python()
+        .parent()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(std::env::split_paths(&path));
+    std::env::join_paths(dirs).unwrap_or(path)
 }
 
 const ADAPTER: &str = r#"import json, sys
@@ -167,13 +183,14 @@ impl Fleet {
             json!({"id":"fleet","objective":"Answer mail","repo":repo,"min_free_bytes":0,"job_timeout_secs":60}),
         )
         .unwrap();
-        // Crew memory and the free-memory floor are admission's concern, tested
-        // apart. These fleets run several crews at once on whatever memory the
-        // test machine has, so neither the floor nor a crew's estimate may refuse them.
+        // Crew memory and the free-memory and free-disk floors are admission's
+        // concern, tested apart. These fleets run several crews at once on
+        // whatever memory and temporary-directory space the test machine has,
+        // so neither floor nor a crew's estimate may refuse them.
         dispatch(
             &mut store,
             "resource.configure",
-            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20}}),
+            json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20}}),
         )
         .unwrap();
         for (task, owner) in [

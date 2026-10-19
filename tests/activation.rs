@@ -23,7 +23,7 @@ fn native_routes(fleet: &Fleet, hosted: bool) {
         let manifest = directory.join("manifest.json");
         fs::write(
             &manifest,
-            json!({"schema_version":1,"id":harness,"executable":[std::env::var("PYTHON").unwrap_or_else(|_|"python3".into()),fleet.root.join("adapter.py")]}).to_string(),
+            json!({"schema_version":1,"id":harness,"executable":[std::env::var("PYTHON").unwrap_or_else(|_| support::python().display().to_string()),fleet.root.join("adapter.py")]}).to_string(),
         ).unwrap();
         manifests.push(manifest);
     }
@@ -1539,7 +1539,7 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     // apart: these crews only need to start.
     fleet.ok(
         "resource.configure",
-        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
+        json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
         None,
     );
     fleet.ok(
@@ -1649,7 +1649,7 @@ fn a_throttled_wake_with_no_fallback_waits_then_wakes_on_its_own_route() {
     let mut fleet = Fleet::new(now_settings());
     fleet.ok(
         "resource.configure",
-        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20}}),
+        json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20}}),
         None,
     );
     fleet.ok(
@@ -1693,7 +1693,7 @@ fn a_stated_reset_holds_a_throttled_route_past_the_short_window() {
     let fleet = Fleet::new(now_settings());
     fleet.ok(
         "resource.configure",
-        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
+        json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
         None,
     );
     fleet.ok(
@@ -1754,7 +1754,7 @@ fn codex_crew_sandbox_defaults_and_flags_read_only() {
     let fleet = Fleet::new(now_settings());
     fleet.ok(
         "resource.configure",
-        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
+        json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20,"claude":1u64 << 20}}),
         None,
     );
     // An isolated bundled:codex manifest so the test never runs real Codex.
@@ -1764,7 +1764,7 @@ fn codex_crew_sandbox_defaults_and_flags_read_only() {
         plugins.join("codex/manifest.json"),
         json!({
             "schema_version":1,"id":"codex",
-            "executable":["python3", fleet.root.join("codex_adapter.py")],
+            "executable":[support::python(), fleet.root.join("codex_adapter.py")],
             "timeout_ms":2000,"max_output_bytes":65536
         })
         .to_string(),
