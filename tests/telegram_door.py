@@ -189,7 +189,15 @@ d.fetch = lambda file_id, name, msg_id: "/nonexistent/voice.ogg"
 voice = {"voice": {"file_id": "f", "duration": 3}, "message_id": 9}
 stt.transcribe = lambda cfg, path: (".", "")
 d.handle_voice(voice, 9, None)
-out["said"], out["sent"] = said, sent
+out["said"], out["sent"] = list(said), list(sent)
+# A voice reply to a typed decision answers with the transcript, not "(voice)".
+typed = []
+d.send = lambda args, msg_id, label: typed.append(args)
+d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "reply", "correlation": "m1",
+                                          "body": text, "payload": {"answer": {"text": text}}}
+stt.transcribe = lambda cfg, path: ("go with b", "")
+d.handle_voice(voice, 9, 7)
+out["typed"] = typed
 print(json.dumps(out))
 """
 
@@ -209,6 +217,7 @@ def check_voice_transcripts() -> None:
     assert prompts["こんにちは"] == '"こんにちは"', prompts
     assert got["said"] == ["🎙️ your voice note came through empty, please re-record"], got
     assert got["sent"] == [], got
+    assert [a["payload"]["answer"]["text"] for a in got["typed"]] == ["go with b"], got
 
 
 class Fleet:
