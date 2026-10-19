@@ -717,6 +717,18 @@ impl Client {
         Ok(())
     }
 
+    /// The processes in a pane's terminal: its shell and its foreground group.
+    pub(crate) fn process_info(&mut self, pane: &str) -> Result<Value> {
+        let result = self.request("pane.process_info", json!({"pane_id":pane}))?;
+        Ok(result.get("process_info").cloned().unwrap_or(result))
+    }
+
+    /// Close a whole space, every tab and pane in it.
+    pub(crate) fn close_workspace(&mut self, workspace: &str) -> Result<()> {
+        self.request("workspace.close", json!({"workspace_id":workspace}))?;
+        Ok(())
+    }
+
     /// The pane as Herdr lists it now, read back to confirm a report or release
     /// took effect: Herdr answers ok to a report it then drops.
     pub fn pane_get(&mut self, pane: &str) -> Result<Value> {
