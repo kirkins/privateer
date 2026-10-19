@@ -72,10 +72,21 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE TABLE IF NOT EXISTS hosted_panes(ship TEXT PRIMARY KEY, pid INTEGER NOT NULL,
            started TEXT NOT NULL, executable TEXT NOT NULL, harness_pid INTEGER,
            harness_started TEXT, recorded_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS hosted_automode(ship TEXT PRIMARY KEY, incident TEXT NOT NULL,
+           ms INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS hosted_relaunches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
            force INTEGER NOT NULL CHECK(force IN (0,1)), requested_ms INTEGER NOT NULL,
            expires_ms INTEGER NOT NULL);",
     )?;
+    // The Claude settings digest a hosted pane launched with, for settings drift.
+    let digest_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hosted_panes') WHERE name='settings_digest')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !digest_column {
+        tx.execute_batch("ALTER TABLE hosted_panes ADD COLUMN settings_digest TEXT;")?;
+    }
     // A pane relaunched by an upgrade, or from sleep, starts asleep.
     let asleep_column: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='start_asleep')",
@@ -1124,6 +1135,10 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
     let hosted_observations = crate::host::repair(store);
+    let hosted_automode = crate::automode::alert(store, &hosted_observations).map_or_else(
+        |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
+        |raised| json!(raised),
+    );
     let hosted_blocked = crate::host::alert_blocked(store, &hosted_observations).unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
@@ -1162,7 +1177,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 

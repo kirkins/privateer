@@ -2,6 +2,7 @@ pub mod activation;
 pub mod activity;
 pub mod admission;
 pub mod attention;
+mod automode;
 pub mod away;
 mod block_ask;
 mod bundled;

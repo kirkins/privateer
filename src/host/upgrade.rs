@@ -17,6 +17,7 @@ use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,47 @@ pub(crate) fn record(store: &Store, ship: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Claude settings a pane's session reads at launch: the operator's user
+/// settings and the ship's own. Auto mode reads them only then.
+fn settings_paths(store: &Store) -> Vec<PathBuf> {
+    let mut paths = vec![];
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".claude/settings.json"));
+    }
+    if let Some(folder) = store.home().parent() {
+        paths.push(folder.join(".claude/settings.json"));
+    }
+    paths
+}
+
+/// A digest of each settings file's bytes. A missing file is part of it.
+pub(crate) fn settings_digest(paths: &[PathBuf]) -> String {
+    let mut hasher = Sha256::new();
+    for path in paths {
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                hasher.update([1]);
+                hasher.update(&bytes);
+            }
+            Err(_) => hasher.update([0]),
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Record the settings this pane's session will launch with. Called after the
+/// launch writes its own settings, so that write is not drift.
+pub(crate) fn record_settings(store: &Store, ship: &str) -> Result<()> {
+    let digest = settings_digest(&settings_paths(store));
+    store.connection().execute(
+        "UPDATE hosted_panes SET settings_digest=?3 WHERE ship=?1 AND pid=?2",
+        params![ship, std::process::id(), digest],
+    )?;
+    Ok(())
+}
+
 /// Record the native harness this pane spawned, so its exit can be checked.
 pub(crate) fn harness(store: &Store, ship: &str, harness: u32) -> Result<()> {
     let started = crate::jobs::process_identity(harness)?;
@@ -132,12 +174,25 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
     };
     let image = kernel_image(pid).unwrap_or(recorded);
     let current = current_for(&image)?;
+    // A pane recorded before settings were tracked has no digest to judge.
+    let launched: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT settings_digest FROM hosted_panes WHERE ship=?1",
+            [ship],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let settings_changed =
+        launched.is_some_and(|launched| launched != settings_digest(&settings_paths(store)));
     Ok(Some(json!({
         "pid": pid,
         "executable": image,
         "commit": commit_of(&image),
         "current_commit": current,
         "drift": behind(&image, current.as_deref()),
+        "settings_changed": settings_changed,
     })))
 }
 
@@ -631,5 +686,27 @@ mod tests {
         assert_eq!(start_point("upgrade", 1800, 7), Some(7));
         assert_eq!(start_point("relaunch", 1800, 7), None);
         assert_eq!(start_point("relaunch", 0, 7), None);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::settings_digest;
+
+    /// A settings edit changes the digest; the same bytes, or a file that
+    /// stays missing, do not. Auto mode reads the file only at launch.
+    #[test]
+    fn the_digest_moves_only_when_a_settings_file_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user.json");
+        let ship = temp.path().join("ship.json");
+        let paths = [user.clone(), ship.clone()];
+        let missing = settings_digest(&paths);
+        std::fs::write(&user, r#"{"autoMode":{"allow":[]}}"#).unwrap();
+        let written = settings_digest(&paths);
+        assert_ne!(missing, written);
+        assert_eq!(written, settings_digest(&paths));
+        std::fs::write(&user, r#"{"autoMode":{"allow":["Bash(git *)"]}}"#).unwrap();
+        assert_ne!(written, settings_digest(&paths));
     }
 }

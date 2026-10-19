@@ -76,22 +76,25 @@ pub(super) fn fleet_mates() -> Vec<(String, Binding)> {
     found
 }
 
-pub(crate) fn repair(store: &Store, socket: &Path) -> Result<Vec<(String, String)>> {
+/// Each hosted mate's pane status and recent screen, for the status and for
+/// auto-mode lockout detection. A pane whose screen cannot be read has an
+/// empty screen.
+pub(crate) fn repair(store: &Store, socket: &Path) -> Result<Vec<(String, String, String)>> {
     let mates = mates(store.connection())?;
     if mates.is_empty() {
         return Ok(vec![]);
     }
-    let Some(view) = super::Client::connect(socket)?.arrange_observed_with_mates(&mates)? else {
+    let mut client = super::Client::connect(socket)?;
+    let Some(view) = client.arrange_observed_with_mates(&mates)? else {
         return Ok(vec![]);
     };
-    Ok(mates
-        .iter()
-        .filter(|(_, binding)| binding.socket == socket)
-        .filter_map(|(ship, binding)| {
-            view.panes
-                .iter()
-                .find(|pane| binding.matches(&view, pane))
-                .map(|pane| (ship.clone(), pane.agent_status.clone()))
-        })
-        .collect())
+    let mut observed = vec![];
+    for (ship, binding) in mates.iter().filter(|(_, binding)| binding.socket == socket) {
+        let Some(pane) = view.panes.iter().find(|pane| binding.matches(&view, pane)) else {
+            continue;
+        };
+        let screen = client.read_visible_text(&pane.pane_id).unwrap_or_default();
+        observed.push((ship.clone(), pane.agent_status.clone(), screen));
+    }
+    Ok(observed)
 }

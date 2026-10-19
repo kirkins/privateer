@@ -230,7 +230,7 @@ fn socket() -> Option<PathBuf> {
 /// Repair presentation for this dispatcher's live hosted mates, even when
 /// they were opened before workspace metadata existed. Return exact-pane
 /// statuses from the same snapshot; presentation and observation are best effort.
-pub(crate) fn repair(store: &Store) -> Vec<(String, String)> {
+pub(crate) fn repair(store: &Store) -> Vec<(String, String, String)> {
     if let Some(socket) = socket() {
         return crate::herdr::sidebar::repair(store, &socket).unwrap_or_default();
     }
@@ -239,7 +239,7 @@ pub(crate) fn repair(store: &Store) -> Vec<(String, String)> {
 
 /// Alert the captain once for each sustained blocked spell. Unknown/missing
 /// observations preserve the current spell; only a known live status clears it.
-pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String)]) -> Result<Value> {
+pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String, String)]) -> Result<Value> {
     let now = Store::now_ms();
     let tx = store.write_transaction()?;
     // Lease expiry ends custody even if Herdr is unavailable this tick.
@@ -249,7 +249,7 @@ pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String)]) -> Res
         [now],
     )?;
     let mut alerts = Vec::new();
-    for (ship, status) in observed {
+    for (ship, status, _) in observed {
         match status.as_str() {
             "blocked" => {
                 let state: Option<(i64, bool)> = tx
