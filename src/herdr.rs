@@ -279,10 +279,12 @@ impl Client {
 
     /// Open a background space running `privateer --home HOME COMMAND...`:
     /// a hosted first mate or a crew member's supervisor.
+    #[allow(clippy::too_many_arguments)]
     pub fn space(
         &mut self,
         folder: &Path,
         label: &str,
+        tab_label: &str,
         binary: &Path,
         home: &Path,
         env: &[(&str, &str)],
@@ -294,6 +296,7 @@ impl Client {
             "workspace.create",
             folder,
             label,
+            Some(tab_label),
             false,
             env,
             binary,
@@ -320,6 +323,7 @@ impl Client {
             "workspace.create",
             folder,
             "bridge",
+            Some("bridge"),
             false,
             &[
                 ("PRIVATEER_BRIDGE_TOKEN", token),
@@ -372,6 +376,7 @@ impl Client {
             "tab.create",
             folder,
             name,
+            None,
             true,
             &[],
             binary,
@@ -388,6 +393,7 @@ impl Client {
         method: &str,
         folder: &Path,
         name: &str,
+        tab_label: Option<&str>,
         focus: bool,
         extra_env: &[(&str, &str)],
         binary: &Path,
@@ -399,6 +405,7 @@ impl Client {
             method,
             folder,
             name,
+            tab_label,
             focus,
             extra_env,
             binary,
@@ -416,6 +423,7 @@ impl Client {
         method: &str,
         folder: &Path,
         name: &str,
+        tab_label: Option<&str>,
         focus: bool,
         extra_env: &[(&str, &str)],
         binary: &Path,
@@ -477,6 +485,17 @@ impl Client {
             "host returned an existing pane; no command sent"
         );
         record(Some(&pane))?;
+        if let Some(tab_label) = tab_label {
+            if let Err(error) = self.request(
+                "tab.rename",
+                json!({"tab_id": &pane.tab_id, "label": tab_label}),
+            ) {
+                eprintln!(
+                    "privateer: could not rename Herdr tab {} to {tab_label:?}: {error:#}",
+                    pane.tab_id
+                );
+            }
+        }
         let fresh = self.snapshot()?;
         ensure!(
             fresh.panes.iter().any(|p| p == &pane && p.agent.is_none()),
