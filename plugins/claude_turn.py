@@ -100,18 +100,24 @@ def resolve_claude(binary="claude", env=None):
     return first_shim or binary
 
 
-def stop_process(child):
+def signal_group(child, signum):
+    """Signal the child's process group. macOS refuses (EPERM) a group whose
+    members have all exited but are not yet reaped; then only the leader is
+    left, and send_signal reaps it instead of signalling it."""
     try:
-        os.killpg(child.pid, signal.SIGTERM)
+        os.killpg(child.pid, signum)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        child.send_signal(signum)
+
+
+def stop_process(child):
+    signal_group(child, signal.SIGTERM)
     try:
         child.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        signal_group(child, signal.SIGKILL)
         try:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -303,17 +309,16 @@ def run(argv, control):
                     if now - state["last_event"] >= idle_limit:
                         reason = "stalled"
                         break
-        with lock:
-            if not reason:
+        if not reason:
+            # The child exited or the reader ended. Let the reader finish before
+            # choosing, so its specific reason never depends on which noticed
+            # first. It has at most a pipe buffer left once the child is gone.
+            reader.join(timeout=5)
+            with lock:
                 reason = state["reason"]
         if reason:
             stop_process(child)
         reader.join(timeout=5)
-        if not reason:
-            with lock:
-                reason = state["reason"]
-            if reason:
-                stop_process(child)
         status = child.wait()
         success = reason is None and status == 0 and turn.complete() and not turn.denied
         summary = {"type": "turn.completed" if success else "native.turn.failed",
@@ -336,9 +341,13 @@ def run(argv, control):
                 pass
 
 
-if __name__ == "__main__":
+def main(argv):
     try:
-        raise SystemExit(run(sys.argv[3:], json.loads(sys.argv[2])))
+        raise SystemExit(run(argv[3:], json.loads(argv[2])))
     except Exception:
         print('{"type":"native.turn.failed","reason":"Claude stream could not be read."}', flush=True)
         raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

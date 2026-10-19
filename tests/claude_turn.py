@@ -34,6 +34,33 @@ if mode == 'stall':
     time.sleep(60)
 raise SystemExit(int(os.environ.get('CLAUDE_TEST_EXIT', '0')))
 '''
+# Runs claude_turn with a slowed reader or with macOS's killpg, which refuses
+# (EPERM) a process group whose members have all exited but are not yet reaped.
+DRIVER = r'''
+import errno,os,sys,time
+from pathlib import Path
+sys.path.insert(0, sys.argv.pop(1))
+import claude_turn
+delay = float(os.environ.get('CLAUDE_TEST_READER_DELAY', '0'))
+if delay:
+    observe = claude_turn.ClaudeTurn.observe
+    def slow(self, value):
+        time.sleep(delay)
+        return observe(self, value)
+    claude_turn.ClaudeTurn.observe = slow
+if os.environ.get('CLAUDE_TEST_DARWIN_KILLPG'):
+    killpg = os.killpg
+    def darwin_killpg(pgid, signum):
+        try:
+            state = Path(f'/proc/{pgid}/stat').read_text().rsplit(')', 1)[1].split()[0]
+        except OSError:
+            state = None
+        if state == 'Z':
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+        return killpg(pgid, signum)
+    os.killpg = darwin_killpg
+claude_turn.main(sys.argv)
+'''
 # Event shapes captured from Claude Code 2.1.300: hooks report before init.
 HOOK = {"type":"system", "subtype":"hook_response", "session_id":IDENTITY, "exit_code":0}
 INIT = {"type":"system", "subtype":"init", "session_id":IDENTITY, "model":"claude-haiku-5-5"}
@@ -55,7 +82,7 @@ class ClaudeTurn(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_stream(self, events, *, code=0, raw=None, resume=None, env_extra=None):
+    def run_stream(self, events, *, code=0, raw=None, resume=None, env_extra=None, driver=False):
         stream = self.root / "stream.jsonl"
         stream.write_bytes(raw if raw is not None else b"".join((json.dumps(e)+"\n").encode() for e in events))
         flags = ["--print", "--verbose", "--output-format", "stream-json"]
@@ -70,9 +97,15 @@ class ClaudeTurn(unittest.TestCase):
             "CLAUDE_TEST_PID": str(pid_file),
             **(env_extra or {}),
         }
-        run = subprocess.run([sys.executable, str(ROOT / "plugins/native_launch.py"), "claude", "claude",
-                              *flags, "--", "prompt"], cwd=self.root, capture_output=True, timeout=10,
-                             env=run_env)
+        if driver:
+            script = self.root / "driver.py"
+            script.write_text(DRIVER)
+            command = [sys.executable, str(script), str(ROOT / "plugins"), "--control", "{}",
+                       str(self.root / "claude")]
+        else:
+            command = [sys.executable, str(ROOT / "plugins/native_launch.py"), "claude", "claude"]
+        run = subprocess.run([*command, *flags, "--", "prompt"], cwd=self.root, capture_output=True,
+                             timeout=10, env=run_env)
         return run, json.loads(run.stdout.splitlines()[-1])
 
     def test_a_run_without_output_ends_at_startup_bound(self):
@@ -255,6 +288,31 @@ class ClaudeTurn(unittest.TestCase):
             run, summary = self.run_stream([], raw=raw)
             self.assertEqual(run.returncode, 2)
             self.assertEqual(summary["reason"], reason)
+
+    def test_a_reader_reason_survives_killpg_refusing_an_exited_group(self):
+        # The reader names the fault before the child is reaped; macOS then
+        # refuses killpg of the exited group, which must not hide the reason.
+        good = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, RESULT])
+        cases = ((dict(events=[INIT, RESULT], resume=OTHER), "resume-identity"),
+                 (dict(events=[], raw=good[:-1]), "truncated-stream"),
+                 (dict(events=[], raw=good+b"not-json\n"), "invalid-json"))
+        for kwargs, reason in cases:
+            with self.subTest(reason=reason):
+                run, summary = self.run_stream(**kwargs, driver=True,
+                                               env_extra={"CLAUDE_TEST_DARWIN_KILLPG": "1"})
+                self.assertEqual((run.returncode, summary["type"]), (2, "native.turn.failed"), run.stderr)
+                self.assertEqual(summary["reason"], reason)
+
+    def test_a_reader_slower_than_the_child_still_names_its_reason(self):
+        # The child exits and is reaped by the poll loop well before the
+        # delayed reader records its fault; the specific reason still wins.
+        for darwin in ("", "1"):
+            with self.subTest(darwin=bool(darwin)):
+                run, summary = self.run_stream([INIT, RESULT], resume=OTHER, driver=True, env_extra={
+                    "CLAUDE_TEST_READER_DELAY": "2", "CLAUDE_TEST_DARWIN_KILLPG": darwin})
+                self.assertEqual((run.returncode, summary["type"]), (2, "native.turn.failed"), run.stderr)
+                self.assertEqual(summary["reason"], "resume-identity")
+                self.assertEqual(summary["native_exit_code"], 0)
 
 
 if __name__ == "__main__":
