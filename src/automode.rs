@@ -1,13 +1,16 @@
 //! Auto-mode lockouts in a hosted first mate's pane.
 //!
 //! Claude Code's auto mode denies actions its classifier judges unsafe. After
-//! three consecutive blocks it refuses every tool, even reads, and stops with
-//! "3 consecutive actions were blocked". Its settings load only at launch, so a
-//! retry before a relaunch is judged by the old policy. The host reads each
-//! hosted pane's recent screen. When it shows the lockout line, or repeated
-//! auto-mode denials, one captain notice per incident offers a relaunch, and
-//! the denials become one block ask. The screen names no tool, so the ask
-//! names it "unknown" until the transcript shape is captured.
+//! three consecutive blocks it refuses every tool, even reads, and stops. Its
+//! settings load only at launch, so a retry before a relaunch is judged by the
+//! old policy. The host reads each hosted pane's visible screen as plain text.
+//! When it shows the stop line, or repeated denial lines, one captain notice per
+//! incident offers a relaunch, and the denials become one block ask. The screen
+//! names no tool, so the ask names it "unknown" until the transcript shape is
+//! captured.
+//!
+//! Matches are anchored to the start of a line, after bullet and box glyphs, so
+//! a diff, a grep, a quoted instruction or a discussion never matches.
 use crate::block_ask;
 use crate::mail;
 use crate::store::Store;
@@ -16,43 +19,56 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-/// The line Claude prints when the lockout starts.
-pub(crate) const LOCKOUT: &str = "consecutive actions were blocked";
-/// Denial lines on one screen that count as a block without the lockout line.
+/// The stop line text, after its count. Claude prints it as "<N> consecutive
+/// actions were blocked" when the lockout starts.
+const LOCKOUT: &str = "consecutive actions were blocked";
+/// Classifier labels that open a denial line, such as `[Auto-Mode Bypass]`.
+const LABELS: [&str; 2] = ["[Auto-Mode ", "[Security "];
+/// Bullet and box glyphs that Claude and its tool results print before a line.
+/// A diff's `+` and `-` and a quote's `>` are not among them.
+const GLYPHS: &str = "●⏺⎿│├└╰╭╮╯─•·›▸■□✗✘❯";
+/// Denial lines on one screen that count as a block without the stop line.
 const REPEATED: usize = 2;
-/// Lines of recent screen read per hosted pane.
-pub(crate) const LINES: u32 = 200;
 
-/// What one screen shows of an auto-mode block. `incident` identifies the
-/// exact set of lines, so a screen that still shows it raises nothing again.
+/// What one screen shows of an auto-mode block. `digest` identifies the
+/// matched lines, so the same block seen again, scrolled or recoloured, is the
+/// same incident.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Finding {
     pub(crate) lockout: bool,
     pub(crate) denials: Vec<String>,
-    pub(crate) incident: String,
+    pub(crate) digest: String,
 }
 
-/// A line that reports a denied action. Auto mode's classifier labels its
-/// reasons in brackets, such as `[Auto-Mode Bypass]`, and a denial names auto mode.
-fn denial(line: &str) -> bool {
-    if line.contains("[Auto-Mode") || line.contains("[Security ") {
-        return true;
-    }
-    let lower = line.to_lowercase();
-    (lower.contains("auto mode") || lower.contains("auto-mode"))
-        && (lower.contains("denied") || lower.contains("blocked"))
+/// A line's text with its leading glyphs and spaces removed.
+fn text(line: &str) -> &str {
+    line.trim_end()
+        .trim_start_matches(|c: char| c.is_whitespace() || GLYPHS.contains(c))
 }
 
-/// The block on a screen, or None when it shows neither the lockout line nor
+/// "<N> consecutive actions were blocked", at the start of the line.
+fn lockout_line(line: &str) -> bool {
+    let digits = line.trim_start_matches(|c: char| c.is_ascii_digit());
+    digits.len() < line.len()
+        && digits
+            .strip_prefix(' ')
+            .is_some_and(|rest| rest.starts_with(LOCKOUT))
+}
+
+/// A tool result that reports a denial: a classifier label opens the line.
+fn denial_line(line: &str) -> bool {
+    LABELS.iter().any(|label| line.starts_with(label)) && line.contains(']')
+}
+
+/// The block on a screen, or None when it shows neither the stop line nor
 /// enough denials.
 pub(crate) fn read(screen: &str) -> Option<Finding> {
     let mut lockout = false;
     let mut denials = vec![];
-    for line in screen.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if line.to_lowercase().contains(LOCKOUT) {
+    for line in screen.lines().map(text).filter(|line| !line.is_empty()) {
+        if lockout_line(line) {
             lockout = true;
-        }
-        if denial(line) {
+        } else if denial_line(line) {
             denials.push(line.to_owned());
         }
     }
@@ -60,29 +76,70 @@ pub(crate) fn read(screen: &str) -> Option<Finding> {
         return None;
     }
     let mut hasher = Sha256::new();
+    hasher.update([u8::from(lockout)]);
     for line in &denials {
         hasher.update(line.as_bytes());
         hasher.update([0]);
     }
-    hasher.update([u8::from(lockout)]);
-    let incident = format!("{:x}", hasher.finalize());
     Some(Finding {
         lockout,
         denials,
-        incident,
+        digest: format!("{:x}", hasher.finalize()),
     })
+}
+
+/// The incident for a block on one pane launch. A relaunch is a new launch,
+/// so the same block after it alerts again.
+fn incident(launch: &str, finding: &Finding) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(launch.as_bytes());
+    hasher.update([0]);
+    hasher.update(finding.digest.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// The captain notice. It must never read as a denial or a stop line itself.
+fn notice(ship: &str, finding: &Finding) -> String {
+    let stop = if finding.lockout {
+        " after repeated blocks"
+    } else {
+        ""
+    };
+    let refusals = match finding.denials.len() {
+        0 => String::new(),
+        1 => " 1 action was refused.".to_owned(),
+        count => format!(" {count} actions were refused."),
+    };
+    format!(
+        "{ship}'s first mate was stopped by Claude's automatic permission checks{stop}.{refusals} Its permission settings load only at launch, so retries stay judged by the old policy. Relaunch it to reload them: `privateer host relaunch {ship}`."
+    )
 }
 
 /// Raise one captain notice, and one block ask for the denials, for each new
 /// incident on a hosted pane. The last incident is kept per ship, so the same
-/// screen raises nothing twice. A ship without a duty task has nobody to tell.
+/// screen raises nothing twice, and a readable screen with no block clears it.
+/// A ship without a duty task has nobody to tell.
 pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Result<Vec<Value>> {
     let mut raised = vec![];
     for (ship, _, screen) in observed {
+        let tx = store.write_transaction()?;
         let Some(finding) = read(screen) else {
+            // An empty screen is a failed read, not a clear one.
+            if !screen.trim().is_empty() {
+                tx.execute("DELETE FROM hosted_automode WHERE ship=?1", [ship])?;
+            }
+            tx.commit()?;
             continue;
         };
-        let tx = store.write_transaction()?;
+        let launch: String = tx
+            .query_row(
+                "SELECT pid, started FROM hosted_panes WHERE ship=?1",
+                [ship],
+                |row| Ok(format!("{}:{}", row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let incident = incident(&launch, &finding);
         let raw: Option<String> = tx
             .query_row("SELECT record FROM ships WHERE name=?1", [ship], |row| {
                 row.get(0)
@@ -98,27 +155,22 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
             "INSERT INTO hosted_automode(ship,incident,ms) VALUES(?1,?2,?3)
              ON CONFLICT(ship) DO UPDATE SET incident=excluded.incident, ms=excluded.ms
              WHERE hosted_automode.incident != excluded.incident",
-            params![ship, finding.incident, Store::now_ms()],
+            params![ship, incident, Store::now_ms()],
         )?;
         if changed == 0 {
             continue;
         }
         let count = finding.denials.len();
-        let body = format!(
-            "{ship}'s first mate hit Claude's auto mode{}: {count} denied action{}. Its auto-mode settings load only at launch, so retries stay judged by the old policy. Relaunch it to reload them: `privateer host relaunch {ship}`.",
-            if finding.lockout { " lockout" } else { "" },
-            if count == 1 { "" } else { "s" },
-        );
         mail::record_crew(
             &tx,
             &json!({
-                "id": format!("hosted-automode-{ship}-{}", &finding.incident[..16]),
+                "id": format!("hosted-automode-{ship}-{}", &incident[..16]),
                 "to": "captain",
                 "kind": "notice",
                 "task_id": duty_task,
                 "urgency": "normal",
-                "body": body,
-                "payload": {"hosted_automode": ship, "incident": finding.incident,
+                "body": notice(ship, &finding),
+                "payload": {"hosted_automode": ship, "incident": incident,
                             "lockout": finding.lockout, "denied": count}
             }),
         )?;
@@ -132,7 +184,7 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
             }
         }
         tx.commit()?;
-        raised.push(json!({"ship": ship, "incident": finding.incident, "lockout": finding.lockout}));
+        raised.push(json!({"ship": ship, "incident": incident, "lockout": finding.lockout}));
     }
     Ok(raised)
 }
@@ -141,16 +193,42 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_lockout_line_is_a_block() {
-        let screen = "● Bash(git push)\n  ⎿  denied\n3 consecutive actions were blocked. Please review the transcript before continuing.";
-        let finding = read(screen).unwrap();
-        assert!(finding.lockout);
+    /// Wrap one line at whole words, as a narrow pane or an editor would.
+    fn wrap(line: &str, width: usize) -> String {
+        let mut out = String::new();
+        let mut col = 0;
+        for word in line.split_whitespace() {
+            let len = word.chars().count();
+            if col > 0 && col + 1 + len > width {
+                out.push('\n');
+                col = 0;
+            } else if col > 0 {
+                out.push(' ');
+                col += 1;
+            }
+            out.push_str(word);
+            col += len;
+        }
+        out
+    }
+
+    fn wrapped(text: &str, width: usize) -> String {
+        text.lines()
+            .map(|line| wrap(line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn repeated_auto_mode_denials_are_a_block_without_the_lockout_line() {
-        let screen = "Auto mode denied this action [Auto-Mode Bypass]\nAuto mode denied this action [Security Test Removal]";
+    fn the_stop_line_is_a_block() {
+        let screen = "● Bash(git push)\n  ⎿  Error\n3 consecutive actions were blocked. Please review the transcript before continuing.";
+        assert!(read(screen).unwrap().lockout);
+        assert!(read("  ⎿  3 consecutive actions were blocked.").unwrap().lockout);
+    }
+
+    #[test]
+    fn repeated_denial_labels_are_a_block_without_the_stop_line() {
+        let screen = "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
         let finding = read(screen).unwrap();
         assert!(!finding.lockout);
         assert_eq!(finding.denials.len(), 2);
@@ -160,24 +238,64 @@ mod tests {
     fn one_ordinary_error_is_not_a_block() {
         assert!(read("error: could not compile crate\nauto mode is on").is_none());
         assert!(read("Permission denied (publickey).").is_none());
+        assert!(read("[Auto-Mode Bypass] Bash denied").is_none());
     }
 
     #[test]
-    fn the_same_screen_names_the_same_incident() {
-        let screen = "3 consecutive actions were blocked.";
-        assert_eq!(read(screen), read(screen));
-        assert_ne!(
-            read(screen).unwrap().incident,
-            read("Auto mode denied [Auto-Mode Bypass]\nAuto mode denied [Security Test Removal]\n3 consecutive actions were blocked.")
-                .unwrap()
-                .incident
-        );
+    fn a_diff_of_this_module_is_not_a_block() {
+        let diff = "+const LOCKOUT: &str = \"consecutive actions were blocked\";\n\
+                    +    if line.contains(\"[Security \") {\n\
+                    -3 consecutive actions were blocked.\n\
+                    +[Auto-Mode Bypass] Bash denied\n\
+                    @@ -37,7 +37,9 @@";
+        assert!(read(diff).is_none());
     }
 
     #[test]
-    fn one_incident_raises_one_notice_and_one_ask() {
-        let temp = tempfile::tempdir().unwrap();
+    fn a_grep_of_the_source_is_not_a_block() {
+        let grep = "src/automode.rs:20:const LOCKOUT: &str = \"consecutive actions were blocked\";\n\
+                    src/automode.rs:24:const LABELS: [&str; 2] = [\"[Auto-Mode \", \"[Security \"];\n\
+                    src/cli.rs:311:- Never retry a denied action.";
+        assert!(read(grep).is_none());
+    }
+
+    #[test]
+    fn prose_about_the_block_is_not_a_block() {
+        let prose = "The stop reads 3 consecutive actions were blocked when auto mode\n\
+                     refuses. The log shows [Auto-Mode Bypass] and [Security Test Removal]\n\
+                     mid-sentence, which a reader must not take for a live denial.";
+        assert!(read(prose).is_none());
+    }
+
+    #[test]
+    fn the_first_mate_instructions_are_not_a_block_at_any_width() {
+        let instructions = instructions_text();
+        for width in [80, 100, 140] {
+            assert!(read(&wrapped(&instructions, width)).is_none(), "width {width}");
+        }
+    }
+
+    #[test]
+    fn the_captain_notice_is_not_a_block() {
+        let finding = read("3 consecutive actions were blocked.").unwrap();
+        assert!(read(&notice("privateer", &finding)).is_none());
+        let denied = read("  ⎿  [Auto-Mode Bypass] denied\n  ⎿  [Security Test Removal] denied").unwrap();
+        assert!(read(&notice("privateer", &denied)).is_none());
+    }
+
+    fn instructions_text() -> String {
+        crate::cli::instructions("privateer", "", "privateer --home /tmp/privateer")
+    }
+
+    fn store_with_duty(temp: &tempfile::TempDir) -> Store {
         let store = Store::open(temp.path()).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO tasks(id,charter_id,owner,title,status,parent,depth)
+                 VALUES('privateer-automode-lockout','privateer','privateer','Lockout','open',NULL,0);",
+            )
+            .unwrap();
         store
             .connection()
             .execute(
@@ -185,22 +303,93 @@ mod tests {
                 [json!({"first_mate": {"duty_task": "privateer-automode-lockout"}}).to_string()],
             )
             .unwrap();
-        let observed = vec![(
-            "privateer".to_owned(),
-            "blocked".to_owned(),
-            "3 consecutive actions were blocked.".to_owned(),
-        )];
-        assert_eq!(alert(&store, &observed).unwrap().len(), 1);
-        // The same screen, still showing the lockout, raises nothing.
-        assert!(alert(&store, &observed).unwrap().is_empty());
-        let notices: i64 = store
+        store
+    }
+
+    fn observe(screen: &str) -> Vec<(String, String, String)> {
+        vec![("privateer".to_owned(), "blocked".to_owned(), screen.to_owned())]
+    }
+
+    fn count(store: &Store, sql: &str) -> i64 {
+        store.connection().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn launch(store: &Store, pid: i64, started: &str) {
+        store
             .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM mail WHERE body LIKE '%auto mode lockout%'",
-                [],
-                |r| r.get(0),
+            .execute(
+                "INSERT OR REPLACE INTO hosted_panes(ship,pid,started,executable,recorded_ms)
+                 VALUES('privateer',?1,?2,'privateer',0)",
+                params![pid, started],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn one_incident_raises_one_notice_and_the_same_screen_again_raises_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let first = "3 consecutive actions were blocked.";
+        // Scrolled, with other output above, the same matched line is the same incident.
+        let scrolled = format!("old output\nmore output\n{first}\n");
+        assert_eq!(alert(&store, &observe(first)).unwrap().len(), 1);
+        assert!(alert(&store, &observe(&scrolled)).unwrap().is_empty());
+        let notices = count(
+            &store,
+            "SELECT COUNT(*) FROM mail WHERE body LIKE '%automatic permission checks%'",
+        );
         assert_eq!(notices, 1);
+    }
+
+    #[test]
+    fn a_relaunch_alerts_the_same_block_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let screen = "3 consecutive actions were blocked.";
+        assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
+        launch(&store, 11, "b");
+        assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_clean_screen_clears_the_incident_so_the_next_block_alerts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let screen = "3 consecutive actions were blocked.";
+        assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
+        assert!(alert(&store, &observe("$ cargo test\nok")).unwrap().is_empty());
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM hosted_automode"), 0);
+        assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_read_does_not_clear_the_incident() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let screen = "3 consecutive actions were blocked.";
+        assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
+        assert!(alert(&store, &observe("")).unwrap().is_empty());
+        assert!(alert(&store, &observe(screen)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_denials_raise_the_block_ask_as_well_as_the_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let screen = "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
+        assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM mail WHERE body LIKE '%automatic permission checks%'"),
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.block') IS NOT NULL"),
+            1
+        );
     }
 }

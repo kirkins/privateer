@@ -93,11 +93,7 @@ pub(crate) fn repair(store: &Store, socket: &Path) -> Result<Vec<(String, String
         let Some(pane) = view.panes.iter().find(|pane| binding.matches(&view, pane)) else {
             continue;
         };
-        let screen = client
-            .read_screen(&pane.pane_id, crate::automode::LINES)
-            .ok()
-            .and_then(|read| read["text"].as_str().map(str::to_owned))
-            .unwrap_or_default();
+        let screen = client.read_visible_text(&pane.pane_id).unwrap_or_default();
         observed.push((ship.clone(), pane.agent_status.clone(), screen));
     }
     Ok(observed)
