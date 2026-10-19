@@ -1751,24 +1751,18 @@ fn a_time_wait_that_names_a_task_or_an_event_is_applied_with_a_typed_hint() {
     let mut fleet = Fleet::new(json!({}));
     attend(&mut fleet);
     enqueue(&mut fleet);
+    task(&mut fleet, "infra-publish");
     let until = privateer::store::Store::now_ms() + 100000;
     let deferred = call(
         &mut fleet,
         "task.defer",
-        json!({"id":"infra-repair","wait":{"kind":"time","reason":"Resume after infra-repair publishes","until_ms":until}}),
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"Resume after infra-publish publishes, not after infra-repair itself","until_ms":until}}),
     );
     assert_eq!(deferred["state"], "waiting", "{deferred}");
-    assert!(
-        deferred["hint"]
-            .as_str()
-            .unwrap()
-            .contains("task infra-repair"),
-        "{deferred}"
-    );
-    assert!(
-        deferred["hint"].as_str().unwrap().contains("after <event>"),
-        "{deferred}"
-    );
+    let hint = deferred["hint"].as_str().unwrap();
+    assert!(hint.contains("task infra-publish"), "{deferred}");
+    assert!(!hint.contains("task infra-repair"), "{deferred}");
+    assert!(hint.contains("after <event>"), "{deferred}");
     let audited: String = fleet
         .store
         .connection()

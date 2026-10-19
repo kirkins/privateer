@@ -86,6 +86,9 @@ Wait kinds:
 | `manual` | Reason | Explicit new enqueue after new direction; never a timed auto-resume |
 
 All waits require a reason. Dependencies are checked for scheduling cycles.
+A `time` wait whose reason names another task, one of this task's own open
+requests, or "after <event>" is still applied, but the defer reply carries a
+`hint` naming the typed wait (`task` or `request`) to use instead.
 Waiting on a correction does not block the corrective child: actual dependencies
 and cancelled/revoked authority govern eligibility. A manually stopped scheduled
 ancestor prevents new automatic descendant work. Manual parking does not kill

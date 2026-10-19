@@ -127,7 +127,7 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
         "manual" => {}
         _ => bail!("wait.kind must be time, attention, task, request or manual"),
     }
-    let hint = time_wait_hint(store, kind, reason)?;
+    let hint = time_wait_hint(store, id, &work.owner, kind, reason)?;
     // Deferring an offer that was taken up is handled work, not a retry.
     if matches!(work.state.as_str(), "offered" | "claimed" | "executing") {
         work.attempts = 0;
@@ -158,7 +158,13 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
 /// a dependency written as a clock. The defer still applies; the hint tells
 /// the caller to wait on the event instead, so it resumes when the event
 /// happens and not at a guessed time.
-fn time_wait_hint(store: &Store, kind: &str, reason: &str) -> Result<Option<String>> {
+fn time_wait_hint(
+    store: &Store,
+    id: &str,
+    owner: &str,
+    kind: &str,
+    reason: &str,
+) -> Result<Option<String>> {
     if kind != "time" {
         return Ok(None);
     }
@@ -174,19 +180,30 @@ fn time_wait_hint(store: &Store, kind: &str, reason: &str) -> Result<Option<Stri
         })
         .collect();
     let mut hints = Vec::new();
+    let mut named = std::collections::HashSet::new();
     for word in &words {
-        if !is_id_shape(word) {
+        // A task cannot wait on itself, so naming it is not a dependency.
+        if !is_id_shape(word) || *word == id || !named.insert(*word) {
             continue;
         }
         // A task is checked first; a request id is a mail id, so it is looked up too.
-        if store.task(word).is_ok() {
-            hints.push(format!(
-                "task {word}: use wait kind task with ref \"{word}\""
-            ));
+        if let Ok(task) = store.task(word) {
+            // A finished dependency is no longer one to wait on.
+            if !matches!(task["status"].as_str(), Some("done" | "cancelled")) {
+                hints.push(format!(
+                    "task {word}: use wait kind task with ref \"{word}\""
+                ));
+            }
         } else if crate::mail::find(store, word)
             .ok()
             .flatten()
-            .is_some_and(|m| m["kind"] == "request")
+            // Only a request wait this task would accept: its own open request to its owner.
+            .is_some_and(|m| {
+                m["kind"] == "request"
+                    && m["from"] == owner
+                    && m["task_id"] == id
+                    && m["state"] == "open"
+            })
         {
             hints.push(format!(
                 "request {word}: use wait kind request with ref \"{word}\""
