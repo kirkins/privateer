@@ -35,6 +35,11 @@ const MANIFESTS: &[(&str, &str)] = &[
     ("rovo", include_str!("../plugins/rovo/manifest.json")),
 ];
 
+/// The bundled harness manifests, by harness id, as shipped.
+pub(crate) fn manifests() -> &'static [(&'static str, &'static str)] {
+    MANIFESTS
+}
+
 fn known(id: &str) -> bool {
     MANIFESTS.iter().any(|(name, _)| *name == id)
 }
@@ -144,4 +149,20 @@ pub(crate) fn migrate(store: &crate::store::Store) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn no_bundled_manifest_overrides_the_host_crew_memory() {
+        // A declared figure outranks the host's default, so the bundled
+        // manifests leave crew memory to the host.
+        for (id, raw) in super::manifests() {
+            let manifest: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert!(
+                manifest.get("memory_bytes").is_none(),
+                "{id} declares memory"
+            );
+        }
+    }
 }

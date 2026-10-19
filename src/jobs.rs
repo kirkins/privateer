@@ -4141,6 +4141,15 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             status["heavy_reserved"] = json!(values.iter().filter(|v| v["heavy"] == true).count());
             status["reservations"] = json!(values);
             status["queue"] = json!(live_queue(&conn)?);
+            // What a crew of each bundled harness reserves here, and from where.
+            let manifests = crate::bundled::manifests()
+                .iter()
+                .map(|(id, raw)| {
+                    let manifest: Value = serde_json::from_str(raw)?;
+                    Ok((*id, crate::plugins::manifest_memory(&manifest)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            status["crew_memory"] = admission::crew_memory_report(&settings, &manifests);
             status["disk_floor_met"] =
                 json!(host.disk_available_bytes >= settings.min_free_disk_bytes);
             // How fast free space has been falling here, and when that rate

@@ -1,1 +1,1 @@
-{"schema_version":1,"id":"gateway-pi","executable":["python3","adapter.py"],"timeout_ms":2000,"max_output_bytes":65536,"memory_bytes":2147483648}
+{"schema_version":1,"id":"gateway-pi","executable":["python3","adapter.py"],"timeout_ms":2000,"max_output_bytes":65536}
