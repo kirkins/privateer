@@ -106,6 +106,17 @@ if mode.startswith("sleep"):
 def call(command, args):
     out = subprocess.run(cli + [command, "--json", json.dumps(args)], capture_output=True, text=True, check=True)
     return json.loads(out.stdout)
+if mode == "half-throttle":
+    # Answers the first open request, then the provider ends the run with a
+    # limit: the mail shows a reply that must never be answered twice.
+    first = next((m for m in call("mail.inbox", {"address": ship})["messages"]
+                  if m["kind"] == "request" and m["state"] == "open"), None)
+    if first:
+        call("mail.send", {"from": ship, "to": first["from"], "kind": "reply",
+                           "correlation": first["id"], "body": "answered before the limit"})
+    print(json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": "error",
+        "errorMessage": "429: {\"type\":\"upstream_unavailable\"}", "content": []}}), flush=True)
+    sys.exit(1)
 errand = re.search(r"^Errand (errand-\S+)", prompt, re.M)
 if errand:
     # An errand ends with its verdict as the final reply, as a model would.

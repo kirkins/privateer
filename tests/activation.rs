@@ -57,6 +57,51 @@ fn native_routes(fleet: &Fleet, hosted: bool) {
     );
 }
 
+fn mate_options(fleet: &Fleet, model: &str) -> Value {
+    let mut options = json!({"mate":fleet.root.join("mate.py"),"mode":fleet.root.join("mode"),
+        "log":fleet.root.join("prompts.log")});
+    options["model"] = json!(model);
+    options
+}
+
+/// The same fleet with the first mate's own route named in the routes file and
+/// a run budget on its window: these harnesses report no usage of their own, so
+/// the runs Privateer counts are the only thing it can measure them by.
+fn native_routes_with_budget(fleet: &Fleet, runs: u64) {
+    native_routes(fleet, false);
+    fleet.ok(
+        "routes.set",
+        json!({
+            "routes": {
+                "own": {"manifest":fleet.root.join("own/manifest.json"),
+                    "options":mate_options(fleet, "own-model"),"cost":"plan",
+                    "allowance":{"window_hours":5,"runs":runs},"tier":1},
+                "spent": {"manifest":fleet.root.join("fallback/manifest.json"),
+                    "options":mate_options(fleet, "spent-model"),"cost":"plan"},
+                "fallback": {"manifest":fleet.root.join("fallback/manifest.json"),
+                    "options":mate_options(fleet, "fallback-model"),"cost":"plan"}
+            },
+            "first_mate": ["own", "spent", "fallback"]
+        }),
+        None,
+    );
+}
+
+/// The runs a route's window has spent, in the shared ledger.
+fn spend_runs(fleet: &Fleet, route: &str, runs: i64, window_ms: i64) {
+    fs::create_dir_all(fleet.root.join("ledger")).unwrap();
+    let ledger = rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
+    privateer::routes::init(&ledger).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT OR REPLACE INTO route_usage(route, runs, runs_window_ends_ms, updated_ms)
+             VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![route, runs, now + window_ms, now],
+        )
+        .unwrap();
+}
+
 fn back_off(fleet: &Fleet, route: &str) {
     fs::create_dir_all(fleet.root.join("ledger")).unwrap();
     let ledger = rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
@@ -90,6 +135,256 @@ fn a_backed_off_first_mate_uses_its_first_clear_fallback_for_a_headless_wake() {
     assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
     assert_eq!(wake_model(&mut fleet), "fallback-model");
     assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
+/// A first mate keeps its own route while its plan has room for it, and moves
+/// to the captain's first_mate order in a fresh session once the plan is past
+/// the share it keeps for itself. Nothing is stopped: only the next wake moves.
+#[test]
+fn a_first_mate_moves_to_its_fallback_before_its_own_route_is_spent() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes_with_budget(&fleet, 20);
+    let wake_for = |fleet: &mut Fleet, id: &str| {
+        fleet.send(
+            json!({"id":id,"from":"apps","to":"infra","kind":"request","body":"Please handle this."}),
+        );
+        Fleet::infra(&fleet.tick())
+    };
+    // Nothing spent: the first mate wakes on its own route.
+    assert_eq!(wake_for(&mut fleet, "first")["status"], "running");
+    assert_eq!(wake_model(&mut fleet), "own-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+
+    // Four fifths of the window is spent: past what crew are refused at, and
+    // the first mate keeps its reserve.
+    spend_runs(&fleet, "own/-/own-model", 16, 5 * 3_600_000);
+    assert_eq!(wake_for(&mut fleet, "second")["status"], "running");
+    assert_eq!(wake_model(&mut fleet), "own-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+
+    // Past nineteen twentieths the next wake moves to the fallback, in a fresh
+    // session: a resumed session belongs to the route it was warmed on.
+    spend_runs(&fleet, "own/-/own-model", 20, 5 * 3_600_000);
+    let moved = wake_for(&mut fleet, "third");
+    assert_eq!(moved["status"], "running", "{moved}");
+    assert_eq!(moved["mode"], "fresh", "{moved}");
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+
+    // The plan renews, and the route is used again.
+    spend_runs(&fleet, "own/-/own-model", 0, 5 * 3_600_000);
+    assert_eq!(wake_for(&mut fleet, "fourth")["status"], "running");
+    assert_eq!(wake_model(&mut fleet), "own-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
+/// Tick until the ship reports a wake that `wanted` accepts, and return that
+/// report. A retry is decided in the same pass that settles the attempt it
+/// replaces, so a test watches the reports rather than the calls.
+fn next_wake(fleet: &mut Fleet, wanted: impl Fn(&Value) -> bool) -> Value {
+    let until = Instant::now() + Duration::from_secs(20);
+    let mut seen = vec![];
+    loop {
+        let report = Fleet::infra(&fleet.tick());
+        if report["status"] == "running" && wanted(&report) {
+            return report;
+        }
+        seen.push(report.clone());
+        assert!(Instant::now() < until, "no such wake: {seen:#?}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The first prompt that says `needle`, waiting for the harness to write it:
+/// a wake is recorded before its job is, so a report of a running wake does
+/// not mean the harness has read its brief yet. With its place in the log, so
+/// the prompt after it can be found.
+fn prompt_with(fleet: &Fleet, needle: &str) -> (usize, String) {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let prompts = fleet.prompts();
+        if let Some(at) = prompts.iter().position(|prompt| prompt.contains(needle)) {
+            return (at, prompts[at].to_owned());
+        }
+        assert!(
+            Instant::now() < until,
+            "no prompt saying {needle}: {prompts:#?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The prompt after the first `from` prompts in the log.
+fn next_prompt(fleet: &Fleet, from: usize) -> String {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let prompts = fleet.prompts();
+        if prompts.len() > from {
+            return prompts[from].to_owned();
+        }
+        assert!(
+            Instant::now() < until,
+            "no prompt after {from}: {prompts:#?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The mail `id` once it is answered, waiting for the wake that answers it: a
+/// wake is reported running before its mate has run, so its reply can land
+/// after the report. Returns the mail as it stands at the bound.
+fn answered_within(fleet: &mut Fleet, id: &str) -> Value {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mail = dispatch(&mut fleet.store, "mail.show", json!({"id": id})).unwrap();
+        if mail["state"] == "answered" || Instant::now() >= until {
+            return mail;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A wake the provider refused is retried once, at once, on the fallback,
+/// without the mail that attempt already answered. Both waits are long enough
+/// that only the retry may pass them.
+#[test]
+fn a_wake_the_provider_refused_is_retried_once_on_the_fallback_without_its_answered_mail() {
+    let mut fleet = Fleet::new(
+        json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600,"max_wakes_per_hour":1}),
+    );
+    native_routes(&fleet, false);
+    fleet.send(
+        json!({"id":"answer-me","from":"apps","to":"infra","kind":"request","body":"the answered one"}),
+    );
+    fleet.send(
+        json!({"id":"still-open","from":"apps","to":"infra","kind":"request","body":"the open one"}),
+    );
+    // The attempt answers the first request, then the provider ends the run.
+    fleet.mode("half-throttle");
+    fleet.tick();
+    let failed = fleet.wakes()[0].clone();
+    assert_eq!(wake_model(&mut fleet), "own-model");
+
+    // The next pass settles it and retries at once, on the fallback rather
+    // than the route that just failed, outside both waits.
+    let retry = next_wake(&mut fleet, |report| report["retry_of"].is_string());
+    assert_eq!(retry["retry_of"], failed["id"].as_str().unwrap(), "{retry}");
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+    assert_eq!(
+        dispatch(&mut fleet.store, "mail.show", json!({"id":"answer-me"})).unwrap()["state"],
+        "answered"
+    );
+    let (_, prompt) = prompt_with(
+        &fleet,
+        &format!("one retry of wake {}", failed["id"].as_str().unwrap()),
+    );
+    assert!(prompt.contains("It has already answered"), "{prompt}");
+    assert!(
+        prompt.contains("It has already answered: answer-me."),
+        "{prompt}"
+    );
+    // The request that attempt answered is not in the mail the retry reads.
+    assert!(!prompt.contains("the answered one"), "{prompt}");
+    assert!(prompt.contains("the open one"), "{prompt}");
+    // It answers the open one itself, and the provider refuses it again.
+    assert_eq!(fleet.settle()["status"], "failed");
+    assert_eq!(
+        dispatch(&mut fleet.store, "mail.show", json!({"id":"still-open"})).unwrap()["state"],
+        "answered"
+    );
+}
+
+/// The retry is once: a wake that is itself a retry is never retried again, and
+/// the wake after it is an ordinary one on the route its profile names.
+#[test]
+fn a_retried_wake_is_not_retried_again_and_the_next_wake_waits() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    for id in ["one", "two", "three"] {
+        fleet.send(
+            json!({"id":id,"from":"apps","to":"infra","kind":"request","body":format!("request {id}")}),
+        );
+    }
+    // Every attempt answers one request and is then refused by the provider.
+    fleet.mode("half-throttle");
+    fleet.tick();
+    let first = fleet.wakes()[0].clone();
+    let retry = next_wake(&mut fleet, |report| report["retry_of"].is_string());
+    assert_eq!(retry["retry_of"], first["id"].as_str().unwrap(), "{retry}");
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+
+    // The retry failed too, so the wake after it is not a retry of it: it is
+    // an ordinary one, which its own failed route being held off may move to
+    // any clear route in the captain's list.
+    let (retry_prompt, _) = prompt_with(&fleet, "one retry of wake");
+    let next = next_wake(&mut fleet, |report| report["retry_of"].is_null());
+    assert_ne!(next["wake"], retry["wake"]);
+    let prompt = next_prompt(&fleet, retry_prompt + 1);
+    assert!(!prompt.contains("one retry of wake"), "{prompt}");
+    // Each attempt answered one request, so nothing is asked twice. The next
+    // wake runs in its own process and answers after it is reported running.
+    for id in ["one", "two", "three"] {
+        let answer = answered_within(&mut fleet, id);
+        assert_eq!(answer["state"], "answered", "{id}: {answer}");
+    }
+}
+
+/// A failed wake whose job record was pruned cannot read its log, and is
+/// treated as not retryable rather than failing the tick.
+#[test]
+fn a_failed_wake_whose_job_was_pruned_is_not_retryable() {
+    let mut fleet = Fleet::new(
+        json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600,"max_wakes_per_hour":1}),
+    );
+    native_routes(&fleet, false);
+    fleet.send(json!({"id":"req-1","from":"apps","to":"infra","kind":"request","body":"work"}));
+    fleet.mode("half-throttle");
+    fleet.tick();
+    let failed = fleet.wakes()[0].clone();
+    let job_id = failed["job_id"].as_str().unwrap();
+
+    // Prune the job record from the jobs table.
+    fleet
+        .store
+        .connection()
+        .execute("DELETE FROM jobs WHERE id=?1", [job_id])
+        .unwrap();
+
+    // The next tick must not error; it simply treats the wake as not retryable.
+    let reports = fleet.tick();
+    let retried = reports["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|ship| ship["retry_of"].is_string());
+    assert!(!retried, "pruned job must not be retried: {reports:?}");
+}
+
+/// A retry skips the route that FAILED, not just the ship's own configured route.
+#[test]
+fn a_retry_skips_the_route_that_failed_not_just_the_ships_own_route() {
+    let mut fleet = Fleet::new(
+        json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600,"max_wakes_per_hour":1}),
+    );
+    native_routes(&fleet, false);
+    // Back off the ship's own route beforehand, so the wake starts on the fallback ("spent").
+    back_off(&fleet, "own/-/own-model");
+    fleet.send(
+        json!({"id":"req-2","from":"apps","to":"infra","kind":"request","body":"work on fallback"}),
+    );
+    // A second request the failed attempt does not answer, so there is mail to retry:
+    fleet.send(
+        json!({"id":"req-3","from":"apps","to":"infra","kind":"request","body":"still open"}),
+    );
+    // "spent" fails with half-throttle:
+    fleet.mode("half-throttle");
+    fleet.tick();
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+
+    // The retry must skip "spent" (the route that failed) and pick the next fallback ("fallback-model"):
+    let retry = next_wake(&mut fleet, |report| report["retry_of"].is_string());
+    assert!(retry["retry_of"].is_string());
+    assert_eq!(wake_model(&mut fleet), "fallback-model");
 }
 
 #[test]
@@ -128,7 +423,10 @@ fn a_provider_pinned_charter_waits_instead_of_changing_first_mate_route() {
     back_off(&fleet, "own/-/own-model");
     fleet.send(json!({"id":"pinned","from":"apps","to":"infra","kind":"request","body":"Keep the pinned provider."}));
     let report = Fleet::infra(&fleet.tick());
-    assert_eq!(report["skipped"], "model route backing off", "{report}");
+    assert_eq!(
+        report["skipped"], "model route backing off or past its headroom",
+        "{report}"
+    );
     assert!(fleet.wakes().is_empty());
 }
 
@@ -1221,6 +1519,19 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     assert_eq!(last["urgency"], "high");
 }
 
+/// Tick until no wake of the infra ship is running.
+fn quiet_infra(fleet: &mut Fleet) {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        fleet.tick();
+        if fleet.wakes().iter().all(|w| w["status"] != "running") {
+            return;
+        }
+        assert!(Instant::now() < until, "an infra wake never ended");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     let mut fleet = Fleet::new(now_settings());
@@ -1278,14 +1589,18 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     assert!(backed[0]["last_error"].as_str().unwrap().starts_with("429"));
     let until = backed[0]["until_ms"].as_i64().unwrap();
 
-    // New crew on that route are refused, and headless wakes wait.
+    // New crew on that route are refused, and headless wakes wait. An infra
+    // wake the run before started in fail mode may still be running, and may
+    // have been throttled by now: let every infra wake end before reading why
+    // the next one waits.
     let refused = crew(&fleet, "second");
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("backing off"));
+    quiet_infra(&mut fleet);
     fleet.send(json!({"id":"q","from":"apps","to":"infra","kind":"request","body":"Ready?"}));
     assert_eq!(
         Fleet::infra(&fleet.tick())["skipped"],
-        "model route backing off"
+        "model route backing off or past its headroom"
     );
     let bearings = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
     assert!(
@@ -1326,6 +1641,51 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
         .query_row("SELECT COUNT(*) FROM model_routes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(left, 0);
+}
+
+#[test]
+fn a_throttled_wake_with_no_fallback_waits_then_wakes_on_its_own_route() {
+    // No routes file: the first mate has no other route to retry on.
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20}}),
+        None,
+    );
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    let ledger_path = fleet.root.join("ledger/resources.sqlite");
+    let ledger = || rusqlite::Connection::open(&ledger_path).unwrap();
+
+    fleet.mode("throttle");
+    fleet.send(json!({"id":"q","from":"apps","to":"infra","kind":"request","body":"Ready?"}));
+    let throttled = Fleet::infra(&fleet.tick());
+    assert!(throttled["wake"].is_string(), "{throttled}");
+    let failed = fleet.settle();
+    assert_eq!(failed["status"], "failed", "{failed}");
+
+    // The retry finds no route, so the wake waits as it does without a
+    // failure, on the route that throttled it.
+    let waiting = Fleet::infra(&fleet.tick());
+    assert_eq!(
+        waiting["skipped"], "model route backing off or past its headroom",
+        "{waiting}"
+    );
+
+    // Once that route's backoff ends, the wake goes out on it, not as a retry.
+    ledger()
+        .execute("UPDATE model_routes SET until_ms=0", [])
+        .unwrap();
+    fleet.mode("normal");
+    let woken = Fleet::infra(&fleet.tick());
+    assert!(woken["wake"].is_string(), "{woken}");
+    assert!(woken["retry_of"].is_null(), "{woken}");
+    let done = fleet.settle();
+    assert_eq!(done["id"], woken["wake"], "{done}");
+    assert_eq!(done["status"], "succeeded", "{done}");
 }
 
 #[test]
