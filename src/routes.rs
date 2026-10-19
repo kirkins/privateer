@@ -292,7 +292,7 @@ struct RouteFailure {
 }
 
 /// The ledger key that stands for every model on a route's harness and provider.
-fn account_key(route: &str) -> Option<String> {
+pub(crate) fn account_key(route: &str) -> Option<String> {
     route
         .rsplit_once('/')
         .map(|(account, _)| format!("{account}/*"))
@@ -800,19 +800,26 @@ pub(crate) fn spent(usage: &Usage, budget: Option<u64>, now: i64) -> Option<Spen
             worst = Some(Spent { share, what });
         }
     };
-    for (name, share, ends_ms) in [
+    for (name, share, ends_ms, window_ms) in [
         (
             "five-hour window",
             usage.window_utilization,
             usage.window_ends_ms,
+            5 * 3_600_000,
         ),
         (
             "weekly window",
             usage.weekly_utilization,
             usage.weekly_ends_ms,
+            7 * 24 * 3_600_000,
         ),
     ] {
         if let Some(share) = share {
+            let expired = match ends_ms {
+                Some(ends) => ends <= now,
+                None => now.saturating_sub(usage.updated_ms) >= window_ms,
+            };
+            let share = if expired { 0.0 } else { share };
             consider(share, window(name, ends_ms, now));
         }
     }
@@ -852,7 +859,24 @@ fn tight(
     limits: &Limits,
     now: i64,
 ) -> Result<Option<String>> {
-    let Some(spent) = spent(&usage_of(conn, route)?, limits.runs, now) else {
+    let mut usage = usage_of(conn, route)?;
+    if let Some(account) = account_key(route).filter(|a| a != route) {
+        if let Ok(account_usage) = usage_of(conn, &account) {
+            let account_is_newer = account_usage.updated_ms > usage.updated_ms
+                || (usage.window_utilization.is_none() && usage.weekly_utilization.is_none());
+            if account_is_newer
+                && (account_usage.window_utilization.is_some()
+                    || account_usage.weekly_utilization.is_some())
+            {
+                usage.window_ends_ms = account_usage.window_ends_ms;
+                usage.window_utilization = account_usage.window_utilization;
+                usage.weekly_ends_ms = account_usage.weekly_ends_ms;
+                usage.weekly_utilization = account_usage.weekly_utilization;
+                usage.updated_ms = usage.updated_ms.max(account_usage.updated_ms);
+            }
+        }
+    }
+    let Some(spent) = spent(&usage, limits.runs, now) else {
         return Ok(None);
     };
     let limit = threshold(limits, who);
@@ -1146,6 +1170,37 @@ fn record_job(
                 usage.updated_ms
             ],
         )?;
+        if let Some(windows) = windows
+            && let Some(account) = account_key(route).filter(|a| a != route)
+        {
+            let mut account_usage = usage_of(&tx, &account)?;
+            account_usage.window_ends_ms = windows.window_ends_ms.or(account_usage.window_ends_ms);
+            account_usage.window_utilization = windows.window_utilization;
+            account_usage.weekly_ends_ms = windows.weekly_ends_ms;
+            account_usage.weekly_utilization = windows.weekly_utilization;
+            account_usage.updated_ms = account_usage.updated_ms.max(at);
+            tx.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO route_usage({USAGE_COLUMNS})
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                ),
+                params![
+                    account,
+                    account_usage.last_succeeded_ms,
+                    account_usage.last_throttled_ms,
+                    account_usage.last_throttle,
+                    account_usage.strikes,
+                    account_usage.window_ends_ms,
+                    account_usage.window_utilization,
+                    account_usage.weekly_ends_ms,
+                    account_usage.weekly_utilization,
+                    account_usage.capped_until_ms,
+                    account_usage.runs,
+                    account_usage.runs_window_ends_ms,
+                    account_usage.updated_ms
+                ],
+            )?;
+        }
     }
     tx.commit()?;
     Ok(())
@@ -2024,6 +2079,9 @@ mod allowance_tests {
         let usage = usage_of(&conn, "claude/-/opus").unwrap();
         assert_eq!(usage.window_ends_ms, Some(1_792_214_400_000));
         assert_eq!(usage.weekly_utilization, Some(0.03));
+        let account = usage_of(&conn, "claude/-/*").unwrap();
+        assert_eq!(account.window_ends_ms, Some(1_792_214_400_000));
+        assert_eq!(account.weekly_utilization, Some(0.03));
     }
 
     /// The share spent is the furthest spent of the windows reported and of
@@ -2047,6 +2105,18 @@ mod allowance_tests {
             share.what.starts_with("weekly window, clears "),
             "{share:?}"
         );
+        // An expired window counts as 0 once its reset time has passed.
+        let expired = spent(&reading, Some(10), now + 8 * HOUR).unwrap();
+        assert_eq!(expired.share, 0.0);
+        // A reading with no reset time goes stale after its window length.
+        let no_reset = Usage {
+            window_utilization: Some(0.7),
+            window_ends_ms: None,
+            updated_ms: now,
+            ..Usage::default()
+        };
+        assert_eq!(spent(&no_reset, None, now + 4 * HOUR).unwrap().share, 0.7);
+        assert_eq!(spent(&no_reset, None, now + 6 * HOUR).unwrap().share, 0.0);
         // The run budget is measured only while its window is open, and only
         // when the captain states one.
         let budgeted = Usage {

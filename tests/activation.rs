@@ -314,6 +314,58 @@ fn a_retried_wake_is_not_retried_again_and_the_next_wake_waits() {
     }
 }
 
+/// A failed wake whose job record was pruned cannot read its log, and is
+/// treated as not retryable rather than failing the tick.
+#[test]
+fn a_failed_wake_whose_job_was_pruned_is_not_retryable() {
+    let mut fleet = Fleet::new(
+        json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600,"max_wakes_per_hour":1}),
+    );
+    native_routes(&fleet, false);
+    fleet.send(
+        json!({"id":"req-1","from":"apps","to":"infra","kind":"request","body":"work"}),
+    );
+    fleet.mode("half-throttle");
+    fleet.tick();
+    let failed = fleet.wakes()[0].clone();
+    let job_id = failed["job_id"].as_str().unwrap();
+
+    // Prune the job record from the jobs table.
+    fleet
+        .store
+        .connection()
+        .execute("DELETE FROM jobs WHERE id=?1", [job_id])
+        .unwrap();
+
+    // The next tick must not error; it simply treats the wake as not retryable.
+    let reports = fleet.tick();
+    let retry = reports.iter().find(|r| r.get("retry_of").is_some());
+    assert!(retry.is_none(), "pruned job must not be retried: {reports:?}");
+}
+
+/// A retry skips the route that FAILED, not just the ship's own configured route.
+#[test]
+fn a_retry_skips_the_route_that_failed_not_just_the_ships_own_route() {
+    let mut fleet = Fleet::new(
+        json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600,"max_wakes_per_hour":1}),
+    );
+    native_routes(&fleet, false);
+    // Back off the ship's own route beforehand, so the wake starts on the fallback ("spent").
+    back_off(&fleet, "own/-/own-model");
+    fleet.send(
+        json!({"id":"req-2","from":"apps","to":"infra","kind":"request","body":"work on fallback"}),
+    );
+    // "spent" fails with half-throttle:
+    fleet.mode("half-throttle");
+    fleet.tick();
+    assert_eq!(wake_model(&mut fleet), "spent-model");
+
+    // The retry must skip "spent" (the route that failed) and pick the next fallback ("fallback-model"):
+    let retry = next_wake(&mut fleet, |report| report["retry_of"].is_string());
+    assert!(retry["retry_of"].is_string());
+    assert_eq!(wake_model(&mut fleet), "fallback-model");
+}
+
 #[test]
 fn a_cleared_first_mate_route_is_used_again_for_the_next_wake() {
     let mut fleet = Fleet::new(now_settings());

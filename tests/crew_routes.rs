@@ -753,6 +753,171 @@ fn a_reported_window_keeps_new_crew_off_the_route_and_leaves_the_first_mate_room
     );
 }
 
+/// An expired window counts as 0, so crew are not refused once the window's
+/// reset time has passed.
+#[test]
+fn an_expired_window_lets_crew_back_onto_the_route() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    shared["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"shared": shared, "other": codex("model-other", "plan")},
+        "crew": ["shared", "other"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.85, ?1, ?2)",
+            rusqlite::params![now + 3_600_000, now],
+        )
+        .unwrap();
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert!(refusal.contains("85% of its weekly window"), "{refusal}");
+    assert!(refusal.contains("80% for crew"), "{refusal}");
+
+    // Once the reset time has passed, the window expires and counts as 0.
+    ledger
+        .execute(
+            "UPDATE route_usage SET weekly_ends_ms=?1 WHERE route='claude/-/sonnet'",
+            rusqlite::params![now - 1_000],
+        )
+        .unwrap();
+    let start = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert_eq!(f.model(&start), "sonnet");
+}
+
+/// Claude window readings are account-wide, recorded under the account key
+/// ("claude/-/*"), so a high reading on one model route refuses crew on another
+/// model route of the same account.
+#[test]
+fn a_fresh_high_reading_on_one_claude_route_refuses_crew_on_another_claude_route_of_the_same_account() {
+    let f = Fleet::new();
+    let script = |window: f64, week: f64| {
+        let resets = privateer::store::Store::now_ms() / 1000;
+        let session = "11111111-2222-3333-4444-555555555555";
+        let init = json!({"type": "system", "subtype": "init", "session_id": session,
+            "model": "claude-sonnet"});
+        let event = json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed",
+            "unifiedWindows": {
+                "five_hour": {"utilization": window, "resetsAt": resets + 3_600},
+                "seven_day": {"utilization": week, "resetsAt": resets + 604_800}}}});
+        let done = json!({"type": "result", "subtype": "success", "is_error": false,
+            "session_id": session, "result": "ok"});
+        let stream = format!("{init}\n{event}\n{done}\n");
+        fs::write(f.root.join("stream.jsonl"), &stream).unwrap();
+        fs::write(
+            f.root.join("bin/claude"),
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/../stream.jsonl\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(f.root.join("bin/claude"), fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let mut fast = claude("sonnet");
+    fast["tier"] = json!(1);
+    let mut deep = claude("opus");
+    deep["tier"] = json!(2);
+    f.routes(json!({
+        "routes": {"fast": fast, "deep": deep, "other": codex("model-other", "plan")},
+        "crew": ["fast", "deep", "other"]
+    }));
+    f.tick();
+
+    // Run on `fast` reports 86% weekly utilization for the account.
+    script(0.4, 0.86);
+    f.run_and_scan("crew-fast", Some("fast"));
+
+    // Both the route and the account key recorded the reading.
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let account_utilization: f64 = ledger
+        .query_row(
+            "SELECT weekly_utilization FROM route_usage WHERE route='claude/-/*'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(account_utilization, 0.86);
+
+    // Launching crew on `deep` is refused because its account is past the crew threshold.
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"deep"}),
+    );
+    assert!(refusal.contains("86% of its weekly window"), "{refusal}");
+    assert!(refusal.contains("80% for crew"), "{refusal}");
+}
+
+/// A parked crew is in-flight running work, so it may resume on its route at
+/// 85% headroom (past the 80% new crew share), and is blocked only by holds.
+#[test]
+fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
+    let f = Fleet::new();
+    let mut shared = claude("sonnet");
+    shared["crew_headroom_pct"] = json!(80);
+    shared["first_mate_headroom_pct"] = json!(95);
+    f.routes(json!({
+        "routes": {"shared": shared},
+        "crew": ["shared"]
+    }));
+    f.tick();
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    ledger
+        .execute(
+            "INSERT INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('claude/-/sonnet', 0.85, ?1, ?2)",
+            rusqlite::params![now + 3_600_000, now],
+        )
+        .unwrap();
+    let store = privateer::store::Store::open(f.root.join("engineering/.privateer/fleet.sqlite")).unwrap();
+    // New crew start is refused at 85%:
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"shared"}),
+    );
+    assert!(refusal.contains("85% of its weekly window"), "{refusal}");
+
+    // But a parked crew resuming on its route is permitted to finish:
+    let can_resume = privateer::crew_routes::resume_route(
+        &store,
+        "engineering",
+        "bundled:claude",
+        &json!({"model": "sonnet"}),
+    )
+    .unwrap();
+    assert!(can_resume, "parked crew at 85% must be allowed to resume");
+
+    // Provider holds still prevent resume:
+    ledger
+        .execute(
+            "INSERT INTO model_routes(route, failures, until_ms, last_error, updated_ms)
+             VALUES('claude/-/sonnet', 1, ?1, '429', ?2)",
+            rusqlite::params![now + 3_600_000, now],
+        )
+        .unwrap();
+    let blocked_resume = privateer::crew_routes::resume_route(
+        &store,
+        "engineering",
+        "bundled:claude",
+        &json!({"model": "sonnet"}),
+    )
+    .unwrap();
+    assert!(!blocked_resume, "a held route must not resume");
+}
+
 /// A route whose harness reports nothing is measured by the runs it counts
 /// against the budget the captain set for its window. No default: a route that
 /// states no budget is never refused on a share nobody knows.

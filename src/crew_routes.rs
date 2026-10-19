@@ -794,20 +794,21 @@ pub(crate) fn retry_fallback(
     ship: &str,
     task: &str,
     profile: &Value,
+    failed_route: Option<&str>,
 ) -> Result<Option<Choice>> {
-    fallback(store, ship, task, profile, true)
+    fallback(store, ship, task, profile, failed_route)
 }
 
 /// A first mate's fallback route. Its own route is used while it can take the
 /// wake; once it cannot (held off, or past the share it keeps for first mates)
-/// the first listed route that can is taken instead. With `move_on`, the route
-/// just tried is passed over whatever its state, which is what a retry wants.
+/// the first listed route that can is taken instead. With `failed_route`, the
+/// route just tried is passed over whatever its state, which is what a retry wants.
 fn fallback(
     store: &Store,
     ship: &str,
     task: &str,
     profile: &Value,
-    move_on: bool,
+    failed_route: Option<&str>,
 ) -> Result<Option<Choice>> {
     let Some(own_route) = identity(&json!({
         "manifest": profile["manifest"],
@@ -828,7 +829,7 @@ fn fallback(
     let Some(policy) = for_store(store)? else {
         return Ok(None);
     };
-    if !move_on
+    if failed_route.is_none()
         && !crate::routes::held_off(
             &ledger,
             &own_route,
@@ -844,7 +845,7 @@ fn fallback(
         let Some(route_id) = identity(route) else {
             continue;
         };
-        if route_id == own_route {
+        if route_id == own_route || failed_route == Some(route_id.as_str()) {
             continue;
         }
         if !crate::routes::held_off(&ledger, &route_id, Who::FirstMate, &limits(route), now)? {
@@ -1144,7 +1145,7 @@ pub(crate) fn retry_refusal(store: &Store, ship: &str, route: &str) -> Result<Op
 /// captain lists it for the crew's ship (or lists no crew routes, which
 /// restricts nothing), and it is not backing off. A resume is a runtime
 /// launch, so it is checked here as an agent start is in `check`.
-pub(crate) fn resume_route(
+pub fn resume_route(
     store: &Store,
     ship: &str,
     manifest: &str,
@@ -1167,8 +1168,10 @@ pub(crate) fn resume_route(
         return Ok(false);
     };
     let route = &policy["routes"][name.as_str()];
+    let ledger = crate::jobs::host_ledger(store)?;
+    let now = Store::now_ms();
     Ok(identity(route)
-        .map(|id| crate::routes::refusal_for(store, &id, Who::Crew, limits(route)))
+        .map(|id| crate::routes::blocked_at(&ledger, &id, now))
         .transpose()?
         .flatten()
         .is_none())
@@ -1263,7 +1266,32 @@ pub(crate) fn states(
     let mut named = std::collections::HashSet::new();
     for (name, route) in policy["routes"].as_object().into_iter().flatten() {
         let id = identity(route);
-        let used = id.as_ref().and_then(|id| usage.get(id)).cloned();
+        let mut used = id.as_ref().and_then(|id| usage.get(id)).cloned();
+        if let Some(account) = id.as_deref().and_then(crate::routes::account_key) {
+            if let Some(account_used) = usage.get(&account) {
+                let account_is_newer = used.as_ref().is_none_or(|u| {
+                    account_used.updated_ms > u.updated_ms
+                        || (u.window_utilization.is_none() && u.weekly_utilization.is_none())
+                });
+                if account_is_newer
+                    && (account_used.window_utilization.is_some()
+                        || account_used.weekly_utilization.is_some())
+                {
+                    if let Some(u) = &mut used {
+                        u.window_ends_ms = account_used.window_ends_ms;
+                        u.window_utilization = account_used.window_utilization;
+                        u.weekly_ends_ms = account_used.weekly_ends_ms;
+                        u.weekly_utilization = account_used.weekly_utilization;
+                        u.updated_ms = u.updated_ms.max(account_used.updated_ms);
+                    } else {
+                        let mut account_u = account_used.clone();
+                        account_u.runs = 0;
+                        account_u.runs_window_ends_ms = None;
+                        used = Some(account_u);
+                    }
+                }
+            }
+        }
         let declared = allowance(route);
         let blocked = match &id {
             Some(id) => crate::routes::blocked_at(ledger, id, now)?,

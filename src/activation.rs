@@ -315,6 +315,8 @@ struct Retry {
     wake: String,
     /// Its classified failure, for the retry to read.
     error: String,
+    /// The route that failed, when known.
+    failed_route: Option<String>,
     /// The requests that attempt answered, by id.
     answered: Vec<String>,
 }
@@ -356,9 +358,18 @@ fn retryable(store: &mut Store, ship: &str, last: &Last) -> Result<Option<Retry>
     let Some(job_id) = &last.job_id else {
         return Ok(None);
     };
-    let Some(error) = crate::routes::throttle(&job_log(store, job_id)?) else {
+    let Ok(log) = job_log(store, job_id) else {
         return Ok(None);
     };
+    let Some(error) = crate::routes::throttle(&log) else {
+        return Ok(None);
+    };
+    let failed_route = job_status(store, job_id).ok().and_then(|job| {
+        job["model_route"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| crate::routes::route_of_argv(&job["command"]))
+    });
     // What that attempt already did to this mailbox is a durable fact in it,
     // not a reading of a transcript: a reply marks the request it answers
     // answered, so both come from one place.
@@ -372,6 +383,7 @@ fn retryable(store: &mut Store, ship: &str, last: &Last) -> Result<Option<Retry>
     Ok(Some(Retry {
         wake: last.id.clone(),
         error,
+        failed_route,
         answered,
     }))
 }
@@ -469,9 +481,9 @@ fn wake_text(
         text.push_str(&format!(
             "\nThis is one retry of wake {}, which the provider ended with: {}. \
              It has already answered: {}. Those requests are left out below and \
-             need no answer; everything else in this mail is new to you. This \
-             attempt skips the one-minute wait and the hourly wake budget, and \
-             the next one, if any, waits as usual.\n",
+             need no answer; check bearings for crew or notices the failed attempt \
+             already started. This attempt skips the one-minute wait and the \
+             hourly wake budget, and the next one, if any, waits as usual.\n",
             retry.wake,
             retry.error,
             if retry.answered.is_empty() {
@@ -964,13 +976,24 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     }
     if retry.is_some() || own_blocked == Some(true) {
         let fallback = match &retry {
-            Some(_) => crate::crew_routes::retry_fallback(store, &name, &task, &profile)?,
+            Some(retry) => crate::crew_routes::retry_fallback(
+                store,
+                &name,
+                &task,
+                &profile,
+                retry.failed_route.as_deref(),
+            )?,
             None => crate::crew_routes::first_mate_fallback(store, &name, &task, &profile)?,
         };
         let Some(fallback) = fallback else {
-            return Ok(json!({"ship": name, "skipped":
-                if retry.is_some() { "no fallback route for a retry" } else { "model route backing off or past its headroom" },
-                "debug": json!({"task": task, "own": profile["manifest"], "plugin": store.authorize(&task, "spawn").map(|a| a["provider_plugin"].to_string()).unwrap_or_else(|e| format!("{e}")), "policy": crate::crew_routes::load().ok().flatten().map(|p| format!("{:?}", crate::crew_routes::order(&p, &name, "first_mate")))})}));
+            return Ok(json!({
+                "ship": name,
+                "skipped": if retry.is_some() {
+                    "no fallback route for a retry"
+                } else {
+                    "model route backing off or past its headroom"
+                }
+            }));
         };
         profile["manifest"] = fallback.manifest;
         profile["options"] = fallback.options;

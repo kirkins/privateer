@@ -81,6 +81,9 @@ Integration, with an isolated routes file and ledger (`PRIVATEER_FLEET`, `PRIVAT
 
 ## Failure modes
 
+- **The run budget counts finished runs only**, so parallel launches can overshoot it.
+- **Runs that end on a task error or a cancel are not counted**, so failed attempts before reaching the provider do not consume budget.
+- **Across a window edge the budget can let through twice its value** if the plan window is rolling.
 - **A budget set too low** refuses work that would have succeeded. It is the captain's number, it is one line in their file, and bearings say how much of it is used.
 - **A budget set too high** is a cap reached before Privateer knows, which is what this change is for; the failure then looks as it does today, a refused run.
 - **A run that reaches the provider and reports no usage** still counts, because counting is by run and not by reported tokens.
