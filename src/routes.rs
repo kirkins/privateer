@@ -2232,7 +2232,12 @@ mod allowance_tests {
             }),
         )
         .unwrap();
-        assert_eq!(usage(&conn).unwrap().len(), 1);
+        // The reading is kept under the route and its account, and the run
+        // that declared nothing adds no row.
+        let rows = usage(&conn).unwrap();
+        assert!(rows.contains_key("claude/-/sonnet"), "{rows:?}");
+        assert!(rows.contains_key("claude/-/*"), "{rows:?}");
+        assert!(!rows.contains_key("opencode/deepseek/v4"), "{rows:?}");
     }
 
     #[test]

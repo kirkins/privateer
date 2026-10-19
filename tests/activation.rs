@@ -357,6 +357,10 @@ fn a_retry_skips_the_route_that_failed_not_just_the_ships_own_route() {
     fleet.send(
         json!({"id":"req-2","from":"apps","to":"infra","kind":"request","body":"work on fallback"}),
     );
+    // A second request the failed attempt does not answer, so there is mail to retry:
+    fleet.send(
+        json!({"id":"req-3","from":"apps","to":"infra","kind":"request","body":"still open"}),
+    );
     // "spent" fails with half-throttle:
     fleet.mode("half-throttle");
     fleet.tick();
