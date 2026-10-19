@@ -180,15 +180,19 @@ async function attention($, kind, tokens, extra = {}) {
 }
 
 // A resumable hosted first mate compacts its own conversation when the runtime
-// says this settled turn crossed the line. Submitted at the turn's end, like a
-// follow-up; the runtime asks once per crossing and not again until below it.
+// says this settled turn crossed the line. The session API runs the same call
+// /compact makes, between turns: it starts no model turn, and it is not a prompt,
+// so this mod's prompt.submit hook never sees it. A declined compaction (a
+// {skip} result, or a refusal) leaves the crossing armed, so the runtime asks
+// again at the next settled turn; the compaction report disarms it.
 async function compact($, gen, reply) {
   if (reply?.compact !== true || gen !== generation || !active || busy || paused
       || pending || prepared || nudge || offer) return;
   try {
     if (!await owned($, gen) || (await $.prompt.read()).text.length) return;
-    await $.prompt.submit({ text: "/compact" });
-  } catch { /* best effort: a crossing is not asked again until the context drops below the line */ }
+    const result = await $.session.compact();
+    if (result?.skip) return;
+  } catch { /* best effort: a refused compaction is asked again at the next settled turn */ }
 }
 
 function followText(idle) {

@@ -241,11 +241,13 @@ fn hosted_claude(store: &Store, ship: &str) -> Result<Option<Line>> {
 
 /// Follows the line for the session holding a hosted Claude first mate. A
 /// session is armed by one of its own samples below the line. The first
-/// settled turn to end at or past the line while armed acts once and disarms,
-/// so one crossing acts once; a session whose first sample is already past the
-/// line never acts, and a new session starts unarmed. A pending request, an
-/// open captain question or an unread crew report holds the action back, and
-/// the session stays armed. Returns the action taken, if any.
+/// settled turn to end at or past the line while armed asks once. The ask
+/// stays armed until the holder reports a compaction, so a declined compaction,
+/// a held-back request or an expired relaunch request asks again at the next
+/// settled turn past the line. A bounded session (which cannot compact) starts
+/// unarmed, so a fresh launch past the line never loops; a resumable one arms
+/// at its start, since a compaction is at most once per launch. Returns the
+/// action taken, if any.
 fn track_line(
     store: &Store,
     ship: &str,
@@ -262,6 +264,7 @@ fn track_line(
         return Ok(None);
     }
     let percent = tokens as f64 * 100.0 / window as f64;
+    // A session with no row of its own is new: a resumable one arms at start.
     let armed: bool = store
         .connection()
         .query_row(
@@ -270,13 +273,18 @@ fn track_line(
             |r| r.get(0),
         )
         .optional()?
-        .unwrap_or(false);
+        .unwrap_or(!line.bounded);
     let action = if kind == "turn" && settled && armed && percent >= line.compact {
         request_at_line(store, ship, holder, &line, tokens, window, percent)?
     } else {
         None
     };
-    let armed = percent < line.compact || (armed && action.is_none());
+    // Only a compaction the holder reports takes a resumable crossing. Every
+    // other report keeps the crossing armed while it is still past the line.
+    let armed = match kind {
+        "compaction" => false,
+        _ => percent < line.compact || armed,
+    };
     store.connection().execute(
         "INSERT INTO context_line(ship, holder, armed) VALUES(?1, ?2, ?3)
          ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, armed=excluded.armed",
@@ -285,10 +293,11 @@ fn track_line(
     Ok(action)
 }
 
-/// Takes the crossing: a bounded first mate asks its pane to relaunch into a
+/// Asks for the crossing: a bounded first mate asks its pane to relaunch into a
 /// fresh session at the next safe point, busy or idle (never forced); a
-/// resumable one is told to /compact by its pane. Holds back while a request
+/// resumable one is asked to /compact by its pane. Holds back while a request
 /// is pending, the captain has a question open, or a crew report is unread.
+/// The caller keeps the crossing armed until the session reports the outcome.
 fn request_at_line(
     store: &Store,
     ship: &str,
@@ -423,6 +432,16 @@ mod tests {
         report_from(store, HOLDER, tokens, settled)
     }
 
+    /// The pane's own report after a compaction it ran.
+    fn report_compaction(store: &Store, tokens: i64) {
+        report(
+            store,
+            &json!({"ship": SHIP, "kind": "compaction", "tokens": tokens, "window": WINDOW,
+                "holder": HOLDER}),
+        )
+        .unwrap();
+    }
+
     fn count(store: &Store, sql: &str) -> i64 {
         store.connection().query_row(sql, [], |r| r.get(0)).unwrap()
     }
@@ -528,7 +547,8 @@ mod tests {
             "no relaunch for a resumable first mate"
         );
         assert_eq!(audited(&store), 1);
-        // Still above the line after the compaction: no second one.
+        // The compaction the pane reports disarms the crossing: no second one.
+        report_compaction(&store, 110_000);
         assert!(report_turn(&store, 105_000, true)["compact"].is_null());
         assert!(report_turn(&store, 120_000, true)["compact"].is_null());
         assert_eq!(audited(&store), 1);
@@ -537,6 +557,38 @@ mod tests {
         assert_eq!(report_turn(&store, 110_000, true)["compact"], true);
         assert_eq!(audited(&store), 2);
         assert_eq!(requests(&store), 0);
+    }
+
+    /// A declined compaction (the pane was busy, or had a draft) keeps the
+    /// crossing armed: the next settled turn past the line asks again, and a
+    /// turn still running does not.
+    #[test]
+    fn a_declined_compaction_asks_again_at_the_next_settled_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        resumable_claude(&store);
+        report_turn(&store, 30_000, true);
+        assert_eq!(report_turn(&store, 110_000, true)["compact"], true);
+        assert!(report_turn(&store, 110_000, false)["compact"].is_null());
+        assert_eq!(report_turn(&store, 112_000, true)["compact"], true);
+        assert_eq!(audited(&store), 2);
+        report_compaction(&store, 112_000);
+        assert!(report_turn(&store, 112_000, true)["compact"].is_null());
+        assert_eq!(audited(&store), 2);
+    }
+
+    /// A resumable launch that starts above the line is armed from its start,
+    /// since a compaction is at most once per launch; a bounded one stays
+    /// unarmed, so a fresh launch past the line never loops.
+    #[test]
+    fn a_resumable_launch_past_the_line_compacts_at_its_first_settled_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        resumable_claude(&store);
+        assert_eq!(report_turn(&store, 150_000, true)["compact"], true);
+        assert_eq!(audited(&store), 1);
+        report_compaction(&store, 150_000);
+        assert!(report_turn(&store, 40_000, true)["compact"].is_null());
     }
 
     /// A session that starts above the line, or a new session that begins

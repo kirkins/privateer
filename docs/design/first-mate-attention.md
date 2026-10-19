@@ -125,28 +125,36 @@ The second trigger is a hard line, not an idle period:
   compacted, a bounded one writes handoff notes now because its session ends;
 - a settled turn (its answer ended, no tool pending) reported by the session
   holding the lease, at or past `context_compact_percent` (default 50), acts:
-  - a resumable first mate (no `tool_bundles`) is sent `/compact` at the turn's
-    end through its adapter, and keeps its conversation;
+  - a resumable first mate (no `tool_bundles`) is compacted at the turn's end
+    through its adapter's session API (the call `/compact` makes between turns:
+    no model turn, and not a prompt), and keeps its conversation;
   - a bounded first mate (`tool_bundles`, which cannot resume) gets a request in
     `hosted_relaunches`. The pane's supervisor takes it at the next safe point,
     busy or idle, and the bounded launch that follows is a fresh session seeded
     from the handoff notes;
-- one crossing acts once. A session is armed by one of its own samples below
-  the line; the first settled turn at or past the line while armed acts and
-  disarms, and a sample below re-arms it. So a session whose first sample is
-  already past the line never acts, a new session starts unarmed, and a
-  compaction that leaves the context above the line does not compact again;
+- one crossing asks once per outcome. A session is armed by one of its own
+  samples below the line; the first settled turn at or past the line while armed
+  asks, and the crossing stays armed until the holder reports a compaction (the
+  `compaction` kind), which disarms it. A sample below the line re-arms it. So a
+  declined compaction (the pane was busy, had a draft or mail, or the session
+  refused it) asks again at the next settled turn past the line, and a
+  compaction that leaves the context above the line does not compact again.
+  A bounded session starts unarmed, so a fresh launch past the line never loops;
+  a resumable launch that starts past the line arms at its start, since a
+  compaction is at most once per launch;
 - a crossing is held back, and the session stays armed, while a relaunch request
-  is pending, the captain has a tool question open, or a crew report is unread;
+  is pending, the captain has a tool question open, or a crew report is unread.
+  A bounded relaunch request that expires unfulfilled asks again in the same
+  session at the next settled turn past the line;
 - only hosted first mates on Claude qualify. Attended (unhosted) first mates
   get neither the warning nor the action.
 
 Audit records `host.context_compact` with the action (`compact` or `relaunch`),
 the tokens, window and line. Limitation: a crew decision is held back only
 through the unread crew reports it arrives as, not by a separate check for an
-open decision. Limitation: the `/compact` submission is unverified against a
-live Claude pane; a refused submission is not retried until the context drops
-below the line and crosses again.
+open decision. Limitation: the session-API compaction is verified only against a fake
+session in `tests/claude-attended.mjs`, not a live Claude pane; a declined
+compaction asks again at the next settled turn past the line.
 
 ## What this does not do
 
