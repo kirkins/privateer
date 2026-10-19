@@ -12,10 +12,13 @@
 //! The rule holds in the job's own world: its home, the homes of this
 //! machine's fleet registry, and the fleet-wide state beside that registry. A
 //! caller that names another registry and another home works in a world of
-//! its own, as test suites run inside a crew's gate job do. A caller with no
-//! job ancestor is resolved as before, except that one whose `PRIVATEER_JOB`
-//! names a running crew is narrowed to that crew. Under one OS account this is
-//! a workflow control, not a security boundary.
+//! its own, as test suites run inside a crew's gate job do. A refusal is
+//! audited and noticed only for the job's home or a home the real registry
+//! lists; a call that reaches the world only through the registry is refused
+//! and recorded nowhere. A caller with no job ancestor is resolved as before,
+//! except that one whose `PRIVATEER_JOB` names a running crew is narrowed to
+//! that crew. Under one OS account this is a workflow control, not a security
+//! boundary.
 use crate::mail::record_crew;
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
@@ -67,13 +70,28 @@ pub(crate) fn crew() -> Option<CrewCaller> {
     RESOLVED.get().and_then(|resolved| resolved.crew.clone())
 }
 
+/// Where a command's target home lies relative to a job's world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum World {
+    /// Not in the job's world: the caller is resolved as before.
+    Outside,
+    /// Reached only through the fleet registry in use, which is the real one.
+    /// A refusal is made and recorded nowhere.
+    Registry,
+    /// The job's own home, or a home the real registry lists. A refusal is
+    /// audited in the job's home and the first mate is noticed.
+    Home,
+}
+
 /// Resolve the caller from its process ancestry, for a command on `target`
 /// (the home it names, if any). Refuses a job that drops its role or borrows
-/// another job.
-pub(crate) fn resolve(target: Option<&Path>, caller: Caller) -> Result<Caller> {
+/// another job. `supervisor` says the command is itself a `_job-supervise`,
+/// whose `PRIVATEER_JOB` is its starter's and not a job it runs in.
+pub(crate) fn resolve(target: Option<&Path>, caller: Caller, supervisor: bool) -> Result<Caller> {
     let env_job = env_job();
     if let Some((home, job, record)) = supervising_job()? {
-        if in_world(&home, target)? {
+        let world = world(&home, target)?;
+        if world != World::Outside {
             let Some(actor) = record["agent_actor"].as_str().map(str::to_owned) else {
                 // The captain's own job runs as the captain.
                 let _ = RESOLVED.set(Resolved {
@@ -85,9 +103,6 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller) -> Result<Caller> {
             let conn = open_readonly(&home)?;
             let crew = classify(&conn, &job, &actor)?;
             drop(conn);
-            // A supervisor's PRIVATEER_JOB is its starter's, not a job it runs
-            // in, and lineage it records keeps using it as before.
-            let supervisor = supervisor_argv(&std::env::args().collect::<Vec<_>>()).is_some();
             let refusal = match (&caller, &env_job) {
                 (_, Some(named)) if named != &job && !supervisor => Some(format!(
                     "this process runs in job {job}; PRIVATEER_JOB cannot name job {named}"
@@ -101,17 +116,19 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller) -> Result<Caller> {
                 _ => None,
             };
             if let Some(refusal) = refusal {
-                // Recording is best effort: the refusal stands either way.
-                let _ = Store::open(&home).and_then(|store| {
-                    store.audit(
-                        "caller.role_drop_refused",
-                        &json!({"job_id": job, "agent": actor, "reason": refusal}),
-                    )?;
-                    match &crew {
-                        Some(crew) => notice(&store, crew, "dropping its role"),
-                        None => Ok(()),
-                    }
-                });
+                if world == World::Home {
+                    // Recording is best effort: the refusal stands either way.
+                    let _ = Store::open(&home).and_then(|store| {
+                        store.audit(
+                            "caller.role_drop_refused",
+                            &json!({"job_id": job, "agent": actor, "reason": refusal}),
+                        )?;
+                        match &crew {
+                            Some(crew) => notice(&store, crew, "dropping its role"),
+                            None => Ok(()),
+                        }
+                    });
+                }
                 bail!("{refusal}");
             }
             let _ = RESOLVED.set(Resolved {
@@ -211,14 +228,15 @@ fn running_crew(home: &Path, job: &str) -> Result<Option<CrewCaller>> {
     }
 }
 
-/// Whether a command on `target` reaches the job's world: the job's home, a
-/// home in this machine's fleet registry, or the state beside that registry.
-fn in_world(home: &Path, target: Option<&Path>) -> Result<bool> {
+/// Where a command on `target` lands: the job's home or a home the real
+/// registry lists, reached only through the registry in use, or outside the
+/// job's world. A target with no home is reached only through the registry.
+fn world(home: &Path, target: Option<&Path>) -> Result<World> {
     let real = real_registry();
     if let Some(target) = target {
         let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_owned());
         if target == home {
-            return Ok(true);
+            return Ok(World::Home);
         }
         if let Some(registry) = real.as_deref().filter(|r| r.is_file()) {
             let conn = Connection::open_with_flags(registry, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -228,12 +246,15 @@ fn in_world(home: &Path, target: Option<&Path>) -> Result<bool> {
                 |r| r.get(0),
             )?;
             if registered {
-                return Ok(true);
+                return Ok(World::Home);
             }
         }
     }
     let chosen = crate::fleet::registry_path()?;
-    Ok(real.is_some_and(|real| same_path(&real, &chosen)))
+    Ok(match real {
+        Some(real) if same_path(&real, &chosen) => World::Registry,
+        _ => World::Outside,
+    })
 }
 
 /// The fleet registry of this OS account, from its password entry rather
@@ -286,6 +307,25 @@ fn supervising_job() -> Result<Option<(PathBuf, String, Value)>> {
     Ok(None)
 }
 
+/// Whether a job the supervisor is about to launch is a crew's: an agent's
+/// spawn that is neither a first mate's wake nor an errand.
+pub(crate) fn is_crew_launch(
+    store: &Store,
+    job_id: &str,
+    action: &str,
+    agent: bool,
+) -> Result<bool> {
+    if !agent || action != "spawn" {
+        return Ok(false);
+    }
+    let wake: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)",
+        [job_id],
+        |r| r.get(0),
+    )?;
+    Ok(!wake && !crate::errand::is_errand(store, job_id)?)
+}
+
 /// `--home H _job-supervise J` from a supervisor's argv.
 fn supervisor_argv(argv: &[String]) -> Option<(PathBuf, String)> {
     let at = argv.iter().position(|a| a == "_job-supervise")?;
@@ -334,7 +374,7 @@ fn ancestors() -> Result<Vec<(u32, Vec<String>)>> {
 /// argv with spaces, so a home path with a space is not recognised.
 #[cfg(not(target_os = "linux"))]
 fn ancestors() -> Result<Vec<(u32, Vec<String>)>> {
-    let output = std::process::Command::new("ps")
+    let output = std::process::Command::new("/bin/ps")
         .args(["-axww", "-o", "pid=,ppid=,args="])
         .env("LC_ALL", "C")
         .output()

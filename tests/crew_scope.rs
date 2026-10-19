@@ -351,3 +351,70 @@ fn outside_a_job_a_variable_naming_a_running_crew_narrows_to_it() {
     }
     f.json(None, "job.cancel", json!({"id":"crew-1"}));
 }
+
+#[test]
+fn a_refused_crew_call_on_a_scratch_home_is_recorded_nowhere() {
+    // The scratch home is outside the job's world, but the default registry
+    // (this account's own) reaches it. The refusal stands and writes nothing.
+    let f = Fleet::new();
+    fs::create_dir(f.root.join("scratch")).unwrap();
+    f.crew(
+        "crew-1",
+        r#"
+REAL=$(getent passwd "$(id -u)" | cut -d: -f6)
+call leak env -u PRIVATEER_ROLE -u PRIVATEER_ACTOR -u PRIVATEER_JOB -u PRIVATEER_FLEET -u XDG_STATE_HOME HOME="$REAL" "$BIN" --home "$ROOT/scratch" mail.ack --json '{"address":"engineering","through_seq":0}'
+"#,
+    );
+    let (code, err) = f.call("leak");
+    assert!(
+        code == "1"
+            && err.contains("job crew-1 runs as agent engineering; a job cannot drop its role"),
+        "{err}"
+    );
+    assert_eq!(f.audits("caller.role_drop_refused"), 0);
+    assert!(f.refusal_notices().is_empty());
+}
+
+#[test]
+fn a_crew_may_park_and_read_its_own_assignment() {
+    let f = Fleet::new();
+    f.crew(
+        "crew-1",
+        r#"
+call crew.park "$BIN" --home "$H" crew.park --json '{}'
+call assignment "$BIN" --home "$H" note.get --json '{"ship":"engineering","focus":"assignment:fix"}'
+"#,
+    );
+    let (code, err) = f.call("crew.park");
+    assert!(code == "1" && !err.contains(REFUSED), "{err}");
+    let (code, err) = f.call("assignment");
+    assert_eq!(code, "0", "{err}");
+}
+
+#[test]
+fn an_errand_keeps_the_first_mates_powers() {
+    let f = Fleet::new();
+    fs::write(
+        f.root.join("crew.sh"),
+        r#"
+call mail.send "$BIN" --home "$H" mail.send --json '{"from":"engineering","to":"captain","kind":"notice","body":"hi"}'
+call task.update "$BIN" --home "$H" task.update --json '{"actor":"engineering","id":"fix","status":"running"}'
+"#,
+    )
+    .unwrap();
+    // The ship's first mate runs its errands on the same fake harness.
+    fs::copy(f.root.join("bin/claude"), f.root.join("bin/codex")).unwrap();
+    f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"go"}),
+    );
+    let until = Instant::now() + std::time::Duration::from_secs(60);
+    while f.calls().len() < 2 && Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for name in ["mail.send", "task.update"] {
+        let (code, err) = f.call(name);
+        assert_eq!(code, "0", "{name}: {err}");
+    }
+}

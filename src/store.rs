@@ -37,16 +37,18 @@ pub enum Caller {
 
 impl Caller {
     pub fn from_env(flag_role: Option<&str>, flag_actor: Option<&str>) -> Result<Self> {
-        Self::from_env_at(None, flag_role, flag_actor)
+        Self::from_env_at(None, flag_role, flag_actor, false)
     }
 
     /// The caller of a command on `home`. Inside a supervised job the job's
     /// records decide: a job that runs as an agent cannot drop its role, and
-    /// a crew is narrowed to crew commands (see `crew_scope`).
+    /// a crew is narrowed to crew commands (see `crew_scope`). `supervisor`
+    /// says the command is `_job-supervise` itself.
     pub fn from_env_at(
         home: Option<&Path>,
         flag_role: Option<&str>,
         flag_actor: Option<&str>,
+        supervisor: bool,
     ) -> Result<Self> {
         let env = |name: &str| -> Result<Option<String>> {
             match std::env::var(name) {
@@ -61,7 +63,7 @@ impl Caller {
             flag_role,
             flag_actor,
         )?;
-        crate::crew_scope::resolve(home, caller)
+        crate::crew_scope::resolve(home, caller, supervisor)
     }
 
     pub fn require_operator(&self, command: &str) -> Result<()> {

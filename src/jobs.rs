@@ -32,6 +32,13 @@ const LOG_SEGMENT: usize = (LOG_LIMIT - LOG_HEAD) / 2;
 /// left under the limit holds the truncation marker.
 const TAIL_FULL: usize = 2 * LOG_SEGMENT - 256;
 const START_GRACE_MS: i64 = 30_000;
+/// First-mate presence a crew's payload must not inherit (crew-role.md).
+const CREW_UNATTENDED: [&str; 4] = [
+    "PRIVATEER_PRESENCE_HOLDER",
+    "PRIVATEER_HOSTED_HOLDER",
+    "PRIVATEER_HOSTED",
+    "PRIVATEER_ATTENDED_HARNESS",
+];
 pub(crate) const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
 const QUEUE_POLL: Duration = Duration::from_secs(1);
 
@@ -1325,7 +1332,7 @@ fn identity(pid: u32) -> Result<Option<Process>> {
 #[cfg(not(target_os = "linux"))]
 fn identity(pid: u32) -> Result<Option<Process>> {
     // lstart is rendered in local time and locale; pin both.
-    let output = Command::new("ps")
+    let output = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "stat="])
         .env("TZ", "UTC0")
         .env("LC_ALL", "C")
@@ -2935,6 +2942,13 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     for (name, _) in std::env::vars_os() {
         let bytes = name.as_encoded_bytes();
         if bytes.starts_with(b"PRIVATEER_CREDENTIAL_") || bytes.starts_with(b"PRIVATEER_MCP_") {
+            cmd.env_remove(name);
+        }
+    }
+    // A crew is not attended by its first mate: the presence and harness
+    // markers that first mate's session set do not reach its payload.
+    if crate::crew_scope::is_crew_launch(store, &job.id, &job.action, job.agent_actor.is_some())? {
+        for name in CREW_UNATTENDED {
             cmd.env_remove(name);
         }
     }

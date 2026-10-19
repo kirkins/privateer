@@ -15,7 +15,9 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 /// A command that inherits no Privateer settings from whoever runs the
 /// tests. A crew job running `cargo test` has PRIVATEER_ROLE, _ACTOR and
 /// _JOB set, which would otherwise make every test's subprocess its agent.
-/// Tests that need a setting set it explicitly afterwards.
+/// Its fleet registry is this process's own temporary one, not the machine's:
+/// under a crew's gate job, a call that reaches the real registry is held to
+/// the crew's role. Tests that need a setting set it explicitly afterwards.
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     for (name, _) in std::env::vars_os() {
@@ -23,6 +25,10 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
             command.env_remove(name);
         }
     }
+    let fleet = std::env::temp_dir().join(format!("privateer-test-fleet-{}", std::process::id()));
+    command
+        .env("PRIVATEER_FLEET", fleet.join("fleet.sqlite"))
+        .env_remove("XDG_STATE_HOME");
     command
 }
 
