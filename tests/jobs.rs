@@ -2100,13 +2100,12 @@ fn waiting_jobs_start_in_arrival_order_and_others_cannot_jump_the_queue() {
             .len(),
         2
     );
-    // A direct request that admission applies to may not jump the line. This
-    // light job's estimate fits the load limits and no slot cap applies to it,
-    // so only the waiting line refuses it.
+    // A direct request that admission applies to may not jump the line. The
+    // head waits on the heavy-job slot, so a heavy request must not pass it.
     let jumped = run(
         &other,
         "job.start",
-        json!({"task_id":"task","id":"jumper","command":["true"],"heavy":false,"estimate":{"cpus":0.1}}),
+        json!({"task_id":"task","id":"jumper","command":["true"],"heavy":true,"estimate":{"cpus":0.1}}),
     );
     assert!(!jumped.status.success());
     let error = String::from_utf8_lossy(&jumped.stderr);
@@ -2118,6 +2117,155 @@ fn waiting_jobs_start_in_arrival_order_and_others_cannot_jump_the_queue() {
     let status = ok(&home, "resource.status", json!({}));
     assert_eq!(status["queue"], json!([]));
     assert_eq!(status["heavy_reserved"], 0);
+}
+
+/// Three jobs queued behind a heavy job that holds disk: the head waits on
+/// disk, so light work that declares none passes it, while a job that declares
+/// disk waits its turn behind the head. Heavy work that declares no disk, such
+/// as a job with no heavy key, waits too. The head then runs before that job.
+#[test]
+fn a_head_refused_on_disk_lets_light_work_pass_and_keeps_its_disk() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let other = fixture.home("other", 0);
+    let free = ok(&home, "resource.status", json!({}))["host"]["disk_available_bytes"]
+        .as_u64()
+        .unwrap();
+    ok(
+        &home,
+        "resource.configure",
+        json!({"min_free_disk_bytes":0,"max_heavy_jobs":null,"max_load_per_cpu":1024.0,
+            "min_available_memory_bytes":0,"ramp_secs":0}),
+    );
+    // Sizes are fractions of the space free now. With a quarter held, the head's
+    // seven eighths cannot fit. Once the holding job ends, the head fits, and the
+    // job behind it, at half, still cannot fit beside the head.
+    let (holding, head, behind) = (free / 4, free / 8 * 7, free / 2);
+    let marker = fixture.repo.join("disk-order.txt");
+    let append = |name: &str| {
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("sleep 2; printf {name} >> '{}'", marker.display()),
+        ]
+    };
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"holding","command":["sleep","30"],"heavy":true,
+            "estimate":{"disk_bytes":holding}}),
+    );
+    wait(&home, "holding", &["running"]);
+    let queued = ok(
+        &other,
+        "job.start",
+        json!({"task_id":"task","id":"head","command":append("A"),"heavy":true,
+            "estimate":{"disk_bytes":head},"wait_for_capacity":true}),
+    );
+    assert_eq!(queued["status"], "queued", "{queued}");
+    assert!(
+        queued["reason"]
+            .as_str()
+            .unwrap()
+            .contains("disk admission refused"),
+        "{queued}"
+    );
+    thread::sleep(Duration::from_millis(10));
+    // Light work that declares no disk passes the head: it runs now.
+    let light = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"light","command":["true"],"heavy":false,
+            "estimate":{"memory_bytes":1}}),
+    );
+    assert_ne!(light["status"], "queued", "{light}");
+    wait(&home, "light", &["succeeded"]);
+    // Work that declares disk does not pass the head, though it would fit
+    // beside the holding job.
+    let behind_queued = ok(
+        &other,
+        "job.start",
+        json!({"task_id":"task","id":"behind","command":append("B"),"heavy":true,
+            "estimate":{"disk_bytes":behind},"wait_for_capacity":true}),
+    );
+    assert_eq!(behind_queued["status"], "queued", "{behind_queued}");
+    // A job that names no heavy key is heavy by default and declares no disk,
+    // so heavy work does not pass the head either.
+    let plain_queued = ok(
+        &other,
+        "job.start",
+        json!({"task_id":"task","id":"plain","command":["true"],"wait_for_capacity":true}),
+    );
+    assert_eq!(plain_queued["status"], "queued", "{plain_queued}");
+    // Once the holding job ends, the head fits and runs. The job behind it must
+    // not take the disk the head is waiting to use.
+    ok(&home, "job.cancel", json!({"id":"holding"}));
+    wait(&other, "head", &["running"]);
+    assert_eq!(
+        ok(&other, "job.status", json!({"id":"behind"}))["status"],
+        "queued"
+    );
+    assert_eq!(
+        ok(&other, "job.status", json!({"id":"plain"}))["status"],
+        "queued"
+    );
+    wait(&other, "head", &["succeeded"]);
+    wait(&other, "behind", &["succeeded"]);
+    wait(&other, "plain", &["succeeded"]);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "AB");
+    assert_eq!(ok(&home, "resource.status", json!({}))["queue"], json!([]));
+}
+
+/// A heavy head waiting on the heavy-job slot is not passed by another heavy
+/// job, though light work with no heavy demand passes it.
+#[test]
+fn a_heavy_head_waiting_on_the_slot_is_not_passed_by_heavy_work() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    let marker = fixture.repo.join("slot-order.txt");
+    let append = |name: &str| {
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("printf {name} >> '{}'", marker.display()),
+        ]
+    };
+    // The fixture allows one heavy job at a time.
+    start(&home, "running", &["sleep", "2"]);
+    let head = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"slot-head","command":append("A"),"heavy":true,
+            "wait_for_capacity":true}),
+    );
+    assert_eq!(head["status"], "queued", "{head}");
+    thread::sleep(Duration::from_millis(10));
+    let second = run(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"slot-second","command":append("B"),"heavy":true,
+            "wait_for_capacity":true}),
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["status"], "queued", "{second}");
+    // Light work with no heavy demand passes the head and runs now.
+    let light = ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"slot-light","command":["true"],"heavy":false,
+            "estimate":{"memory_bytes":1}}),
+    );
+    assert_ne!(light["status"], "queued", "{light}");
+    wait(&home, "slot-light", &["succeeded"]);
+    wait(&home, "running", &["succeeded"]);
+    wait(&home, "slot-head", &["succeeded"]);
+    wait(&home, "slot-second", &["succeeded"]);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "AB");
 }
 
 #[test]
