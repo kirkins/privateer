@@ -1802,7 +1802,7 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(state.0, 0);
     assert!(state.1 > privateer::store::Store::now_ms(), "{state:?}");
     assert!(state.2.is_none(), "{state:?}");
-    fs::remove_file(&socket).unwrap();
+    fs::rename(&socket, socket.with_extension("away")).unwrap();
     let calls = herdr.requests.lock().unwrap().len();
     place.json(
         "mail.send",
@@ -1817,16 +1817,20 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(place.wakes(), 1);
     place.stop_wake("adopted host backoff fallback", &report);
 
-    // Only a due attempt reports a new host error. Jump the durable deadline
-    // rather than deleting backoff, then prove missing Herdr still falls back
-    // to a real headless subprocess without leaking the launch lease.
+    // Only a due attempt reports a new host error, and one that finds Herdr
+    // unreachable holds mail for Herdr's grace rather than waking headless, as
+    // when the dispatcher starts before Herdr at boot. Jump the durable
+    // deadline rather than deleting backoff.
     place.retry_now();
     place.json(
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"retry after deadline"}),
     );
     let report = place.tick();
-    assert!(report["wake"].is_string(), "{report}");
+    assert_eq!(
+        report["skipped"], "waiting for Herdr before a headless wake",
+        "{report}"
+    );
     assert!(
         report["host_error"]
             .as_str()
@@ -1834,17 +1838,36 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
             .starts_with("Herdr socket unavailable:"),
         "{report}"
     );
-    assert!(report["host_backoff_until_ms"].is_null(), "{report}");
     let state = place.launch_state();
     assert_eq!(state.0, 1);
     assert!(state.1 > privateer::store::Store::now_ms(), "{state:?}");
     assert_eq!(state.2.as_deref(), report["host_error"].as_str());
+    assert_eq!(place.wakes(), 1);
+
+    // Past the grace, missing Herdr still falls back to a real headless
+    // subprocess without leaking the launch lease.
+    place
+        .database()
+        .execute(
+            "UPDATE host_launches SET unreachable_ms=unreachable_ms-180000",
+            [],
+        )
+        .unwrap();
+    let report = place.tick();
+    assert!(report["wake"].is_string(), "{report}");
+    assert_eq!(report["host_backoff_until_ms"], state.1, "{report}");
     let presence = place.json("ship.presence", json!({"ship":"infra"}));
     assert_eq!(presence["attended"], false, "{presence}");
     assert!(presence["lease"].is_null(), "{presence}");
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
     assert_eq!(place.wakes(), 2);
-    place.stop_wake("due missing-socket fallback", &report);
+    place.stop_wake("missing-socket fallback after the grace", &report);
+
+    // Herdr answering again is launched into at once, inside the backoff.
+    fs::rename(socket.with_extension("away"), &socket).unwrap();
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w3:p1", "{report}");
+    assert_eq!(place.wakes(), 2);
 }
 
 /// Idle the hosted first mate past its sleep threshold until it sleeps: its
