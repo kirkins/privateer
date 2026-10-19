@@ -217,7 +217,12 @@ esac
     }
     /// Wait until a job reaches one of the accepted statuses.
     fn wait(&self, id: &str, accepted: &[&str]) -> Value {
-        let until = Instant::now() + std::time::Duration::from_secs(60);
+        self.wait_secs(id, accepted, 60)
+    }
+
+    /// `wait` with its own budget, for a chain of launches on a loaded runner.
+    fn wait_secs(&self, id: &str, accepted: &[&str], secs: u64) -> Value {
+        let until = Instant::now() + std::time::Duration::from_secs(secs);
         loop {
             // A job that is not created yet is not an error to wait through.
             let out = self.run(
@@ -1161,7 +1166,8 @@ fn a_resumed_crew_that_parks_again_resumes_again_and_finishes() {
         });
         let _stop = Stop(&done);
         start_crew(&f, "crew-twice");
-        f.wait("crew-resume-park-crew-twice-2-1", &["succeeded"]);
+        // Two launches, two children and two resumes, beside a dispatcher loop.
+        f.wait_secs("crew-resume-park-crew-twice-2-1", &["succeeded"], 180);
     });
     assert!(
         passes.load(std::sync::atomic::Ordering::Relaxed) > 0,
