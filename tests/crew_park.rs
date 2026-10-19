@@ -1144,6 +1144,14 @@ fn a_resumed_crew_that_parks_again_resumes_again_and_finishes() {
     f.set_mode("twice");
     let done = std::sync::atomic::AtomicBool::new(false);
     let passes = std::sync::atomic::AtomicUsize::new(0);
+    // Stops the dispatcher loop however the body ends, so a failed wait fails
+    // the test instead of leaving the scope waiting on that loop forever.
+    struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     std::thread::scope(|scope| {
         scope.spawn(|| {
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1151,9 +1159,9 @@ fn a_resumed_crew_that_parks_again_resumes_again_and_finishes() {
                 passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
+        let _stop = Stop(&done);
         start_crew(&f, "crew-twice");
         f.wait("crew-resume-park-crew-twice-2-1", &["succeeded"]);
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
     assert!(
         passes.load(std::sync::atomic::Ordering::Relaxed) > 0,
