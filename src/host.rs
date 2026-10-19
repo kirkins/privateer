@@ -67,6 +67,175 @@ fn claude_trusted(folder: &Path) -> bool {
         .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
 }
 
+/// A Claude folder whose trust dialog was never accepted. The launch fails with
+/// it, and the captain gets one request naming the folder (see `raise_untrusted`).
+#[derive(Debug)]
+pub(crate) struct Untrusted(pub(crate) PathBuf);
+
+impl std::fmt::Display for Untrusted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Claude has not been trusted in {}; run `privateer start claude` there once, choose \"Yes, I trust this folder\" and, for permission_mode auto, finish auto mode's setup screen",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for Untrusted {}
+
+/// The one step that clears an untrusted folder, for the captain's own hands.
+fn trust_step(folder: &Path) -> String {
+    format!(
+        "open Claude in {} once (`cd {} && claude`) and choose \"Yes, I trust this folder\"",
+        folder.display(),
+        folder.display()
+    )
+}
+
+/// Raise the captain's one request for an untrusted folder. The same folder
+/// raises nothing twice until `clear_untrusted` withdraws it. A ship without a
+/// duty task has nobody to tell, as with the other host alerts.
+pub(crate) fn raise_untrusted(store: &Store, ship: &str, folder: &Path) -> Result<()> {
+    let folder = folder.display().to_string();
+    let tx = store.write_transaction()?;
+    let open: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT folder, mail_id FROM hosted_untrusted WHERE ship=?1",
+            [ship],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if matches!(&open, Some((known, Some(_))) if *known == folder) {
+        return Ok(());
+    }
+    let raw: Option<String> = tx
+        .query_row("SELECT record FROM ships WHERE name=?1", [ship], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let duty_task = raw
+        .and_then(|record| serde_json::from_str::<Value>(&record).ok())
+        .and_then(|record| {
+            record["first_mate"]["duty_task"]
+                .as_str()
+                .map(str::to_owned)
+        });
+    let Some(duty_task) = duty_task else {
+        return Ok(());
+    };
+    let now = Store::now_ms();
+    let id = format!("hosted-untrusted-{ship}-{now}");
+    let step = trust_step(Path::new(&folder));
+    let body = format!(
+        "{ship}'s first mate cannot start in Herdr: Claude has not trusted {folder}. Trust it once, then Privateer starts the mate on its next attempt."
+    );
+    crate::mail::record_crew(
+        &tx,
+        &json!({
+            "id": id,
+            "to": crate::mail::CAPTAIN,
+            "kind": "request",
+            "task_id": duty_task,
+            "urgency": "normal",
+            "body": body,
+            "payload": {
+                "hosted_untrusted": ship,
+                "folder": folder,
+                "needs_hands": {"step": step}
+            }
+        }),
+    )?;
+    tx.execute(
+        "INSERT INTO hosted_untrusted(ship,folder,ms,mail_id) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(ship) DO UPDATE SET folder=excluded.folder, ms=excluded.ms, mail_id=excluded.mail_id",
+        params![ship, folder, now, id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Clear a ship's untrusted-folder state once its folder is trusted, and
+/// withdraw the captain's request as the duplicate-mates alert does.
+pub(crate) fn clear_untrusted(store: &Store, ship: &str) -> Result<()> {
+    let tx = store.write_transaction()?;
+    let open: Option<Option<String>> = tx
+        .query_row(
+            "SELECT mail_id FROM hosted_untrusted WHERE ship=?1",
+            [ship],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(mail_id) = open else {
+        return Ok(());
+    };
+    tx.execute("DELETE FROM hosted_untrusted WHERE ship=?1", [ship])?;
+    tx.commit()?;
+    if let Some(id) = mail_id {
+        let task: Option<String> = store
+            .connection()
+            .query_row("SELECT task_id FROM mail WHERE id=?1", [&id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let request = json!({
+            "id": id,
+            "from": crate::mail::CREW,
+            "to": crate::mail::CAPTAIN,
+            "task_id": task,
+        });
+        crate::mail::end_request(
+            store,
+            &request,
+            "withdrawn",
+            "Claude trusts the ship's folder now",
+        )?;
+    }
+    Ok(())
+}
+
+/// Serve's view of every untrusted folder still awaiting the captain.
+pub(crate) fn untrusted_pending(store: &Store) -> Result<Vec<Value>> {
+    let mut query = store
+        .connection()
+        .prepare("SELECT ship, folder FROM hosted_untrusted ORDER BY ship")?;
+    let rows = query
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(ship, folder)| {
+            json!({"ship": ship, "untrusted": folder, "step": trust_step(Path::new(&folder))})
+        })
+        .collect())
+}
+
+/// `hosted_blocked` for serve: the block alerts, plus each untrusted folder
+/// until it is trusted. A failed block read keeps its error beside the list.
+pub(crate) fn with_untrusted(store: &Store, blocked: Value) -> Value {
+    let pending = untrusted_pending(store).unwrap_or_default();
+    if pending.is_empty() {
+        return blocked;
+    }
+    match blocked {
+        Value::Array(mut items) => {
+            items.extend(pending);
+            Value::Array(items)
+        }
+        error => json!({"error": error, "untrusted": pending}),
+    }
+}
+
+/// `ship.create` for a hosted Claude ship: say now which folder to trust, so
+/// the captain is not first told at a launch. True when a request was raised.
+pub(crate) fn raise_untrusted_at_create(store: &Store, ship: &str, folder: &Path) -> Result<bool> {
+    let folder = folder.canonicalize()?;
+    if claude_trusted(&folder) {
+        return Ok(false);
+    }
+    raise_untrusted(store, ship, &folder)?;
+    Ok(true)
+}
+
 /// Bytes read from one transcript while looking for its first entrypoint
 /// record. Current Claude Code writes about 105 KB of other records before it.
 const TRANSCRIPT_SCAN_BYTES: u64 = 8 * 1024 * 1024;
@@ -501,11 +670,13 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         .parent()
         .context("ship folder")?
         .canonicalize()?;
-    ensure!(
-        harness != "claude" || claude_trusted(&folder),
-        "Claude has not been trusted in {}; run `privateer start claude` there once, choose \"Yes, I trust this folder\" and, for permission_mode auto, finish auto mode's setup screen",
-        folder.display()
-    );
+    if harness == "claude" {
+        if !claude_trusted(&folder) {
+            raise_untrusted(store, ship, &folder)?;
+            return Err(Untrusted(folder).into());
+        }
+        clear_untrusted(store, ship)?;
+    }
     ensure!(
         crate::presence::folder_ship(store).as_deref() == Some(ship),
         "hosted start must use this folder's ship"
