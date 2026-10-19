@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub mod bridge;
+pub(crate) mod restored;
 pub(crate) mod sleep;
 pub mod upgrade;
 
@@ -801,6 +802,7 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
             &env,
             &["start", "--hosted"],
         )?;
+        restored::record(store, &socket, &pane, "mate", ship, folder);
         settle(store, &mut client, &pane.workspace_id, "mate", ship);
         let launched =
             json!({"holder": holder, "pane": pane.pane_id, "workspace": pane.workspace_id});
@@ -944,6 +946,7 @@ fn crew_space(
         env,
         command,
     )?;
+    restored::record(store, &socket, &pane, "crew", ship, cwd);
     let viewer = command[0] == "watch";
     // Where the captain finds this crew's session. Presentation only: a
     // pane that is not recorded still runs the crew.

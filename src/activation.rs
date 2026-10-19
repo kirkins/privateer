@@ -89,6 +89,7 @@ pub fn init(store: &Store) -> Result<()> {
     if !digest_column {
         tx.execute_batch("ALTER TABLE hosted_panes ADD COLUMN settings_digest TEXT;")?;
     }
+    crate::host::restored::init(&tx)?;
     // A pane relaunched by an upgrade, or from sleep, starts asleep.
     let asleep_column: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='start_asleep')",
@@ -1133,6 +1134,8 @@ pub fn tick(store: &mut Store) -> Result<Value> {
 }
 
 fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Value> {
+    // Before any space opens, so a restored copy is not counted as one.
+    let restored = crate::host::restored::sweep(store);
     let bridge = crate::host::bridge::maintain(store).unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
@@ -1181,7 +1184,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
     )
 }
 
