@@ -638,6 +638,22 @@ impl Herdr {
                             "format":params["format"],"revision":7,"truncated":false,
                             "text":"\u{1b}[1mpi\u{1b}[0m ready"}})
                     }
+                    "pane.process_info" => {
+                        let live = live.lock().unwrap();
+                        let pane = live.iter().find(|p| p["pane_id"] == params["pane_id"]);
+                        json!({"type":"pane_process_info",
+                            "process_info": pane.map(|p| p["process_info"].clone())})
+                    }
+                    "workspace.close" => {
+                        live.lock()
+                            .unwrap()
+                            .retain(|p| p["workspace_id"] != params["workspace_id"]);
+                        order
+                            .lock()
+                            .unwrap()
+                            .retain(|(id, _)| *id != params["workspace_id"]);
+                        json!({"type":"ok"})
+                    }
                     "pane.get" => {
                         let live = live.lock().unwrap();
                         let pane = live.iter().find(|p| p["pane_id"] == params["pane_id"]);
@@ -703,6 +719,23 @@ impl Herdr {
             .find(|p| p["pane_id"] == pane_id)
             .cloned()
             .unwrap()
+    }
+    /// Herdr restarted and restored this space: the same pane under a new
+    /// terminal, running a shell in `cwd`, with `command` in front if given.
+    fn restore(&self, workspace_id: &str, cwd: &Path, command: Option<&str>) {
+        let mut panes = self.panes.lock().unwrap();
+        let pane = panes
+            .iter_mut()
+            .find(|p| p["workspace_id"] == workspace_id)
+            .expect("restored pane exists");
+        pane["terminal_id"] = json!(format!("{workspace_id}-restored"));
+        pane["agent"] = Value::Null;
+        let mut processes = vec![json!({"pid":100,"name":"bash","cwd":cwd})];
+        if let Some(command) = command {
+            processes = vec![json!({"pid":101,"name":command,"cwd":cwd})];
+        }
+        pane["process_info"] = json!({"pane_id":pane["pane_id"],"shell_pid":100,
+            "foreground_process_group_id":processes[0]["pid"],"foreground_processes":processes});
     }
     /// The sidebar, top to bottom.
     fn order(&self) -> Vec<String> {
@@ -1894,6 +1927,36 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
     assert_eq!(place.wakes(), 2);
     place.stop_wake("due missing-socket fallback", &report);
+}
+
+#[test]
+fn a_space_herdr_restores_after_a_restart_is_closed_unless_the_captain_uses_it() {
+    let (place, herdr) = hosted_fixture();
+    // Herdr restarts: the session it ran is gone, and it restores the space
+    // with a shell the captain has started something in. That one is theirs.
+    place.stop_native("infra");
+    herdr.restore("w2", &place.folder, Some("vim"));
+    place.retry_now();
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w3:p1", "{report}");
+    assert!(herdr.calls("workspace.close").is_empty());
+    assert!(herdr.order().contains(&"w2".to_owned()));
+
+    // A restored copy at its bare shell is closed, and a fresh space opened.
+    until("the second hosted harness", || {
+        place.root.join("pi-env").exists()
+    });
+    place.stop_native("infra");
+    herdr.restore("w3", &place.folder, None);
+    place.retry_now();
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w4:p1", "{report}");
+    let closed = herdr.calls("workspace.close");
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["params"]["workspace_id"], "w3");
+    let mut left = herdr.order();
+    left.sort();
+    assert_eq!(left, ["w1", "w2", "w4"]);
 }
 
 /// Idle the hosted first mate past its sleep threshold until it sleeps: its
