@@ -241,6 +241,53 @@ fn agents_cannot_switch_fleet_mode_or_add_rules() {
 }
 
 #[test]
+fn the_captains_standing_authorization_reaches_that_ships_auto_mode_classifier() {
+    let f = Fleet::new();
+    let grant = "Making liaison's own Apify actors public in the Apify Store.";
+    let allow = |f: &Fleet| -> Vec<Value> {
+        f.ok(Some("liaison"), &["start", "claude"]);
+        let args: Vec<String> =
+            serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+        args.iter()
+            .position(|a| a == "--settings")
+            .map(|i| {
+                serde_json::from_str::<Value>(&args[i + 1]).unwrap()["autoMode"]["allow"].clone()
+            })
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+    };
+    let agent = f
+        .command(
+            Some("liaison"),
+            &["permissions", "authorize", "liaison", grant],
+        )
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(!agent.status.success(), "a ship cannot authorize itself");
+    f.ok(None, &["permissions", "authorize", "liaison", grant]);
+    f.ok(
+        None,
+        &["permissions", "authorize", "elsewhere", "Something else."],
+    );
+    let given = allow(&f);
+    assert_eq!(given[0], "$defaults");
+    assert!(given.contains(&json!(format!("The captain has authorized this: {grant}"))));
+    assert!(
+        !given
+            .iter()
+            .any(|a| a.as_str().unwrap().contains("Something else"))
+    );
+    f.ok(None, &["permissions", "unauthorize", "liaison", grant]);
+    assert!(
+        !allow(&f)
+            .iter()
+            .any(|a| a.as_str().unwrap().contains(grant))
+    );
+}
+
+#[test]
 fn attended_launches_receive_the_same_fleet_policy() {
     let f = Fleet::new();
     f.ok(None, &["permissions", "yolo"]);

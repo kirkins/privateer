@@ -207,5 +207,19 @@ class Permissions(unittest.TestCase):
         self.assertEqual(settings["autoMode"]["environment"][0], "$defaults")
         self.assertIn("user_env", settings["autoMode"]["environment"])
 
+    def test_a_ships_standing_authorizations_reach_only_its_first_mates_classifier(self):
+        grant = "Making storefront's own Apify actors public in the Apify Store."
+        self.policy = {"mode":"standard", "claude_allow":[], "authorized":{"storefront":[grant]}}
+        def allow(owner, role):
+            req = self.request(permission_mode="auto")
+            req["context"].update(owner=owner, role=role, actions=["inspect"])
+            _, argv = build("claude", req)
+            if "--settings" not in argv:
+                return []
+            return json.loads(argv[argv.index("--settings") + 1])["autoMode"]["allow"]
+        self.assertIn(f"The captain has authorized this: {grant}", allow("storefront", "first_mate"))
+        self.assertFalse(any(grant in a for a in allow("bizdev", "first_mate")))
+        self.assertFalse(any(grant in a for a in allow("storefront", "crew")))
+
 
 if __name__=="__main__":unittest.main()

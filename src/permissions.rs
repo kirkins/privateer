@@ -23,9 +23,10 @@ fn defaults() -> Value {
 fn validate(value: &Value) -> Result<()> {
     let object = value.as_object().context("permissions must be an object")?;
     ensure!(
-        object
-            .keys()
-            .all(|k| matches!(k.as_str(), "mode" | "claude_allow" | "forges")),
+        object.keys().all(|k| matches!(
+            k.as_str(),
+            "mode" | "claude_allow" | "forges" | "authorized"
+        )),
         "unknown permission setting"
     );
     ensure!(
@@ -46,6 +47,31 @@ fn validate(value: &Value) -> Result<()> {
                 && !rule.chars().any(char::is_control),
             "invalid tool rule"
         );
+    }
+    if let Some(authorized) = value.get("authorized") {
+        let ships = authorized
+            .as_object()
+            .context("authorized must be an object of ship names")?;
+        ensure!(ships.len() <= 64, "at most 64 ships with authorizations");
+        for (ship, statements) in ships {
+            crate::store::identifier(ship)?;
+            let statements = statements
+                .as_array()
+                .context("a ship's authorizations must be a list")?;
+            ensure!(statements.len() <= 16, "at most 16 authorizations per ship");
+            for statement in statements {
+                let statement = statement
+                    .as_str()
+                    .context("authorizations must be strings")?;
+                ensure!(
+                    !statement.is_empty()
+                        && statement.len() <= 500
+                        && statement.trim() == statement
+                        && !statement.chars().any(char::is_control),
+                    "an authorization is one line of at most 500 characters"
+                );
+            }
+        }
     }
     if let Some(forges) = value.get("forges") {
         let forges_obj = forges.as_object().context("forges must be an object")?;
@@ -246,7 +272,13 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     ensure!(
         args.as_object().is_some_and(|o| o.keys().all(|k| matches!(
             k.as_str(),
-            "mode" | "claude_allow" | "claude_allow_add" | "forges"
+            "mode"
+                | "claude_allow"
+                | "claude_allow_add"
+                | "forges"
+                | "authorized"
+                | "authorize"
+                | "unauthorize"
         ))),
         "unknown permission setting"
     );
@@ -255,7 +287,7 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     let mut conn = crate::fleet::registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut value = load()?;
-    for key in ["mode", "claude_allow", "forges"] {
+    for key in ["mode", "claude_allow", "forges", "authorized"] {
         if let Some(v) = args.get(key) {
             value[key] = v.clone();
         }
@@ -266,6 +298,34 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
             .context("claude_allow must be a list")?;
         if !rules.contains(rule) {
             rules.push(rule.clone());
+        }
+    }
+    if let Some(grant) = args.get("authorize") {
+        let (ship, text) = authorization(grant)?;
+        let list = value["authorized"][ship]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !list.iter().any(|s| s == text) {
+            value["authorized"][ship] = json!([list, vec![json!(text)]].concat());
+        }
+    }
+    if let Some(grant) = args.get("unauthorize") {
+        let (ship, text) = authorization(grant)?;
+        let list = value["authorized"][ship]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        ensure!(
+            list.iter().any(|s| s == text),
+            "{ship} has no such authorization"
+        );
+        let kept: Vec<Value> = list.into_iter().filter(|s| s != text).collect();
+        let ships = value["authorized"].as_object_mut().context("authorized")?;
+        if kept.is_empty() {
+            ships.remove(ship);
+        } else {
+            ships.insert(ship.to_owned(), json!(kept));
         }
     }
     validate(&value)?;
@@ -293,6 +353,11 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     Ok(value)
 }
 
+/// `{"ship","text"}` of one standing authorization.
+fn authorization(grant: &Value) -> Result<(&str, &str)> {
+    Ok((required(grant, "ship")?, required(grant, "text")?))
+}
+
 pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
     let value = match args {
         [] => load()?,
@@ -304,7 +369,14 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
             caller.require_operator("permissions.set")?;
             set(caller, &json!({"claude_allow_add":rule}))?
         }
-        _ => bail!("usage: privateer permissions [show|standard|yolo|allow 'Tool(rule)']"),
+        [verb, ship, text] if matches!(verb.as_str(), "authorize" | "unauthorize") => {
+            let mut request = json!({});
+            request[verb.as_str()] = json!({"ship": ship, "text": text});
+            set(caller, &request)?
+        }
+        _ => bail!(
+            "usage: privateer permissions [show|standard|yolo|allow 'Tool(rule)'|authorize SHIP TEXT|unauthorize SHIP TEXT]"
+        ),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())

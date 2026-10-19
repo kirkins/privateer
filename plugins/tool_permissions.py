@@ -16,6 +16,11 @@ def policy(value=None):
     if len(rules) > 64 or any(not isinstance(r, str) or not r or len(r) > 512 or r != r.strip() or r.startswith("-")
                               or any(ord(c) < 32 for c in r) for r in rules):
         raise ValueError("invalid fleet tool rules")
+    authorized = value.get("authorized", {})
+    if not isinstance(authorized, dict) or any(
+            not isinstance(statements, list) or any(not isinstance(t, str) for t in statements)
+            for statements in authorized.values()):
+        raise ValueError("invalid fleet authorizations")
     if "forges" in value:
         forges = value["forges"]
         if not isinstance(forges, dict):
@@ -108,16 +113,23 @@ def charter_rules(actions, forge=None, role=None, errand=False, policy_value=Non
     return list(dict.fromkeys(rules))
 
 
-def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship=None):
-    if role == "crew" or errand or not actions:
+def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship=None, authorized=()):
+    """Tell Claude's auto-mode classifier what the captain already authorized.
+
+    The classifier trusts settings, not what an agent reads in mail or notes,
+    so a captain's standing grant must reach it here or it is asked again."""
+    if role == "crew" or errand or not (actions or authorized):
         return None
     allow = ["$defaults"]
-    if "merge_green" in actions:
+    if "merge_green" in (actions or []):
         allow.append("Merging this ship's own pull requests once CI is green is authorized by the ship's "
                      "charter (merge_green), even without a human review.")
-    if "publish_pr" in actions:
+    if "publish_pr" in (actions or []):
         allow.append("Creating and publishing pull requests is authorized by the ship's charter (publish_pr).")
-    env = ["$defaults", f"Charter actions granted: {', '.join(sorted(actions))}."]
+    allow += [f"The captain has authorized this: {text}" for text in authorized]
+    env = ["$defaults"]
+    if actions:
+        env.append(f"Charter actions granted: {', '.join(sorted(actions))}.")
     if ship:
         env.append(f"Ship {ship} operates under its active charter.")
     return {
@@ -126,6 +138,11 @@ def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship
             "environment": env,
         }
     }
+
+
+def authorized_for(value, ship):
+    """The captain's standing authorizations for one ship."""
+    return list(policy(value).get("authorized", {}).get(ship or "", []))
 
 
 def merge_auto_mode_settings(target_settings, incoming_settings):
@@ -227,7 +244,8 @@ def attended_argv(harness, argv, value):
         extra += ["--allowedTools", *claude_rules(value, actions=actions, forge=forge, role="first_mate")]
         # An attended Claude session is the ship's first mate.
         extra += ["--disallowedTools", *claude_disallowed("first_mate")]
-        auto_settings = claude_auto_mode_settings(actions, forge=forge, role="first_mate", ship=ship)
+        auto_settings = claude_auto_mode_settings(actions, forge=forge, role="first_mate", ship=ship,
+                                                  authorized=authorized_for(value, ship))
         if auto_settings:
             settings_idx = None
             for idx, arg in enumerate(prefix):

@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 
 from protocol import context, option, serve
-from tool_permissions import options_for, claude_disallowed, claude_rules, policy, claude_auto_mode_settings
+from tool_permissions import options_for, claude_disallowed, claude_rules, policy, claude_auto_mode_settings, authorized_for
 
 
 PROFILES = {
@@ -280,7 +280,8 @@ def build(harness, request):
         ship = request["context"].get("owner")
         argv += ["--allowedTools", *claude_rules(tool_policy, control, actions=actions, forge=forge, role=role, errand=errand)]
         argv += ["--disallowedTools", *claude_disallowed(role)]
-        auto_settings = claude_auto_mode_settings(actions, forge=forge, role=role, errand=errand, ship=ship)
+        auto_settings = claude_auto_mode_settings(actions, forge=forge, role=role, errand=errand, ship=ship,
+                                                  authorized=authorized_for(tool_policy, ship))
         if auto_settings:
             settings_idx = None
             for idx, arg in enumerate(argv):
