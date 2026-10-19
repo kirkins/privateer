@@ -3,9 +3,12 @@
 //! instead of waking a headless one per batch of mail. The session holds the
 //! ship's presence lease (a `host:` holder the runtime owns, not the
 //! captain's) and its attended mail adapter starts turns as mail arrives. If
-//! the host is unreachable, the headless wake runs as before; if the session
-//! dies, its lease lapses and a later ordinary tick launches another. Failed
-//! launches back off durably, including a pane that never adopts its lease.
+//! the host is unreachable, the headless wake runs as before once Herdr has
+//! stayed unreachable for a grace, so a dispatcher that starts before Herdr at
+//! boot does not take its mail headless; if the session dies, its lease lapses
+//! and a later ordinary tick launches another. Failed launches back off
+//! durably, including a pane that never adopts its lease, except that Herdr
+//! coming back after being unreachable is launched into at once.
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
@@ -660,6 +663,28 @@ pub(crate) enum Attempt {
     Busy,
 }
 
+/// How long a hosted ship waits for an unreachable Herdr before a headless
+/// wake takes its mail, by default.
+pub(crate) const HERDR_GRACE_SECS: u64 = 180;
+
+/// The end of the grace a hosted ship gives an unreachable Herdr before a
+/// headless wake, while it lasts: from when a launch first found Herdr
+/// unreachable, not from the age of the mail.
+pub(crate) fn awaiting_herdr(store: &Store, ship: &str, grace_ms: i64) -> Result<Option<i64>> {
+    let since: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT unreachable_ms FROM host_launches WHERE ship=?1",
+            [ship],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(since
+        .map(|since| since.saturating_add(grace_ms))
+        .filter(|until| *until > Store::now_ms()))
+}
+
 /// Retry at most once a minute, exponentially up to an hour. This bound is
 /// independent of headless wake retry settings (which may legitimately be 0).
 fn delay(failures: i64) -> i64 {
@@ -752,22 +777,37 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         if running || crate::presence::attended(store, ship)? {
             return Ok(Attempt::Busy);
         }
-        let previous: Option<(i64, i64, bool, Option<i64>)> = tx
+        let previous: Option<(i64, i64, bool, Option<i64>, bool)> = tx
             .query_row(
-                "SELECT failures, retry_ms, start_asleep, start_through FROM host_launches WHERE ship=?1",
+                "SELECT failures, retry_ms, start_asleep, start_through, unreachable_ms IS NOT NULL
+                 FROM host_launches WHERE ship=?1",
                 [ship],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         let now = Store::now_ms();
-        if let Some((_, until, _, _)) = previous.filter(|(_, until, _, _)| *until > now) {
+        // Backoff is for launches that fail; Herdr that was down and now
+        // answers is launched into at once, so its space is not left waiting.
+        if let Some((_, until, _, _, unreachable)) =
+            previous.filter(|(_, until, _, _, _)| *until > now)
+            && !(unreachable && answers())
+        {
+            // A launch backing off while Herdr is still missing starts the
+            // grace now, so a dispatcher that wakes first at boot waits it out.
+            if !answers() {
+                tx.execute(
+                    "UPDATE host_launches SET unreachable_ms=COALESCE(unreachable_ms, ?2) WHERE ship=?1",
+                    params![ship, now],
+                )?;
+                tx.commit()?;
+            }
             return Ok(Attempt::Backoff(until));
         }
-        let failures = previous.map_or(1, |(n, _, _, _)| n.saturating_add(1).clamp(1, 7));
+        let failures = previous.map_or(1, |(n, _, _, _, _)| n.saturating_add(1).clamp(1, 7));
         // The flag and the mail it has seen stay until a pane starts on them.
-        let carried = previous.filter(|(_, _, flag, _)| *flag);
+        let carried = previous.filter(|(_, _, flag, _, _)| *flag);
         asleep = carried.is_some();
-        let through = carried.and_then(|(_, _, _, through)| through);
+        let through = carried.and_then(|(_, _, _, through, _)| through);
         tx.execute(
             "INSERT INTO host_launches(ship,holder,failures,retry_ms,error,start_asleep,start_through) VALUES(?1,?2,?3,?4,'awaiting hosted startup',?5,?6)
              ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, failures=excluded.failures,
@@ -781,8 +821,11 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         crate::presence::attend(store, ship, &holder, LAUNCH_TTL_SECS, harness.as_deref())?;
         tx.commit()?;
     }
+    // Past admission, a failure may be Herdr's own.
+    let mut at_host = false;
     let result = (|| -> Result<Value> {
         validate_start(store, ship, profile)?;
+        at_host = true;
         let socket = socket().context("no Herdr socket configured")?;
         let mut client = crate::herdr::Client::connect(&socket)?;
         let folder = store.home().parent().context("ship folder")?;
@@ -814,6 +857,16 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         )?;
         Ok(launched)
     })();
+    // The grace before a headless wake runs from when a launch first found
+    // Herdr unreachable, and ends at a launch it does not stop.
+    let unreachable = result.is_err() && at_host && !answers();
+    let tx = store.write_transaction()?;
+    tx.execute(
+        "UPDATE host_launches SET unreachable_ms=CASE WHEN ?2 THEN COALESCE(unreachable_ms, ?3) END
+         WHERE ship=?1",
+        params![ship, unreachable, Store::now_ms()],
+    )?;
+    tx.commit()?;
     match result {
         Ok(pane) => Ok(Attempt::Launched(pane)),
         Err(error) => {
