@@ -500,6 +500,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             {
                 job["_run_ms"] = spent.clone();
             }
+            // The crew a resume continues; only the runtime's resume sets it.
+            if let Some(resumed) = args
+                .get("_resume_of")
+                .filter(|_| matches!(store.caller(), Caller::Operator))
+            {
+                job["_resume_of"] = resumed.clone();
+            }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();
             }
