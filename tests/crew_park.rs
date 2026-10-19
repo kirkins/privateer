@@ -1201,3 +1201,86 @@ fn a_parked_crew_with_partial_require_use_resumes() {
         "route_why should be recorded: {job}"
     );
 }
+
+/// A crew under a live scheduled claim parks on a child, the child settles, and
+/// the runtime resumes it. The resumed crew parks again on a new child, and
+/// that child's outcome resumes it a second time. Both resumes are admitted
+/// under the claim, through the real park and resume, and each records the
+/// crew it continues.
+#[test]
+fn a_crew_under_a_claim_parks_and_resumes_twice_through_the_runtime() {
+    let f = Fleet::new();
+    f.set_mode("chain");
+    f.json(
+        None,
+        "ship.attend",
+        json!({"ship":"engineering","holder":"host:crew-park-test","ttl_secs":600}),
+    );
+    f.json(
+        None,
+        "task.enqueue",
+        json!({"id":"fix","brief":"Fix the build."}),
+    );
+    let offer = f.json(
+        None,
+        "work.poll",
+        json!({"ship":"engineering","holder":"host:crew-park-test","idle":true,
+            "attention":{"tokens":1000,"window":100000}}),
+    )["offer"]["id"]
+        .clone();
+    assert!(offer.is_string(), "no claim was offered");
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-claim","manifest":"bundled:claude","work_offer":offer}),
+    );
+    let conn =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    // Three launches are the crew and its two resumes; the second resume's
+    // park row is written once its launch is admitted.
+    let until = Instant::now() + std::time::Duration::from_secs(120);
+    let resumes: Vec<String> = loop {
+        let resumed: Vec<String> = conn
+            .prepare(
+                "SELECT resumed_job_id FROM crew_parks
+                 WHERE root='crew-claim' AND resumed_job_id IS NOT NULL ORDER BY created_ms",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        if resumed.len() >= 2 && f.launches().len() >= 3 {
+            break resumed;
+        }
+        assert!(
+            Instant::now() < until,
+            "resumes {resumed:?} after {:?}\nsteps: {}\nnotices: {:?}",
+            f.launches(),
+            f.steps(),
+            f.ship_notices()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(resumes.len(), 2, "{resumes:?}");
+    // Each resume continues the crew before it: the first the claimed crew,
+    // the second the first resume.
+    let continued: Vec<Option<String>> = resumes
+        .iter()
+        .map(|job| {
+            conn.query_row(
+                "SELECT json_extract(record,'$.resume_of') FROM jobs WHERE id=?1",
+                [job],
+                |r| r.get(0),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        continued,
+        vec![Some("crew-claim".to_owned()), Some(resumes[0].clone())],
+        "{resumes:?}"
+    );
+    // The second resume parked again on its own child, so its job is parked.
+    f.wait_park(&resumes[1]);
+}

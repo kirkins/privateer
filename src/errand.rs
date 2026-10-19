@@ -130,10 +130,11 @@ fn prompt(store: &Store, id: &str, ship: &str, focus: &str, brief: &str) -> Resu
 }
 
 /// The live scheduled offer for a task that the calling job holds, when the
-/// caller is a woken first mate (the job named by `PRIVATEER_JOB`). A stale
+/// caller is a woken first mate (the job this process runs in, as the agent
+/// that job runs as). A stale
 /// offer, such as one a `task.defer` has released, is not carried forward.
 fn woken_offer(store: &Store, task_id: &str) -> Result<Option<String>> {
-    let (Caller::Agent { .. }, Ok(job)) = (store.caller(), std::env::var("PRIVATEER_JOB")) else {
+    let (Caller::Agent { actor }, Some(job)) = (store.caller(), crate::crew_scope::job_id()) else {
         return Ok(None);
     };
     if !crate::scheduling::available(store)? {
@@ -144,9 +145,10 @@ fn woken_offer(store: &Store, task_id: &str) -> Result<Option<String>> {
         .query_row(
             "SELECT json_extract(j.record,'$.work_offer') FROM jobs j
                JOIN task_schedule s ON s.task_id=?2
-             WHERE j.id=?1 AND json_extract(s.record,'$.offer_id')=json_extract(j.record,'$.work_offer')
+             WHERE j.id=?1 AND json_extract(j.record,'$.agent_actor')=?3
+               AND json_extract(s.record,'$.offer_id')=json_extract(j.record,'$.work_offer')
                AND json_extract(s.record,'$.state') IN ('offered','claimed','executing')",
-            params![job, task_id],
+            params![job, task_id, actor],
             |r| r.get(0),
         )
         .optional()?;

@@ -495,7 +495,8 @@ pub(crate) fn admit_job(
 /// Whether the crew a launch continues began before the live claim was
 /// offered, on the claimed task. Its work was in flight first, so the claim
 /// must not orphan its resume. The crew is judged by its lineage root (the
-/// crew that first began the work), as `crew::lineage` gives it.
+/// crew that first began the work), as `crew::lineage` gives it; a root that
+/// is a first mate's wake never qualifies.
 fn resume_predates(store: &Store, crew: Option<&str>, task: &str, offer: &str) -> Result<bool> {
     let Some(crew) = crew else {
         return Ok(false);
@@ -504,6 +505,16 @@ fn resume_predates(store: &Store, crew: Option<&str>, task: &str, offer: &str) -
         .last()
         .context("crew lineage")?
         .clone();
+    // A first mate's wake is not a crew: a wake that predates the claim does
+    // not make its work in flight.
+    let woken: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)",
+        [&root],
+        |r| r.get(0),
+    )?;
+    if woken {
+        return Ok(false);
+    }
     let job_of = |id: &str| -> Result<Option<(Option<String>, Option<i64>)>> {
         Ok(store
             .connection()

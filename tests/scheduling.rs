@@ -1712,3 +1712,36 @@ fn a_resume_of_an_unrelated_job_cannot_pass_the_claim() {
     );
     assert!(refused.contains("execution claim"), "{refused}");
 }
+
+#[test]
+fn a_wake_that_predates_a_claim_cannot_pass_it_by_resuming() {
+    let mut fleet = Fleet::new(json!({}));
+    // A first mate's wake, started on the task before the claim is offered.
+    let wake = fleet.ok(
+        "job.start",
+        json!({"id":"wake-old-1","task_id":"infra-repair","command":["true"],"heavy":false}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &wake["id"])["status"], "succeeded");
+    fleet
+        .store
+        .connection()
+        .execute(
+            "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms)
+             VALUES('wake-old', 'infra', 'task:infra-repair', 0, 'wake-old-1', 'work', 'succeeded', 0)",
+            [],
+        )
+        .unwrap();
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    poll(&mut fleet, true);
+    // A wake's work is not a crew's in flight: the claim does not admit its
+    // resume, though the wake predates the claim on the same task.
+    let refused = fleet.refused(
+        "job.start",
+        json!({"id":"wake-resume-1","task_id":"infra-repair","command":["true"],"heavy":false,
+        "_resume_of":wake["id"]}),
+        None,
+    );
+    assert!(refused.contains("execution claim"), "{refused}");
+}
