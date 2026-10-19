@@ -191,10 +191,11 @@ fn usage_of(conn: &Connection, route: &str) -> Result<Usage> {
 }
 
 /// The usage a route is judged on: its own reading with its account's plan
-/// windows laid over it. The account's windows win when it reports any and its
-/// reading is no older than the route's (a tie goes to the account), or when
-/// the route reports none. A route with no reading of its own takes the
-/// account's windows and no runs, since the runs are the route's.
+/// windows laid over it. The account's windows win whenever it reports any,
+/// because a route's reading moves on every run, including throttled runs and
+/// runs that report no windows, so its age says nothing about the plan. A route
+/// with no reading of its own takes the account's windows and no runs, since
+/// the runs are the route's.
 pub(crate) fn with_account_windows(route: Option<Usage>, account: Option<&Usage>) -> Option<Usage> {
     let reports = |u: &Usage| u.window_utilization.is_some() || u.weekly_utilization.is_some();
     let Some(account) = account.filter(|a| reports(a)) else {
@@ -207,9 +208,6 @@ pub(crate) fn with_account_windows(route: Option<Usage>, account: Option<&Usage>
             ..account.clone()
         });
     };
-    if reports(&usage) && usage.updated_ms > account.updated_ms {
-        return Some(usage);
-    }
     usage.window_ends_ms = account.window_ends_ms;
     usage.window_utilization = account.window_utilization;
     usage.weekly_ends_ms = account.weekly_ends_ms;
@@ -2262,7 +2260,7 @@ mod allowance_tests {
     }
 
     #[test]
-    fn a_tied_account_reading_with_windows_wins_over_the_route_reading() {
+    fn the_account_windows_win_over_the_route_reading_whatever_its_age() {
         let windows = |at: i64, used: f64| Usage {
             window_utilization: Some(used),
             updated_ms: at,
@@ -2281,11 +2279,21 @@ mod allowance_tests {
         );
         assert_eq!(merged.runs, 3, "the route keeps its own runs");
         let newer = windows(200, 0.2);
-        let kept = with_account_windows(Some(newer.clone()), Some(&account)).unwrap();
+        let merged = with_account_windows(Some(newer.clone()), Some(&account)).unwrap();
         assert_eq!(
-            kept, newer,
-            "a route reading newer than the account's stands"
+            merged.window_utilization,
+            Some(0.9),
+            "a route reading newer than the account's does not outrank its windows"
         );
+        assert_eq!(merged.updated_ms, 200, "the reading's age is kept");
+        let windowless = Usage {
+            runs: 5,
+            updated_ms: 300,
+            ..Default::default()
+        };
+        let merged = with_account_windows(Some(windowless), Some(&account)).unwrap();
+        assert_eq!(merged.window_utilization, Some(0.9));
+        assert_eq!(merged.runs, 5, "a run that reports no windows still counts");
         let bare = with_account_windows(None, Some(&account)).unwrap();
         assert_eq!(bare.window_utilization, Some(0.9));
         assert_eq!(bare.runs, 0);

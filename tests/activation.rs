@@ -1504,6 +1504,19 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     assert_eq!(last["urgency"], "high");
 }
 
+/// Tick until no wake of the infra ship is running.
+fn quiet_infra(fleet: &mut Fleet) {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        fleet.tick();
+        if fleet.wakes().iter().all(|w| w["status"] != "running") {
+            return;
+        }
+        assert!(Instant::now() < until, "an infra wake never ended");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     let mut fleet = Fleet::new(now_settings());
@@ -1561,10 +1574,14 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
     assert!(backed[0]["last_error"].as_str().unwrap().starts_with("429"));
     let until = backed[0]["until_ms"].as_i64().unwrap();
 
-    // New crew on that route are refused, and headless wakes wait.
+    // New crew on that route are refused, and headless wakes wait. An infra
+    // wake the run before started in fail mode may still be running, and may
+    // have been throttled by now: let every infra wake end before reading why
+    // the next one waits.
     let refused = crew(&fleet, "second");
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("backing off"));
+    quiet_infra(&mut fleet);
     fleet.send(json!({"id":"q","from":"apps","to":"infra","kind":"request","body":"Ready?"}));
     assert_eq!(
         Fleet::infra(&fleet.tick())["skipped"],
@@ -1609,6 +1626,51 @@ fn a_throttled_model_route_backs_off_and_a_success_clears_it() {
         .query_row("SELECT COUNT(*) FROM model_routes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(left, 0);
+}
+
+#[test]
+fn a_throttled_wake_with_no_fallback_waits_then_wakes_on_its_own_route() {
+    // No routes file: the first mate has no other route to retry on.
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20,"crew_memory_bytes":{"codex":1u64 << 20}}),
+        None,
+    );
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    let ledger_path = fleet.root.join("ledger/resources.sqlite");
+    let ledger = || rusqlite::Connection::open(&ledger_path).unwrap();
+
+    fleet.mode("throttle");
+    fleet.send(json!({"id":"q","from":"apps","to":"infra","kind":"request","body":"Ready?"}));
+    let throttled = Fleet::infra(&fleet.tick());
+    assert!(throttled["wake"].is_string(), "{throttled}");
+    let failed = fleet.settle();
+    assert_eq!(failed["status"], "failed", "{failed}");
+
+    // The retry finds no route, so the wake waits as it does without a
+    // failure, on the route that throttled it.
+    let waiting = Fleet::infra(&fleet.tick());
+    assert_eq!(
+        waiting["skipped"], "model route backing off or past its headroom",
+        "{waiting}"
+    );
+
+    // Once that route's backoff ends, the wake goes out on it, not as a retry.
+    ledger()
+        .execute("UPDATE model_routes SET until_ms=0", [])
+        .unwrap();
+    fleet.mode("normal");
+    let woken = Fleet::infra(&fleet.tick());
+    assert!(woken["wake"].is_string(), "{woken}");
+    assert!(woken["retry_of"].is_null(), "{woken}");
+    let done = fleet.settle();
+    assert_eq!(done["id"], woken["wake"], "{done}");
+    assert_eq!(done["status"], "succeeded", "{done}");
 }
 
 #[test]

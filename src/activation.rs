@@ -782,13 +782,12 @@ pub(crate) fn warm_session(
 /// Decide whether a ship's first mate is due, and wake it if so.
 fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let name = ship["name"].as_str().context("ship name")?.to_owned();
-    let mut profile = ship["first_mate"].clone();
+    let profile = ship["first_mate"].clone();
     if crate::permissions::paused(store, &name)? {
         return Ok(
             json!({"ship":name,"skipped":"tool permission question awaits captain or a policy change"}),
         );
     }
-    let now = Store::now_ms();
     let running: bool = store.connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status IN ('offered','running'))",
         [&name],
@@ -834,6 +833,30 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
             Err(error) => host_error = Some(format!("{error:#}")),
         }
     }
+    headless_wake(
+        store,
+        name,
+        profile,
+        host_error,
+        host_backoff_until_ms,
+        own_blocked,
+        true,
+    )
+}
+
+/// The headless wake of a ship that its hosted first mate did not take.
+/// `retry_allowed` is false once a failed wake's retry has found no route to
+/// take: that wake then runs as any other, with its waits and its whole mail.
+fn headless_wake(
+    store: &mut Store,
+    name: String,
+    mut profile: Value,
+    host_error: Option<String>,
+    host_backoff_until_ms: Option<i64>,
+    mut own_blocked: Option<bool>,
+    retry_allowed: bool,
+) -> Result<Value> {
+    let now = Store::now_ms();
     // A wake covers mail through its sequence whether or not the first mate
     // acknowledged it, so an agent that forgets to ack is not woken forever.
     let woken_through: i64 = store.connection().query_row(
@@ -902,8 +925,8 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // that failed for its own reasons keeps its mail and waits as it always
     // did: only a limit or an outage says another route may do better.
     let retry = match &last {
-        Some(last) => retryable(store, &name, last)?,
-        None => None,
+        Some(last) if retry_allowed => retryable(store, &name, last)?,
+        _ => None,
     };
     let last_failure = last
         .as_ref()
@@ -989,13 +1012,23 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
             None => crate::crew_routes::first_mate_fallback(store, &name, &task, &profile)?,
         };
         let Some(fallback) = fallback else {
+            // A retry with no route to move to is no retry: the wake waits as
+            // it does without a failure, through the backoff, the hourly budget
+            // and the whole mail. Nothing was recorded, so this runs once.
+            if retry.is_some() {
+                return headless_wake(
+                    store,
+                    name,
+                    profile,
+                    host_error,
+                    host_backoff_until_ms,
+                    own_blocked,
+                    false,
+                );
+            }
             return Ok(json!({
                 "ship": name,
-                "skipped": if retry.is_some() {
-                    "no fallback route for a retry"
-                } else {
-                    "model route backing off or past its headroom"
-                }
+                "skipped": "model route backing off or past its headroom"
             }));
         };
         profile["manifest"] = fallback.manifest;

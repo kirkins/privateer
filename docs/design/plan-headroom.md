@@ -54,7 +54,7 @@ A task error is not retried early. The same first mate with the same brief on an
 ## Changes by file
 
 - `src/routes.rs`: `Who`; `Spent` and `spent`; `refusal_for`, `held_off` and the headroom refusal; `route_usage` gains `runs` and `runs_window_ends_ms` (migrated under the write lock); `Allowance.runs` counted in `record_job`; Claude windows recorded for every Claude route.
-- `src/crew_routes.rs`: `Limits` (the two shares and the run budget), `limits`, `limits_of`; `runs` in the allowance shape and its validation; `choose` and `resume_route` refuse at the crew share; `first_mate_fallback` and the new `retry_fallback` at the first-mate share; `RouteState.spent` shows the share in bearings and in the fleet snapshot.
+- `src/crew_routes.rs`: `Limits` (the two shares and the run budget), `limits`, `limits_of`; `runs` in the allowance shape and its validation; `choose` refuses at the crew share, and `resume_route` is blocked only by a hold; `first_mate_fallback` and the new `retry_fallback` at the first-mate share; `RouteState.spent` shows the share in bearings and in the fleet snapshot.
 - `src/activation.rs`: `own_route_blocked` reads the first-mate share; `Last`, `Retry` and `retryable`; the wake row records `retry_of`; the retry is taken outside both waits and skips its answered mail; `wake_text` tells the retry what it is retrying.
 - `src/lib.rs`: a launch is judged as the kind it is, so a first mate's own wake is not refused at the crew share.
 - `src/snapshot.rs`: each route row carries `used`, the share spent and the window it is from.
