@@ -743,6 +743,21 @@ fn captain_blocked_alerts(place: &Place) -> Vec<Value> {
         .collect()
 }
 
+/// Open runtime.needs items raised for two or more mate spaces of `infra`.
+fn duplicate_mate_needs(place: &Place) -> Vec<Value> {
+    place.json("runtime.needs", json!({"limit":100}))["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| {
+            item["source_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("duplicate-mates-infra-"))
+        })
+        .cloned()
+        .collect()
+}
+
 fn age_hosted_block(place: &Place) {
     place
         .database()
@@ -2242,6 +2257,31 @@ fn hosted_blocked_alerts_never_for_an_idle_pane() {
             .unwrap(),
         0,
     );
+    place.stop_native("infra");
+}
+
+#[test]
+fn two_mate_spaces_for_one_ship_alert_once_and_clear_at_one() {
+    let (place, herdr) = hosted_fixture();
+    assert!(duplicate_mate_needs(&place).is_empty());
+    // A second space tagged as infra's mate, as a restored or stale Herdr space would be.
+    herdr
+        .spaces
+        .lock()
+        .unwrap()
+        .push(("w9".into(), json!({"privateer":"mate","ship":"infra"})));
+    place.tick();
+    let needs = duplicate_mate_needs(&place);
+    assert_eq!(needs.len(), 1, "{needs:?}");
+    assert_eq!(needs[0]["source"], "mail");
+    // A second pass does not raise it again, and leaves both spaces open.
+    place.tick();
+    assert_eq!(duplicate_mate_needs(&place).len(), 1);
+    assert_eq!(herdr.spaces.lock().unwrap().len(), 3);
+    // Only one mate space is left: the alert clears.
+    herdr.spaces.lock().unwrap().retain(|(id, _)| id != "w9");
+    place.tick();
+    assert!(duplicate_mate_needs(&place).is_empty());
     place.stop_native("infra");
 }
 

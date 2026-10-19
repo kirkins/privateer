@@ -576,6 +576,22 @@ impl Client {
         Ok(())
     }
 
+    /// Privateer's mate spaces as Herdr lists them now, as (ship, workspace).
+    /// Read-only: a duplicate is reported, never closed here.
+    pub(crate) fn mate_spaces(&mut self) -> Result<Vec<(String, String)>> {
+        let listed = self.request("workspace.list", json!({}))?;
+        Ok(listed["workspaces"]
+            .as_array()
+            .context("workspace list missing")?
+            .iter()
+            .filter(|w| w["tokens"]["privateer"] == "mate")
+            .filter_map(|w| {
+                let ship = w["tokens"]["ship"].as_str().filter(|s| !s.is_empty())?;
+                Some((ship.to_owned(), w["workspace_id"].as_str()?.to_owned()))
+            })
+            .collect())
+    }
+
     /// Keep Privateer's spaces together at the top of the sidebar: the bridge
     /// first, then each ship's first mate followed by its crew. Ships keep
     /// their first mates' current order, then name for ships without a mate.
