@@ -1857,14 +1857,18 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"still there?"}),
     );
+    // Herdr's loss during the backoff starts the grace, so the headless wake
+    // waits it out rather than running at once.
     let report = place.tick();
-    assert!(report["wake"].is_string(), "{report}");
+    assert_eq!(
+        report["skipped"], "waiting for Herdr before a headless wake",
+        "{report}"
+    );
     assert!(report["host_error"].is_null(), "{report}");
     assert_eq!(report["host_backoff_until_ms"], state.1, "{report}");
     assert_eq!(place.launch_state(), state);
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
-    assert_eq!(place.wakes(), 1);
-    place.stop_wake("adopted host backoff fallback", &report);
+    assert_eq!(place.wakes(), 0);
 
     // Only a due attempt reports a new host error, and one that finds Herdr
     // unreachable holds mail for Herdr's grace rather than waking headless, as
@@ -1891,7 +1895,7 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(state.0, 1);
     assert!(state.1 > privateer::store::Store::now_ms(), "{state:?}");
     assert_eq!(state.2.as_deref(), report["host_error"].as_str());
-    assert_eq!(place.wakes(), 1);
+    assert_eq!(place.wakes(), 0);
 
     // Past the grace, missing Herdr still falls back to a real headless
     // subprocess without leaking the launch lease.
@@ -1909,14 +1913,14 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(presence["attended"], false, "{presence}");
     assert!(presence["lease"].is_null(), "{presence}");
     assert_eq!(herdr.requests.lock().unwrap().len(), calls);
-    assert_eq!(place.wakes(), 2);
+    assert_eq!(place.wakes(), 1);
     place.stop_wake("missing-socket fallback after the grace", &report);
 
     // Herdr answering again is launched into at once, inside the backoff.
     fs::rename(socket.with_extension("away"), &socket).unwrap();
     let report = place.tick();
     assert_eq!(report["hosted"]["pane"], "w3:p1", "{report}");
-    assert_eq!(place.wakes(), 2);
+    assert_eq!(place.wakes(), 1);
 }
 
 /// A dispatcher that wakes first at boot finds the launch still in its
