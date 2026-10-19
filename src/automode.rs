@@ -4,8 +4,9 @@
 //! three consecutive blocks it refuses every tool, even reads, and stops. Its
 //! settings load only at launch, so a retry before a relaunch is judged by the
 //! old policy. The host reads each hosted pane's visible screen as plain text.
-//! When it shows the stop line, or a denial line, one captain notice per
-//! incident offers a relaunch, and the denials become one block ask. The screen
+//! When it shows the stop line, one captain notice per incident offers a
+//! relaunch. When it shows the stop line or a denial line, one block ask is
+//! raised for the incident. The screen
 //! names no tool, so the ask names it "unknown" until the transcript shape is
 //! captured.
 //!
@@ -69,7 +70,9 @@ fn denial_line(line: &str) -> bool {
     };
     let label = rest.trim_start().strip_prefix('·').map(str::trim_start);
     !tool.is_empty()
-        && !tool.contains(char::is_whitespace)
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         && label.is_some_and(|label| label.starts_with('[') && label.contains(']'))
 }
 
@@ -134,8 +137,8 @@ fn notice(ship: &str, finding: &Finding) -> String {
     )
 }
 
-/// Raise one captain notice, and one block ask for the denials, for each new
-/// incident on a hosted pane. The last incident is kept per ship, so the same
+/// Raise a captain notice for each new lockout, and one block ask for each new
+/// lockout or denial, on a hosted pane. The last incident is kept per ship, so the same
 /// screen raises nothing twice, and a readable screen with no block clears it.
 /// A ship without a duty task has nobody to tell.
 pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Result<Vec<Value>> {
@@ -190,20 +193,23 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
             continue;
         }
         let count = finding.denials.len();
-        mail::record_crew(
-            &tx,
-            &json!({
-                "id": format!("hosted-automode-{ship}-{}", &incident[..16]),
-                "to": "captain",
-                "kind": "notice",
-                "task_id": duty_task,
-                "urgency": "normal",
-                "body": notice(ship, &finding),
-                "payload": {"hosted_automode": ship, "incident": incident,
-                            "lockout": finding.lockout, "denied": count}
-            }),
-        )?;
-        if !finding.denials.is_empty() {
+        // Only the stop line offers a relaunch. A lone denial is a block ask.
+        if finding.lockout {
+            mail::record_crew(
+                &tx,
+                &json!({
+                    "id": format!("hosted-automode-{ship}-{}", &incident[..16]),
+                    "to": "captain",
+                    "kind": "notice",
+                    "task_id": duty_task,
+                    "urgency": "normal",
+                    "body": notice(ship, &finding),
+                    "payload": {"hosted_automode": ship, "incident": incident,
+                                "lockout": finding.lockout, "denied": count}
+                }),
+            )?;
+        }
+        if finding.lockout || count > 0 {
             if let Ok(task) = store.task(&duty_task) {
                 let (records, more) = block_ask::records(
                     &[json!({"tool_name": "unknown", "tool_input": {}})],
@@ -277,9 +283,12 @@ mod tests {
 
     #[test]
     fn a_real_lockout_screen_is_a_block() {
-        let screen = "bash denied by auto mode · [Security Test Removal] · /permissions\n\
-                      │ 3 consecutive actions were blocked. Please review the transcript before continuing.\n\
-                      │ Latest blocked action: [Auto-Mode Bypass]";
+        // Each line opens with a quote, so the source never matches itself.
+        let screen = concat!(
+            "bash denied by auto mode · [Security Test Removal] · /permissions\n",
+            "│ 3 consecutive actions were blocked. Please review the transcript before continuing.\n",
+            "│ Latest blocked action: [Auto-Mode Bypass]"
+        );
         let finding = read(screen).unwrap();
         assert!(finding.lockout);
         assert_eq!(finding.denials.len(), 1);
@@ -460,11 +469,38 @@ mod tests {
     }
 
     #[test]
-    fn a_denial_raises_the_block_ask_as_well_as_the_notice() {
+    fn a_denial_raises_the_block_ask_and_no_notice() {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
         let screen = "bash denied by auto mode · [Security Test Removal] · /permissions";
+        assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail WHERE body LIKE '%automatic permission checks%'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.block') IS NOT NULL"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_lockout_only_screen_raises_the_notice_and_the_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // The lockout box with no denial row above it.
+        let screen = concat!(
+            "│ 3 consecutive actions were blocked.\n",
+            "│ Please review the transcript before continuing."
+        );
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
         assert_eq!(
             count(
@@ -480,5 +516,10 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn the_matcher_does_not_match_its_own_source() {
+        assert!(read(include_str!("automode.rs")).is_none());
     }
 }
