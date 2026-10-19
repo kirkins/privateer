@@ -2,7 +2,8 @@
 //! dashboard observation. The guard serializes homes; the direct dashboard
 //! holds a separate kernel lease for its entire lifetime. Pending launch tokens
 //! are fenced under the guard before replacement. No time-based death inference,
-//! label adoption, input replay, process signalling or pane closing.
+//! label adoption, input replay, process signalling or pane closing here; the
+//! copy Herdr restores of a bridge after its restart is closed by `restored`.
 use crate::{
     herdr::{Binding, Client, Pane, View},
     store::{Caller, Store},
@@ -472,7 +473,11 @@ pub(crate) fn maintain(store: &Store) -> Result<Value> {
         },
     );
     let pane = match launched {
-        Ok(pane) => pane,
+        Ok(pane) => {
+            let folder = store.home().parent().context("ship folder")?;
+            super::restored::record(store, &socket, &pane, "bridge", &claim.owner.ship, folder);
+            pane
+        }
         Err(error) => {
             if claim.binding.is_none()
                 && error

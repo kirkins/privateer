@@ -78,6 +78,8 @@ pub fn init(store: &Store) -> Result<()> {
            harness_started TEXT, recorded_ms INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS hosted_automode(ship TEXT PRIMARY KEY, incident TEXT NOT NULL,
            ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS hosted_untrusted(ship TEXT PRIMARY KEY, folder TEXT NOT NULL,
+           ms INTEGER NOT NULL, mail_id TEXT);
          CREATE TABLE IF NOT EXISTS hosted_relaunches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
            force INTEGER NOT NULL CHECK(force IN (0,1)), requested_ms INTEGER NOT NULL,
            expires_ms INTEGER NOT NULL);",
@@ -91,6 +93,7 @@ pub fn init(store: &Store) -> Result<()> {
     if !digest_column {
         tx.execute_batch("ALTER TABLE hosted_panes ADD COLUMN settings_digest TEXT;")?;
     }
+    crate::host::restored::init(&tx)?;
     // A pane relaunched by an upgrade, or from sleep, starts asleep.
     let asleep_column: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='start_asleep')",
@@ -1160,6 +1163,8 @@ pub fn tick(store: &mut Store) -> Result<Value> {
 }
 
 fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Value> {
+    // Before any space opens, so a restored copy is not counted as one.
+    let restored = crate::host::restored::sweep(store);
     let bridge = crate::host::bridge::maintain(store).unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
@@ -1197,6 +1202,8 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
             }),
         });
     }
+    // Untrusted folders raised by this pass's launches are reported here too.
+    let hosted_blocked = crate::host::with_untrusted(store, hosted_blocked);
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
     // Mail other machines hold for ships here, which they cannot send.
     let machines = crate::machines::tick(store.home(), budget);
@@ -1206,7 +1213,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
     )
 }
 

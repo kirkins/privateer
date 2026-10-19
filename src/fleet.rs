@@ -500,6 +500,7 @@ fn create_here(
             options,
         },
     )?;
+    let hosted_here = host.is_some();
     if let Some(host) = host {
         let mut child = Store::open(&home)?;
         let mut profile =
@@ -524,6 +525,12 @@ fn create_here(
     register(&ship, &home, &created_by)?;
     let child = Store::open(&home)?;
     link(&child, &ship)?;
+    // A hosted Claude ship's folder needs the captain's trust before its first mate starts.
+    let untrusted = if harness == "claude" && hosted_here {
+        crate::host::raise_untrusted_at_create(&child, &ship, &folder)?.then(|| folder.clone())
+    } else {
+        None
+    };
     // Linked machines learn the ship now, not at their next refresh.
     let directory = crate::machines::announce(Some(&*store));
     let dispatcher = match service_path {
@@ -533,7 +540,7 @@ fn create_here(
     let charter = child.charter(&ship)?;
     Ok(json!({"ship": ship, "folder": folder, "harness": harness,
         "actions": charter["actions"], "created_by": created_by, "dispatcher": dispatcher,
-        "directory": directory}))
+        "directory": directory, "untrusted_folder": untrusted}))
 }
 
 /// Retire a ship: revoke its charter, stop its dispatcher, unlink it from

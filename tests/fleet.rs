@@ -276,6 +276,48 @@ fn a_ship_creates_a_linked_sibling_ship() {
 }
 
 #[test]
+fn a_hosted_claude_ship_asks_for_its_folders_trust_at_creation() {
+    let machine = Machine::new();
+    let liaison = machine.ship("liaison");
+    // Claude trusts only the folder named in its user config, here HOME's.
+    let trusted = machine.ships.join("bay");
+    fs::create_dir_all(&trusted).unwrap();
+    let trust = json!({"projects": {trusted.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
+    fs::write(machine.root.join(".claude.json"), trust.to_string()).unwrap();
+
+    let art = machine.json(
+        &liaison,
+        "ship.create",
+        json!({"name":"art","harness":"claude","host":"herdr"}),
+    );
+    let art_folder = machine.ships.join("art");
+    assert_eq!(art["untrusted_folder"], json!(art_folder), "{art}");
+    let art_requests: Vec<Value> = machine.json(
+        &art_folder,
+        "mail.inbox",
+        json!({"address":"captain","all":true,"limit":100}),
+    )["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["hosted_untrusted"] == "art")
+        .cloned()
+        .collect();
+    assert_eq!(art_requests.len(), 1, "{art_requests:?}");
+    let step = art_requests[0]["payload"]["needs_hands"]["step"]
+        .as_str()
+        .unwrap();
+    assert!(step.contains(art_folder.to_str().unwrap()), "{step}");
+
+    let bay = machine.json(
+        &liaison,
+        "ship.create",
+        json!({"name":"bay","harness":"claude","host":"herdr"}),
+    );
+    assert!(bay["untrusted_folder"].is_null(), "{bay}");
+}
+
+#[test]
 fn an_agent_creates_ships_only_within_its_own_charter() {
     let machine = Machine::new();
     let liaison = machine.ship("liaison");

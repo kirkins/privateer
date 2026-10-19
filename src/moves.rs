@@ -641,6 +641,7 @@ fn rewrite(home: &Path, manifest: &Value, folder: &Path, path: &str) -> Result<V
         "sessions",
         "host_launches",
         "hosted_block_alerts",
+        "hosted_untrusted",
     ] {
         if has_table(&tx, table)? {
             tx.execute(&format!("DELETE FROM {table}"), [])?;

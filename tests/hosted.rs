@@ -163,8 +163,12 @@ impl Place {
     }
     /// One dispatcher pass, with Herdr's socket where its default would be.
     fn tick(&self) -> Value {
+        self.serve_once()["ships"][0].take()
+    }
+    /// One dispatcher pass as serve prints it: the whole report.
+    fn serve_once(&self) -> Value {
         let line = self.ok(&["serve", "--json", r#"{"once":true}"#]);
-        serde_json::from_str::<Value>(&line).unwrap()["ships"][0].take()
+        serde_json::from_str(&line).unwrap()
     }
     fn at(&self, name: &str, command: &str, args: Value) -> Value {
         let home = self.folder.parent().unwrap().join(name).join(".privateer");
@@ -638,6 +642,22 @@ impl Herdr {
                             "format":params["format"],"revision":7,"truncated":false,
                             "text":"\u{1b}[1mpi\u{1b}[0m ready"}})
                     }
+                    "pane.process_info" => {
+                        let live = live.lock().unwrap();
+                        let pane = live.iter().find(|p| p["pane_id"] == params["pane_id"]);
+                        json!({"type":"pane_process_info",
+                            "process_info": pane.map(|p| p["process_info"].clone())})
+                    }
+                    "workspace.close" => {
+                        live.lock()
+                            .unwrap()
+                            .retain(|p| p["workspace_id"] != params["workspace_id"]);
+                        order
+                            .lock()
+                            .unwrap()
+                            .retain(|(id, _)| *id != params["workspace_id"]);
+                        json!({"type":"ok"})
+                    }
                     "pane.get" => {
                         let live = live.lock().unwrap();
                         let pane = live.iter().find(|p| p["pane_id"] == params["pane_id"]);
@@ -703,6 +723,37 @@ impl Herdr {
             .find(|p| p["pane_id"] == pane_id)
             .cloned()
             .unwrap()
+    }
+    /// Herdr restarted and restored this space: the same pane under a new
+    /// terminal, running a shell in `cwd`, with `command` in front if given.
+    fn restore(&self, workspace_id: &str, cwd: &Path, command: Option<&str>) {
+        let mut panes = self.panes.lock().unwrap();
+        let pane = panes
+            .iter_mut()
+            .find(|p| p["workspace_id"] == workspace_id)
+            .expect("restored pane exists");
+        pane["terminal_id"] = json!(format!("{workspace_id}-restored"));
+        pane["agent"] = Value::Null;
+        let mut processes = vec![json!({"pid":100,"name":"bash","cwd":cwd})];
+        if let Some(command) = command {
+            processes = vec![json!({"pid":101,"name":command,"cwd":cwd})];
+        }
+        pane["process_info"] = json!({"pane_id":pane["pane_id"],"shell_pid":100,
+            "foreground_process_group_id":processes[0]["pid"],"foreground_processes":processes});
+    }
+    /// Herdr restarted and restored this space under a new terminal, and the
+    /// shell's pid now runs `name` in its place, as after `exec privateer ...`.
+    fn restore_exec(&self, workspace_id: &str, cwd: &Path, name: &str) {
+        let mut panes = self.panes.lock().unwrap();
+        let pane = panes
+            .iter_mut()
+            .find(|p| p["workspace_id"] == workspace_id)
+            .expect("restored pane exists");
+        pane["terminal_id"] = json!(format!("{workspace_id}-restored"));
+        pane["agent"] = Value::Null;
+        pane["process_info"] = json!({"pane_id":pane["pane_id"],"shell_pid":100,
+            "foreground_process_group_id":100,
+            "foreground_processes":[{"pid":100,"name":name,"cwd":cwd}]});
     }
     /// The sidebar, top to bottom.
     fn order(&self) -> Vec<String> {
@@ -790,6 +841,103 @@ fn age_duplicate_overlap(place: &Place) {
             [privateer::store::Store::now_ms() - 5 * 60 * 1000 - 1],
         )
         .unwrap();
+}
+
+/// Captain requests that name an untrusted folder for infra.
+fn untrusted_requests(place: &Place) -> Vec<Value> {
+    place.json(
+        "mail.inbox",
+        json!({"address":"captain","all":true,"limit":100}),
+    )["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["payload"]["hosted_untrusted"] == "infra")
+        .cloned()
+        .collect()
+}
+
+/// The state a captain request's mail row was left in.
+fn request_state(place: &Place, id: &str) -> String {
+    place
+        .database()
+        .query_row("SELECT state FROM mail WHERE id=?1", [id], |r| r.get(0))
+        .unwrap()
+}
+
+/// A hosted Claude first mate in a folder with no trust record, and its Herdr.
+fn untrusted_claude_place() -> (Place, Herdr) {
+    let place = Place::new();
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:claude");
+    first_mate["options"] = json!({"model":"claude-opus-5-5","permission_mode":"auto"});
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    (place, herdr)
+}
+
+/// An unreadable Claude config is no verdict: the launch waits, and no request is raised.
+#[test]
+fn an_unparsable_claude_config_blocks_the_launch_without_a_request() {
+    let (place, _herdr) = untrusted_claude_place();
+    // Claude rewrites this file in place, so a read caught mid-write looks like this.
+    fs::write(place.root.join(".claude.json"), r#"{"projects": {"#).unwrap();
+    let serve = place.serve_once();
+    let error = serve["ships"][0]["host_error"].as_str().unwrap();
+    assert!(error.contains("Yes, I trust this folder"), "{error}");
+    assert!(untrusted_in_serve(&serve).is_empty(), "{serve}");
+    assert!(untrusted_requests(&place).is_empty());
+    assert!(!place.root.join("pi-argv").exists());
+}
+
+/// A ship that leaves Claude takes its folder request and alert with it.
+#[test]
+fn switching_an_untrusted_claude_ship_to_another_harness_clears_its_request() {
+    let (place, _herdr) = untrusted_claude_place();
+    place.serve_once();
+    let requests = untrusted_requests(&place);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let request_id = requests[0]["id"].as_str().unwrap().to_owned();
+
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:pi");
+    first_mate["options"] = json!({});
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    place.retry_now();
+    place.tick();
+
+    assert!(untrusted_in_serve(&place.serve_once()).is_empty());
+    let open: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM hosted_untrusted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(open, 0);
+    assert_eq!(request_state(&place, &request_id), "withdrawn");
+    until("the hosted pi", || place.root.join("pi-env").exists());
+    place.stop_native("infra");
+}
+
+/// The untrusted folders a serve report lists under hosted_blocked.
+fn untrusted_in_serve(serve: &Value) -> Vec<String> {
+    serve["hosted_blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["untrusted"].as_str().map(str::to_owned))
+        .collect()
 }
 
 fn age_hosted_block(place: &Place) {
@@ -1984,6 +2132,59 @@ fn a_launch_in_backoff_at_boot_with_herdr_missing_waits_out_the_grace() {
     place.stop_wake("boot backoff after the grace", &report);
 }
 
+#[test]
+fn a_space_herdr_restores_after_a_restart_is_closed_unless_the_captain_uses_it() {
+    let (place, herdr) = hosted_fixture();
+    // Herdr restarts: the session it ran is gone, and it restores the space
+    // with a shell the captain has started something in. That one is theirs.
+    place.stop_native("infra");
+    herdr.restore("w2", &place.folder, Some("vim"));
+    place.retry_now();
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w3:p1", "{report}");
+    assert!(herdr.calls("workspace.close").is_empty());
+    assert!(herdr.order().contains(&"w2".to_owned()));
+
+    // A restored copy at its bare shell is closed, and a fresh space opened.
+    until("the second hosted harness", || {
+        place.root.join("pi-env").exists()
+    });
+    place.stop_native("infra");
+    herdr.restore("w3", &place.folder, None);
+    place.retry_now();
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w4:p1", "{report}");
+    let closed = herdr.calls("workspace.close");
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["params"]["workspace_id"], "w3");
+    let mut left = herdr.order();
+    left.sort();
+    assert_eq!(left, ["w1", "w2", "w4"]);
+}
+
+#[test]
+fn a_restored_space_running_privateer_at_the_shell_pid_is_not_closed() {
+    let (place, herdr) = hosted_fixture();
+    // A live bridge or a sleeping first mate runs in the pane where the shell
+    // was: `exec privateer ...` replaced it. The terminal changed, but the
+    // space is in use and is not a bare shell, so it is left alone.
+    place.stop_native("infra");
+    herdr.restore_exec("w2", &place.folder, "privateer-dashb");
+    place.retry_now();
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w3:p1", "{report}");
+    assert!(herdr.calls("workspace.close").is_empty(), "{report}");
+    assert!(herdr.order().contains(&"w2".to_owned()));
+    let left: Vec<Value> = place.json("audit.list", json!({"limit":1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "host.restored_left")
+        .map(|event| event["payload"]["workspace"].clone())
+        .collect();
+    assert_eq!(left, [json!("w2")], "{report}");
+}
+
 /// Idle the hosted first mate past its sleep threshold until it sleeps: its
 /// adapter reports it idle, and its native payload exits. Herdr has recorded
 /// the harness as exited by then, which is when it drops a report naming it.
@@ -2493,9 +2694,38 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
     place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
 
     // An untrusted folder would stop at Claude's trust dialog: refuse instead.
-    let error = place.tick()["host_error"].as_str().unwrap().to_owned();
+    // The captain hears of it once, in serve and as one request naming the folder.
+    let folder = place.folder.canonicalize().unwrap();
+    let folder_text = folder.display().to_string();
+    let serve = place.serve_once();
+    let error = serve["ships"][0]["host_error"].as_str().unwrap().to_owned();
     assert!(error.contains("Yes, I trust this folder"), "{error}");
     assert!(!place.root.join("pi-argv").exists());
+    assert_eq!(
+        untrusted_in_serve(&serve),
+        vec![folder_text.clone()],
+        "{serve}"
+    );
+    let requests = untrusted_requests(&place);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["kind"], "request");
+    let step = requests[0]["payload"]["needs_hands"]["step"]
+        .as_str()
+        .unwrap();
+    assert!(
+        step.contains(&folder_text) && step.contains("Yes, I trust this folder"),
+        "{step}"
+    );
+
+    // A later attempt, still untrusted, raises nothing new.
+    place.retry_now();
+    let serve = place.serve_once();
+    assert_eq!(
+        untrusted_in_serve(&serve),
+        vec![folder_text.clone()],
+        "{serve}"
+    );
+    assert_eq!(untrusted_requests(&place).len(), 1);
 
     // Trust on a folder above is not enough: Claude asks again for a folder
     // with its own permission rules, which every ship folder has.
@@ -2514,6 +2744,17 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
     trusted(&place.folder);
     place.tick();
     until("the hosted Claude", || place.root.join("pi-env").exists());
+    // Trusting the folder clears the alert and withdraws its request.
+    assert!(untrusted_in_serve(&place.serve_once()).is_empty());
+    let open: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM hosted_untrusted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(open, 0);
+    assert_eq!(
+        request_state(&place, requests[0]["id"].as_str().unwrap()),
+        "withdrawn"
+    );
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
     let args: Vec<&str> = argv.lines().collect();
     assert!(
