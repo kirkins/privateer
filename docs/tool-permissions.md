@@ -24,9 +24,31 @@ Configure the whole local fleet from any directory:
 ```sh
 privateer permissions show
 privateer permissions allow 'Bash(forge-helper *)'
+privateer permissions authorize storefront "Making storefront's own Apify actors public in the Apify Store."
+privateer permissions unauthorize storefront "Making storefront's own Apify actors public in the Apify Store."
 privateer permissions yolo
 privateer permissions standard
 ```
+
+## Standing authorizations for auto mode
+
+Claude's auto mode asks a classifier about each action. It trusts its
+settings, not what the agent reads, so a grant the captain gave a ship in mail
+or a note does not count: the classifier refuses the action (making a listing
+public, deploying, changing an account) and the ship asks again. A tool rule
+cannot fix this when the refused command is a script, since no narrower rule
+exists.
+
+`privateer permissions authorize SHIP TEXT` records one sentence the captain
+allows, for that ship only. Every Claude launch of that ship's first mate
+(wakes, hosted and attended sessions) adds it to `autoMode.allow` after
+Claude's defaults, prefixed "The captain has authorized this:". Crew and
+errands do not receive it. Write what is allowed and where, as you would to
+a colleague. `unauthorize` with the same text removes it. Each ship holds up to
+16 sentences of at most 500 characters. The classifier still judges each
+action against them, and they change nothing for ships that do not run in
+auto mode. A decision card whose denial has no narrower rule names this
+command.
 
 Telegram supports `/yolo on`, `/yolo off`, and `/yolo status` through the existing
 authorized chat/user checks. This is a direct captain command, without inference
@@ -43,11 +65,13 @@ selects a separate adjacent policy. Other hosts/fleets are configured separately
 JSON API: `permissions.show {}`; captain-only `permissions.set` accepts:
 
 ```json
-{"mode":"standard","claude_allow":["Bash(forge-helper *)"]}
+{"mode":"standard","claude_allow":["Bash(forge-helper *)"],
+ "authorized":{"storefront":["Making storefront's own Apify actors public in the Apify Store."]}}
 ```
 
 `claude_allow` replaces additional rules; `claude_allow_add` appends one under
-the fleet write lock. Standard mode stops forcing YOLO and restores native
+the fleet write lock. `authorized` replaces every ship's authorizations;
+`authorize` and `unauthorize` take `{"ship","text"}` and add or remove one. Standard mode stops forcing YOLO and restores native
 profile/settings choices; it does not revoke custom rules or a profile that
 already requests permissive access. No native settings files, hooks, credentials,
 provider routes, model choices, or charter actions are rewritten.

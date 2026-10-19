@@ -611,8 +611,17 @@ pub(crate) fn raise(
     }
     crate::mail::typed_payload("decision", &mut payload)?;
     let job_line = job_id.map(|j| format!(" Job: {j}.")).unwrap_or_default();
+    // No narrower rule usually means Claude's auto-mode check refused it,
+    // which reads the captain's standing authorizations, not tool rules.
+    let remedy = if all_derived {
+        "`privateer permissions allow 'Tool(rule)'` or `privateer permissions yolo`".to_owned()
+    } else {
+        format!(
+            "`privateer permissions authorize {ship} 'what you allow'` or `privateer permissions yolo`"
+        )
+    };
     let body = format!(
-        "{question}\n{why}\nDenied: {}.{job_line}\nThe captain can also run `privateer permissions allow 'Tool(rule)'` or `privateer permissions yolo`.",
+        "{question}\n{why}\nDenied: {}.{job_line}\nThe captain can also run {remedy}.",
         previews.join("; ")
     );
     crate::mail::record_runtime(
