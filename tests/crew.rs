@@ -292,7 +292,7 @@ fn jobs_that_end_in_the_capacity_queue_report_too() {
     fleet.ok(
         "resource.configure",
         json!({"max_heavy_jobs": 1, "max_load_per_cpu": 1024,
-            "min_available_memory_bytes": 0, "heavy_estimate":{"memory_bytes":0,"disk_bytes":0}, "ramp_secs": 0}),
+            "min_available_memory_bytes": 0, "min_free_disk_bytes": 0, "heavy_estimate":{"memory_bytes":0,"disk_bytes":0}, "ramp_secs": 0}),
         None,
     );
     let heavy = |id: &str, extra: Value| {
@@ -363,7 +363,7 @@ fn a_crew_decision_reaches_the_first_mate_and_the_crew_reads_its_reply() {
     let job = fleet.ok(
         "job.start",
         json!({"id": "asker", "task_id": "infra-repair", "heavy": false,
-            "command": ["python3", script, support::BIN, fleet.home]}),
+            "command": [support::python(), script, support::BIN, fleet.home]}),
         Some("infra"),
     );
     // The dispatcher wakes the first mate for the decision; the scripted
@@ -455,7 +455,7 @@ fn a_job_its_crew_follows_waits_for_the_crew_instead_of_waking_the_first_mate() 
     fleet.ok(
         "job.start",
         json!({"id": "worker", "task_id": "infra-repair", "heavy": false,
-            "command": ["python3", script, support::BIN, fleet.home, release]}),
+            "command": [support::python(), script, support::BIN, fleet.home, release]}),
         Some("infra"),
     );
     let until = Instant::now() + Duration::from_secs(30);

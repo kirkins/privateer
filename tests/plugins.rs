@@ -33,7 +33,7 @@ impl Fixture {
         privateer::dispatch(
             &mut store,
             "resource.configure",
-            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
+            json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
         )
         .unwrap();
         let charter = json!({"id":"mission","active":true,"repo":repo,"actions":["spawn","implement","test"],"job_timeout_secs":20,"min_free_bytes":0,"max_heavy_jobs":1});
@@ -68,7 +68,7 @@ fn manifest(f: &Fixture, body: &str, timeout: u64, max: usize) -> PathBuf {
     let script = f.base().join("adapter.py");
     fs::write(&script, body).unwrap();
     let path = f.base().join("manifest.json");
-    fs::write(&path, json!({"schema_version":1,"id":"fixture","executable":["python3",script],"timeout_ms":timeout,"max_output_bytes":max}).to_string()).unwrap();
+    fs::write(&path, json!({"schema_version":1,"id":"fixture","executable":[support::python(),script],"timeout_ms":timeout,"max_output_bytes":max}).to_string()).unwrap();
     path
 }
 fn response_script(result: &str) -> String {
@@ -683,7 +683,7 @@ assert session_started('agy',{'event':'init','conversation_id':identity,'init':{
 assert session_started('agy',{'event':'step_update','step_update':{'event':'init','conversation_id':identity}}) is None
 assert session_started('agy',{'type':'init','session_id':identity}) is None
 "#;
-    let output = support::command("python3")
+    let output = support::command(support::python())
         .args(["-c", script])
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"))
         .arg(f.base())
@@ -710,7 +710,7 @@ fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
         "tests/opencode_v2.py",
         "tests/opencode_watch.py",
     ] {
-        let output = support::command("python3")
+        let output = support::command(support::python())
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
             .output()
             .unwrap();
