@@ -276,9 +276,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         .ok_or_else(|| anyhow::anyhow!("route must be a route name"))
                 })
                 .transpose()?;
+            let require = crew_routes::parse_require(
+                args.as_object_mut().unwrap().remove("require").as_ref(),
+            )?;
             // Whether the options are the chosen route's or profile's, so the
             // memory figure they carry is theirs; caller options never are.
             let mut route_options = false;
+            let mut route_choice: Option<crew_routes::Choice> = None;
             if charter.get("provider_plugin").is_none_or(Value::is_null)
                 && !workspace::is_wake(store, &args)?
                 && let Some(ship) = owner.as_str()
@@ -286,15 +290,31 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 match args.get("manifest").and_then(Value::as_str) {
                     Some(manifest) => {
                         anyhow::ensure!(requested.is_none(), "pass route or manifest, not both");
-                        crew_routes::check(store, ship, "crew", manifest, &args["options"])?;
+                        let resume_why = args
+                            .get("_resume_why")
+                            .and_then(Value::as_str)
+                            .filter(|_| matches!(store.caller(), Caller::Operator));
+                        route_choice = crew_routes::check(
+                            store,
+                            ship,
+                            "crew",
+                            manifest,
+                            &args["options"],
+                            require.as_ref(),
+                            resume_why,
+                        )?;
                     }
                     None => {
-                        if let Some(choice) =
-                            crew_routes::choose(store, ship, "crew", requested.as_deref())?
-                        {
+                        if let Some(choice) = crew_routes::choose(
+                            store,
+                            ship,
+                            "crew",
+                            requested.as_deref(),
+                            require.as_ref(),
+                        )? {
                             // The agent may add settings such as effort; the
                             // route decides the provider, model and memory.
-                            let mut options = choice.options;
+                            let mut options = choice.options.clone();
                             if let Some(extra) = args.get("options").and_then(Value::as_object) {
                                 for (key, value) in extra {
                                     if !matches!(
@@ -305,14 +325,18 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                                     }
                                 }
                             }
-                            args["manifest"] = choice.manifest;
+                            args["manifest"] = choice.manifest.clone();
                             args["options"] = options;
                             route_options = true;
+                            route_choice = Some(choice);
                         }
                     }
                 }
             } else {
-                anyhow::ensure!(requested.is_none(), "route applies only to crew launches");
+                anyhow::ensure!(
+                    requested.is_none() && require.is_none(),
+                    "route and require apply only to crew launches"
+                );
             }
             // Crew default to their ship's first-mate harness and model, the
             // route the captain chose, unless the charter pins a provider.
@@ -482,11 +506,36 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             if let Some(route) = model_route {
                 job["model_route"] = serde_json::json!(route);
             }
+            let is_wake = workspace::is_wake(store, &args)?;
+            let route_name = route_choice.as_ref().map(|c| c.name.clone()).or_else(|| {
+                if is_wake {
+                    args.get("route_name")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                } else {
+                    None
+                }
+            });
+            let route_why = route_choice.as_ref().map(|c| c.why.clone()).or_else(|| {
+                if is_wake {
+                    args.get("route_why")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                } else {
+                    None
+                }
+            });
+            if let Some(name) = &route_name {
+                job["route_name"] = serde_json::json!(name);
+            }
+            if let Some(why) = &route_why {
+                job["route_why"] = serde_json::json!(why);
+            }
             // Crew reserve memory like any estimated job; a first mate's own
             // wake is not crew and stays outside admission. Errands are wakes
             // too, so they stay outside admission as well: they are short and
             // the first mate's own.
-            if !workspace::is_wake(store, &args)? {
+            if !is_wake {
                 // A resume reuses the estimate its crew was admitted under: the
                 // runtime's own resume only (see `crew::resume`).
                 let estimate = match args
@@ -503,9 +552,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     "config": args.get("config"), "tool_bundles": args.get("tool_bundles"),
                     "cwd": args.get("cwd"),
                     "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false)),
+                    "require": require.as_ref().map(|r| r.to_json()),
                 });
             }
-            let mut started = jobs::start_agent(store, job)?;
+            let mut started = jobs::start_agent(store, job.clone())?;
             if viewed {
                 // Presentation only: a refused space never stops the crew.
                 let viewer = host::view_crew(
@@ -517,6 +567,18 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 );
                 started["viewer"] = serde_json::json!(viewer.is_ok());
             }
+            started["route"] = route_choice
+                .as_ref()
+                .map(|c| c.to_route_json())
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "name": route_name,
+                        "identity": job.get("model_route").cloned().unwrap_or(Value::Null),
+                        "tier": Value::Null,
+                        "uses": [],
+                        "why": route_why,
+                    })
+                });
             Ok(started)
         }
         "agent" => plugins::dispatch(store, command, args),

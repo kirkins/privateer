@@ -670,3 +670,98 @@ fn an_attended_ship_gets_crew_outcomes_through_its_hooks_without_a_headless_wake
     );
     assert!(hook("SessionEnd").status.success());
 }
+
+#[test]
+fn outcome_and_verdict_notices_name_the_route_and_why() {
+    let mut fleet = Fleet::new(now_settings());
+    fs::write(
+        fleet.home.join("config.json"),
+        json!({"resource_home": fleet.root.join("ledger"), "ship": "infra"}).to_string(),
+    )
+    .unwrap();
+    let routes_file = fleet.root.join("routes.json");
+    let routes = json!({
+        "routes": {
+            "work": {
+                "manifest": fleet.root.join("manifest.json"),
+                "options": {
+                    "mate": fleet.root.join("mate.py"),
+                    "mode": fleet.root.join("mode"),
+                    "log": fleet.root.join("prompts.log"),
+                    "model": "model-work",
+                },
+                "cost": "free",
+                "tier": 1,
+                "uses": ["review", "implement"],
+            }
+        },
+        "crew": ["work"],
+        "errand": ["work"],
+    });
+    fs::write(&routes_file, routes.to_string()).unwrap();
+    let set_routes = fleet
+        .command()
+        .args(["routes", "set", routes_file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        set_routes.status.success(),
+        "routes set failed: {}",
+        String::from_utf8_lossy(&set_routes.stderr)
+    );
+
+    // 1. Crew job via agent.start (no require)
+    fleet.mode("crew");
+    fleet.ok(
+        "agent.start",
+        json!({"id": "routed-crew", "task_id": "infra-repair"}),
+        Some("infra"),
+    );
+    let job = wait(&fleet, "routed-crew", &["succeeded"]);
+    assert_eq!(job["status"], "succeeded");
+    let outcomes = outcomes_of(&mut fleet, "routed-crew");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    let outcome_body = outcomes[0]["body"].as_str().unwrap();
+    assert!(
+        outcome_body.contains(
+            "Route: first in allowance order on infra's crew list: work (no requirement)"
+        ),
+        "{outcome_body}"
+    );
+
+    // 2. Errand via errand.start with require
+    fleet.mode("normal");
+    let started = fleet.ok(
+        "errand.start",
+        json!({
+            "focus": "task:infra-repair",
+            "brief": "Review the cache rebuild.",
+            "require": {"use": "review", "tier": 1}
+        }),
+        Some("infra"),
+    );
+    assert_eq!(
+        started["route"]["why"],
+        "cheapest on infra's errand list meeting review at tier <= 1: work"
+    );
+    let errand_id = started["errand"].as_str().unwrap();
+    wait(&fleet, errand_id, &["succeeded"]);
+    fleet.tick();
+
+    let mail = from_crew(&mut fleet, "infra");
+    let verdict_mail = mail
+        .iter()
+        .find(|m| {
+            m["body"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Errand on task:infra-repair, verdict:")
+        })
+        .expect("verdict mail not found");
+    let verdict_body = verdict_mail["body"].as_str().unwrap();
+    assert!(
+        verdict_body
+            .contains("Route: cheapest on infra's errand list meeting review at tier <= 1: work"),
+        "{verdict_body}"
+    );
+}

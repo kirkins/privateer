@@ -133,6 +133,10 @@ struct Job {
     /// A harness job's `harness/provider/model`, for provider backoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_why: Option<String>,
     /// The tokens a harness job reported, recorded once when it settles
     /// (see `harness_usage`). None while it runs, and for a harness that
     /// reported nothing: never zero for an unknown.
@@ -2136,6 +2140,16 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .and_then(Value::as_str)
             .filter(|_| agent)
             .map(str::to_owned),
+        route_name: args
+            .get("route_name")
+            .and_then(Value::as_str)
+            .filter(|_| agent)
+            .map(str::to_owned),
+        route_why: args
+            .get("route_why")
+            .and_then(Value::as_str)
+            .filter(|_| agent)
+            .map(str::to_owned),
         usage: None,
         usage_partial: false,
         codex_read_only_crew: args
@@ -4034,6 +4048,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate, "wait_for_capacity": old.wait_for_capacity, "max_wait_secs": old.max_wait_secs, "codex_read_only_crew": old.codex_read_only_crew});
             if let Some(route) = &route {
                 next["model_route"] = json!(route);
+            }
+            if let Some(name) = &old.route_name {
+                next["route_name"] = json!(name);
+            }
+            if let Some(why) = &old.route_why {
+                next["route_why"] = json!(why);
             }
             if old.hosted {
                 next["hosted"] = json!(true);

@@ -163,6 +163,9 @@ pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Resu
         " after {:.1} s, for task {task_id}.\n",
         duration_ms as f64 / 1000.0
     ));
+    if let Some(route_why) = job["route_why"].as_str() {
+        body.push_str(&format!("Route: {route_why}\n"));
+    }
     if let Some(reason) = &reason {
         body.push_str(&format!("Reason: {reason}\n"));
     }
@@ -1054,19 +1057,27 @@ fn launch_resume(
             "config",
             "tool_bundles",
             "cwd",
+            "require",
         ]
     } else {
-        &["heavy", "config", "tool_bundles", "cwd"]
+        &["heavy", "config", "tool_bundles", "cwd", "require"]
     };
     for key in keys {
         if !launch[key].is_null() {
             args[key] = launch[key].clone();
         }
     }
-    if route_ok && !crew_record["estimate"].is_null() {
-        // The estimate the crew was admitted under, memory included: the
-        // launch record has no route figure to size it again from.
-        args["_resume_estimate"] = crew_record["estimate"].clone();
+    if route_ok {
+        if !crew_record["estimate"].is_null() {
+            // The estimate the crew was admitted under, memory included: the
+            // launch record has no route figure to size it again from.
+            args["_resume_estimate"] = crew_record["estimate"].clone();
+        }
+        if let Some(why) = crew_record.get("route_why").and_then(Value::as_str) {
+            args["_resume_why"] = json!(why);
+        } else {
+            args["_resume_why"] = json!("");
+        }
     }
     // Each resume gets a fresh budget (see `supervise_inner`); the run time
     // carried here is recorded on the job for reporting and bearings only.

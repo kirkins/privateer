@@ -831,6 +831,20 @@ fn uses_need_a_tier_and_known_words_and_strength_shows_in_bearings_and_profile()
         Value::Null,
         "{profile}"
     );
+
+    // An unranked route never meets a requirement.
+    let refused = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"plain","require":{"tier":2}}),
+    );
+    assert!(refused.contains("route plain is unranked"), "{refused}");
+    let refused = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"plain","require":{"use":"implement"}}),
+    );
+    assert!(refused.contains("route plain is unranked"), "{refused}");
 }
 
 #[test]
@@ -932,12 +946,16 @@ fn the_fleet_snapshot_shows_each_route_in_the_state_bearings_show() {
     assert_eq!(routes[0]["route"], "codex/-/model-busy");
     assert_eq!(routes[0]["cost"], "credits");
     assert_eq!(routes[0]["allowance"], Value::Null);
+    assert_eq!(routes[0]["tier"], Value::Null);
     assert_eq!(routes[1]["allowance"]["shape"], "5h window");
     assert_eq!(routes[1]["allowance"]["window_used"], 0.97);
+    assert_eq!(routes[1]["tier"], 1);
     assert_eq!(routes[2]["allowance"]["shape"], "daily 07:00 UTC");
     assert_eq!(routes[2]["allowance"]["last_used_ms"], Value::Null);
     assert_eq!(routes[2]["tier"], 1);
+    assert_eq!(routes[3]["tier"], Value::Null);
     assert_eq!(routes[4]["route"], "codex/-/model-gone");
+    assert_eq!(routes[4]["tier"], Value::Null);
     assert_eq!(routes[4]["error"], "quota exhausted");
 
     // Bearings read the same states.
@@ -969,4 +987,205 @@ fn the_fleet_snapshot_shows_each_route_in_the_state_bearings_show() {
     let cleared = f.json(None, "fleet.snapshot", json!({}));
     assert_eq!(cleared["machines"][0]["routes"][0]["state"], "available");
     assert!(cleared["machines"][0]["changed_ms"].as_i64().unwrap() > changed);
+}
+
+#[test]
+fn a_requirement_filters_and_the_cheapest_that_meets_it_runs() {
+    let f = Fleet::new();
+    let mut cheap = codex("model-cheap", "free");
+    cheap["tier"] = json!(4);
+    cheap["uses"] = json!(["implement"]);
+
+    let mut carry = codex("model-carry", "plan");
+    carry["tier"] = json!(1);
+    carry["uses"] = json!(["review", "implement"]);
+
+    let mut idle = codex("model-idle", "plan");
+    idle["allowance"] = json!({"daily_utc": "07:00"});
+    idle["tier"] = json!(1);
+    idle["uses"] = json!(["review", "implement"]);
+
+    // In the captain's list order: cheap, carry, idle.
+    // carry and idle both meet require (tier <= 1, review).
+    // cheap is cheaper but does not meet review at tier 1.
+    // idle has an allowance (class 0), which beats carry-over (class 2),
+    // so idle must be chosen over carry even though carry is listed first.
+    f.routes(json!({
+        "routes": {
+            "cheap": cheap,
+            "carry": carry,
+            "idle": idle,
+        },
+        "errand": ["cheap", "carry", "idle"],
+    }));
+
+    let reply = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({
+            "focus": "task:fix",
+            "brief": "review the changes",
+            "require": {"use": "review", "tier": 1},
+        }),
+    );
+    assert_eq!(reply["status"], "running");
+    assert_eq!(reply["route"]["name"], "idle");
+    assert_eq!(
+        reply["route"]["why"],
+        "cheapest on engineering's errand list meeting review at tier <= 1: idle"
+    );
+
+    // Now with carry and cheap only (no allowance route), carry meets it.
+    f.routes(json!({
+        "routes": {
+            "cheap": codex("model-cheap", "free"),
+            "carry": carry,
+        },
+        "errand": ["cheap", "carry"],
+    }));
+
+    let reply2 = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({
+            "focus": "task:fix",
+            "brief": "review the changes again",
+            "require": {"use": "review", "tier": 1},
+        }),
+    );
+    assert_eq!(reply2["route"]["name"], "carry");
+    assert_eq!(
+        reply2["route"]["why"],
+        "cheapest on engineering's errand list meeting review at tier <= 1: carry"
+    );
+}
+
+#[test]
+fn an_explicit_route_below_the_requirement_is_refused() {
+    let f = Fleet::new();
+    let mut luna = codex("model-luna", "credits");
+    luna["tier"] = json!(4);
+    luna["uses"] = json!(["implement"]);
+
+    let mut opus = codex("model-opus", "plan");
+    opus["tier"] = json!(1);
+    opus["uses"] = json!(["review", "implement"]);
+
+    f.routes(json!({
+        "routes": {"luna": luna, "opus": opus},
+        "crew": ["luna", "opus"],
+        "errand": ["luna", "opus"],
+    }));
+
+    // Explicit route below requirement:
+    let refused_route = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({
+            "task_id": "fix",
+            "route": "luna",
+            "require": {"use": "review", "tier": 1},
+        }),
+    );
+    assert!(
+        refused_route.contains("route luna is tier 4 with uses [implement]; this launch needs review at tier <= 1; routes on engineering's crew list that meet it: opus"),
+        "{refused_route}"
+    );
+
+    // Explicit manifest below requirement:
+    let refused_manifest = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({
+            "task_id": "fix",
+            "manifest": "bundled:codex",
+            "options": {"model": "model-luna"},
+            "require": {"use": "review", "tier": 1},
+        }),
+    );
+    assert!(
+        refused_manifest.contains("route luna is tier 4 with uses [implement]; this launch needs review at tier <= 1; routes on engineering's crew list that meet it: opus"),
+        "{refused_manifest}"
+    );
+}
+
+#[test]
+fn a_requirement_with_no_routes_file_is_refused() {
+    let f = Fleet::new();
+    // f has no routes configured.
+    let refused_agent = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({
+            "task_id": "fix",
+            "require": {"use": "review", "tier": 1},
+        }),
+    );
+    assert!(
+        refused_agent.contains("the captain has listed no routes to choose from"),
+        "{refused_agent}"
+    );
+
+    let refused_errand = f.refused(
+        Some("engineering"),
+        "errand.start",
+        json!({
+            "focus": "task:fix",
+            "brief": "review",
+            "require": {"use": "review", "tier": 1},
+        }),
+    );
+    assert!(
+        refused_errand.contains("the captain has listed no routes to choose from"),
+        "{refused_errand}"
+    );
+}
+
+#[test]
+fn a_crew_launch_cannot_forge_its_route_why() {
+    let f = Fleet::new();
+    let mut steady = codex("model-steady", "credits");
+    steady["tier"] = json!(2);
+    steady["uses"] = json!(["implement"]);
+    f.routes(json!({
+        "routes": {"steady": steady},
+        "crew": ["steady"],
+    }));
+    let reply = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({
+            "task_id": "fix",
+            "route_why": "forged route why from caller",
+        }),
+    );
+    assert_ne!(reply["route"]["why"], "forged route why from caller");
+    assert_eq!(
+        reply["route"]["why"],
+        "first in allowance order on engineering's crew list: steady (no requirement)"
+    );
+}
+
+#[test]
+fn an_operator_passing_require_with_an_unlisted_manifest_is_refused_as_unlisted() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"steady": codex("model-steady", "credits")},
+        "crew": ["steady"],
+    }));
+    let unlisted = json!({
+        "task_id": "fix",
+        "manifest": "bundled:codex",
+        "options": {"model": "model-pricey"},
+        "require": {"tier": 1},
+    });
+    let refusal = f.refused(None, "agent.start", unlisted);
+    assert!(
+        refusal.contains("is not one of engineering's crew routes"),
+        "unexpected refusal: {refusal}"
+    );
+    assert!(
+        !refusal.contains("the captain has listed no routes to choose from"),
+        "must not say no routes to choose from: {refusal}"
+    );
 }
