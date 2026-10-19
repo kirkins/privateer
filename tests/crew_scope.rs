@@ -314,6 +314,35 @@ call heavy "$BIN" --home "$H" job.start --json '{"id":"inner","task_id":"fix","h
     f.ok(None, &["routes", "show"]);
 }
 
+/// A supervisor is the runtime. A parked crew's resume is launched from
+/// inside the supervisor that settled, and that one may carry the
+/// dispatcher's operator environment beneath a crew's job. A supervisor
+/// started there is not refused as a role drop: it goes on to look up its own
+/// job. Another caller there still is refused.
+#[test]
+fn a_supervisor_started_inside_a_crews_job_is_not_refused_its_role() {
+    let f = Fleet::new();
+    f.crew(
+        "crew-1",
+        r#"
+call supervise env -u PRIVATEER_ROLE -u PRIVATEER_ACTOR "$BIN" --home "$H" _job-supervise no-such-job
+call no-role env -u PRIVATEER_ROLE -u PRIVATEER_ACTOR "$BIN" --home "$H" mail.ack --json '{"address":"engineering","through_seq":0}'
+"#,
+    );
+    let (code, err) = f.call("supervise");
+    assert!(
+        code == "1" && err.contains("unknown job no-such-job") && !err.contains("drop its role"),
+        "{err}"
+    );
+    let (code, err) = f.call("no-role");
+    assert!(
+        code == "1"
+            && err.contains("job crew-1 runs as agent engineering; a job cannot drop its role"),
+        "{err}"
+    );
+    assert_eq!(f.audits("caller.role_drop_refused"), 1);
+}
+
 #[test]
 fn outside_a_job_a_variable_naming_a_running_crew_narrows_to_it() {
     let f = Fleet::new();
