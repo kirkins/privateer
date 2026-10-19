@@ -15,22 +15,63 @@ use std::collections::BTreeMap;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// A request that does not fit right now. Unlike other errors it can wait in
-/// the capacity queue and succeed later.
+/// the capacity queue and succeed later. `blocker` names the one resource the
+/// refusal is about, when the refusal is one a queued request may pass.
 #[derive(Debug)]
-pub struct Refused(pub String);
+pub struct Refused {
+    pub message: String,
+    pub blocker: Option<Blocker>,
+}
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for Refused {}
 
+/// The resource a refused request waits for. A request queued behind it may
+/// pass only when its own demand does not use that resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Blocker {
+    Disk,
+    HeavySlot,
+    Cpu,
+}
+
+impl Blocker {
+    /// Whether a request with this demand may pass a head waiting on this
+    /// resource. Its own admission still checks everything it declares.
+    pub fn passable_by(self, demand: Option<Demand>, heavy: bool) -> bool {
+        match self {
+            Blocker::Disk => demand.is_none_or(|d| d.disk_bytes == 0),
+            Blocker::HeavySlot => !heavy,
+            Blocker::Cpu => demand.is_none_or(|d| d.cpus <= 0.0),
+        }
+    }
+
+    pub fn resource(self) -> &'static str {
+        match self {
+            Blocker::Disk => "disk",
+            Blocker::HeavySlot => "the heavy-job slot",
+            Blocker::Cpu => "CPU",
+        }
+    }
+}
+
 macro_rules! refuse_unless {
-    ($condition:expr, $($message:tt)+) => {
+    (on $blocker:expr, $condition:expr, $($message:tt)+) => {
         let fits: bool = $condition;
         if !fits {
-            return Err(Refused(format!($($message)+)).into());
+            return Err(Refused {
+                message: format!($($message)+),
+                blocker: $blocker,
+            }
+            .into());
         }
+    };
+    ($condition:expr, $($message:tt)+) => {
+        refuse_unless!(on None, $condition, $($message)+);
     };
 }
 pub(crate) use refuse_unless;
@@ -500,6 +541,7 @@ pub fn admit(
         mib(request.disk_total_bytes)
     );
     refuse_unless!(
+        on Some(Blocker::Disk),
         available >= required_disk,
         "disk admission refused: {} MiB disk available, {} MiB must stay free (host floor {} MiB, charter floor {} MiB); retry later or tune resource.configure",
         mib(available),
@@ -520,6 +562,7 @@ pub fn admit(
         .saturating_add(committed as i128)
         .saturating_add(demand.disk_bytes as i128);
     refuse_unless!(
+        on Some(Blocker::Disk),
         available as i128 >= needed,
         "disk admission refused: {} MiB disk available, {} MiB must stay free (host floor {} MiB, charter floor {} MiB), and {} MiB is declared by running jobs while this one declares {} MiB, so {} MiB are needed; retry later, declare less with estimate.disk_bytes, or tune resource.configure (heavy_estimate.disk_bytes, min_free_disk_bytes)",
         mib(available),
@@ -533,7 +576,7 @@ pub fn admit(
     if request.heavy {
         let heavy = held.iter().filter(|h| h.heavy).count() as u64;
         if let Some(cap) = settings.max_heavy_jobs {
-            refuse_unless!(heavy < cap, "heavy-job capacity exhausted ({heavy}/{cap})");
+            refuse_unless!(on Some(Blocker::HeavySlot), heavy < cap, "heavy-job capacity exhausted ({heavy}/{cap})");
         }
         if let Some(cap) = request.charter_cap {
             let share = held
@@ -541,6 +584,7 @@ pub fn admit(
                 .filter(|h| h.heavy && h.home == request.home && h.charter == Some(request.charter))
                 .count() as u64;
             refuse_unless!(
+                on Some(Blocker::HeavySlot),
                 share < cap,
                 "charter heavy-job share exhausted ({share}/{cap})"
             );
@@ -567,6 +611,7 @@ pub fn admit(
         let load = (host.load - request.released_load).max(0.0);
         let per_cpu = (load + recent_cpus) / host.cpus;
         refuse_unless!(
+            on Some(Blocker::Cpu),
             per_cpu < settings.max_load_per_cpu,
             "admission refused: CPU demand {per_cpu:.2} per CPU is at the limit {} (load {:.2}, {:.1} of it from jobs that just ended, {recent_cpus:.1} CPUs recently admitted, {} CPUs); retry later or tune resource.configure",
             settings.max_load_per_cpu,
@@ -1501,6 +1546,67 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_refusal_names_the_resource_a_queued_job_may_pass_over() {
+        let settings = Settings {
+            min_free_disk_bytes: 0,
+            max_load_per_cpu: 1024.0,
+            ..Settings::default()
+        };
+        let host = host(0.0);
+        // Four GiB declared on three GiB free: refused on disk.
+        let mut request = heavy(0.0);
+        request.disk_available_bytes = 3 * GIB;
+        let refused = admit(&settings, &host, 0, &[], &request).unwrap_err();
+        let refused = refused.downcast_ref::<Refused>().unwrap();
+        assert_eq!(refused.blocker, Some(Blocker::Disk), "{refused}");
+        // A light job on the same machine is not refused for disk at all.
+        let light = light(0.0);
+        assert!(admit(&settings, &host, 0, &[], &light).is_ok());
+        // Memory is not a resource a queued job can pass over.
+        let settings = Settings {
+            min_available_memory_bytes: 16 * GIB,
+            ..settings
+        };
+        let memory = Request {
+            demand: Some(Demand {
+                cpus: 0.0,
+                memory_bytes: GIB,
+                disk_bytes: 0,
+            }),
+            ..light(0.0)
+        };
+        let refused = admit(&settings, &host, 0, &[], &memory).unwrap_err();
+        let refused = refused.downcast_ref::<Refused>().unwrap();
+        assert_eq!(refused.blocker, None, "{refused}");
+    }
+
+    #[test]
+    fn a_head_passes_over_only_work_that_leaves_its_resource_alone() {
+        let disk = Some(Demand {
+            cpus: 0.0,
+            memory_bytes: GIB,
+            disk_bytes: GIB,
+        });
+        let cpu = Some(Demand {
+            cpus: 2.0,
+            memory_bytes: 0,
+            disk_bytes: 0,
+        });
+        let memory = Some(Demand {
+            cpus: 0.0,
+            memory_bytes: GIB,
+            disk_bytes: 0,
+        });
+        assert!(!Blocker::Disk.passable_by(disk, false));
+        assert!(Blocker::Disk.passable_by(memory, false));
+        assert!(Blocker::Disk.passable_by(None, true));
+        assert!(!Blocker::Cpu.passable_by(cpu, false));
+        assert!(Blocker::Cpu.passable_by(memory, false));
+        assert!(!Blocker::HeavySlot.passable_by(None, true));
+        assert!(Blocker::HeavySlot.passable_by(memory, false));
     }
 
     #[test]
