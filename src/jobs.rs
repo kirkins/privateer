@@ -32,6 +32,13 @@ const LOG_SEGMENT: usize = (LOG_LIMIT - LOG_HEAD) / 2;
 /// left under the limit holds the truncation marker.
 const TAIL_FULL: usize = 2 * LOG_SEGMENT - 256;
 const START_GRACE_MS: i64 = 30_000;
+/// First-mate presence a crew's payload must not inherit (crew-role.md).
+const CREW_UNATTENDED: [&str; 4] = [
+    "PRIVATEER_PRESENCE_HOLDER",
+    "PRIVATEER_HOSTED_HOLDER",
+    "PRIVATEER_HOSTED",
+    "PRIVATEER_ATTENDED_HARNESS",
+];
 pub(crate) const DEFAULT_MAX_WAIT_SECS: u64 = 3600;
 const QUEUE_POLL: Duration = Duration::from_secs(1);
 
@@ -1358,7 +1365,7 @@ fn other_boot(process: &Process) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn identity(pid: u32) -> Result<Option<Process>> {
     // lstart is rendered in local time and locale; pin both.
-    let output = Command::new("ps")
+    let output = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "stat="])
         .env("TZ", "UTC0")
         .env("LC_ALL", "C")
@@ -1499,6 +1506,18 @@ fn same_process(process: &Process) -> Result<bool> {
     }
     Ok(identity(process.pid)?
         .is_some_and(|p| !p.zombie && same_start(&process.started, &p.started)))
+}
+/// Whether the live process `pid` is the one a job record names as its
+/// supervisor: the same PID, start identity and PID namespace. A reused PID,
+/// or a process in another namespace, is not.
+pub(crate) fn is_recorded_supervisor(recorded: &Value, pid: u32) -> Result<bool> {
+    let Ok(recorded) = serde_json::from_value::<Process>(recorded.clone()) else {
+        return Ok(false);
+    };
+    if recorded.pid != pid || recorded.pid_namespace.as_deref() != pid_namespace() {
+        return Ok(false);
+    }
+    same_process(&recorded)
 }
 fn group_members(group: u32) -> Result<Vec<u32>> {
     let output = Command::new("ps")
@@ -1999,14 +2018,12 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         }
         Caller::Operator => requested_actor.map(str::to_owned),
     };
-    // An agent inside a supervised job (crew, or a first mate's wake) is named
-    // by PRIVATEER_JOB; remember which of its jobs started this one.
+    // An agent inside a supervised job (crew, or a first mate's wake) is found
+    // through its supervisor; remember which of its jobs started this one.
     let started_by = match (store.caller(), &agent_actor) {
-        (Caller::Agent { .. }, Some(actor)) => {
-            std::env::var("PRIVATEER_JOB").ok().filter(|parent| {
-                load(store, parent).is_ok_and(|p| p.agent_actor.as_deref() == Some(actor))
-            })
-        }
+        (Caller::Agent { .. }, Some(actor)) => crate::crew_scope::job_id().filter(|parent| {
+            load(store, parent).is_ok_and(|p| p.agent_actor.as_deref() == Some(actor))
+        }),
         _ => None,
     };
     let expected_workspace = args
@@ -2976,6 +2993,13 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     for (name, _) in std::env::vars_os() {
         let bytes = name.as_encoded_bytes();
         if bytes.starts_with(b"PRIVATEER_CREDENTIAL_") || bytes.starts_with(b"PRIVATEER_MCP_") {
+            cmd.env_remove(name);
+        }
+    }
+    // A crew is not attended by its first mate: the presence and harness
+    // markers that first mate's session set do not reach its payload.
+    if crate::crew_scope::is_crew_launch(store, &job.id, &job.action, job.agent_actor.is_some())? {
+        for name in CREW_UNATTENDED {
             cmd.env_remove(name);
         }
     }

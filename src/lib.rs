@@ -12,6 +12,7 @@ pub mod core;
 pub mod credentials;
 pub mod crew;
 pub mod crew_routes;
+pub mod crew_scope;
 pub mod cursor_mail;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
@@ -140,6 +141,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
         }
     }
+    crew_scope::check(store, command, &args)?;
     match command.split('.').next().unwrap_or("") {
         "runtime" if command == "runtime.needs" => needs::query(store, &args),
         "upgrade" if command == "upgrade.status" => releases::status(),

@@ -155,7 +155,7 @@ fn registry_is_per_home_and_an_agent_cannot_approve_it() {
 }
 
 #[test]
-fn real_agent_start_nested_crew_replay_and_explicit_empty_do_not_inherit() {
+fn real_agent_start_crews_do_not_inherit_bundles_and_cannot_nest() {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
     let (temp, mut store, config) = fixture();
@@ -177,7 +177,7 @@ fn real_agent_start_nested_crew_replay_and_explicit_empty_do_not_inherit() {
     dispatch(
         &mut store,
         "task.create",
-        json!({"id":"nested","parent":"task","owner":"ship","title":"nested crew"}),
+        json!({"id":"empty","parent":"task","owner":"ship","title":"explicit empty bundles"}),
     )
     .unwrap();
     let bin = root.join("bin");
@@ -185,16 +185,17 @@ fn real_agent_start_nested_crew_replay_and_explicit_empty_do_not_inherit() {
     let fake = bin.join("pi");
     let cli = json!([env!("CARGO_BIN_EXE_privateer"), "--home", store.home()]);
     let log = root.join("native-argv.jsonl");
+    let refusal = root.join("nested-start.json");
     fs::write(&fake, format!(r#"#!{}
 import json,subprocess,sys,time,uuid
 with open({},'a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
 if any('Task task:' in a for a in sys.argv):
-    out=subprocess.run({} + ['agent.start','--json',json.dumps({{'id':'nested-job','task_id':'nested'}})],capture_output=True,text=True)
-    if out.returncode: sys.exit(3)
+    out=subprocess.run({} + ['agent.start','--json',json.dumps({{'id':'nested-job','task_id':'empty'}})],capture_output=True,text=True)
+    with open({},'w') as f: f.write(json.dumps({{'returncode':out.returncode,'stderr':out.stderr}}))
 print(json.dumps({{'type':'session','id':str(uuid.uuid4())}}),flush=True)
 print(json.dumps({{'type':'message_end','message':{{'role':'assistant','stopReason':'stop'}}}}),flush=True)
 print(json.dumps({{'type':'agent_settled','aborted':False}}),flush=True)
-"#, support::python().display(), json!(log), cli)).unwrap();
+"#, support::python().display(), json!(log), cli, json!(refusal))).unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
     let run = |command: &str, args: Value| -> Value {
         let output = support::command(env!("CARGO_BIN_EXE_privateer"))
@@ -231,8 +232,8 @@ print(json.dumps({{'type':'agent_settled','aborted':False}}),flush=True)
             std::thread::sleep(Duration::from_millis(25));
         }
     };
-    // The nested crew runs beside the legacy one: its memory is admission's
-    // concern, tested apart, so keep it tiny here.
+    // The crew's memory is admission's concern, tested apart, so keep it tiny
+    // here.
     run(
         "resource.configure",
         json!({"min_available_memory_bytes":0,"crew_memory_bytes":{"pi":1u64 << 20}}),
@@ -241,29 +242,41 @@ print(json.dumps({{'type':'agent_settled','aborted':False}}),flush=True)
     run("agent.start", args.clone());
     let legacy = wait("legacy-job");
     assert_eq!(legacy["status"], "succeeded");
-    let nested = wait("nested-job");
-    assert_eq!(nested["status"], "succeeded");
-    assert_eq!(nested["started_by"], "legacy-job");
-    for job in [&legacy, &nested] {
-        let command = job["command"].as_array().unwrap();
-        assert!(!command.iter().any(|v| v == "--tool-bundles"));
-        assert!(
-            command
-                .windows(2)
-                .any(|p| p[0] == "--provider" && p[1] == "chosen")
-        );
-        assert!(
-            command
-                .windows(2)
-                .any(|p| p[0] == "--model" && p[1] == "exact")
-        );
-    }
+    // A crew cannot start a crew: the nested start is refused as the first
+    // mate's command, and the crew succeeds without it.
+    let refused: Value = serde_json::from_str(&fs::read_to_string(refusal).unwrap()).unwrap();
+    assert_ne!(refused["returncode"], 0);
+    assert!(
+        refused["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("agent.start is the first mate's, not crew's")
+    );
+    assert!(
+        !run("job.list", json!({}))["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == "nested-job")
+    );
+    let command = legacy["command"].as_array().unwrap();
+    assert!(!command.iter().any(|v| v == "--tool-bundles"));
+    assert!(
+        command
+            .windows(2)
+            .any(|p| p[0] == "--provider" && p[1] == "chosen")
+    );
+    assert!(
+        command
+            .windows(2)
+            .any(|p| p[0] == "--model" && p[1] == "exact")
+    );
     let replay = run("agent.start", args);
     assert_eq!(replay["incarnation"], legacy["incarnation"]);
     assert!(
         run(
             "agent.start",
-            json!({"id":"empty-job","task_id":"nested","tool_bundles":[]})
+            json!({"id":"empty-job","task_id":"empty","tool_bundles":[]})
         )["command"]
             .as_array()
             .unwrap()
@@ -273,7 +286,7 @@ print(json.dumps({{'type':'agent_settled','aborted':False}}),flush=True)
     // The activation wrapper refuses this deliberately unsupported native
     // binary before it runs: explicit [] is not silently legacy.
     assert_eq!(wait("empty-job")["exit_code"], 2);
-    assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 2);
+    assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 1);
 }
 
 #[test]

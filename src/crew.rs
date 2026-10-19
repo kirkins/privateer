@@ -243,9 +243,7 @@ fn report(store: &Store, args: &Value) -> Result<Value> {
     let Caller::Agent { actor } = store.caller() else {
         bail!("crew.report is for crew, which run as their ship's agent");
     };
-    let job_id = std::env::var("PRIVATEER_JOB")
-        .ok()
-        .filter(|j| !j.is_empty())
+    let job_id = crate::crew_scope::job_id()
         .context("crew.report runs inside a crew job; PRIVATEER_JOB is not set")?;
     let job = crate::jobs::record(store, &job_id)?;
     ensure!(
@@ -359,7 +357,7 @@ const LAUNCH_BOUND_MS: i64 = (crate::jobs::DEFAULT_MAX_WAIT_SECS as i64 + 900) *
 
 /// The crew job itself, then the crew jobs its resumes replaced, oldest last.
 /// A child started by any of them belongs to this crew.
-fn lineage(store: &Store, crew: &str) -> Result<Vec<String>> {
+pub(crate) fn lineage(store: &Store, crew: &str) -> Result<Vec<String>> {
     let mut chain = vec![crew.to_owned()];
     loop {
         let previous: Option<String> = store
@@ -380,7 +378,7 @@ fn lineage(store: &Store, crew: &str) -> Result<Vec<String>> {
 /// Whether the running job is a crew that may park: a supervised crew job of
 /// its ship, not a first mate's wake and not hosted.
 pub(crate) fn may_park(store: &Store) -> bool {
-    let Ok(crew) = std::env::var("PRIVATEER_JOB") else {
+    let Some(crew) = crate::crew_scope::job_id() else {
         return false;
     };
     let Ok(job) = crate::jobs::record(store, &crew) else {
@@ -461,9 +459,7 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
     let Caller::Agent { actor } = store.caller() else {
         bail!("crew.park is for crew, which run as their ship's agent");
     };
-    let crew = std::env::var("PRIVATEER_JOB")
-        .ok()
-        .filter(|j| !j.is_empty())
+    let crew = crate::crew_scope::job_id()
         .context("crew.park runs inside a crew job; PRIVATEER_JOB is not set")?;
     let child = required(args, "job_id")?;
     let next = required(args, "next")?;

@@ -65,6 +65,18 @@ When a job ancestor is found:
 - **The role** (crew or first mate) comes from the records, not the environment.
 - **`started_by`** for a new job (`src/jobs.rs:1964`) comes from the resolved `J`, not from `PRIVATEER_JOB`. Otherwise a crew that unsets the variable starts heavy jobs with no lineage, and they would not be crew.
 
+**The world.** The rule applies to a command only when it is in the job's world. A command's target home (`--home`, `PRIVATEER_HOME` or the discovered home) is in the world when it is:
+
+- the job's own home `H`, or
+- a home listed in this OS account's real fleet registry (`~/.local/state/privateer/fleet.sqlite`, read from the password entry), or
+- reached only through the registry in use when that registry is the real one. A command with no target home is in the world this way.
+
+A command outside the world is resolved as before. A refusal of a role drop is audited and the first mate is noticed only when the target is `H` or a registry home. A refusal reached only through the registry is made and recorded nowhere, so a test that changes only `--home` cannot write into a live home. A test that names its own `PRIVATEER_FLEET` or `XDG_STATE_HOME` is outside the world and is not held to the role.
+
+**As_runtime exception.** A `_job-supervise` process is the runtime, not a job caller. Its `PRIVATEER_JOB` is its starter's (for a parked crew's resume, the parent job), so it is not refused as a borrowed job and its crew allowlist is not applied. It is identified from its parsed command (`Caller::from_env_at` takes `supervisor`), not from raw argv.
+
+**Crew launches.** A crew's payload has no first-mate presence: the supervisor removes `PRIVATEER_PRESENCE_HOLDER`, `PRIVATEER_HOSTED_HOLDER`, `PRIVATEER_HOSTED` and `PRIVATEER_ATTENDED_HARNESS` from it. A crew launch is an agent's `spawn` job that has no `wakes` row and is not an errand.
+
 **Residual.** Under one OS account this is not a security boundary. A crew can still escape by starting work outside its tree: a double fork or `setsid` that is reparented to init, a running tmux server, `systemd-run --user`, `at` or `ssh localhost`. It can also write `privateer.sqlite` directly, or read another process's `/proc/<pid>/environ`. Each of these is a deliberate evasion rather than a habit, which is the failure we see. The `Caller` doc comment stays as it is. A per-crew OS user is the real boundary, and it is out of scope (answered question 4).
 
 The supervisor also stops passing first-mate presence to crews. It removes `PRIVATEER_PRESENCE_HOLDER`, `PRIVATEER_HOSTED_HOLDER`, `PRIVATEER_HOSTED` and `PRIVATEER_ATTENDED_HARNESS` from crew payloads (`src/jobs.rs`, next to the credential scrub).

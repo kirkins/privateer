@@ -22,6 +22,7 @@ pub struct Store {
     home: PathBuf,
     connection: Connection,
     caller: Caller,
+    crew: Option<crate::crew_scope::CrewCaller>,
 }
 
 /// Who is issuing commands. Agents launched by Privateer run with a role
@@ -36,6 +37,19 @@ pub enum Caller {
 
 impl Caller {
     pub fn from_env(flag_role: Option<&str>, flag_actor: Option<&str>) -> Result<Self> {
+        Self::from_env_at(None, flag_role, flag_actor, false)
+    }
+
+    /// The caller of a command on `home`. Inside a supervised job the job's
+    /// records decide: a job that runs as an agent cannot drop its role, and
+    /// a crew is narrowed to crew commands (see `crew_scope`). `supervisor`
+    /// says the command is `_job-supervise` itself.
+    pub fn from_env_at(
+        home: Option<&Path>,
+        flag_role: Option<&str>,
+        flag_actor: Option<&str>,
+        supervisor: bool,
+    ) -> Result<Self> {
         let env = |name: &str| -> Result<Option<String>> {
             match std::env::var(name) {
                 Ok(value) => Ok(Some(value)),
@@ -43,12 +57,13 @@ impl Caller {
                 Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
             }
         };
-        Self::resolve(
+        let caller = Self::resolve(
             env("PRIVATEER_ROLE")?.as_deref(),
             env("PRIVATEER_ACTOR")?.as_deref(),
             flag_role,
             flag_actor,
-        )
+        )?;
+        crate::crew_scope::resolve(home, caller, supervisor)
     }
 
     pub fn require_operator(&self, command: &str) -> Result<()> {
@@ -112,6 +127,7 @@ impl Store {
             home,
             connection,
             caller,
+            crew: None,
         })
     }
 
@@ -144,6 +160,7 @@ impl Store {
             home,
             connection,
             caller,
+            crew: None,
         })
     }
 
@@ -153,6 +170,7 @@ impl Store {
         }
         let mut store = Self::open(home)?;
         store.set_caller(caller);
+        store.crew = crate::crew_scope::crew();
         Ok(store)
     }
 
@@ -233,6 +251,7 @@ impl Store {
             home,
             connection,
             caller: Caller::Operator,
+            crew: None,
         };
         crate::jobs::init(&store)?;
         crate::workspace::init(&store)?;
@@ -256,6 +275,15 @@ impl Store {
     }
     pub fn caller(&self) -> &Caller {
         &self.caller
+    }
+    /// The crew this CLI caller was resolved to, if any.
+    pub fn crew(&self) -> Option<&crate::crew_scope::CrewCaller> {
+        self.crew.as_ref()
+    }
+    /// The runtime acting for a job, such as its supervisor resuming a parked
+    /// crew, is not held to the crew's commands.
+    pub fn as_runtime(&mut self) {
+        self.crew = None;
     }
     pub fn set_caller(&mut self, caller: Caller) {
         self.caller = caller;

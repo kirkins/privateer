@@ -92,8 +92,19 @@ impl Fixture {
         }
     }
 }
+/// The CLI on a fixture home, with a fleet registry of the fixture's own: a
+/// home outside the machine's fleet is the operator's even when these tests
+/// run inside a crew's gate job.
+fn cli(home: &Path) -> Command {
+    let mut command = support::command(BIN);
+    command.env(
+        "PRIVATEER_FLEET",
+        home.parent().unwrap().join("fleet.sqlite"),
+    );
+    command
+}
 fn run(home: &Path, command: &str, args: Value) -> std::process::Output {
-    support::command(BIN)
+    cli(home)
         .arg("--home")
         .arg(home)
         .arg(command)
@@ -604,7 +615,7 @@ fn unexpected_supervisor_error_is_private_durable_and_keeps_payload_capacity() {
     );
     fs::write(fakebin.join("ps"), script).unwrap();
     fs::set_permissions(fakebin.join("ps"), fs::Permissions::from_mode(0o700)).unwrap();
-    let output = support::command(BIN).arg("--home").arg(&home).arg("job.start").arg("--json")
+    let output = cli(&home).arg("--home").arg(&home).arg("job.start").arg("--json")
         .arg(json!({"task_id":"task","id":"diagnostic","command":["/bin/sh","-c","sleep 0.3; touch fail-ps; exec sleep 30"]}).to_string())
         .env("PATH",format!("{}:/usr/bin:/bin",fakebin.display())).output().unwrap();
     assert!(
@@ -657,7 +668,7 @@ fn completion_cleanup_stops_leftover_helpers_by_default_and_preserves_success() 
 }
 
 fn ok_env(home: &Path, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
-    let output = support::command(BIN)
+    let output = cli(home)
         .arg("--home")
         .arg(home)
         .arg(command)
@@ -1142,7 +1153,7 @@ fn agent_jobs_carry_the_role_into_their_payload() {
         "operator\n"
     );
     // Agents start work only on tasks they own, and only as themselves.
-    let output = support::command(BIN)
+    let output = cli(&home)
         .args(["--home", home.to_str().unwrap(), "job.start", "--json"])
         .arg(json!({"task_id":"task","id":"foreign","command":["true"],"heavy":false}).to_string())
         .env("PRIVATEER_ROLE", "agent")
@@ -1151,7 +1162,7 @@ fn agent_jobs_carry_the_role_into_their_payload() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("tasks it owns"));
-    let output = support::command(BIN)
+    let output = cli(&home)
         .args(["--home", home.to_str().unwrap(), "job.start", "--json"])
         .arg(json!({"task_id":"task","id":"disguised","command":["true"],"heavy":false,"agent_actor":"other"}).to_string())
         .envs(agent)
