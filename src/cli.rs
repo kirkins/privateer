@@ -1321,7 +1321,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 // The lease is another session's: leave it untouched, and end
                 // this pane with its harness already stopped.
                 terminal.restore();
-                eprintln!("{ship}: another session took the ship's mail lease; this pane is ending");
+                eprintln!(
+                    "{ship}: another session took the ship's mail lease; this pane is ending"
+                );
                 std::process::exit(0);
             }
             crate::host::sleep::Ended::Asleep(asleep) => {

@@ -584,7 +584,9 @@ mod tests {
             .args(["-c", "sleep 3; true"])
             .spawn()
             .unwrap();
-        let old_started = crate::jobs::process_identity(old_pane.id()).unwrap().unwrap();
+        let old_started = crate::jobs::process_identity(old_pane.id())
+            .unwrap()
+            .unwrap();
         store
             .connection()
             .execute(
@@ -593,14 +595,20 @@ mod tests {
             )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::jobs::child_pids(old_pane.id()).unwrap().is_empty() && Instant::now() < deadline
+        while crate::jobs::child_pids(old_pane.id()).unwrap().is_empty()
+            && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(10));
         }
         let prior = pane_record(&store, ship).unwrap();
         // The replacement pane records itself over the old row, as record() does.
-        let mut new_pane = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        let new_started = crate::jobs::process_identity(new_pane.id()).unwrap().unwrap();
+        let mut new_pane = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let new_started = crate::jobs::process_identity(new_pane.id())
+            .unwrap()
+            .unwrap();
         store
             .connection()
             .execute(
