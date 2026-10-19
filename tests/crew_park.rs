@@ -12,6 +12,13 @@ const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 const SESSION: &str = "7d1b1f0e-1111-4222-8333-444455556666";
 /// See `Fleet::launch_budget`.
 const LAUNCH_BUDGET_SECS: u64 = 20;
+/// A crew's budget counts from its launch, so the child it starts must exist
+/// well before the deadline. Twenty seconds was not enough on a loaded runner.
+const SPENT_CAP_BUDGET_SECS: u64 = 60;
+/// The budget of the child the spent-cap crew starts. The cap cancels it at
+/// the crew's deadline; its own deadline lies far past that, so the cancel is
+/// the only way it can end while the test waits.
+const SPENT_CAP_CHILD_SECS: u64 = 600;
 
 struct Fleet {
     _tmp: tempfile::TempDir,
@@ -73,6 +80,13 @@ case "$MODE" in
   deadline)
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
+  capped)
+    # Starts its child once the test has given the child its own budget, and
+    # outlives the test's crew budget, so the payload is still running when
+    # the deadline lands; a payload that exits first is refused as stale.
+    while [ ! -e "$ROOT/start-child" ]; do [ -d "$ROOT" ] || exit 1; sleep 0.1; done
+    "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
+    sleep 300 ;;
   *)
     child='sleep 2; echo built'
     if [ "$MODE" = slow ] || [ "$MODE" = aged ]; then child='sleep 6; echo built'; fi
@@ -860,15 +874,26 @@ fn a_spent_park_cap_at_the_deadline_ends_the_crew_and_its_job() {
 #[test]
 fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
     let f = Fleet::new();
-    f.set_mode("deadline");
-    // The child must be running by the crew's deadline for it to be cancelled.
-    f.json(
-        None,
-        "charter.put",
-        json!({"id": "engineering", "job_timeout_secs": LAUNCH_BUDGET_SECS, "crew_max_parks": 0}),
-    );
+    f.set_mode("capped");
+    let charter = |secs: u64| {
+        f.json(
+            None,
+            "charter.put",
+            json!({"id": "engineering", "job_timeout_secs": secs, "crew_max_parks": 0}),
+        );
+    };
+    // A job's budget is the charter's when it is started. The crew gets the
+    // short one, its child (started once released) a far longer one, so the
+    // child cannot time out on its own around the crew's deadline.
+    charter(SPENT_CAP_BUDGET_SECS);
     start_crew(&f, "crew-26");
-    let crew = f.wait("crew-26", &["timed_out"]);
+    charter(SPENT_CAP_CHILD_SECS);
+    fs::write(f.root.join("start-child"), "").unwrap();
+    // The child must exist by the crew's deadline for it to be cancelled.
+    let child = f.wait("child-1", &["running"]);
+    assert_eq!(child["timeout_secs"], SPENT_CAP_CHILD_SECS, "{child}");
+    let crew = f.wait_secs("crew-26", &["timed_out"], SPENT_CAP_BUDGET_SECS + 60);
+    assert_eq!(crew["timeout_secs"], SPENT_CAP_BUDGET_SECS, "{crew}");
     assert!(
         crew["reason"]
             .as_str()
@@ -876,7 +901,8 @@ fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
             .contains("the cap is 0"),
         "{crew}"
     );
-    f.wait("child-1", &["cancelled"]);
+    let child = f.wait("child-1", &["cancelled"]);
+    assert_eq!(child["cancel_requested"], true, "{child}");
 }
 
 /// An identical repeat of a parked crew's start returns the job it already
