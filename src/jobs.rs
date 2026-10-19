@@ -1405,13 +1405,10 @@ pub(crate) fn process_identity(pid: u32) -> Result<Option<String>> {
 }
 
 /// The live processes whose parent is `pid`, from the kernel's parent links.
-/// Empty where /proc is unavailable.
 #[cfg(target_os = "linux")]
-pub(crate) fn child_pids(pid: u32) -> Vec<u32> {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return vec![];
-    };
-    entries
+pub(crate) fn child_pids(pid: u32) -> Result<Vec<u32>> {
+    let entries = fs::read_dir("/proc").context("inspect process tree")?;
+    Ok(entries
         .filter_map(|entry| {
             let candidate: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
             let stat = fs::read_to_string(format!("/proc/{candidate}/stat")).ok()?;
@@ -1425,12 +1422,34 @@ pub(crate) fn child_pids(pid: u32) -> Vec<u32> {
                 .ok()?;
             (parent == pid).then_some(candidate)
         })
-        .collect()
+        .collect())
 }
 
+/// The live processes whose parent is `pid`, from one process table. Zombies
+/// are skipped: they have exited and hold their PID only until reaped.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn child_pids(_pid: u32) -> Vec<u32> {
-    vec![]
+pub(crate) fn child_pids(pid: u32) -> Result<Vec<u32>> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,stat="])
+        .env("LC_ALL", "C")
+        .output()
+        .context("inspect process tree")?;
+    ensure!(output.status.success(), "process tree inspection failed");
+    let mut children = vec![];
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(child), Some(parent), Some(stat)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if stat.starts_with('Z') {
+            continue;
+        }
+        if parent.parse::<u32>()? == pid {
+            children.push(child.parse()?);
+        }
+    }
+    Ok(children)
 }
 
 /// This process's identity, recorded with a claim another process may check.

@@ -223,10 +223,13 @@ pub(crate) fn supervise(
         let due = checked.elapsed() >= Duration::from_secs(5);
         if due {
             checked = Instant::now();
-            // A lease another session now holds means its mail is theirs: this
-            // harness ends here rather than run beside them. A failed read is not
-            // a move, so it is judged again at the next check.
-            if crate::presence::moved_from(store, ship, holder).unwrap_or(false) {
+            // A lease another session now holds means its mail is theirs: a hosted
+            // harness ends here rather than run beside them. A captain's own session
+            // (start:) is never superseded. A failed read is not a move, so it is
+            // judged again at the next check.
+            if holder.starts_with(crate::presence::HOSTED)
+                && crate::presence::moved_from(store, ship, holder).unwrap_or(false)
+            {
                 stop(child)?;
                 store.audit("host.superseded", &json!({"ship": ship, "holder": holder}))?;
                 return Ok(Ended::Superseded);
@@ -513,6 +516,32 @@ mod tests {
         // The lease stays with the session that took it.
         assert!(crate::presence::moved_from(&store, ship, ours).unwrap());
         assert!(!crate::presence::moved_from(&store, ship, "host:infra:other").unwrap());
+    }
+
+    /// A captain's own session keeps its harness when another session takes the
+    /// lease: only a hosted pane is superseded. The harness runs to its end.
+    #[test]
+    fn a_start_session_whose_lease_moves_is_not_superseded() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let ship = "infra";
+        store
+            .connection()
+            .execute(
+                "INSERT INTO ships(name, record) VALUES(?1, '{\"location\":\"here\"}')",
+                [ship],
+            )
+            .unwrap();
+        let ours = "start:infra:captain";
+        crate::presence::attend(&store, ship, ours, 90, None).unwrap();
+        crate::presence::attend(&store, ship, "host:infra:other", 90, None).unwrap();
+        // Outlives the first check, which is when a hosted harness would be superseded.
+        let mut harness = std::process::Command::new("sleep")
+            .arg("6")
+            .spawn()
+            .unwrap();
+        let ended = supervise(&store, ship, ours, &mut harness, 0).unwrap();
+        assert!(matches!(ended, Ended::Exited(_)));
     }
 
     #[test]
