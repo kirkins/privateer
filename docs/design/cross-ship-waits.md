@@ -1,6 +1,6 @@
 # Design: waits on another ship's task
 
-Status: design only, no code. Task `privateer-typed-dependency-waits`, part 2. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
+Status: proposed, awaiting the captain's approval; design only, no code. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
 
 ## Problem
 
