@@ -341,7 +341,9 @@ pub(crate) fn relaunch(store: &mut Store, ship: &str, force: bool) -> Result<Val
     let prior_commit = before
         .as_ref()
         .and_then(|pane| pane["commit"].as_str().map(str::to_owned));
-    let prior_harness = harness_of(store, ship)?;
+    // The pane this relaunch asks to stop, read before any request goes out: a
+    // new pane recorded during the wait must not stand in for it.
+    let prior_pane = pane_record(store, ship)?;
     let lease = presence::presence(store, ship)?;
     // A pane is running only under a hosted holder; anything else is an
     // ordinary launch, with nothing to relaunch.
@@ -405,9 +407,8 @@ pub(crate) fn relaunch(store: &mut Store, ship: &str, force: bool) -> Result<Val
             .connection()
             .execute("DELETE FROM hosted_relaunches WHERE ship=?1", [ship])?;
     }
-    let harness_exited = prior_harness.is_none_or(|(pid, started)| {
-        crate::jobs::process_identity(pid).ok().flatten() != Some(started)
-    });
+    // Checked after the pane has let go, so its own harness has had its chance to stop.
+    let harness_exited = !harness_running(prior_pane)?;
     // Never two harnesses on one conversation: a pane that left while its
     // harness still runs (its lease lapsed or moved) keeps that harness.
     ensure!(
@@ -434,17 +435,59 @@ fn recorded(store: &Store, ship: &str) -> Result<bool> {
     Ok(live_pane(store, ship)?.is_some())
 }
 
-/// The native harness a live pane spawned, with its start identity.
-fn harness_of(store: &Store, ship: &str) -> Result<Option<(u32, String)>> {
+/// A pane's `hosted_panes` row: its pid and start identity, then the harness
+/// it recorded, if any.
+type PaneRecord = (u32, String, Option<u32>, Option<String>);
+
+fn pane_record(store: &Store, ship: &str) -> Result<Option<PaneRecord>> {
     Ok(store
         .connection()
         .query_row(
-            "SELECT harness_pid, harness_started FROM hosted_panes WHERE ship=?1",
+            "SELECT pid, started, harness_pid, harness_started FROM hosted_panes WHERE ship=?1",
             [ship],
-            |r| Ok((r.get::<_, Option<u32>>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
-        .optional()?
-        .and_then(|(pid, started)| Some((pid?, started?))))
+        .optional()?)
+}
+
+/// Whether a process the ship's pane started still runs, for the pane recorded
+/// in `record`. The recorded harness is checked by identity, and the pane's
+/// process tree is walked from the pane, because its wrapper may have spawned
+/// the native process rather than exec'd into it. A pane that is itself gone
+/// has no tree to walk, and its orphans reparent away from it, so only the
+/// recorded harness can name them.
+fn harness_running(record: Option<PaneRecord>) -> Result<bool> {
+    let Some((pane, pane_started, harness, harness_started)) = record else {
+        return Ok(false);
+    };
+    if let (Some(pid), Some(started)) = (harness, harness_started)
+        && crate::jobs::process_identity(pid)?.as_deref() == Some(started.as_str())
+    {
+        return Ok(true);
+    }
+    if crate::jobs::process_identity(pane)?.as_deref() != Some(pane_started.as_str()) {
+        return Ok(false);
+    }
+    tree_alive(pane)
+}
+
+/// Whether any process under `root` is alive, walking the kernel's parent links
+/// breadth first. Bounded, so a runaway tree is refused rather than walked on.
+fn tree_alive(root: u32) -> Result<bool> {
+    const LIMIT: usize = 4_096;
+    let mut pending = vec![root];
+    for _ in 0..LIMIT {
+        let Some(parent) = pending.pop() else {
+            return Ok(false);
+        };
+        for child in crate::jobs::child_pids(parent)? {
+            if crate::jobs::process_identity(child)?.is_some() {
+                return Ok(true);
+            }
+            pending.push(child);
+        }
+    }
+    bail!("process tree under pid {root} exceeds {LIMIT} processes")
 }
 
 #[cfg(test)]
@@ -497,6 +540,87 @@ mod tests {
             .unwrap();
         assert_eq!(held, vec![0]);
         assert!(!crate::presence::attended(&store, ship).unwrap());
+    }
+
+    /// A harness the pane spawned, rather than exec'd into, is still running
+    /// under the pane even though no harness pid was recorded for it.
+    #[test]
+    fn a_child_still_running_under_the_pane_counts_as_its_harness() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let ship = "infra";
+        // A stand-in pane whose child, the stand-in harness, outlives the shell.
+        let mut pane = std::process::Command::new("sh")
+            .args(["-c", "sleep 2; true"])
+            .spawn()
+            .unwrap();
+        let started = crate::jobs::process_identity(pane.id()).unwrap().unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms) VALUES(?1,?2,?3,'x',0)",
+                params![ship, pane.id(), started],
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::jobs::child_pids(pane.id()).unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(harness_running(pane_record(&store, ship).unwrap()).unwrap());
+        // Once the pane is gone, nothing under it is found.
+        pane.wait().unwrap();
+        assert!(!harness_running(pane_record(&store, ship).unwrap()).unwrap());
+    }
+
+    /// A relaunch judges the pane it asked to stop, even when a new pane has
+    /// recorded its row during the wait: the old pane's harness still runs, and
+    /// the new pane's row names no harness of its own.
+    #[test]
+    fn a_relaunch_judges_the_pane_it_asked_to_stop_not_its_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let ship = "infra";
+        let mut old_pane = std::process::Command::new("sh")
+            .args(["-c", "sleep 3; true"])
+            .spawn()
+            .unwrap();
+        let old_started = crate::jobs::process_identity(old_pane.id())
+            .unwrap()
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms) VALUES(?1,?2,?3,'x',0)",
+                params![ship, old_pane.id(), old_started],
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::jobs::child_pids(old_pane.id()).unwrap().is_empty()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prior = pane_record(&store, ship).unwrap();
+        // The replacement pane records itself over the old row, as record() does.
+        let mut new_pane = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let new_started = crate::jobs::process_identity(new_pane.id())
+            .unwrap()
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE hosted_panes SET pid=?2, started=?3, harness_pid=NULL, harness_started=NULL WHERE ship=?1",
+                params![ship, new_pane.id(), new_started],
+            )
+            .unwrap();
+        assert!(harness_running(prior).unwrap());
+        assert!(!harness_running(pane_record(&store, ship).unwrap()).unwrap());
+        new_pane.kill().unwrap();
+        new_pane.wait().unwrap();
+        old_pane.wait().unwrap();
     }
 
     /// A catch-up on a ship that never sleeps starts awake: only a ship that
