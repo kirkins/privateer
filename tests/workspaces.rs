@@ -1623,4 +1623,60 @@ fn release_with_archive_true_archives_switched_branch_and_releases() {
         ),
         head
     );
+    let task_tip = git(
+        &f.repo,
+        &[
+            "rev-parse",
+            &format!("refs/heads/{}", w["branch"].as_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["task_archive_ref"].as_str().unwrap()]
+        ),
+        task_tip
+    );
+}
+
+#[test]
+fn a_detached_crew_keeps_the_unlanded_task_branch_and_alerts() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    let task_branch = w["branch"].as_str().unwrap().to_owned();
+
+    commit_work(&p, "task.txt", "task branch work");
+    git(&p, &["checkout", "--quiet", "--detach", "main"]);
+
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+
+    let report = f.ok("serve", json!({"once": true}));
+    let released: Vec<&str> = report["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["task_id"].as_str())
+        .collect();
+    assert!(!released.contains(&"one"), "{report}");
+
+    let status = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(status["state"], "ready");
+    let reason = status["retained_reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("task branch {task_branch} changes are not landed")),
+        "{reason}"
+    );
+
+    let inbox = f.ok("mail.inbox", json!({"address":"ship"}));
+    let alerts = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["workspace_alert"] == "one")
+        .count();
+    assert_eq!(alerts, 1, "{inbox}");
 }

@@ -120,22 +120,20 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         .transpose()?
         .unwrap_or(false);
     let head = git(&lock, &path, &["rev-parse", "HEAD"])?;
-    // After a switch, the recorded task branch can hold commits HEAD does
-    // not reach. A missing branch cannot be verified, so it counts as unlanded.
-    let task_tip = if w.switched_branch.is_some() {
-        git(
-            &lock,
-            &path,
-            &["rev-parse", "--verify", &format!("refs/heads/{}", w.branch)],
-        )
-        .ok()
-    } else {
-        None
-    };
+    // The recorded task branch can hold commits HEAD does not reach, whether
+    // HEAD is on a branch, detached, or on another branch. A missing branch
+    // after a switch cannot be verified, so it counts as unlanded.
+    let task_tip = git(
+        &lock,
+        &path,
+        &["rev-parse", "--verify", &format!("refs/heads/{}", w.branch)],
+    )
+    .ok();
+    let task_check = w.switched_branch.is_some() || task_tip.as_deref().is_some_and(|t| t != head);
     if archive {
         w.archive_ref = Some(archive_tip(store, &lock, &w, &head)?);
-        if let Some(tip) = task_tip.as_deref().filter(|tip| *tip != head) {
-            archive_tip(store, &lock, &w, tip)?;
+        if let Some(tip) = task_tip.as_deref() {
+            w.task_archive_ref = Some(archive_tip(store, &lock, &w, tip)?);
         }
     } else {
         let target = base_target(&lock, &w)?;
@@ -143,7 +141,7 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
             landed(&lock, &w, &target, &head),
             "workspace changes are not landed; use archive:true to preserve committed work"
         );
-        if w.switched_branch.is_some() {
+        if task_check {
             ensure!(
                 task_tip
                     .as_deref()
@@ -205,6 +203,19 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
 /// reacquire may have replaced the record since. Callers hold the lock.
 fn current(store: &Store, _lock: &Lock, snapshot: &Workspace) -> Result<Option<Workspace>> {
     Ok(load(store, &snapshot.task_id)?.filter(|w| w.lease_id == snapshot.lease_id))
+}
+
+/// Refresh the crew's branch on the record as it is now under the lock. The
+/// caller's copy may predate the lock, so only a ready record with the same
+/// lease is written. Callers hold the lock.
+fn refresh_branch(store: &Store, lock: &Lock, snapshot: &Workspace) -> Result<Option<Workspace>> {
+    let Some(mut w) = current(store, lock, snapshot)? else {
+        return Ok(None);
+    };
+    if w.state == "ready" && sync_branch(lock, &mut w) {
+        let _ = save(store, &w);
+    }
+    Ok(Some(w))
 }
 
 /// Record why a workspace is kept. Only a ready record is written, so a
@@ -525,8 +536,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             };
             if w.state == "ready" && w.path.as_ref().is_some_and(|p| p.is_dir()) {
                 if let Ok(lock) = Lock::acquire(store) {
-                    if sync_branch(&lock, &mut w) {
-                        let _ = save(store, &w);
+                    if let Some(fresh) = refresh_branch(store, &lock, &w)? {
+                        w = fresh;
                     }
                 }
             }
@@ -586,6 +597,7 @@ mod stale_write_tests {
             path: Some(PathBuf::from("/unused/pool/slot")),
             lease_id: Some(lease.into()),
             archive_ref: None,
+            task_archive_ref: None,
             switched_branch: None,
             current_branch: None,
             retained_reason: None,
@@ -634,5 +646,63 @@ mod stale_write_tests {
         let after = load(&store, "one").unwrap().unwrap();
         assert_eq!(after.state, "releasing");
         assert_eq!(after.retained_reason, None);
+    }
+
+    #[test]
+    fn a_stale_status_copy_never_saves_over_a_newer_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(&mut store, "charter.put", json!({"id":"mission","objective":"stale write fixture","repo":temp.path(),"min_free_bytes":0})).unwrap();
+        crate::dispatch(&mut store, "ship.put", json!({"name":"ship"})).unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"one","charter_id":"mission","owner":"ship","title":"one"}),
+        )
+        .unwrap();
+
+        // A real slot whose HEAD has switched away from the task branch.
+        let slot = temp.path().join("slot");
+        fs::create_dir(&slot).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["symbolic-ref", "HEAD", "refs/heads/fix/elsewhere"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&slot)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        // The copy was read as ready, then a release began under the lock.
+        let mut releasing = record("lease-two");
+        releasing.path = Some(slot.clone());
+        releasing.state = "releasing".into();
+        save(&store, &releasing).unwrap();
+        let mut stale = record("lease-two");
+        stale.path = Some(slot.clone());
+        let lock = Lock::acquire(&store).unwrap();
+        let fresh = refresh_branch(&store, &lock, &stale).unwrap().unwrap();
+        drop(lock);
+        assert_eq!(fresh.state, "releasing");
+        assert_eq!(fresh.switched_branch, None);
+        let after = load(&store, "one").unwrap().unwrap();
+        assert_eq!(after.state, "releasing");
+        assert_eq!(after.switched_branch, None);
+
+        // A ready record with the same lease takes the branch change.
+        let mut ready = record("lease-two");
+        ready.path = Some(slot.clone());
+        save(&store, &ready).unwrap();
+        let lock = Lock::acquire(&store).unwrap();
+        let fresh = refresh_branch(&store, &lock, &stale).unwrap().unwrap();
+        drop(lock);
+        assert_eq!(fresh.switched_branch.as_deref(), Some("fix/elsewhere"));
+        let after = load(&store, "one").unwrap().unwrap();
+        assert_eq!(after.switched_branch.as_deref(), Some("fix/elsewhere"));
     }
 }

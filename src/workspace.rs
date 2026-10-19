@@ -77,6 +77,8 @@ pub(crate) struct Workspace {
     pub(crate) lease_id: Option<String>,
     pub(crate) archive_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_archive_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) switched_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) current_branch: Option<String>,
@@ -369,6 +371,7 @@ fn acquire_locked(
             path: None,
             lease_id: None,
             archive_ref: None,
+            task_archive_ref: None,
             switched_branch: None,
             current_branch: None,
             retained_reason: None,
