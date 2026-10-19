@@ -65,7 +65,8 @@ privateer --home /absolute/home workspace.status --json '{"task_id":"repair"}'
 ```
 
 `workspace.list` is bounded (100 records by default, at most 1,000); use
-`after_id` for pagination. `workspace.acquire {task_id}` explicitly allocates or
+`after_id` for pagination. Released records are listed too; `{"active":true}`
+leaves them out. `workspace.acquire {task_id}` explicitly allocates or
 recovers a checkout before starting jobs. Ordinary launches do this themselves.
 Both the host `min_free_disk_bytes` and charter `min_free_bytes` floors apply to
 the worktree pool's filesystem. A workspace needs only disk: when the floors are

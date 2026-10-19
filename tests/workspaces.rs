@@ -1516,13 +1516,82 @@ fn a_stale_lease_moved_record_is_cleared() {
     assert_eq!(status["state"], "released");
 
     let list = f.ok("workspace.list", json!({}));
+    let listed = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["task_id"] == "one")
+        .expect("released records stay in the default listing");
+    assert_eq!(listed["state"], "released");
+
+    let active = f.ok("workspace.list", json!({"active":true}));
     assert!(
-        !list
+        !active
             .as_array()
             .unwrap()
             .iter()
             .any(|item| item["task_id"] == "one")
     );
+}
+
+#[test]
+fn an_unlanded_task_branch_is_kept_after_the_crew_switches_and_lands_elsewhere() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    let task_branch = w["branch"].as_str().unwrap().to_owned();
+
+    commit_work(&p, "task.txt", "task branch work");
+    let task_tip = git(&p, &["rev-parse", &format!("refs/heads/{task_branch}")]);
+    // The crew switches to a branch from base and lands it; the task branch
+    // keeps its own unlanded commit.
+    git(&p, &["checkout", "-b", "fix/other", "HEAD~1"]);
+    commit_work(&p, "other.txt", "other work");
+    commit_work(&f.repo, "other.txt", "squash merge other work");
+
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+
+    let report = f.ok("serve", json!({"once": true}));
+    let released: Vec<&str> = report["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["task_id"].as_str())
+        .collect();
+    assert!(!released.contains(&"one"), "{report}");
+
+    let status = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(status["state"], "ready");
+    assert_eq!(status["switched_branch"], "fix/other");
+    let reason = status["retained_reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("task branch {task_branch} changes are not landed")),
+        "{reason}"
+    );
+
+    let inbox = f.ok("mail.inbox", json!({"address":"ship"}));
+    let alerts = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["workspace_alert"] == "one")
+        .count();
+    assert_eq!(alerts, 1, "{inbox}");
+
+    let released = f.release(&w, true);
+    assert_eq!(released["state"], "released");
+    let archived = git(
+        &f.repo,
+        &[
+            "for-each-ref",
+            "refs/privateer/workspaces/",
+            "--format=%(objectname)",
+        ],
+    );
+    assert!(archived.lines().any(|sha| sha == task_tip), "{archived}");
 }
 
 #[test]

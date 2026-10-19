@@ -1,6 +1,59 @@
 //! Explicit release and recovery keep unfinished work and stale leases intact.
 use super::*;
 
+/// The base branch that work must reach to count as landed. Fetches origin
+/// first when there is one.
+fn base_target(lock: &Lock, w: &Workspace) -> Result<String> {
+    if git(lock, &w.git_repo, &["remote", "get-url", "origin"]).is_ok() {
+        git(lock, &w.git_repo, &["fetch", "--quiet", "origin"])?;
+        Ok(format!("refs/remotes/origin/{}", w.base_branch))
+    } else {
+        Ok(format!("refs/heads/{}", w.base_branch))
+    }
+}
+
+/// Whether `rev` adds nothing to `target`: it is reachable from it, or a
+/// squash or rebase merge left `target` with the same tree.
+fn landed(lock: &Lock, w: &Workspace, target: &str, rev: &str) -> bool {
+    let ahead: Result<u64> = git(
+        lock,
+        &w.git_repo,
+        &["rev-list", "--count", &format!("{target}..{rev}")],
+    )
+    .and_then(|s| s.trim().parse().map_err(Into::into));
+    if ahead.is_ok_and(|n| n == 0) {
+        return true;
+    }
+    let merged = git(
+        lock,
+        &w.git_repo,
+        &["merge-tree", "--write-tree", target, rev],
+    );
+    merged.is_ok_and(|m| {
+        m.lines().next()
+            == git(
+                lock,
+                &w.git_repo,
+                &["rev-parse", &format!("{target}^{{tree}}")],
+            )
+            .ok()
+            .as_deref()
+    })
+}
+
+/// Keep a commit reachable under the workspace's generation before its
+/// checkout is returned to the pool.
+fn archive_tip(store: &Store, lock: &Lock, w: &Workspace, rev: &str) -> Result<String> {
+    let reference = format!(
+        "refs/privateer/workspaces/{}/{}/{}",
+        hash(&store.home().to_string_lossy()),
+        w.generation,
+        rev
+    );
+    git(lock, &w.git_repo, &["update-ref", &reference, rev])?;
+    Ok(reference)
+}
+
 fn release(store: &Store, args: &Value) -> Result<Value> {
     let task = required(args, "task_id")?;
     owner(store, task)?;
@@ -67,53 +120,38 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         .transpose()?
         .unwrap_or(false);
     let head = git(&lock, &path, &["rev-parse", "HEAD"])?;
-    if archive {
-        let reference = format!(
-            "refs/privateer/workspaces/{}/{}/{}",
-            hash(&store.home().to_string_lossy()),
-            w.generation,
-            head
-        );
-        git(&lock, &w.git_repo, &["update-ref", &reference, &head])?;
-        w.archive_ref = Some(reference);
-    } else {
-        let remote = format!("refs/remotes/origin/{}", w.base_branch);
-        let local = format!("refs/heads/{}", w.base_branch);
-        let target = if git(&lock, &w.git_repo, &["remote", "get-url", "origin"]).is_ok() {
-            git(&lock, &w.git_repo, &["fetch", "--quiet", "origin"])?;
-            remote
-        } else {
-            local
-        };
-        let ahead: Result<u64> = git(
+    // After a switch, the recorded task branch can hold commits HEAD does
+    // not reach. A missing branch cannot be verified, so it counts as unlanded.
+    let task_tip = if w.switched_branch.is_some() {
+        git(
             &lock,
-            &w.git_repo,
-            &["rev-list", "--count", &format!("{target}..{head}")],
+            &path,
+            &["rev-parse", "--verify", &format!("refs/heads/{}", w.branch)],
         )
-        .and_then(|s| s.trim().parse().map_err(Into::into));
-        let is_landed = if ahead.as_ref().is_ok_and(|&n| n == 0) {
-            true
-        } else {
-            let merged = git(
-                &lock,
-                &w.git_repo,
-                &["merge-tree", "--write-tree", &target, &head],
-            );
-            merged.is_ok_and(|m| {
-                m.lines().next()
-                    == git(
-                        &lock,
-                        &w.git_repo,
-                        &["rev-parse", &format!("{target}^{{tree}}")],
-                    )
-                    .ok()
-                    .as_deref()
-            })
-        };
+        .ok()
+    } else {
+        None
+    };
+    if archive {
+        w.archive_ref = Some(archive_tip(store, &lock, &w, &head)?);
+        if let Some(tip) = task_tip.as_deref().filter(|tip| *tip != head) {
+            archive_tip(store, &lock, &w, tip)?;
+        }
+    } else {
+        let target = base_target(&lock, &w)?;
         ensure!(
-            is_landed,
+            landed(&lock, &w, &target, &head),
             "workspace changes are not landed; use archive:true to preserve committed work"
         );
+        if w.switched_branch.is_some() {
+            ensure!(
+                task_tip
+                    .as_deref()
+                    .is_some_and(|tip| landed(&lock, &w, &target, tip)),
+                "task branch {} changes are not landed; use archive:true to preserve committed work",
+                w.branch
+            );
+        }
     }
     w.state = "releasing".into();
     owner(store, task)?;
@@ -162,32 +200,63 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     public(store, &w)
 }
 
-fn record_keep(store: &Store, w: &mut Workspace, reason: &str) -> Result<()> {
-    w.retained_reason = Some(reason.to_owned());
-    save(store, w)?;
-    store.audit(
-        "workspace.retained",
-        &json!({"task_id": w.task_id, "path": w.path, "reason": reason}),
-    )?;
-    Ok(())
+/// The record as it is now, if it still carries the snapshot's lease. The
+/// sweep reads its candidates before taking the lock, so a release and
+/// reacquire may have replaced the record since. Callers hold the lock.
+fn current(store: &Store, _lock: &Lock, snapshot: &Workspace) -> Result<Option<Workspace>> {
+    Ok(load(store, &snapshot.task_id)?.filter(|w| w.lease_id == snapshot.lease_id))
 }
 
+/// Record why a workspace is kept. Only a ready record is written, so a
+/// release that has begun is never overwritten, and a reason is written and
+/// audited only when it changes. Returns the record as it is now.
+fn keep(
+    store: &Store,
+    lock: &Lock,
+    snapshot: &Workspace,
+    reason: &str,
+) -> Result<Option<Workspace>> {
+    let Some(mut w) = current(store, lock, snapshot)? else {
+        return Ok(None);
+    };
+    if w.state != "ready" {
+        return Ok(Some(w));
+    }
+    let synced = sync_branch(lock, &mut w);
+    if w.retained_reason.as_deref() != Some(reason) {
+        w.retained_reason = Some(reason.to_owned());
+        save(store, &w)?;
+        store.audit(
+            "workspace.retained",
+            &json!({"task_id": w.task_id, "path": w.path, "reason": reason}),
+        )?;
+    } else if synced {
+        save(store, &w)?;
+    }
+    Ok(Some(w))
+}
+
+/// Raise one alert per task and reason. A changed reason replaces the alert
+/// and is sent again, so the owner always sees the current cause.
 fn alert_unreleasable(store: &Store, w: &Workspace, reason: &str) -> Result<()> {
     let db = store.connection();
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS workspace_alerts (task_id TEXT PRIMARY KEY, raised_ms INTEGER NOT NULL, reason TEXT NOT NULL);",
     )?;
-    let already: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM workspace_alerts WHERE task_id=?1)",
-        [&w.task_id],
-        |r| r.get(0),
-    )?;
-    if already {
+    let raised: Option<String> = db
+        .query_row(
+            "SELECT reason FROM workspace_alerts WHERE task_id=?1",
+            [&w.task_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if raised.as_deref() == Some(reason) {
         return Ok(());
     }
     let now = Store::now_ms();
     db.execute(
-        "INSERT INTO workspace_alerts (task_id, raised_ms, reason) VALUES (?1, ?2, ?3)",
+        "INSERT INTO workspace_alerts (task_id, raised_ms, reason) VALUES (?1, ?2, ?3)
+         ON CONFLICT(task_id) DO UPDATE SET raised_ms=excluded.raised_ms, reason=excluded.reason",
         params![w.task_id, now, reason],
     )?;
     store.audit(
@@ -207,7 +276,7 @@ fn alert_unreleasable(store: &Store, w: &Workspace, reason: &str) -> Result<()> 
             "kind": "notice",
             "task_id": w.task_id,
             "urgency": "normal",
-            "body": format!("Workspace for done task {} cannot be released: {}", w.task_id, reason),
+            "body": format!("Workspace for task {} cannot be released: {}", w.task_id, reason),
             "payload": {
                 "workspace_alert": w.task_id,
                 "reason": reason,
@@ -256,21 +325,24 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
         .collect::<rusqlite::Result<_>>()?;
     let mut released = vec![];
     for record in records {
-        let mut w: Workspace = serde_json::from_str(&record)?;
-        let (Some(lease), Some(path)) = (w.lease_id.clone(), w.path.clone()) else {
+        let snapshot: Workspace = serde_json::from_str(&record)?;
+        let (Some(lease), Some(path)) = (snapshot.lease_id.clone(), snapshot.path.clone()) else {
             continue;
         };
         let lock = match Lock::acquire(store) {
             Ok(l) => l,
             Err(_) => continue,
         };
+        // Every write below uses the record as it is under the lock.
+        let Some(mut w) = current(store, &lock, &snapshot)?.filter(|w| w.state == "ready") else {
+            continue;
+        };
         if let Ok(all_slots) = slots(&lock, &w) {
-            let lease_held = all_slots.iter().any(|slot| {
-                slot["lease_id"].as_str() == Some(&lease)
-                    && slot["lease_holder"] == w.holder
-                    && slot["path"].as_str() == Some(path.to_str().unwrap_or_default())
-            });
-            if !lease_held {
+            let on_lease: Vec<&Value> = all_slots
+                .iter()
+                .filter(|slot| slot["lease_id"].as_str() == Some(&lease))
+                .collect();
+            if on_lease.is_empty() {
                 w.state = "released".into();
                 w.retained_reason = None;
                 let _ = save(store, &w);
@@ -284,6 +356,16 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 );
                 continue;
             }
+            let path_text = path.to_str().unwrap_or_default();
+            if !on_lease.iter().any(|slot| {
+                slot["lease_holder"] == w.holder && slot["path"].as_str() == Some(path_text)
+            }) {
+                let reason = "lease holder or path no longer matches its Treehouse slot";
+                if let Some(kept) = keep(store, &lock, &w, reason)? {
+                    alert_unreleasable(store, &kept, reason)?;
+                }
+                continue;
+            }
         }
         sync_branch(&lock, &mut w);
 
@@ -295,7 +377,11 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if unfinished > 0 {
-            record_keep(store, &mut w, "jobs still running")?;
+            keep(store, &lock, &w, "jobs still running")?;
+            continue;
+        }
+        if last_finished.is_some_and(|at| now - at < SWEEP_GRACE_MS) {
+            keep(store, &lock, &w, "jobs finished within grace period")?;
             continue;
         }
         let finished = matches!(
@@ -303,17 +389,8 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
             Some("done" | "cancelled")
         );
         if !finished {
-            if last_finished.is_some_and(|at| now - at < SWEEP_GRACE_MS) {
-                record_keep(store, &mut w, "jobs finished within grace period")?;
-                continue;
-            }
             let own = (|| -> Result<u64> {
-                let target = if git(&lock, &w.git_repo, &["remote", "get-url", "origin"]).is_ok() {
-                    git(&lock, &w.git_repo, &["fetch", "--quiet", "origin"])?;
-                    format!("refs/remotes/origin/{}", w.base_branch)
-                } else {
-                    format!("refs/heads/{}", w.base_branch)
-                };
+                let target = base_target(&lock, &w)?;
                 Ok(git(
                     &lock,
                     &path,
@@ -322,7 +399,7 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 .parse()?)
             })();
             if !own.is_ok_and(|n| n > 0) {
-                record_keep(store, &mut w, "active task without branch commits")?;
+                keep(store, &lock, &w, "active task without branch commits")?;
                 continue;
             }
         }
@@ -337,9 +414,14 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
             }
             Err(err) => {
                 let reason = format!("{err:#}");
-                record_keep(store, &mut w, &reason)?;
-                if finished {
-                    alert_unreleasable(store, &w, &reason)?;
+                // release may have saved "releasing" before it failed.
+                let Ok(lock) = Lock::acquire(store) else {
+                    continue;
+                };
+                if let Some(kept) = keep(store, &lock, &w, &reason)? {
+                    if finished {
+                        alert_unreleasable(store, &kept, &reason)?;
+                    }
                 }
             }
         }
@@ -466,12 +548,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 Caller::Agent { actor } => Some(actor.as_str()),
                 Caller::Operator => None,
             };
-            let include_released = args.get("include_released") == Some(&json!(true))
-                || args.get("all") == Some(&json!(true));
-            let query = if include_released {
-                "SELECT w.record FROM workspaces w JOIN tasks t ON t.id=w.task_id WHERE w.task_id>?1 AND (?2 IS NULL OR t.owner=?2) ORDER BY w.task_id LIMIT ?3"
-            } else {
+            let active_only = args.get("active") == Some(&json!(true));
+            let query = if active_only {
                 "SELECT w.record FROM workspaces w JOIN tasks t ON t.id=w.task_id WHERE w.task_id>?1 AND (?2 IS NULL OR t.owner=?2) AND json_extract(w.record,'$.state') != 'released' ORDER BY w.task_id LIMIT ?3"
+            } else {
+                "SELECT w.record FROM workspaces w JOIN tasks t ON t.id=w.task_id WHERE w.task_id>?1 AND (?2 IS NULL OR t.owner=?2) ORDER BY w.task_id LIMIT ?3"
             };
             let mut statement = store.connection().prepare(query)?;
             let raw =
@@ -482,5 +563,76 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "workspace.release" => release(store, &args),
         _ => bail!("unknown workspace command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod stale_write_tests {
+    use super::*;
+
+    fn record(lease: &str) -> Workspace {
+        Workspace {
+            task_id: "one".into(),
+            generation: "gen1".into(),
+            charter_repo: PathBuf::from("/unused/charter"),
+            repo: PathBuf::from("/unused/repo"),
+            git_repo: PathBuf::from("/unused/repo"),
+            pool: PathBuf::from("/unused/pool"),
+            binary: PathBuf::from("/unused/treehouse"),
+            holder: "privateer:ship:gen1".into(),
+            branch: "privateer/one".into(),
+            base_branch: "main".into(),
+            state: "ready".into(),
+            path: Some(PathBuf::from("/unused/pool/slot")),
+            lease_id: Some(lease.into()),
+            archive_ref: None,
+            switched_branch: None,
+            current_branch: None,
+            retained_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_stale_sweep_copy_never_overwrites_a_reacquired_or_releasing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(&mut store, "charter.put", json!({"id":"mission","objective":"stale write fixture","repo":temp.path(),"min_free_bytes":0})).unwrap();
+        crate::dispatch(&mut store, "ship.put", json!({"name":"ship"})).unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"one","charter_id":"mission","owner":"ship","title":"one"}),
+        )
+        .unwrap();
+
+        // The sweep read lease-one, then the task was released and reacquired.
+        save(&store, &record("lease-two")).unwrap();
+        let stale = record("lease-one");
+        let lock = Lock::acquire(&store).unwrap();
+        assert!(current(&store, &lock, &stale).unwrap().is_none());
+        assert!(
+            keep(&store, &lock, &stale, "stale reason")
+                .unwrap()
+                .is_none()
+        );
+        let after = load(&store, "one").unwrap().unwrap();
+        assert_eq!(after.lease_id.as_deref(), Some("lease-two"));
+        assert_eq!(after.state, "ready");
+        assert_eq!(after.retained_reason, None);
+
+        // A release that has saved "releasing" is not written back to ready.
+        let mut releasing = record("lease-two");
+        releasing.state = "releasing".into();
+        save(&store, &releasing).unwrap();
+        let fresh = record("lease-two");
+        assert!(
+            keep(&store, &lock, &fresh, "jobs still running")
+                .unwrap()
+                .is_some()
+        );
+        drop(lock);
+        let after = load(&store, "one").unwrap().unwrap();
+        assert_eq!(after.state, "releasing");
+        assert_eq!(after.retained_reason, None);
     }
 }
