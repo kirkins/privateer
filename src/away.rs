@@ -91,9 +91,14 @@ fn registry() -> Result<rusqlite::Connection> {
         ("digest_every_secs", "INTEGER"),
     ] {
         if !columns.iter().any(|c| c == column) {
-            conn.execute_batch(&format!(
+            // Another process opening the registry at the same moment may add
+            // it first; its duplicate is the same outcome.
+            if let Err(error) = conn.execute_batch(&format!(
                 "ALTER TABLE away ADD COLUMN {column} {definition}"
-            ))?;
+            )) && !error.to_string().contains("duplicate column name")
+            {
+                return Err(error.into());
+            }
         }
     }
     Ok(conn)
