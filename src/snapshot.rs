@@ -389,6 +389,11 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         [],
         |r| r.get::<_, bool>(0),
     )?;
+    let has_crew_panes = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='crew_panes')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
     let mut jobs = vec![];
     for job in live {
         budget.check()?;
@@ -463,8 +468,19 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
             }
             _ => Value::Null,
         };
+        // A crew whose space was recorded can be read with `session.read`.
+        let session = if has_crew_panes {
+            conn.query_row("SELECT viewer FROM crew_panes WHERE job_id=?1", [id], |r| {
+                r.get::<_, bool>(0)
+            })
+            .optional()?
+            .map(|viewer| if viewer { "viewer" } else { "live" })
+        } else {
+            None
+        };
         jobs.push(json!({
             "id": id, "task_id": task_id, "task_title": task_title, "kind": kind,
+            "session": session,
             "state": status, "heavy": job["heavy"].as_bool().unwrap_or(false),
             "created_ms": job["created_ms"], "spawned_ms": job.get("spawned_ms").cloned().unwrap_or(Value::Null),
             "started_ms": holders.and_then(|h| h.by_job.get(id)),

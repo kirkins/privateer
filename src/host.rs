@@ -593,11 +593,21 @@ fn crew_space(
         env,
         command,
     )?;
+    let viewer = command[0] == "watch";
+    // Where the captain finds this crew's session. Presentation only: a
+    // pane that is not recorded still runs the crew.
+    let binding = crate::herdr::Binding {
+        socket,
+        socket_identity: client.identity(),
+        pane: pane.clone(),
+    };
+    let recorded = crate::session::record_crew(store, job, ship, &binding, viewer);
     settle(store, &mut client, &pane.workspace_id, "crew", ship);
     store.audit(
         "host.crew",
         &json!({"job_id": job, "task_id": task, "pane": pane.pane_id,
-            "workspace": pane.workspace_id, "viewer": command[0] == "watch"}),
+            "workspace": pane.workspace_id, "viewer": viewer,
+            "unrecorded": recorded.err().map(|e| format!("{e:#}"))}),
     )?;
     Ok(())
 }
