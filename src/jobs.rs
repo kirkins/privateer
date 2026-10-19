@@ -129,6 +129,10 @@ struct Job {
     foreign: Option<String>,
     #[serde(default)]
     work_offer: Option<String>,
+    /// The parked crew this runtime resume continues. Kept so a claim can
+    /// admit the resume's own work through that crew's lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_of: Option<String>,
     /// Crew hosted in the terminal host: the supervisor runs in its own
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2155,6 +2159,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .get("work_offer")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        resume_of: resume_of.map(str::to_owned),
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
         spawned_ms: None,
         model_route: args
@@ -2272,7 +2277,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                     && existing.estimate == job.estimate
                     && existing.wait_for_capacity == job.wait_for_capacity
                     && existing.hosted == job.hosted
-                    && existing.work_offer == job.work_offer,
+                    && existing.work_offer == job.work_offer
+                    && existing.resume_of == job.resume_of,
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));

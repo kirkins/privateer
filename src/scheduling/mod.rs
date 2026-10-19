@@ -452,7 +452,7 @@ pub(crate) fn admit_job(
                 matched_offer |= offer == Some(expected);
                 let mut allowed = job == expected || offer == Some(expected);
                 if !allowed && id == origin {
-                    allowed = resume_predates(store, resume_of, expected)?;
+                    allowed = resume_predates(store, parent.or(resume_of), &id, expected)?;
                 }
                 let mut ancestor = parent.or(resume_of).map(str::to_owned);
                 for _ in 0..128 {
@@ -472,7 +472,14 @@ pub(crate) fn admit_job(
                         allowed = true;
                         break;
                     }
-                    ancestor = record.and_then(|r| r["started_by"].as_str().map(str::to_owned));
+                    // A resume continues the crew it names, as a started job
+                    // continues the job that started it.
+                    ancestor = record.and_then(|r| {
+                        r["started_by"]
+                            .as_str()
+                            .or(r["resume_of"].as_str())
+                            .map(str::to_owned)
+                    });
                 }
                 ensure!(
                     allowed,
@@ -485,28 +492,44 @@ pub(crate) fn admit_job(
     bail!("task ancestry exceeds scheduling limit")
 }
 
-/// Whether a parked crew began before the live claim was offered. Its work
-/// was in flight first, so the claim must not orphan its resume.
-fn resume_predates(store: &Store, resume_of: Option<&str>, offer: &str) -> Result<bool> {
-    let Some(crew) = resume_of else {
+/// Whether the crew a launch continues began before the live claim was
+/// offered, on the claimed task. Its work was in flight first, so the claim
+/// must not orphan its resume. The crew is judged by its lineage root (the
+/// crew that first began the work), as `crew::lineage` gives it.
+fn resume_predates(store: &Store, crew: Option<&str>, task: &str, offer: &str) -> Result<bool> {
+    let Some(crew) = crew else {
         return Ok(false);
     };
-    let started: Option<i64> = store
-        .connection()
-        .query_row(
-            "SELECT json_extract(record,'$.created_ms') FROM jobs WHERE id=?1",
-            [crew],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
+    let root = crate::crew::lineage(store, crew)?
+        .last()
+        .context("crew lineage")?
+        .clone();
+    let job_of = |id: &str| -> Result<Option<(Option<String>, Option<i64>)>> {
+        Ok(store
+            .connection()
+            .query_row(
+                "SELECT json_extract(record,'$.task_id'), json_extract(record,'$.created_ms')
+                 FROM jobs WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    };
+    let Some((crew_task, _)) = job_of(crew)? else {
+        return Ok(false);
+    };
+    let Some((Some(root_task), Some(started))) = job_of(&root)? else {
+        return Ok(false);
+    };
     let offered: Option<i64> = store
         .connection()
         .query_row("SELECT created_ms FROM wakes WHERE id=?1", [offer], |r| {
             r.get(0)
         })
         .optional()?;
-    Ok(matches!((started, offered), (Some(s), Some(o)) if s < o))
+    Ok(crew_task.as_deref() == Some(task)
+        && root_task == task
+        && offered.is_some_and(|o| started < o))
 }
 
 fn stopped_ancestor(store: &Store, task: &str) -> Result<Option<String>> {

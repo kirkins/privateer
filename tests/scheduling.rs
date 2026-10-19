@@ -1562,3 +1562,153 @@ fn a_crew_started_before_a_claim_resumes_under_it() {
     );
     assert!(unrelated.contains("execution claim"), "{unrelated}");
 }
+
+/// A crew started under the live claim, its job settled, for resume tests.
+fn claimed_crew(fleet: &mut Fleet, id: &str) -> Value {
+    attend(fleet);
+    enqueue(fleet);
+    let offer = poll(fleet, true)["offer"]["id"].clone();
+    let crew = fleet.ok(
+        "job.start",
+        json!({"id":id,"task_id":"infra-repair","command":["true"],"heavy":false,"work_offer":offer}),
+        None,
+    );
+    assert_eq!(settle_job(fleet, &crew["id"])["status"], "succeeded");
+    crew
+}
+
+#[test]
+fn a_crew_resumed_twice_under_a_claim_resumes_both_times() {
+    let mut fleet = Fleet::new(json!({}));
+    let crew = claimed_crew(&mut fleet, "crew-a0");
+    // Each resume names the one before it, as a second park does through the
+    // runtime's own launch. The second resume reaches the claim through the
+    // first resume's record, not through the original crew alone.
+    let first = fleet.ok(
+        "job.start",
+        json!({"id":"crew-a1","task_id":"infra-repair","command":["true"],"heavy":false,
+        "_resume_of":crew["id"]}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &first["id"])["status"], "succeeded");
+    let second = fleet.ok(
+        "job.start",
+        json!({"id":"crew-a2","task_id":"infra-repair","command":["true"],"heavy":false,
+        "_resume_of":first["id"]}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &second["id"])["status"], "succeeded");
+}
+
+#[test]
+fn a_resumed_crew_starts_its_own_job_under_the_claim() {
+    let mut fleet = Fleet::new(json!({}));
+    let crew = claimed_crew(&mut fleet, "crew-b0");
+    let gate = json!({"task_id":"infra-repair","command":["true"],"heavy":false});
+    let out = fleet.root.join("resumed-gate.out");
+    // The resumed crew runs as the first mate's agent actor and starts its own
+    // gate job, which must inherit the claim through the resume it continues.
+    let resume = fleet.ok(
+        "job.start",
+        json!({"id":"crew-b1","task_id":"infra-repair","heavy":false,"agent_actor":"infra",
+        "_resume_of":crew["id"],"command":[
+            "env","PRIVATEER_ROLE=agent","PRIVATEER_ACTOR=infra",
+            "sh","-c","\"$0\" --home \"$1\" job.start --json \"$2\" >\"$3\" 2>&1",
+            support::BIN, fleet.home, gate.to_string(), out]}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &resume["id"])["status"], "succeeded");
+    let output = std::fs::read_to_string(&out).unwrap();
+    let gate: Value = serde_json::from_str(&output).unwrap_or_else(|_| panic!("{output}"));
+    assert_eq!(settle_job(&fleet, &gate["id"])["status"], "succeeded");
+}
+
+#[test]
+fn an_agent_cannot_pass_a_resume_to_get_past_the_claim() {
+    let mut fleet = Fleet::new(json!({}));
+    let crew = claimed_crew(&mut fleet, "crew-c0");
+    // Only the runtime's own launch may name a resume; an agent's naming of
+    // the crew is ignored, so the launch is an unrelated one and is refused.
+    let refused = fleet.refused(
+        "job.start",
+        json!({"id":"crew-c1","task_id":"infra-repair","command":["true"],"heavy":false,
+        "_resume_of":crew["id"]}),
+        Some("infra"),
+    );
+    assert!(refused.contains("execution claim"), "{refused}");
+}
+
+#[test]
+fn a_woken_first_mate_errand_takes_its_live_offer_without_naming_it() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let offer = poll(&mut fleet, true)["offer"]["id"].clone();
+    // The woken first mate's job carries the live offer; its errand inherits
+    // that offer without the caller naming it. The job runs the errand CLI as
+    // the agent, so the errand sees its supervising job through PRIVATEER_JOB.
+    let brief = json!({"focus":"task:infra-repair","brief":"Review the claimed work."});
+    let out = fleet.root.join("woken-errand.out");
+    let mate = fleet.ok(
+        "job.start",
+        json!({"id":"mate-d1","task_id":"infra-repair","heavy":false,"work_offer":offer,"command":[
+            "env","PRIVATEER_ROLE=agent","PRIVATEER_ACTOR=infra",
+            "sh","-c","\"$0\" --home \"$1\" errand.start --json \"$2\" >\"$3\" 2>&1",
+            support::BIN, fleet.home, brief.to_string(), out]}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &mate["id"])["status"], "succeeded");
+    let output = std::fs::read_to_string(&out).unwrap();
+    let started: Value = serde_json::from_str(&output).unwrap_or_else(|_| panic!("{output}"));
+    assert_eq!(started["status"], "running", "{started}");
+}
+
+#[test]
+fn a_released_offer_cannot_start_an_errand() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let offer = poll(&mut fleet, true)["offer"]["id"].clone();
+    let until = privateer::store::Store::now_ms() + 100000;
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","offer_id":offer,"wait":{"kind":"time","reason":"Release the claim","until_ms":until}}),
+    );
+    // The released offer is no longer the claim, so an errand naming it is
+    // refused rather than admitted by the stale record.
+    let refused = fleet.refused(
+        "errand.start",
+        json!({"focus":"task:infra-repair","brief":"Review the claimed work.","work_offer":offer}),
+        Some("infra"),
+    );
+    assert!(refused.contains("no longer an active claim"), "{refused}");
+}
+
+#[test]
+fn a_resume_of_an_unrelated_job_cannot_pass_the_claim() {
+    let mut fleet = Fleet::new(json!({}));
+    call(
+        &mut fleet,
+        "task.create",
+        json!({"id":"infra-other","charter_id":"fleet","owner":"infra","title":"infra other"}),
+    );
+    // Admitted before the claim, but on another task: it is neither under the
+    // offer nor a crew of this task, so its named resume is refused.
+    let other = fleet.ok(
+        "job.start",
+        json!({"id":"other-1","task_id":"infra-other","command":["true"],"heavy":false}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &other["id"])["status"], "succeeded");
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    poll(&mut fleet, true);
+    let refused = fleet.refused(
+        "job.start",
+        json!({"id":"crew-f1","task_id":"infra-repair","command":["true"],"heavy":false,
+        "_resume_of":other["id"]}),
+        None,
+    );
+    assert!(refused.contains("execution claim"), "{refused}");
+}
