@@ -78,12 +78,12 @@ pub fn init(store: &Store) -> Result<()> {
 }
 
 /// The one definition of a message that only informs, for every place that
-/// decides one: an information-only notice, and nothing in the thread of a
-/// request this same mailbox still has open. `because_of` names the thread a
-/// follow-up grows from, so a low notice correcting that thread is actionable
-/// for the sender of every still-open follow-up, one level only. The parent
-/// may be answered and may live in another home; only an open follow-up sent
-/// from this mailbox counts, and the wake names it.
+/// decides one: an information-only notice that is in the thread of no open
+/// request this mailbox sent or received, and of no request an open follow-up
+/// of this mailbox grows from. `because_of` names the thread a follow-up grows
+/// from, so a low notice in that thread is actionable for the sender of every
+/// still-open follow-up, one level only; the parent may be answered and may
+/// live in another home, and the wake names the follow-up.
 pub(crate) const ROUTINE_MAIL: &str = "kind='notice' AND urgency='low'
      AND NOT (EXISTS(SELECT 1 FROM mail AS follow_up WHERE follow_up.because_of=mail.correlation
        AND follow_up.sender=mail.recipient AND follow_up.state='open'
