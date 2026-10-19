@@ -155,6 +155,11 @@ impl Client {
         })
     }
 
+    /// The socket inode this client was created for.
+    pub fn identity(&self) -> (u64, u64) {
+        self.identity
+    }
+
     /// A fresh stream to the same socket inode this client was created for.
     fn open(&self) -> Result<BufReader<UnixStream>> {
         let before = std::fs::metadata(&self.path).context("Herdr socket unavailable")?;

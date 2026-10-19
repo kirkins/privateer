@@ -2576,6 +2576,92 @@ fn a_hosted_ships_crew_on_another_harness_runs_headless_with_a_viewer_space() {
 }
 
 #[test]
+fn the_captain_reads_and_types_into_a_live_crews_session_until_it_ends() {
+    let place = Place::new();
+    // A headless Codex crew that keeps working until released.
+    fs::write(
+        place.root.join("bin/codex"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"t1\"}}'\n\
+             while [ ! -e '{root}/release' ]; do sleep 0.05; done\n\
+             printf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+            root = place.root.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        place.root.join("bin/codex"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "task.create",
+        json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
+    );
+    place.agent(
+        "agent.start",
+        json!({"id":"crew-3","task_id":"infra-fix","manifest":"bundled:codex","options":{"model":"m"}}),
+    );
+    let pane = herdr.calls("pane.send_input")[0]["params"]["pane_id"].clone();
+
+    // The fleet shows which crew have a session, and of which kind.
+    let snapshot = place.json("fleet.snapshot", json!({}));
+    let job = snapshot["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["jobs"].as_array().unwrap())
+        .find(|j| j["id"] == "crew-3")
+        .unwrap();
+    assert_eq!(job["session"], "viewer", "{job}");
+
+    let read = place.json("session.read", json!({"ship":"infra","job":"crew-3"}));
+    assert_eq!(
+        (&read["pane_id"], &read["viewer"]),
+        (&pane, &json!(true)),
+        "{read}"
+    );
+    place.json(
+        "session.send",
+        json!({"ship":"infra","job":"crew-3","text":"use the cache","keys":["Enter"]}),
+    );
+    let typed = herdr.calls("pane.send_input").last().unwrap()["params"].clone();
+    assert_eq!(
+        (&typed["pane_id"], &typed["text"]),
+        (&pane, &json!("use the cache"))
+    );
+
+    // Another ship's name, or a crew that has ended, reaches nothing.
+    let refused = |args: Value| {
+        !place
+            .command(&["session.read", "--json", &args.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(refused(json!({"ship":"nobody","job":"crew-3"})));
+    fs::write(place.root.join("release"), "").unwrap();
+    until("the crew to finish", || {
+        place.json("job.status", json!({"id":"crew-3"}))["status"] == "succeeded"
+    });
+    assert!(refused(json!({"ship":"infra","job":"crew-3"})));
+}
+
+#[test]
 fn bounded_hosted_crew_plan_retains_its_lifecycle_adapter_without_inheriting_selection() {
     let place = Place::new();
     place.json(

@@ -241,6 +241,7 @@ impl Store {
         crate::report::init(&store)?;
         crate::bundled::migrate(&store)?;
         crate::activation::init(&store)?;
+        crate::session::init(&store)?;
         crate::errand::init(&store)?;
         crate::context::init(&store)?;
         crate::attention::init(&store)?;

@@ -1,16 +1,21 @@
-//! The captain looks into a ship's live first-mate session and types into
-//! it, from any of the fleet's machines.
+//! The captain looks into a ship's live first-mate session, or one of its
+//! crew's, and types into it, from any of the fleet's machines.
 //!
 //! A hosted first mate runs as an interactive harness in a terminal host
-//! pane, bound to the ship's presence lease. `session.read` returns that
-//! pane's recent screen (with its colours, and a revision that changes when
-//! the screen does) and the agent's state; `session.send` types text and
-//! keys into it. Both are the operator's. The binding is checked against
-//! the host before use, so a pane that has been reused for something else is
-//! never read or typed into. A ship on a linked machine is reached over the
-//! gateway.
+//! pane, bound to the ship's presence lease. A hosted ship's crew each get a
+//! space of their own: the harness itself, or for a harness that cannot be
+//! hosted, a view of the headless run (`privateer watch --job`), whose typed
+//! lines go to the first mate. That pane is recorded against the job when
+//! the space opens. `session.read` returns the pane's recent screen (with
+//! its colours, and a revision that changes when the screen does) and the
+//! agent's state; `session.send` types text and keys into it. With `job`,
+//! both act on that crew's pane while the job is live. Both are the
+//! operator's. The binding is checked against the host before use, so a
+//! pane that has been reused for something else is never read or typed
+//! into. A ship on a linked machine is reached over the gateway.
 
 use crate::herdr::{Binding, Client};
+use crate::jobs::TERMINAL_SQL;
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::OptionalExtension;
@@ -22,6 +27,48 @@ const LINES: u32 = 200;
 const MAX_LINES: u32 = 2000;
 const MAX_TEXT_CHARS: usize = 8192;
 const MAX_KEYS: usize = 16;
+
+pub fn init(store: &Store) -> Result<()> {
+    store.connection().execute_batch(
+        "CREATE TABLE IF NOT EXISTS crew_panes(job_id TEXT PRIMARY KEY, ship TEXT NOT NULL,
+           binding TEXT NOT NULL, viewer INTEGER NOT NULL CHECK(viewer IN (0,1)),
+           recorded_ms INTEGER NOT NULL);",
+    )?;
+    Ok(())
+}
+
+/// Record the pane a crew job's space opened, so the captain can find its
+/// session. Rows of jobs that have ended go at the same time, so the table
+/// holds live crew only.
+pub(crate) fn record_crew(
+    store: &Store,
+    job: &str,
+    ship: &str,
+    binding: &Binding,
+    viewer: bool,
+) -> Result<()> {
+    let tx = store.write_transaction()?;
+    tx.execute(
+        &format!(
+            "DELETE FROM crew_panes WHERE job_id NOT IN (SELECT id FROM jobs
+               WHERE json_extract(record,'$.status') NOT IN {TERMINAL_SQL})"
+        ),
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO crew_panes(job_id,ship,binding,viewer,recorded_ms)
+         VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![
+            job,
+            ship,
+            serde_json::to_string(binding)?,
+            viewer,
+            Store::now_ms()
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     ensure!(
@@ -49,6 +96,9 @@ pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
 }
 
 fn check(command: &str, args: &Value) -> Result<()> {
+    if let Some(job) = args.get("job").filter(|v| !v.is_null()) {
+        identifier(job.as_str().context("job must be a job id")?)?;
+    }
     match command {
         "session.read" => {
             if let Some(lines) = args.get("lines").filter(|v| !v.is_null()) {
@@ -109,20 +159,32 @@ fn home_of(ship: &str) -> Result<Option<PathBuf>> {
 
 fn here(home: &std::path::Path, ship: &str, command: &str, args: &Value) -> Result<Value> {
     let store = Store::open(home)?;
-    let (binding, holder) = live_binding(&store, ship)?;
+    let job = args.get("job").and_then(Value::as_str);
+    let (binding, holder, viewer) = match job {
+        Some(job) => crew_binding(&store, ship, job)?,
+        None => {
+            let (binding, holder) = live_binding(&store, ship)?;
+            (binding, holder, None)
+        }
+    };
     let mut client = Client::connect(&binding.socket)?;
     let view = client.snapshot()?;
     let pane = view
         .panes
         .iter()
         .find(|p| binding.matches(&view, p))
-        .with_context(|| format!("{ship}'s session is no longer in its pane"))?;
+        .with_context(|| match job {
+            Some(job) => format!("crew {job}'s session is no longer in its pane"),
+            None => format!("{ship}'s session is no longer in its pane"),
+        })?;
     match command {
         "session.read" => {
             let lines = args["lines"].as_u64().map_or(LINES, |n| n as u32);
             let read = client.read_screen(&pane.pane_id, lines)?;
             Ok(json!({
                 "ship": ship,
+                "job": job,
+                "viewer": viewer,
                 "pane_id": pane.pane_id,
                 "agent_status": pane.agent_status,
                 "revision": read["revision"],
@@ -136,9 +198,10 @@ fn here(home: &std::path::Path, ship: &str, command: &str, args: &Value) -> Resu
             client.type_into(&pane.pane_id, text, &keys)?;
             store.audit(
                 "session.send",
-                &json!({"ship": ship, "holder": holder, "chars": text.chars().count(), "keys": keys}),
+                &json!({"ship": ship, "job": job, "holder": holder,
+                    "chars": text.chars().count(), "keys": keys}),
             )?;
-            Ok(json!({"ship": ship, "pane_id": pane.pane_id, "sent": true}))
+            Ok(json!({"ship": ship, "job": job, "pane_id": pane.pane_id, "sent": true}))
         }
     }
 }
@@ -156,4 +219,28 @@ fn live_binding(store: &Store, ship: &str) -> Result<(Binding, String)> {
     let (binding, holder) = row.with_context(|| format!("{ship} has no live session"))?;
     let binding = binding.with_context(|| format!("{ship}'s session is not in a terminal host"))?;
     Ok((serde_json::from_str(&binding)?, holder))
+}
+
+/// The terminal host binding of a live crew job of `ship`, the job as its
+/// holder, and whether the pane is a view of a headless run.
+fn crew_binding(store: &Store, ship: &str, job: &str) -> Result<(Binding, String, Option<bool>)> {
+    let row: Option<(String, bool)> = store
+        .connection()
+        .query_row(
+            &format!(
+                "SELECT c.binding, c.viewer FROM crew_panes c JOIN jobs j ON j.id=c.job_id
+                 WHERE c.job_id=?1 AND c.ship=?2
+                   AND json_extract(j.record,'$.status') NOT IN {TERMINAL_SQL}"
+            ),
+            rusqlite::params![job, ship],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (binding, viewer) =
+        row.with_context(|| format!("{ship} has no live crew {job} with a session"))?;
+    Ok((
+        serde_json::from_str(&binding)?,
+        job.to_owned(),
+        Some(viewer),
+    ))
 }
