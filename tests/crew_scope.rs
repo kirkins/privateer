@@ -361,7 +361,7 @@ fn a_refused_crew_call_on_a_scratch_home_is_recorded_nowhere() {
     f.crew(
         "crew-1",
         r#"
-REAL=$(getent passwd "$(id -u)" | cut -d: -f6)
+REAL=$(eval echo "~$(id -un)")
 call leak env -u PRIVATEER_ROLE -u PRIVATEER_ACTOR -u PRIVATEER_JOB -u PRIVATEER_FLEET -u XDG_STATE_HOME HOME="$REAL" "$BIN" --home "$ROOT/scratch" mail.ack --json '{"address":"engineering","through_seq":0}'
 "#,
     );
