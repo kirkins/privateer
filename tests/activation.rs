@@ -1417,6 +1417,31 @@ fn errand_settled(fleet: &mut Fleet, id: &str) -> Value {
     }
 }
 
+/// Tick until the infra mailbox holds a message whose body contains `needle`,
+/// and return the whole history. The first mate's wake acknowledges mail in
+/// the background, so an unread-only read can miss a message that has arrived.
+fn mail_history_containing(fleet: &mut Fleet, needle: &str) -> Value {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        fleet.tick();
+        let history = fleet.ok(
+            "mail.inbox",
+            json!({"address":"infra","all":true}),
+            Some("infra"),
+        );
+        let found = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["body"].as_str().unwrap_or_default().contains(needle));
+        if found {
+            return history;
+        }
+        assert!(std::time::Instant::now() < until, "{history}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     let mut fleet = Fleet::new(now_settings());
@@ -1472,7 +1497,7 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     assert!(prompt.contains("Review the cache rebuild"));
     assert!(prompt.contains("review it before merging"));
     // The first mate receives the verdict and no crew outcome for the errand.
-    let inbox = fleet.ok("mail.inbox", json!({"address":"infra"}), Some("infra"));
+    let inbox = mail_history_containing(&mut fleet, &format!("Reviewed: {id}"));
     let mail: Vec<&Value> = inbox["messages"].as_array().unwrap().iter().collect();
     assert_eq!(mail.len(), 1, "{inbox}");
     assert_eq!(mail[0]["from"], "crew");
@@ -1505,7 +1530,7 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     );
     let failed = failing["errand"].as_str().unwrap().to_owned();
     assert_eq!(errand_settled(&mut fleet, &failed)["status"], "failed");
-    let inbox = fleet.ok("mail.inbox", json!({"address":"infra"}), Some("infra"));
+    let inbox = mail_history_containing(&mut fleet, "without a verdict");
     let last = inbox["messages"]
         .as_array()
         .unwrap()
