@@ -248,4 +248,3 @@ def check_headers(servers, env):
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=10)
         at("mcp_servers.credential", lambda: require(done.returncode == 0))
-

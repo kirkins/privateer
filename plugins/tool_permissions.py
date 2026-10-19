@@ -113,7 +113,8 @@ def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship
         return None
     allow = ["$defaults"]
     if "merge_green" in actions:
-        allow.append("Merging green PRs with passing CI and review is authorized by the ship's charter (merge_green).")
+        allow.append("Merging this ship's own pull requests once CI is green is authorized by the ship's "
+                     "charter (merge_green), even without a human review.")
     if "publish_pr" in actions:
         allow.append("Creating and publishing pull requests is authorized by the ship's charter (publish_pr).")
     env = ["$defaults", f"Charter actions granted: {', '.join(sorted(actions))}."]
