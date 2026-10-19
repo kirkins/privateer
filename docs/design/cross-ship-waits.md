@@ -27,26 +27,29 @@ A new wait kind, `remote`, which names a task in another ship's home:
 Push only. There is no next-check timer.
 
 1. **Subscribe.** When the defer is applied, the waiting home sends the owner a runtime notice `payload.wait_subscribe: {task, subscriber, subscriber_task}`. The owner records one subscription row keyed by (subscriber ship, subscriber task, far task). Re-sending the same subscription adds nothing.
-2. **Report.** When the owner's task reaches a final status (`done`, `cancelled`), the owner sends each subscriber a runtime notice `payload.task_end: {task, status, reason}`. If the task had already ended when the subscription arrives, the owner answers at once with its final status, so a late defer does not wait forever.
-3. **Resume.** The waiting home verifies the notice (below), records the satisfied wait in its own transaction, and the scheduler resumes the task with the far status in the resume reason. A `cancelled` status faults the waiting task; it never resumes as if the dependency succeeded.
+2. **Report.** When the owner's task reaches a final status (`done`, `cancelled`), the owner sends each subscriber a runtime notice `payload.task_end: {task, status, reason}`. If the task had already ended when the subscription arrives, the owner answers at once with its final status, so a late defer does not wait forever. The owner sends `wait_closed` `{task, reason}` instead when it refuses the subscription (`reason: refused`) or is retired (`reason: retired`). `wait_closed` is not a final status and reports none.
+3. **Resume.** The waiting home verifies the notice (below), records the satisfied wait in its own transaction, and the scheduler resumes the task with the far status in the resume reason. A `cancelled` status, or a `wait_closed` notice, faults the waiting task; it never resumes as if the dependency succeeded.
 
-Both `wait_subscribe` and `task_end` are runtime-to-runtime. They are handled before any inbox is written, so they never wake the owner's first mate and never appear as mail. They are reserved the way `request_end` is (`src/mail.rs`, the reserved-payload check near line 1091): an agent's `mail.send` that sets either key is refused, so only the runtime can author them. The notices ride the existing outbox and peer link; no new transport.
+`wait_subscribe`, `wait_unsubscribe`, `task_end` and `wait_closed` are runtime-to-runtime. They are handled before any inbox is written, so they never wake the owner's first mate and never appear as mail. They are reserved the way `request_end` is (`src/mail.rs`, the reserved-payload check near line 1091): an agent's `mail.send` that sets any of these keys is refused, so only the runtime can author them. The notices ride the existing outbox and peer link; no new transport.
 
 The waiting home never opens the owner's database. It learns a state only from a `task_end` the owner chose to send.
 
 ## Anti-forgery
 
-A `task_end` is accepted only when all three hold, otherwise it is dropped and audited:
+The link authenticates a machine, not a ship. A notice is accepted only when all of these hold, otherwise it is dropped and audited:
 
-- it arrives over the authenticated peer link, and the link's identity is the ship named in the subscription's ref (the owner's ship, not any ship that can reach the machine);
-- a subscription row exists in the waiting home for (this waiting task, this far task), so unsolicited reports resume nothing;
-- its `task` matches that subscription and its `status` is one of the two final states.
+- `from` equals the ship named in the wait's ref. A notice from any other ship is dropped, even one that can reach the machine.
+- `via` names the machine in the ref, or is absent when the ref names no machine. `via` is the sending machine's declared name, checked against the machine registry (`src/mail.rs`, around line 1466). The incoming path trusts a `from` ship only because that ship is registered with a remote peer (around line 2001).
+- The subscription row matches. The owner accepts a `wait_subscribe` only for a task that exists and is shared with that subscriber. The waiting home accepts a `task_end` or `wait_closed` only for a task whose wait names this far task, so unsolicited reports resume nothing.
+- For `task_end`, `task` matches the wait and `status` is one of `done` or `cancelled`.
+
+On one machine this is the same trust `request_end` already gets: the ship that sends is the one the ref names, and the machine is the one the link came in on.
 
 ## Visibility rule
 
-The owner shares a task explicitly. A task has a `shared_with` list of ships allowed to subscribe to it, set by the owner through `task.update`. A subscription from a ship not on the list is refused with `task_end` `reason: refused`, which reveals nothing about whether the task exists.
+The owner shares a task explicitly. A task has a `shared_with` list of ships allowed to subscribe to it, set by the owner through `task.update`. A subscription from a ship not on the list is refused with a `wait_closed` notice, `reason: refused`, which reveals nothing about whether the task exists. The waiting task faults.
 
-I chose explicit marking over "tasks linked to a request thread the subscriber is in". Mail threads are created and closed by either side, so inferring visibility from them lets a request grant access it was never meant to. An explicit list is default-deny, is visible in `task.show`, and is audited when it changes. The cost is that the owner must mark a dependency before a remote ship can wait on it; that is acceptable, because the owner is the one who decides what another ship may see.
+I chose explicit marking over "tasks linked to a request thread the subscriber is in". A request is ended only by its sender, so a requester who opens a thread should not decide what the owner may reveal: inferring visibility from threads would let a requester open access the owner never granted. An explicit list is default-deny, is visible in `task.show`, and is audited when it changes. The cost is that the owner must mark a dependency before a remote ship can wait on it; that is acceptable, because the owner is the one who decides what another ship may see.
 
 What crosses the link is the final status and a short reason, and nothing else: no notes, brief, logs or task table. A subscription names one task, not a query.
 
@@ -55,7 +58,8 @@ What crosses the link is the final status and a short reason, and nothing else: 
 - The waiting task is cancelled, or re-deferred with a different ref: the waiting home sends `wait_unsubscribe` for the old subscription before it changes the wait. The owner deletes the row.
 - The waiting task ends by any other path (faulted, or its wait is manually stopped): the same unsubscribe is sent when the task leaves `waiting`.
 - The owner's task ends: the owner sends `task_end` once to each subscriber and deletes its subscription rows, so none outlive the task.
-- The owner ship is retired: the owner's home sends `task_end` with `reason: retired` to each subscriber before it stops delivering, then deletes its rows. A waiting task resumes and sees the reason.
+- The owner ship is retired: the owner's home sends `wait_closed` with `reason: retired` to each subscriber before it stops delivering, then deletes its rows. The waiting task faults with that reason. A retired owner's task can never finish, so the wait must not resume.
+- The waiting ship is retired: its home sends `wait_unsubscribe` for each remote wait before it stops delivering, and the waiting tasks end through the normal retirement path. If that notice cannot be sent, the owner deletes the row when its `task_end` to the retired ship is refused, because the ship is no longer registered.
 - The owner's home is lost without notice: the subscriber cannot tell the difference, so it falls back to the unreachable rule below.
 
 ## Unreachable peer
@@ -75,9 +79,9 @@ Staleness is the honest answer to "no next check": the runtime reports how long 
 | Peer unreachable for a long time | Stays `waiting`; staleness surfaced with the far end named. No automatic resume. |
 | Far task cancelled or closed unsuccessfully | `task_end` carries the status; the waiting task faults. |
 | Subscription for an already-ended task | Owner answers at once with its final status. |
-| Owner ship retired | `task_end` `reason: retired` if the owner's home is still up; otherwise the staleness path. |
+| Owner ship retired | `wait_closed` `reason: retired` if the owner's home is still up, and the waiting task faults; otherwise the staleness path. |
 | Ship renamed or scope moved | The ref names the ship; the subscription fails with a clear refusal and the first mate re-defers with the new name. |
-| Far task not shared with this ship | `task_end` `reason: refused`, nothing else. |
+| Far task not shared with this ship | `wait_closed` `reason: refused`, and the waiting task faults. Nothing about the task is revealed. |
 
 ## Implementation order (not part of this task)
 
