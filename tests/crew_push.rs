@@ -128,7 +128,7 @@ echo "not logged in"; exit 1
             let out = Command::new("git")
                 .current_dir(&repo)
                 .env("HOME", self.root.join("home"))
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_GLOBAL", self.root.join("home/.gitconfig"))
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env_remove("GIT_CONFIG_COUNT")
                 .args(args)
@@ -159,7 +159,7 @@ echo "not logged in"; exit 1
         c.current_dir(self.root.join("engineering"))
             .args(args)
             .env("HOME", self.root.join("home"))
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", self.root.join("home/.gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env(
                 "PATH",
