@@ -637,10 +637,13 @@ fn native_exec_preserves_role_and_routes_but_does_not_inherit_foreign_harness_id
             .any(|a| a == "fixture-model")
     );
     // Empty PATH cannot fall back to another installed harness or provider.
+    // The resolver also looks in the mise data directory, so point it at an
+    // empty one: a machine with its own mise-installed claude must not leak in.
     let failed = support::command(argv[0].as_str().unwrap())
         .args(argv[1..].iter().map(|v| v.as_str().unwrap()))
         .env_clear()
         .env("PATH", f.base().join("missing-bin"))
+        .env("MISE_DATA_DIR", f.base().join("no-mise"))
         .output()
         .unwrap();
     assert!(!failed.status.success());
