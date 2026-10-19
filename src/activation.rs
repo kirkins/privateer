@@ -1019,6 +1019,55 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
     }
 }
 
+pub(crate) fn idle_duration(ms: i64) -> String {
+    let minutes = (ms / 60_000).max(0);
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    }
+}
+
+fn wake_output_idle(store: &Store, job_id: &str) -> Option<i64> {
+    let (incarnation, spawned_ms): (Option<String>, Option<i64>) = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(record, '$.incarnation'), json_extract(record, '$.spawned_ms') FROM jobs WHERE id=?1",
+            [job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let spawned_ms = spawned_ms?;
+    let log_path = match incarnation {
+        Some(inc) => store
+            .home()
+            .join("jobs")
+            .join(job_id)
+            .join(inc)
+            .join("stdout.log"),
+        None => store.home().join("jobs").join(job_id).join("stdout.log"),
+    };
+    let now = Store::now_ms();
+    match std::fs::metadata(&log_path) {
+        Ok(meta) => {
+            if meta.len() == 0 {
+                Some(now.saturating_sub(spawned_ms))
+            } else {
+                let modified_ms = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(spawned_ms);
+                Some(now.saturating_sub(modified_ms))
+            }
+        }
+        Err(_) => Some(now.saturating_sub(spawned_ms)),
+    }
+}
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "wake.list" => {
@@ -1037,22 +1086,131 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             )?;
             let wakes = statement
                 .query_map(params![ship, limit], |r| {
+                    let id = r.get::<_, String>(0)?;
+                    let ship = r.get::<_, String>(1)?;
+                    let focus = r.get::<_, String>(2)?;
+                    let through_seq = r.get::<_, i64>(3)?;
+                    let job_id = r.get::<_, Option<String>>(4)?;
+                    let raw_mode = r.get::<_, String>(5)?;
+                    let status = r.get::<_, String>(6)?;
+                    let created_ms = r.get::<_, i64>(7)?;
+                    let finished_ms = r.get::<_, Option<i64>>(8)?;
+                    let error = r.get::<_, Option<String>>(9)?;
                     let usage: Option<String> = r.get(10)?;
-                    Ok(json!({
-                        "id": r.get::<_, String>(0)?, "ship": r.get::<_, String>(1)?,
-                        "focus": r.get::<_, String>(2)?, "through_seq": r.get::<_, i64>(3)?,
-                        "job_id": r.get::<_, Option<String>>(4)?, "mode": r.get::<_, String>(5)?,
-                        "status": r.get::<_, String>(6)?, "created_ms": r.get::<_, i64>(7)?,
-                        "finished_ms": r.get::<_, Option<i64>>(8)?, "error": r.get::<_, Option<String>>(9)?,
+                    let focuses: Option<String> = r.get(11)?;
+                    let session_id = r.get::<_, Option<String>>(12)?;
+                    let idle_ms = if status == "running" {
+                        job_id
+                            .as_deref()
+                            .and_then(|jid| wake_output_idle(store, jid))
+                    } else {
+                        None
+                    };
+                    let mut wake = json!({
+                        "id": id, "ship": ship,
+                        "focus": focus, "through_seq": through_seq,
+                        "job_id": job_id, "mode": raw_mode,
+                        "status": status, "created_ms": created_ms,
+                        "finished_ms": finished_ms, "error": error,
                         "usage": usage.and_then(|u| serde_json::from_str::<Value>(&u).ok()),
-                        "focuses": r.get::<_, Option<String>>(11)?
-                            .and_then(|f| serde_json::from_str::<Value>(&f).ok()),
-                        "session_id": r.get::<_, Option<String>>(12)?,
-                    }))
+                        "focuses": focuses.and_then(|f| serde_json::from_str::<Value>(&f).ok()),
+                        "session_id": session_id,
+                    });
+                    if let Some(idle) = idle_ms {
+                        wake["output_idle_ms"] = json!(idle);
+                    }
+                    Ok(wake)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(json!({"wakes": wakes}))
         }
         _ => bail!("unknown wake command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn stalled_running_wake_is_not_called_fresh() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let mut store = Store::open(&home).unwrap();
+        let now = Store::now_ms();
+        let thirty_six_mins_ago = now - 36 * 60 * 1000;
+
+        crate::jobs::init(&store).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![
+                    "job-stalled",
+                    json!({"id": "job-stalled", "incarnation": "inc-1", "spawned_ms": thirty_six_mins_ago}).to_string()
+                ],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms)
+                 VALUES('wake-stalled', 'art', 'task:art-1', 1, 'job-stalled', 'fresh', 'running', ?1)",
+                [thirty_six_mins_ago],
+            )
+            .unwrap();
+
+        // Wake whose job is waiting for capacity (spawned_ms is None)
+        let ten_mins_ago = now - 10 * 60 * 1000;
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![
+                    "job-queued",
+                    json!({"id": "job-queued", "spawned_ms": Value::Null}).to_string()
+                ],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms)
+                 VALUES('wake-waiting', 'art', 'task:art-3', 3, 'job-queued', 'fresh', 'running', ?1)",
+                [ten_mins_ago],
+            )
+            .unwrap();
+
+        // Fresh wake started 5 seconds ago with no job yet
+        store
+            .connection()
+            .execute(
+                "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms)
+                 VALUES('wake-fresh', 'art', 'task:art-2', 2, NULL, 'fresh', 'running', ?1)",
+                [now - 5_000],
+            )
+            .unwrap();
+
+        let res = dispatch(&mut store, "wake.list", json!({"ship": "art"})).unwrap();
+        let wakes = res["wakes"].as_array().unwrap();
+        assert_eq!(wakes.len(), 3);
+
+        // wake-fresh was created 5s ago: mode stays "fresh", no output_idle_ms
+        assert_eq!(wakes[0]["id"], "wake-fresh");
+        assert_eq!(wakes[0]["mode"], "fresh");
+        assert!(wakes[0].get("output_idle_ms").is_none());
+
+        // wake-waiting is waiting for capacity: mode stays "fresh", shows no idle text
+        assert_eq!(wakes[1]["id"], "wake-waiting");
+        assert_eq!(wakes[1]["mode"], "fresh");
+        assert!(wakes[1].get("output_idle_ms").is_none());
+
+        // wake-stalled spawned 36m ago: mode stays "fresh", output_idle_ms records idle duration
+        assert_eq!(wakes[2]["id"], "wake-stalled");
+        assert_eq!(wakes[2]["mode"], "fresh");
+        let idle = wakes[2]["output_idle_ms"].as_i64().unwrap();
+        assert!(idle >= 36 * 60 * 1000);
+        assert_eq!(idle_duration(idle), "36m");
     }
 }
