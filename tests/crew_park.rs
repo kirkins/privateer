@@ -12,6 +12,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 const SESSION: &str = "7d1b1f0e-1111-4222-8333-444455556666";
 /// See `Fleet::launch_budget`.
 const LAUNCH_BUDGET_SECS: u64 = 20;
+/// A crew's budget counts from its launch, so the child it starts must exist
+/// well before the deadline. Twenty seconds was not enough on a loaded runner.
+const SPENT_CAP_BUDGET_SECS: u64 = 60;
 
 struct Fleet {
     _tmp: tempfile::TempDir,
@@ -214,7 +217,11 @@ esac
     }
     /// Wait until a job reaches one of the accepted statuses.
     fn wait(&self, id: &str, accepted: &[&str]) -> Value {
-        let until = Instant::now() + std::time::Duration::from_secs(60);
+        self.wait_within(60, id, accepted)
+    }
+    /// `wait`, for a job whose own deadline is longer than a minute.
+    fn wait_within(&self, secs: u64, id: &str, accepted: &[&str]) -> Value {
+        let until = Instant::now() + std::time::Duration::from_secs(secs);
         loop {
             // A job that is not created yet is not an error to wait through.
             let out = self.run(
@@ -853,14 +860,16 @@ fn a_spent_park_cap_at_the_deadline_ends_the_crew_and_its_job() {
 fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
     let f = Fleet::new();
     f.set_mode("deadline");
-    // The child must be running by the crew's deadline for it to be cancelled.
+    // The child must exist by the crew's deadline for it to be cancelled, so
+    // wait for it to run before the crew can time out.
     f.json(
         None,
         "charter.put",
-        json!({"id": "engineering", "job_timeout_secs": LAUNCH_BUDGET_SECS, "crew_max_parks": 0}),
+        json!({"id": "engineering", "job_timeout_secs": SPENT_CAP_BUDGET_SECS, "crew_max_parks": 0}),
     );
     start_crew(&f, "crew-26");
-    let crew = f.wait("crew-26", &["timed_out"]);
+    f.wait("child-1", &["running"]);
+    let crew = f.wait_within(SPENT_CAP_BUDGET_SECS + 30, "crew-26", &["timed_out"]);
     assert!(
         crew["reason"]
             .as_str()
