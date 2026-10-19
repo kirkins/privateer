@@ -1563,8 +1563,8 @@ mod tests {
         let refused = refused.downcast_ref::<Refused>().unwrap();
         assert_eq!(refused.blocker, Some(Blocker::Disk), "{refused}");
         // A light job on the same machine is not refused for disk at all.
-        let light = light(0.0);
-        assert!(admit(&settings, &host, 0, &[], &light).is_ok());
+        let light_job = light(0.0);
+        assert!(admit(&settings, &host, 0, &[], &light_job).is_ok());
         // Memory is not a resource a queued job can pass over.
         let settings = Settings {
             min_available_memory_bytes: 16 * GIB,
