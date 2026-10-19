@@ -174,9 +174,9 @@ fn bare_shell_in(info: &Value, folder: &Path) -> bool {
                         && names.iter().any(|name| {
                             SHELLS.contains(name) || login.is_some_and(|login| login == *name)
                         })
-                        && !names.iter().any(|name| {
-                            name.starts_with("privateer") || HARNESSES.contains(name)
-                        })
+                        && !names
+                            .iter()
+                            .any(|name| name.starts_with("privateer") || HARNESSES.contains(name))
                 })
                 && all.iter().all(|p| {
                     p["cwd"]

@@ -1986,8 +1986,7 @@ fn a_restored_space_running_privateer_at_the_shell_pid_is_not_closed() {
     assert_eq!(report["hosted"]["pane"], "w3:p1", "{report}");
     assert!(herdr.calls("workspace.close").is_empty(), "{report}");
     assert!(herdr.order().contains(&"w2".to_owned()));
-    let left: Vec<Value> = place
-        .json("audit.list", json!({"limit":1000}))["events"]
+    let left: Vec<Value> = place.json("audit.list", json!({"limit":1000}))["events"]
         .as_array()
         .unwrap()
         .iter()
