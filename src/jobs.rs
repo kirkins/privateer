@@ -4381,7 +4381,12 @@ mod park_end_signal_tests {
 
         // Once reaped, its PID may be reused: a bare group id is never signalled.
         child.wait().unwrap();
-        let refused = signal_group(&payload, libc::SIGTERM, &[payload.clone()], false);
+        let refused = signal_group(
+            &payload,
+            libc::SIGTERM,
+            std::slice::from_ref(&payload),
+            false,
+        );
         assert!(refused.is_err());
     }
 }
