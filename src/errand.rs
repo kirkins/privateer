@@ -30,26 +30,25 @@ pub fn init(store: &Store) -> Result<()> {
            route TEXT, route_why TEXT);
          CREATE INDEX IF NOT EXISTS errand_ship ON errands(ship, created_ms);",
     )?;
-    let has_digest: bool = store.connection().query_row(
+    // Checked and added under the write lock so concurrent opens cannot both add one.
+    let tx = store.write_transaction()?;
+    let has_digest: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('errands') WHERE name='plan_digest')",
         [],
         |r| r.get(0),
     )?;
     if !has_digest {
-        store
-            .connection()
-            .execute_batch("ALTER TABLE errands ADD COLUMN plan_digest TEXT;")?;
+        tx.execute_batch("ALTER TABLE errands ADD COLUMN plan_digest TEXT;")?;
     }
-    let has_route: bool = store.connection().query_row(
+    let has_route: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('errands') WHERE name='route')",
         [],
         |r| r.get(0),
     )?;
     if !has_route {
-        store
-            .connection()
-            .execute_batch("ALTER TABLE errands ADD COLUMN route TEXT; ALTER TABLE errands ADD COLUMN route_why TEXT;")?;
+        tx.execute_batch("ALTER TABLE errands ADD COLUMN route TEXT; ALTER TABLE errands ADD COLUMN route_why TEXT;")?;
     }
+    tx.commit()?;
     crate::herdr::errands::init(store)?;
     Ok(())
 }

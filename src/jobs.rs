@@ -379,16 +379,17 @@ pub fn init(store: &Store) -> Result<()> {
     ))?;
     // The process that claimed a park's resume, so recovery leaves a launch
     // that is still in flight alone (added after the table first shipped).
-    let claimer: bool = store.connection().query_row(
+    // Checked and added under the write lock so concurrent opens cannot both add it.
+    let tx = store.write_transaction()?;
+    let claimer: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_parks') WHERE name='claimer')",
         [],
         |r| r.get(0),
     )?;
     if !claimer {
-        store
-            .connection()
-            .execute_batch("ALTER TABLE crew_parks ADD COLUMN claimer TEXT")?;
+        tx.execute_batch("ALTER TABLE crew_parks ADD COLUMN claimer TEXT")?;
     }
+    tx.commit()?;
     Ok(())
 }
 fn valid_id(id: &str) -> bool {
@@ -4496,5 +4497,43 @@ mod park_end_signal_tests {
             false,
         );
         assert!(refused.is_err());
+    }
+}
+
+#[cfg(test)]
+mod schema_race_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    /// Two processes can open an old home at once. Both must migrate it: the
+    /// loser of the ADD COLUMN race sees the column already there, not an error.
+    #[test]
+    fn concurrent_opens_of_an_old_schema_both_succeed() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        drop(Store::open(&home).unwrap());
+        {
+            let conn = Connection::open(home.join("privateer.sqlite")).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE crew_parks DROP COLUMN claimer;
+                 ALTER TABLE errands DROP COLUMN plan_digest;
+                 ALTER TABLE errands DROP COLUMN route;
+                 ALTER TABLE errands DROP COLUMN route_why;",
+            )
+            .unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (home, barrier) = (home.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&home).map(drop).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().expect("open must migrate, not fail");
+        }
     }
 }
