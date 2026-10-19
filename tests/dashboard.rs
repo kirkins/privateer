@@ -1,5 +1,6 @@
 #![cfg(feature = "dashboard")]
 
+mod dashboard_sample;
 mod support;
 
 use privateer::{
@@ -192,7 +193,7 @@ fn click_text(app: &mut App, screen: &str, label: &str) {
 fn mouse_fleet_selection_and_scroll_never_open_agents_and_resize_clears_hit_map() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let mut app = App {
-        snapshot: Snapshot::demo(),
+        snapshot: dashboard_sample::snapshot(),
         ..App::default()
     };
     let screen = render(&mut app, 140, 40);
@@ -209,7 +210,7 @@ fn mouse_fleet_selection_and_scroll_never_open_agents_and_resize_clears_hit_map(
 #[test]
 fn bridge_drops_navigation_tabs_board_and_watch_at_all_supported_widths() {
     let mut app = App {
-        snapshot: Snapshot::demo(),
+        snapshot: dashboard_sample::snapshot(),
         ..App::default()
     };
     for width in [40, 80, 120] {
@@ -230,7 +231,7 @@ fn bridge_drops_navigation_tabs_board_and_watch_at_all_supported_widths() {
 
 #[test]
 fn mouse_selection_tracks_the_scrolled_list_instead_of_its_first_record() {
-    let template = privateer::dashboard::captain::sample_mail()[0].clone();
+    let template = dashboard_sample::mail()[0].clone();
     let mail = (0..30)
         .map(|n| {
             let mut m = template.clone();
@@ -253,7 +254,7 @@ fn mouse_selection_tracks_the_scrolled_list_instead_of_its_first_record() {
 #[test]
 fn compact_view_keeps_failures_visible_and_untrusted_controls_are_not_rendered() {
     let mut app = App {
-        snapshot: Snapshot::demo(),
+        snapshot: dashboard_sample::snapshot(),
         compact: true,
         home_age: Some(0),
         home_error: Some("disk unavailable\x1b[2J".into()),
@@ -418,28 +419,6 @@ fn silent_socket_times_out_without_holding_the_operator_loop() {
 }
 
 #[test]
-fn demo_cli_never_opens_an_inherited_herdr_socket() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("api.sock");
-    let listener = UnixListener::bind(&path).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let output = support::command(env!("CARGO_BIN_EXE_privateer-dashboard"))
-        .args(["--demo", "--once"])
-        .env("HERDR_ENV", "1")
-        .env("HERDR_SOCKET_PATH", &path)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["demo"], true);
-    assert!(result["herdr"].is_null());
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
-}
-
-#[test]
 fn refresh_preserves_selected_identity_and_requires_reselection_after_replacement() {
     use privateer::dashboard::herdr::{Pane, View};
     let pane: Pane =
@@ -531,57 +510,10 @@ fn oversized_and_slow_drip_socket_responses_are_bounded() {
 }
 
 #[test]
-fn bridge_preview_identifies_demo_and_does_not_pretend_chat_is_connected() {
-    let mut app = App {
-        snapshot: Snapshot::demo(),
-        mail: privateer::dashboard::captain::sample_mail(),
-        demo: true,
-        herdr: Some(privateer::dashboard::herdr::View::demo()),
-        compact: true,
-        home_age: Some(0),
-        herdr_age: Some(0),
-        ..App::default()
-    };
-    let home = render(&mut app, 120, 34);
-    assert!(home.contains("Fleet"));
-    assert!(home.contains("Research"));
-    app.select_ship(Some("navigator".into()));
-    let view = render(&mut app, 120, 34);
-    assert!(view.contains("DEMO / sample only"));
-    assert!(app.focus_target().is_err());
-    if let Some(path) = std::env::var_os("PRIVATEER_DASHBOARD_PREVIEW") {
-        fs::write(&path, &home).unwrap();
-        app.select_ship(Some("apps".into()));
-        app.select_tab(1);
-        let assignments = render(&mut app, 120, 34);
-        fs::write(
-            std::path::PathBuf::from(&path).with_file_name("dashboard-preview-assignments.txt"),
-            assignments,
-        )
-        .unwrap();
-        app.open_inbox();
-        fs::write(
-            std::path::PathBuf::from(&path).with_file_name("dashboard-preview-inbox.txt"),
-            render(&mut app, 120, 34),
-        )
-        .unwrap();
-        app.open_liaison();
-        app.compose();
-        fs::write(
-            std::path::PathBuf::from(&path).with_file_name("dashboard-preview-compose.txt"),
-            render(&mut app, 120, 34),
-        )
-        .unwrap();
-    }
-}
-
-#[test]
 fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh() {
-    use privateer::dashboard::{captain::sample_mail, herdr::View};
     let mut app = App {
-        snapshot: Snapshot::demo(),
-        mail: sample_mail(),
-        demo: true,
+        snapshot: dashboard_sample::snapshot(),
+        mail: dashboard_sample::mail(),
         ..App::default()
     };
     let before = serde_json::to_value(&app.snapshot).unwrap();
@@ -590,7 +522,7 @@ fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh
     let screen = render(&mut app, 120, 34);
     click_text(&mut app, &screen, "Build investigation update");
     assert_eq!(app.selected, 1);
-    app.update_herdr(View::demo());
+    app.update_herdr(dashboard_sample::view());
     assert_eq!(
         app.selected, 1,
         "a terminal refresh cannot reset a mail selection"
@@ -609,12 +541,11 @@ fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh
 }
 
 #[test]
-fn demo_composer_bounds_input_and_history_without_changing_runtime_state() {
+fn composer_bounds_input_without_changing_runtime_state() {
     use crossterm::event::KeyCode;
     use privateer::dashboard::captain::InputMode;
     let mut app = App {
-        snapshot: Snapshot::demo(),
-        demo: true,
+        snapshot: dashboard_sample::snapshot(),
         ..App::default()
     };
     let before = serde_json::to_value(&app.snapshot).unwrap();
@@ -624,7 +555,7 @@ fn demo_composer_bounds_input_and_history_without_changing_runtime_state() {
         app.edit_composer(KeyCode::Char(c));
     }
     app.edit_composer(KeyCode::Esc);
-    assert!(app.exchanges.is_empty());
+    assert!(app.composer.is_none());
     app.compose();
     for _ in 0..1100 {
         app.edit_composer(KeyCode::Char('界'));
@@ -638,21 +569,13 @@ fn demo_composer_bounds_input_and_history_without_changing_runtime_state() {
     );
     app.edit_composer(KeyCode::Tab);
     assert_eq!(app.composer.as_ref().unwrap().mode, InputMode::Status);
-    app.edit_composer(KeyCode::Enter);
-    app.edit_composer(KeyCode::Enter);
-    assert_eq!(app.exchanges.len(), 1, "submission consumes the draft once");
-    assert!(app.exchanges[0].response.contains("No model call or wake"));
-    for _ in 0..25 {
-        app.compose();
-        app.edit_composer(KeyCode::Char('a'));
-        app.edit_composer(KeyCode::Enter);
-    }
-    assert_eq!(app.exchanges.len(), 20);
+    app.edit_composer(KeyCode::Esc);
+    assert!(app.composer.is_none());
     assert_eq!(serde_json::to_value(&app.snapshot).unwrap(), before);
 }
 
 #[test]
-fn live_captain_view_does_not_infer_mail_or_allow_demo_sends() {
+fn live_captain_view_does_not_infer_mail_or_send_without_a_home() {
     let (_root, store) = fixture();
     let mut app = App {
         snapshot: Snapshot::read(store.home()).unwrap(),
@@ -665,7 +588,6 @@ fn live_captain_view_does_not_infer_mail_or_allow_demo_sends() {
     app.compose();
     assert!(app.composer.is_none());
     assert!(app.notice.contains("No message sent"));
-    assert!(app.exchanges.is_empty());
     app.open_liaison();
     assert!(app.notice.contains("No liaison configured"));
 }
@@ -698,17 +620,16 @@ fn registry_allows_one_optional_liaison_without_changing_task_ownership() {
 
 #[test]
 fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
-    use privateer::dashboard::herdr::View;
     let mut app = App {
-        snapshot: Snapshot::demo(),
-        herdr: Some(View::demo()),
+        snapshot: dashboard_sample::snapshot(),
+        herdr: Some(dashboard_sample::view()),
         ..App::default()
     };
     assert!(app.ship.is_none());
     app.select_ship(Some("apps".into()));
     let bridge = render(&mut app, 140, 40);
     assert!(!bridge.contains("Repeated connection facts"));
-    // The fleet table shows the running crew for apps (demo job build-1 on app-build).
+    // The fleet table shows the running crew for apps (sample job build-1 on app-build).
     assert!(bridge.contains("1 app-build"));
     app.select_tab(1);
     let assigned = render(&mut app, 140, 40);
@@ -851,8 +772,8 @@ fn boarding_never_sends_launch_input_after_the_new_pane_changes() {
 
 #[test]
 fn automatic_bindings_require_socket_terminal_location_and_pinned_session() {
-    use privateer::herdr::{Binding, View};
-    let view = View::demo();
+    use privateer::herdr::Binding;
+    let view = dashboard_sample::view();
     let pane = view.panes[0].clone();
     let mut binding = Binding {
         socket: "/isolated/socket".into(),
@@ -879,10 +800,10 @@ fn automatic_bindings_require_socket_terminal_location_and_pinned_session() {
 fn manual_selection_cannot_bypass_known_automatic_pane_identity() {
     use privateer::dashboard::{
         fleet::ShipState,
-        herdr::{Binding, View},
+        herdr::Binding,
         model::{Ship, TerminalBinding},
     };
-    let mut original = View::demo();
+    let mut original = dashboard_sample::view();
     original.panes[0].agent_session = Some(json!({"kind":"id","value":"original"}));
     let bound = original.panes[0].clone();
     let unrelated = original.panes[1].clone();
@@ -975,12 +896,8 @@ fn manual_selection_cannot_bypass_known_automatic_pane_identity() {
 
 #[test]
 fn automatic_presence_bindings_cannot_give_one_live_pane_to_two_ships() {
-    use privateer::dashboard::{
-        fleet::ShipState,
-        herdr::{Binding, View},
-        model::Ship,
-    };
-    let view = View::demo();
+    use privateer::dashboard::{fleet::ShipState, herdr::Binding, model::Ship};
+    let view = dashboard_sample::view();
     let binding = Binding {
         socket: "/isolated/socket".into(),
         socket_identity: view.socket_identity,
@@ -1020,8 +937,7 @@ fn outcome_notices_expire_clear_on_navigation_and_render_once() {
     use privateer::dashboard::ui::NOTICE_TTL;
     use std::time::Instant;
     let mut app = App {
-        snapshot: Snapshot::demo(),
-        demo: true,
+        snapshot: dashboard_sample::snapshot(),
         ..App::default()
     };
     let start = Instant::now();
@@ -1046,12 +962,12 @@ fn outcome_notices_expire_clear_on_navigation_and_render_once() {
     assert!(app.tick_notice(start + NOTICE_TTL * 5));
 
     // Navigation starts with a clean slate; refresh does not.
-    app.notice = "Demo replies are sample-only.".into();
+    app.notice = "Reply not sent.".into();
     app.select_ship(None);
     assert!(app.notice.is_empty());
     app.select_ship(Some("apps".into()));
     app.notice = "Retired apps; its folder is kept.".into();
-    let mut snapshot = Snapshot::demo();
+    let mut snapshot = dashboard_sample::snapshot();
     snapshot.ships.retain(|s| s.id != "apps");
     app.update_snapshot(snapshot);
     assert!(app.ship.is_none());
@@ -1065,14 +981,6 @@ fn an_empty_live_fleet_points_to_ship_creation_without_a_liaison_action() {
     assert!(screen.contains("Runtime needs not observed"));
     assert!(app.snapshot.ships.is_empty());
     assert!(!screen.contains("[l Talk to liaison]"));
-    let mut demo = App {
-        snapshot: Snapshot::demo(),
-        demo: true,
-        ..App::default()
-    };
-    let screen = render(&mut demo, 120, 34);
-    assert!(!screen.contains("[l Talk to liaison]"));
-    assert!(screen.contains("DEMO / sample only"));
 }
 
 #[test]
@@ -1197,7 +1105,7 @@ fn a_message_leaving_history_requires_explicit_reselection_not_an_adjacent_row()
 fn short_terminals_keep_a_fleet_row_and_ascii_marks_empty_cells_and_long_names() {
     use privateer::dashboard::model::Ship;
     let mut app = App {
-        snapshot: Snapshot::demo(),
+        snapshot: dashboard_sample::snapshot(),
         ..App::default()
     };
     let screen = render(&mut app, 100, 14);
@@ -1235,7 +1143,7 @@ fn short_terminals_keep_a_fleet_row_and_ascii_marks_empty_cells_and_long_names()
 fn v_opens_the_voyage_sea_and_esc_or_v_returns_to_the_bridge() {
     use crossterm::event::KeyCode;
     let mut app = App {
-        snapshot: Snapshot::demo(),
+        snapshot: dashboard_sample::snapshot(),
         home_age: Some(0),
         ..App::default()
     };
@@ -1263,24 +1171,10 @@ fn v_opens_the_voyage_sea_and_esc_or_v_returns_to_the_bridge() {
 }
 
 #[test]
-fn demo_voyage_keeps_the_sample_label() {
-    use crossterm::event::KeyCode;
-    let mut app = App {
-        snapshot: Snapshot::demo(),
-        demo: true,
-        home_age: Some(0),
-        ..App::default()
-    };
-    app.bridge_key(KeyCode::Char('v'));
-    let sea = render(&mut app, 100, 30);
-    assert!(sea.contains("voyage · DEMO / sample only"), "{sea}");
-}
-
-#[test]
 fn mouse_is_ignored_while_the_sea_is_open() {
     use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
     let mut app = App {
-        snapshot: Snapshot::demo(),
+        snapshot: dashboard_sample::snapshot(),
         home_age: Some(0),
         ..App::default()
     };
@@ -1301,14 +1195,14 @@ fn mouse_is_ignored_while_the_sea_is_open() {
 
 #[test]
 fn voyage_counts_a_ship_working_only_from_its_own_fresh_herdr_pane() {
-    let mut view = privateer::dashboard::herdr::View::demo();
+    let mut view = dashboard_sample::view();
     for pane in &mut view.panes {
-        if pane.pane_id == "demo:apps" {
+        if pane.pane_id == "sample:apps" {
             pane.agent_status = "working".into();
         }
     }
     let mut app = App {
-        snapshot: Snapshot::demo(),
+        snapshot: dashboard_sample::snapshot(),
         herdr: Some(view),
         herdr_age: Some(0),
         ..App::default()

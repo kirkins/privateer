@@ -129,7 +129,7 @@ const COLUMNS: [(&str, u16, bool); 9] = [
     ("Last wake", 14, true),
 ];
 
-/// Whether any ship has a live home observation (never in the demo).
+/// Whether any ship has a live home observation.
 pub fn observed(snapshot: &Snapshot) -> bool {
     snapshot.ships.iter().any(|s| s.live.is_some())
 }

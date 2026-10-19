@@ -8,13 +8,14 @@ consumers; they are not bridge controls. Nothing here installs or deploys.
 
 ```sh
 cargo build --locked --features dashboard --bins
-./target/debug/privateer-dashboard --demo
-./target/debug/privateer-dashboard --demo --once
+./target/debug/privateer-dashboard --once --no-herdr
+./target/debug/privateer-dashboard
 ```
 
 The dashboard dependencies remain optional. Ordinary builds of `privateer`
-need no TUI. Demo mode opens no runtime home, registry or socket, even with
-inherited Herdr variables; its mail and work are explicitly samples.
+need no TUI. The dashboard has no sample or demo mode: it observes registered
+local homes only. `--once` prints one bounded read-only JSON observation, and
+`--no-herdr` keeps it from connecting to Herdr.
 
 ## Hosted machine bridge
 

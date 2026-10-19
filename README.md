@@ -6,119 +6,76 @@
   <img alt="Privateer fleet: the captain, liaison, peer ships, and their first mates and crews" src="assets/banner.png" width="100%" />
 </p>
 
-Privateer is a fresh Rust runtime for independent peer agents working under a charter. One conversational agent is your familiar point of contact; departments can coordinate directly and keep working while that conversation is busy. Every outcome has a recorded owner.
+Privateer is a Rust runtime for a fleet of AI-agent ships. Each ship has a **first mate**, the agent you talk to for that ship's work. First mates coordinate with each other by mail, not by command, and run their own **crew** as supervised jobs. Every task, outcome and open request has one recorded owner. The **charter** says what the fleet may do, and production needs your explicit approval for the exact artifact and environment.
 
-The first milestone is durable machinery and an isolated working pilot. The pilot does not install over an existing fleet, create production credentials, or run model inference.
+## Install and upgrade
 
-See [milestone status and validation](docs/milestone-1.md) for what is implemented, demonstrated, and still needed before fleet replacement. The agreed direction for conversation and activation (the captain, ships and their first mates, mailboxes, channels and standing grants) is in [the conversation and activation design](docs/design/conversation-and-activation.md).
-
-## Terminal dashboard
-
-The optional Rust dashboard is a single-column bridge: Fleet, authoritative
-Needs you, and timestamped Recently done. Herdr owns terminal navigation:
+Rust 1.85 or newer and Cargo are required. Unix is supported.
 
 ```sh
-cargo run --features dashboard --bin privateer-dashboard -- --demo
+cargo install --locked --path . --features dashboard  # privateer and privateer-dashboard
 ```
 
-The dashboard reads existing local homes without creating or repairing them.
-Enter focuses a ship's existing validated Herdr mate space; Tab selects typed
-runtime needs for inline correlated replies or exact artifact/environment/version
-approval/denial. No navigation sidebar, per-ship tabs, Board, Watch or pane creation.
-`i` opens separate mail history; acknowledgement is not resolution. Unknown or
-unavailable evidence is never an all-clear. Demo mode stays sample-only.
-Herdr uses only the injected or explicitly selected socket, with exact identity
-checks. No mail injection into existing agent panes is enabled.
-See [dashboard setup and boundaries](docs/dashboard.md).
+Versioned release directories (`releases/<git commit>/bin` with a `current` link) are described in [releases](docs/releases.md), and stable launchers should point at `current/bin/privateer`. `cargo install` remains supported. `privateer upgrade status` is read-only; the runtime does not execute fleet upgrades yet.
 
-
-## Quick start
-
-Git-backed coding jobs use built-in [Treehouse task workspaces](docs/workspaces.md)
-for separate checkouts, durable leases and explicit safe cleanup. Install
-[Treehouse](https://github.com/kunchenguid/treehouse#install) on PATH for those
-jobs. Ordinary non-Git jobs do not require it.
-
-Jobs share the machine through one host-wide ledger: CPUs, memory and declared
-disk, with floors the machine's owner sets for its real workload. See
-[setting a machine's resource floor](docs/resources.md).
-
-Bare `privateer` opens an installed fleet dashboard in ordinary terminals and
-Herdr. With no current ship, first-run setup offers a dedicated ship folder.
-Entry shows the bridge without boarding anyone, so first mates keep answering
-mail headlessly. Press `l` in the dashboard to talk to your liaison. Running
-`privateer-dashboard` directly opens the observability view. See
-[entry conditions and fallback guidance](docs/dashboard.md#first-run-and-everyday-entry).
+## Getting started
 
 ```sh
-cargo install --locked --path . --features dashboard  # installs privateer + privateer-dashboard
-privateer                           # fleet dashboard and first-run setup
-cd ~/ships/liaison                   # after creating this ship in setup
-privateer start                     # talk to this ship's first mate directly
+cd ~/ships/liaison
+privateer init --ship liaison --liaison   # make this folder a ship and write its AGENTS.md
+privateer start                           # talk to this ship's first mate
+privateer status
 ```
 
-The dashboard uses an executable installed beside the runtime or on PATH.
-If it is missing, bare `privateer` keeps the legacy flow: in a ship folder it
-ensures the dispatcher and opens the harness; elsewhere it offers to initialize
-the current folder first (`--yes` skips that question). Without a configured
-Herdr socket, dashboard observation, inbox and setup remain available; creation
-shows a quoted `privateer --home HOME start` command for direct access.
+`privateer service status|start|stop` manages the background dispatcher, which answers mail while you are away. `privateer ship new NAME` adds a ship, and `privateer ask SHIP "..."` sends one a message. See [getting aboard](docs/architecture.md#getting-aboard) for the first-run flow.
 
-The background dispatcher answers mail while you are away; it is installed as a systemd user service where available, as a launchd agent on a Mac you are logged in to, and otherwise run in the background for this login (`privateer service status|start|stop`). Other everyday commands, from anywhere in the ship folder: `privateer ask infra "..."`, `privateer inbox`, `privateer status`, `privateer project add <git url>`. Add more ships without leaving the one you are in: `privateer ship new apps --scope "Application work"` (or ask your first mate to); ships on one machine find and mail each other automatically, and `privateer ship retire NAME` retires one. In the legacy flow, scripts can use `privateer --yes` to skip the initialization question.
+Bare `privateer` opens the dashboard when it is installed. Without a dashboard it falls back to the ship-folder flow above.
 
-Pi sessions have an optional, home-persistent [`/calm` conversation view](docs/pi-calm.md), off by default. It quiets operational rows without changing context, tool execution or mail delivery.
+## Commands
 
-Claude ships can run Git and GitHub CLI commands without per-folder permission edits. Use `privateer permissions yolo` (Telegram: `/yolo on`) to select YOLO for every first mate's next launch, or `privateer permissions standard` to restore normal profile behavior. Additional tools use captain-managed fleet rules. See [Tool permissions](docs/tool-permissions.md).
+Captain commands are typed in a terminal, such as `init`, `start`, `status`, `ask`, `tell`, `inbox`, `ship`, `service`, `permissions`, `routes`, `door` and `machine`. Run `privateer --help` for the full list.
 
-To talk to your liaison from your phone, add the Telegram front door: `privateer door add telegram --config ~/.config/privateer/telegram.toml && privateer door start telegram` (see [the Telegram door](plugins/telegram/README.md)). Front doors are fleet-wide adapters that carry the captain's mail; see [architecture](docs/architecture.md#front-doors).
-
-For installation updates and recovery, see [replacing the installed executable](docs/architecture.md#replacing-the-installed-executable). Versioned release identities, durable bundled-adapter references, and read-only `privateer upgrade status` are described in [releases](docs/releases.md); fleet upgrade execution is not implemented yet.
-
-## Automatic prepared work
-
-Prepared tasks can run without new mail or a captain nudge. Write their assignment
-and call `task.enqueue`; the existing dispatcher records a bounded work offer,
-with hosted or fresh task-focused delivery and explicit resumption conditions.
-Legacy open/ranked tasks remain unscheduled. See [work scheduling](docs/scheduling.md)
-for enqueueing, typed waits, native adapter scope and recovery guarantees.
-
-## General runtime and optional integrations
-
-The core owns charters, tasks, custody, targeted messages, coalesced notifications, durable jobs, resource admission, and SSH transport. It contains no personal provider account, model, gateway address, machine name, or user path.
-
-Harnesses and provider routes are optional executable plugins. A private gateway belongs in a plugin's private configuration. Core jobs receive approved argv through the plugin interface; they do not invent a fallback provider. See [architecture](docs/architecture.md) and [plugin examples](plugins/).
-
-The default charter allows implementation, testing, opening PRs, merging passing work, routine recovery, cleanup, delegation, and messaging. Production requires approval of the exact artifact and environment. The current delivery check records workflow evidence; forge merge and production deployment adapters are future integrations.
-
-For human-authored command arguments, the examples use YAML; JSON files are also
-supported:
+Runtime commands take JSON, either inline or from a file:
 
 ```sh
+privateer --home /absolute/private/home status --json '{}'
 privateer --home /absolute/private/home charter.put --file examples/charter.yaml
 ```
 
-Edit the [example charter](examples/charter.yaml) for your repository first.
-`--file` accepts regular UTF-8 `.yaml`, `.yml` and `.json` files, containing one
-object with unique string keys and JSON-compatible values. Plain YAML integers
-must fit `i64` or `u64`; floating-point numbers must fit finite `f64` values.
-Quote numeric-looking text or use `!!str` to keep it as a string, including in
-mapping keys. For `--file`, raw input and normalized JSON arguments are each
-limited to 64 KiB, with at most 64 nesting levels, 10,000 nodes (including keys),
-and 1 MiB of expanded scalar/key data. Nonrecursive YAML aliases are supported
-within these budgets. Parsing finishes before a home is opened.
-YAML supplies data: it does not read includes, run constructors or expand
-environment variables. Local custom tags are rejected; standard core tags and
-inert global annotations may be accepted or ignored as ordinary data. Existing
-command validation still applies. Use `--file` once, separately from `--json`;
-it supplies command arguments, not runtime configuration. RPC, hooks and internal
-supervisors do not accept `--file`. Inline `--json`, machine protocols and outputs
-continue to use JSON. Native integration configuration retains its
-[required formats](plugins/README.md). To pass `--file` to a native harness, put
-it after the separator in `privateer start HARNESS -- --file PATH`.
+`--file` takes one YAML or JSON object of up to 64 KiB, read as data only. `privateer --home PATH rpc` accepts one JSON request per line. First mates run with `PRIVATEER_ROLE=agent`, which refuses operator commands and binds their actor name to their own ship.
 
-## Build and try the isolated pilot
+## Concepts
 
-Rust 1.85 or newer and Cargo are required. Unix systems are supported for process-group supervision. Python 3 is used by optional native adapters and process fixtures; Git is used by the pilot. Node 24 is required for the Pi/OMP extension tests. The extension runs inside the chosen harness in normal use.
+- **Charter**: what the fleet may do. Edit the [example charter](examples/charter.yaml) first. See [architecture](docs/architecture.md#runtime-boundary).
+- **Ships and mail**: each ship has a folder, a mailbox and a first mate. Messages are durable and targeted. See [ships and mailboxes](docs/architecture.md#ships-and-mailboxes).
+- **Tasks and custody**: a task has one owner until a handoff is accepted. See [architecture](docs/architecture.md#runtime-boundary).
+- **Waking**: the dispatcher wakes first mates for due mail and work. See [waking first mates](docs/architecture.md#waking-first-mates).
+- **Crew and outcomes**: crew are supervised jobs that report results back to their first mate. See [crew outcomes](docs/architecture.md#crew-outcomes).
+- **Errands**: short headless reviews or investigations that mail back only a verdict. See [errands](docs/architecture.md#errands).
+- **Scheduling**: prepared tasks can run without a captain nudge. See [work scheduling](docs/scheduling.md).
+- **Workspaces**: Git jobs use separate checkouts through [Treehouse](docs/workspaces.md). Non-Git jobs do not need it.
+- **Resources**: jobs share one host-wide ledger of CPU, memory and disk. See [resources](docs/resources.md).
+- **Permissions and routes**: launch permissions and the order in which crew routes are tried. See [tool permissions](docs/tool-permissions.md).
+- **Harnesses and plugins**: agent harnesses and provider routes are executable plugins. Private gateways and credentials stay in private configuration. See [plugins](plugins/README.md).
+- **Machines and front doors**: ships on linked machines exchange directories over SSH, and front doors such as [Telegram](plugins/telegram/README.md) carry the captain's mail. See [peer transport](docs/architecture.md#peer-transport) and [front doors](docs/architecture.md#front-doors).
+
+## Dashboard
+
+`privateer-dashboard` is a single-column terminal bridge: **Fleet**, **Needs you** and **Recently done**. It reads the real local homes of your registered fleet and never creates or repairs them. It has no sample or demo data.
+
+```sh
+privateer-dashboard                      # interactive; needs a terminal
+privateer-dashboard --once               # one bounded read-only JSON observation
+privateer-dashboard --home /absolute/home --no-herdr
+```
+
+Enter focuses a ship's existing, validated Herdr pane. It never launches or creates panes. Needs you lists typed runtime needs, and an answer is sent as a reply to the original request. `i` opens mail history, `v` opens the voyage view, and `q` quits. Unknown or unavailable evidence is never shown as an all-clear. Full details are in [dashboard setup and boundaries](docs/dashboard.md).
+
+## Design notes
+
+Current architecture is in [docs/architecture.md](docs/architecture.md). Agreed directions and proposals live in [docs/design/](docs/design/), starting with [conversation and activation](docs/design/conversation-and-activation.md). The [milestone 1 notes](docs/milestone-1.md) record the first milestone's status and validation.
+
+## Build, test and pilot
 
 ```sh
 cargo build
@@ -126,30 +83,10 @@ cargo test
 python3 scripts/pilot.py --binary target/debug/privateer
 ```
 
-The pilot creates temporary homes for a navigator and two departments, a small Git repository, and a shared resource ledger. It demonstrates direct peer messages, repeated-alert aggregation, detached work surviving its launcher, resource admission, and durable completion. It performs no live inference, remote publishing, or fleet update. Its evidence and temporary files are retained at the reported path for inspection.
+Python 3 is used by optional native adapters and test fixtures, and Git by the pilot. Node 24 is needed for the Pi/OMP extension tests. The pilot runs in temporary homes, with no live inference, remote publishing or fleet update. See [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
 
-For an independent CLI home:
+## Safety boundaries
 
-```sh
-privateer --home /absolute/private/home init --json '{}'
-privateer --home /absolute/private/home status --json '{}'
-```
+SQLite transactions preserve local state and custody. Job supervisors own their process groups, bound their logs and deadlines, and draw on the host-wide capacity ledger. Charters govern the workflow under the operating-system account that runs Privateer. They are not an adversarial credential sandbox. See [operators and agents](docs/architecture.md#operators-and-agents) for the identity checks and their limits.
 
-Register an SSH peer after installing the same binary on that host. Edit the
-[example peer](examples/peer.yaml) with its SSH host and absolute paths first;
-the [status request](examples/peer-status.yaml) uses the same peer name:
-
-```sh
-privateer --home /absolute/private/home peer.put --file examples/peer.yaml
-privateer --home /absolute/private/home peer.call --file examples/peer-status.yaml
-```
-
-Native SSH handles authentication and host verification. The remote executable and home must be absolute paths; an SSH host is an alias or `user@host`. The caller receives the remote JSON envelope, including its correlation ID and success/error result. Remote state remains remote. The current peer address is a transport configuration, not a proof that another host inherited a charter.
-
-## Safety and reliability boundaries
-
-SQLite transactions preserve local state and custody. Job supervisors own process groups, bound logs and deadlines, and use a host-wide capacity ledger. A busy navigator is not a lock on department work. Notification acknowledgments cover only the observed sequence, so newer facts remain pending.
-
-Charters govern this workflow under the operating-system account running Privateer. They are not an adversarial credential sandbox. See [Operators and agents](docs/architecture.md#operators-and-agents) for caller identity checks, operator restrictions and their limits. Model reasoning still comes from the chosen harness; this milestone has not established a fully autonomous multi-harness fleet. Read [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
-
-Privateer is inspired by First Mate's orchestration and Corsair's experiments, but starts with a new codebase rather than inheriting their shell runtime.
+Privateer is inspired by First Mate's orchestration and Corsair's experiments, but it is a new codebase rather than an inherited shell runtime.
