@@ -322,7 +322,7 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
         summary.push_str(&format!(" urgency {urgency}\n  {body}"));
         if let Some(follow_up) = &follow_up {
             summary.push_str(&format!(
-                "\n  this corrects an open request you raised because of it: {follow_up}; \
+                "\n  the mail is in the thread of a request that your open request {follow_up} grows from; \
                  answer it in that thread, or withdraw or update it with mail.withdraw or mail.send"
             ));
         }

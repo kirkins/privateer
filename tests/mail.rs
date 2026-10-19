@@ -169,8 +169,7 @@ fn a_low_notice_in_the_thread_of_an_open_follow_up_is_actionable_until_that_foll
         dispatch(&mut s, "mail.pending", json!({"address":"infra"})).unwrap()["actionable"],
         0
     );
-    // And a thread with no follow-up of this mailbox's never wakes it, even
-    // for a second ship that has an open request of its own.
+    // A low notice in the thread of an open request wakes its recipient (or sender).
     send(
         &mut s,
         json!({"id":"other","from":"apps","to":"infra","kind":"request","body":"Ship it?"}),
@@ -183,7 +182,7 @@ fn a_low_notice_in_the_thread_of_an_open_follow_up_is_actionable_until_that_foll
     )
     .unwrap();
     let pending = dispatch(&mut s, "mail.pending", json!({"address":"infra"})).unwrap();
-    assert_eq!(pending["actionable"], 1);
+    assert_eq!(pending["actionable"], 2);
     assert_eq!(pending["headers"][0]["id"], "fyi");
 }
 
@@ -211,12 +210,13 @@ fn because_of_names_one_request_and_only_a_request_carries_it() {
         .unwrap()["because_of"],
         "baf32096"
     );
+    let grandchild = send(
+        &mut s,
+        json!({"id":"grandchild","from":"infra","to":"captain","kind":"request","because_of":"child","body":"?"}),
+    )
+    .unwrap();
+    assert_eq!(grandchild["because_of"], "child");
     for (args, expected) in [
-        // No chains: a follow-up of a follow-up names the oldest request.
-        (
-            json!({"id":"grandchild","from":"infra","to":"captain","kind":"request","because_of":"child","body":"?"}),
-            "not a chain",
-        ),
         (
             json!({"id":"self","from":"infra","to":"captain","kind":"request","because_of":"self","body":"?"}),
             "because of itself",
@@ -262,11 +262,11 @@ fn because_of_names_one_request_and_only_a_request_carries_it() {
 
 #[test]
 fn a_notice_may_correct_a_thread_this_home_never_stored() {
-    let (_temp, mut s) = fleet();
+    let Pair { _temp, mut a, .. } = pair();
     // The parent lives in another home, so this one never stored the id: the
-    // correction is exactly the mail that cannot be refused for naming it.
+    // correction to a peer is exactly the mail that cannot be refused for naming it.
     let correction = send(
-        &mut s,
+        &mut a,
         json!({"id":"correction","from":"apps","to":"infra","kind":"notice","urgency":"low",
         "correlation":"baf32096","body":"Correction: the desktop is free"}),
     )
@@ -276,12 +276,23 @@ fn a_notice_may_correct_a_thread_this_home_never_stored() {
     // answers or asks for something only this home can judge.
     for kind in ["reply", "request"] {
         let refused = err(send(
-            &mut s,
+            &mut a,
             json!({"id":format!("{kind}-nowhere"),"from":"apps","to":"infra","kind":kind,
             "correlation":"baf32096","body":"?"}),
         ));
         assert!(refused.contains("unknown correlated message"), "{refused}");
     }
+    // A local typo (notice to a local recipient with unknown correlation) is still refused.
+    let (_temp_local, mut s) = fleet();
+    let local_typo = err(send(
+        &mut s,
+        json!({"id":"local-typo","from":"apps","to":"infra","kind":"notice","urgency":"low",
+        "correlation":"baf32096","body":"Correction: the desktop is free"}),
+    ));
+    assert!(
+        local_typo.contains("unknown correlated message"),
+        "{local_typo}"
+    );
 }
 
 #[test]

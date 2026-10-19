@@ -85,9 +85,12 @@ pub fn init(store: &Store) -> Result<()> {
 /// may be answered and may live in another home; only an open follow-up sent
 /// from this mailbox counts, and the wake names it.
 pub(crate) const ROUTINE_MAIL: &str = "kind='notice' AND urgency='low'
-     AND NOT EXISTS(SELECT 1 FROM mail AS follow_up WHERE follow_up.because_of=mail.correlation
+     AND NOT (EXISTS(SELECT 1 FROM mail AS follow_up WHERE follow_up.because_of=mail.correlation
        AND follow_up.sender=mail.recipient AND follow_up.state='open'
-       AND follow_up.kind IN ('request','decision'))";
+       AND follow_up.kind IN ('request','decision'))
+       OR EXISTS(SELECT 1 FROM mail AS req WHERE req.id=mail.correlation
+       AND req.state='open' AND req.kind IN ('request','decision')
+       AND (req.sender=mail.recipient OR req.recipient=mail.recipient)))";
 
 /// The open follow-up of this mailbox that a notice in its thread concerns, if
 /// any: the oldest one, so a wake names a bounded id to withdraw or update.
@@ -1219,14 +1222,6 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             "because_of is the request a follow-up asks about; only a request carries it"
         );
         ensure!(parent != id, "a request cannot be raised because of itself");
-        // One level, no chains: a follow-up of a follow-up names the oldest
-        // request, so a later correction reaches one child and its parent.
-        if let Some(held) = by_id(store, parent)? {
-            ensure!(
-                held["because_of"].is_null(),
-                "{parent} is itself a follow-up; because_of names one request, not a chain"
-            );
-        }
     }
 
     let tx = store.write_transaction()?;
@@ -1322,7 +1317,8 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             // exactly the one whose correction must still arrive. Replies and
             // requests still name something this home can judge.
             None => ensure!(
-                kind == "notice" || (from == CAPTAIN && kind == "reply" && direct),
+                (kind == "notice" && peer.is_some())
+                    || (from == CAPTAIN && kind == "reply" && direct),
                 "unknown correlated message {correlation}"
             ),
         }
@@ -2021,10 +2017,6 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         ensure!(
             kind == "request",
             "because_of is the request a follow-up asks about; only a request carries it"
-        );
-        ensure!(
-            by_id(store, parent)?.is_none_or(|held| held["because_of"].is_null()),
-            "{parent} is itself a follow-up; because_of names one request, not a chain"
         );
     }
     let request_kind = optional_str(args, "request_kind")?;

@@ -277,11 +277,14 @@ fn not_quiet(store: &Store, ship: &str, profile: &Value) -> Result<Option<&'stat
 /// the last wake's coverage, as `activation::consider` reads it.
 fn mail_pending(store: &Store, ship: &str) -> Result<bool> {
     Ok(store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND COALESCE(delivery,'received')='received'
-           AND (kind<>'notice' OR urgency<>'low')
-           AND seq > MAX(
-             COALESCE((SELECT MAX(through_seq) FROM wakes WHERE ship=?1 AND status='succeeded'), 0),
-             COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1), 0)))",
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND COALESCE(delivery,'received')='received'
+               AND NOT ({})
+               AND seq > MAX(
+                 COALESCE((SELECT MAX(through_seq) FROM wakes WHERE ship=?1 AND status='succeeded'), 0),
+                 COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1), 0)))",
+            crate::mail::ROUTINE_MAIL
+        ),
         [ship],
         |r| r.get(0),
     )?)

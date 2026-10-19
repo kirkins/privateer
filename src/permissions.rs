@@ -238,7 +238,15 @@ pub(crate) fn paused(store: &Store, owner: &str) -> Result<bool> {
         [owner],
         |r| r.get(0),
     )?;
-    let fresh: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2 AND (sender<>'crew' OR task_id IS NOT ?3) AND (kind<>'notice' OR urgency<>'low'))",rusqlite::params![owner,question.max(through),task],|r|r.get(0))?;
+    let fresh: bool = store.connection().query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1 AND seq>?2
+               AND (sender<>'crew' OR task_id IS NOT ?3) AND NOT ({}))",
+            crate::mail::ROUTINE_MAIL
+        ),
+        rusqlite::params![owner, question.max(through), task],
+        |r| r.get(0),
+    )?;
     Ok(!fresh)
 }
 
