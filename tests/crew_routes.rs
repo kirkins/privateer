@@ -882,8 +882,15 @@ fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
             rusqlite::params![now + 3_600_000, now],
         )
         .unwrap();
-    let store =
-        privateer::store::Store::open(&f.root.join("engineering/.privateer/fleet.sqlite")).unwrap();
+    // The ship's home is its folder's `.privateer`, which holds its config.
+    let store = privateer::store::Store::open(&f.root.join("engineering/.privateer")).unwrap();
+    // This test reads the routes file and the ledger in-process, so point both
+    // at the fleet's own copies rather than the machine's.
+    // SAFETY: no other test in this binary reads the environment in-process.
+    unsafe {
+        std::env::set_var("PRIVATEER_FLEET", f.root.join("fleet.sqlite"));
+        std::env::set_var("PRIVATEER_RESOURCE_HOME", f.root.join("ledger"));
+    }
     // New crew start is refused at 85%:
     let refusal = f.refused(
         Some("engineering"),
