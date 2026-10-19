@@ -135,7 +135,13 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
             .query_row(
                 "SELECT pid, started FROM hosted_panes WHERE ship=?1",
                 [ship],
-                |row| Ok(format!("{}:{}", row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok(format!(
+                        "{}:{}",
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?
+                    ))
+                },
             )
             .optional()?
             .unwrap_or_default();
@@ -147,7 +153,11 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
             .optional()?;
         let duty_task = raw
             .and_then(|record| serde_json::from_str::<Value>(&record).ok())
-            .and_then(|record| record["first_mate"]["duty_task"].as_str().map(str::to_owned));
+            .and_then(|record| {
+                record["first_mate"]["duty_task"]
+                    .as_str()
+                    .map(str::to_owned)
+            });
         let Some(duty_task) = duty_task else {
             continue;
         };
@@ -223,12 +233,17 @@ mod tests {
     fn the_stop_line_is_a_block() {
         let screen = "● Bash(git push)\n  ⎿  Error\n3 consecutive actions were blocked. Please review the transcript before continuing.";
         assert!(read(screen).unwrap().lockout);
-        assert!(read("  ⎿  3 consecutive actions were blocked.").unwrap().lockout);
+        assert!(
+            read("  ⎿  3 consecutive actions were blocked.")
+                .unwrap()
+                .lockout
+        );
     }
 
     #[test]
     fn repeated_denial_labels_are_a_block_without_the_stop_line() {
-        let screen = "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
+        let screen =
+            "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
         let finding = read(screen).unwrap();
         assert!(!finding.lockout);
         assert_eq!(finding.denials.len(), 2);
@@ -271,7 +286,10 @@ mod tests {
     fn the_first_mate_instructions_are_not_a_block_at_any_width() {
         let instructions = instructions_text();
         for width in [80, 100, 140] {
-            assert!(read(&wrapped(&instructions, width)).is_none(), "width {width}");
+            assert!(
+                read(&wrapped(&instructions, width)).is_none(),
+                "width {width}"
+            );
         }
     }
 
@@ -279,7 +297,8 @@ mod tests {
     fn the_captain_notice_is_not_a_block() {
         let finding = read("3 consecutive actions were blocked.").unwrap();
         assert!(read(&notice("privateer", &finding)).is_none());
-        let denied = read("  ⎿  [Auto-Mode Bypass] denied\n  ⎿  [Security Test Removal] denied").unwrap();
+        let denied =
+            read("  ⎿  [Auto-Mode Bypass] denied\n  ⎿  [Security Test Removal] denied").unwrap();
         assert!(read(&notice("privateer", &denied)).is_none());
     }
 
@@ -292,7 +311,8 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "INSERT INTO tasks(id,charter_id,owner,title,status,parent,depth)
+                "INSERT INTO charters(id,data) VALUES('privateer','{}');
+                 INSERT INTO tasks(id,charter_id,owner,title,status,parent,depth)
                  VALUES('privateer-automode-lockout','privateer','privateer','Lockout','open',NULL,0);",
             )
             .unwrap();
@@ -307,7 +327,11 @@ mod tests {
     }
 
     fn observe(screen: &str) -> Vec<(String, String, String)> {
-        vec![("privateer".to_owned(), "blocked".to_owned(), screen.to_owned())]
+        vec![(
+            "privateer".to_owned(),
+            "blocked".to_owned(),
+            screen.to_owned(),
+        )]
     }
 
     fn count(store: &Store, sql: &str) -> i64 {
@@ -360,7 +384,11 @@ mod tests {
         launch(&store, 10, "a");
         let screen = "3 consecutive actions were blocked.";
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
-        assert!(alert(&store, &observe("$ cargo test\nok")).unwrap().is_empty());
+        assert!(
+            alert(&store, &observe("$ cargo test\nok"))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(count(&store, "SELECT COUNT(*) FROM hosted_automode"), 0);
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
     }
@@ -381,14 +409,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        let screen = "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
+        let screen =
+            "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM mail WHERE body LIKE '%automatic permission checks%'"),
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail WHERE body LIKE '%automatic permission checks%'"
+            ),
             1
         );
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.block') IS NOT NULL"),
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.block') IS NOT NULL"
+            ),
             1
         );
     }

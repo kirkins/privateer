@@ -184,8 +184,8 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
         )
         .optional()?
         .flatten();
-    let settings_changed = launched
-        .is_some_and(|launched| launched != settings_digest(&settings_paths(store)));
+    let settings_changed =
+        launched.is_some_and(|launched| launched != settings_digest(&settings_paths(store)));
     Ok(Some(json!({
         "pid": pid,
         "executable": image,

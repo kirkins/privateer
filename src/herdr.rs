@@ -541,7 +541,10 @@ impl Client {
             json!({"pane_id": pane, "source": "visible", "format": "plain",
                    "strip_ansi": true}),
         )?;
-        Ok(result["read"]["text"].as_str().unwrap_or_default().to_owned())
+        Ok(result["read"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned())
     }
 
     /// Type into a pane: text, then keys such as `Enter`.
