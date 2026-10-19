@@ -534,11 +534,12 @@ impl Client {
 
     /// A pane's visible screen as plain text, without colours. Auto-mode
     /// detection reads only what is on screen now, never scrollback, so a
-    /// transcript it wrote earlier cannot match again.
+    /// transcript it wrote earlier cannot match again. Herdr accepts only the
+    /// formats "text" and "ansi"; "plain" is rejected.
     pub(crate) fn read_visible_text(&mut self, pane: &str) -> Result<String> {
         let result = self.request(
             "pane.read",
-            json!({"pane_id": pane, "source": "visible", "format": "plain",
+            json!({"pane_id": pane, "source": "visible", "format": "text",
                    "strip_ansi": true}),
         )?;
         Ok(result["read"]["text"]

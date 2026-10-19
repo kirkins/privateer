@@ -456,6 +456,18 @@ impl Herdr {
                     seen.lock().unwrap().push(request);
                     continue;
                 }
+                // Real Herdr accepts only "text" and "ansi" screen formats.
+                if request["method"] == "pane.read"
+                    && !matches!(params["format"].as_str(), Some("text" | "ansi"))
+                {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":request["id"],"error":{"code":"invalid_request","message":"unknown pane.read format"}})
+                    );
+                    seen.lock().unwrap().push(request);
+                    continue;
+                }
                 if request["method"] == "pane.send_input" && suppress.load(Ordering::SeqCst) {
                     let _ = writeln!(
                         stream,
@@ -1957,11 +1969,24 @@ fn the_captain_reads_and_types_into_a_hosted_first_mates_session() {
     assert_eq!(read["pane_id"], "w2:p1", "{read}");
     assert_eq!(read["revision"], 7);
     assert_eq!(read["text"], "\u{1b}[1mpi\u{1b}[0m ready");
-    let asked = &herdr.calls("pane.read")[0]["params"];
+    let reads = herdr.calls("pane.read");
+    let asked = &reads
+        .iter()
+        .find(|call| call["params"]["source"] == "recent")
+        .expect("the recent screen read")["params"];
     assert_eq!(
         (asked["format"].as_str(), asked["lines"].as_u64()),
         (Some("ansi"), Some(50))
     );
+    // Auto-mode detection reads the visible screen as text: Herdr refuses "plain".
+    let visible: Vec<_> = reads
+        .iter()
+        .filter(|call| call["params"]["source"] == "visible")
+        .collect();
+    assert!(!visible.is_empty(), "the visible screen read for auto mode");
+    for call in visible {
+        assert_eq!(call["params"]["format"], "text", "{call}");
+    }
 
     // Typing goes into that pane, and is audited without the text.
     place.json(

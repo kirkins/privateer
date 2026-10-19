@@ -4,7 +4,7 @@
 //! three consecutive blocks it refuses every tool, even reads, and stops. Its
 //! settings load only at launch, so a retry before a relaunch is judged by the
 //! old policy. The host reads each hosted pane's visible screen as plain text.
-//! When it shows the stop line, or repeated denial lines, one captain notice per
+//! When it shows the stop line, or a denial line, one captain notice per
 //! incident offers a relaunch, and the denials become one block ask. The screen
 //! names no tool, so the ask names it "unknown" until the transcript shape is
 //! captured.
@@ -20,15 +20,18 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 /// The stop line text, after its count. Claude prints it as "<N> consecutive
-/// actions were blocked" when the lockout starts.
+/// actions were blocked. Please review the transcript before continuing." when
+/// the lockout starts.
 const LOCKOUT: &str = "consecutive actions were blocked";
-/// Classifier labels that open a denial line, such as `[Auto-Mode Bypass]`.
-const LABELS: [&str; 2] = ["[Auto-Mode ", "[Security "];
+/// The rest of the stop line, on it or on the line after it.
+const REVIEW: &str = "Please review the transcript";
+/// A denial's shape in the transcript: `bash denied by auto mode · [<label>]`.
+const DENIED: &str = " denied by auto mode";
+/// The docs' shape for a blocked call: `Denied by auto mode classifier <reason>`.
+const CLASSIFIER: &str = "Denied by auto mode classifier";
 /// Bullet and box glyphs that Claude and its tool results print before a line.
 /// A diff's `+` and `-` and a quote's `>` are not among them.
 const GLYPHS: &str = "●⏺⎿│├└╰╭╮╯─•·›▸■□✗✘❯";
-/// Denial lines on one screen that count as a block without the stop line.
-const REPEATED: usize = 2;
 
 /// What one screen shows of an auto-mode block. `digest` identifies the
 /// matched lines, so the same block seen again, scrolled or recoloured, is the
@@ -55,24 +58,40 @@ fn lockout_line(line: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(LOCKOUT))
 }
 
-/// A tool result that reports a denial: a classifier label opens the line.
+/// A tool result that reports a denial: `<word> denied by auto mode · [<label>]`
+/// or the docs' `Denied by auto mode classifier <reason>`. One line is enough.
 fn denial_line(line: &str) -> bool {
-    LABELS.iter().any(|label| line.starts_with(label)) && line.contains(']')
+    if line.starts_with(CLASSIFIER) {
+        return true;
+    }
+    let Some((tool, rest)) = line.split_once(DENIED) else {
+        return false;
+    };
+    let label = rest.trim_start().strip_prefix('·').map(str::trim_start);
+    !tool.is_empty()
+        && !tool.contains(char::is_whitespace)
+        && label.is_some_and(|label| label.starts_with('[') && label.contains(']'))
 }
 
-/// The block on a screen, or None when it shows neither the stop line nor
-/// enough denials.
+/// The block on a screen, or None when it shows neither the stop line nor a
+/// denial. The screen shows only the latest denial, so one is enough.
 pub(crate) fn read(screen: &str) -> Option<Finding> {
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(text)
+        .filter(|line| !line.is_empty())
+        .collect();
     let mut lockout = false;
     let mut denials = vec![];
-    for line in screen.lines().map(text).filter(|line| !line.is_empty()) {
+    for (index, line) in lines.iter().enumerate() {
         if lockout_line(line) {
-            lockout = true;
+            let next = lines.get(index + 1).copied().unwrap_or_default();
+            lockout |= line.contains(REVIEW) || next.contains(REVIEW);
         } else if denial_line(line) {
-            denials.push(line.to_owned());
+            denials.push((*line).to_owned());
         }
     }
-    if !lockout && denials.len() < REPEATED {
+    if !lockout && denials.is_empty() {
         return None;
     }
     let mut hasher = Sha256::new();
@@ -233,20 +252,46 @@ mod tests {
     fn the_stop_line_is_a_block() {
         let screen = "● Bash(git push)\n  ⎿  Error\n3 consecutive actions were blocked. Please review the transcript before continuing.";
         assert!(read(screen).unwrap().lockout);
+        // The review phrase may wrap onto the next line.
+        let wrapped = "│ 3 consecutive actions were blocked.\n│ Please review the transcript before continuing.";
+        assert!(read(wrapped).unwrap().lockout);
+    }
+
+    #[test]
+    fn a_count_without_the_review_phrase_is_not_the_stop_line() {
+        assert!(read("  ⎿  3 consecutive actions were blocked.").is_none());
+        assert!(read("3 consecutive actions were blocked.\nok").is_none());
+    }
+
+    #[test]
+    fn a_real_denial_line_is_a_block_on_its_own() {
+        let screen = "bash denied by auto mode · [Security Test Removal] · /permissions";
+        let finding = read(screen).unwrap();
+        assert!(!finding.lockout);
+        assert_eq!(finding.denials.len(), 1);
+        // Claude's box glyphs before the line do not hide it.
         assert!(
-            read("  ⎿  3 consecutive actions were blocked.")
-                .unwrap()
-                .lockout
+            read("│ bash denied by auto mode · [Security Test Removal] · /permissions").is_some()
         );
     }
 
     #[test]
-    fn repeated_denial_labels_are_a_block_without_the_stop_line() {
+    fn a_real_lockout_screen_is_a_block() {
+        let screen = "bash denied by auto mode · [Security Test Removal] · /permissions\n\
+                      │ 3 consecutive actions were blocked. Please review the transcript before continuing.\n\
+                      │ Latest blocked action: [Auto-Mode Bypass]";
+        let finding = read(screen).unwrap();
+        assert!(finding.lockout);
+        assert_eq!(finding.denials.len(), 1);
+    }
+
+    #[test]
+    fn the_docs_denial_row_is_a_block() {
         let screen =
-            "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
+            "  ⎿  Denied by auto mode classifier Reads production data without a stated need";
         let finding = read(screen).unwrap();
         assert!(!finding.lockout);
-        assert_eq!(finding.denials.len(), 2);
+        assert_eq!(finding.denials.len(), 1);
     }
 
     #[test]
@@ -254,6 +299,9 @@ mod tests {
         assert!(read("error: could not compile crate\nauto mode is on").is_none());
         assert!(read("Permission denied (publickey).").is_none());
         assert!(read("[Auto-Mode Bypass] Bash denied").is_none());
+        assert!(read("bash denied by auto mode").is_none());
+        assert!(read("bash denied by auto mode · Security Test Removal").is_none());
+        assert!(read("Two tools denied by auto mode · [Security Test Removal]").is_none());
     }
 
     #[test]
@@ -295,10 +343,13 @@ mod tests {
 
     #[test]
     fn the_captain_notice_is_not_a_block() {
-        let finding = read("3 consecutive actions were blocked.").unwrap();
+        let finding = read(
+            "3 consecutive actions were blocked. Please review the transcript before continuing.",
+        )
+        .unwrap();
         assert!(read(&notice("privateer", &finding)).is_none());
         let denied =
-            read("  ⎿  [Auto-Mode Bypass] denied\n  ⎿  [Security Test Removal] denied").unwrap();
+            read("bash denied by auto mode · [Security Test Removal] · /permissions").unwrap();
         assert!(read(&notice("privateer", &denied)).is_none());
     }
 
@@ -354,7 +405,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        let first = "3 consecutive actions were blocked.";
+        let first =
+            "3 consecutive actions were blocked. Please review the transcript before continuing.";
         // Scrolled, with other output above, the same matched line is the same incident.
         let scrolled = format!("old output\nmore output\n{first}\n");
         assert_eq!(alert(&store, &observe(first)).unwrap().len(), 1);
@@ -371,7 +423,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        let screen = "3 consecutive actions were blocked.";
+        let screen =
+            "3 consecutive actions were blocked. Please review the transcript before continuing.";
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
         launch(&store, 11, "b");
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
@@ -382,7 +435,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        let screen = "3 consecutive actions were blocked.";
+        let screen =
+            "3 consecutive actions were blocked. Please review the transcript before continuing.";
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
         assert!(
             alert(&store, &observe("$ cargo test\nok"))
@@ -398,19 +452,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        let screen = "3 consecutive actions were blocked.";
+        let screen =
+            "3 consecutive actions were blocked. Please review the transcript before continuing.";
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
         assert!(alert(&store, &observe("")).unwrap().is_empty());
         assert!(alert(&store, &observe(screen)).unwrap().is_empty());
     }
 
     #[test]
-    fn repeated_denials_raise_the_block_ask_as_well_as_the_notice() {
+    fn a_denial_raises_the_block_ask_as_well_as_the_notice() {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        let screen =
-            "  ⎿  [Auto-Mode Bypass] Bash denied\n  ⎿  [Security Test Removal] Edit denied";
+        let screen = "bash denied by auto mode · [Security Test Removal] · /permissions";
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
         assert_eq!(
             count(
