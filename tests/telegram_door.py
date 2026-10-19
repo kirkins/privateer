@@ -169,6 +169,61 @@ def check_card_rendering() -> None:
     assert said[2] == {"text": "a\nb", "quiet": True}, said
 
 
+VOICE_PROBE = """
+import json, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, stt, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+out = {"prompts": {t: stt.prompt_for(t) for t in
+                   (".", "...", " . ", "ok.", "5", "こんにちは")}}
+# The door end to end with a fake transcriber: a punctuation-only transcript is
+# answered with a re-record request and never sent to a ship.
+cfg = {"stt": {"api_key": "test-key"}, "tts": {}}
+said, sent = [], []
+d = door.Door({"door": "t"}, cfg, None)
+d.say = lambda text, reply_to=None, html=False, markup=None, quiet=False: (
+    said.append(text) or (len(said), ""))
+d.send = lambda args, msg_id, label: sent.append(args)
+d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "request"}
+d.fetch = lambda file_id, name, msg_id: "/nonexistent/voice.ogg"
+voice = {"voice": {"file_id": "f", "duration": 3}, "message_id": 9}
+stt.transcribe = lambda cfg, path: (".", "")
+d.handle_voice(voice, 9, None)
+out["said"], out["sent"] = list(said), list(sent)
+# A voice reply to a typed decision answers with the transcript, not "(voice)".
+typed = []
+d.send = lambda args, msg_id, label: typed.append(args)
+d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "reply", "correlation": "m1",
+                                          "body": text, "payload": {"answer": {"text": text}}}
+stt.transcribe = lambda cfg, path: ("go with b", "")
+d.handle_voice(voice, 9, 7)
+stt.transcribe = lambda cfg, path: ("word " * 1200, "")
+d.handle_voice(voice, 9, 7)
+out["typed"] = typed
+print(json.dumps(out))
+"""
+
+
+def check_voice_transcripts() -> None:
+    """A transcript with no letters or digits is empty: the door asks the captain to
+    re-record and sends nothing; real words, including a bare "5" and non-Latin
+    text, pass through as the captain's answer."""
+    out = subprocess.run([sys.executable, "-c", VOICE_PROBE, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout)
+    prompts = got["prompts"]
+    for silent in (".", "...", " . "):
+        assert prompts[silent].startswith("[The user sent a voice message but it came through empty"), prompts
+    assert prompts["ok."] == '"ok."' and prompts["5"] == '"5"', prompts
+    assert prompts["こんにちは"] == '"こんにちは"', prompts
+    assert got["said"] == ["🎙️ your voice note came through empty, please re-record"], got
+    assert got["sent"] == [], got
+    short, long = got["typed"]
+    assert short["payload"]["answer"]["text"] == "go with b" and short["body"] == '"go with b"', got
+    assert len(long["payload"]["answer"]["text"]) <= 4096 and len(long["body"]) > 4096, long["body"][:80]
+
+
 class Fleet:
     def __init__(self, binary: str, root: pathlib.Path):
         self.binary, self.root = binary, root
@@ -242,6 +297,7 @@ def main() -> int:
     telegram = FakeTelegram()
     check_age_phrases()
     check_card_rendering()
+    check_voice_transcripts()
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp).resolve()
         fleet = Fleet(binary, root)

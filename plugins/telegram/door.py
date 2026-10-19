@@ -850,9 +850,19 @@ class Door:
             self.say(f"🎙️ transcription failed — {stt.error_class(err)}. The audio is kept at {dest}",
                      reply_to=msg_id)
             return
+        if stt.is_empty(transcript):
+            # Nothing the captain said: tell them to re-record rather than send an answer.
+            self.say("🎙️ your voice note came through empty, please re-record", reply_to=msg_id)
+            return
         body = stt.prompt_for(transcript)
         caption = (msg.get("caption") or "").strip()
         args["body"] = f"{caption}\n{body}" if caption else body
+        if "answer" in args.get("payload", {}):
+            # A typed answer carries the captain's words, not the "(voice)" placeholder.
+            spoken = transcript.strip()
+            text = f"{caption}\n{spoken}" if caption else spoken
+            # The runtime caps an answer at 4096 characters; the body keeps it all.
+            args["payload"]["answer"]["text"] = text if len(text) <= 4096 else text[:4095].rstrip() + "…"
         if transcript.strip() and stt.stt_config(self.cfg).get("echo_transcript", True):
             shown = transcript.strip()
             shown = shown if len(shown) <= 400 else shown[:400].rstrip() + "…"

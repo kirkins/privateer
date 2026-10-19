@@ -210,12 +210,19 @@ def duration_note(voice: dict) -> str:
 # --- prompt semantics (hermes gateway) ------------------------------------------
 
 
+def is_empty(transcript: str) -> bool:
+    """True when the transcript has no letters or digits. Whisper returns "." or
+    "..." for silent or noisy audio, and those are not something the captain said.
+    isalnum (not an ASCII check) so letters in any script still count."""
+    return not any(ch.isalnum() for ch in transcript)
+
+
 def prompt_for(transcript: str) -> str:
     """What a successful transcription is submitted as. Non-empty: a plain quoted
     line — wrappers like "The user sent a voice message..." get read as
     meta-instructions; hermes found the bare quote is what an LLM treats as
-    ordinary user speech. Empty/whitespace: the sentinel above, never an empty
-    prompt (the agent would answer nothing and could loop)."""
-    if not transcript.strip():
+    ordinary user speech. Empty, whitespace, or punctuation only: the sentinel
+    above, never an empty prompt (the agent would answer nothing and could loop)."""
+    if is_empty(transcript):
         return EMPTY_SENTINEL
     return f'"{transcript.strip()}"'
