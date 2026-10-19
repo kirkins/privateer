@@ -672,3 +672,249 @@ fn a_ship_cannot_forge_a_block_ask_or_its_links() {
         json!({"from":"liaison","to":"captain","kind":"notice","about":ask,"body":"still blocked"}),
     );
 }
+
+#[test]
+fn claude_launch_derives_merge_rules_from_charter_actions() {
+    let f = Fleet::new();
+
+    // 1. A ship with merge_green on Forgejo:
+    f.init("fitforge", "claude");
+    let mut profile = f.json("fitforge", "ship.show", json!({"name": "fitforge"}));
+    profile["first_mate"]["batch_secs"] = json!(0);
+    profile["first_mate"]["retry_backoff_secs"] = json!(0);
+    f.json("fitforge", "ship.put", profile);
+    f.json(
+        "fitforge",
+        "permissions.set",
+        json!({
+            "forges": {
+                "forgejo": {
+                    "publish_pr": "fakeforge prs create *",
+                    "merge_green": "fakeforge prs merge *"
+                }
+            }
+        }),
+    );
+    f.json(
+        "fitforge",
+        "charter.put",
+        json!({
+            "id": "fitforge",
+            "objective": "Build and merge fitforge apps",
+            "repo": f.root.join("fitforge").to_str().unwrap(),
+            "actions": ["inspect", "spawn", "implement", "test", "publish_pr", "merge_green"],
+            "forge": "forgejo",
+        }),
+    );
+
+    f.ok(Some("fitforge"), &["start", "claude"]);
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    assert!(
+        args.contains(&"Bash(fakeforge prs merge *)".into()),
+        "merge_green ship Claude launch argv carries the merge rule: {args:?}"
+    );
+    assert!(
+        args.contains(&"Bash(fakeforge prs create *)".into()),
+        "publish_pr carries the publish rule: {args:?}"
+    );
+    let settings_pos = args.iter().position(|a| a == "--settings").unwrap();
+    let settings: Value = serde_json::from_str(&args[settings_pos + 1]).unwrap();
+    let auto_allow = settings["autoMode"]["allow"].as_array().unwrap();
+    assert_eq!(auto_allow[0], "$defaults");
+    assert!(
+        auto_allow
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("merge_green")),
+        "settings carries merge_green context"
+    );
+    let auto_env = settings["autoMode"]["environment"].as_array().unwrap();
+    assert_eq!(auto_env[0], "$defaults");
+
+    // 2. A ship without merge_green on Forgejo:
+    f.init("browser-mac", "claude");
+    let mut profile = f.json("browser-mac", "ship.show", json!({"name": "browser-mac"}));
+    profile["first_mate"]["batch_secs"] = json!(0);
+    profile["first_mate"]["retry_backoff_secs"] = json!(0);
+    f.json("browser-mac", "ship.put", profile);
+    f.json(
+        "browser-mac",
+        "charter.put",
+        json!({
+            "id": "browser-mac",
+            "objective": "Browser automation",
+            "repo": f.root.join("browser-mac").to_str().unwrap(),
+            "actions": ["inspect", "spawn", "implement", "test", "publish_pr"],
+            "forge": "forgejo",
+        }),
+    );
+
+    f.ok(Some("browser-mac"), &["start", "claude"]);
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    assert!(
+        !args.contains(&"Bash(fakeforge prs merge *)".into()),
+        "ship without merge_green must NOT carry the merge rule: {args:?}"
+    );
+    assert!(
+        args.contains(&"Bash(fakeforge prs create *)".into()),
+        "publish_pr carries publish rule: {args:?}"
+    );
+    let settings_pos = args.iter().position(|a| a == "--settings").unwrap();
+    let settings: Value = serde_json::from_str(&args[settings_pos + 1]).unwrap();
+    let auto_allow = settings["autoMode"]["allow"].as_array().unwrap();
+    assert_eq!(auto_allow[0], "$defaults");
+    assert!(
+        !auto_allow
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("merge_green")),
+        "settings must NOT carry merge_green context when not granted"
+    );
+
+    // 3. A crew launch on the merge_green ship never carries the merge rule:
+    f.crew("fitforge", "crew-1", json!({}));
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    assert!(
+        !args.contains(&"Bash(fakeforge prs merge *)".into()),
+        "crew launch never carries the merge rule: {args:?}"
+    );
+    assert!(
+        !args.contains(&"Bash(fakeforge prs create *)".into()),
+        "crew launch never carries the publish rule: {args:?}"
+    );
+    if let Some(pos) = args.iter().position(|a| a == "--settings") {
+        let settings: Value = serde_json::from_str(&args[pos + 1]).unwrap();
+        if let Some(auto_allow) = settings["autoMode"]["allow"].as_array() {
+            assert!(
+                !auto_allow
+                    .iter()
+                    .any(|v| v.as_str().unwrap().contains("merge_green")),
+                "crew launch settings never carry merge_green"
+            );
+        }
+    }
+
+    // 4. GitHub forge mapping:
+    f.init("hub-ship", "claude");
+    let mut profile = f.json("hub-ship", "ship.show", json!({"name": "hub-ship"}));
+    profile["first_mate"]["batch_secs"] = json!(0);
+    profile["first_mate"]["retry_backoff_secs"] = json!(0);
+    f.json("hub-ship", "ship.put", profile);
+    f.json(
+        "hub-ship",
+        "charter.put",
+        json!({
+            "id": "hub-ship",
+            "objective": "GitHub tooling",
+            "repo": f.root.join("hub-ship").to_str().unwrap(),
+            "actions": ["inspect", "spawn", "implement", "test", "publish_pr", "merge_green"],
+            "forge": "github",
+        }),
+    );
+    f.ok(Some("hub-ship"), &["start", "claude"]);
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    assert!(
+        args.contains(&"Bash(gh pr merge *)".into()),
+        "merge_green on GitHub carries gh pr merge: {args:?}"
+    );
+    assert!(
+        args.contains(&"Bash(gh pr create *)".into()),
+        "publish_pr on GitHub carries gh pr create: {args:?}"
+    );
+
+    // GitHub ship without merge_green
+    f.json(
+        "hub-ship",
+        "charter.put",
+        json!({
+            "id": "hub-ship",
+            "objective": "GitHub tooling",
+            "repo": f.root.join("hub-ship").to_str().unwrap(),
+            "actions": ["inspect", "spawn", "implement", "test", "publish_pr"],
+            "forge": "github",
+        }),
+    );
+    f.ok(Some("hub-ship"), &["start", "claude"]);
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    assert!(
+        !args.contains(&"Bash(gh pr merge *)".into()),
+        "without merge_green, GitHub launch does NOT carry gh pr merge: {args:?}"
+    );
+    assert!(
+        args.contains(&"Bash(gh pr create *)".into()),
+        "publish_pr still carries gh pr create: {args:?}"
+    );
+}
+
+#[test]
+fn errand_launch_gets_no_forge_rules() {
+    let f = Fleet::new();
+    f.init("fitforge", "claude");
+    let mut profile = f.json("fitforge", "ship.show", json!({"name": "fitforge"}));
+    profile["first_mate"]["batch_secs"] = json!(0);
+    profile["first_mate"]["retry_backoff_secs"] = json!(0);
+    f.json("fitforge", "ship.put", profile);
+    f.json(
+        "fitforge",
+        "permissions.set",
+        json!({
+            "forges": {
+                "forgejo": {
+                    "publish_pr": "fakeforge prs create *",
+                    "merge_green": "fakeforge prs merge *"
+                }
+            }
+        }),
+    );
+    f.json(
+        "fitforge",
+        "charter.put",
+        json!({
+            "id": "fitforge",
+            "objective": "Build and merge fitforge apps",
+            "repo": f.root.join("fitforge").to_str().unwrap(),
+            "actions": ["inspect", "spawn", "implement", "test", "publish_pr", "merge_green"],
+            "forge": "forgejo",
+        }),
+    );
+
+    let errand = f.json(
+        "fitforge",
+        "errand.start",
+        json!({"focus": "task:fitforge-duty", "brief": "Review the PR"}),
+    );
+    let id = errand["errand"].as_str().unwrap().to_owned();
+    let _ = f.wait("fitforge", &id);
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    assert!(
+        !args.contains(&"Bash(fakeforge prs merge *)".into()),
+        "errand launch must NOT carry merge rule: {args:?}"
+    );
+    assert!(
+        !args.contains(&"Bash(fakeforge prs create *)".into()),
+        "errand launch must NOT carry publish rule: {args:?}"
+    );
+    assert!(
+        !args.contains(&"Bash(gh pr merge *)".into()),
+        "errand launch must NOT carry gh merge rule: {args:?}"
+    );
+    assert!(
+        !args.contains(&"Bash(gh pr create *)".into()),
+        "errand launch must NOT carry gh publish rule: {args:?}"
+    );
+    if let Some(pos) = args.iter().position(|a| a == "--settings") {
+        let settings: Value = serde_json::from_str(&args[pos + 1]).unwrap();
+        if let Some(auto_allow) = settings["autoMode"]["allow"].as_array() {
+            assert!(
+                !auto_allow
+                    .iter()
+                    .any(|v| v.as_str().unwrap().contains("merge_green")),
+                "errand launch settings must NOT carry merge_green: {settings:?}"
+            );
+        }
+    }
+}

@@ -190,7 +190,7 @@ class ClaudeBundles(unittest.TestCase):
                 path.parent.rmdir()
 
     def test_caller_overrides_and_session_flags_refuse(self):
-        for args in (['--plugin-dir', str(self.base)], ['--plugin-url', 'https://invalid'], ['--settings', '{}'],
+        for args in (['--plugin-dir', str(self.base)], ['--plugin-url', 'https://invalid'], ['--settings', '{"permissions": {}}'],
                      ['--setting-sources=user'], ['--mcp-config', 'x.json'], ['--bare'], ['--safe-mode'],
                      ['--agents', '{}'], ['--continue'], ['-c'], ['-pc'], ['-r', SESSION], ['--resume', 'latest'],
                      ['--resume=' + SESSION], ['--session-id', SESSION], ['--fork-session'],
@@ -353,6 +353,31 @@ class ClaudeBundles(unittest.TestCase):
                 execute.assert_not_called()
             undo()
         self.assertEqual(launch(plan)[1]['PRIVATEER_CREDENTIAL_BRAVE_API_KEY_FILE'], str(path))
+
+    def test_bundled_launch_merges_charter_auto_mode_for_merge_green_ship(self):
+        from tool_permissions import attended_argv
+        policy = {
+            'mode': 'standard',
+            'actions': ['inspect', 'publish_pr', 'merge_green'],
+            'forge': 'forgejo',
+            'forges': {'forgejo': {'publish_pr': 'fakeforge prs create *', 'merge_green': 'fakeforge prs merge *'}},
+            'ship': 'fitforge',
+            'claude_allow': [],
+        }
+        attended = attended_argv('claude', ['claude', '--print', '--', 'brief'], policy)
+        self.assertIn('Bash(fakeforge prs merge *)', attended)
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', attended, bundles=self.plan(), attended=True)
+        argv = execute.call_args.args[1]
+        self.assertEqual(argv.count('--settings'), 1)
+        settings = json.loads(argv[argv.index('--settings') + 1])
+        self.assertEqual(settings['model'], 'exact')
+        self.assertEqual(settings['effort'], 'high')
+        self.assertEqual(settings['autoMode']['allow'][0], '$defaults')
+        self.assertTrue(any('merge_green' in r for r in settings['autoMode']['allow']))
+        self.assertEqual(settings['autoMode']['environment'][0], '$defaults')
+        self.assertTrue(any('Charter actions granted' in r for r in settings['autoMode']['environment']))
+        self.assertIn('Bash(fakeforge prs merge *)', argv)
 
 
     def test_selected_mcp_servers_load_by_config_with_headers_from_their_files(self):

@@ -64,6 +64,7 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
         "objective",
         "repo",
         "actions",
+        "forge",
         "max_delegation_depth",
         "job_timeout_secs",
         "min_free_bytes",
@@ -76,6 +77,11 @@ fn charter_put(store: &Store, args: Value) -> Result<Value> {
         if let Some(v) = args.get(key) {
             charter[key] = v.clone();
         }
+    }
+    if let Some(forge) = charter.get("forge").filter(|v| !v.is_null()) {
+        let forge_str = forge.as_str().context("forge must be a string")?;
+        let normalized = crate::permissions::normalize_forge_name(forge_str)?;
+        charter["forge"] = json!(normalized);
     }
     if !charter["active"].is_boolean() {
         bail!("active must be a boolean");

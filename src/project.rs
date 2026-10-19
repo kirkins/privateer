@@ -92,6 +92,15 @@ fn add(store: &mut Store, args: &Value) -> Result<Value> {
         "{} already exists",
         destination.display()
     );
+    let forge = args
+        .get("forge")
+        .filter(|v| !v.is_null())
+        .and_then(Value::as_str);
+    let normalized_forge = if let Some(f) = forge {
+        Some(crate::permissions::normalize_forge_name(f)?)
+    } else {
+        None
+    };
     let staging = projects.join(format!(".{name}-{}.clone", uuid::Uuid::new_v4()));
     let shown = redacted(url);
     let agent = matches!(store.caller(), Caller::Agent { .. });
@@ -114,6 +123,17 @@ fn add(store: &mut Store, args: &Value) -> Result<Value> {
         cloned?;
         bail!("git clone of {shown} failed");
     }
+    if let Some(ref f) = normalized_forge {
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                staging.to_str().unwrap(),
+                "config",
+                "privateer.forge",
+                f.as_str(),
+            ])
+            .status();
+    }
     let published = (|| -> Result<Value> {
         let tx = store.write_transaction()?;
         let again = target_home(store, &target, own.as_deref())?;
@@ -125,8 +145,11 @@ fn add(store: &mut Store, args: &Value) -> Result<Value> {
         );
         fs::rename(&staging, &destination)?;
         let by = own.clone().unwrap_or_else(|| "captain".into());
-        let result = json!({"ship": target, "project": name, "folder": destination,
+        let mut result = json!({"ship": target, "project": name, "folder": destination,
             "url": shown, "by": by});
+        if let Some(f) = normalized_forge {
+            result["forge"] = json!(f);
+        }
         store.audit("project.added", &result)?;
         tx.commit()?;
         Ok(result)

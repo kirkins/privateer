@@ -56,7 +56,7 @@ HEADERS = Path(__file__).resolve().with_name("claude_mcp_headers.py")
 # Flags a bounded Claude launch passes, plus --print for the headless runs
 # that use it. Any installed Claude declaring these will do.
 NEEDED = ["--setting-sources", "--strict-mcp-config", "--settings", "--plugin-dir", "--print"]
-FORBIDDEN = ("--plugin-dir", "--plugin-url", "--settings", "--setting-sources", "--mcp-config", "--bare",
+FORBIDDEN = ("--plugin-dir", "--plugin-url", "--setting-sources", "--mcp-config", "--bare",
              "--safe-mode", "--agents", "--resume", "--continue", "--fork-session", "--session-id",
              "--from-pr", "--teleport")
 
@@ -113,28 +113,54 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
     flags = args[:args.index("--")] if "--" in args else args
     runtime = [str(path) for path in runtime_plugins]
     folders = []
+    kept_flags = []
+    incoming_settings = []
     i = 0
     while i < len(flags):
         arg = flags[i]
         name = arg.split("=", 1)[0]
         if arg == "--plugin-dir" and i + 1 < len(flags) and flags[i+1] in runtime:
+            kept_flags.extend([arg, flags[i+1]])
             runtime.remove(flags[i+1])
             i += 2
         elif name == "--add-dir":
+            kept_flags.append(arg)
             i += 1
             if "=" in arg:
                 folders.append(arg.split("=", 1)[1])
             else:
                 while i < len(flags) and not flags[i].startswith("-"):
                     folders.append(flags[i])
+                    kept_flags.append(flags[i])
                     i += 1
         elif (arg == "--resume" and not attended and i + 1 < len(flags)
                 and str(uuid.UUID(flags[i+1])) == flags[i+1].lower()):
+            kept_flags.extend([arg, flags[i+1]])
             i += 2
+        elif name == "--settings":
+            if "=" in arg:
+                raw = arg.split("=", 1)[1]
+                i += 1
+            elif i + 1 < len(flags):
+                raw = flags[i+1]
+                i += 2
+            else:
+                require(False)
+            try:
+                if not raw.strip().startswith("{") and len(raw) < 1024 and present(Path(raw)):
+                    incoming = json.loads(file_bytes(safe_path(raw)))
+                else:
+                    incoming = json.loads(raw)
+            except Exception:
+                require(False)
+            require(isinstance(incoming, dict))
+            require(all(k == "autoMode" for k in incoming))
+            incoming_settings.append(incoming)
         else:
             require(name not in FORBIDDEN)
             # Short clusters such as -c, -r or -pc continue/resume sessions.
             require(not (arg.startswith("-") and not arg.startswith("--") and set(arg[1:]) & set("cr")))
+            kept_flags.append(arg)
             i += 1
     for folder in folders:
         # A relative folder resolves against Claude's cwd, not this process's.
@@ -148,9 +174,32 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
     with open(binary, "rb") as stream:
         require(stream.read(2) != b"#!")
     require_flags(str(binary), env, cwd or os.getcwd(), "Claude Code", NEEDED)
-    carried = ["--settings", json.dumps(value["settings"], separators=(",", ":"))] if value["settings"] else []
+    merged_settings = dict(value["settings"])
+    for inc in incoming_settings:
+        if "autoMode" in inc:
+            auto = dict(merged_settings.get("autoMode", {}))
+            inc_auto = inc["autoMode"]
+            require(isinstance(inc_auto, dict))
+            for key in ("allow", "environment"):
+                inc_list = inc_auto.get(key, [])
+                require(isinstance(inc_list, list) and all(isinstance(x, str) for x in inc_list))
+                if key in auto:
+                    existing = list(auto[key])
+                    if "$defaults" not in existing and "$defaults" in inc_list:
+                        existing.insert(0, "$defaults")
+                    for item in inc_list:
+                        if item not in existing:
+                            existing.append(item)
+                    auto[key] = existing
+                else:
+                    auto[key] = list(inc_list)
+            merged_settings["autoMode"] = auto
+    if merged_settings:
+        require(len(json.dumps(merged_settings)) <= MAX_CARRIED_BYTES)
+    carried = ["--settings", json.dumps(merged_settings, separators=(",", ":"))] if merged_settings else []
     plugins = [arg for item in value["skills"] for arg in ("--plugin-dir", item["root"])]
-    return [argv[0], *FLAGS, *mcp_config(value.get("mcp_servers", []), env), *carried, *plugins, *args]
+    tail = args[args.index("--"):] if "--" in args else []
+    return [argv[0], *FLAGS, *mcp_config(value.get("mcp_servers", []), env), *carried, *plugins, *kept_flags, *tail]
 
 
 def config_directory(env):

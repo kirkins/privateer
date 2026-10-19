@@ -118,14 +118,17 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
             } else {
                 "validate"
             };
-            let mut request = json!({"id": id, "version": 1, "method": method, "context": context, "options": options});
+            let id_str = args.get("id").and_then(Value::as_str).unwrap_or_default();
+            let is_errand = crate::errand::is_errand(store, id_str).unwrap_or(false);
             // Wakes and errands run as the ship's first mate; anything else is crew.
             let role = if crate::workspace::is_wake(store, &args)? {
                 "first_mate"
             } else {
                 "crew"
             };
+            let mut request = json!({"id": id, "version": 1, "method": method, "context": context, "options": options});
             request["context"]["role"] = json!(role);
+            request["context"]["errand"] = json!(is_errand);
             if let Some(selected) = args.get("tool_bundles") {
                 let mut harness = None;
                 for name in ["pi", "claude"] {
@@ -391,7 +394,23 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
         source_repo.clone()
     };
     let crew = !crate::workspace::is_wake(store, args)?;
-    let mut context = json!({"task_id": id, "title": title, "repo": repo,"source_repo":source_repo,"owner": task["owner"], "actions": charter["actions"], "crew": crew, "control":{"version":1,"cli_argv":[executable,"--home",store.home()],"writable":writable}});
+    let owner = task["owner"].as_str().unwrap_or("");
+    let forges = crate::permissions::detect_forges(store, owner, &charter);
+    let mut context = json!({
+        "task_id": id,
+        "title": title,
+        "repo": repo,
+        "source_repo": source_repo,
+        "owner": owner,
+        "actions": charter["actions"],
+        "forge": forges.first().cloned().unwrap_or_else(|| "github".to_string()),
+        "crew": crew,
+        "control": {
+            "version": 1,
+            "cli_argv": [executable, "--home", store.home()],
+            "writable": writable
+        }
+    });
     // Wake-specific text goes after the stable brief, so the brief's bytes
     // stay identical across wakes and its prefix keeps hitting the cache.
     let mut text = brief(&context);

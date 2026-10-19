@@ -93,5 +93,119 @@ class Permissions(unittest.TestCase):
         self.assertEqual(proc.returncode,0,proc.stderr)
         self.assertEqual(json.loads(proc.stdout),{"permission":'{"*":"allow"}',"route":"pinned"})
 
+    def test_charter_actions_derive_forge_rules_for_first_mate(self):
+        self.policy["forges"] = {
+            "forgejo": {
+                "publish_pr": "fakeforge prs create *",
+                "merge_green": "fakeforge prs merge *",
+            }
+        }
+        req = self.request()
+        req["context"]["role"] = "first_mate"
+        req["context"]["actions"] = ["inspect", "implement", "test", "publish_pr", "merge_green"]
+        req["context"]["forge"] = "forgejo"
+        _, argv = build("claude", req)
+        self.assertIn("Bash(fakeforge prs merge *)", argv)
+        self.assertIn("Bash(fakeforge prs create *)", argv)
+        settings_idx = argv.index("--settings")
+        settings = json.loads(argv[settings_idx + 1])
+        self.assertEqual(settings["autoMode"]["allow"][0], "$defaults")
+        self.assertEqual(settings["autoMode"]["environment"][0], "$defaults")
+        self.assertTrue(any("merge_green" in r for r in settings["autoMode"]["allow"]))
+        self.assertTrue(any("publish_pr" in r for r in settings["autoMode"]["allow"]))
+
+        # GitHub forge
+        req["context"]["forge"] = "github"
+        _, argv = build("claude", req)
+        self.assertIn("Bash(gh pr merge *)", argv)
+        self.assertIn("Bash(gh pr create *)", argv)
+
+        # Ship without merge_green
+        req["context"]["actions"] = ["inspect", "implement", "test", "publish_pr"]
+        req["context"]["forge"] = "forgejo"
+        _, argv = build("claude", req)
+        self.assertNotIn("Bash(fakeforge prs merge *)", argv)
+        self.assertIn("Bash(fakeforge prs create *)", argv)
+        settings_idx = argv.index("--settings")
+        settings = json.loads(argv[settings_idx + 1])
+        self.assertEqual(settings["autoMode"]["allow"][0], "$defaults")
+        self.assertFalse(any("merge_green" in r for r in settings["autoMode"]["allow"]))
+        self.assertTrue(any("publish_pr" in r for r in settings["autoMode"]["allow"]))
+
+    def test_crew_and_errands_never_receive_charter_rules_or_merge_rules(self):
+        self.policy["forges"] = {
+            "forgejo": {
+                "publish_pr": "fakeforge prs create *",
+                "merge_green": "fakeforge prs merge *",
+            }
+        }
+        req = self.request()
+        req["context"]["role"] = "crew"
+        req["context"]["actions"] = ["inspect", "implement", "test", "publish_pr", "merge_green"]
+        req["context"]["forge"] = "forgejo"
+        _, argv = build("claude", req)
+        self.assertNotIn("Bash(fakeforge prs merge *)", argv)
+        self.assertNotIn("Bash(fakeforge prs create *)", argv)
+        self.assertNotIn("Bash(gh pr merge *)", argv)
+        self.assertNotIn("--settings", argv)
+
+        # Errands also never receive merge or publish rules
+        req["context"]["role"] = "first_mate"
+        req["context"]["errand"] = True
+        _, argv = build("claude", req)
+        self.assertNotIn("Bash(fakeforge prs merge *)", argv)
+        self.assertNotIn("Bash(fakeforge prs create *)", argv)
+        self.assertNotIn("Bash(gh pr merge *)", argv)
+        self.assertNotIn("--settings", argv)
+
+    def test_attended_launch_carries_charter_rules_for_merge_green(self):
+        policy_data = dict(self.policy)
+        policy_data["actions"] = ["inspect", "publish_pr", "merge_green"]
+        policy_data["forge"] = "forgejo"
+        policy_data["forges"] = {
+            "forgejo": {
+                "publish_pr": "fakeforge prs create *",
+                "merge_green": "fakeforge prs merge *",
+            }
+        }
+        argv = attended_argv("claude", ["claude"], policy_data)
+        self.assertIn("Bash(fakeforge prs merge *)", argv)
+        self.assertIn("Bash(fakeforge prs create *)", argv)
+        settings_idx = argv.index("--settings")
+        settings = json.loads(argv[settings_idx + 1])
+        self.assertEqual(settings["autoMode"]["allow"][0], "$defaults")
+        self.assertEqual(settings["autoMode"]["environment"][0], "$defaults")
+        self.assertTrue(any("merge_green" in r for r in settings["autoMode"]["allow"]))
+
+        # Without merge_green
+        policy_data["actions"] = ["inspect", "publish_pr"]
+        argv = attended_argv("claude", ["claude"], policy_data)
+        self.assertNotIn("Bash(fakeforge prs merge *)", argv)
+        self.assertIn("Bash(fakeforge prs create *)", argv)
+        settings_idx = argv.index("--settings")
+        settings = json.loads(argv[settings_idx + 1])
+        self.assertEqual(settings["autoMode"]["allow"][0], "$defaults")
+        self.assertFalse(any("merge_green" in r for r in settings["autoMode"]["allow"]))
+
+    def test_preexisting_settings_merges_charter_auto_mode(self):
+        policy_data = dict(self.policy)
+        policy_data["actions"] = ["inspect", "publish_pr", "merge_green"]
+        policy_data["forge"] = "forgejo"
+        policy_data["forges"] = {
+            "forgejo": {
+                "publish_pr": "fakeforge prs create *",
+                "merge_green": "fakeforge prs merge *",
+            }
+        }
+        user_settings = {"autoMode": {"allow": ["$defaults", "Bash(user_cmd *)"], "environment": ["$defaults", "user_env"]}}
+        argv = attended_argv("claude", ["claude", "--settings", json.dumps(user_settings)], policy_data)
+        self.assertEqual(argv.count("--settings"), 1)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["autoMode"]["allow"][0], "$defaults")
+        self.assertIn("Bash(user_cmd *)", settings["autoMode"]["allow"])
+        self.assertTrue(any("merge_green" in r for r in settings["autoMode"]["allow"]))
+        self.assertEqual(settings["autoMode"]["environment"][0], "$defaults")
+        self.assertIn("user_env", settings["autoMode"]["environment"])
+
 
 if __name__=="__main__":unittest.main()

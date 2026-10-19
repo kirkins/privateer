@@ -1175,9 +1175,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                  holder: &str,
                  continuation: Option<crate::host::Conversation>|
      -> Result<std::process::Command> {
-        // Read at every launch, so fleet YOLO set while a pane sleeps applies
-        // at its wake.
-        let policy = serde_json::to_string(&crate::permissions::load()?)?;
+        let mut policy = crate::permissions::load()?;
+        if let Ok(charter) = store.charter(&ship) {
+            policy["actions"] = charter["actions"].clone();
+            let forges = crate::permissions::detect_forges(&store, &ship, &charter);
+            if let Some(f) = forges.first() {
+                policy["forge"] = json!(f);
+            }
+        }
+        policy["ship"] = json!(ship);
+        policy["role"] = json!("first_mate");
+        let policy = serde_json::to_string(&policy)?;
         let mut command = std::process::Command::new("python3");
         command.arg(plugins.join("native_launch.py"));
         if let Some(plan) = &launch.bundle_plan {
@@ -1744,8 +1752,8 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         return Ok(());
     }
     if verb == "project" {
-        let flags = flags(args, &["ship"])?;
-        let usage = "usage: privateer project add GIT_URL [NAME] [--ship SHIP]";
+        let flags = flags(args, &["ship", "forge"])?;
+        let usage = "usage: privateer project add GIT_URL [NAME] [--ship SHIP] [--forge FORGE]";
         ensure!(
             flags.positional.first().map(String::as_str) == Some("add"),
             usage
@@ -1757,6 +1765,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         }
         if let Some(ship) = flags.values.get("ship") {
             request["target"] = json!(ship);
+        }
+        if let Some(forge) = flags.values.get("forge") {
+            request["forge"] = json!(forge);
         }
         let added = crate::dispatch(&mut store, "project.add", request)?;
         println!(
