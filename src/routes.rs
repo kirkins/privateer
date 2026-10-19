@@ -190,6 +190,34 @@ fn usage_of(conn: &Connection, route: &str) -> Result<Usage> {
         .unwrap_or_default())
 }
 
+/// The usage a route is judged on: its own reading with its account's plan
+/// windows laid over it. The account's windows win when it reports any and its
+/// reading is no older than the route's (a tie goes to the account), or when
+/// the route reports none. A route with no reading of its own takes the
+/// account's windows and no runs, since the runs are the route's.
+pub(crate) fn with_account_windows(route: Option<Usage>, account: Option<&Usage>) -> Option<Usage> {
+    let reports = |u: &Usage| u.window_utilization.is_some() || u.weekly_utilization.is_some();
+    let Some(account) = account.filter(|a| reports(a)) else {
+        return route;
+    };
+    let Some(mut usage) = route else {
+        return Some(Usage {
+            runs: 0,
+            runs_window_ends_ms: None,
+            ..account.clone()
+        });
+    };
+    if reports(&usage) && usage.updated_ms > account.updated_ms {
+        return Some(usage);
+    }
+    usage.window_ends_ms = account.window_ends_ms;
+    usage.window_utilization = account.window_utilization;
+    usage.weekly_ends_ms = account.weekly_ends_ms;
+    usage.weekly_utilization = account.weekly_utilization;
+    usage.updated_ms = usage.updated_ms.max(account.updated_ms);
+    Some(usage)
+}
+
 /// The windows a Claude run last reported as allowed: the five-hour window's
 /// end and use, and the seven-day window's.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -861,20 +889,8 @@ fn tight(
 ) -> Result<Option<String>> {
     let mut usage = usage_of(conn, route)?;
     if let Some(account) = account_key(route).filter(|a| a != route) {
-        if let Ok(account_usage) = usage_of(conn, &account) {
-            let account_is_newer = account_usage.updated_ms > usage.updated_ms
-                || (usage.window_utilization.is_none() && usage.weekly_utilization.is_none());
-            if account_is_newer
-                && (account_usage.window_utilization.is_some()
-                    || account_usage.weekly_utilization.is_some())
-            {
-                usage.window_ends_ms = account_usage.window_ends_ms;
-                usage.window_utilization = account_usage.window_utilization;
-                usage.weekly_ends_ms = account_usage.weekly_ends_ms;
-                usage.weekly_utilization = account_usage.weekly_utilization;
-                usage.updated_ms = usage.updated_ms.max(account_usage.updated_ms);
-            }
-        }
+        let account_usage = usage_of(conn, &account).ok();
+        usage = with_account_windows(Some(usage), account_usage.as_ref()).unwrap_or_default();
     }
     let Some(spent) = spent(&usage, limits.runs, now) else {
         return Ok(None);
@@ -2243,5 +2259,36 @@ mod allowance_tests {
     #[test]
     fn utc_time_reads_a_civil_date() {
         assert_eq!(utc_time(1_792_266_600_000), "2026-10-17 19:50 UTC");
+    }
+
+    #[test]
+    fn a_tied_account_reading_with_windows_wins_over_the_route_reading() {
+        let windows = |at: i64, used: f64| Usage {
+            window_utilization: Some(used),
+            updated_ms: at,
+            ..Default::default()
+        };
+        let account = windows(100, 0.9);
+        let route = Usage {
+            runs: 3,
+            ..windows(100, 0.2)
+        };
+        let merged = with_account_windows(Some(route.clone()), Some(&account)).unwrap();
+        assert_eq!(
+            merged.window_utilization,
+            Some(0.9),
+            "a tie goes to the account"
+        );
+        assert_eq!(merged.runs, 3, "the route keeps its own runs");
+        let newer = windows(200, 0.2);
+        let kept = with_account_windows(Some(newer.clone()), Some(&account)).unwrap();
+        assert_eq!(
+            kept, newer,
+            "a route reading newer than the account's stands"
+        );
+        let bare = with_account_windows(None, Some(&account)).unwrap();
+        assert_eq!(bare.window_utilization, Some(0.9));
+        assert_eq!(bare.runs, 0);
+        assert!(with_account_windows(None, Some(&Usage::default())).is_none());
     }
 }

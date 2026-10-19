@@ -1263,29 +1263,7 @@ pub(crate) fn states(
         let id = identity(route);
         let mut used = id.as_ref().and_then(|id| usage.get(id)).cloned();
         if let Some(account) = id.as_deref().and_then(crate::routes::account_key) {
-            if let Some(account_used) = usage.get(&account) {
-                let account_is_newer = used.as_ref().is_none_or(|u| {
-                    account_used.updated_ms > u.updated_ms
-                        || (u.window_utilization.is_none() && u.weekly_utilization.is_none())
-                });
-                if account_is_newer
-                    && (account_used.window_utilization.is_some()
-                        || account_used.weekly_utilization.is_some())
-                {
-                    if let Some(u) = &mut used {
-                        u.window_ends_ms = account_used.window_ends_ms;
-                        u.window_utilization = account_used.window_utilization;
-                        u.weekly_ends_ms = account_used.weekly_ends_ms;
-                        u.weekly_utilization = account_used.weekly_utilization;
-                        u.updated_ms = u.updated_ms.max(account_used.updated_ms);
-                    } else {
-                        let mut account_u = account_used.clone();
-                        account_u.runs = 0;
-                        account_u.runs_window_ends_ms = None;
-                        used = Some(account_u);
-                    }
-                }
-            }
+            used = crate::routes::with_account_windows(used, usage.get(&account));
         }
         let declared = allowance(route);
         let blocked = match &id {
