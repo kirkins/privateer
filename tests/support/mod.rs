@@ -305,7 +305,9 @@ impl Fleet {
     }
     /// Tick until the latest wake is no longer running.
     pub fn settle(&mut self) -> Value {
-        let until = Instant::now() + Duration::from_secs(20);
+        // Condition-based: a passing wake returns at once. The bound only
+        // matters on a loaded runner, where a fake harness can run for ~20 s.
+        let until = Instant::now() + Duration::from_secs(60);
         loop {
             self.tick();
             let latest = self.wakes()[0].clone();
