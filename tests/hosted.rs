@@ -163,8 +163,12 @@ impl Place {
     }
     /// One dispatcher pass, with Herdr's socket where its default would be.
     fn tick(&self) -> Value {
+        self.serve_once()["ships"][0].take()
+    }
+    /// One dispatcher pass as serve prints it: the whole report.
+    fn serve_once(&self) -> Value {
         let line = self.ok(&["serve", "--json", r#"{"once":true}"#]);
-        serde_json::from_str::<Value>(&line).unwrap()["ships"][0].take()
+        serde_json::from_str(&line).unwrap()
     }
     fn at(&self, name: &str, command: &str, args: Value) -> Value {
         let home = self.folder.parent().unwrap().join(name).join(".privateer");
@@ -790,6 +794,103 @@ fn age_duplicate_overlap(place: &Place) {
             [privateer::store::Store::now_ms() - 5 * 60 * 1000 - 1],
         )
         .unwrap();
+}
+
+/// Captain requests that name an untrusted folder for infra.
+fn untrusted_requests(place: &Place) -> Vec<Value> {
+    place.json(
+        "mail.inbox",
+        json!({"address":"captain","all":true,"limit":100}),
+    )["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["payload"]["hosted_untrusted"] == "infra")
+        .cloned()
+        .collect()
+}
+
+/// The state a captain request's mail row was left in.
+fn request_state(place: &Place, id: &str) -> String {
+    place
+        .database()
+        .query_row("SELECT state FROM mail WHERE id=?1", [id], |r| r.get(0))
+        .unwrap()
+}
+
+/// A hosted Claude first mate in a folder with no trust record, and its Herdr.
+fn untrusted_claude_place() -> (Place, Herdr) {
+    let place = Place::new();
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:claude");
+    first_mate["options"] = json!({"model":"claude-opus-5-5","permission_mode":"auto"});
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    (place, herdr)
+}
+
+/// An unreadable Claude config is no verdict: the launch waits, and no request is raised.
+#[test]
+fn an_unparsable_claude_config_blocks_the_launch_without_a_request() {
+    let (place, _herdr) = untrusted_claude_place();
+    // Claude rewrites this file in place, so a read caught mid-write looks like this.
+    fs::write(place.root.join(".claude.json"), r#"{"projects": {"#).unwrap();
+    let serve = place.serve_once();
+    let error = serve["ships"][0]["host_error"].as_str().unwrap();
+    assert!(error.contains("Yes, I trust this folder"), "{error}");
+    assert!(untrusted_in_serve(&serve).is_empty(), "{serve}");
+    assert!(untrusted_requests(&place).is_empty());
+    assert!(!place.root.join("pi-argv").exists());
+}
+
+/// A ship that leaves Claude takes its folder request and alert with it.
+#[test]
+fn switching_an_untrusted_claude_ship_to_another_harness_clears_its_request() {
+    let (place, _herdr) = untrusted_claude_place();
+    place.serve_once();
+    let requests = untrusted_requests(&place);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let request_id = requests[0]["id"].as_str().unwrap().to_owned();
+
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:pi");
+    first_mate["options"] = json!({});
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    place.retry_now();
+    place.tick();
+
+    assert!(untrusted_in_serve(&place.serve_once()).is_empty());
+    let open: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM hosted_untrusted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(open, 0);
+    assert_eq!(request_state(&place, &request_id), "withdrawn");
+    until("the hosted pi", || place.root.join("pi-env").exists());
+    place.stop_native("infra");
+}
+
+/// The untrusted folders a serve report lists under hosted_blocked.
+fn untrusted_in_serve(serve: &Value) -> Vec<String> {
+    serve["hosted_blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["untrusted"].as_str().map(str::to_owned))
+        .collect()
 }
 
 fn age_hosted_block(place: &Place) {
@@ -2405,9 +2506,38 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
     place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
 
     // An untrusted folder would stop at Claude's trust dialog: refuse instead.
-    let error = place.tick()["host_error"].as_str().unwrap().to_owned();
+    // The captain hears of it once, in serve and as one request naming the folder.
+    let folder = place.folder.canonicalize().unwrap();
+    let folder_text = folder.display().to_string();
+    let serve = place.serve_once();
+    let error = serve["ships"][0]["host_error"].as_str().unwrap().to_owned();
     assert!(error.contains("Yes, I trust this folder"), "{error}");
     assert!(!place.root.join("pi-argv").exists());
+    assert_eq!(
+        untrusted_in_serve(&serve),
+        vec![folder_text.clone()],
+        "{serve}"
+    );
+    let requests = untrusted_requests(&place);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["kind"], "request");
+    let step = requests[0]["payload"]["needs_hands"]["step"]
+        .as_str()
+        .unwrap();
+    assert!(
+        step.contains(&folder_text) && step.contains("Yes, I trust this folder"),
+        "{step}"
+    );
+
+    // A later attempt, still untrusted, raises nothing new.
+    place.retry_now();
+    let serve = place.serve_once();
+    assert_eq!(
+        untrusted_in_serve(&serve),
+        vec![folder_text.clone()],
+        "{serve}"
+    );
+    assert_eq!(untrusted_requests(&place).len(), 1);
 
     // Trust on a folder above is not enough: Claude asks again for a folder
     // with its own permission rules, which every ship folder has.
@@ -2426,6 +2556,17 @@ fn a_hosted_claude_first_mate_needs_folder_trust_and_continues_only_a_real_conve
     trusted(&place.folder);
     place.tick();
     until("the hosted Claude", || place.root.join("pi-env").exists());
+    // Trusting the folder clears the alert and withdraws its request.
+    assert!(untrusted_in_serve(&place.serve_once()).is_empty());
+    let open: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM hosted_untrusted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(open, 0);
+    assert_eq!(
+        request_state(&place, requests[0]["id"].as_str().unwrap()),
+        "withdrawn"
+    );
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
     let args: Vec<&str> = argv.lines().collect();
     assert!(

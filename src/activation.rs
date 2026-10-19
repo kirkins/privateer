@@ -74,6 +74,8 @@ pub fn init(store: &Store) -> Result<()> {
            harness_started TEXT, recorded_ms INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS hosted_automode(ship TEXT PRIMARY KEY, incident TEXT NOT NULL,
            ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS hosted_untrusted(ship TEXT PRIMARY KEY, folder TEXT NOT NULL,
+           ms INTEGER NOT NULL, mail_id TEXT);
          CREATE TABLE IF NOT EXISTS hosted_relaunches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
            force INTEGER NOT NULL CHECK(force IN (0,1)), requested_ms INTEGER NOT NULL,
            expires_ms INTEGER NOT NULL);",
@@ -1168,6 +1170,8 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
             }),
         });
     }
+    // Untrusted folders raised by this pass's launches are reported here too.
+    let hosted_blocked = crate::host::with_untrusted(store, hosted_blocked);
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
     // Mail other machines hold for ships here, which they cannot send.
     let machines = crate::machines::tick(store.home(), budget);
