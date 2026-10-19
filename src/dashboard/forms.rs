@@ -27,10 +27,6 @@ pub struct Form {
 }
 impl App {
     pub fn manage(&mut self, kind: Kind) {
-        if self.demo {
-            self.notice = "Demo only; no fleet changes.".into();
-            return;
-        }
         if self.mail_pending {
             return;
         }
@@ -78,7 +74,7 @@ impl App {
         });
     }
     pub fn onboard(&mut self) {
-        if self.demo || self.mail_pending {
+        if self.mail_pending {
             return;
         }
         let harnesses = crate::cli::installed_harnesses().unwrap_or_default();

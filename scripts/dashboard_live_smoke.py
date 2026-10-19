@@ -206,6 +206,7 @@ def run(binary, runtime):
             tui = Tui(binary, env, ["--herdr-socket", str(server.path)])
             tui.drain(.5)
             tui.until(lambda: tui.text.contains("Please answer"), "typed need did not load")
+            assert b"\x1b[?1006h" in tui.output, "mouse capture was not enabled"
             tui.keys(b"j\r")  # select Fleet ship and focus ONLY its existing pane
             tui.until(lambda: server.focuses == 1, "Enter did not focus existing mate")
             tui.keys(b"\t\rGo ahead\r")

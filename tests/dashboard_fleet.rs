@@ -1,4 +1,5 @@
 #![cfg(feature = "dashboard")]
+mod dashboard_sample;
 mod support;
 use serde_json::{Value, json};
 use std::{
@@ -661,14 +662,6 @@ fn empty_status_reads_state_while_ask_and_message_require_text() {
         m.json(&apps, "wake.list", json!({"ship":"apps"}))["wakes"],
         json!([])
     );
-    app.demo = true;
-    app.compose();
-    app.edit_composer(KeyCode::Tab);
-    app.edit_composer(KeyCode::Enter);
-    assert!(app.composer.is_none());
-    assert!(app.action.is_none());
-    assert_eq!(app.exchanges.len(), 1);
-    assert_eq!(app.exchanges[0].mode, InputMode::Status);
 }
 
 #[test]
@@ -1269,19 +1262,6 @@ fn duplicate_task_ids_join_jobs_and_preserve_selection_by_origin_during_handoffs
 }
 
 #[test]
-fn demo_work_origins_stay_sample_only_without_creating_state() {
-    let m = Machine::new();
-    let view = m.dashboard_args(&["--demo", "--once"]);
-    assert_eq!(view["demo"], true);
-    for section in ["tasks", "pending", "activity", "jobs", "custody"] {
-        let rows = view["snapshot"][section].as_array().unwrap();
-        assert!(!rows.is_empty());
-        assert!(rows.iter().all(|row| row["home"].is_null()));
-    }
-    assert_eq!(fs::read_dir(&m.root).unwrap().count(), 0);
-}
-
-#[test]
 fn read_requests_beyond_the_inbox_page_survive_refresh_and_ack_when_reachable() {
     use privateer::dashboard::{command, fleet, mailbox::Mailbox};
     let m = Machine::new();
@@ -1587,7 +1567,7 @@ fn full_mail_bodies_and_payloads_are_readable_before_ack_and_after_leaving_the_i
 
 #[test]
 fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recover() {
-    use privateer::dashboard::{fleet, herdr::View, model::Snapshot, ui::App};
+    use privateer::dashboard::{fleet, model::Snapshot, ui::App};
     let m = Machine::new();
     let apps = m.ship("apps");
     let infra = m.ship("infra");
@@ -1609,7 +1589,7 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     let config = |id: &str, pane: &str, terminal: &str, liaison: bool| json!({"ships":[{"id":id,"name":"Shared display label","liaison":liaison,"terminals":[{"pane_id":pane,"terminal_id":terminal}]}]});
     let apps_config = apps.join(".privateer/dashboard.json");
     let infra_config = infra.join(".privateer/dashboard.json");
-    let herdr = View::demo();
+    let herdr = dashboard_sample::view();
     m.json(
         &apps,
         "ship.attend",
@@ -1625,15 +1605,15 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
         .unwrap();
     fs::write(
         &apps_config,
-        config("apps", "demo:apps", "demo-terminal-apps", true).to_string(),
+        config("apps", "sample:apps", "sample-terminal-apps", true).to_string(),
     )
     .unwrap();
     fs::write(
         &infra_config,
         config(
             "infra",
-            "demo:infrastructure",
-            "demo-terminal-infrastructure",
+            "sample:infrastructure",
+            "sample-terminal-infrastructure",
             false,
         )
         .to_string(),
@@ -1675,29 +1655,32 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     };
     app.open_liaison();
     assert_eq!(app.ship.as_deref(), Some("apps"));
-    assert_eq!(app.selected_pane().unwrap().pane_id, "demo:apps");
+    assert_eq!(app.selected_pane().unwrap().pane_id, "sample:apps");
     let details = screen(&mut app);
     assert!(details.contains("Selected ship:"));
     assert!(details.contains("Recorded scope:"));
     assert!(details.contains(&"é".repeat(30)));
     app.select_ship(Some("infra".into()));
-    assert_eq!(app.selected_pane().unwrap().pane_id, "demo:infrastructure");
+    assert_eq!(
+        app.selected_pane().unwrap().pane_id,
+        "sample:infrastructure"
+    );
     for (pane, terminal, liaison, reason) in [
         (
-            "demo:apps",
-            "demo-terminal-apps",
+            "sample:apps",
+            "sample-terminal-apps",
             false,
             "a pane can belong to only one ship",
         ),
         (
-            "demo:apps",
+            "sample:apps",
             "different-terminal",
             false,
             "a pane can belong to only one ship",
         ),
         (
-            "demo:infrastructure",
-            "demo-terminal-infrastructure",
+            "sample:infrastructure",
+            "sample-terminal-infrastructure",
             true,
             "only one ship may be the liaison",
         ),
@@ -1784,15 +1767,15 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     }
     fs::write(
         &apps_config,
-        config("apps", "demo:apps", "demo-terminal-apps", false).to_string(),
+        config("apps", "sample:apps", "sample-terminal-apps", false).to_string(),
     )
     .unwrap();
     fs::write(
         &infra_config,
         config(
             "infra",
-            "demo:infrastructure",
-            "demo-terminal-infrastructure",
+            "sample:infrastructure",
+            "sample-terminal-infrastructure",
             true,
         )
         .to_string(),
@@ -1802,13 +1785,16 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     assert!(app.snapshot.presentation_error.is_none());
     app.open_liaison();
     assert_eq!(app.ship.as_deref(), Some("infra"));
-    assert_eq!(app.selected_pane().unwrap().pane_id, "demo:infrastructure");
+    assert_eq!(
+        app.selected_pane().unwrap().pane_id,
+        "sample:infrastructure"
+    );
     assert!(!screen(&mut app).contains("PRESENTATION UNAVAILABLE"));
 }
 
 #[test]
 fn foreign_and_invalid_local_claims_block_navigation_without_hiding_durable_work() {
-    use privateer::dashboard::{herdr::View, model::Snapshot, ui::App};
+    use privateer::dashboard::{model::Snapshot, ui::App};
     let m = Machine::new();
     let apps = m.ship("apps");
     let infra = m.ship("infra");
@@ -1832,7 +1818,7 @@ fn foreign_and_invalid_local_claims_block_navigation_without_hiding_durable_work
         json!({"id":"work","actor":"apps","target":"infra"}),
     );
     m.json(&apps, "task.accept", json!({"id":"work","actor":"infra"}));
-    let herdr = View::demo();
+    let herdr = dashboard_sample::view();
     let pane = &herdr.panes[1];
     let binding =
         json!({"socket":"/isolated/socket","socket_identity":herdr.socket_identity,"pane":pane});
@@ -2102,7 +2088,7 @@ fn retirement_rejects_a_name_that_now_belongs_to_a_different_home() {
 }
 
 #[test]
-fn management_forms_require_explicit_retirement_and_never_mutate_demo() {
+fn management_forms_require_explicit_retirement() {
     use crossterm::event::KeyCode;
     use privateer::dashboard::{fleet, forms::Kind, ui::App};
     let m = Machine::new();
@@ -2122,11 +2108,6 @@ fn management_forms_require_explicit_retirement_and_never_mutate_demo() {
     let action = app.action.take().unwrap();
     assert_eq!(action.verb, "ship.retire");
     assert_eq!(action.args["name"], "apps");
-    app.form = None;
-    app.demo = true;
-    app.manage(Kind::New);
-    assert!(app.form.is_none());
-    assert!(app.action.is_none());
 }
 
 #[test]
