@@ -139,6 +139,19 @@ The runtime never sees shell commands, so this layer is enforced through the har
 - **C. gh shim (all harnesses).** `plugins/crew-bin/gh` (new), first on the crew's `PATH`. It allows `gh auth git-credential` (git calls it for fetches) and refuses everything else, `gh auth token` included, with the refusal text. gh here is a mise wrapper, so `mise x gh -- gh ...` and the absolute install path both bypass the shim. C exists to give a plain `gh` call a clear refusal, not to stop a crew that looks for the real binary.
 - **D. No push credential (recommended for round 3, pending the captain).** The crew env gets an empty `GH_CONFIG_DIR` (a crew-only directory with no token) and an empty command-scope `credential.helper=`, which clears the helpers set in global and repository configuration. The credential helper here is URL-scoped (`credential.https://github.com/.helper`), so whether an empty `credential.helper=` clears it too is check V5; if it does not, D also sets the URL-scoped key empty. Then `/usr/bin/gh`, `mise x gh` and a cleared `GIT_CONFIG_COUNT` have nothing to write with. This repository is public, so fetches still work. A read-only token comes later, and only if a private-repo ship needs one. D is the only layer that holds against a crew that sets out to bypass A to C, and it is cheap because it needs no token.
 
+### Round 3a: no push credentials (layer D, implemented)
+
+The captain's yes (2026-10-19) made D the rule for crews now, with no token. `src/crew_launch.rs` strips a crew payload's push credentials at launch, in `src/jobs.rs` next to the crew env scrub. Only a crew launch is touched: a first mate's wake and an errand keep their environment (`tests/crew_push.rs`).
+
+- **git.** `GIT_CONFIG_COUNT` gets one more entry, `credential.helper=` (empty), appended after any the starter exported, so it comes last and resets the helper list. Checked with git 2.56.0: an empty command-scope `credential.helper` stops both a global helper and a URL-scoped `credential.<url>.helper` from answering, so no separate URL-scoped key is set (V5).
+- **gh.** `GH_CONFIG_DIR` points at `jobs/<id>/<incarnation>/gh`, an empty directory created for that launch. `GH_TOKEN` and `GITHUB_TOKEN` are removed. V6 (the real `gh` with an empty config dir) is not run here: the rule is that this machine's `gh` is never run from a test. The tests use a fake `gh` that reads the same variables.
+- **ssh.** `GIT_SSH_COMMAND` is `ssh -o IdentitiesOnly=yes -o IdentityFile=/dev/null -o IdentityAgent=none -F /dev/null`, so no key is offered and no agent is used. `SSH_AUTH_SOCK` is removed. The crew's ssh config is not read.
+- **GIT_ASKPASS** is also removed, because an askpass program can supply a token. This is beyond the brief's list.
+
+**Fetching.** A crew's fetch over SSH from a private remote fails now, which is accepted: the workspace is already cloned, and fetching is the first mate's job. Fetching a public https remote still works. **First mates push crew branches and open PRs.** A crew commits locally and reports the commit.
+
+**Limits.** Under one OS account, a crew can still unset these variables in its own shell, or read the credential files in its `HOME`. D stops a crew from pushing through the environment the runtime gives it. It is not a lock against a crew that deliberately reads the files; the per-crew OS user (answered question 4) is that boundary.
+
 **Local pushes are not refused.** A workspace shares its clone's object store, so a push to the local `projects/<repo>` gains a crew nothing. A `git` shim to refuse it would also break `tests/workspaces.rs:770` and `tests/machines.rs:2064` when they run inside a crew's heavy job. B rewrites only network schemes, and `file://` is left alone for the same reason.
 
 ### Per harness
