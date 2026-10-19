@@ -850,6 +850,10 @@ class Door:
             self.say(f"🎙️ transcription failed — {stt.error_class(err)}. The audio is kept at {dest}",
                      reply_to=msg_id)
             return
+        if stt.is_empty(transcript):
+            # Nothing the captain said: tell them to re-record rather than send an answer.
+            self.say("🎙️ your voice note came through empty, please re-record", reply_to=msg_id)
+            return
         body = stt.prompt_for(transcript)
         caption = (msg.get("caption") or "").strip()
         args["body"] = f"{caption}\n{body}" if caption else body
