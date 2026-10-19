@@ -743,8 +743,9 @@ fn captain_blocked_alerts(place: &Place) -> Vec<Value> {
         .collect()
 }
 
-/// Open runtime.needs items raised for two or more mate spaces of `infra`.
-fn duplicate_mate_needs(place: &Place) -> Vec<Value> {
+/// Open runtime.needs items raised for two or more mate spaces of `ship`.
+fn duplicate_mate_needs(place: &Place, ship: &str) -> Vec<Value> {
+    let prefix = format!("duplicate-mates-{ship}-");
     place.json("runtime.needs", json!({"limit":100}))["items"]
         .as_array()
         .unwrap()
@@ -752,10 +753,31 @@ fn duplicate_mate_needs(place: &Place) -> Vec<Value> {
         .filter(|item| {
             item["source_id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("duplicate-mates-infra-"))
+                .is_some_and(|id| id.starts_with(&prefix))
         })
         .cloned()
         .collect()
+}
+
+/// Rows the host keeps for overlapping mate spaces, raised or still pending.
+fn duplicate_count(place: &Place) -> i64 {
+    place
+        .database()
+        .query_row("SELECT COUNT(*) FROM duplicate_mate_alerts", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// Push the first sighting of infra's overlap past the raise threshold.
+fn age_duplicate_overlap(place: &Place) {
+    place
+        .database()
+        .execute(
+            "UPDATE duplicate_mate_alerts SET first_seen_ms=?1 WHERE ship='infra'",
+            [privateer::store::Store::now_ms() - 5 * 60 * 1000 - 1],
+        )
+        .unwrap();
 }
 
 fn age_hosted_block(place: &Place) {
@@ -2263,7 +2285,7 @@ fn hosted_blocked_alerts_never_for_an_idle_pane() {
 #[test]
 fn two_mate_spaces_for_one_ship_alert_once_and_clear_at_one() {
     let (place, herdr) = hosted_fixture();
-    assert!(duplicate_mate_needs(&place).is_empty());
+    assert!(duplicate_mate_needs(&place, "infra").is_empty());
     // A second space tagged as infra's mate, as a restored or stale Herdr space would be.
     herdr
         .spaces
@@ -2271,17 +2293,63 @@ fn two_mate_spaces_for_one_ship_alert_once_and_clear_at_one() {
         .unwrap()
         .push(("w9".into(), json!({"privateer":"mate","ship":"infra"})));
     place.tick();
-    let needs = duplicate_mate_needs(&place);
+    // The first sighting is only recorded: nothing raised yet.
+    assert!(duplicate_mate_needs(&place, "infra").is_empty());
+    age_duplicate_overlap(&place);
+    place.tick();
+    let needs = duplicate_mate_needs(&place, "infra");
     assert_eq!(needs.len(), 1, "{needs:?}");
     assert_eq!(needs[0]["source"], "mail");
+    assert_eq!(needs[0]["needs_hands"], true, "{needs:?}");
     // A second pass does not raise it again, and leaves both spaces open.
     place.tick();
-    assert_eq!(duplicate_mate_needs(&place).len(), 1);
+    assert_eq!(duplicate_mate_needs(&place, "infra").len(), 1);
     assert_eq!(herdr.spaces.lock().unwrap().len(), 3);
     // Only one mate space is left: the alert clears.
     herdr.spaces.lock().unwrap().retain(|(id, _)| id != "w9");
     place.tick();
-    assert!(duplicate_mate_needs(&place).is_empty());
+    assert!(duplicate_mate_needs(&place, "infra").is_empty());
+    place.stop_native("infra");
+}
+
+#[test]
+fn an_overlap_that_clears_before_the_threshold_raises_nothing() {
+    let (place, herdr) = hosted_fixture();
+    herdr
+        .spaces
+        .lock()
+        .unwrap()
+        .push(("w9".into(), json!({"privateer":"mate","ship":"infra"})));
+    place.tick();
+    // The old space closes before the overlap has lasted long enough.
+    herdr.spaces.lock().unwrap().retain(|(id, _)| id != "w9");
+    place.tick();
+    assert!(duplicate_mate_needs(&place, "infra").is_empty());
+    assert_eq!(duplicate_count(&place), 0);
+    // A new overlap starts its own clock: it is not raised on the next pass.
+    herdr
+        .spaces
+        .lock()
+        .unwrap()
+        .push(("w9".into(), json!({"privateer":"mate","ship":"infra"})));
+    place.tick();
+    assert!(duplicate_mate_needs(&place, "infra").is_empty());
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_duplicate_for_a_ship_this_home_does_not_host_is_never_raised() {
+    let (place, herdr) = hosted_fixture();
+    // Herdr lists every home's spaces, so a ship with no local hosted first mate
+    // is another home's to raise.
+    herdr.spaces.lock().unwrap().extend([
+        ("w8".into(), json!({"privateer":"mate","ship":"ghost"})),
+        ("w9".into(), json!({"privateer":"mate","ship":"ghost"})),
+    ]);
+    place.tick();
+    place.tick();
+    assert!(duplicate_mate_needs(&place, "ghost").is_empty());
+    assert_eq!(duplicate_count(&place), 0);
     place.stop_native("infra");
 }
 

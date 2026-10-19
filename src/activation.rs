@@ -67,8 +67,8 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE TABLE IF NOT EXISTS hosted_block_alerts(
            ship TEXT PRIMARY KEY, blocked_since_ms INTEGER NOT NULL,
            alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1)));
-         CREATE TABLE IF NOT EXISTS duplicate_mate_alerts(ship TEXT PRIMARY KEY, mail_id TEXT NOT NULL,
-           workspaces TEXT NOT NULL, raised_ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS duplicate_mate_alerts(ship TEXT PRIMARY KEY,
+           first_seen_ms INTEGER NOT NULL, workspaces TEXT NOT NULL, mail_id TEXT);
          CREATE TABLE IF NOT EXISTS hosted_panes(ship TEXT PRIMARY KEY, pid INTEGER NOT NULL,
            started TEXT NOT NULL, executable TEXT NOT NULL, harness_pid INTEGER,
            harness_started TEXT, recorded_ms INTEGER NOT NULL);

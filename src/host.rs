@@ -29,6 +29,10 @@ const LAUNCH_TTL_SECS: u64 = 3 * crate::plugins::LAUNCH_CEILING_MS / 1000 + 60;
 /// within one dispatcher cycle plus a short, bounded grace period.
 const BLOCKED_ALERT_AFTER_MS: i64 = 5 * 60 * 1000;
 
+/// A second mate space usually goes away on its own as the old one closes, so
+/// an overlap raises a request only once it has lasted this long across passes.
+const DUPLICATE_MATES_ALERT_AFTER_MS: i64 = BLOCKED_ALERT_AFTER_MS;
+
 /// Harnesses whose attended adapter starts a turn when mail arrives.
 const LIVE_HARNESSES: &[&str] = &["pi", "pi-signed", "claude"];
 /// Harnesses whose hosted crew end their session when the work settles.
@@ -313,22 +317,50 @@ pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String)]) -> Res
     Ok(json!(alerts))
 }
 
-/// The host pass's duplicate check: one listing of Herdr's mate spaces. With no
-/// socket there is nothing to observe, so nothing is cleared either.
+/// Ships whose first mate Herdr hosts on this home, the same filter the sidebar
+/// uses. Every home sees all of Herdr's spaces, so only the owning home may
+/// raise a duplicate for a ship: one duplicate must not reach the captain once
+/// per home.
+fn local_herdr_ships(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+    let mut query = conn.prepare(
+        "SELECT name FROM ships WHERE json_extract(record,'$.location')='here'
+           AND json_extract(record,'$.first_mate.host')='herdr'",
+    )?;
+    let names = query
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(names)
+}
+
+/// The host pass's duplicate check: one listing of Herdr's mate spaces, read
+/// only when this home hosts a first mate in Herdr. With no socket there is
+/// nothing to observe, so nothing is cleared either.
 pub(crate) fn check_duplicate_mates(store: &Store) -> Result<Value> {
     let Some(socket) = socket() else {
         return Ok(json!([]));
     };
-    let mut client = crate::herdr::Client::connect(&socket)?;
-    alert_duplicate_mates(store, &client.mate_spaces()?)
+    let spaces = if local_herdr_ships(store.connection())?.is_empty() {
+        vec![]
+    } else {
+        let mut client = crate::herdr::Client::connect(&socket)?;
+        client.mate_spaces()?
+    };
+    reconcile_duplicate_mates(store, &spaces, true)
 }
 
-/// Raise one owner alert per ship that has more than one mate space, naming
-/// them, and withdraw it once one or none is left. Runtime.needs shows the open
-/// request, so the captain sees it without a live Herdr query.
-pub(crate) fn alert_duplicate_mates(store: &Store, spaces: &[(String, String)]) -> Result<Value> {
+/// Raise one owner request per local ship that has more than one mate space,
+/// naming them, once the overlap has lasted DUPLICATE_MATES_ALERT_AFTER_MS.
+/// `raise` is false when settle observes a space: it records the first sighting
+/// and clears what has gone, but never raises. The request is withdrawn once
+/// one or none is left. Runtime.needs shows it, since it cannot query Herdr live.
+fn reconcile_duplicate_mates(
+    store: &Store,
+    spaces: &[(String, String)],
+    raise: bool,
+) -> Result<Value> {
+    let local = local_herdr_ships(store.connection())?;
     let mut by_ship: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (ship, workspace) in spaces {
+    for (ship, workspace) in spaces.iter().filter(|(ship, _)| local.contains(ship)) {
         by_ship
             .entry(ship.as_str())
             .or_default()
@@ -336,31 +368,74 @@ pub(crate) fn alert_duplicate_mates(store: &Store, spaces: &[(String, String)]) 
     }
     let now = Store::now_ms();
     let tx = store.write_transaction()?;
-    let raised: Vec<(String, String)> = tx
+    let tracked: Vec<(String, Option<String>)> = tx
         .prepare("SELECT ship, mail_id FROM duplicate_mate_alerts ORDER BY ship")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut alerts = vec![];
-    for (ship, mail_id) in raised {
+    for (ship, mail_id) in tracked {
         if by_ship.get(ship.as_str()).map_or(0, Vec::len) > 1 {
             continue;
         }
-        tx.execute(
-            "UPDATE mail SET state='withdrawn',ended_by='host',ended_ms=?2,end_reason=?3 WHERE id=?1 AND state='open'",
-            params![mail_id, now, "Herdr shows one mate space for this ship again"],
-        )?;
+        if let Some(mail_id) = mail_id {
+            let task: Option<String> = tx
+                .query_row("SELECT task_id FROM mail WHERE id=?1", [&mail_id], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .flatten();
+            let request = json!({
+                "id": mail_id,
+                "from": crate::mail::CREW,
+                "to": crate::mail::CAPTAIN,
+                "task_id": task,
+            });
+            crate::mail::end_request(
+                store,
+                &request,
+                "withdrawn",
+                "Herdr shows one mate space for this ship again",
+            )?;
+        }
         tx.execute("DELETE FROM duplicate_mate_alerts WHERE ship=?1", [&ship])?;
         alerts.push(json!({"ship": ship, "cleared": true}));
     }
     for (ship, workspaces) in &by_ship {
-        let already: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM duplicate_mate_alerts WHERE ship=?1)",
-            [ship],
-            |r| r.get(0),
-        )?;
-        if workspaces.len() < 2 || already {
+        if workspaces.len() < 2 {
             continue;
         }
+        // The first sighting is kept; only the listed spaces refresh.
+        tx.execute(
+            "INSERT INTO duplicate_mate_alerts(ship,first_seen_ms,workspaces,mail_id) VALUES(?1,?2,?3,NULL)
+             ON CONFLICT(ship) DO UPDATE SET workspaces=excluded.workspaces",
+            params![ship, now, json!(workspaces).to_string()],
+        )?;
+        let (first_seen, mail_id): (i64, Option<String>) = tx.query_row(
+            "SELECT first_seen_ms, mail_id FROM duplicate_mate_alerts WHERE ship=?1",
+            [ship],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if !raise
+            || mail_id.is_some()
+            || now.saturating_sub(first_seen) < DUPLICATE_MATES_ALERT_AFTER_MS
+        {
+            continue;
+        }
+        let raw: Option<String> = tx
+            .query_row("SELECT record FROM ships WHERE name=?1", [ship], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let duty_task = raw
+            .and_then(|record| serde_json::from_str::<Value>(&record).ok())
+            .and_then(|record| {
+                record["first_mate"]["duty_task"]
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        let Some(duty_task) = duty_task else {
+            continue;
+        };
         let id = format!("duplicate-mates-{ship}-{now}");
         let listed = workspaces.join(", ");
         let body = format!(
@@ -371,16 +446,23 @@ pub(crate) fn alert_duplicate_mates(store: &Store, spaces: &[(String, String)]) 
             &tx,
             &json!({
                 "id": id,
-                "to": "captain",
+                "to": crate::mail::CAPTAIN,
                 "kind": "request",
+                "task_id": duty_task,
                 "urgency": "normal",
                 "body": body,
-                "payload": {"duplicate_mates": ship, "workspaces": workspaces}
+                "payload": {
+                    "duplicate_mates": ship,
+                    "workspaces": workspaces,
+                    "needs_hands": {"step": format!(
+                        "in Herdr, close the extra mate space for {ship} ({listed}), keeping the one with the live pane"
+                    )}
+                }
             }),
         )?;
         tx.execute(
-            "INSERT INTO duplicate_mate_alerts(ship,mail_id,workspaces,raised_ms) VALUES(?1,?2,?3,?4)",
-            params![ship, id, json!(workspaces).to_string(), now],
+            "UPDATE duplicate_mate_alerts SET mail_id=?2 WHERE ship=?1",
+            params![ship, id],
         )?;
         alerts.push(json!({"ship": ship, "workspaces": workspaces}));
     }
@@ -702,7 +784,8 @@ fn settle(
         .tag(workspace, role, ship)
         .and_then(|()| client.arrange_with_mates(&mates));
     // The new space is tagged now, so a second mate space for this ship shows.
+    // Settle only records the sighting: the old space may still be closing.
     if let Ok(spaces) = client.mate_spaces() {
-        let _ = alert_duplicate_mates(store, &spaces);
+        let _ = reconcile_duplicate_mates(store, &spaces, false);
     }
 }
