@@ -41,11 +41,16 @@ pub enum Blocker {
 
 impl Blocker {
     /// Whether a request with this demand may pass a head waiting on this
-    /// resource. Its own admission still checks everything it declares.
+    /// resource. Its own admission still checks everything it declares. Heavy
+    /// work never passes: it takes the slot and loads the CPU and disk whatever
+    /// it declares, so letting it past a head would starve the head.
     pub fn passable_by(self, demand: Option<Demand>, heavy: bool) -> bool {
+        if heavy {
+            return false;
+        }
         match self {
             Blocker::Disk => demand.is_none_or(|d| d.disk_bytes == 0),
-            Blocker::HeavySlot => !heavy,
+            Blocker::HeavySlot => true,
             Blocker::Cpu => demand.is_none_or(|d| d.cpus <= 0.0),
         }
     }
@@ -1602,7 +1607,7 @@ mod tests {
         });
         assert!(!Blocker::Disk.passable_by(disk, false));
         assert!(Blocker::Disk.passable_by(memory, false));
-        assert!(Blocker::Disk.passable_by(None, true));
+        assert!(!Blocker::Disk.passable_by(None, true));
         assert!(!Blocker::Cpu.passable_by(cpu, false));
         assert!(Blocker::Cpu.passable_by(memory, false));
         assert!(!Blocker::HeavySlot.passable_by(None, true));

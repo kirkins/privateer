@@ -2121,7 +2121,8 @@ fn waiting_jobs_start_in_arrival_order_and_others_cannot_jump_the_queue() {
 
 /// Three jobs queued behind a heavy job that holds disk: the head waits on
 /// disk, so light work that declares none passes it, while a job that declares
-/// disk waits its turn behind the head. The head then runs before that job.
+/// disk waits its turn behind the head. Heavy work that declares no disk, such
+/// as a job with no heavy key, waits too. The head then runs before that job.
 #[test]
 fn a_head_refused_on_disk_lets_light_work_pass_and_keeps_its_disk() {
     let fixture = Fixture::new();
@@ -2188,6 +2189,14 @@ fn a_head_refused_on_disk_lets_light_work_pass_and_keeps_its_disk() {
             "estimate":{"disk_bytes":behind},"wait_for_capacity":true}),
     );
     assert_eq!(behind_queued["status"], "queued", "{behind_queued}");
+    // A job that names no heavy key is heavy by default and declares no disk,
+    // so heavy work does not pass the head either.
+    let plain_queued = ok(
+        &other,
+        "job.start",
+        json!({"task_id":"task","id":"plain","command":["true"],"wait_for_capacity":true}),
+    );
+    assert_eq!(plain_queued["status"], "queued", "{plain_queued}");
     // Once the holding job ends, the head fits and runs. The job behind it must
     // not take the disk the head is waiting to use.
     ok(&home, "job.cancel", json!({"id":"holding"}));
@@ -2196,8 +2205,13 @@ fn a_head_refused_on_disk_lets_light_work_pass_and_keeps_its_disk() {
         ok(&other, "job.status", json!({"id":"behind"}))["status"],
         "queued"
     );
+    assert_eq!(
+        ok(&other, "job.status", json!({"id":"plain"}))["status"],
+        "queued"
+    );
     wait(&other, "head", &["succeeded"]);
     wait(&other, "behind", &["succeeded"]);
+    wait(&other, "plain", &["succeeded"]);
     assert_eq!(fs::read_to_string(&marker).unwrap(), "AB");
     assert_eq!(ok(&home, "resource.status", json!({}))["queue"], json!([]));
 }
