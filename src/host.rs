@@ -57,10 +57,17 @@ fn claude_config() -> Option<(PathBuf, PathBuf)> {
 /// Read only: Claude rewrites this file itself, so Privateer never writes it.
 /// `None` when the file cannot be read or parsed right now, as a read that
 /// lands mid-write says nothing about trust: that is no answer to act on.
+/// A missing file is an answer: Claude has never been run here, so nothing is trusted.
 fn claude_trusted(folder: &Path) -> Option<bool> {
-    let config = claude_config()
-        .and_then(|(_, file)| std::fs::read(file).ok())
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())?;
+    let Some((_, file)) = claude_config() else {
+        return Some(false);
+    };
+    let raw = match std::fs::read(file) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    let config = serde_json::from_slice::<Value>(&raw).ok()?;
     Some(
         folder
             .to_str()
