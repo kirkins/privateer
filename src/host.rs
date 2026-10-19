@@ -483,11 +483,6 @@ pub(crate) enum Attempt {
 /// wake takes its mail, by default.
 pub(crate) const HERDR_GRACE_SECS: u64 = 180;
 
-/// Whether Herdr's socket accepts a connection now.
-fn herdr_answers() -> bool {
-    socket().is_some_and(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
-}
-
 /// The end of the grace a hosted ship gives an unreachable Herdr before a
 /// headless wake, while it lasts: from when a launch first found Herdr
 /// unreachable, not from the age of the mail.
@@ -601,8 +596,17 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         // answers is launched into at once, so its space is not left waiting.
         if let Some((_, until, _, _, unreachable)) =
             previous.filter(|(_, until, _, _, _)| *until > now)
-            && !(unreachable && herdr_answers())
+            && !(unreachable && answers())
         {
+            // A launch backing off while Herdr is still missing starts the
+            // grace now, so a dispatcher that wakes first at boot waits it out.
+            if !answers() {
+                tx.execute(
+                    "UPDATE host_launches SET unreachable_ms=COALESCE(unreachable_ms, ?2) WHERE ship=?1",
+                    params![ship, now],
+                )?;
+                tx.commit()?;
+            }
             return Ok(Attempt::Backoff(until));
         }
         let failures = previous.map_or(1, |(n, _, _, _, _)| n.saturating_add(1).clamp(1, 7));
@@ -660,7 +664,7 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
     })();
     // The grace before a headless wake runs from when a launch first found
     // Herdr unreachable, and ends at a launch it does not stop.
-    let unreachable = result.is_err() && at_host && !herdr_answers();
+    let unreachable = result.is_err() && at_host && !answers();
     let tx = store.write_transaction()?;
     tx.execute(
         "UPDATE host_launches SET unreachable_ms=CASE WHEN ?2 THEN COALESCE(unreachable_ms, ?3) END

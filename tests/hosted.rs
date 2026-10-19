@@ -1919,6 +1919,67 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     assert_eq!(place.wakes(), 2);
 }
 
+/// A dispatcher that wakes first at boot finds the launch still in its
+/// shutdown backoff with Herdr missing. The grace starts then, so the headless
+/// wake waits it out rather than running at once.
+#[test]
+fn a_launch_in_backoff_at_boot_with_herdr_missing_waits_out_the_grace() {
+    let place = Place::new();
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"check CI"}),
+    );
+    // No Herdr here: the first launch fails and records the grace.
+    let report = place.tick();
+    assert_eq!(
+        report["skipped"], "waiting for Herdr before a headless wake",
+        "{report}"
+    );
+    let state = place.launch_state();
+    assert_eq!(state.0, 1);
+    assert!(state.1 > privateer::store::Store::now_ms(), "{state:?}");
+
+    // Boot: the stored grace is missing while the 60 s backoff still runs.
+    place
+        .database()
+        .execute("UPDATE host_launches SET unreachable_ms=NULL", [])
+        .unwrap();
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"still there?"}),
+    );
+    let report = place.tick();
+    assert_eq!(
+        report["skipped"], "waiting for Herdr before a headless wake",
+        "{report}"
+    );
+    assert_eq!(report["host_backoff_until_ms"], state.1, "{report}");
+    assert_eq!(place.launch_state(), state);
+    assert_eq!(place.wakes(), 0);
+    let since: Option<i64> = place
+        .database()
+        .query_row(
+            "SELECT unreachable_ms FROM host_launches WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(since.is_some(), "the grace must be recorded before backoff");
+
+    // Past the grace, the headless wake runs.
+    place
+        .database()
+        .execute(
+            "UPDATE host_launches SET unreachable_ms=unreachable_ms-180000",
+            [],
+        )
+        .unwrap();
+    let report = place.tick();
+    assert!(report["wake"].is_string(), "{report}");
+    assert_eq!(place.wakes(), 1);
+    place.stop_wake("boot backoff after the grace", &report);
+}
+
 /// Idle the hosted first mate past its sleep threshold until it sleeps: its
 /// adapter reports it idle, and its native payload exits. Herdr has recorded
 /// the harness as exited by then, which is when it drops a report naming it.
