@@ -230,6 +230,20 @@ fn next_prompt(fleet: &Fleet, from: usize) -> String {
     }
 }
 
+/// The mail `id` once it is answered, waiting for the wake that answers it: a
+/// wake is reported running before its mate has run, so its reply can land
+/// after the report. Returns the mail as it stands at the bound.
+fn answered_within(fleet: &mut Fleet, id: &str) -> Value {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mail = dispatch(&mut fleet.store, "mail.show", json!({"id": id})).unwrap();
+        if mail["state"] == "answered" || Instant::now() >= until {
+            return mail;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// A wake the provider refused is retried once, at once, on the fallback,
 /// without the mail that attempt already answered. Both waits are long enough
 /// that only the retry may pass them.
@@ -307,9 +321,10 @@ fn a_retried_wake_is_not_retried_again_and_the_next_wake_waits() {
     assert_ne!(next["wake"], retry["wake"]);
     let prompt = next_prompt(&fleet, retry_prompt + 1);
     assert!(!prompt.contains("one retry of wake"), "{prompt}");
-    // Each attempt answered one request, so nothing is asked twice.
+    // Each attempt answered one request, so nothing is asked twice. The next
+    // wake runs in its own process and answers after it is reported running.
     for id in ["one", "two", "three"] {
-        let answer = dispatch(&mut fleet.store, "mail.show", json!({"id":id})).unwrap();
+        let answer = answered_within(&mut fleet, id);
         assert_eq!(answer["state"], "answered", "{id}: {answer}");
     }
 }
