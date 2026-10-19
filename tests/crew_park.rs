@@ -15,6 +15,10 @@ const LAUNCH_BUDGET_SECS: u64 = 20;
 /// A crew's budget counts from its launch, so the child it starts must exist
 /// well before the deadline. Twenty seconds was not enough on a loaded runner.
 const SPENT_CAP_BUDGET_SECS: u64 = 60;
+/// The crew's own deadline, inside that budget. The child job it starts gets
+/// the full budget from its own start, so its deadline falls well after the
+/// crew's cancel; with equal deadlines the child could time out first.
+const SPENT_CAP_CREW_SECS: u64 = 30;
 
 struct Fleet {
     _tmp: tempfile::TempDir,
@@ -872,9 +876,13 @@ fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
         "charter.put",
         json!({"id": "engineering", "job_timeout_secs": SPENT_CAP_BUDGET_SECS, "crew_max_parks": 0}),
     );
-    start_crew(&f, "crew-26");
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-26","manifest":"bundled:claude","timeout_secs":SPENT_CAP_CREW_SECS}),
+    );
     f.wait("child-1", &["running"]);
-    let crew = f.wait_within(SPENT_CAP_BUDGET_SECS + 30, "crew-26", &["timed_out"]);
+    let crew = f.wait_within(SPENT_CAP_CREW_SECS + 30, "crew-26", &["timed_out"]);
     assert!(
         crew["reason"]
             .as_str()
