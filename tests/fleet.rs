@@ -229,6 +229,37 @@ fn ships_on_one_machine_find_and_mail_each_other() {
 }
 
 #[test]
+fn the_captain_tells_a_ship_on_this_machine_from_another_ships_home() {
+    let machine = Machine::new();
+    let liaison = machine.ship("liaison");
+    let apps = machine.ship("apps");
+    let tell = |to: &str, id: &str| {
+        let args =
+            json!({"id":id,"from":"captain","to":to,"kind":"notice","body":"Rotate the key."})
+                .to_string();
+        machine.run(&liaison, &["mail.send", "--json", args.as_str()])
+    };
+
+    // Written in apps' own home, as a tell from its folder would write it.
+    let sent = tell("apps", "captain-tell");
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let inbox = machine.json(&apps, "mail.inbox", json!({"address":"apps"}));
+    assert_eq!(inbox["messages"][0]["from"], "captain", "{inbox}");
+    assert_eq!(inbox["messages"][0]["body"], "Rotate the key.", "{inbox}");
+
+    // A ship whose folder is gone is refused with what to run instead.
+    fs::remove_dir_all(&apps).unwrap();
+    let refused = tell("apps", "captain-gone");
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("privateer ship retire apps"), "{stderr}");
+}
+
+#[test]
 fn a_ship_creates_a_linked_sibling_ship() {
     let machine = Machine::new();
     let liaison = machine.ship("liaison");

@@ -1072,13 +1072,14 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     );
     ensure!(from != to, "a mailbox cannot write to itself");
     let peer = recipient.as_ref().and_then(remote_peer).map(str::to_owned);
-    if let Some(peer) = &peer {
-        // The captain's mailbox is per home; only a link between machines
-        // carries the captain's mail to another home.
-        ensure!(
-            from != CAPTAIN || crate::peers::machine(store, peer)?,
-            "the captain's mail stays in this home for now"
-        );
+    if let Some(peer) = &peer
+        && from == CAPTAIN
+        && !crate::peers::machine(store, peer)?
+    {
+        // The captain's mailbox is per home. A ship on this machine takes the
+        // captain's mail in its own home, as a tell from its folder would; a
+        // ship behind any other peer is reached only over a machine link.
+        return crate::captain::send_local(args);
     }
     let id = optional_str(args, "id")?
         .map(str::to_owned)

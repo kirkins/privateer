@@ -431,6 +431,30 @@ fn send(args: &Value) -> Result<Value> {
     Ok(json!({"to": to, "home": holder, "mail": sent}))
 }
 
+/// The captain's `mail.send` to a ship that lives behind a peer other than a
+/// machine's: when that ship is on this machine, it is written in the ship's
+/// own home, as `tell` from its folder would write it. Any other ship is
+/// refused with what to run.
+pub(crate) fn send_local(args: &Value) -> Result<Value> {
+    let to = required(args, "to")?;
+    let conn = crate::fleet::registry()?;
+    let member = crate::fleet::members(&conn)?
+        .into_iter()
+        .find(|m| m.name == to && m.home.is_dir());
+    let Some(member) = member else {
+        bail!(
+            "{to} is not a ship on this machine with its folder present, so the captain's mail \
+             cannot reach it from this home: the captain's mail goes to ships on this machine \
+             directly and to ships on a linked machine over its link. If {to} lives on another \
+             machine, link that machine with `privateer machine add NAME SSH_TARGET --executable \
+             PATH` and send again; if its folder was moved or deleted, retire it with \
+             `privateer ship retire {to}`"
+        );
+    };
+    let mut store = Store::open(&member.home)?;
+    crate::dispatch(&mut store, "mail.send", args.clone())
+}
+
 /// The captain ends one item without answering it, in whichever home holds it.
 fn dismiss(store: &Store, args: &Value) -> Result<Value> {
     operator(store)?;
