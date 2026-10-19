@@ -287,13 +287,18 @@ struct Mail {
 }
 
 /// Mail for a ship newer than both its acknowledgement and its last wake,
-/// each labelled with the focus it belongs to.
+/// each labelled with the focus it belongs to. A notice in the thread of a
+/// request this ship still has open is not routine: it corrects the
+/// follow-up, and the wake names that request.
 fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
-    let mut statement = store.connection().prepare(
-        "SELECT seq, id, sender, kind, correlation, request_kind, urgency, body, payload, task_id
+    let mut statement = store.connection().prepare(&format!(
+        "SELECT seq, id, sender, kind, correlation, request_kind, urgency, body, payload, task_id,
+            NOT ({}) AS actionable, {}
          FROM mail WHERE recipient=?1 AND COALESCE(delivery, 'received')='received' AND seq > ?2
          ORDER BY seq LIMIT 200",
-    )?;
+        crate::mail::ROUTINE_MAIL,
+        crate::mail::OPEN_FOLLOW_UP
+    ))?;
     let rows = statement.query_map(params![ship, after], |r| {
         let kind: String = r.get(3)?;
         let urgency: String = r.get(6)?;
@@ -303,6 +308,7 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
         let id: String = r.get(1)?;
         let from: String = r.get(2)?;
         let correlation: Option<String> = r.get(4)?;
+        let follow_up: Option<String> = r.get(11)?;
         let mut summary = format!(
             "- seq {} id {id} from {from} kind {kind}",
             r.get::<_, i64>(0)?
@@ -314,6 +320,12 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
             summary.push_str(&format!(" correlation {correlation}"));
         }
         summary.push_str(&format!(" urgency {urgency}\n  {body}"));
+        if let Some(follow_up) = &follow_up {
+            summary.push_str(&format!(
+                "\n  the mail is in the thread of a request that your open request {follow_up} grows from; \
+                 answer it in that thread, or withdraw or update it with mail.withdraw or mail.send"
+            ));
+        }
         // A crew report's body already states its payload.
         if from != crate::mail::CREW && payload != "{}" && payload.len() <= 1024 {
             summary.push_str(&format!("\n  payload {payload}"));
@@ -324,7 +336,7 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
             Mail {
                 seq: r.get(0)?,
                 // Information-only notices wait for the next real wake.
-                routine: kind == "notice" && urgency == "low",
+                routine: !r.get::<_, bool>(10)?,
                 crew: from == crate::mail::CREW,
                 focus: String::new(),
                 summary,
@@ -418,7 +430,7 @@ fn wake_text(
         ));
     }
     text.push_str(&format!(
-        "Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. For more history on a focus use focus.digest {{\"ship\":\"{ship}\",\"focus\":...}}. Before you finish, for each focus you worked on, replace its handoff note with note.put {{\"ship\":\"{ship}\",\"focus\":...,\"body\":...}}: what you are doing and why, what you are waiting on, and what comes next, in under 2 KB; facts are already recorded. Then acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."
+        "Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. Anything about a request goes in that request's thread: its answer, a correction, or \"no longer needed\" all carry correlation set to the request id, so a low notice in the thread is not lost; when you raise a request because of another one, set because_of to the id of the request it grows from. For more history on a focus use focus.digest {{\"ship\":\"{ship}\",\"focus\":...}}. Before you finish, for each focus you worked on, replace its handoff note with note.put {{\"ship\":\"{ship}\",\"focus\":...,\"body\":...}}: what you are doing and why, what you are waiting on, and what comes next, in under 2 KB; facts are already recorded. Then acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."
     ));
     Ok(text)
 }
@@ -714,9 +726,12 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // page. A routine-only page must advance when actionable mail follows
     // it, without claiming coverage of messages beyond that page.
     let (oldest, newest): (Option<i64>, Option<i64>) = store.connection().query_row(
-        "SELECT MIN(created_ms), MAX(created_ms) FROM mail
+        &format!(
+            "SELECT MIN(created_ms), MAX(created_ms) FROM mail
          WHERE recipient=?1 AND COALESCE(delivery, 'received')='received' AND seq>?2
-           AND (kind!='notice' OR urgency!='low')",
+           AND NOT ({})",
+            crate::mail::ROUTINE_MAIL
+        ),
         params![name, after],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;

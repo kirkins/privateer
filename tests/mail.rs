@@ -114,6 +114,188 @@ fn pending_coalesces_a_burst_without_reading_or_acknowledging_bodies() {
 }
 
 #[test]
+fn a_low_notice_in_the_thread_of_an_open_follow_up_is_actionable_until_that_follow_up_is_closed() {
+    let (_temp, mut s) = fleet();
+    // The incident: a ship asks, this home answers and raises a follow-up on
+    // the answer, and the asking ship corrects itself later in that thread.
+    send(
+        &mut s,
+        json!({"id":"baf32096","from":"apps","to":"infra","kind":"request","body":"Which machine?"}),
+    )
+    .unwrap();
+    send(
+        &mut s,
+        json!({"from":"infra","to":"apps","kind":"reply","correlation":"baf32096","body":"The laptop"}),
+    )
+    .unwrap();
+    let follow_up = send(
+        &mut s,
+        json!({"id":"e376ceec","from":"infra","to":"captain","kind":"request",
+        "because_of":"baf32096","body":"Can you release the laptop?"}),
+    )
+    .unwrap();
+    assert_eq!(follow_up["because_of"], "baf32096");
+    // The question is answered and read; only the follow-up and any later
+    // correction in its thread are left in this mailbox.
+    let answered = dispatch(&mut s, "mail.show", json!({"id":"baf32096"})).unwrap();
+    dispatch(
+        &mut s,
+        "mail.ack",
+        json!({"address":"infra","through_seq":answered["seq"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.pending", json!({"address":"infra"})).unwrap()["actionable"],
+        0
+    );
+    send(
+        &mut s,
+        json!({"id":"late","from":"apps","to":"infra","kind":"notice","urgency":"low",
+        "correlation":"baf32096","body":"Correction: the desktop is free"}),
+    )
+    .unwrap();
+    // A low notice that corrects an open follow-up is not routine.
+    let pending = dispatch(&mut s, "mail.pending", json!({"address":"infra"})).unwrap();
+    assert_eq!(pending["actionable"], 1);
+    assert_eq!(pending["count"], 1);
+    // Once the follow-up is closed, the same notice is background again.
+    dispatch(
+        &mut s,
+        "mail.withdraw",
+        json!({"id":"e376ceec","actor":"infra","reason":"the correction settled it"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.pending", json!({"address":"infra"})).unwrap()["actionable"],
+        0
+    );
+    // A low notice in the thread of an open request wakes its recipient (or sender).
+    send(
+        &mut s,
+        json!({"id":"other","from":"apps","to":"infra","kind":"request","body":"Ship it?"}),
+    )
+    .unwrap();
+    send(
+        &mut s,
+        json!({"id":"fyi","from":"apps","to":"infra","kind":"notice","urgency":"low",
+        "correlation":"other","body":"Unrelated heads-up"}),
+    )
+    .unwrap();
+    let pending = dispatch(&mut s, "mail.pending", json!({"address":"infra"})).unwrap();
+    assert_eq!(pending["actionable"], 2);
+    assert_eq!(pending["headers"][0]["id"], "fyi");
+}
+
+#[test]
+fn because_of_names_one_request_and_only_a_request_carries_it() {
+    let (_temp, mut s) = fleet();
+    send(
+        &mut s,
+        json!({"id":"parent","from":"apps","to":"infra","kind":"request","body":"Which machine?"}),
+    )
+    .unwrap();
+    send(
+        &mut s,
+        json!({"id":"child","from":"infra","to":"captain","kind":"request","because_of":"parent",
+        "body":"Release the laptop"}),
+    )
+    .unwrap();
+    // The parent may be unknown here: it can live in another home.
+    assert_eq!(
+        send(
+            &mut s,
+            json!({"id":"elsewhere","from":"infra","to":"captain","kind":"request",
+            "because_of":"baf32096","body":"Release the desktop"})
+        )
+        .unwrap()["because_of"],
+        "baf32096"
+    );
+    let grandchild = send(
+        &mut s,
+        json!({"id":"grandchild","from":"infra","to":"captain","kind":"request","because_of":"child","body":"?"}),
+    )
+    .unwrap();
+    assert_eq!(grandchild["because_of"], "child");
+    for (args, expected) in [
+        (
+            json!({"id":"self","from":"infra","to":"captain","kind":"request","because_of":"self","body":"?"}),
+            "because of itself",
+        ),
+        (
+            json!({"id":"bad id","from":"infra","to":"captain","kind":"request","because_of":"bad id","body":"?"}),
+            "identifier",
+        ),
+        (
+            json!({"id":"headline","from":"infra","to":"captain","kind":"notice","because_of":"parent","body":"?"}),
+            "only a request carries it",
+        ),
+        (
+            json!({"id":"typed","from":"infra","to":"captain","kind":"decision","because_of":"parent",
+        "body":"?","payload":{"decision":{"question":"?","options":[
+          {"id":"a","label":"A","what_happens":"a"},{"id":"b","label":"B","what_happens":"b"}]}}}),
+            "only a request carries it",
+        ),
+    ] {
+        let message = err(send(&mut s, args.clone()));
+        assert!(message.contains(expected), "{args}: {message}");
+    }
+    // The id is the idempotency key: a retry may not change the link.
+    send(
+        &mut s,
+        json!({"id":"parent-2","from":"apps","to":"infra","kind":"request","body":"Or the desktop?"}),
+    )
+    .unwrap();
+    assert!(
+        err(send(
+            &mut s,
+            json!({"id":"child","from":"infra","to":"captain","kind":"request","because_of":"parent-2",
+            "body":"Release the laptop"})
+        ))
+        .contains("already holds a different message")
+    );
+    // The same retry with the same link is the message that is already there.
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"child"})).unwrap()["because_of"],
+        "parent"
+    );
+}
+
+#[test]
+fn a_notice_may_correct_a_thread_this_home_never_stored() {
+    let Pair { _temp, mut a, .. } = pair();
+    // The parent lives in another home, so this one never stored the id: the
+    // correction to a peer is exactly the mail that cannot be refused for naming it.
+    let correction = send(
+        &mut a,
+        json!({"id":"correction","from":"apps","to":"infra","kind":"notice","urgency":"low",
+        "correlation":"baf32096","body":"Correction: the desktop is free"}),
+    )
+    .unwrap();
+    assert_eq!(correction["correlation"], "baf32096");
+    // A reply or a request naming an unknown thread is still refused here: it
+    // answers or asks for something only this home can judge.
+    for kind in ["reply", "request"] {
+        let refused = err(send(
+            &mut a,
+            json!({"id":format!("{kind}-nowhere"),"from":"apps","to":"infra","kind":kind,
+            "correlation":"baf32096","body":"?"}),
+        ));
+        assert!(refused.contains("unknown correlated message"), "{refused}");
+    }
+    // A local typo (notice to a local recipient with unknown correlation) is still refused.
+    let (_temp_local, mut s) = fleet();
+    let local_typo = err(send(
+        &mut s,
+        json!({"id":"local-typo","from":"apps","to":"infra","kind":"notice","urgency":"low",
+        "correlation":"baf32096","body":"Correction: the desktop is free"}),
+    ));
+    assert!(
+        local_typo.contains("unknown correlated message"),
+        "{local_typo}"
+    );
+}
+
+#[test]
 fn directory_records_ships_and_reserves_the_captain() {
     let (_temp, mut s) = fleet();
     let ships = dispatch(&mut s, "ship.list", json!({})).unwrap();
@@ -499,7 +681,7 @@ fn seed_legacy_oversize(store: &Store, mut args: Value) -> Value {
     args["payload"] = json!({"text":"\"\\\n船"});
     let mut wire = json!({"id":args["id"],"from":args["from"],"to":args["to"],"kind":args["kind"],
         "correlation":args["correlation"],"request_kind":null,"body":"","payload":args["payload"],
-        "urgency":"normal","deadline_ms":null,"created_ms":now});
+        "urgency":"normal","deadline_ms":null,"created_ms":now,"because_of":null});
     args["body"] = json!("x".repeat(65_537 - wire.to_string().len()));
     wire["body"] = args["body"].clone();
     assert_eq!(wire.to_string().len(), 65_537);
@@ -1033,7 +1215,8 @@ fn outgoing_mail_is_limited_by_its_normalized_wire_bytes() {
             "kind":"notice","body":"\"\\\n船","payload":{}});
         let mut wire = json!({"id":mode,"from":"apps","to":"infra",
             "kind":"notice","body":"\"\\\n船","payload":{},"correlation":null,
-            "request_kind":null,"urgency":"normal","deadline_ms":null,"created_ms":now});
+            "request_kind":null,"urgency":"normal","deadline_ms":null,"created_ms":now,
+            "because_of":null});
         if mode == "generated-id" {
             args.as_object_mut().unwrap().remove("id");
             wire["id"] = json!("00000000-0000-0000-0000-000000000000");

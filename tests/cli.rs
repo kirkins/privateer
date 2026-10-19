@@ -669,6 +669,12 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
     // A captain's own hands are marked, with the exact step, never buried in a report.
     assert!(agents.contains(r#""needs_hands":{"step":"#), "{agents}");
     assert!(agents.contains("Never bury such an ask under a report"));
+    // Anything about a request goes in its thread, and a follow-up names it.
+    assert!(agents.contains("Anything about a request goes in that request's thread"));
+    assert!(
+        agents.contains(r#""because_of":"<parent request id>""#),
+        "{agents}"
+    );
     // A captain's choice between options is a typed decision, not a question in the body.
     assert!(agents.contains(
         "send it as `kind` `decision` with `payload.decision`, not as a question in the body"

@@ -112,9 +112,12 @@ pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option
         return Ok(None);
     }
     let (mail, backlog): (bool, bool) = store.connection().query_row(
-        "SELECT COALESCE(MAX(sender<>?3 OR correlation IS NOT 'backlog-'||?1), 0), COUNT(*)>0
-         FROM mail WHERE recipient=?1 AND seq>?2
-           AND COALESCE(delivery,'received')='received' AND (kind<>'notice' OR urgency<>'low')",
+        &format!(
+            "SELECT COALESCE(MAX(sender<>?3 OR correlation IS NOT 'backlog-'||?1), 0), COUNT(*)>0
+             FROM mail WHERE recipient=?1 AND seq>?2
+               AND COALESCE(delivery,'received')='received' AND NOT ({})",
+            crate::mail::ROUTINE_MAIL
+        ),
         params![ship, asleep.through_seq, crate::mail::CREW],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -461,5 +464,97 @@ fn say(store: &Store, ship: &str, body: &str) {
     match sent {
         Ok(_) => println!("→ you: {body}"),
         Err(error) => println!("✗ not sent: {error:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correction_in_parent_thread_raises_sleeping_pane_alarm() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        for ship in ["apps", "infra"] {
+            crate::dispatch(&mut store, "ship.put", json!({"name": ship, "scope": ship})).unwrap();
+        }
+        // apps asks infra a question; infra answers it.
+        crate::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"id": "baf32096", "from": "apps", "to": "infra", "kind": "request",
+                   "body": "Which machine?"}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"from": "infra", "to": "apps", "kind": "reply",
+                   "correlation": "baf32096", "body": "The laptop"}),
+        )
+        .unwrap();
+        // infra raises a follow-up to captain because_of baf32096.
+        crate::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"id": "e376ceec", "from": "infra", "to": "captain", "kind": "request",
+                   "because_of": "baf32096", "body": "Release the laptop"}),
+        )
+        .unwrap();
+
+        // infra goes to sleep with all mail through current sequence seen.
+        let through_seq: i64 = store
+            .connection()
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM mail", [], |r| r.get(0))
+            .unwrap();
+        let asleep = Asleep {
+            holder: "host:infra:pane".into(),
+            through_seq,
+        };
+        assert_eq!(alarm(&store, "infra", &asleep).unwrap(), None);
+
+        // A routine low notice in an unrelated thread or with no correlation does not wake it.
+        crate::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"id": "heads-up", "from": "apps", "to": "infra", "kind": "notice",
+                   "urgency": "low", "body": "Heads-up"}),
+        )
+        .unwrap();
+        assert_eq!(alarm(&store, "infra", &asleep).unwrap(), None);
+
+        // A correction in the parent thread of infra's open follow-up raises the alarm.
+        crate::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"id": "late-corr", "from": "apps", "to": "infra", "kind": "notice",
+                   "urgency": "low", "correlation": "baf32096", "body": "Desktop is free"}),
+        )
+        .unwrap();
+        assert_eq!(alarm(&store, "infra", &asleep).unwrap(), Some("mail"));
+
+        // Once the follow-up is withdrawn, a low notice in that thread is quiet again.
+        crate::dispatch(
+            &mut store,
+            "mail.withdraw",
+            json!({"id": "e376ceec", "actor": "infra", "reason": "settled"}),
+        )
+        .unwrap();
+        let after_withdraw: i64 = store
+            .connection()
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM mail", [], |r| r.get(0))
+            .unwrap();
+        let asleep_after = Asleep {
+            holder: "host:infra:pane".into(),
+            through_seq: after_withdraw,
+        };
+        crate::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"id": "later-note", "from": "apps", "to": "infra", "kind": "notice",
+                   "urgency": "low", "correlation": "baf32096", "body": "Quiet again"}),
+        )
+        .unwrap();
+        assert_eq!(alarm(&store, "infra", &asleep_after).unwrap(), None);
     }
 }

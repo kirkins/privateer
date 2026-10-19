@@ -53,6 +53,8 @@ pub fn init(store: &Store) -> Result<()> {
         ("delivered_ms", "INTEGER"),
         // A transport acknowledgement is not proof an old peer applied a closure.
         ("remote_end_state", "TEXT"),
+        // The request a follow-up is raised because of; see ROUTINE_MAIL.
+        ("because_of", "TEXT"),
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail') WHERE name=?1)",
@@ -67,12 +69,35 @@ pub fn init(store: &Store) -> Result<()> {
     }
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS mail_pending ON mail(delivery, seq) WHERE delivery='pending';
+         CREATE INDEX IF NOT EXISTS mail_because_of ON mail(because_of) WHERE because_of IS NOT NULL;
          CREATE TABLE IF NOT EXISTS mail_delivery_retry(peer TEXT PRIMARY KEY,
            failures INTEGER NOT NULL, next_attempt_ms INTEGER NOT NULL, last_attempt_ms INTEGER NOT NULL);",
     )?;
     tx.commit()?;
     Ok(())
 }
+
+/// The one definition of a message that only informs, for every place that
+/// decides one: an information-only notice that is in the thread of no open
+/// request this mailbox sent or received, and of no request an open follow-up
+/// of this mailbox grows from. `because_of` names the thread a follow-up grows
+/// from, so a low notice in that thread is actionable for the sender of every
+/// still-open follow-up, one level only; the parent may be answered and may
+/// live in another home, and the wake names the follow-up.
+pub(crate) const ROUTINE_MAIL: &str = "kind='notice' AND urgency='low'
+     AND NOT (EXISTS(SELECT 1 FROM mail AS follow_up WHERE follow_up.because_of=mail.correlation
+       AND follow_up.sender=mail.recipient AND follow_up.state='open'
+       AND follow_up.kind IN ('request','decision'))
+       OR EXISTS(SELECT 1 FROM mail AS req WHERE req.id=mail.correlation
+       AND req.state='open' AND req.kind IN ('request','decision')
+       AND (req.sender=mail.recipient OR req.recipient=mail.recipient)))";
+
+/// The open follow-up of this mailbox that a notice in its thread concerns, if
+/// any: the oldest one, so a wake names a bounded id to withdraw or update.
+pub(crate) const OPEN_FOLLOW_UP: &str =
+    "(SELECT f.id FROM mail AS f WHERE f.because_of=mail.correlation
+     AND f.sender=mail.recipient AND f.state='open' AND f.kind IN ('request','decision')
+     ORDER BY f.seq LIMIT 1)";
 
 /// Where a ship's mailbox lives: None for this home, Some(peer) for another.
 fn remote_peer(ship: &Value) -> Option<&str> {
@@ -296,7 +321,7 @@ pub(crate) fn find(store: &Store, id: &str) -> Result<Option<Value>> {
     Ok(by_id(store, id)?.map(|m| annotate(m, Store::now_ms())))
 }
 
-pub(crate) const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms,ended_by,ended_ms,end_reason";
+pub(crate) const COLUMNS: &str = "seq,id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,answered_by,answered_ms,delivery,delivery_attempts,delivery_error,delivered_ms,ended_by,ended_ms,end_reason,because_of";
 
 pub(crate) fn message(r: &Row) -> rusqlite::Result<Value> {
     let payload: String = r.get(9)?;
@@ -314,6 +339,7 @@ pub(crate) fn message(r: &Row) -> rusqlite::Result<Value> {
         "delivery_error": r.get::<_, Option<String>>(18)?, "delivered_ms": r.get::<_, Option<i64>>(19)?,
         "ended_by": r.get::<_, Option<String>>(20)?, "ended_ms": r.get::<_, Option<i64>>(21)?,
         "end_reason": r.get::<_, Option<String>>(22)?,
+        "because_of": r.get::<_, Option<String>>(23)?,
     }))
 }
 
@@ -1188,6 +1214,15 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         kind != "reply" || correlation.is_some(),
         "a reply names the request it answers as correlation"
     );
+    let because_of = optional_str(args, "because_of")?;
+    if let Some(parent) = because_of {
+        identifier(parent)?;
+        ensure!(
+            kind == "request",
+            "because_of is the request a follow-up asks about; only a request carries it"
+        );
+        ensure!(parent != id, "a request cannot be raised because of itself");
+    }
 
     let tx = store.write_transaction()?;
     if operator && correlation.is_some_and(|c| crate::block_ask::is_ask_id(store, c)) {
@@ -1221,6 +1256,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             && existing["to"] == to
             && existing["kind"] == kind
             && existing["correlation"] == json!(correlation)
+            && existing["because_of"] == json!(because_of)
             && existing["task_id"] == json!(task_id)
             && existing["request_kind"] == json!(request_kind)
             && existing["body"] == body
@@ -1276,19 +1312,21 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
                     crate::block_ask::check_answer(&thread, &payload)?;
                 }
             }
-            // The captain's request may live in the home that asked it, not
-            // this one; a reply to a linked ship is checked where that request
-            // is, and a refusal there is surfaced to the captain.
+            // A notice only groups a thread, and the thread it corrects may
+            // live in the other home: a ship that never stored that id is
+            // exactly the one whose correction must still arrive. Replies and
+            // requests still name something this home can judge.
             None => ensure!(
-                from == CAPTAIN && kind == "reply" && direct,
+                (kind == "notice" && peer.is_some())
+                    || (from == CAPTAIN && kind == "reply" && direct),
                 "unknown correlated message {correlation}"
             ),
         }
     }
     let now = Store::now_ms();
     tx.execute(
-        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,because_of)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             id,
             from,
@@ -1303,7 +1341,8 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             deadline_ms,
             now,
             opens.then_some("open"),
-            peer.as_ref().map(|_| "pending")
+            peer.as_ref().map(|_| "pending"),
+            because_of
         ],
     )?;
     if peer.is_some() {
@@ -1365,6 +1404,9 @@ fn envelope(message: &Value) -> Value {
         "urgency",
         "deadline_ms",
         "created_ms",
+        // An old peer keeps the message and ignores the link; the follow-up's
+        // own home is where the wake happens.
+        "because_of",
     ] {
         envelope[key] = message[key].clone();
     }
@@ -1967,6 +2009,16 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     }
     local_address(store, to)?;
     let correlation = optional_str(args, "correlation")?;
+    // A follow-up keeps its link where it was raised: the sender's home is
+    // where its wake happens, and the other home only reads the message.
+    let because_of = optional_str(args, "because_of")?;
+    if let Some(parent) = because_of {
+        identifier(parent)?;
+        ensure!(
+            kind == "request",
+            "because_of is the request a follow-up asks about; only a request carries it"
+        );
+    }
     let request_kind = optional_str(args, "request_kind")?;
     let body = args.get("body").and_then(Value::as_str).unwrap_or("");
     let mut payload = args.get("payload").cloned().unwrap_or(json!({}));
@@ -2050,8 +2102,8 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     }
     let now = Store::now_ms();
     tx.execute(
-        "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11)",
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms,because_of)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11,?13)",
         params![
             id,
             from,
@@ -2064,7 +2116,8 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             urgency,
             deadline_ms,
             now,
-            matches!(kind, "request" | "decision").then_some("open")
+            matches!(kind, "request" | "decision").then_some("open"),
+            because_of
         ],
     )?;
     if answers_here {
@@ -2182,8 +2235,10 @@ fn pending(store: &Store, args: &Value) -> Result<Value> {
         .max(acknowledged)
         .max(0);
     let (count, through, actionable): (i64,i64,i64) = store.connection().query_row(
-        "SELECT COUNT(*), COALESCE(MAX(seq), ?2), COALESCE(SUM(CASE WHEN kind <> 'notice' OR urgency <> 'low' THEN 1 ELSE 0 END),0)
-         FROM mail WHERE recipient=?1 AND seq>?2 AND COALESCE(delivery,'received')='received'",
+        &format!(
+            "SELECT COUNT(*), COALESCE(MAX(seq), ?2), COALESCE(SUM(CASE WHEN {ROUTINE_MAIL} THEN 0 ELSE 1 END),0)
+             FROM mail WHERE recipient=?1 AND seq>?2 AND COALESCE(delivery,'received')='received'"
+        ),
         params![address,after], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     let mut statement=store.connection().prepare(
         "SELECT seq,id,sender,kind,urgency,task_id FROM mail WHERE recipient=?1 AND seq>?2 AND seq<=?3
