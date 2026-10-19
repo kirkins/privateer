@@ -1404,6 +1404,35 @@ pub(crate) fn process_identity(pid: u32) -> Result<Option<String>> {
     Ok(identity(pid)?.filter(|p| !p.zombie).map(|p| p.started))
 }
 
+/// The live processes whose parent is `pid`, from the kernel's parent links.
+/// Empty where /proc is unavailable.
+#[cfg(target_os = "linux")]
+pub(crate) fn child_pids(pid: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return vec![];
+    };
+    entries
+        .filter_map(|entry| {
+            let candidate: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let stat = fs::read_to_string(format!("/proc/{candidate}/stat")).ok()?;
+            // The parent PID follows the state, after the command's final ')'.
+            let parent: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (parent == pid).then_some(candidate)
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn child_pids(_pid: u32) -> Vec<u32> {
+    vec![]
+}
+
 /// This process's identity, recorded with a claim another process may check.
 pub(crate) fn own_identity() -> Result<String> {
     let me = identity(std::process::id())?.context("cannot identify this process")?;

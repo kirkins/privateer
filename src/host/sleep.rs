@@ -192,6 +192,9 @@ pub(crate) enum Ended {
     /// Stopped at a safe point to move onto the current release, under the
     /// holder its fence moved the lease to, and the mail sequence it had seen.
     Relaunch(&'static str, String, i64),
+    /// Another session took the ship's lease, so its mail is no longer this
+    /// pane's. The harness was stopped and must not run beside the new holder.
+    Superseded,
 }
 
 /// Wait for a hosted harness, refreshing the lease, and stop it once the ship
@@ -214,11 +217,22 @@ pub(crate) fn supervise(
         }
         if leased && refreshed.elapsed() >= Duration::from_secs(30) {
             refreshed = Instant::now();
-            // A replaced lease is never reclaimed; the session just runs on.
+            // A replaced lease is never reclaimed; a lapsed one is not retaken here.
             leased = crate::presence::refresh(store, ship, holder, 90).unwrap_or(false);
         }
-        if leased && checked.elapsed() >= Duration::from_secs(5) {
+        let due = checked.elapsed() >= Duration::from_secs(5);
+        if due {
             checked = Instant::now();
+            // A lease another session now holds means its mail is theirs: this
+            // harness ends here rather than run beside them. A failed read is not
+            // a move, so it is judged again at the next check.
+            if crate::presence::moved_from(store, ship, holder).unwrap_or(false) {
+                stop(child)?;
+                store.audit("host.superseded", &json!({"ship": ship, "holder": holder}))?;
+                return Ok(Ended::Superseded);
+            }
+        }
+        if leased && due {
             // Relaunch only when idle: a turn in progress is never interrupted
             // unless its operator forced it.
             if let Ok(Some((reason, fenced, through))) =
@@ -470,6 +484,36 @@ fn say(store: &Store, ship: &str, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A harness whose lease another session takes is stopped at the next
+    /// check, rather than run on beside the new holder.
+    #[test]
+    fn a_harness_whose_lease_moves_to_another_session_is_stopped() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let ship = "infra";
+        store
+            .connection()
+            .execute(
+                "INSERT INTO ships(name, record) VALUES(?1, '{\"location\":\"here\"}')",
+                [ship],
+            )
+            .unwrap();
+        let ours = "host:infra:pane";
+        crate::presence::attend(&store, ship, ours, 90, None).unwrap();
+        crate::presence::attend(&store, ship, "host:infra:other", 90, None).unwrap();
+        // Our own stand-in harness, which would run for a minute if not stopped.
+        let mut harness = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let ended = supervise(&store, ship, ours, &mut harness, 0).unwrap();
+        assert!(matches!(ended, Ended::Superseded));
+        assert!(harness.try_wait().unwrap().is_some());
+        // The lease stays with the session that took it.
+        assert!(crate::presence::moved_from(&store, ship, ours).unwrap());
+        assert!(!crate::presence::moved_from(&store, ship, "host:infra:other").unwrap());
+    }
 
     #[test]
     fn correction_in_parent_thread_raises_sleeping_pane_alarm() {

@@ -1317,6 +1317,12 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 crate::host::upgrade::retire(&store, &ship, &fenced, reason, start);
                 std::process::exit(0);
             }
+            crate::host::sleep::Ended::Superseded => {
+                // The lease is another session's: leave it untouched, and end
+                // this pane with its harness already stopped.
+                terminal.restore();
+                std::process::exit(0);
+            }
             crate::host::sleep::Ended::Asleep(asleep) => {
                 holder.clone_from(&asleep.holder);
                 if let Some(lease) = hosted_lease.as_mut() {
