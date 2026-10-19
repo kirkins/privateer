@@ -1964,6 +1964,9 @@ fn the_captain_reads_and_types_into_a_hosted_first_mates_session() {
             == "w2:p1"
     });
 
+    // The next tick reads the bound pane's visible screen for auto-mode detection.
+    place.tick();
+
     // The screen, with its colours and revision, from the ship's own pane.
     let read = place.json("session.read", json!({"ship":"infra","lines":50}));
     assert_eq!(read["pane_id"], "w2:p1", "{read}");
