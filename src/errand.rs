@@ -129,6 +129,30 @@ fn prompt(store: &Store, id: &str, ship: &str, focus: &str, brief: &str) -> Resu
     ))
 }
 
+/// The live scheduled offer for a task that the calling job holds, when the
+/// caller is a woken first mate (the job named by `PRIVATEER_JOB`). A stale
+/// offer, such as one a `task.defer` has released, is not carried forward.
+fn woken_offer(store: &Store, task_id: &str) -> Result<Option<String>> {
+    let (Caller::Agent { .. }, Ok(job)) = (store.caller(), std::env::var("PRIVATEER_JOB")) else {
+        return Ok(None);
+    };
+    if !crate::scheduling::available(store)? {
+        return Ok(None);
+    }
+    let offer: Option<Option<String>> = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(j.record,'$.work_offer') FROM jobs j
+               JOIN task_schedule s ON s.task_id=?2
+             WHERE j.id=?1 AND json_extract(s.record,'$.offer_id')=json_extract(j.record,'$.work_offer')
+               AND json_extract(s.record,'$.state') IN ('offered','claimed','executing')",
+            params![job, task_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(offer.flatten())
+}
+
 /// `errand.start {focus, brief}`: run one errand for the caller's ship.
 fn start(store: &mut Store, args: &Value) -> Result<Value> {
     let ship = match store.caller() {
@@ -160,6 +184,17 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
             .as_str()
             .context("the ship has no duty task")?
             .to_owned(),
+    };
+    // Under a scheduled claim the errand carries its offer: named by the
+    // caller, or the live offer a woken first mate holds for this task.
+    let offer = match args.get("work_offer") {
+        Some(offer) => Some(
+            offer
+                .as_str()
+                .context("work_offer must be text")?
+                .to_owned(),
+        ),
+        None => woken_offer(store, &task_id)?,
     };
     // The captain's errand routes when listed, otherwise the ship's own.
     let require = crate::crew_routes::parse_require(args.get("require"))?;
@@ -236,6 +271,9 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     }
     if let Some(config) = profile.get("config").filter(|_| own) {
         launch["config"] = config.clone();
+    }
+    if let Some(offer) = &offer {
+        launch["work_offer"] = json!(offer);
     }
     if let Some(session) = &resume {
         launch["options"]["resume"] = json!(session);

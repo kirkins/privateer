@@ -409,17 +409,22 @@ fn view(work: &Scheduled) -> Value {
 /// Serialize this check with job insertion: an unrelated launcher cannot race
 /// a durable offer. Descendants of the recorded coordinator, or of a job
 /// admitted under the offer (a hosted coordinator's crew), inherit its claim.
+/// A runtime resume (`resume_of`, the parked crew) continues work already
+/// admitted: it inherits the claim through the crew's lineage, or, when the
+/// crew started before the live claim was offered, through the same task.
 pub(crate) fn admit_job(
     store: &Store,
     task: &str,
     job: &str,
     parent: Option<&str>,
     offer: Option<&str>,
+    resume_of: Option<&str>,
 ) -> Result<()> {
     if !available(store)? {
         return Ok(());
     }
     let mut matched_offer = offer.is_none();
+    let origin = task.to_owned();
     let mut task = Some(task.to_owned());
     for _ in 0..128 {
         let Some(id) = task else {
@@ -446,7 +451,10 @@ pub(crate) fn admit_job(
                     .context("active work has no offer")?;
                 matched_offer |= offer == Some(expected);
                 let mut allowed = job == expected || offer == Some(expected);
-                let mut ancestor = parent.map(str::to_owned);
+                if !allowed && id == origin {
+                    allowed = resume_predates(store, resume_of, expected)?;
+                }
+                let mut ancestor = parent.or(resume_of).map(str::to_owned);
                 for _ in 0..128 {
                     let Some(id) = ancestor else {
                         break;
@@ -475,6 +483,30 @@ pub(crate) fn admit_job(
         task = store.task(&id)?["parent"].as_str().map(str::to_owned);
     }
     bail!("task ancestry exceeds scheduling limit")
+}
+
+/// Whether a parked crew began before the live claim was offered. Its work
+/// was in flight first, so the claim must not orphan its resume.
+fn resume_predates(store: &Store, resume_of: Option<&str>, offer: &str) -> Result<bool> {
+    let Some(crew) = resume_of else {
+        return Ok(false);
+    };
+    let started: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(record,'$.created_ms') FROM jobs WHERE id=?1",
+            [crew],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let offered: Option<i64> = store
+        .connection()
+        .query_row("SELECT created_ms FROM wakes WHERE id=?1", [offer], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    Ok(matches!((started, offered), (Some(s), Some(o)) if s < o))
 }
 
 fn stopped_ancestor(store: &Store, task: &str) -> Result<Option<String>> {

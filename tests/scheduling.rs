@@ -1471,3 +1471,94 @@ fn a_large_backlog_backs_off_until_one_listed_task_is_handled() {
     assert_eq!(check["backoff_secs"], 7200, "{check}");
     assert_eq!(alarm(&mut fleet)["quiet"], 1);
 }
+
+fn settle_job(fleet: &Fleet, id: &Value) -> Value {
+    for _ in 0..250 {
+        let job = fleet.ok("job.status", json!({"id":id}), None);
+        if !matches!(
+            job["status"].as_str(),
+            Some("starting" | "queued" | "launching" | "running")
+        ) {
+            return job;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("fixture job did not settle");
+}
+
+#[test]
+fn errand_start_under_a_claim_takes_only_its_live_offer() {
+    let mut fleet = Fleet::new(support::now_settings());
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let offer = poll(&mut fleet, true)["offer"]["id"].clone();
+    let brief = json!({"focus":"task:infra-repair","brief":"Review the claimed work."});
+    let refused = fleet.refused("errand.start", brief.clone(), Some("infra"));
+    assert!(refused.contains("execution claim"), "{refused}");
+    let mut wrong = brief.clone();
+    wrong["work_offer"] = json!("work-not-the-claim");
+    let refused = fleet.refused("errand.start", wrong, Some("infra"));
+    assert!(refused.contains("execution claim"), "{refused}");
+    let mut current = brief;
+    current["work_offer"] = offer;
+    let started = fleet.ok("errand.start", current, Some("infra"));
+    assert_eq!(started["status"], "running", "{started}");
+}
+
+#[test]
+fn a_resume_under_a_claim_continues_work_the_claim_admitted() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let offer = poll(&mut fleet, true)["offer"]["id"].clone();
+    let crew = fleet.ok(
+        "job.start",
+        json!({"task_id":"infra-repair","command":["true"],"heavy":false,"work_offer":offer}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &crew["id"])["status"], "succeeded");
+    // A resume names the parked crew it continues, and the claim admits it
+    // through that crew's lineage.
+    let resume = fleet.ok(
+        "job.start",
+        json!({"id":"crew-resume-test-1","task_id":"infra-repair","command":["true"],"heavy":false,
+        "_resume_of":crew["id"]}),
+        None,
+    );
+    assert_eq!(resume["id"], "crew-resume-test-1", "{resume}");
+    assert_eq!(settle_job(&fleet, &resume["id"])["status"], "succeeded");
+    // A launch that is no resume of anything stays refused.
+    let unrelated = fleet.refused(
+        "job.start",
+        json!({"task_id":"infra-repair","command":["true"],"heavy":false}),
+        None,
+    );
+    assert!(unrelated.contains("execution claim"), "{unrelated}");
+}
+
+#[test]
+fn a_crew_started_before_a_claim_resumes_under_it() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    let crew = fleet.ok(
+        "job.start",
+        json!({"task_id":"infra-repair","command":["true"],"heavy":false}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &crew["id"])["status"], "succeeded");
+    enqueue(&mut fleet);
+    poll(&mut fleet, true);
+    let resume = fleet.ok(
+        "job.start",
+        json!({"id":"crew-resume-test-2","task_id":"infra-repair","command":["true"],"heavy":false,
+        "_resume_of":crew["id"]}),
+        None,
+    );
+    assert_eq!(settle_job(&fleet, &resume["id"])["status"], "succeeded");
+    let unrelated = fleet.refused(
+        "job.start",
+        json!({"task_id":"infra-repair","command":["true"],"heavy":false}),
+        None,
+    );
+    assert!(unrelated.contains("execution claim"), "{unrelated}");
+}

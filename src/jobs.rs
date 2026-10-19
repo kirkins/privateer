@@ -2026,6 +2026,11 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         }),
         _ => None,
     };
+    // A crew's resume names the parked crew it continues. Only the runtime's
+    // own launch (an operator caller) may say so.
+    let resume_of = matches!(store.caller(), Caller::Operator)
+        .then(|| args.get("_resume_of").and_then(Value::as_str))
+        .flatten();
     let expected_workspace = args
         .get("workspace_lease_id")
         .map(|v| v.as_str().context("workspace_lease_id must be a string"))
@@ -2243,6 +2248,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             &id,
             job.started_by.as_deref(),
             job.work_offer.as_deref(),
+            resume_of,
         )?;
         check_plugin_binding(&job, &current)?;
         check_workspace_owner(store, &job)?;
