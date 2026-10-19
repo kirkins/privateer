@@ -118,21 +118,24 @@ fn sweep_spaces(store: &Store) -> Result<Vec<Value>> {
                 .filter(|p| p.workspace_id == space.workspace)
                 .count()
                 == 1;
-            let unused = alone
-                && client
-                    .process_info(&space.pane)
-                    .is_ok_and(|info| bare_shell_in(&info, Path::new(&space.folder)));
-            let closed = unused && client.close_workspace(&space.workspace).is_ok();
+            // A failed read is temporary: keep the record for the next pass.
+            let unused = match alone.then(|| client.process_info(&space.pane)) {
+                Some(Err(_)) => continue,
+                Some(Ok(info)) => bare_shell_in(&info, Path::new(&space.folder)),
+                None => false,
+            };
+            let kind = if unused {
+                // A failed close is temporary too: keep the record for the next pass.
+                if client.close_workspace(&space.workspace).is_err() {
+                    continue;
+                }
+                "host.restored_closed"
+            } else {
+                "host.restored_left"
+            };
             let entry = json!({"workspace": space.workspace, "pane": space.pane,
-                "role": space.role, "ship": space.ship, "closed": closed});
-            store.audit(
-                if closed {
-                    "host.restored_closed"
-                } else {
-                    "host.restored_left"
-                },
-                &entry,
-            )?;
+                "role": space.role, "ship": space.ship, "closed": unused});
+            store.audit(kind, &entry)?;
             out.push(entry);
         }
         let tx = store.write_transaction()?;
@@ -145,23 +148,52 @@ fn sweep_spaces(store: &Store) -> Result<Vec<Value>> {
     Ok(out)
 }
 
+const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "fish", "dash", "ksh"];
+const HARNESSES: [&str; 5] = ["claude", "pi", "codex", "opencode", "agy"];
+
 /// Nothing runs in the pane but its shell, and the shell is where the space
-/// was opened: no one has used the restored copy.
+/// was opened: no one has used the restored copy. A `privateer` process or a
+/// harness is never a bare shell, even at the shell's pid: Privateer starts
+/// its panes with `exec`, which replaces the shell.
 fn bare_shell_in(info: &Value, folder: &Path) -> bool {
     let Some(shell) = info["shell_pid"].as_u64() else {
         return false;
     };
+    let login = std::env::var("SHELL").ok();
+    let login = login
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str());
     let processes = info["foreground_processes"].as_array();
     info["foreground_process_group_id"].as_u64() == Some(shell)
         && processes.is_some_and(|all| {
             !all.is_empty()
-                && all.iter().all(|p| p["pid"].as_u64() == Some(shell))
+                && all.iter().all(|p| {
+                    let names = process_names(p);
+                    p["pid"].as_u64() == Some(shell)
+                        && names.iter().any(|name| {
+                            SHELLS.contains(name) || login.is_some_and(|login| login == *name)
+                        })
+                        && !names.iter().any(|name| {
+                            name.starts_with("privateer") || HARNESSES.contains(name)
+                        })
+                })
                 && all.iter().all(|p| {
                     p["cwd"]
                         .as_str()
                         .is_some_and(|cwd| same_folder(Path::new(cwd), folder))
                 })
         })
+}
+
+/// A process's name and argv[0], by base name, without a login shell's dash.
+fn process_names(process: &Value) -> Vec<&str> {
+    [process["name"].as_str(), process["argv"][0].as_str()]
+        .into_iter()
+        .flatten()
+        .filter_map(|name| Path::new(name.trim_start_matches('-')).file_name())
+        .filter_map(|name| name.to_str())
+        .collect()
 }
 
 fn same_folder(a: &Path, b: &Path) -> bool {

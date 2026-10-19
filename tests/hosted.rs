@@ -737,6 +737,20 @@ impl Herdr {
         pane["process_info"] = json!({"pane_id":pane["pane_id"],"shell_pid":100,
             "foreground_process_group_id":processes[0]["pid"],"foreground_processes":processes});
     }
+    /// Herdr restarted and restored this space under a new terminal, and the
+    /// shell's pid now runs `name` in its place, as after `exec privateer ...`.
+    fn restore_exec(&self, workspace_id: &str, cwd: &Path, name: &str) {
+        let mut panes = self.panes.lock().unwrap();
+        let pane = panes
+            .iter_mut()
+            .find(|p| p["workspace_id"] == workspace_id)
+            .expect("restored pane exists");
+        pane["terminal_id"] = json!(format!("{workspace_id}-restored"));
+        pane["agent"] = Value::Null;
+        pane["process_info"] = json!({"pane_id":pane["pane_id"],"shell_pid":100,
+            "foreground_process_group_id":100,
+            "foreground_processes":[{"pid":100,"name":name,"cwd":cwd}]});
+    }
     /// The sidebar, top to bottom.
     fn order(&self) -> Vec<String> {
         self.spaces
@@ -1957,6 +1971,30 @@ fn a_space_herdr_restores_after_a_restart_is_closed_unless_the_captain_uses_it()
     let mut left = herdr.order();
     left.sort();
     assert_eq!(left, ["w1", "w2", "w4"]);
+}
+
+#[test]
+fn a_restored_space_running_privateer_at_the_shell_pid_is_not_closed() {
+    let (place, herdr) = hosted_fixture();
+    // A live bridge or a sleeping first mate runs in the pane where the shell
+    // was: `exec privateer ...` replaced it. The terminal changed, but the
+    // space is in use and is not a bare shell, so it is left alone.
+    place.stop_native("infra");
+    herdr.restore_exec("w2", &place.folder, "privateer-dashb");
+    place.retry_now();
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w3:p1", "{report}");
+    assert!(herdr.calls("workspace.close").is_empty(), "{report}");
+    assert!(herdr.order().contains(&"w2".to_owned()));
+    let left: Vec<Value> = place
+        .json("audit.list", json!({"limit":1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "host.restored_left")
+        .map(|event| event["payload"]["workspace"].clone())
+        .collect();
+    assert_eq!(left, [json!("w2")], "{report}");
 }
 
 /// Idle the hosted first mate past its sleep threshold until it sleeps: its
