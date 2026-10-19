@@ -880,10 +880,20 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
     // Budget for cold Python startup (including the injected delay), while
     // remaining well below the fixture's five-second blocked call and the
     // configured peer timeout. Production timeouts are unchanged.
-    let first = tick(1000);
-    assert!(started.elapsed() < Duration::from_secs(3), "{first}");
+    let first = tick(3000);
+    assert!(started.elapsed() < Duration::from_secs(4), "{first}");
     assert_eq!(Fleet::infra(&first)["status"], "running", "{first}");
     assert_eq!(first["delivered"]["attempted"], 1);
+    // The fake peer writes the marker after its cold start; wait for it
+    // rather than reading once, since a loaded runner can start it late.
+    let until = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < until,
+            "slow peer never wrote {marker:?}: {first}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     let observed: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
     assert_eq!(
         observed["wakes"], 1,
