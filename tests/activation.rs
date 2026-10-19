@@ -888,7 +888,10 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
     // rather than reading once, since a loaded runner can start it late.
     let until = Instant::now() + Duration::from_secs(10);
     while !marker.exists() {
-        assert!(Instant::now() < until, "slow peer never wrote {marker:?}: {first}");
+        assert!(
+            Instant::now() < until,
+            "slow peer never wrote {marker:?}: {first}"
+        );
         thread::sleep(Duration::from_millis(50));
     }
     let observed: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
