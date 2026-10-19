@@ -2079,6 +2079,14 @@ fn an_idle_ship_moves_to_the_other_machine_and_back() {
         "note.put",
         json!({"ship": "scout", "focus": "ship", "body": "Chart the north passage first."}),
     );
+    // Its Claude settings name the laptop's binary, as they did before the move.
+    let stale = "/home/laptop/.cargo/bin/privateer";
+    fs::create_dir_all(laptop.folder("scout").join(".claude")).unwrap();
+    fs::write(
+        laptop.folder("scout").join(".claude/settings.json"),
+        json!({"permissions": {"allow": [format!("Bash({stale}:*)")]}}).to_string(),
+    )
+    .unwrap();
 
     let moved = laptop.run(
         "liaison",
@@ -2099,6 +2107,17 @@ fn an_idle_ship_moves_to_the_other_machine_and_back() {
     assert_eq!(charter["repo"], json!(mac.folder("scout")), "{charter}");
     assert_eq!(charter["active"], true, "{charter}");
     assert!(mac.folder("scout").join("projects/charts/README").is_file());
+    // The Mac's copy of its settings points at the binary running here.
+    let settings: Value = serde_json::from_slice(
+        &fs::read(mac.folder("scout").join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_privateer");
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!([format!("Bash({bin}:*)")]),
+        "{settings}"
+    );
     // The laptop's folder is kept but runs nothing, and laptop ships reach
     // the ship on the Mac.
     let stale = laptop.run("scout", &["status"], None);

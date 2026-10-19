@@ -750,6 +750,159 @@ fn init_again_keeps_the_captains_edits() {
 }
 
 #[test]
+fn a_moved_folder_points_privateers_claude_settings_at_this_binary() {
+    // A ship moved from another machine still names that machine's binary.
+    let folder = Folder::new("liaison");
+    let stale = "/home/old/.cargo/bin/privateer";
+    let foreign = "/usr/bin/foreign-tool hook claude SessionStart";
+    let seed = |value: Value| {
+        fs::create_dir_all(folder.ship.join(".claude")).unwrap();
+        fs::write(folder.ship.join(".claude/settings.json"), value.to_string()).unwrap();
+    };
+    seed(json!({
+        "model": "sonnet",
+        "permissions": {"allow": [format!("Bash({stale}:*)"), "Bash(git:*)"]},
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": format!("{stale} hook claude SessionStart")}]},
+                {"hooks": [{"type": "command", "command": foreign}]}
+            ],
+            "Stop": [{"hooks": [
+                {"type": "command", "command": format!("{stale} hook claude Stop")},
+                {"type": "command", "command": "notify-send done"}
+            ]}],
+            "SessionEnd": [{"hooks": [
+                {"type": "command", "command": format!("{stale} hook claude SessionEnd")},
+                {"type": "command", "command": format!("{stale} hook claude SessionEnd")}
+            ]}]
+        }
+    }));
+    folder.ok(&["init", "--ship", "liaison", "--scope", "Liaison"]);
+
+    let read = |folder: &Folder| -> Value {
+        serde_json::from_slice(&fs::read(folder.ship.join(".claude/settings.json")).unwrap())
+            .unwrap()
+    };
+    let settings = read(&folder);
+    assert_eq!(settings["model"], "sonnet");
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!(["Bash(git:*)", format!("Bash({BIN}:*)")])
+    );
+    fn commands(settings: &Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|e| e["hooks"].as_array().unwrap().iter())
+            .map(|h| h["command"].as_str().unwrap().to_owned())
+            .collect()
+    }
+    let ours = |event: &str| format!("{BIN} hook claude {event}");
+    assert_eq!(
+        commands(&settings, "SessionStart"),
+        [foreign.to_owned(), ours("SessionStart")]
+    );
+    assert_eq!(
+        commands(&settings, "Stop"),
+        ["notify-send done".to_owned(), ours("Stop")]
+    );
+    assert_eq!(commands(&settings, "SessionEnd"), [ours("SessionEnd")]);
+    assert!(
+        !String::from_utf8_lossy(&fs::read(folder.ship.join(".claude/settings.json")).unwrap())
+            .contains(stale)
+    );
+
+    // Running again changes nothing, byte for byte.
+    let first = fs::read(folder.ship.join(".claude/settings.json")).unwrap();
+    folder.ok(&["init"]);
+    assert_eq!(
+        fs::read(folder.ship.join(".claude/settings.json")).unwrap(),
+        first
+    );
+
+    // A dispatcher start, or a session start, brings a moved folder back to this binary.
+    seed(json!({"permissions": {"allow": [format!("Bash({stale}:*)")]}}));
+    folder.ok(&["service", "start"]);
+    let settings = read(&folder);
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!([format!("Bash({BIN}:*)")])
+    );
+    seed(
+        json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": format!("{stale} hook claude Stop")}]}]}}),
+    );
+    folder.ok(&["start"]);
+    let settings = read(&folder);
+    assert_eq!(commands(&settings, "Stop"), [ours("Stop")]);
+}
+
+#[test]
+fn claude_settings_leave_foreign_entries_exactly_as_they_were() {
+    let folder = Folder::new("desk");
+    folder.ok(&["init", "--ship", "desk", "--scope", "Desk"]);
+    // Entries Privateer did not write: no hooks list, a non-list hooks, a bare
+    // string, and a hook of another tool. None may gain a key or change.
+    let foreign = json!([
+        {"matcher": "Bash"},
+        {"hooks": "not a list"},
+        "a bare string entry",
+        {"hooks": [{"type": "command", "command": "notify-send done"}]}
+    ]);
+    // Hand-written rules naming a bare or relative `privateer` are not ours.
+    let rules = json!([
+        "Bash(privateer:*)",
+        "Bash(./target/debug/privateer:*)",
+        format!("Bash({BIN}:*)")
+    ]);
+    fs::write(
+        folder.ship.join(".claude/settings.json"),
+        json!({"permissions": {"allow": rules}, "hooks": {"Stop": foreign}}).to_string(),
+    )
+    .unwrap();
+
+    folder.ok(&["init"]);
+    let settings: Value =
+        serde_json::from_slice(&fs::read(folder.ship.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!([
+            "Bash(privateer:*)",
+            "Bash(./target/debug/privateer:*)",
+            format!("Bash({BIN}:*)")
+        ])
+    );
+    let stop = settings["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop[..4], *foreign.as_array().unwrap());
+    assert_eq!(
+        stop[4]["hooks"][0]["command"],
+        format!("{BIN} hook claude Stop")
+    );
+    assert_eq!(stop.len(), 5, "{settings}");
+}
+
+#[test]
+fn a_malformed_claude_settings_file_does_not_stop_a_start() {
+    let folder = Folder::new("desk");
+    folder.ok(&["init", "--ship", "desk", "--scope", "Desk"]);
+    let path = folder.ship.join(".claude/settings.json");
+    for broken in ["{ not json", r#"{"permissions":{"allow":"Bash(git:*)"}}"#] {
+        fs::write(&path, broken).unwrap();
+        for args in [&["start"][..], &["service", "start"][..]] {
+            let out = folder.run_in(&folder.ship, args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("could not update the ship's Claude settings"),
+                "{stderr}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+    }
+}
+
+#[test]
 fn a_dispatcher_start_brings_generated_instructions_up_to_this_build() {
     let folder = Folder::new("desk");
     folder.ok(&["init", "--ship", "infra", "--scope", "Deploys"]);

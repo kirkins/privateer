@@ -300,12 +300,14 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
 
 /// Make sure the ship's dispatcher is running; report how.
 pub fn ensure(home: &Path, ship: &str) -> Result<String> {
+    crate::cli::refresh_claude_settings(home);
     start(&dispatcher(home, ship), &home.join("serve.log"))
 }
 
 /// Start the ship's dispatcher with `path` as its PATH. A process reached
 /// over SSH has a bare PATH that would not find the harness.
 pub(crate) fn ensure_with_path(home: &Path, ship: &str, path: &str) -> Result<String> {
+    crate::cli::refresh_claude_settings(home);
     let mut service = dispatcher(home, ship);
     service.path = Some(path.to_owned());
     start(&service, &home.join("serve.log"))
