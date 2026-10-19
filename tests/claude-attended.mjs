@@ -197,6 +197,14 @@ try {
   await begin("asked again at the next settled turn");await end();await flush();
   replyCompacts=false;
   assert.equal(compactions.length,3,"a declined crossing asks again at the next settled turn");
+  // A stale draft in the pane's input box does not block the compaction, and the draft is left as typed.
+  usedTokens=150000;replyCompacts=true;
+  await begin("across the line with a stale draft");draft="stale unsent captain input";
+  await end();await flush();replyCompacts=false;
+  assert.equal(compactions.length,4,"a pane with a draft still compacts at the line");
+  assert.equal(draft,"stale unsent captain input","the compaction leaves the draft untouched");
+  assert.equal(usedTokens,50000,"the fake compacted with a draft present");
+  draft="";
   assert.deepEqual(submitted,[],"no /compact prompt on any path");
   usedTokens=50000;await tick();assert.equal(queue.length,beforeWork+1,"the compaction adds no mail prompt");
   await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"host:test"});

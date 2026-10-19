@@ -118,6 +118,11 @@ a busy first mate is never idle that long. A hosted Claude first mate has no
 quiet compaction at all, so it grew to 60% of a 1M window with nothing reducing
 it, and every turn re-read the whole of it.
 
+Quiet idle compaction is deliberately not added for hosted Claude. An idle pane
+re-reads nothing: its context is only paid for when a turn starts, and the line
+above already compacts a busy first mate at its next settled turn. Adding an
+idle trigger would compact a conversation that costs nothing to leave alone.
+
 The second trigger is a hard line, not an idle period:
 
 - at `context_warn_percent` (default 40) the bearings' attention line says what
@@ -136,7 +141,7 @@ The second trigger is a hard line, not an idle period:
   samples below the line; the first settled turn at or past the line while armed
   asks, and the crossing stays armed until the holder reports a compaction (the
   `compaction` kind), which disarms it. A sample below the line re-arms it. So a
-  declined compaction (the pane was busy, had a draft or mail, or the session
+  declined compaction (the pane was busy, had mail or an open ask, or the session
   refused it) asks again at the next settled turn past the line, and a
   compaction that leaves the context above the line does not compact again.
   A bounded session starts unarmed, so a fresh launch past the line never loops;

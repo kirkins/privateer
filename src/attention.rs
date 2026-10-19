@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(requests(&store), 0);
     }
 
-    /// A declined compaction (the pane was busy, or had a draft) keeps the
+    /// A declined compaction (the pane was busy, or refused it) keeps the
     /// crossing armed: the next settled turn past the line asks again, and a
     /// turn still running does not.
     #[test]
