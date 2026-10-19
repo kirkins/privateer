@@ -145,6 +145,16 @@ pub fn leave(store: &Store, ship: &str, holder: &str) -> Result<bool> {
     )? == 1)
 }
 
+/// Whether another holder now holds a live lease on the ship, so this holder has
+/// lost it. A lapsed lease, with no live replacement, is not a move.
+pub fn moved_from(store: &Store, ship: &str, holder: &str) -> Result<bool> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM presence WHERE ship=?1 AND holder<>?2 AND expires_ms>?3)",
+        params![ship, holder, Store::now_ms()],
+        |r| r.get(0),
+    )?)
+}
+
 /// A heartbeat may extend its own lease, never reclaim a replacement.
 pub fn refresh(store: &Store, ship: &str, holder: &str, ttl_secs: u64) -> Result<bool> {
     local_ship(store, ship)?;

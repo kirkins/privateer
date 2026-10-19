@@ -1404,6 +1404,54 @@ pub(crate) fn process_identity(pid: u32) -> Result<Option<String>> {
     Ok(identity(pid)?.filter(|p| !p.zombie).map(|p| p.started))
 }
 
+/// The live processes whose parent is `pid`, from the kernel's parent links.
+#[cfg(target_os = "linux")]
+pub(crate) fn child_pids(pid: u32) -> Result<Vec<u32>> {
+    let entries = fs::read_dir("/proc").context("inspect process tree")?;
+    Ok(entries
+        .filter_map(|entry| {
+            let candidate: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let stat = fs::read_to_string(format!("/proc/{candidate}/stat")).ok()?;
+            // The parent PID follows the state, after the command's final ')'.
+            let parent: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (parent == pid).then_some(candidate)
+        })
+        .collect())
+}
+
+/// The live processes whose parent is `pid`, from one process table. Zombies
+/// are skipped: they have exited and hold their PID only until reaped.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn child_pids(pid: u32) -> Result<Vec<u32>> {
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,stat="])
+        .env("LC_ALL", "C")
+        .output()
+        .context("inspect process tree")?;
+    ensure!(output.status.success(), "process tree inspection failed");
+    let mut children = vec![];
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(child), Some(parent), Some(stat)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if stat.starts_with('Z') {
+            continue;
+        }
+        if parent.parse::<u32>()? == pid {
+            children.push(child.parse()?);
+        }
+    }
+    Ok(children)
+}
+
 /// This process's identity, recorded with a claim another process may check.
 pub(crate) fn own_identity() -> Result<String> {
     let me = identity(std::process::id())?.context("cannot identify this process")?;
