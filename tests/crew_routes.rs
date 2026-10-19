@@ -735,7 +735,7 @@ fn a_reported_window_keeps_new_crew_off_the_route_and_leaves_the_first_mate_room
     rusqlite::Connection::open(f.root.join("ledger/resources.sqlite"))
         .unwrap()
         .execute(
-            "UPDATE route_usage SET weekly_utilization=0.97 WHERE route='claude/*'",
+            "UPDATE route_usage SET weekly_utilization=0.97 WHERE route='claude/-/*'",
             [],
         )
         .unwrap();
