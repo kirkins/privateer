@@ -111,33 +111,42 @@ running and what waits. The first mate pulls from the top when attention
 allows; a blocked task leaves the running set and records its blocker, so it
 never holds a place.
 
-### 5. A busy hosted first mate that cannot resume starts fresh at a line
+### 5. A busy hosted Claude first mate acts at a context line
 
-Quiet compaction needs the session idle for `quiet_compact_secs`, and a busy
-first mate is never idle that long. A hosted Claude first mate on bounded tool
-bundles has no quiet compaction at all (its conversation cannot resume), so it
-grew to 60% of a 1M window with nothing reducing it, and every turn re-read the
-whole of it.
+Quiet compaction (Pi only) needs the session idle for `quiet_compact_secs`, and
+a busy first mate is never idle that long. A hosted Claude first mate has no
+quiet compaction at all, so it grew to 60% of a 1M window with nothing reducing
+it, and every turn re-read the whole of it.
 
 The second trigger is a hard line, not an idle period:
 
-- at `context_warn_percent` (default 40) the bearings' attention line says to
-  write handoff notes now, and that the turn crossing `context_compact_percent`
-  (default 50) ends the session;
+- at `context_warn_percent` (default 40) the bearings' attention line says what
+  the crossing will do: a resumable first mate keeps its notes current and is
+  compacted, a bounded one writes handoff notes now because its session ends;
 - a settled turn (its answer ended, no tool pending) reported by the session
-  holding the lease, at or past the line, requests a relaunch in `hosted_relaunches`.
-  The pane's supervisor takes it at the next safe point, busy or idle, and the
-  bounded launch that follows is a fresh session seeded from the handoff notes;
-- one crossing asks once: a pending request holds the next, and a relaunch
-  ends the session that crossed. The request waits while the captain has a
-  tool question open or a crew report is unread, and it is never forced;
-- only hosted first mates on Claude with `tool_bundles` qualify; a resumable
-  first mate would reopen the same conversation, so it gets neither the warning
-  nor the request.
+  holding the lease, at or past `context_compact_percent` (default 50), acts:
+  - a resumable first mate (no `tool_bundles`) is sent `/compact` at the turn's
+    end through its adapter, and keeps its conversation;
+  - a bounded first mate (`tool_bundles`, which cannot resume) gets a request in
+    `hosted_relaunches`. The pane's supervisor takes it at the next safe point,
+    busy or idle, and the bounded launch that follows is a fresh session seeded
+    from the handoff notes;
+- one crossing acts once. A session is armed by one of its own samples below
+  the line; the first settled turn at or past the line while armed acts and
+  disarms, and a sample below re-arms it. So a session whose first sample is
+  already past the line never acts, a new session starts unarmed, and a
+  compaction that leaves the context above the line does not compact again;
+- a crossing is held back, and the session stays armed, while a relaunch request
+  is pending, the captain has a tool question open, or a crew report is unread;
+- only hosted first mates on Claude qualify. Attended (unhosted) first mates
+  get neither the warning nor the action.
 
-Audit records `host.context_compact` with the tokens, window and line. Limitation: a
-crew decision is held back only through the unread crew reports it arrives as,
-not by a separate check for an open decision.
+Audit records `host.context_compact` with the action (`compact` or `relaunch`),
+the tokens, window and line. Limitation: a crew decision is held back only
+through the unread crew reports it arrives as, not by a separate check for an
+open decision. Limitation: the `/compact` submission is unverified against a
+live Claude pane; a refused submission is not retried until the context drops
+below the line and crosses again.
 
 ## What this does not do
 

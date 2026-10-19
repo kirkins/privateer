@@ -5,11 +5,12 @@
 //! counts only for the session that took it; once another session holds the
 //! ship, it reads unknown until that session reports.
 //! The pressure thresholds remain provisional.
-//! A hosted first mate that cannot resume its conversation (Claude with
-//! bounded tool bundles) has no quiet compaction to reach for. It is warned
-//! in its bearings at `context_warn_percent`, and a settled turn that ends at
-//! or past `context_compact_percent` asks its pane to relaunch into a fresh
-//! session seeded from its handoff notes.
+//! A hosted Claude first mate has no quiet compaction (that is Pi's). It is
+//! warned in its bearings at `context_warn_percent`, and a settled turn that
+//! crosses `context_compact_percent` acts once per crossing: a resumable one
+//! is told to `/compact` its conversation, and a bounded one (tool bundles,
+//! which cannot resume) gets a request to relaunch into a fresh session seeded
+//! from its handoff notes.
 use crate::presence;
 use crate::store::{Store, required};
 use anyhow::{Result, bail, ensure};
@@ -29,7 +30,9 @@ pub fn init(store: &Store) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS attention(ship TEXT NOT NULL, at_ms INTEGER NOT NULL,
            kind TEXT NOT NULL, tokens INTEGER NOT NULL, window INTEGER NOT NULL,
            summary_chars INTEGER);
-         CREATE INDEX IF NOT EXISTS attention_ship ON attention(ship, at_ms);",
+         CREATE INDEX IF NOT EXISTS attention_ship ON attention(ship, at_ms);
+         CREATE TABLE IF NOT EXISTS context_line(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,
+           armed INTEGER NOT NULL);",
     )?;
     let tx = store.write_transaction()?;
     let present: bool = tx.query_row(
@@ -79,19 +82,26 @@ fn report(store: &Store, args: &Value) -> Result<Value> {
         params![ship, now, kind, tokens, window, summary, holder],
     )?;
     // Only a turn that ended its answer, reported by the session holding the
-    // ship, may ask for a fresh session: never mid-turn or with a tool pending.
+    // ship, may act on the line: never mid-turn or with a tool pending.
     let settled = args.get("settled").and_then(Value::as_bool) == Some(true);
-    if let Some(holder) = holder.filter(|_| kind == "turn" && settled)
-        && args["holder"].as_str() == Some(holder)
-    {
-        request_fresh_start(store, ship, holder, tokens, window)?;
-    }
+    let session = holder.filter(|h| args.get("holder").and_then(Value::as_str) == Some(h));
+    let action = match session {
+        Some(holder) => track_line(store, ship, holder, kind, settled, tokens, window)?,
+        None => None,
+    };
     store.connection().execute(
         "DELETE FROM attention WHERE ship=?1 AND at_ms < ?2 AND rowid<>(SELECT rowid FROM attention
          WHERE ship=?1 AND kind IN ('turn','sample') ORDER BY at_ms DESC,rowid DESC LIMIT 1)",
         params![ship, now - KEEP_MS],
     )?;
-    summary_for(store, ship)
+    let mut summary = summary_for(store, ship)?;
+    if action == Some("compact")
+        && let Some(object) = summary.as_object_mut()
+    {
+        // The pane submits /compact itself, at its settled turn end.
+        object.insert("compact".into(), json!(true));
+    }
+    Ok(summary)
 }
 
 /// Latest fullness and rolling growth; stale or replaced sessions are unknown.
@@ -156,8 +166,8 @@ pub fn summary_for(store: &Store, ship: &str) -> Result<Value> {
         previous = Some(*tokens);
     }
     let percent = tokens as f64 * 100.0 / window as f64;
-    let fresh = fresh_start(store, ship)?;
-    let warning = fresh.is_some_and(|(warn, _)| percent >= warn);
+    let fresh = hosted_claude(store, ship)?;
+    let warning = fresh.as_ref().is_some_and(|line| percent >= line.warn);
     let mut reasons = vec![];
     if compactions > 0 {
         reasons.push(format!("compacted {compactions}× in the last hour"));
@@ -176,7 +186,7 @@ pub fn summary_for(store: &Store, ship: &str) -> Result<Value> {
         json!({"pressure": pressure, "fresh": true, "sample_ms":sample_ms, "reasons": reasons, "percent": percent.round(),
         "tokens": tokens, "window": window, "compactions_hour": compactions,
         "added_hour": added, "last_summary_chars": last_summary, "unread_crew": unread_crew,
-        "fresh_start": fresh.map(|(warn, compact)| json!({"warn_percent": warn, "compact_percent": compact})),
+        "fresh_start": fresh.map(|line| json!({"warn_percent": line.warn, "compact_percent": line.compact, "bounded": line.bounded})),
         "fresh_start_warning": warning}),
     )
 }
@@ -191,11 +201,17 @@ fn unread_crew(store: &Store, ship: &str) -> Result<i64> {
     )?)
 }
 
-/// The warning and compaction fullness of a first mate whose conversation
-/// cannot resume: hosted, on Claude, with bounded tool bundles, so every
-/// launch starts fresh. None for any other first mate, which keeps one
-/// conversation and so has no fresh start to warn about.
-fn fresh_start(store: &Store, ship: &str) -> Result<Option<(f64, f64)>> {
+/// A hosted Claude first mate's lines. A bounded one (tool bundles) cannot
+/// resume, so crossing the line starts a fresh session; a resumable one
+/// compacts its own conversation there instead.
+struct Line {
+    warn: f64,
+    compact: f64,
+    bounded: bool,
+}
+
+/// The lines of a hosted Claude first mate; None for any other first mate.
+fn hosted_claude(store: &Store, ship: &str) -> Result<Option<Line>> {
     let record: Option<String> = store
         .connection()
         .query_row("SELECT record FROM ships WHERE name=?1", [ship], |r| {
@@ -211,36 +227,79 @@ fn fresh_start(store: &Store, ship: &str) -> Result<Option<(f64, f64)>> {
         .and_then(crate::bundled::harness)
         .as_deref()
         == Some("claude");
-    if !(claude && crate::host::hosted(&first) && first.get("tool_bundles").is_some()) {
+    if !(claude && crate::host::hosted(&first)) {
         return Ok(None);
     }
-    let warn = first["context_warn_percent"].as_f64().unwrap_or(40.0);
     let compact = first["context_compact_percent"].as_f64().unwrap_or(50.0);
-    Ok(Some((warn.min(compact), compact)))
+    let warn = first["context_warn_percent"].as_f64().unwrap_or(40.0);
+    Ok(Some(Line {
+        warn: warn.min(compact),
+        compact,
+        bounded: first.get("tool_bundles").is_some(),
+    }))
 }
 
-/// Asks the hosted pane to relaunch into a fresh session once a settled turn
-/// ends at or past the compaction fullness, whether or not the first mate is
-/// idle: the supervisor takes the request at the next safe point. One crossing
-/// asks once: a request still pending holds the next one back, and the
-/// relaunch ends the session that crossed. A captain's open tool question or
-/// an unread crew report holds it too, so no decision is cut off.
-fn request_fresh_start(
+/// Follows the line for the session holding a hosted Claude first mate. A
+/// session is armed by one of its own samples below the line. The first
+/// settled turn to end at or past the line while armed acts once and disarms,
+/// so one crossing acts once; a session whose first sample is already past the
+/// line never acts, and a new session starts unarmed. A pending request, an
+/// open captain question or an unread crew report holds the action back, and
+/// the session stays armed. Returns the action taken, if any.
+fn track_line(
     store: &Store,
     ship: &str,
     holder: &str,
+    kind: &str,
+    settled: bool,
     tokens: i64,
     window: i64,
-) -> Result<()> {
-    let Some((_, compact)) = fresh_start(store, ship)? else {
-        return Ok(());
+) -> Result<Option<&'static str>> {
+    let Some(line) = hosted_claude(store, ship)? else {
+        return Ok(None);
     };
+    if !holder.starts_with(presence::HOSTED) {
+        return Ok(None);
+    }
     let percent = tokens as f64 * 100.0 / window as f64;
-    if percent < compact
-        || !holder.starts_with(presence::HOSTED)
-        || crate::permissions::paused(store, ship)?
-    {
-        return Ok(());
+    let armed: bool = store
+        .connection()
+        .query_row(
+            "SELECT armed FROM context_line WHERE ship=?1 AND holder=?2",
+            params![ship, holder],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let action = if kind == "turn" && settled && armed && percent >= line.compact {
+        request_at_line(store, ship, holder, &line, tokens, window, percent)?
+    } else {
+        None
+    };
+    let armed = percent < line.compact || (armed && action.is_none());
+    store.connection().execute(
+        "INSERT INTO context_line(ship, holder, armed) VALUES(?1, ?2, ?3)
+         ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, armed=excluded.armed",
+        params![ship, holder, armed],
+    )?;
+    Ok(action)
+}
+
+/// Takes the crossing: a bounded first mate asks its pane to relaunch into a
+/// fresh session at the next safe point, busy or idle (never forced); a
+/// resumable one is told to /compact by its pane. Holds back while a request
+/// is pending, the captain has a question open, or a crew report is unread.
+fn request_at_line(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    line: &Line,
+    tokens: i64,
+    window: i64,
+    percent: f64,
+) -> Result<Option<&'static str>> {
+    if crate::permissions::paused(store, ship)? || unread_crew(store, ship)? > 0 {
+        return Ok(None);
     }
     let now = Store::now_ms();
     let pending: bool = store.connection().query_row(
@@ -248,21 +307,26 @@ fn request_fresh_start(
         params![ship, now],
         |r| r.get(0),
     )?;
-    if pending || unread_crew(store, ship)? > 0 {
-        return Ok(());
+    if pending {
+        return Ok(None);
     }
-    store.connection().execute(
-        "INSERT INTO hosted_relaunches(ship,holder,force,requested_ms,expires_ms) VALUES(?1,?2,0,?3,?4)
-         ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, force=0,
-           requested_ms=excluded.requested_ms, expires_ms=excluded.expires_ms",
-        params![ship, holder, now, now + crate::host::upgrade::REQUEST_TTL_MS],
-    )?;
+    let action = if line.bounded {
+        store.connection().execute(
+            "INSERT INTO hosted_relaunches(ship,holder,force,requested_ms,expires_ms) VALUES(?1,?2,0,?3,?4)
+             ON CONFLICT(ship) DO UPDATE SET holder=excluded.holder, force=0,
+               requested_ms=excluded.requested_ms, expires_ms=excluded.expires_ms",
+            params![ship, holder, now, now + crate::host::upgrade::REQUEST_TTL_MS],
+        )?;
+        "relaunch"
+    } else {
+        "compact"
+    };
     store.audit(
         "host.context_compact",
-        &json!({"ship": ship, "holder": holder, "tokens": tokens, "window": window,
-            "percent": percent.round(), "compact_percent": compact}),
+        &json!({"ship": ship, "holder": holder, "action": action, "tokens": tokens,
+            "window": window, "percent": percent.round(), "compact_percent": line.compact}),
     )?;
-    Ok(())
+    Ok(Some(action))
 }
 
 /// One line for the bearings, or None with no reports.
@@ -288,10 +352,18 @@ pub fn line(summary: &Value) -> Option<String> {
         );
     }
     if summary["fresh_start_warning"] == true {
-        line.push_str(&format!(
-            ". Write your handoff notes now: at {}% full, the turn that crosses it ends this session, and a fresh one starts from those notes.",
-            summary["fresh_start"]["compact_percent"].as_f64().unwrap_or(50.0) as i64,
-        ));
+        let at = summary["fresh_start"]["compact_percent"]
+            .as_f64()
+            .unwrap_or(50.0) as i64;
+        if summary["fresh_start"]["bounded"] == true {
+            line.push_str(&format!(
+                ". Write your handoff notes now: at {at}% full, the turn that crosses it ends this session, and a fresh one starts from those notes.",
+            ));
+        } else {
+            line.push_str(&format!(
+                ". Keep your handoff notes current: at {at}% full, the turn that crosses it compacts this session.",
+            ));
+        }
     }
     Some(line)
 }
@@ -313,27 +385,42 @@ mod tests {
     /// A 200k window: 50% is 100k tokens, 40% is 80k.
     const WINDOW: i64 = 200_000;
 
-    /// A hosted Claude first mate on bounded tool bundles: every launch starts fresh.
-    fn bounded_claude(store: &Store) {
-        let record = json!({"location": "here", "first_mate": {"manifest": "bundled:claude",
-            "host": "herdr", "tool_bundles": [], "context_warn_percent": 40, "context_compact_percent": 50}});
+    /// A hosted Claude first mate, bounded (every launch starts fresh) or
+    /// resumable, held by `holder`.
+    fn claude_first_mate(store: &Store, holder: &str, mut first: Value) {
+        first["manifest"] = json!("bundled:claude");
+        first["context_warn_percent"] = json!(40);
+        first["context_compact_percent"] = json!(50);
+        let record = json!({"location": "here", "first_mate": first});
         store
             .connection()
             .execute(
-                "INSERT INTO ships(name, record) VALUES(?1, ?2)",
+                "INSERT OR REPLACE INTO ships(name, record) VALUES(?1, ?2)",
                 params![SHIP, record.to_string()],
             )
             .unwrap();
-        crate::presence::attend(store, SHIP, HOLDER, 90, None).unwrap();
+        crate::presence::attend(store, SHIP, holder, 90, None).unwrap();
     }
 
-    fn report_turn(store: &Store, tokens: i64, settled: bool) -> Value {
+    fn bounded_claude(store: &Store) {
+        claude_first_mate(store, HOLDER, json!({"host": "herdr", "tool_bundles": []}));
+    }
+
+    fn resumable_claude(store: &Store) {
+        claude_first_mate(store, HOLDER, json!({"host": "herdr"}));
+    }
+
+    fn report_from(store: &Store, holder: &str, tokens: i64, settled: bool) -> Value {
         report(
             store,
             &json!({"ship": SHIP, "kind": "turn", "tokens": tokens, "window": WINDOW,
-                "holder": HOLDER, "settled": settled}),
+                "holder": holder, "settled": settled}),
         )
         .unwrap()
+    }
+
+    fn report_turn(store: &Store, tokens: i64, settled: bool) -> Value {
+        report_from(store, HOLDER, tokens, settled)
     }
 
     fn count(store: &Store, sql: &str) -> i64 {
@@ -359,6 +446,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path()).unwrap();
         bounded_claude(&store);
+        report_turn(&store, 30_000, true);
         report_turn(&store, 110_000, false);
         assert_eq!(requests(&store), 0, "mid-turn reports never ask");
         report_turn(&store, 110_000, true);
@@ -402,6 +490,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path()).unwrap();
         bounded_claude(&store);
+        report_turn(&store, 30_000, true);
         report_turn(&store, 110_000, true);
         report_turn(&store, 120_000, true);
         report_turn(&store, 130_000, true);
@@ -419,25 +508,101 @@ mod tests {
         assert_eq!(audited(&store), 2);
     }
 
-    /// A first mate that can resume its conversation, or is not Claude, has
-    /// no fresh start: no warning and no request.
+    /// A resumable hosted Claude is told to /compact at the line and is never
+    /// relaunched; each crossing compacts once, and the warning is not a request.
     #[test]
-    fn a_first_mate_that_can_resume_is_never_asked_to_start_fresh() {
+    fn a_resumable_claude_compacts_once_per_crossing_without_relaunch() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path()).unwrap();
-        let record = json!({"location": "here", "first_mate": {"manifest": "bundled:claude",
-            "host": "herdr", "context_warn_percent": 40, "context_compact_percent": 50}});
+        resumable_claude(&store);
+        report_turn(&store, 30_000, true);
+        let warned = report_turn(&store, 90_000, true);
+        assert_eq!(warned["fresh_start_warning"], true);
+        assert!(line(&warned).unwrap().contains("compacts this session"));
+        assert!(warned["compact"].is_null(), "under the line: {warned}");
+        let crossed = report_turn(&store, 110_000, true);
+        assert_eq!(crossed["compact"], true, "{crossed}");
+        assert_eq!(
+            requests(&store),
+            0,
+            "no relaunch for a resumable first mate"
+        );
+        assert_eq!(audited(&store), 1);
+        // Still above the line after the compaction: no second one.
+        assert!(report_turn(&store, 105_000, true)["compact"].is_null());
+        assert!(report_turn(&store, 120_000, true)["compact"].is_null());
+        assert_eq!(audited(&store), 1);
+        // Dropping below the line re-arms it, and the next crossing compacts.
+        report_turn(&store, 30_000, true);
+        assert_eq!(report_turn(&store, 110_000, true)["compact"], true);
+        assert_eq!(audited(&store), 2);
+        assert_eq!(requests(&store), 0);
+    }
+
+    /// A session that starts above the line, or a new session that begins
+    /// past it, never acts: only a crossing within one session does.
+    #[test]
+    fn a_session_first_sample_past_the_line_triggers_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        bounded_claude(&store);
+        report_turn(&store, 150_000, true);
+        assert_eq!(
+            requests(&store),
+            0,
+            "the first sample of a session never asks"
+        );
+        assert_eq!(audited(&store), 0);
+        report_turn(&store, 30_000, true);
+        crate::presence::attend(&store, SHIP, "host:second", 90, None).unwrap();
+        report_from(&store, "host:second", 150_000, true);
+        assert_eq!(
+            requests(&store),
+            0,
+            "a new session above the line is not a crossing"
+        );
+        report_from(&store, "host:second", 30_000, true);
+        report_from(&store, "host:second", 150_000, true);
+        assert_eq!(requests(&store), 1, "the new session's own crossing asks");
+    }
+
+    /// A held-back crossing stays armed: a crossing while a relaunch request
+    /// is pending asks at the next settled turn past the line.
+    #[test]
+    fn a_held_back_crossing_asks_at_the_next_settled_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        bounded_claude(&store);
+        report_turn(&store, 30_000, true);
         store
             .connection()
             .execute(
-                "INSERT INTO ships(name, record) VALUES(?1, ?2)",
-                params![SHIP, record.to_string()],
+                "INSERT INTO hosted_relaunches(ship,holder,force,requested_ms,expires_ms) VALUES(?1,?2,0,?3,?4)",
+                params![SHIP, "host:other", Store::now_ms(), Store::now_ms() + 600_000],
             )
             .unwrap();
-        crate::presence::attend(&store, SHIP, HOLDER, 90, None).unwrap();
+        report_turn(&store, 110_000, true);
+        assert_eq!(audited(&store), 0, "a pending request holds it back");
+        store
+            .connection()
+            .execute("DELETE FROM hosted_relaunches WHERE ship=?1", [SHIP])
+            .unwrap();
+        report_turn(&store, 115_000, true);
+        assert_eq!(requests(&store), 1);
+        assert_eq!(audited(&store), 1);
+    }
+
+    /// An attended first mate that is not hosted gets no line at all.
+    #[test]
+    fn an_unhosted_first_mate_is_never_asked_to_compact_or_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        claude_first_mate(&store, HOLDER, json!({}));
+        report_turn(&store, 30_000, true);
         let summary = report_turn(&store, 150_000, true);
         assert!(summary["fresh_start"].is_null(), "{summary}");
-        assert_eq!(summary["fresh_start_warning"], false);
+        assert!(summary["compact"].is_null(), "{summary}");
         assert_eq!(requests(&store), 0);
+        assert_eq!(audited(&store), 0);
     }
 }
