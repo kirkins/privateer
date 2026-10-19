@@ -86,7 +86,7 @@ enum World {
 /// Resolve the caller from its process ancestry, for a command on `target`
 /// (the home it names, if any). Refuses a job that drops its role or borrows
 /// another job. `supervisor` says the command is itself a `_job-supervise`,
-/// whose `PRIVATEER_JOB` is its starter's and not a job it runs in.
+/// whose `PRIVATEER_JOB` and role are its starter's: it is never refused.
 pub(crate) fn resolve(target: Option<&Path>, caller: Caller, supervisor: bool) -> Result<Caller> {
     let env_job = env_job();
     if let Some((home, job, record)) = supervising_job()? {
@@ -103,8 +103,15 @@ pub(crate) fn resolve(target: Option<&Path>, caller: Caller, supervisor: bool) -
             let conn = open_readonly(&home)?;
             let crew = classify(&conn, &job, &actor)?;
             drop(conn);
+            // A supervisor is the runtime, not a caller in its ancestor's job:
+            // its environment is its starter's. A parked crew's resume is
+            // launched from inside the supervisor that settled, which may
+            // carry the dispatcher's operator environment beneath an agent's
+            // job. It takes that job's agent and is never refused, since a
+            // refused supervisor exits before it claims its own job.
             let refusal = match (&caller, &env_job) {
-                (_, Some(named)) if named != &job && !supervisor => Some(format!(
+                _ if supervisor => None,
+                (_, Some(named)) if named != &job => Some(format!(
                     "this process runs in job {job}; PRIVATEER_JOB cannot name job {named}"
                 )),
                 (Caller::Operator, _) => Some(format!(

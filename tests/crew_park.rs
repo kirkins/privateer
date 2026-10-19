@@ -1212,6 +1212,12 @@ fn a_resumed_crew_that_parks_again_resumes_again_and_finishes() {
         !notices.iter().any(|b| b.contains("supervisor disappeared")),
         "{notices:?}"
     );
+    // A resume's supervisor, launched from the parking crew's own supervisor,
+    // is the runtime and is never refused as the crew dropping its role.
+    assert!(
+        !notices.iter().any(|b| b.contains("dropping its role")),
+        "{notices:?}"
+    );
 }
 
 #[test]
