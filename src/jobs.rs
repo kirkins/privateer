@@ -3002,6 +3002,11 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         for name in CREW_UNATTENDED {
             cmd.env_remove(name);
         }
+        // A crew fetches and commits; its first mate pushes (crew-role.md).
+        let gh_config = dir.join("gh");
+        fs::create_dir_all(&gh_config)?;
+        fs::set_permissions(&gh_config, fs::Permissions::from_mode(0o700))?;
+        crate::crew_launch::scrub_push_credentials(&mut cmd, &gh_config);
     }
     // Crew report through crew.report, which checks this job.
     cmd.env("PRIVATEER_JOB", &job.id)

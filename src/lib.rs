@@ -11,6 +11,7 @@ pub mod context;
 pub mod core;
 pub mod credentials;
 pub mod crew;
+mod crew_launch;
 pub mod crew_routes;
 pub mod crew_scope;
 pub mod cursor_mail;
