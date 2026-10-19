@@ -55,16 +55,17 @@ fn claude_config() -> Option<(PathBuf, PathBuf)> {
 /// `.claude/settings.json`, and Claude asks again for a folder with its own
 /// rules (seen on 2.1.300 under an already trusted parent).
 /// Read only: Claude rewrites this file itself, so Privateer never writes it.
-fn claude_trusted(folder: &Path) -> bool {
-    let Some(config) = claude_config()
+/// `None` when the file cannot be read or parsed right now, as a read that
+/// lands mid-write says nothing about trust: that is no answer to act on.
+fn claude_trusted(folder: &Path) -> Option<bool> {
+    let config = claude_config()
         .and_then(|(_, file)| std::fs::read(file).ok())
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-    else {
-        return false;
-    };
-    folder
-        .to_str()
-        .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true)
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())?;
+    Some(
+        folder
+            .to_str()
+            .is_some_and(|dir| config["projects"][dir]["hasTrustDialogAccepted"] == true),
+    )
 }
 
 /// A Claude folder whose trust dialog was never accepted. The launch fails with
@@ -89,8 +90,13 @@ fn trust_step(folder: &Path) -> String {
     format!(
         "open Claude in {} once (`cd {} && claude`) and choose \"Yes, I trust this folder\"",
         folder.display(),
-        folder.display()
+        shell_quote(&folder.display().to_string())
     )
+}
+
+/// POSIX single-quote one word, so a folder with spaces survives the shell.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Raise the captain's one request for an untrusted folder. The same folder
@@ -229,7 +235,8 @@ pub(crate) fn with_untrusted(store: &Store, blocked: Value) -> Value {
 /// the captain is not first told at a launch. True when a request was raised.
 pub(crate) fn raise_untrusted_at_create(store: &Store, ship: &str, folder: &Path) -> Result<bool> {
     let folder = folder.canonicalize()?;
-    if claude_trusted(&folder) {
+    // Only a parsed, untrusted answer raises; an unreadable config waits for the launch.
+    if claude_trusted(&folder) != Some(false) {
         return Ok(false);
     }
     raise_untrusted(store, ship, &folder)?;
@@ -656,11 +663,15 @@ fn delay(failures: i64) -> i64 {
 /// Interactive starts cannot silently substitute a custom adapter or its config.
 /// Rechecked by `start --hosted`, since revocation may win after pane creation.
 pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> Result<()> {
-    ensure!(hosted(profile), "ship is no longer hosted");
-    let harness = profile["manifest"]
+    // A ship that no longer needs Claude's folder trust has no trust request left to keep.
+    let bundled = profile["manifest"]
         .as_str()
-        .and_then(crate::bundled::harness)
-        .context("hosting requires a bundled native harness")?;
+        .and_then(crate::bundled::harness);
+    if !hosted(profile) || bundled.as_deref() != Some("claude") {
+        clear_untrusted(store, ship)?;
+    }
+    ensure!(hosted(profile), "ship is no longer hosted");
+    let harness = bundled.context("hosting requires a bundled native harness")?;
     ensure!(
         LIVE_HARNESSES.contains(&harness.as_str()),
         "{harness} cannot be hosted: its attended adapter does not start turns on mail"
@@ -671,11 +682,15 @@ pub(crate) fn validate_start(store: &mut Store, ship: &str, profile: &Value) -> 
         .context("ship folder")?
         .canonicalize()?;
     if harness == "claude" {
-        if !claude_trusted(&folder) {
-            raise_untrusted(store, ship, &folder)?;
-            return Err(Untrusted(folder).into());
+        match claude_trusted(&folder) {
+            Some(true) => clear_untrusted(store, ship)?,
+            Some(false) => {
+                raise_untrusted(store, ship, &folder)?;
+                return Err(Untrusted(folder).into());
+            }
+            // Unreadable right now: block the launch, but neither raise nor clear.
+            None => return Err(Untrusted(folder).into()),
         }
-        clear_untrusted(store, ship)?;
     }
     ensure!(
         crate::presence::folder_ship(store).as_deref() == Some(ship),
@@ -958,5 +973,16 @@ fn settle(
     // Settle only records the sighting: the old space may still be closing.
     if let Ok(spaces) = client.mate_spaces() {
         let _ = reconcile_duplicate_mates(store, &spaces, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn the_trust_step_folder_survives_spaces_and_quotes() {
+        assert_eq!(shell_quote("/home/a b"), "'/home/a b'");
+        assert_eq!(shell_quote("/home/it's"), r"'/home/it'\''s'");
     }
 }
