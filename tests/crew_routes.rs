@@ -488,7 +488,7 @@ fn a_route_figure_beats_the_host_setting_which_beats_the_manifest() {
         json!({"crew_memory_bytes":null}),
     );
     f.routes(json!({"routes": {"steady": codex("model-steady", "credits")}, "crew": ["steady"]}));
-    // The bundled codex manifest declares 2 GiB and nothing overrides it. It
+    // The bundled codex manifest declares no figure, so the 2 GiB default applies. It
     // runs alone, so only the floor counts for it.
     f.json(
         Some("engineering"),
@@ -497,7 +497,7 @@ fn a_route_figure_beats_the_host_setting_which_beats_the_manifest() {
     );
     let job = f.json(None, "job.status", json!({"id":"crew-manifest"}));
     assert_eq!(job["estimate"]["memory_bytes"], 2u64 << 30, "{job}");
-    // This host's setting for codex replaces the manifest's figure.
+    // This host's setting for codex replaces the default.
     f.json(
         None,
         "resource.configure",
