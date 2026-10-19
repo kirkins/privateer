@@ -73,6 +73,11 @@ case "$MODE" in
   deadline)
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
+  capped)
+    # Outlives the test's crew budget, so the payload is still running when
+    # the deadline lands; a payload that exits first is refused as stale.
+    "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
+    sleep 300 ;;
   *)
     child='sleep 2; echo built'
     if [ "$MODE" = slow ] || [ "$MODE" = aged ]; then child='sleep 6; echo built'; fi
@@ -859,7 +864,7 @@ fn a_spent_park_cap_at_the_deadline_ends_the_crew_and_its_job() {
 #[test]
 fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
     let f = Fleet::new();
-    f.set_mode("deadline");
+    f.set_mode("capped");
     // The child must exist by the crew's deadline for it to be cancelled, so
     // wait for it to run before the crew can time out.
     f.json(
