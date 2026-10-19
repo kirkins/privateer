@@ -14,8 +14,16 @@ use std::process::Command;
 /// Checked with real git: a global helper and a `credential.<url>.helper` both
 /// stop answering.
 const CONFIG_COUNT: &str = "GIT_CONFIG_COUNT";
-/// Environment a crew payload must not carry: gh's tokens and the SSH agent.
-const CREW_UNSET: [&str; 4] = ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "GIT_ASKPASS"];
+/// Environment a crew payload must not carry: gh's tokens, the SSH agent and
+/// SSH's own askpass.
+const CREW_UNSET: [&str; 6] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "SSH_AUTH_SOCK",
+    "SSH_ASKPASS",
+];
 /// Offers no key and no agent, reads no `~/.ssh/config`, and so cannot
 /// authenticate to any host.
 const CREW_SSH: &str =
@@ -41,6 +49,11 @@ fn scrub_with_base(cmd: &mut Command, gh_config_dir: &Path, base: usize) {
         .env(format!("GIT_CONFIG_KEY_{base}"), "credential.helper")
         .env(format!("GIT_CONFIG_VALUE_{base}"), "")
         .env("GIT_SSH_COMMAND", CREW_SSH)
+        // An empty GIT_ASKPASS, unlike an unset one, stops git falling back to
+        // core.askPass and SSH_ASKPASS; with no terminal prompt either, git
+        // has no way to ask for a credential.
+        .env("GIT_ASKPASS", "")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_CONFIG_DIR", gh_config_dir);
     for name in CREW_UNSET {
         cmd.env_remove(name);
@@ -77,6 +90,8 @@ mod tests {
             Some(Some("/jobs/x/gh".into()))
         );
         assert_eq!(env_of(&cmd, "GIT_SSH_COMMAND"), Some(Some(CREW_SSH.into())));
+        assert_eq!(env_of(&cmd, "GIT_ASKPASS"), Some(Some(String::new())));
+        assert_eq!(env_of(&cmd, "GIT_TERMINAL_PROMPT"), Some(Some("0".into())));
         for name in CREW_UNSET {
             assert_eq!(env_of(&cmd, name), Some(None), "{name} is removed");
         }
