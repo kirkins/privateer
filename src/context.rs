@@ -465,6 +465,11 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             pane["current_commit"].as_str().unwrap_or("")
         ));
     }
+    if hosted_pane.as_ref().is_some_and(|pane| pane["settings_changed"] == true) {
+        text.push_str(&format!(
+            "Claude's settings changed after {ship}'s hosted first mate launched; auto mode and permissions read them only at launch. `privateer host relaunch {ship}` moves it onto them at its next safe point.\n"
+        ));
+    }
     Ok(json!({
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
         "backlog": backlog(store, ship)?,
