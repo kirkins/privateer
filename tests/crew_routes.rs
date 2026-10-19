@@ -802,7 +802,8 @@ fn an_expired_window_lets_crew_back_onto_the_route() {
 /// ("claude/-/*"), so a high reading on one model route refuses crew on another
 /// model route of the same account.
 #[test]
-fn a_fresh_high_reading_on_one_claude_route_refuses_crew_on_another_claude_route_of_the_same_account() {
+fn a_fresh_high_reading_on_one_claude_route_refuses_crew_on_another_claude_route_of_the_same_account()
+ {
     let f = Fleet::new();
     let script = |window: f64, week: f64| {
         let resets = privateer::store::Store::now_ms() / 1000;
@@ -881,7 +882,8 @@ fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
             rusqlite::params![now + 3_600_000, now],
         )
         .unwrap();
-    let store = privateer::store::Store::open(f.root.join("engineering/.privateer/fleet.sqlite")).unwrap();
+    let store =
+        privateer::store::Store::open(&f.root.join("engineering/.privateer/fleet.sqlite")).unwrap();
     // New crew start is refused at 85%:
     let refusal = f.refused(
         Some("engineering"),

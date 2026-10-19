@@ -782,7 +782,7 @@ pub(crate) fn first_mate_fallback(
     task: &str,
     profile: &Value,
 ) -> Result<Option<Choice>> {
-    fallback(store, ship, task, profile, false)
+    fallback(store, ship, task, profile, None)
 }
 
 /// The route a retry of a failed wake takes: the first listed route that can
@@ -1145,12 +1145,7 @@ pub(crate) fn retry_refusal(store: &Store, ship: &str, route: &str) -> Result<Op
 /// captain lists it for the crew's ship (or lists no crew routes, which
 /// restricts nothing), and it is not backing off. A resume is a runtime
 /// launch, so it is checked here as an agent start is in `check`.
-pub fn resume_route(
-    store: &Store,
-    ship: &str,
-    manifest: &str,
-    options: &Value,
-) -> Result<bool> {
+pub fn resume_route(store: &Store, ship: &str, manifest: &str, options: &Value) -> Result<bool> {
     let Some(policy) = for_store(store)? else {
         return Ok(true);
     };

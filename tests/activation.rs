@@ -322,9 +322,7 @@ fn a_failed_wake_whose_job_was_pruned_is_not_retryable() {
         json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600,"max_wakes_per_hour":1}),
     );
     native_routes(&fleet, false);
-    fleet.send(
-        json!({"id":"req-1","from":"apps","to":"infra","kind":"request","body":"work"}),
-    );
+    fleet.send(json!({"id":"req-1","from":"apps","to":"infra","kind":"request","body":"work"}));
     fleet.mode("half-throttle");
     fleet.tick();
     let failed = fleet.wakes()[0].clone();
@@ -339,8 +337,12 @@ fn a_failed_wake_whose_job_was_pruned_is_not_retryable() {
 
     // The next tick must not error; it simply treats the wake as not retryable.
     let reports = fleet.tick();
-    let retry = reports.iter().find(|r| r.get("retry_of").is_some());
-    assert!(retry.is_none(), "pruned job must not be retried: {reports:?}");
+    let retried = reports["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|ship| ship["retry_of"].is_string());
+    assert!(!retried, "pruned job must not be retried: {reports:?}");
 }
 
 /// A retry skips the route that FAILED, not just the ship's own configured route.

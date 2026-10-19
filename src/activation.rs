@@ -325,7 +325,10 @@ struct Retry {
 /// that ran. A log that cannot be read is empty, which says nothing about the
 /// route and never makes a wake look retried.
 fn job_log(store: &mut Store, job_id: &str) -> Result<String> {
-    let job = job_status(store, job_id)?;
+    // A pruned job record has no log to read, so it reads as an empty one.
+    let Ok(job) = job_status(store, job_id) else {
+        return Ok(String::new());
+    };
     let path = store
         .home()
         .join("jobs")
