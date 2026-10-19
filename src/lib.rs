@@ -11,6 +11,7 @@ pub mod context;
 pub mod core;
 pub mod credentials;
 pub mod crew;
+mod crew_launch;
 pub mod crew_routes;
 pub mod crew_scope;
 pub mod cursor_mail;
@@ -365,19 +366,29 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let codex = codex_crew_sandbox_default(&mut args);
             let codex_read_only = codex
                 && args["options"].get("sandbox").and_then(Value::as_str) == Some("read-only");
-            // A provider that is throttling this route only fails another run.
+            // A provider that is throttling this route only fails another run,
+            // and a plan past the share this route keeps for the kind of launch
+            // this is only fails it too. A first mate's wake is judged as one:
+            // it keeps the route crew are refused, and moves on its own.
             let model_route = args["manifest"]
                 .as_str()
                 .and_then(|m| routes::route_of(m, &args["options"]));
+            let wake = workspace::is_wake(store, &args)?;
             if let Some(route) = &model_route {
-                if let Some(refusal) = routes::refusal(store, route)? {
+                let who = if wake {
+                    routes::Who::FirstMate
+                } else {
+                    routes::Who::Crew
+                };
+                let limits = crew_routes::limits_of(store, route)?;
+                if let Some(refusal) = routes::refusal_for(store, route, who, limits)? {
                     anyhow::bail!(refusal);
                 }
             }
             // Crew of a hosted ship run live in their own space, where the
             // captain can watch and steer them, when the host answers. Crew on
             // a harness that cannot be hosted run headless with a viewer space.
-            let (hosted, viewed) = if workspace::is_wake(store, &args)? {
+            let (hosted, viewed) = if wake {
                 (false, false)
             } else {
                 let profile = owner
@@ -498,6 +509,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .filter(|_| matches!(store.caller(), Caller::Operator))
             {
                 job["_run_ms"] = spent.clone();
+            }
+            // The crew a resume continues; only the runtime's resume sets it.
+            if let Some(resumed) = args
+                .get("_resume_of")
+                .filter(|_| matches!(store.caller(), Caller::Operator))
+            {
+                job["_resume_of"] = resumed.clone();
             }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();

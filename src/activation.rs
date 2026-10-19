@@ -100,6 +100,9 @@ pub fn init(store: &Store) -> Result<()> {
         "session_id",
         "dispatcher_generation",
         "plan_digest",
+        // The wake this one retries, so a failed wake is retried once and
+        // only once.
+        "retry_of",
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
@@ -284,12 +287,108 @@ pub(crate) fn ships(store: &Store) -> Result<Vec<Value>> {
         .collect())
 }
 
+#[derive(Clone)]
 struct Mail {
     seq: i64,
     routine: bool,
     crew: bool,
+    id: String,
     focus: String,
     summary: String,
+}
+
+/// A wake attempt: the last one for a ship, as the retry rules read it.
+struct Last {
+    id: String,
+    status: String,
+    finished_ms: Option<i64>,
+    job_id: Option<String>,
+    /// The wake this one is itself a retry of.
+    retry_of: Option<String>,
+    created_ms: i64,
+}
+
+/// A failed wake to retry at once on the fallback, with the requests it had
+/// already answered.
+struct Retry {
+    /// The wake being retried.
+    wake: String,
+    /// Its classified failure, for the retry to read.
+    error: String,
+    /// The route that failed, when known.
+    failed_route: Option<String>,
+    /// The requests that attempt answered, by id.
+    answered: Vec<String>,
+}
+
+/// A finished job's stdout, read through its job record for the incarnation
+/// that ran. A log that cannot be read is empty, which says nothing about the
+/// route and never makes a wake look retried.
+fn job_log(store: &mut Store, job_id: &str) -> Result<String> {
+    // A pruned job record has no log to read, so it reads as an empty one.
+    let Ok(job) = job_status(store, job_id) else {
+        return Ok(String::new());
+    };
+    let path = store
+        .home()
+        .join("jobs")
+        .join(job_id)
+        .join(job["incarnation"].as_str().unwrap_or(""))
+        .join("stdout.log");
+    // A bounded log can be cut inside a UTF-8 character; keep the rest.
+    Ok(std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default())
+}
+
+/// Whether the last wake failed on something another route may do better: a
+/// provider limit or an outage, read out of its log, and not a wake that has
+/// already been retried or is itself a retry. A task error leaves no wake
+/// retried: the same first mate with the same brief would fail the same way,
+/// so it waits out the ordinary backoff instead.
+fn retryable(store: &mut Store, ship: &str, last: &Last) -> Result<Option<Retry>> {
+    if last.status != "failed" || last.retry_of.is_some() {
+        return Ok(None);
+    }
+    let already: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM wakes WHERE retry_of=?1)",
+        [&last.id],
+        |r| r.get(0),
+    )?;
+    if already {
+        return Ok(None);
+    }
+    let Some(job_id) = &last.job_id else {
+        return Ok(None);
+    };
+    let Ok(log) = job_log(store, job_id) else {
+        return Ok(None);
+    };
+    let Some(error) = crate::routes::throttle(&log) else {
+        return Ok(None);
+    };
+    let failed_route = job_status(store, job_id).ok().and_then(|job| {
+        job["model_route"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| crate::routes::route_of_argv(&job["command"]))
+    });
+    // What that attempt already did to this mailbox is a durable fact in it,
+    // not a reading of a transcript: a reply marks the request it answers
+    // answered, so both come from one place.
+    let mut statement = store.connection().prepare(
+        "SELECT correlation FROM mail WHERE sender=?1 AND kind='reply'
+           AND correlation IS NOT NULL AND created_ms>=?2 ORDER BY seq",
+    )?;
+    let answered = statement
+        .query_map(params![ship, last.created_ms], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(Some(Retry {
+        wake: last.id.clone(),
+        error,
+        failed_route,
+        answered,
+    }))
 }
 
 /// Mail for a ship newer than both its acknowledgement and its last wake,
@@ -344,6 +443,7 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
                 // Information-only notices wait for the next real wake.
                 routine: !r.get::<_, bool>(10)?,
                 crew: from == crate::mail::CREW,
+                id,
                 focus: String::new(),
                 summary,
             },
@@ -370,12 +470,31 @@ fn wake_text(
     mail: &[Mail],
     through: i64,
     resumed: bool,
+    retry: Option<&Retry>,
 ) -> Result<String> {
     let mut text = format!("Wake {wake} for ship {ship}.\n");
     // A resumed session already has its bearings and notes in context.
     if !resumed {
         let bearings = crate::context::bearings(store, ship)?;
         text.push_str(bearings["text"].as_str().unwrap_or(""));
+    }
+    // A retry says what it is retrying and what is already done, so the first
+    // mate does not answer a request twice or read its own past reply as new.
+    if let Some(retry) = retry {
+        text.push_str(&format!(
+            "\nThis is one retry of wake {}, which the provider ended with: {}. \
+             It has already answered: {}. Those requests are left out below and \
+             need no answer; check bearings for crew or notices the failed attempt \
+             already started. This attempt skips the one-minute wait and the \
+             hourly wake budget, and the next one, if any, waits as usual.\n",
+            retry.wake,
+            retry.error,
+            if retry.answered.is_empty() {
+                "nothing".to_owned()
+            } else {
+                retry.answered.join(", ")
+            }
+        ));
     }
     text.push_str(&format!("New mail through seq {through}, by focus:\n"));
     let mut foci: Vec<&str> = vec![];
@@ -480,6 +599,9 @@ fn job_status(store: &mut Store, job_id: &str) -> Result<Value> {
     crate::jobs::dispatch(store, "job.status", json!({"id": job_id}))
 }
 
+/// Whether a first mate's own route cannot take a wake now: it is held off, or
+/// its plan is past the share this route keeps for first mates. A first mate
+/// moves to its fallback on either, in a fresh session.
 pub(crate) fn own_route_blocked(store: &Store, profile: &Value) -> Result<bool> {
     let Some(route) = profile["manifest"]
         .as_str()
@@ -487,7 +609,8 @@ pub(crate) fn own_route_blocked(store: &Store, profile: &Value) -> Result<bool> 
     else {
         return Ok(false);
     };
-    Ok(crate::routes::refusal(store, &route)?.is_some())
+    let limits = crate::crew_routes::limits_of(store, &route)?;
+    Ok(crate::routes::refusal_for(store, &route, crate::routes::Who::FirstMate, limits)?.is_some())
 }
 
 /// Record the outcome of wakes whose first mate has finished.
@@ -659,13 +782,12 @@ pub(crate) fn warm_session(
 /// Decide whether a ship's first mate is due, and wake it if so.
 fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let name = ship["name"].as_str().context("ship name")?.to_owned();
-    let mut profile = ship["first_mate"].clone();
+    let profile = ship["first_mate"].clone();
     if crate::permissions::paused(store, &name)? {
         return Ok(
             json!({"ship":name,"skipped":"tool permission question awaits captain or a policy change"}),
         );
     }
-    let now = Store::now_ms();
     let running: bool = store.connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status IN ('offered','running'))",
         [&name],
@@ -711,6 +833,30 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
             Err(error) => host_error = Some(format!("{error:#}")),
         }
     }
+    headless_wake(
+        store,
+        name,
+        profile,
+        host_error,
+        host_backoff_until_ms,
+        own_blocked,
+        true,
+    )
+}
+
+/// The headless wake of a ship that its hosted first mate did not take.
+/// `retry_allowed` is false once a failed wake's retry has found no route to
+/// take: that wake then runs as any other, with its waits and its whole mail.
+fn headless_wake(
+    store: &mut Store,
+    name: String,
+    mut profile: Value,
+    host_error: Option<String>,
+    host_backoff_until_ms: Option<i64>,
+    mut own_blocked: Option<bool>,
+    retry_allowed: bool,
+) -> Result<Value> {
+    let now = Store::now_ms();
     // A wake covers mail through its sequence whether or not the first mate
     // acknowledged it, so an agent that forgets to ack is not woken forever.
     let woken_through: i64 = store.connection().query_row(
@@ -749,27 +895,46 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     if mail.is_empty() {
         return Ok(json!({"ship": name, "skipped": "nothing wake-worthy"}));
     }
-    let triggers: Vec<&Mail> = mail.iter().filter(|m| !m.routine).collect();
     let quiet = now - newest >= setting(&profile, "batch_secs") * 1000;
     let overdue = now - oldest >= setting(&profile, "max_delay_secs") * 1000;
     if !quiet && !overdue {
         return Ok(json!({"ship": name, "skipped": "batching"}));
     }
-    let last: Option<(String, Option<i64>)> = store
+    let last: Option<Last> = store
         .connection()
         .query_row(
             // A backlog alarm's record row is not a wake attempt; it must not
             // hide a recent failure from the retry backoff.
-            "SELECT status, finished_ms FROM wakes WHERE ship=?1 AND reason<>'backlog'
-             ORDER BY created_ms DESC LIMIT 1",
+            "SELECT id, status, finished_ms, job_id, retry_of, created_ms FROM wakes
+             WHERE ship=?1 AND reason<>'backlog' ORDER BY created_ms DESC LIMIT 1",
             [&name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| {
+                Ok(Last {
+                    id: r.get(0)?,
+                    status: r.get(1)?,
+                    finished_ms: r.get(2)?,
+                    job_id: r.get(3)?,
+                    retry_of: r.get(4)?,
+                    created_ms: r.get(5)?,
+                })
+            },
         )
         .optional()?;
+    // A wake the provider refused is retried once, at once, on the fallback,
+    // rather than waiting out the backoff on a route that just failed. A wake
+    // that failed for its own reasons keeps its mail and waits as it always
+    // did: only a limit or an outage says another route may do better.
+    let retry = match &last {
+        Some(last) if retry_allowed => retryable(store, &name, last)?,
+        _ => None,
+    };
     let last_failure = last
-        .filter(|(status, _)| status == "failed")
-        .and_then(|(_, at)| at);
-    if last_failure.is_some_and(|at| now - at < setting(&profile, "retry_backoff_secs") * 1000) {
+        .as_ref()
+        .filter(|last| last.status == "failed")
+        .and_then(|last| last.finished_ms);
+    if retry.is_none()
+        && last_failure.is_some_and(|at| now - at < setting(&profile, "retry_backoff_secs") * 1000)
+    {
         return Ok(json!({"ship": name, "skipped": "backing off after a failed wake"}));
     }
     let recent: i64 = store.connection().query_row(
@@ -777,11 +942,25 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         params![name, now - 3_600_000],
         |r| r.get(0),
     )?;
-    if recent >= setting(&profile, "max_wakes_per_hour") {
+    if retry.is_none() && recent >= setting(&profile, "max_wakes_per_hour") {
         return Ok(json!({"ship": name, "skipped": "hourly wake budget spent"}));
     }
-
+    // The retry covers the same mail as the attempt it replaces, including the
+    // requests that attempt answered: a wake covers mail through its sequence
+    // whether or not this first mate read it, so nothing is asked twice.
     let through = mail.iter().map(|m| m.seq).max().unwrap_or(0);
+    let mail: Vec<Mail> = match &retry {
+        Some(retry) => mail
+            .iter()
+            .filter(|item| !retry.answered.contains(&item.id))
+            .cloned()
+            .collect::<Vec<Mail>>(),
+        None => mail,
+    };
+    if mail.is_empty() {
+        return Ok(json!({"ship": name, "skipped": "nothing left to retry"}));
+    }
+    let triggers: Vec<&Mail> = mail.iter().filter(|m| !m.routine).collect();
     let wake = format!("wake-{}", uuid::Uuid::new_v4());
     // The primary focus is the oldest wake-worthy mail's. A wake about a task
     // the ship owns runs under that task when its charter allows a first
@@ -814,16 +993,43 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         }
         _ => None,
     };
-    // A headless wake on a backed-off route would only fail. Try the captain's
-    // first_mate order; if it has no clear route, preserve the existing wait.
+    // A headless wake on a route that cannot take it would only fail. Try the
+    // captain's first_mate order; if it has no clear route, preserve the
+    // existing wait. A retry goes there whether or not its own route is clear,
+    // because the route that just failed is the one it is moving off.
     if own_blocked.is_none() {
         own_blocked = Some(own_route_blocked(store, &profile)?);
     }
-    if own_blocked == Some(true) {
-        let Some(fallback) =
-            crate::crew_routes::first_mate_fallback(store, &name, &task, &profile)?
-        else {
-            return Ok(json!({"ship": name, "skipped": "model route backing off"}));
+    if retry.is_some() || own_blocked == Some(true) {
+        let fallback = match &retry {
+            Some(retry) => crate::crew_routes::retry_fallback(
+                store,
+                &name,
+                &task,
+                &profile,
+                retry.failed_route.as_deref(),
+            )?,
+            None => crate::crew_routes::first_mate_fallback(store, &name, &task, &profile)?,
+        };
+        let Some(fallback) = fallback else {
+            // A retry with no route to move to is no retry: the wake waits as
+            // it does without a failure, through the backoff, the hourly budget
+            // and the whole mail. Nothing was recorded, so this runs once.
+            if retry.is_some() {
+                return headless_wake(
+                    store,
+                    name,
+                    profile,
+                    host_error,
+                    host_backoff_until_ms,
+                    own_blocked,
+                    false,
+                );
+            }
+            return Ok(json!({
+                "ship": name,
+                "skipped": "model route backing off or past its headroom"
+            }));
         };
         profile["manifest"] = fallback.manifest;
         profile["options"] = fallback.options;
@@ -834,7 +1040,15 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         resume = None;
         harness = harness_id(&profile);
     }
-    let text = wake_text(store, &wake, &name, &mail, through, resume.is_some())?;
+    let text = wake_text(
+        store,
+        &wake,
+        &name,
+        &mail,
+        through,
+        resume.is_some(),
+        retry.as_ref(),
+    )?;
     let mut start = json!({
         "id": wake, "task_id": task, "manifest": profile["manifest"],
         "options": profile["options"], "wake": text,
@@ -855,8 +1069,8 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // Record the wake, with its job id, before the job exists: its outcome
     // must never be mistaken for crew and wake this first mate again.
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, dispatcher_generation)
-         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9,
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, dispatcher_generation)
+         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10,
            (SELECT value FROM metadata WHERE key='dispatcher_generation'))",
         params![
             wake,
@@ -867,7 +1081,8 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
             now,
             json!(foci).to_string(),
             harness,
-            resume
+            resume,
+            retry.as_ref().map(|retry| retry.wake.clone())
         ],
     )?;
     let started = crate::dispatch(store, "agent.start", start);
@@ -885,11 +1100,13 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     }
     store.audit(
         "wake.started",
-        &json!({"wake": wake, "ship": name, "through_seq": through, "status": status}),
+        &json!({"wake": wake, "ship": name, "through_seq": through, "status": status,
+            "retries": retry.as_ref().map(|retry| retry.wake.clone())}),
     )?;
     Ok(
         json!({"ship": name, "wake": wake, "status": status, "through_seq": through,
         "focus": primary, "task_id": task, "focuses": foci, "mode": mode, "error": error,
+        "retry_of": retry.as_ref().map(|retry| retry.wake.clone()),
         "host_error": host_error, "host_backoff_until_ms": host_backoff_until_ms}),
     )
 }

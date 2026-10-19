@@ -1078,6 +1078,9 @@ fn launch_resume(
     // Each resume gets a fresh budget (see `supervise_inner`); the run time
     // carried here is recorded on the job for reporting and bearings only.
     args["_run_ms"] = json!(crew_record["run_ms"].as_u64().unwrap_or(0));
+    // The parked crew this continues: its lineage admits the resume under a
+    // scheduled claim, as the work it was started under.
+    args["_resume_of"] = json!(crew);
     if same_session {
         // The resumed session already holds the brief and its earlier turns.
         args["options"]["resume"] = json!(session);

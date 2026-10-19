@@ -33,7 +33,8 @@ impl Fleet {
         fs::create_dir(root.join("engineering")).unwrap();
         let fleet = Self { _tmp: tmp, root };
         // The fake claude. Its mode file picks what the crew does: park on a
-        // child (session, nosession, long, gated), start a child and run out
+        // child (session, nosession, long, gated), park on a new child at
+        // every launch up to a limit (chain, twice), start a child and run out
         // its budget (deadline), or run out with nothing outstanding (held). A
         // resumed run is recognised by its job id, and completes its turn. A
         // gated child runs until the test releases it (`release_child`).
@@ -44,12 +45,14 @@ BIN='{bin}'
 gate="while [ ! -e $ROOT/release-child ]; do [ -d $ROOT ] || exit 1; sleep 0.1; done; echo built"
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
 MODE=$(cat "$ROOT/mode" 2>/dev/null)
-if [ "$MODE" = chain ]; then
-  # Every launch parks on its own child, up to six launches; the seventh (the
-  # sixth resume) finishes its turn.
+if [ "$MODE" = chain ] || [ "$MODE" = twice ]; then
+  # Every launch parks on its own child, up to six launches (two when twice);
+  # the next one (the last resume) finishes its turn.
   N=$(wc -l < "$ROOT/launches.log" | tr -d ' ')
+  LIMIT=6
+  if [ "$MODE" = twice ]; then LIMIT=2; fi
   printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
-  if [ "$N" -gt 6 ]; then
+  if [ "$N" -gt "$LIMIT" ]; then
     printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"{session}"}}\n'
     exit 0
   fi
@@ -228,10 +231,11 @@ esac
     }
     /// Wait until a job reaches one of the accepted statuses.
     fn wait(&self, id: &str, accepted: &[&str]) -> Value {
-        self.wait_within(60, id, accepted)
+        self.wait_secs(id, accepted, 60)
     }
-    /// `wait`, for a job whose own deadline is longer than a minute.
-    fn wait_within(&self, secs: u64, id: &str, accepted: &[&str]) -> Value {
+
+    /// `wait` with its own budget, for a chain of launches on a loaded runner.
+    fn wait_secs(&self, id: &str, accepted: &[&str], secs: u64) -> Value {
         let until = Instant::now() + std::time::Duration::from_secs(secs);
         loop {
             // A job that is not created yet is not an error to wait through.
@@ -888,7 +892,7 @@ fn a_spent_park_cap_cancels_the_job_a_crew_would_have_waited_on() {
     // The child must exist by the crew's deadline for it to be cancelled.
     let child = f.wait("child-1", &["running"]);
     assert_eq!(child["timeout_secs"], SPENT_CAP_CHILD_SECS, "{child}");
-    let crew = f.wait_within(SPENT_CAP_BUDGET_SECS + 60, "crew-26", &["timed_out"]);
+    let crew = f.wait_secs("crew-26", &["timed_out"], SPENT_CAP_BUDGET_SECS + 60);
     assert_eq!(crew["timeout_secs"], SPENT_CAP_BUDGET_SECS, "{crew}");
     assert!(
         crew["reason"]
@@ -1160,6 +1164,88 @@ fn a_crew_that_parks_six_times_keeps_its_ids_short_and_unique() {
     assert_eq!(last, "crew-resume-park-crew-chain-6-1", "{rows:?}");
 }
 
+/// A crew parks and resumes, the resumed crew parks again and resumes again,
+/// and that run finishes. Dispatcher passes run throughout, so a pass can read
+/// a crew running just before its supervisor parks it and exits; that read
+/// must not fail the parked crew (see `jobs::stale_reconcile_tests`), or the
+/// second child's outcome finds no crew to resume.
+#[test]
+fn a_resumed_crew_that_parks_again_resumes_again_and_finishes() {
+    let f = Fleet::new();
+    f.set_mode("twice");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let passes = std::sync::atomic::AtomicUsize::new(0);
+    // Stops the dispatcher loop however the body ends, so a failed wait fails
+    // the test instead of leaving the scope waiting on that loop forever.
+    struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                f.run(None, &["serve", "--json", r#"{"once":true}"#]);
+                passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let _stop = Stop(&done);
+        start_crew(&f, "crew-twice");
+        // Two launches, two children and two resumes, beside a dispatcher loop.
+        f.wait_secs("crew-resume-park-crew-twice-2-1", &["succeeded"], 180);
+    });
+    assert!(
+        passes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "no dispatcher pass ran"
+    );
+    let first = f.wait("crew-resume-park-crew-twice-1-1", &["resumed"]);
+    assert_eq!(
+        first["reason"], "resumed as crew-resume-park-crew-twice-2-1",
+        "{first}"
+    );
+    assert_eq!(first["park"], "park-crew-twice-2", "{first}");
+    let root = f.wait("crew-twice", &["resumed"]);
+    assert_eq!(
+        root["reason"], "resumed as crew-resume-park-crew-twice-1-1",
+        "{root}"
+    );
+    for crew in ["crew-twice", "crew-resume-park-crew-twice-1-1"] {
+        assert_eq!(
+            f.park_field(crew, "state"),
+            rusqlite::types::Value::Text("resumed".into()),
+            "{crew}"
+        );
+    }
+    let launches = f.launches();
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    assert!(
+        launches[1].contains("Job child-1 succeeded"),
+        "{launches:?}"
+    );
+    assert!(
+        launches[2].contains("Job child-2 succeeded"),
+        "{launches:?}"
+    );
+    let notices = f.ship_notices();
+    assert!(
+        notices
+            .iter()
+            .any(|b| b.contains("crew-resume-park-crew-twice-1-1 parked on job child-2")),
+        "{notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|b| b.contains("supervisor disappeared")),
+        "{notices:?}"
+    );
+    // A resume's supervisor, launched from the parking crew's own supervisor,
+    // is the runtime and is never refused as the crew dropping its role.
+    assert!(
+        !notices.iter().any(|b| b.contains("dropping its role")),
+        "{notices:?}"
+    );
+}
+
 #[test]
 fn a_parked_crew_with_partial_require_tier_resumes() {
     let f = Fleet::new();
@@ -1230,4 +1316,87 @@ fn a_parked_crew_with_partial_require_use_resumes() {
         job["route_why"].is_string(),
         "route_why should be recorded: {job}"
     );
+}
+
+/// A crew under a live scheduled claim parks on a child, the child settles, and
+/// the runtime resumes it. The resumed crew parks again on a new child, and
+/// that child's outcome resumes it a second time. Both resumes are admitted
+/// under the claim, through the real park and resume, and each records the
+/// crew it continues.
+#[test]
+fn a_crew_under_a_claim_parks_and_resumes_twice_through_the_runtime() {
+    let f = Fleet::new();
+    f.set_mode("chain");
+    f.json(
+        None,
+        "ship.attend",
+        json!({"ship":"engineering","holder":"host:crew-park-test","ttl_secs":600}),
+    );
+    f.json(
+        None,
+        "task.enqueue",
+        json!({"id":"fix","brief":"Fix the build."}),
+    );
+    let offer = f.json(
+        None,
+        "work.poll",
+        json!({"ship":"engineering","holder":"host:crew-park-test","idle":true,
+            "attention":{"tokens":1000,"window":100000}}),
+    )["offer"]["id"]
+        .clone();
+    assert!(offer.is_string(), "no claim was offered");
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-claim","manifest":"bundled:claude","work_offer":offer}),
+    );
+    let conn =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    // Three launches are the crew and its two resumes; the second resume's
+    // park row is written once its launch is admitted.
+    let until = Instant::now() + std::time::Duration::from_secs(120);
+    let resumes: Vec<String> = loop {
+        let resumed: Vec<String> = conn
+            .prepare(
+                "SELECT resumed_job_id FROM crew_parks
+                 WHERE root='crew-claim' AND resumed_job_id IS NOT NULL ORDER BY created_ms",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        if resumed.len() >= 2 && f.launches().len() >= 3 {
+            break resumed;
+        }
+        assert!(
+            Instant::now() < until,
+            "resumes {resumed:?} after {:?}\nsteps: {}\nnotices: {:?}",
+            f.launches(),
+            f.steps(),
+            f.ship_notices()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(resumes.len(), 2, "{resumes:?}");
+    // Each resume continues the crew before it: the first the claimed crew,
+    // the second the first resume.
+    let continued: Vec<Option<String>> = resumes
+        .iter()
+        .map(|job| {
+            conn.query_row(
+                "SELECT json_extract(record,'$.resume_of') FROM jobs WHERE id=?1",
+                [job],
+                |r| r.get(0),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        continued,
+        vec![Some("crew-claim".to_owned()), Some(resumes[0].clone())],
+        "{resumes:?}"
+    );
+    // The second resume parked again on its own child, so its job is parked.
+    f.wait_park(&resumes[1]);
 }

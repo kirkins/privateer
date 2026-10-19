@@ -1,6 +1,4 @@
 //! Captain-facing presentation with command-backed live mailbox actions.
-//! Demo interactions stay in memory without mailbox changes, wakes, terminal
-//! input or approvals.
 use super::{
     model::{clean, count},
     ui::App,
@@ -55,44 +53,6 @@ impl Mail {
     }
 }
 
-pub fn sample_mail() -> Vec<Mail> {
-    vec![
-        Mail {
-            payload: serde_json::json!({}),
-            home: None, seq: 0, acknowledged: false,
-            identity: None, origin: None,
-            id: "demo-decision".into(),
-            kind: "Decision".into(),
-            from: "Research".into(),
-            subject: "Choose the next investigation".into(),
-            body: "Research is available. Would you like a reliability review or a provider comparison? This is a sample decision; no work has been assigned.".into(),
-            status: "Awaiting captain".into(),
-        },
-        Mail {
-            payload: serde_json::json!({}),
-            home: None, seq: 0, acknowledged: false,
-            identity: None, origin: None,
-            id: "demo-reply".into(),
-            kind: "Reply".into(),
-            from: "Apps".into(),
-            subject: "Build investigation update".into(),
-            body: "The sample build investigation is still owned by Apps. Infrastructure has an incoming handoff offer; responsibility changes only after acceptance.".into(),
-            status: "Reply to your request".into(),
-        },
-        Mail {
-            payload: serde_json::json!({}),
-            home: None, seq: 0, acknowledged: false,
-            identity: None, origin: None,
-            id: "demo-notice".into(),
-            kind: "Notice".into(),
-            from: "Infrastructure".into(),
-            subject: "Provider connection needs attention".into(),
-            body: "Repeated connection alerts are grouped into one item. Detailed operational facts remain in the ship's Bridge and Logbook.".into(),
-            status: "Grouped notice".into(),
-        },
-    ]
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InputMode {
     Status,
@@ -129,14 +89,6 @@ pub struct Composer {
     pub id: String,
 }
 
-#[derive(Clone)]
-pub struct Exchange {
-    pub ship: String,
-    pub mode: InputMode,
-    pub body: String,
-    pub response: String,
-}
-
 impl App {
     pub fn edit_composer(&mut self, key: KeyCode) {
         if self.mail_pending {
@@ -145,8 +97,7 @@ impl App {
         }
         match key {
             KeyCode::Esc => self.composer = None,
-            KeyCode::Enter if !self.demo => self.submit_live(),
-            KeyCode::Enter => self.submit_preview(),
+            KeyCode::Enter => self.submit_live(),
             _ => {
                 if let Some(draft) = &mut self.composer {
                     match key {
@@ -223,7 +174,7 @@ impl App {
             .and_then(|s| s.live.as_ref())
             .filter(|l| l.error.is_none())
             .map(|l| l.home.clone());
-        if !self.demo && home.is_none() {
+        if home.is_none() {
             self.notice = "Ship home is unavailable. No message sent.".into();
             return;
         }
@@ -235,36 +186,6 @@ impl App {
             ..Composer::default()
         });
     }
-    pub fn submit_preview(&mut self) {
-        let Some(draft) = self.composer.take() else {
-            return;
-        };
-        if !self.demo || (draft.mode != InputMode::Status && draft.body.trim().is_empty()) {
-            self.notice = "No message sent.".into();
-            return;
-        }
-        let response = match draft.mode {
-            InputMode::Status => format!(
-                "Recorded sample state: {}, {}. No model call or wake.",
-                count(self.snapshot.tasks.iter().filter(|t| t.owner == draft.recipient).count(), "owned assignment", "owned assignments"),
-                count(self.snapshot.pending.iter().filter(|n| n.owner == draft.recipient).count(), "pending issue", "pending issues")
-            ),
-            InputMode::Ask => "Side-question preview only. A connected harness would answer without creating fleet work; it may use inference.".into(),
-            InputMode::Message => "Sample queued locally for preview. No agent was woken and no live message was delivered.".into(),
-        };
-        if self.exchanges.len() >= 20 {
-            self.exchanges.drain(..self.exchanges.len() - 19);
-        }
-        self.select_ship(Some(draft.recipient.clone()));
-        self.select_tab(0);
-        self.exchanges.push(Exchange {
-            ship: draft.recipient,
-            mode: draft.mode,
-            body: draft.body,
-            response,
-        });
-        self.notice = "Demo interaction only · discarded on exit · no inference".into();
-    }
     pub fn reply(&mut self) {
         if self.mail_pending {
             return;
@@ -272,10 +193,6 @@ impl App {
         let Some(mail) = self.mail.get(self.selected) else {
             return;
         };
-        if self.demo {
-            self.notice = "Demo replies are sample-only.".into();
-            return;
-        }
         if !matches!(mail.kind.as_str(), "request" | "decision") || mail.status == "answered" {
             self.notice = "Select an open request or decision.".into();
             return;
@@ -367,11 +284,9 @@ impl App {
         }
         lines.extend([
             Line::from(""),
-            Line::from(if self.demo {
-                "Sample mailbox · viewing does not acknowledge or answer this item."
-            } else {
-                "Enter: mark read · Esc: bridge. A read acknowledges only the contiguous read prefix."
-            }),
+            Line::from(
+                "Enter: mark read · Esc: bridge. A read acknowledges only the contiguous read prefix.",
+            ),
         ]);
         lines
     }
@@ -395,11 +310,7 @@ impl App {
             .iter()
             .find(|s| s.id == draft.recipient)
             .map_or(draft.recipient.as_str(), |s| s.name.as_str());
-        let block = Block::bordered().title(format!(
-            "{}To {}",
-            if self.demo { "DEMO · " } else { "" },
-            clean(name, 80)
-        ));
+        let block = Block::bordered().title(format!("To {}", clean(name, 80)));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         let rows = Layout::vertical([
@@ -476,13 +387,8 @@ impl App {
         frame.render_widget(
             Paragraph::new(if self.notice.is_empty() {
                 format!(
-                    "{} / 1024 chars · {}",
+                    "{} / 1024 chars · captain mailbox",
                     draft.body.chars().count(),
-                    if self.demo {
-                        "local sample only"
-                    } else {
-                        "captain mailbox"
-                    }
                 )
             } else {
                 clean(&self.notice, 512)
@@ -490,9 +396,7 @@ impl App {
             rows[3],
         );
         frame.render_widget(
-            Paragraph::new(if self.demo {
-                "Tab: mode · Enter: preview · Esc: cancel"
-            } else if draft.correlation.is_some() {
+            Paragraph::new(if draft.correlation.is_some() {
                 "Enter: reply · Esc: cancel"
             } else if draft.mode == InputMode::Status {
                 "Tab: mode · Enter: status · Esc: cancel"

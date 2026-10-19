@@ -54,34 +54,6 @@ pub struct View {
     pub socket_identity: (u64, u64),
 }
 
-impl View {
-    /// Clearly marked sample terminals; demo mode never connects to a socket.
-    pub fn demo() -> Self {
-        Self {
-            version: "demo".into(),
-            protocol: 20,
-            panes: [
-                ("navigator", "pi"),
-                ("apps", "codex"),
-                ("infrastructure", "pi"),
-            ]
-            .into_iter()
-            .map(|(id, agent)| Pane {
-                pane_id: format!("demo:{id}"),
-                terminal_id: format!("demo-terminal-{id}"),
-                workspace_id: format!("demo-{id}"),
-                tab_id: format!("demo-{id}:tab"),
-                agent: Some(agent.into()),
-                agent_status: "idle".into(),
-                title: Some(format!("{id} primary")),
-                agent_session: None,
-            })
-            .collect(),
-            ..Self::default()
-        }
-    }
-}
-
 /// A navigation binding recorded by a live presence holder. The socket
 /// incarnation and terminal identity are part of the binding, never a label.
 #[derive(Clone, Debug, Deserialize, Serialize)]

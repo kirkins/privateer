@@ -129,6 +129,10 @@ struct Job {
     foreign: Option<String>,
     #[serde(default)]
     work_offer: Option<String>,
+    /// The parked crew this runtime resume continues. Kept so a claim can
+    /// admit the resume's own work through that crew's lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_of: Option<String>,
     /// Crew hosted in the terminal host: the supervisor runs in its own
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2026,6 +2030,11 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         }),
         _ => None,
     };
+    // A crew's resume names the parked crew it continues. Only the runtime's
+    // own launch (an operator caller) may say so.
+    let resume_of = matches!(store.caller(), Caller::Operator)
+        .then(|| args.get("_resume_of").and_then(Value::as_str))
+        .flatten();
     let expected_workspace = args
         .get("workspace_lease_id")
         .map(|v| v.as_str().context("workspace_lease_id must be a string"))
@@ -2150,6 +2159,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .get("work_offer")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        resume_of: resume_of.map(str::to_owned),
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
         spawned_ms: None,
         model_route: args
@@ -2243,6 +2253,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             &id,
             job.started_by.as_deref(),
             job.work_offer.as_deref(),
+            resume_of,
         )?;
         check_plugin_binding(&job, &current)?;
         check_workspace_owner(store, &job)?;
@@ -2266,7 +2277,8 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                     && existing.estimate == job.estimate
                     && existing.wait_for_capacity == job.wait_for_capacity
                     && existing.hosted == job.hosted
-                    && existing.work_offer == job.work_offer,
+                    && existing.work_offer == job.work_offer
+                    && existing.resume_of == job.resume_of,
                 "job id already belongs to different work"
             );
             return Ok(Some(existing));
@@ -3002,6 +3014,11 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         for name in CREW_UNATTENDED {
             cmd.env_remove(name);
         }
+        // A crew fetches and commits; its first mate pushes (crew-role.md).
+        let gh_config = dir.join("gh");
+        fs::create_dir_all(&gh_config)?;
+        fs::set_permissions(&gh_config, fs::Permissions::from_mode(0o700))?;
+        crate::crew_launch::scrub_push_credentials(&mut cmd, &gh_config);
     }
     // Crew report through crew.report, which checks this job.
     cmd.env("PRIVATEER_JOB", &job.id)
@@ -3423,7 +3440,11 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         let observed_payload = job.payload.clone();
         let mut settled = false;
         job = alter(store, &job.id, |j| {
+            // `job` may be read before its crew parked: the supervisor parks
+            // it as its payload ends, then exits. A parked record has no
+            // payload to supervise, so it is not settled from that stale read.
             if terminal(&j.status)
+                || j.status == "parked"
                 || j.incarnation != observed_incarnation
                 || j.payload != observed_payload
             {
@@ -3467,6 +3488,7 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         let observed_payload = job.payload.clone();
         job = alter(store, &job.id, |j| {
             if terminal(&j.status)
+                || j.status == "parked"
                 || (j.status == "orphaned" && j.reason.is_some())
                 || j.incarnation != observed_incarnation
                 || j.supervisor != observed_supervisor
@@ -4196,5 +4218,60 @@ mod escape_tests {
         ] {
             assert!(!independently_supervised(args), "{args}");
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_reconcile_tests {
+    use super::*;
+
+    /// A process that has run and been reaped: its identity names nothing.
+    fn ended_process() -> Process {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let process = identity(child.id()).unwrap().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        process
+    }
+
+    /// The dispatcher reads every job, then checks each one's supervisor. A
+    /// crew's supervisor can park it and exit in between: the read still says
+    /// running, the supervisor is gone, and the payload has ended. That read
+    /// must not settle the parked crew as failed, or its child's outcome finds
+    /// no crew to resume (crew-resume-park-1ab330c6-...-1-1, 2026-10-19).
+    #[test]
+    fn a_crew_parked_after_the_dispatcher_read_it_stays_parked() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let supervisor = ended_process();
+        let payload = ended_process();
+        let running: Job = serde_json::from_value(json!({
+            "id": "crew-resume-park-crew-1-1-1", "task_id": "fix", "incarnation": "one",
+            "command": ["claude"], "cwd": temp.path(), "action": "spawn", "heavy": false,
+            "timeout_secs": 60, "ledger": temp.path().join("ledger.sqlite"),
+            "status": "running", "created_ms": Store::now_ms(), "finished_ms": null,
+            "supervisor": supervisor, "payload": payload, "cancel_requested": false,
+            "exit_code": null, "reason": null, "retry_of": null,
+            "agent_actor": "engineering", "park": "park-crew-1-2",
+        }))
+        .unwrap();
+        // What the supervisor wrote as the payload ended, after that read.
+        let mut parked = running.clone();
+        parked.status = "parked".into();
+        parked.exit_code = Some(0);
+        parked.reason = Some("crew parked: park-crew-1-2".into());
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![parked.id, serde_json::to_string(&parked).unwrap()],
+            )
+            .unwrap();
+        let job = reconcile(&store, running, &mut Reserved::default()).unwrap();
+        assert_eq!(job.status, "parked", "{:?}", job.reason);
+        let stored = load(&store, &job.id).unwrap();
+        assert_eq!(stored.status, "parked", "{:?}", stored.reason);
+        assert_eq!(stored.reason.as_deref(), Some("crew parked: park-crew-1-2"));
+        assert_eq!(stored.finished_ms, None);
     }
 }

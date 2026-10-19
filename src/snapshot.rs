@@ -257,12 +257,16 @@ fn route_json(route: crate::crew_routes::RouteState) -> Value {
         json!({"shape": crate::crew_routes::describe(allowance.shape),
             "window_ends_ms": used.window_ends_ms, "weekly_ends_ms": used.weekly_ends_ms,
             "window_used": used.window_utilization, "week_used": used.weekly_utilization,
+            "runs": used.runs, "runs_budget": allowance.runs,
             "last_used_ms": used.last_succeeded_ms})
     });
     json!({"name": route.name, "route": route.route, "cost": route.cost, "tier": route.tier,
         "state": route.state.as_str(), "until_ms": route.until_ms,
         "error": route.error.map(|e| e.chars().take(ERROR_CHARS).collect::<String>()),
-        "allowance": allowance})
+        "allowance": allowance,
+        // The share of the plan spent, whatever the harness reports: a route
+        // refused for want of headroom says so here rather than looking clear.
+        "used": route.spent.map(|spent| json!({"share": spent.share, "window": spent.what}))})
 }
 
 /// The first line of a crew progress report, after the runtime's lead line.

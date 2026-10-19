@@ -54,7 +54,6 @@ The same actions without Herdr: a tmux window per ship running `privateer start`
 
 - Read homes read-only; change state only through Privateer commands, as the operator. Never write `privateer.sqlite` directly.
 - Never create a home by opening a missing one; check the folder exists.
-- Demo mode stays sample-only.
 - Keep the existing Herdr safety rules: no guessed sockets, protocol checks, no focusing or binding by label similarity.
 
 ## Acceptance

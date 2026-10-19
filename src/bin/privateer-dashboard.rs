@@ -8,7 +8,7 @@ use crossterm::{
 use privateer::{
     dashboard::{
         bridge::{self, Answer, Attention},
-        captain::{Mail, sample_mail},
+        captain::Mail,
         fleet,
         herdr::{Client, Pane, View},
         mailbox::Mailbox,
@@ -30,7 +30,6 @@ use std::{
 struct Options {
     home: Option<PathBuf>,
     socket: Option<PathBuf>,
-    demo: bool,
     once: bool,
     ascii: bool,
     reduced_motion: bool,
@@ -50,7 +49,6 @@ fn options() -> Result<Option<Options>> {
                         .into(),
                 )
             }
-            "--demo" => out.demo = true,
             "--once" => out.once = true,
             "--ascii" => out.ascii = true,
             "--reduced-motion" => out.reduced_motion = true,
@@ -59,7 +57,6 @@ fn options() -> Result<Option<Options>> {
                 println!(
                     "Privateer · bridge\n\n\
 privateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\
-privateer-dashboard --demo [--once]\n\n\
 --once: bounded read-only JSON observation\n\
 --no-herdr: do not connect to Herdr\n\
 --ascii: plain fleet markers (* aboard, o not aboard, x unavailable,\n\
@@ -79,22 +76,21 @@ No launch, Board, Watch, tabs, pane creation/reorder, or automatic focus."
             _ => bail!("unknown argument {arg}"),
         }
     }
-    ensure!(!(out.demo && out.home.is_some()), "choose --demo or --home");
     ensure!(
         !(out.no_herdr && out.socket.is_some()),
         "--no-herdr conflicts with --herdr-socket"
     );
     // Only the host's no-argument direct launch adopts. Explicit --once,
-    // --demo, --home, etc. remain the existing observation-only entry points,
+    // --home, etc. remain the existing observation-only entry points,
     // even if a terminal happens to inherit a launch token.
     out.hosted = std::env::args_os().len() == 1 && privateer::host::bridge::requested();
-    if !out.demo && out.home.is_none() && !out.hosted {
+    if out.home.is_none() && !out.hosted {
         out.home = std::env::var_os("PRIVATEER_HOME").map(PathBuf::from);
     }
     if out.socket.is_none() && std::env::var("HERDR_ENV").as_deref() == Ok("1") {
         out.socket = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from);
     }
-    if out.demo || out.no_herdr {
+    if out.no_herdr {
         out.socket = None;
     }
     Ok(Some(out))
@@ -327,16 +323,8 @@ fn run(opts: Options) -> Result<()> {
     } else {
         None
     };
-    let registry = if opts.demo {
-        PathBuf::new()
-    } else {
-        privateer::fleet::registry_path()?
-    };
-    let snapshot = if opts.demo {
-        Snapshot::demo()
-    } else {
-        fleet::read(&registry, opts.home.as_deref())?
-    };
+    let registry = privateer::fleet::registry_path()?;
+    let snapshot = fleet::read(&registry, opts.home.as_deref())?;
     if opts.once {
         let (herdr, error) = match opts.socket.as_ref() {
             Some(path) => match Client::connect(path).and_then(|mut c| c.snapshot()) {
@@ -346,18 +334,14 @@ fn run(opts: Options) -> Result<()> {
             None => (None, None),
         };
         let mut mailbox = Mailbox::default();
-        if !opts.demo {
-            mailbox.refresh_readonly(&snapshot, opts.home.as_deref());
-        }
+        mailbox.refresh_readonly(&snapshot, opts.home.as_deref());
         let mut attention = Attention::default();
         // --once is deliberately ONE page/home step, not an unbounded fleet scan.
-        if !opts.demo {
-            attention.step(&snapshot, opts.home.as_deref());
-        }
+        attention.step(&snapshot, opts.home.as_deref());
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"demo":opts.demo,"read_only":true,"snapshot":snapshot,"herdr":herdr,"herdr_error":error,"attention":attention,"mail":if opts.demo {sample_mail()} else {mailbox.messages},"mail_errors":mailbox.errors})
+                &json!({"read_only":true,"snapshot":snapshot,"herdr":herdr,"herdr_error":error,"attention":attention,"mail":mailbox.messages,"mail_errors":mailbox.errors})
             )?
         );
         return Ok(());
@@ -366,19 +350,16 @@ fn run(opts: Options) -> Result<()> {
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive dashboard requires a terminal; use --once for JSON"
     );
-    let state = (!opts.demo).then(|| state_worker(registry.clone(), opts.home.clone()));
+    let (updates, actions) = state_worker(registry.clone(), opts.home.clone());
     let herdr = opts
         .socket
         .map(|path| herdr_worker(path, registry, opts.home));
     let mut app = App {
         snapshot,
-        herdr: opts.demo.then(View::demo),
-        demo: opts.demo,
         ascii: opts.ascii,
         reduced: opts.reduced_motion,
         home_age: Some(0),
         herdr_configured: herdr.is_some(),
-        mail: if opts.demo { sample_mail() } else { Vec::new() },
         ..App::default()
     };
     let mut home_updated = Instant::now();
@@ -388,30 +369,28 @@ fn run(opts: Options) -> Result<()> {
         let _capture = MouseCapture;
         execute!(io::stdout(), EnableMouseCapture)?;
         loop {
-            if let Some((updates, _)) = &state {
-                while let Ok(update) = updates.try_recv() {
-                    match update.snapshot {
-                        Ok(s) => {
-                            app.update_snapshot(s);
-                            app.home_error = None;
-                            home_updated = Instant::now();
+            while let Ok(update) = updates.try_recv() {
+                match update.snapshot {
+                    Ok(s) => {
+                        app.update_snapshot(s);
+                        app.home_error = None;
+                        home_updated = Instant::now();
+                    }
+                    Err(e) => app.home_error = Some(e.to_string()),
+                }
+                app.update_attention(update.attention);
+                app.update_mail(update.mail, update.errors);
+                if let Some(outcome) = update.outcome {
+                    app.mail_pending = false;
+                    app.notice = match outcome {
+                        Ok(notice) => {
+                            app.answer = None;
+                            notice
                         }
-                        Err(e) => app.home_error = Some(e.to_string()),
-                    }
-                    app.update_attention(update.attention);
-                    app.update_mail(update.mail, update.errors);
-                    if let Some(outcome) = update.outcome {
-                        app.mail_pending = false;
-                        app.notice = match outcome {
-                            Ok(notice) => {
-                                app.answer = None;
-                                notice
-                            }
-                            Err(e) => format!(
-                                "Action failed: {e}; draft retained. Refresh/reselect if stale."
-                            ),
-                        };
-                    }
+                        Err(e) => format!(
+                            "Action failed: {e}; draft retained. Refresh/reselect if stale."
+                        ),
+                    };
                 }
             }
             if let Some((updates, _)) = &herdr {
@@ -456,25 +435,18 @@ fn run(opts: Options) -> Result<()> {
                     if app.bridge_key(key.code) {
                         request_focus(&mut app, herdr.as_ref().map(|(_, s)| s));
                     }
-                    if let Some(mail) = app.history_read.take()
-                        && let Some((_, sender)) = &state
-                    {
-                        if sender.try_send(Action::Read(mail)).is_ok() {
+                    if let Some(mail) = app.history_read.take() {
+                        if actions.try_send(Action::Read(mail)).is_ok() {
                             app.mail_pending = true;
                         } else {
                             app.notice = "History read queue busy; reselect and retry.".into();
                         }
                     }
-                    if app.inbox_open
-                        && key.code == KeyCode::Char('i')
-                        && let Some((_, sender)) = &state
-                    {
-                        let _ = sender.try_send(Action::History);
+                    if app.inbox_open && key.code == KeyCode::Char('i') {
+                        let _ = actions.try_send(Action::History);
                     }
-                    if let Some(answer) = app.answer_action.take()
-                        && let Some((_, sender)) = &state
-                    {
-                        if sender.try_send(Action::Answer(answer)).is_ok() {
+                    if let Some(answer) = app.answer_action.take() {
+                        if actions.try_send(Action::Answer(answer)).is_ok() {
                             app.mail_pending = true;
                             app.notice =
                                 "Revalidating exact runtime item and recording answer…".into();
@@ -501,11 +473,47 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use privateer::dashboard::model::{Discovery, Ship, TerminalBinding};
+
+    /// One ship whose only terminal is the pane Herdr reports; no sample data.
+    fn fixture() -> (Snapshot, View) {
+        let snapshot = Snapshot {
+            ships: vec![Ship {
+                id: "apps".into(),
+                name: "Apps".into(),
+                terminals: vec![TerminalBinding {
+                    pane_id: "w1:p1".into(),
+                    terminal_id: "terminal-1".into(),
+                }],
+                ..Ship::default()
+            }],
+            discovery: Discovery::Complete,
+            ..Snapshot::default()
+        };
+        let view = View {
+            version: "test".into(),
+            protocol: 20,
+            panes: vec![Pane {
+                pane_id: "w1:p1".into(),
+                terminal_id: "terminal-1".into(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                agent: Some("codex".into()),
+                agent_status: "idle".into(),
+                title: None,
+                agent_session: None,
+            }],
+            socket_identity: (1, 1),
+        };
+        (snapshot, view)
+    }
+
     #[test]
-    fn actual_enter_path_queues_only_existing_focus_and_refuses_stale_or_demo() {
+    fn actual_enter_path_queues_only_existing_focus_and_refuses_stale_or_invalid() {
+        let (snapshot, view) = fixture();
         let mut app = App {
-            snapshot: Snapshot::demo(),
-            herdr: Some(View::demo()),
+            snapshot,
+            herdr: Some(view),
             home_age: Some(0),
             herdr_age: Some(0),
             ..App::default()
@@ -514,38 +522,25 @@ mod tests {
         let (send, receive) = mpsc::sync_channel(1);
         assert!(app.bridge_key(KeyCode::Enter));
         request_focus(&mut app, Some(&send));
-        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "demo:apps");
+        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "w1:p1");
         // Display clipping alone does not remove validated existing focus.
         app.snapshot.truncated = true;
         request_focus(&mut app, Some(&send));
-        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "demo:apps");
-        for case in [
-            "stale",
-            "demo",
-            "ambiguous",
-            "incomplete",
-            "unknown",
-            "invalid",
-        ] {
+        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "w1:p1");
+        for case in ["stale", "ambiguous", "incomplete", "unknown", "invalid"] {
             app.herdr_age = Some(0);
-            app.demo = false;
             app.snapshot.presentation_error = None;
-            app.snapshot.discovery = privateer::dashboard::model::Discovery::Complete;
+            app.snapshot.discovery = Discovery::Complete;
             app.selection_invalidated = false;
             match case {
                 "stale" => app.herdr_age = Some(10),
-                "demo" => app.demo = true,
                 "ambiguous" => app.snapshot.presentation_error = Some("conflict".into()),
-                "incomplete" => {
-                    app.snapshot.discovery = privateer::dashboard::model::Discovery::Incomplete
-                }
-                "unknown" => {
-                    app.snapshot.discovery = privateer::dashboard::model::Discovery::Unknown
-                }
+                "incomplete" => app.snapshot.discovery = Discovery::Incomplete,
+                "unknown" => app.snapshot.discovery = Discovery::Unknown,
                 _ => app.selection_invalidated = true,
             }
             request_focus(&mut app, Some(&send));
-            assert!(receive.try_recv().is_err());
+            assert!(receive.try_recv().is_err(), "{case} focus was queued");
         }
     }
 }

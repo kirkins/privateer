@@ -1,6 +1,6 @@
 use super::{
     bridge::{Answer, Attention, Binding, FRESH_MS, RECENT_MS},
-    captain::{Composer, Exchange, HistoryBinding, Mail},
+    captain::{Composer, HistoryBinding, Mail},
     herdr,
     model::{Snapshot, Task, clean, count},
     overview, voyage,
@@ -73,7 +73,6 @@ pub struct App {
     pub board_requested: bool,
     pub watch_requested: bool,
     pub pending_board: Option<PendingBoard>,
-    pub exchanges: Vec<Exchange>,
     pub snapshot: Snapshot,
     pub herdr: Option<herdr::View>,
     pub home_error: Option<String>,
@@ -89,7 +88,6 @@ pub struct App {
     pub ascii: bool,
     /// Still voyage scene: water and sprites hold their first frame.
     pub reduced: bool,
-    pub demo: bool,
     /// The voyage sea replaces the bridge body while open; `Some` since it opened.
     pub voyage: Option<Instant>,
     pub notice: String,
@@ -311,7 +309,6 @@ impl App {
     }
     /// Snapshot + full Herdr identity must both be fresh. Does not create or reorder panes.
     pub fn focus_target(&self) -> anyhow::Result<(herdr::View, herdr::Pane)> {
-        anyhow::ensure!(!self.demo, "Demo only; no live focus");
         anyhow::ensure!(
             self.home_error.is_none() && self.home_age.is_some_and(|a| a < 10),
             "Privateer observation unavailable/stale"
@@ -526,7 +523,7 @@ impl App {
         }
     }
     pub fn begin_answer(&mut self) {
-        if self.mail_pending || self.demo {
+        if self.mail_pending {
             self.notice = "No live answer available.".into();
             return;
         }
@@ -849,7 +846,7 @@ impl App {
             }
             lines.push(Line::from(format!(
                 "{} scope: {}",
-                if self.demo { "Sample" } else { "Recorded" },
+                "Recorded",
                 if ship.description.is_empty() {
                     "not observed".into()
                 } else {
@@ -967,12 +964,8 @@ impl App {
         ])
         .split(area);
         frame.render_widget(
-            Paragraph::new(if self.voyage.is_some() && self.demo {
-                " PRIVATEER · voyage · DEMO / sample only · sea drawn from recorded state"
-            } else if self.voyage.is_some() {
+            Paragraph::new(if self.voyage.is_some() {
                 " PRIVATEER · voyage · sea drawn from recorded state, not live health"
-            } else if self.demo {
-                " PRIVATEER · bridge · DEMO / sample only"
             } else {
                 " PRIVATEER · bridge · recorded facts, not live health"
             })
