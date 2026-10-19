@@ -311,16 +311,18 @@ pub(crate) fn launch_manifest(charter: &Value, args: &Value) -> Result<(String, 
         .as_str()
         .context("plugin manifest has no id")?
         .to_owned();
-    let memory = match manifest.get("memory_bytes") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(
-            value
-                .as_u64()
-                .filter(|bytes| *bytes > 0)
-                .context("memory_bytes must be a positive number of bytes")?,
-        ),
-    };
-    Ok((id, memory))
+    Ok((id, manifest_memory(&manifest)?))
+}
+/// The crew memory a manifest declares, if it declares one.
+pub(crate) fn manifest_memory(manifest: &Value) -> Result<Option<u64>> {
+    match manifest.get("memory_bytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            Ok(Some(value.as_u64().filter(|bytes| *bytes > 0).context(
+                "memory_bytes must be a positive number of bytes",
+            )?))
+        }
+    }
 }
 fn selected_paths(charter: &Value, args: &Value) -> Result<(PathBuf, Option<PathBuf>)> {
     let pin = charter.get("provider_plugin").filter(|v| !v.is_null());

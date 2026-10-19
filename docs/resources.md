@@ -79,7 +79,8 @@ A crew's memory is the first of these that is set:
    with no route, is dropped and does not set this figure;
 2. this host's `crew_memory_bytes`, a map from harness id to bytes, set with
    `resource.configure`;
-3. the `memory_bytes` the harness manifest declares;
+3. the `memory_bytes` a custom harness manifest declares (the bundled manifests
+   declare none);
 4. this host's `crew_default_memory_bytes`, for a manifest that declares none.
 
 A memory figure the request itself asks for in `estimate` counts too, and the
@@ -99,10 +100,13 @@ privateer --home ~/ships/<ship>/.privateer resource.configure --json \
 
 The memory a crew reserves shows as `estimate.memory_bytes` in `job.status`,
 and as `demand.memory_bytes` on its reservation in `resource.status`. A
-harness manifest declares its figure as `memory_bytes`, in bytes. The figures
-the bundled manifests declare are generic placeholders, not measurements: tune
-them with `crew_memory_bytes` once you have seen what a harness really uses on
-your machine.
+harness manifest may declare its figure as `memory_bytes`, in bytes. The bundled
+manifests declare none, so a bundled harness reserves this host's default until
+you set its figure with `crew_memory_bytes` once you have seen what it really
+uses on your machine. `resource.status` lists `crew_memory`: each bundled
+harness's figure for a launch with no route, with its `source` (`host`,
+`manifest` or `default`). A route's own `memory_bytes` is set per launch, so it
+is not listed there.
 
 Hosted first mates are outside admission, so their memory is not reserved and
 does not appear in `resource.status`.

@@ -382,6 +382,55 @@ fn a_crew_manifest_without_a_memory_figure_reserves_the_default() {
     f.json(None, "job.cancel", json!({"id":"crew-holder"}));
 }
 
+/// Lowering the host's default changes the reservation of a crew whose
+/// manifest declares no figure, and resource.status says where it came from.
+#[test]
+fn lowering_the_default_moves_a_crew_with_no_manifest_figure() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/codex"), "#!/bin/sh\nsleep 30\n").unwrap();
+    let dir = f.root.join("custom/codex");
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("manifest.json");
+    let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/codex/adapter.py");
+    fs::write(
+        &manifest,
+        json!({"schema_version":1,"id":"codex","executable":["python3", adapter],
+            "timeout_ms":2000,"max_output_bytes":65536})
+        .to_string(),
+    )
+    .unwrap();
+    f.json(
+        None,
+        "resource.configure",
+        json!({"crew_memory_bytes":null,"crew_default_memory_bytes":1u64 << 20}),
+    );
+    let route = json!({"manifest": manifest, "cost": "credits",
+        "options": {"model":"model-default","sandbox":"danger-full-access"}});
+    f.routes(json!({"routes": {"own": route}, "crew": ["own"]}));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"crew-lowered","route":"own"}),
+    );
+    let status = f.json(None, "resource.status", json!({}));
+    let reserved = status["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"] == "crew-lowered")
+        .unwrap_or_else(|| panic!("no reservation for crew-lowered: {status}"));
+    assert_eq!(reserved["demand"]["memory_bytes"], 1u64 << 20, "{reserved}");
+    let codex = status["crew_memory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["harness"] == "codex")
+        .unwrap_or_else(|| panic!("no crew memory for codex: {status}"));
+    assert_eq!(codex["memory_bytes"], 1u64 << 20, "{codex}");
+    assert_eq!(codex["source"], "default", "{codex}");
+    f.json(None, "job.cancel", json!({"id":"crew-lowered"}));
+}
+
 /// A memory figure a caller passes with an explicit manifest is not a route's
 /// figure, so it cannot shrink the crew's own reservation.
 #[test]
@@ -439,7 +488,7 @@ fn a_route_figure_beats_the_host_setting_which_beats_the_manifest() {
         json!({"crew_memory_bytes":null}),
     );
     f.routes(json!({"routes": {"steady": codex("model-steady", "credits")}, "crew": ["steady"]}));
-    // The bundled codex manifest declares 2 GiB and nothing overrides it. It
+    // The bundled codex manifest declares no figure, so the 2 GiB default applies. It
     // runs alone, so only the floor counts for it.
     f.json(
         Some("engineering"),
@@ -448,7 +497,7 @@ fn a_route_figure_beats_the_host_setting_which_beats_the_manifest() {
     );
     let job = f.json(None, "job.status", json!({"id":"crew-manifest"}));
     assert_eq!(job["estimate"]["memory_bytes"], 2u64 << 30, "{job}");
-    // This host's setting for codex replaces the manifest's figure.
+    // This host's setting for codex replaces the default.
     f.json(
         None,
         "resource.configure",

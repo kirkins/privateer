@@ -364,10 +364,42 @@ pub fn crew_memory(
     manifest: Option<u64>,
     route: Option<u64>,
 ) -> u64 {
-    route
-        .or_else(|| settings.crew_memory_bytes.get(harness).copied())
-        .or(manifest)
-        .unwrap_or(settings.crew_default_memory_bytes)
+    crew_memory_source(settings, harness, manifest, route).0
+}
+
+/// The same figure as `crew_memory`, with the layer it resolved from:
+/// "route", "host", "manifest" or "default".
+pub fn crew_memory_source(
+    settings: &Settings,
+    harness: &str,
+    manifest: Option<u64>,
+    route: Option<u64>,
+) -> (u64, &'static str) {
+    if let Some(bytes) = route {
+        return (bytes, "route");
+    }
+    if let Some(bytes) = settings.crew_memory_bytes.get(harness).copied() {
+        return (bytes, "host");
+    }
+    match manifest {
+        Some(bytes) => (bytes, "manifest"),
+        None => (settings.crew_default_memory_bytes, "default"),
+    }
+}
+
+/// Each harness's crew memory on this host, as a launch with no route would
+/// reserve it. `manifests` pairs a harness id with the figure its manifest
+/// declares, if any. A route's own figure is set per launch, so it is not here.
+pub fn crew_memory_report(settings: &Settings, manifests: &[(&str, Option<u64>)]) -> Value {
+    Value::Array(
+        manifests
+            .iter()
+            .map(|(harness, manifest)| {
+                let (bytes, source) = crew_memory_source(settings, harness, *manifest, None);
+                json!({"harness": harness, "memory_bytes": bytes, "source": source})
+            })
+            .collect(),
+    )
 }
 
 /// The demand to record for a job, or None when it is neither heavy nor
@@ -1173,6 +1205,49 @@ mod tests {
         assert!(admit(&settings, &host, 0, &[crew("crew-job")], &build).is_ok());
         // Another job's crew still counts, so the build waits.
         assert!(admit(&settings, &host, 0, &[crew("other-job")], &build).is_err());
+    }
+
+    #[test]
+    fn a_crew_memory_resolves_route_host_manifest_then_default() {
+        let mut settings = Settings {
+            crew_default_memory_bytes: GIB,
+            ..Settings::default()
+        };
+        // A manifest that declares none reserves the host's default, and
+        // lowering that default moves it.
+        assert_eq!(
+            crew_memory_source(&settings, "pi", None, None),
+            (GIB, "default")
+        );
+        settings.crew_default_memory_bytes = GIB / 4;
+        assert_eq!(
+            crew_memory_source(&settings, "pi", None, None),
+            (GIB / 4, "default")
+        );
+        // A declared manifest figure outranks the default.
+        assert_eq!(
+            crew_memory_source(&settings, "pi", Some(3 * GIB), None),
+            (3 * GIB, "manifest")
+        );
+        // This host's figure for the harness outranks the manifest, and a
+        // route's own figure outranks both.
+        settings.crew_memory_bytes.insert("pi".to_owned(), GIB / 2);
+        assert_eq!(
+            crew_memory_source(&settings, "pi", Some(3 * GIB), None),
+            (GIB / 2, "host")
+        );
+        assert_eq!(
+            crew_memory_source(&settings, "pi", Some(3 * GIB), Some(GIB / 8)),
+            (GIB / 8, "route")
+        );
+        let report = crew_memory_report(&settings, &[("pi", None), ("claude", Some(3 * GIB))]);
+        assert_eq!(
+            report,
+            json!([
+                {"harness":"pi","memory_bytes":GIB / 2,"source":"host"},
+                {"harness":"claude","memory_bytes":3 * GIB,"source":"manifest"},
+            ])
+        );
     }
 
     #[test]
