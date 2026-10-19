@@ -59,7 +59,9 @@ What crosses the link is the final status and a short reason, and nothing else: 
 - The waiting task ends by any other path (faulted, or its wait is manually stopped): the same unsubscribe is sent when the task leaves `waiting`.
 - The owner's task ends: the owner sends `task_end` once to each subscriber and deletes its subscription rows, so none outlive the task.
 - The owner ship is retired: the owner's home sends `wait_closed` with `reason: retired` to each subscriber before it stops delivering, then deletes its rows. The waiting task faults with that reason. A retired owner's task can never finish, so the wait must not resume.
-- The waiting ship is retired: its home sends `wait_unsubscribe` for each remote wait before it stops delivering, and the waiting tasks end through the normal retirement path. If that notice cannot be sent, the owner deletes the row when its `task_end` to the retired ship is refused, because the ship is no longer registered.
+- The waiting ship is retired: `ship.retire` (`src/fleet.rs`) today only revokes the charter, stops the dispatcher and removes registry entries. It cancels no tasks and does not empty the outbox first. So retire gains a step: before stopping the dispatcher, send `wait_unsubscribe` for each remote wait (and `wait_closed` for each subscription it owns) and let the outbox drain. Its waiting tasks need no cancelling: with the charter revoked they are no longer eligible to run.
+- A refused wait notice is never retried. Today a refused message that is not from the captain stays pending, and one peer's failure pauses that peer's whole queue (`src/mail.rs`, near the delivery loop). So a refused `task_end`, `wait_closed`, `wait_subscribe` or `wait_unsubscribe` is dropped, not held, and the owner deletes the matching row. Otherwise one notice to a retired ship would hold back all later mail to that peer.
+- When `wait_closed` faults a waiting task, the waiting home does not send `wait_unsubscribe` back: the owner has already removed the row.
 - The owner's home is lost without notice: the subscriber cannot tell the difference, so it falls back to the unreachable rule below.
 
 ## Unreachable peer
@@ -88,7 +90,8 @@ Staleness is the honest answer to "no next check": the runtime reports how long 
 1. Owner side: `shared_with` on tasks, `wait_subscribe` and `wait_unsubscribe` handling, and `task_end` on final status, with idempotent rows and the refusal path.
 2. Waiting side: accept `kind: remote` in `task.defer`, the reserved-payload guard, the anti-forgery checks, and resume with the far status.
 3. Resync on reconnect and the staleness surfacing in needs.
-4. Cross-machine tests through the isolated fleet fixture (two homes, one link), including replay, reconnect and a refused subscription.
+4. Retire: send `wait_unsubscribe` and `wait_closed` and drain the outbox before stopping the dispatcher; drop a refused wait notice rather than leave it pending.
+5. Cross-machine tests through the isolated fleet fixture (two homes, one link), including replay, reconnect and a refused subscription.
 
 Each step is reviewable on its own. There is no same-home step: a dependency on the same home is already a `task` wait.
 
