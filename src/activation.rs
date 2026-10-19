@@ -33,6 +33,10 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
     // bundles, which cannot resume) relaunch into a fresh session from its notes.
     ("context_warn_percent", 40, 1, 100),
     ("context_compact_percent", 50, 1, 100),
+    // A hosted ship whose Herdr is unreachable waits this long, from when it
+    // was first found unreachable, before mail wakes a headless first mate,
+    // so a dispatcher that starts before Herdr at boot does not (0 waits not).
+    ("herdr_grace_secs", crate::host::HERDR_GRACE_SECS, 0, 3600),
     // A hosted first mate's harness stops after this long idle and starts
     // again on the same conversation when needed (0 keeps it running).
     (
@@ -106,6 +110,15 @@ pub fn init(store: &Store) -> Result<()> {
     )?;
     if !through_column {
         tx.execute_batch("ALTER TABLE host_launches ADD COLUMN start_through INTEGER;")?;
+    }
+    // When a launch first found Herdr unreachable; cleared once Herdr answers.
+    let unreachable_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='unreachable_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !unreachable_column {
+        tx.execute_batch("ALTER TABLE host_launches ADD COLUMN unreachable_ms INTEGER;")?;
     }
     for column in [
         "focuses",
@@ -907,6 +920,22 @@ fn headless_wake(
     let mail = new_mail(store, &name, after)?;
     if mail.is_empty() {
         return Ok(json!({"ship": name, "skipped": "nothing wake-worthy"}));
+    }
+    // Herdr may be starting after this dispatcher, as at boot: give it a
+    // grace before a headless first mate takes mail its live session would.
+    if own_blocked == Some(false) {
+        // Ships recorded before the setting existed wait too.
+        let grace = profile["herdr_grace_secs"]
+            .as_i64()
+            .unwrap_or(crate::host::HERDR_GRACE_SECS as i64)
+            * 1000;
+        if let Some(until) = crate::host::awaiting_herdr(store, &name, grace)? {
+            return Ok(
+                json!({"ship": name, "skipped": "waiting for Herdr before a headless wake",
+                "herdr_grace_until_ms": until, "host_error": host_error,
+                "host_backoff_until_ms": host_backoff_until_ms}),
+            );
+        }
     }
     let quiet = now - newest >= setting(&profile, "batch_secs") * 1000;
     let overdue = now - oldest >= setting(&profile, "max_delay_secs") * 1000;
