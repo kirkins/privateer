@@ -75,7 +75,8 @@ fn resolve_python() -> PathBuf {
 /// fakes and bare `python3` manifests in a fixture reach the same interpreter.
 fn fixture_path() -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let dirs = python()
+    let interpreter = python();
+    let dirs = interpreter
         .parent()
         .into_iter()
         .map(Path::to_path_buf)
