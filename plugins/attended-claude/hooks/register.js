@@ -384,7 +384,7 @@ export function register(on) {
   }).catch(($, e, next) => recover($, e, next));
   on("session.compact", async ($, e, next) => {
     const result = await next(e);
-    if (active && !e.agentId && !result?.skip && Number.isFinite(result?.tokensBefore)) {
+    if (active && !e.agentId && e.trigger !== "precompute" && !result?.skip && Number.isFinite(result?.tokensBefore)) {
       void attention($, "compaction", result.tokensBefore);
     }
     return result;

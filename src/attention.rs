@@ -591,8 +591,9 @@ mod tests {
         assert!(report_turn(&store, 40_000, true)["compact"].is_null());
     }
 
-    /// A session that starts above the line, or a new session that begins
-    /// past it, never acts: only a crossing within one session does.
+    /// A bounded session that starts above the line, or a new bounded session
+    /// that begins past it, never acts: only a crossing within one session
+    /// does. (A resumable launch arms at start; see the resumable tests.)
     #[test]
     fn a_session_first_sample_past_the_line_triggers_nothing() {
         let temp = tempfile::tempdir().unwrap();
