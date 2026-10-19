@@ -197,6 +197,8 @@ d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "reply", "correla
                                           "body": text, "payload": {"answer": {"text": text}}}
 stt.transcribe = lambda cfg, path: ("go with b", "")
 d.handle_voice(voice, 9, 7)
+stt.transcribe = lambda cfg, path: ("word " * 1200, "")
+d.handle_voice(voice, 9, 7)
 out["typed"] = typed
 print(json.dumps(out))
 """
@@ -217,7 +219,9 @@ def check_voice_transcripts() -> None:
     assert prompts["こんにちは"] == '"こんにちは"', prompts
     assert got["said"] == ["🎙️ your voice note came through empty, please re-record"], got
     assert got["sent"] == [], got
-    assert [a["payload"]["answer"]["text"] for a in got["typed"]] == ["go with b"], got
+    short, long = got["typed"]
+    assert short["payload"]["answer"]["text"] == "go with b" and short["body"] == '"go with b"', got
+    assert len(long["payload"]["answer"]["text"]) <= 4096 and len(long["body"]) > 4096, long["body"][:80]
 
 
 class Fleet:

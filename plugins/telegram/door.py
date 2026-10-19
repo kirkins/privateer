@@ -860,7 +860,9 @@ class Door:
         if "answer" in args.get("payload", {}):
             # A typed answer carries the captain's words, not the "(voice)" placeholder.
             spoken = transcript.strip()
-            args["payload"]["answer"]["text"] = f"{caption}\n{spoken}" if caption else spoken
+            text = f"{caption}\n{spoken}" if caption else spoken
+            # The runtime caps an answer at 4096 characters; the body keeps it all.
+            args["payload"]["answer"]["text"] = text if len(text) <= 4096 else text[:4095].rstrip() + "…"
         if transcript.strip() and stt.stt_config(self.cfg).get("echo_transcript", True):
             shown = transcript.strip()
             shown = shown if len(shown) <= 400 else shown[:400].rstrip() + "…"
