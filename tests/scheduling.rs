@@ -1745,3 +1745,53 @@ fn a_wake_that_predates_a_claim_cannot_pass_it_by_resuming() {
     );
     assert!(refused.contains("execution claim"), "{refused}");
 }
+
+#[test]
+fn a_time_wait_that_names_a_task_or_an_event_is_applied_with_a_typed_hint() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let until = privateer::store::Store::now_ms() + 100000;
+    let deferred = call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"Resume after infra-repair publishes","until_ms":until}}),
+    );
+    assert_eq!(deferred["state"], "waiting", "{deferred}");
+    assert!(
+        deferred["hint"]
+            .as_str()
+            .unwrap()
+            .contains("task infra-repair"),
+        "{deferred}"
+    );
+    assert!(
+        deferred["hint"].as_str().unwrap().contains("after <event>"),
+        "{deferred}"
+    );
+    let audited: String = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT payload FROM audit WHERE kind='task.defer' ORDER BY time_ms DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(audited.contains("use wait kind task"), "{audited}");
+}
+
+#[test]
+fn a_plain_time_wait_is_applied_without_a_hint() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let until = privateer::store::Store::now_ms() + 100000;
+    let deferred = call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"An explicit cooldown","until_ms":until}}),
+    );
+    assert_eq!(deferred["state"], "waiting", "{deferred}");
+    assert!(deferred["hint"].is_null(), "{deferred}");
+}
