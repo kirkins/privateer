@@ -1745,3 +1745,93 @@ fn a_wake_that_predates_a_claim_cannot_pass_it_by_resuming() {
     );
     assert!(refused.contains("execution claim"), "{refused}");
 }
+
+#[test]
+fn a_time_wait_that_names_a_task_or_an_event_is_applied_with_a_typed_hint() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    task(&mut fleet, "infra-publish");
+    let until = privateer::store::Store::now_ms() + 100000;
+    let deferred = call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"Resume after infra-publish publishes, not after infra-repair itself","until_ms":until}}),
+    );
+    assert_eq!(deferred["state"], "waiting", "{deferred}");
+    let hint = deferred["hint"].as_str().unwrap();
+    assert!(hint.contains("task infra-publish"), "{deferred}");
+    assert!(!hint.contains("task infra-repair"), "{deferred}");
+    assert!(hint.contains("after <event>"), "{deferred}");
+    let audited: String = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT payload FROM audit WHERE kind='task.defer' ORDER BY time_ms DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(audited.contains("use wait kind task"), "{audited}");
+}
+
+#[test]
+fn a_plain_time_wait_is_applied_without_a_hint() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let until = privateer::store::Store::now_ms() + 100000;
+    let deferred = call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"An explicit cooldown","until_ms":until}}),
+    );
+    assert_eq!(deferred["state"], "waiting", "{deferred}");
+    assert!(deferred["hint"].is_null(), "{deferred}");
+}
+
+#[test]
+fn a_time_wait_that_names_its_own_open_request_gets_a_request_hint() {
+    let mut fleet = Fleet::new(json!({}));
+    enqueue(&mut fleet);
+    let request = call(
+        &mut fleet,
+        "mail.send",
+        json!({"from":"infra","to":"captain","kind":"request","task_id":"infra-repair","body":"Please confirm the fixture."}),
+    );
+    let id = request["id"].as_str().unwrap();
+    let until = privateer::store::Store::now_ms() + 100000;
+    let deferred = call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":format!("Resume when request {id} is answered"),"until_ms":until}}),
+    );
+    assert!(
+        deferred["hint"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("request {id}: use wait kind request")),
+        "{deferred}"
+    );
+}
+
+#[test]
+fn a_time_wait_that_names_a_done_task_gets_no_hint() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    task(&mut fleet, "infra-dep");
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"infra-dep","actor":"infra","status":"done"}),
+    );
+    let until = privateer::store::Store::now_ms() + 100000;
+    let deferred = call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"Resume once infra-dep is done","until_ms":until}}),
+    );
+    assert_eq!(deferred["state"], "waiting", "{deferred}");
+    assert!(deferred["hint"].is_null(), "{deferred}");
+}

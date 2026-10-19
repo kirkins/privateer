@@ -127,6 +127,7 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
         "manual" => {}
         _ => bail!("wait.kind must be time, attention, task, request or manual"),
     }
+    let hint = time_wait_hint(store, id, &work.owner, kind, reason)?;
     // Deferring an offer that was taken up is handled work, not a retry.
     if matches!(work.state.as_str(), "offered" | "claimed" | "executing") {
         work.attempts = 0;
@@ -146,9 +147,92 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
     store
         .connection()
         .execute("UPDATE tasks SET status='blocked' WHERE id=?1", [id])?;
-    store.audit("task.defer", &json!({"id":id,"wait":wait}))?;
+    store.audit("task.defer", &json!({"id":id,"wait":wait,"hint":hint}))?;
     tx.commit()?;
-    Ok(view(&work))
+    let mut out = view(&work);
+    out["hint"] = json!(hint);
+    Ok(out)
+}
+
+/// A time wait whose reason names a task, a request or an "after <event>" is
+/// a dependency written as a clock. The defer still applies; the hint tells
+/// the caller to wait on the event instead, so it resumes when the event
+/// happens and not at a guessed time.
+fn time_wait_hint(
+    store: &Store,
+    id: &str,
+    owner: &str,
+    kind: &str,
+    reason: &str,
+) -> Result<Option<String>> {
+    if kind != "time" {
+        return Ok(None);
+    }
+    let words: Vec<&str> = reason
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '"' | '\''
+                )
+            })
+        })
+        .collect();
+    let mut hints = Vec::new();
+    let mut named = std::collections::HashSet::new();
+    for word in &words {
+        // A task cannot wait on itself, so naming it is not a dependency.
+        if !is_id_shape(word) || *word == id || !named.insert(*word) {
+            continue;
+        }
+        // A task is checked first; a request id is a mail id, so it is looked up too.
+        if let Ok(task) = store.task(word) {
+            // A finished dependency is no longer one to wait on.
+            if !matches!(task["status"].as_str(), Some("done" | "cancelled")) {
+                hints.push(format!(
+                    "task {word}: use wait kind task with ref \"{word}\""
+                ));
+            }
+        } else if crate::mail::find(store, word)
+            .ok()
+            .flatten()
+            // Only a request wait this task would accept: its own open request to its owner.
+            .is_some_and(|m| {
+                m["kind"] == "request"
+                    && m["from"] == owner
+                    && m["task_id"] == id
+                    && m["state"] == "open"
+            })
+        {
+            hints.push(format!(
+                "request {word}: use wait kind request with ref \"{word}\""
+            ));
+        }
+    }
+    if words
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case("after"))
+    {
+        hints.push(
+            "reason says \"after <event>\": use wait kind task (local) or request (mail)".into(),
+        );
+    }
+    Ok((!hints.is_empty()).then(|| {
+        format!(
+            "a time wait names a dependency, so it will resume at a guessed time: {}",
+            hints.join("; ")
+        )
+    }))
+}
+
+/// Task ids and mail ids in this home: lowercase letters, digits and hyphens.
+fn is_id_shape(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
