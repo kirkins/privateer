@@ -15,8 +15,8 @@ for (const k of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_JOB","PRIVATEER_H
 const run = (args, env = base, input) => execFileSync(cli,args,{cwd:folder,env,input,encoding:"utf8",timeout:10000,maxBuffer:4*1024*1024});
 const call = (name,args={}) => JSON.parse(run(["--home",home,name,"--json",JSON.stringify(args)]));
 let sequence=0, session="native-one", draft="", reject=false, delayed;
-let storeFailure=false, later=0;
-const registered=new Set(), reports=[];
+let storeFailure=false, later=0, usedTokens=50000, replyCompacts=false, compactDeclines=false;
+const registered=new Set(), reports=[], submitted=[], compactions=[];
 const records=new Map(), rows=new Map(), notices=[], queue=[], timers=new Set();
 const nativeEnv={...base,PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship",PRIVATEER_HOME:home,
   PRIVATEER_CONTROL_CLI:cli,PRIVATEER_PRESENCE_HOLDER:"start:test",PRIVATEER_ATTENDED_HARNESS:"claude"};
@@ -31,7 +31,14 @@ const fire=async(name,e={},bottom=async x=>x)=>{
 const $={
   env:{get:async k=>nativeEnv[k],set:async(k,v)=>{if(v===undefined)delete nativeEnv[k];else nativeEnv[k]=v;}},
   session:{id:async()=>session,surfaces:async()=>["terminal"],messages:async()=>rows.get(session)??[],
-    usage:async()=>({context:{tokens:50000,window:200000}})},
+    usage:async()=>({context:{tokens:usedTokens,window:200000}}),
+    // The documented between-turns compaction: no model turn, and a decline is {skip}.
+    compact:async()=>{
+      compactions.push(session);
+      if(compactDeclines)return {skip:true};
+      const before=usedTokens;usedTokens=50000;
+      return fire("session.compact",{},async()=>({tokensBefore:before}));
+    }},
   store:{get:async k=>records.get(k),set:async(k,v)=>{if(storeFailure)throw Error('store unavailable');records.set(k,structuredClone(v));},keys:async()=>[...records.keys()],delete:async k=>records.delete(k)},
   ui:{status:async text=>notices.push(text)},
   clock:{now:async()=>Date.now()+later,every:(ms,fn)=>{assert.equal(ms,5000);const t={fn,cancel:()=>timers.delete(t)};timers.add(t);return t;}},
@@ -48,9 +55,13 @@ const $={
     assert.deepEqual(options.env,{PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship"});
     if(argv[3]==="attention.report")reports.push(JSON.parse(argv[5]));
     if(delayed){await delayed;delayed=undefined;}
-    return {exitCode:0,stdout:run(argv.slice(1),{...nativeEnv,...options.env}),stderr:""};
+    let stdout=run(argv.slice(1),{...nativeEnv,...options.env});
+    // The runtime's line decision is tested in Rust; here the reply stands in for a crossing.
+    if(argv[3]==="attention.report"&&replyCompacts)stdout=JSON.stringify({...JSON.parse(stdout),compact:true});
+    return {exitCode:0,stdout,stderr:""};
   }},
   prompt:{read:async()=>({text:draft,cursor:draft.length}),submit:async value=>{
+    if(value.text==="/compact"){submitted.push(value.text);return {text:value.text};}
     if(reject)return {drop:"native queue refused"};
     const event={text:value.text,origin:{kind:"plugin",name:"privateer-mail"}};
     const result=await fire("prompt.submit",event);
@@ -130,7 +141,7 @@ try {
   await fire("session.end",{});session="native-two";await fire("classic.SessionStart",{});await tick();assert.equal(queue.length,6);
   assert.equal(queue[5].session,"native-two");await begin(queue[5].text);await end();await flush();
   // Each completed turn reports the session's context as the ship's attention.
-  assert.deepEqual(reports.at(-1),{ship:"ship",kind:"turn",tokens:50000,window:200000,holder:"start:test"});
+  assert.deepEqual(reports.at(-1),{ship:"ship",kind:"turn",tokens:50000,window:200000,holder:"start:test",settled:true});
   // A completed turn that leaves running work unmoved gets one more prompt, once per set.
   call("task.create",{id:"ship-docs",parent:"ship-duty",owner:"ship",title:"Write the docs"});
   call("task.update",{id:"ship-docs",actor:"ship",status:"running"});
@@ -150,6 +161,7 @@ try {
   call("ship.attend",{ship:"ship",holder:"host:test",ttl_secs:90});
   Object.assign(nativeEnv,{PRIVATEER_HOSTED:"1",PRIVATEER_PRESENCE_HOLDER:"host:test"});await load();
   const hostedStart=queue.length;send();await tick();assert.equal(queue.length,hostedStart+1);
+  assert(queue.at(-1).text.includes("Attention: "),"a busy or idle Claude notice carries the attention line");
   await begin(queue.at(-1).text);await end({reason:"error"});send();await tick();assert.equal(queue.length,hostedStart+1);
   later=61000;await tick();assert.equal(queue.length,hostedStart+2,"hosted mail retries after a minute");
   await begin(queue.at(-1).text);await end();later=0;
@@ -163,6 +175,30 @@ try {
   call("task.update",{id:"repair",actor:"ship",status:"done"});await end();await flush();
   assert(call("wake.list",{ship:"ship"}).wakes.some(w=>w.status==="succeeded"),"the settled offer is recorded");
   await tick();assert.equal(queue.length,beforeWork+1,"completed work leaves the session idle");
+  // A hosted resumable first mate compacts through the session API when a settled turn crosses the line.
+  // The compaction is not a prompt, so the prompt hook never sees it and no /compact is submitted.
+  const reportsBefore=reports.length;
+  usedTokens=150000;replyCompacts=true;
+  await begin("captain question across the line");await end();await flush();
+  replyCompacts=false;
+  assert.deepEqual(compactions,[session],"a crossing compacts once through the session API");
+  assert.deepEqual(submitted,[],"a crossing never submits /compact as a prompt");
+  assert.equal(usedTokens,50000,"the fake compacted");
+  assert(reports.slice(reportsBefore).some(r=>r.kind==="compaction"&&r.tokens===150000),"the compaction is reported with the tokens before it");
+  await begin("follow-up below the line");await end();await flush();
+  assert.equal(compactions.length,1,"a reply without a crossing compacts nothing");
+  // A declined compaction ({skip}) is not reported, and the next settled turn past the line asks again.
+  usedTokens=150000;replyCompacts=true;compactDeclines=true;
+  const declinedReports=reports.filter(r=>r.kind==="compaction").length;
+  await begin("declined across the line");await end();await flush();
+  assert.equal(compactions.length,2,"the declined compaction was asked");
+  assert.equal(reports.filter(r=>r.kind==="compaction").length,declinedReports,"a declined compaction is not reported");
+  compactDeclines=false;
+  await begin("asked again at the next settled turn");await end();await flush();
+  replyCompacts=false;
+  assert.equal(compactions.length,3,"a declined crossing asks again at the next settled turn");
+  assert.deepEqual(submitted,[],"no /compact prompt on any path");
+  usedTokens=50000;await tick();assert.equal(queue.length,beforeWork+1,"the compaction adds no mail prompt");
   await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"host:test"});
   call("ship.attend",{ship:"ship",holder:"start:test",ttl_secs:90});nativeEnv.PRIVATEER_PRESENCE_HOLDER="start:test";
   await fire("session.end",{});delete nativeEnv.PRIVATEER_HOSTED;await load();

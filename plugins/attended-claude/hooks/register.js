@@ -70,7 +70,8 @@ function message(snapshot) {
   return `${marker(snapshot)}\n${snapshot.count} new mailbox arrivals for ${config.ship}. `
     + `Read bodies with this argv: ${JSON.stringify(inbox)}. Page as needed; reply with correlation IDs, `
     + `and acknowledge only handled messages. This notification is not an acknowledgement. `
-    + `Existing charter and production deployment approval rules apply. Headers: ${JSON.stringify(snapshot.headers)}`;
+    + `Existing charter and production deployment approval rules apply. Headers: ${JSON.stringify(snapshot.headers)}`
+    + (snapshot.attention ? ` ${snapshot.attention}` : "");
 }
 
 async function snapshot($, gen) {
@@ -164,16 +165,34 @@ async function poll($) {
 }
 
 // The ship's attention: its live context after each turn and each compaction,
-// reported by the session that holds the lease. Best effort.
+// reported by the session that holds the lease. Returns the runtime's reply
+// (the summary, with compact: true when this turn crossed the compaction line).
+// Best effort.
 async function attention($, kind, tokens, extra = {}) {
   try {
     const gen = generation;
     const { context } = await $.session.usage();
     tokens = tokens ?? context?.tokens;
     if (!active || !Number.isFinite(tokens) || !(context?.window > 0) || !await owned($, gen)) return;
-    await call($, "attention.report", { ship: config.ship, kind, tokens: Math.round(tokens),
+    return await call($, "attention.report", { ship: config.ship, kind, tokens: Math.round(tokens),
       window: context.window, holder: config.holder, ...extra });
   } catch { /* attention reports are best effort */ }
+}
+
+// A resumable hosted first mate compacts its own conversation when the runtime
+// says this settled turn crossed the line. The session API runs the same call
+// /compact makes, between turns: it starts no model turn, and it is not a prompt,
+// so this mod's prompt.submit hook never sees it. A declined compaction (a
+// {skip} result, or a refusal) leaves the crossing armed, so the runtime asks
+// again at the next settled turn; the compaction report disarms it.
+async function compact($, gen, reply) {
+  if (reply?.compact !== true || gen !== generation || !active || busy || paused
+      || pending || prepared || nudge || offer) return;
+  try {
+    if (!await owned($, gen) || (await $.prompt.read()).text.length) return;
+    const result = await $.session.compact();
+    if (result?.skip) return;
+  } catch { /* best effort: a refused compaction is asked again at the next settled turn */ }
 }
 
 function followText(idle) {
@@ -355,13 +374,17 @@ export function register(on) {
       }
     }
     const result = await next(e);
-    if (main) void attention($, "turn");
+    // settled: the turn ended its answer with no tool pending, so the line may act.
+    if (main) {
+      const gen = generation;
+      void attention($, "turn", undefined, { settled: completed }).then(reply => compact($, gen, reply));
+    }
     if (completed) void follow($);
     return result;
   }).catch(($, e, next) => recover($, e, next));
   on("session.compact", async ($, e, next) => {
     const result = await next(e);
-    if (active && !e.agentId && !result?.skip && Number.isFinite(result?.tokensBefore)) {
+    if (active && !e.agentId && e.trigger !== "precompute" && !result?.skip && Number.isFinite(result?.tokensBefore)) {
       void attention($, "compaction", result.tokensBefore);
     }
     return result;

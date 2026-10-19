@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 /// A request is honoured only this long after it was made, so one nobody took
 /// cannot relaunch a pane hours later.
-const REQUEST_TTL_MS: i64 = 10 * 60 * 1000;
+pub(crate) const REQUEST_TTL_MS: i64 = 10 * 60 * 1000;
 
 /// How long `host relaunch` waits for its pane to reach a safe point.
 const RELAUNCH_WAIT: Duration = Duration::from_secs(90);

@@ -27,6 +27,12 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
     // with its context at least this full (0 seconds turns it off).
     ("quiet_compact_secs", 600, 0, 86_400),
     ("quiet_compact_percent", 40, 1, 100),
+    // A hosted Claude first mate is warned in its bearings at this fullness.
+    // A settled turn end that crosses the compaction fullness, busy or idle,
+    // makes a resumable one /compact its conversation, and a bounded one (tool
+    // bundles, which cannot resume) relaunch into a fresh session from its notes.
+    ("context_warn_percent", 40, 1, 100),
+    ("context_compact_percent", 50, 1, 100),
     // A hosted first mate's harness stops after this long idle and starts
     // again on the same conversation when needed (0 keeps it running).
     (
