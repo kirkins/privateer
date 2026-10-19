@@ -1651,7 +1651,7 @@ fn a_woken_first_mate_errand_takes_its_live_offer_without_naming_it() {
     let out = fleet.root.join("woken-errand.out");
     let mate = fleet.ok(
         "job.start",
-        json!({"id":"mate-d1","task_id":"infra-repair","heavy":false,"work_offer":offer,"command":[
+        json!({"id":"mate-d1","task_id":"infra-repair","heavy":false,"work_offer":offer,"agent_actor":"infra","command":[
             "env","PRIVATEER_ROLE=agent","PRIVATEER_ACTOR=infra",
             "sh","-c","\"$0\" --home \"$1\" errand.start --json \"$2\" >\"$3\" 2>&1",
             support::BIN, fleet.home, brief.to_string(), out]}),
