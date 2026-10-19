@@ -67,6 +67,8 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE TABLE IF NOT EXISTS hosted_block_alerts(
            ship TEXT PRIMARY KEY, blocked_since_ms INTEGER NOT NULL,
            alerted INTEGER NOT NULL DEFAULT 0 CHECK(alerted IN (0,1)));
+         CREATE TABLE IF NOT EXISTS duplicate_mate_alerts(ship TEXT PRIMARY KEY,
+           first_seen_ms INTEGER NOT NULL, workspaces TEXT NOT NULL, mail_id TEXT);
          CREATE TABLE IF NOT EXISTS hosted_panes(ship TEXT PRIMARY KEY, pid INTEGER NOT NULL,
            started TEXT NOT NULL, executable TEXT NOT NULL, harness_pid INTEGER,
            harness_started TEXT, recorded_ms INTEGER NOT NULL);
@@ -1140,6 +1142,9 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let hosted_blocked = crate::host::alert_blocked(store, &hosted_observations).unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     );
+    let duplicate_mates = crate::host::check_duplicate_mates(store).unwrap_or_else(
+        |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
+    );
     let reconciled = crate::jobs::reconcile_unsupervised(store)?;
     // Asks a policy change covers end, even when it was made in another home.
     let asks_ended = crate::block_ask::sweep(store).unwrap_or_else(|error| {
@@ -1172,7 +1177,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge}),
     )
 }
 
