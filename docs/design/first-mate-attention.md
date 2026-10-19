@@ -111,6 +111,34 @@ running and what waits. The first mate pulls from the top when attention
 allows; a blocked task leaves the running set and records its blocker, so it
 never holds a place.
 
+### 5. A busy hosted first mate that cannot resume starts fresh at a line
+
+Quiet compaction needs the session idle for `quiet_compact_secs`, and a busy
+first mate is never idle that long. A hosted Claude first mate on bounded tool
+bundles has no quiet compaction at all (its conversation cannot resume), so it
+grew to 60% of a 1M window with nothing reducing it, and every turn re-read the
+whole of it.
+
+The second trigger is a hard line, not an idle period:
+
+- at `context_warn_percent` (default 40) the bearings' attention line says to
+  write handoff notes now, and that the turn crossing `context_compact_percent`
+  (default 50) ends the session;
+- a settled turn (its answer ended, no tool pending) reported by the session
+  holding the lease, at or past the line, requests a relaunch in `hosted_relaunches`.
+  The pane's supervisor takes it at the next safe point, busy or idle, and the
+  bounded launch that follows is a fresh session seeded from the handoff notes;
+- one crossing asks once: a pending request holds the next, and a relaunch
+  ends the session that crossed. The request waits while the captain has a
+  tool question open or a crew report is unread, and it is never forced;
+- only hosted first mates on Claude with `tool_bundles` qualify; a resumable
+  first mate would reopen the same conversation, so it gets neither the warning
+  nor the request.
+
+Audit records `host.context_compact` with the tokens, window and line. Limitation: a
+crew decision is held back only through the unread crew reports it arrives as,
+not by a separate check for an open decision.
+
 ## What this does not do
 
 - No fixed cap on tasks, crew or errands.

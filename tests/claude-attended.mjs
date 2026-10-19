@@ -130,7 +130,7 @@ try {
   await fire("session.end",{});session="native-two";await fire("classic.SessionStart",{});await tick();assert.equal(queue.length,6);
   assert.equal(queue[5].session,"native-two");await begin(queue[5].text);await end();await flush();
   // Each completed turn reports the session's context as the ship's attention.
-  assert.deepEqual(reports.at(-1),{ship:"ship",kind:"turn",tokens:50000,window:200000,holder:"start:test"});
+  assert.deepEqual(reports.at(-1),{ship:"ship",kind:"turn",tokens:50000,window:200000,holder:"start:test",settled:true});
   // A completed turn that leaves running work unmoved gets one more prompt, once per set.
   call("task.create",{id:"ship-docs",parent:"ship-duty",owner:"ship",title:"Write the docs"});
   call("task.update",{id:"ship-docs",actor:"ship",status:"running"});

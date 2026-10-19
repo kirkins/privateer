@@ -355,7 +355,8 @@ export function register(on) {
       }
     }
     const result = await next(e);
-    if (main) void attention($, "turn");
+    // settled: the turn ended its answer with no tool pending, so a fresh start may follow.
+    if (main) void attention($, "turn", undefined, { settled: completed });
     if (completed) void follow($);
     return result;
   }).catch(($, e, next) => recover($, e, next));
