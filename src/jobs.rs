@@ -1675,9 +1675,10 @@ const UNPROVEN_LEADER: &str = "payload leader missing or changed; cannot discove
 /// currently be proven to own the group (for example caught mid-exit);
 /// inspection failures remain errors.
 ///
-/// `reserved` means the caller holds the leader as an exited but unreaped
-/// child (observed with waitid), which by itself keeps the PID and process
-/// group id from being reused, so the leader's identity is not re-inspected.
+/// `reserved` means the caller holds the leader as its own child, not yet
+/// reaped (alive, or exited and observed with waitid), which by itself keeps
+/// the PID and process group id from being reused, so the leader's identity
+/// is not re-inspected.
 fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Process>>> {
     if !addressable(process) {
         return Ok(None);
@@ -1704,20 +1705,27 @@ fn capture_anchors(process: &Process, reserved: bool) -> Result<Option<Vec<Proce
     }
     Ok(Some(anchors))
 }
-fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<()> {
+/// Signal the payload's group. `reserved` means the caller is the leader's
+/// parent and has not reaped it: alive or exited, the leader keeps its PID and
+/// so its group id from reuse, and nothing else needs to anchor the group. A
+/// leader that exits just before the signal is then nothing left to signal,
+/// not a stale group.
+fn signal_group(process: &Process, signal: i32, anchors: &[Process], reserved: bool) -> Result<()> {
     ensure!(
         addressable(process),
         "payload process group belongs to another PID namespace; refusing signal"
     );
     // A still-live recorded member anchors this exact group even if its
     // leader exits during TERM grace. Never signal solely by stale PGID.
-    let mut anchored = false;
-    for anchor in std::iter::once(process).chain(anchors.iter()) {
-        if same_process(anchor)?
-            && unsafe { libc::getpgid(anchor.pid as i32) } == process.pid as i32
-        {
-            anchored = true;
-            break;
+    let mut anchored = reserved;
+    if !anchored {
+        for anchor in std::iter::once(process).chain(anchors.iter()) {
+            if same_process(anchor)?
+                && unsafe { libc::getpgid(anchor.pid as i32) } == process.pid as i32
+            {
+                anchored = true;
+                break;
+            }
         }
     }
     ensure!(
@@ -1725,11 +1733,37 @@ fn signal_group(process: &Process, signal: i32, anchors: &[Process]) -> Result<(
         "payload leader/recorded members missing or changed; refusing stale process-group signal"
     );
     let rc = unsafe { libc::kill(-(process.pid as i32), signal) };
+    let error = std::io::Error::last_os_error().raw_os_error();
+    // macOS refuses (EPERM) a group left with only its unreaped leader.
     ensure!(
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        rc == 0
+            || error == Some(libc::ESRCH)
+            || (reserved && error == Some(libc::EPERM) && !group_alive(process)?),
         "cannot signal payload group"
     );
     Ok(())
+}
+/// Begin ending a supervised payload: record its group's live members and
+/// the descendants that left it, then TERM them. `reserved` as for
+/// `signal_group`: the supervisor has not reaped the leader.
+fn terminate_payload(
+    store: &Store,
+    id: &str,
+    payload: &Process,
+    known: &[Process],
+    reserved: bool,
+) -> Result<Job> {
+    let anchors = capture_anchors(payload, reserved)?.context(UNPROVEN_LEADER)?;
+    let escaped = escaped_descendants(payload, known)?;
+    let job = alter(store, id, |j| {
+        j.group_anchors = anchors;
+        j.escaped = escaped;
+    })?;
+    update_reservation(store, &job)?;
+    signal_group(payload, libc::SIGTERM, &job.group_anchors, reserved)?;
+    // Killing the payload's group is not proof its work stopped.
+    signal_escaped(&job.escaped, libc::SIGTERM)?;
+    Ok(job)
 }
 /// `terminal` as an SQL list. A query must repeat the `jobs_live` condition
 /// with it word for word for SQLite to use that index.
@@ -3163,7 +3197,9 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 // cleanup, not a cancelled outcome. Only recorded live group
                 // members may anchor TERM/KILL after the leader was reaped.
                 if group {
-                    if let Err(error) = signal_group(&payload, libc::SIGTERM, &job.group_anchors) {
+                    if let Err(error) =
+                        signal_group(&payload, libc::SIGTERM, &job.group_anchors, false)
+                    {
                         if group_alive(&payload)? {
                             reason = Some(format!("descendant cleanup refused: {error}"));
                         }
@@ -3234,27 +3270,27 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             // ends on its own just as the park is noticed. A group that is
             // already gone is not signalled: refusing it as stale would fail
             // a park that did what it should.
+            // It can also end just after that check. Until this loop reaps
+            // the leader its PID and group id stay reserved, so its group is
+            // signalled on that proof rather than refused as stale
+            // (efe29e60, a7fa0853, 2026-10-19).
             if outcome == "parked" && !payload_alive(&payload, &job.escaped)? {
                 terminated_at = Some(Instant::now());
             } else {
-                let anchors = capture_anchors(&payload, leader_exited(payload.pid)?)?
-                    .context(UNPROVEN_LEADER)?;
-                let escaped = escaped_descendants(&payload, &job.escaped)?;
-                job = alter(store, id, |j| {
-                    j.group_anchors = anchors;
-                    j.escaped = escaped;
-                })?;
-                update_reservation(store, &job)?;
-                signal_group(&payload, libc::SIGTERM, &job.group_anchors)?;
-                // Killing the payload's group is not proof its work stopped.
-                signal_escaped(&job.escaped, libc::SIGTERM)?;
+                job =
+                    terminate_payload(store, id, &payload, &job.escaped, leader_status.is_none())?;
                 terminated_at = Some(Instant::now());
             }
         }
         if let Some(at) = terminated_at {
             if !killed && at.elapsed() >= Duration::from_secs(2) {
                 if group_alive(&payload)? {
-                    signal_group(&payload, libc::SIGKILL, &job.group_anchors)?;
+                    signal_group(
+                        &payload,
+                        libc::SIGKILL,
+                        &job.group_anchors,
+                        leader_status.is_none(),
+                    )?;
                 }
                 signal_escaped(&job.escaped, libc::SIGKILL)?;
                 killed = true;
@@ -3764,7 +3800,7 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
                     j.escaped = escaped.clone();
                 })?;
                 if group {
-                    signal_group(&p, libc::SIGTERM, &anchors)?;
+                    signal_group(&p, libc::SIGTERM, &anchors, false)?;
                 }
                 signal_escaped(&escaped, libc::SIGTERM)?;
                 let until = Instant::now() + Duration::from_secs(2);
@@ -3772,7 +3808,7 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
                     thread::sleep(Duration::from_millis(50));
                 }
                 if group_alive(&p)? {
-                    signal_group(&p, libc::SIGKILL, &anchors)?;
+                    signal_group(&p, libc::SIGKILL, &anchors, false)?;
                 }
                 signal_escaped(&escaped, libc::SIGKILL)?;
                 // Give killed descendants time to leave the group.
@@ -4273,5 +4309,79 @@ mod stale_reconcile_tests {
         assert_eq!(stored.status, "parked", "{:?}", stored.reason);
         assert_eq!(stored.reason.as_deref(), Some("crew parked: park-crew-1-2"));
         assert_eq!(stored.finished_ms, None);
+    }
+}
+
+#[cfg(test)]
+mod park_end_signal_tests {
+    use super::*;
+
+    /// A harness ends its turn after `crew.park`, so its payload leader can
+    /// exit just after the supervisor saw it alive at the end of the park's
+    /// grace. The leader is then the supervisor's unreaped child: its group id
+    /// is still reserved, and ending it is nothing left to signal. Refusing it
+    /// as stale failed parked crews with a supervisor error 5 s after they
+    /// parked (efe29e60, a7fa0853, 2026-10-19).
+    #[test]
+    fn a_payload_that_exits_as_its_park_is_noticed_is_not_a_stale_group() {
+        // Started as the supervisor starts a payload: leader of its own group.
+        let mut command = Command::new("sh");
+        command.args(["-c", "read line"]).stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let payload = identity(child.id()).unwrap().unwrap();
+        // The supervisor's last snapshot, while the leader still ran.
+        let anchors = capture_anchors(&payload, false).unwrap().unwrap();
+        drop(child.stdin.take());
+        let until = Instant::now() + Duration::from_secs(10);
+        while exited_unreaped(payload.pid).unwrap().is_none() {
+            assert!(Instant::now() < until, "payload did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // What the incidents hit: no recorded member is live any more.
+        let refused = signal_group(&payload, libc::SIGTERM, &anchors, false).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("refusing stale process-group signal"),
+            "{refused:#}"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let running: Job = serde_json::from_value(json!({
+            "id": "crew-1", "task_id": "fix", "incarnation": "one",
+            "command": ["claude"], "cwd": temp.path(), "action": "spawn", "heavy": false,
+            "timeout_secs": 60, "ledger": temp.path().join("ledger.sqlite"),
+            "status": "running", "created_ms": Store::now_ms(), "finished_ms": null,
+            "supervisor": identity(std::process::id()).unwrap(), "payload": payload,
+            "group_anchors": anchors, "cancel_requested": false,
+            "exit_code": null, "reason": null, "retry_of": null,
+            "agent_actor": "engineering", "park": "park-crew-1-1",
+        }))
+        .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![running.id, serde_json::to_string(&running).unwrap()],
+            )
+            .unwrap();
+        // The supervisor's park stop, before it reaps the leader.
+        let job = terminate_payload(&store, "crew-1", &payload, &[], true).unwrap();
+        assert_eq!(job.status, "running");
+        assert_eq!(job.park.as_deref(), Some("park-crew-1-1"));
+        assert_eq!(job.group_anchors.first(), Some(&payload));
+        assert!(!payload_alive(&payload, &job.escaped).unwrap());
+
+        // Once reaped, its PID may be reused: a bare group id is never signalled.
+        child.wait().unwrap();
+        let refused = signal_group(&payload, libc::SIGTERM, &[payload.clone()], false);
+        assert!(refused.is_err());
     }
 }
