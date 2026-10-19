@@ -26,7 +26,8 @@ impl Fleet {
         fs::create_dir(root.join("engineering")).unwrap();
         let fleet = Self { _tmp: tmp, root };
         // The fake claude. Its mode file picks what the crew does: park on a
-        // child (session, nosession, long, gated), start a child and run out
+        // child (session, nosession, long, gated), park on a new child at
+        // every launch up to a limit (chain, twice), start a child and run out
         // its budget (deadline), or run out with nothing outstanding (held). A
         // resumed run is recognised by its job id, and completes its turn. A
         // gated child runs until the test releases it (`release_child`).
@@ -37,12 +38,14 @@ BIN='{bin}'
 gate="while [ ! -e $ROOT/release-child ]; do [ -d $ROOT ] || exit 1; sleep 0.1; done; echo built"
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
 MODE=$(cat "$ROOT/mode" 2>/dev/null)
-if [ "$MODE" = chain ]; then
-  # Every launch parks on its own child, up to six launches; the seventh (the
-  # sixth resume) finishes its turn.
+if [ "$MODE" = chain ] || [ "$MODE" = twice ]; then
+  # Every launch parks on its own child, up to six launches (two when twice);
+  # the next one (the last resume) finishes its turn.
   N=$(wc -l < "$ROOT/launches.log" | tr -d ' ')
+  LIMIT=6
+  if [ "$MODE" = twice ]; then LIMIT=2; fi
   printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
-  if [ "$N" -gt 6 ]; then
+  if [ "$N" -gt "$LIMIT" ]; then
     printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"{session}"}}\n'
     exit 0
   fi
@@ -1128,6 +1131,73 @@ fn a_crew_that_parks_six_times_keeps_its_ids_short_and_unique() {
     );
     assert_eq!(rows[0].0, "park-crew-chain-1", "{rows:?}");
     assert_eq!(last, "crew-resume-park-crew-chain-6-1", "{rows:?}");
+}
+
+/// A crew parks and resumes, the resumed crew parks again and resumes again,
+/// and that run finishes. Dispatcher passes run throughout, so a pass can read
+/// a crew running just before its supervisor parks it and exits; that read
+/// must not fail the parked crew (see `jobs::stale_reconcile_tests`), or the
+/// second child's outcome finds no crew to resume.
+#[test]
+fn a_resumed_crew_that_parks_again_resumes_again_and_finishes() {
+    let f = Fleet::new();
+    f.set_mode("twice");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let passes = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                f.run(None, &["serve", "--json", r#"{"once":true}"#]);
+                passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        start_crew(&f, "crew-twice");
+        f.wait("crew-resume-park-crew-twice-2-1", &["succeeded"]);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    assert!(
+        passes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "no dispatcher pass ran"
+    );
+    let first = f.wait("crew-resume-park-crew-twice-1-1", &["resumed"]);
+    assert_eq!(
+        first["reason"], "resumed as crew-resume-park-crew-twice-2-1",
+        "{first}"
+    );
+    assert_eq!(first["park"], "park-crew-twice-2", "{first}");
+    let root = f.wait("crew-twice", &["resumed"]);
+    assert_eq!(
+        root["reason"], "resumed as crew-resume-park-crew-twice-1-1",
+        "{root}"
+    );
+    for crew in ["crew-twice", "crew-resume-park-crew-twice-1-1"] {
+        assert_eq!(
+            f.park_field(crew, "state"),
+            rusqlite::types::Value::Text("resumed".into()),
+            "{crew}"
+        );
+    }
+    let launches = f.launches();
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    assert!(
+        launches[1].contains("Job child-1 succeeded"),
+        "{launches:?}"
+    );
+    assert!(
+        launches[2].contains("Job child-2 succeeded"),
+        "{launches:?}"
+    );
+    let notices = f.ship_notices();
+    assert!(
+        notices
+            .iter()
+            .any(|b| b.contains("crew-resume-park-crew-twice-1-1 parked on job child-2")),
+        "{notices:?}"
+    );
+    assert!(
+        !notices.iter().any(|b| b.contains("supervisor disappeared")),
+        "{notices:?}"
+    );
 }
 
 #[test]
