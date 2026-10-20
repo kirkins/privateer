@@ -19,6 +19,7 @@ pub const ACTIONS: &[&str] = &[
     "ship.scope",
     "ship.actions",
     "ship.consumes",
+    "ship.requires",
     "project.add",
 ];
 

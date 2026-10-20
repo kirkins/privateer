@@ -313,6 +313,19 @@ fn export(args: &Value) -> Result<Value> {
         .with_context(|| format!("no ship named {ship} on this machine"))?;
     let home = member.home.clone();
     let folder = home.parent().context("ship folder")?.to_path_buf();
+    // A pinned ship moves only when the operator said to unpin it, decided
+    // before anything stops.
+    let unpin = args["unpin"].as_bool().unwrap_or(false);
+    let pin = {
+        let mut store = Store::open(&home)?;
+        crate::mail::dispatch(&mut store, "ship.show", json!({"name": ship}))?
+            .get("pinned")
+            .cloned()
+            .filter(|p| !p.is_null())
+    };
+    if let Some(pin) = &pin {
+        ensure!(unpin, "{}", pinned_text(ship, pin));
+    }
     // Nothing new starts once its dispatcher is stopped.
     crate::service::stop(&home, ship)?;
     let staged = (|| -> Result<Value> {
@@ -369,11 +382,19 @@ fn export(args: &Value) -> Result<Value> {
             json!({"id": id, "ship": ship, "from": crate::machines::this_machine(),
             "created_by": member.created_by,
             "folder": folder, "files": listed, "projects": projects, "links_left": links,
-            "first_mate": profile["first_mate"]}),
+            "first_mate": profile["first_mate"],
+            "requires": profile.get("requires").cloned().unwrap_or_else(|| json!([])),
+            "unpin": unpin && pin.is_some()}),
         )
     })();
     match staged {
         Ok(manifest) => {
+            if let Some(pin) = &pin {
+                Store::open(&home)?.audit(
+                    "ship.unpinned",
+                    &json!({"ship": ship, "move": id, "pinned": pin}),
+                )?;
+            }
             put(
                 &conn,
                 id,
@@ -473,6 +494,135 @@ fn project_entry(project: &Value) -> Result<(String, String)> {
     Ok((name.to_owned(), url.to_owned()))
 }
 
+/// What keeps this machine from hosting a ship, besides its declared needs:
+/// the name, its first mate's plugin and harness, and fetching its projects.
+fn hosting_problems(
+    conn: &Connection,
+    ship: &str,
+    first_mate: &Value,
+    projects: &Value,
+    path: &str,
+) -> Result<Vec<String>> {
+    let mut problems = vec![];
+    if crate::fleet::members(conn)?.iter().any(|m| m.name == ship) {
+        problems.push(format!("{ship} is already a ship on this machine"));
+    }
+    if let Some(plugin) = first_mate["manifest"].as_str() {
+        if !(plugin.starts_with("bundled:") || Path::new(plugin).is_file()) {
+            problems.push(format!(
+                "{ship}'s first mate uses the plugin {plugin}, which this machine does not have"
+            ));
+        }
+    }
+    let harness = first_mate["manifest"]
+        .as_str()
+        .and_then(crate::bundled::harness);
+    if let Some(binary) = harness.as_deref().and_then(crate::cli::harness_binary) {
+        if !crate::cli::on_path_in(binary, path) {
+            problems.push(format!(
+                "{ship}'s first mate runs {binary}, which is not installed here"
+            ));
+        }
+    }
+    for project in projects.as_array().into_iter().flatten() {
+        let (name, url) = project_entry(project)?;
+        let reached = git_quietly(Command::new("git").args(["ls-remote", "--heads", "--", &url]))
+            .status()
+            .is_ok_and(|s| s.success());
+        if !reached {
+            problems.push(format!(
+                "this machine cannot fetch {ship}'s project {name} from {url}"
+            ));
+        }
+    }
+    Ok(problems)
+}
+
+/// Unmet needs as the captain reads them: `xcode (xcodebuild is not on PATH)`.
+fn unmet_text(unmet: &Value) -> String {
+    unmet
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|u| {
+            format!(
+                "{} ({})",
+                u["need"].as_str().unwrap_or("?"),
+                u["why"].as_str().unwrap_or("unmet")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Why a pinned ship stays, and how the operator moves it anyway.
+fn pinned_text(ship: &str, pin: &Value) -> String {
+    format!(
+        "{ship} is pinned by {}: {}; pass --unpin to move it anyway and clear the pin",
+        pin["by"].as_str().unwrap_or("someone"),
+        pin["reason"].as_str().unwrap_or("no reason given")
+    )
+}
+
+/// What a move of a ship on this machine would carry, without stopping or
+/// changing anything: its needs and pin, its first mate and projects, what
+/// keeps it from being idle, and its size.
+fn inspect(args: &Value) -> Result<Value> {
+    let ship = required(args, "ship")?;
+    identifier(ship)?;
+    let conn = crate::fleet::registry()?;
+    let member = crate::fleet::members(&conn)?
+        .into_iter()
+        .find(|m| m.name == ship && m.home.is_dir())
+        .with_context(|| format!("no ship named {ship} on this machine"))?;
+    let folder = member.home.parent().context("ship folder")?.to_path_buf();
+    let mut store = Store::open(&member.home)?;
+    let profile = crate::mail::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
+    let mut not_idle = busy(&store)?;
+    let (projects, unsafe_projects) = projects(&folder)?;
+    not_idle.extend(unsafe_projects);
+    let (mut files, mut links) = (vec![], vec![]);
+    walk(&folder, &folder, &mut files, &mut links)?;
+    let database = member.home.join("privateer.sqlite");
+    let folder_bytes: u64 = files
+        .iter()
+        .chain(std::iter::once(&database))
+        .filter_map(|rel| fs::metadata(folder.join(rel)).ok())
+        .map(|m| m.len())
+        .sum();
+    Ok(json!({"ship": ship,
+        "requires": profile.get("requires").cloned().unwrap_or_else(|| json!([])),
+        "pinned": profile.get("pinned").cloned().unwrap_or(Value::Null),
+        "first_mate": profile["first_mate"], "projects": projects, "not_idle": not_idle,
+        "folder_bytes": folder_bytes, "project_count": projects.len()}))
+}
+
+/// Whether this machine can host a ship: each required capability probed
+/// live, then what else would stop it here. The arguments name needs; a
+/// probe is only ever this machine's own.
+fn check(args: &Value) -> Result<Value> {
+    let ship = required(args, "ship")?;
+    identifier(ship)?;
+    let requires = crate::capabilities::names(&args["requires"])?;
+    let conn = crate::fleet::registry()?;
+    let mut answer = crate::capabilities::check(&conn, &requires)?;
+    let path = crate::service::login_path();
+    answer["problems"] = json!(hosting_problems(
+        &conn,
+        ship,
+        &args["first_mate"],
+        &args["projects"],
+        &path
+    )?);
+    let registry = crate::fleet::registry_path()?;
+    answer["free_disk_bytes"] = json!(
+        crate::admission::disk(registry.parent().context("fleet registry directory")?)
+            .map(|(free, _)| free)
+            .ok()
+    );
+    Ok(answer)
+}
+
 /// Accept a move to this machine: check it can host the ship, and make room.
 fn begin(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
@@ -484,36 +634,24 @@ fn begin(args: &Value) -> Result<Value> {
     if let Some((_, detail)) = row(&conn, id, "import")? {
         return Ok(json!({"folder": detail["folder"]}));
     }
-    ensure!(
-        !crate::fleet::members(&conn)?.iter().any(|m| m.name == ship),
-        "{ship} is already a ship on this machine"
-    );
-    if let Some(plugin) = manifest["first_mate"]["manifest"].as_str() {
-        ensure!(
-            plugin.starts_with("bundled:") || Path::new(plugin).is_file(),
-            "{ship}'s first mate uses the plugin {plugin}, which this machine does not have"
-        );
-    }
     let path = crate::service::login_path();
-    let harness = manifest["first_mate"]["manifest"]
-        .as_str()
-        .and_then(crate::bundled::harness);
-    if let Some(binary) = harness.as_deref().and_then(crate::cli::harness_binary) {
-        ensure!(
-            crate::cli::on_path_in(binary, &path),
-            "{ship}'s first mate runs {binary}, which is not installed here"
-        );
-    }
-    for project in manifest["projects"].as_array().into_iter().flatten() {
-        let (name, url) = project_entry(project)?;
-        let reached = git_quietly(Command::new("git").args(["ls-remote", "--heads", "--", &url]))
-            .status()
-            .is_ok_and(|s| s.success());
-        ensure!(
-            reached,
-            "this machine cannot fetch {ship}'s project {name} from {url}"
-        );
-    }
+    let problems = hosting_problems(
+        &conn,
+        ship,
+        &manifest["first_mate"],
+        &manifest["projects"],
+        &path,
+    )?;
+    ensure!(problems.is_empty(), "{}", problems.join("; "));
+    // Offers may have changed since the preflight: check them again, live.
+    let requires = crate::capabilities::names(&manifest["requires"])?;
+    let checked = crate::capabilities::check(&conn, &requires)?;
+    ensure!(
+        checked["unmet"].as_array().is_none_or(Vec::is_empty),
+        "{} does not offer {}",
+        crate::machines::this_machine(),
+        unmet_text(&checked["unmet"])
+    );
     let mut total = 0u64;
     for file in manifest["files"].as_array().context("files are listed")? {
         relative(required(file, "path")?)?;
@@ -656,6 +794,13 @@ fn rewrite(home: &Path, manifest: &Value, folder: &Path, path: &str) -> Result<V
             "DELETE FROM workspaces WHERE json_extract(record,'$.state')='released'",
             [],
         )?;
+    }
+    if manifest["unpin"] == true {
+        tx.execute(
+            "UPDATE ships SET record=json_remove(record,'$.pinned') WHERE name=?1",
+            [ship],
+        )?;
+        notes.push("its pin was cleared, as the move was told to".into());
     }
     let hosted = manifest["first_mate"]
         .get("host")
@@ -977,6 +1122,8 @@ pub fn refuse_moved(home: &Path) -> Result<()> {
 /// that machine's gateway.
 pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
     match command {
+        "move.inspect" => inspect(args),
+        "move.check" => check(args),
         "move.export" => export(args),
         "move.read" => read(args),
         "move.abort" => abort(args),
@@ -1042,11 +1189,113 @@ fn plan(conn: &Connection, ship: &str, to: &str) -> Result<Value> {
     }
 }
 
+/// The two sides of a move as planned, and the names the captain knows them by.
+fn sides(record: &Value, to: &str) -> Result<(Side, Side, String, String)> {
+    let machine = required(record, "machine")?.to_owned();
+    Ok(if to == "here" {
+        (
+            Side::There(machine.clone()),
+            Side::Here,
+            machine,
+            crate::machines::this_machine(),
+        )
+    } else {
+        (
+            Side::Here,
+            Side::There(machine.clone()),
+            crate::machines::this_machine(),
+            machine,
+        )
+    })
+}
+
+/// Ask the ship's machine what the move carries and the other machine
+/// whether it can host it, stopping nothing.
+fn preflight(source: &Side, target: &Side, ship: &str, from: &str, to: &str) -> Result<Value> {
+    let inspected = source.call("move.inspect", json!({"ship": ship}), None)?;
+    let requires = inspected["requires"].clone();
+    let checked = match target.call(
+        "move.check",
+        json!({"ship": ship, "requires": requires, "first_mate": inspected["first_mate"],
+            "projects": inspected["projects"]}),
+        Some(SLOW_CALL),
+    ) {
+        Ok(checked) => checked,
+        // A machine too old to check cannot say it offers anything, but
+        // still checks the rest when the move begins, as before.
+        Err(error)
+            if format!("{error:#}").contains("unknown move command move.check")
+                && requires.as_array().is_none_or(Vec::is_empty) =>
+        {
+            json!({"met": [], "unmet": [], "problems": [], "free_disk_bytes": null})
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(json!({"ship": ship, "from": from, "to": to, "requires": requires,
+        "pinned": inspected["pinned"], "met": checked["met"], "unmet": checked["unmet"],
+        "problems": checked["problems"], "not_idle": inspected["not_idle"],
+        "folder_bytes": inspected["folder_bytes"], "project_count": inspected["project_count"],
+        "free_disk_bytes": checked["free_disk_bytes"]}))
+}
+
+/// Everything a preflight found that keeps the ship where it is, in one
+/// sentence; `None` when it may move.
+fn refusal(report: &Value, unpin: bool) -> Option<String> {
+    let ship = report["ship"].as_str().unwrap_or("the ship");
+    let list = |key: &str| -> Vec<String> {
+        report[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    let mut reasons = vec![];
+    if !report["pinned"].is_null() && !unpin {
+        reasons.push(pinned_text(ship, &report["pinned"]));
+    }
+    if report["unmet"].as_array().is_some_and(|u| !u.is_empty()) {
+        reasons.push(format!(
+            "{} does not offer {}",
+            report["to"].as_str().unwrap_or("the other machine"),
+            unmet_text(&report["unmet"])
+        ));
+    }
+    reasons.extend(list("problems"));
+    let not_idle = list("not_idle");
+    if !not_idle.is_empty() {
+        reasons.push(format!("it is not idle: {}", not_idle.join("; ")));
+    }
+    (!reasons.is_empty()).then(|| {
+        format!(
+            "{ship} stays on {}: {}",
+            report["from"].as_str().unwrap_or("its machine"),
+            reasons.join("; ")
+        )
+    })
+}
+
+/// `ship move --check`: the preflight and the idle test, changing nothing.
+fn check_only(conn: &Connection, ship: &str, to: &str, unpin: bool) -> Result<Value> {
+    let record = plan(conn, ship, to)?;
+    let (source, target, from, to_name) = sides(&record, to)?;
+    let mut report = preflight(&source, &target, ship, &from, &to_name)?;
+    let refused = refusal(&report, unpin);
+    report["movable"] = json!(refused.is_none());
+    report["refusal"] = json!(refused);
+    report["check"] = json!(true);
+    Ok(report)
+}
+
 fn run(args: &Value) -> Result<Value> {
     let ship = required(args, "name")?;
     identifier(ship)?;
     let to = required(args, "to")?;
+    let unpin = args["unpin"].as_bool().unwrap_or(false);
     let conn = crate::fleet::registry()?;
+    if args["check"].as_bool().unwrap_or(false) {
+        return check_only(&conn, ship, to, unpin);
+    }
     // An interrupted move of this ship is picked up where it stopped.
     let unfinished = conn
         .query_row(
@@ -1080,14 +1329,17 @@ fn run(args: &Value) -> Result<Value> {
     };
     let machine = required(&record, "machine")?.to_owned();
     let peer = required(&record, "peer")?.to_owned();
-    let (source, target) = if to == "here" {
-        (Side::There(machine.clone()), Side::Here)
-    } else {
-        (Side::Here, Side::There(machine.clone()))
-    };
+    let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
     if prior != "released" {
         if prior == "new" {
+            // Refused here, nothing has stopped, so nothing restarts. A
+            // resumed move skips this: its ship may already be exported or
+            // active there, and `move.begin` still checks if it has not passed.
+            let report = preflight(&source, &target, ship, &from, &to_name)?;
+            if let Some(refused) = refusal(&report, unpin) {
+                bail!(refused);
+            }
             put(&conn, &id, "run", ship, "started", &record)?;
         }
         let fail = |error: anyhow::Error| -> anyhow::Error {
@@ -1096,7 +1348,11 @@ fn run(args: &Value) -> Result<Value> {
             error
         };
         let manifest = source
-            .call("move.export", json!({"id": id, "ship": ship}), None)
+            .call(
+                "move.export",
+                json!({"id": id, "ship": ship, "unpin": unpin}),
+                None,
+            )
             .inspect_err(|_| {
                 let _ = put(&conn, &id, "run", ship, "failed", &record);
             })?;

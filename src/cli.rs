@@ -83,6 +83,42 @@ fn on_path(binary: &str) -> bool {
     std::env::var("PATH").is_ok_and(|paths| on_path_in(binary, &paths))
 }
 
+/// What `ship move --check` found, for the captain.
+fn print_check(name: &str, report: &Value) {
+    let names = |key: &str| {
+        report[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let from = report["from"].as_str().unwrap_or("");
+    let to = report["to"].as_str().unwrap_or("");
+    match report["refusal"].as_str() {
+        Some(refusal) => println!("{name} would not move from {from} to {to}: {refusal}"),
+        None => println!("{name} can move from {from} to {to}; nothing was stopped or changed."),
+    }
+    let met = names("met");
+    println!("  met: {}", if met.is_empty() { "nothing declared" } else { &met });
+    for unmet in report["unmet"].as_array().into_iter().flatten() {
+        println!(
+            "  unmet: {} ({})",
+            unmet["need"].as_str().unwrap_or(""),
+            unmet["why"].as_str().unwrap_or("")
+        );
+    }
+    println!(
+        "  folder: {} MiB besides its projects; {} projects",
+        report["folder_bytes"].as_u64().unwrap_or(0) / (1024 * 1024),
+        report["project_count"].as_u64().unwrap_or(0)
+    );
+    if let Some(free) = report["free_disk_bytes"].as_u64() {
+        println!("  free on {to}: {} MiB", free / (1024 * 1024));
+    }
+}
+
 /// Whether `binary` is an executable in one of `paths`' directories.
 pub(crate) fn on_path_in(binary: &str, paths: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1691,7 +1727,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             args,
             &["scope", "folder", "harness", "objective", "machine", "to"],
         )?;
-        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME | privateer ship move NAME --to MACHINE|--here [--folder PATH]";
+        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME | privateer ship move NAME --to MACHINE|--here [--folder PATH] [--check] [--unpin]";
         let name = flags.positional.get(1).context(usage)?;
         match flags.positional.first().map(String::as_str) {
             Some("new") => {
@@ -1731,7 +1767,16 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                 if let Some(folder) = flags.values.get("folder") {
                     request["folder"] = json!(folder);
                 }
+                for switch in ["check", "unpin"] {
+                    if flags.switches.iter().any(|s| s == switch) {
+                        request[switch] = json!(true);
+                    }
+                }
                 let moved = crate::dispatch(&mut store, "ship.move", request)?;
+                if moved["check"] == true {
+                    print_check(name, &moved);
+                    return Ok(());
+                }
                 println!(
                     "Aye. {name} moved from {} to {}, now at {}.\n  dispatcher: {}",
                     moved["from"].as_str().unwrap_or(""),
