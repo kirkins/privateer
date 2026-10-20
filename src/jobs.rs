@@ -2520,9 +2520,10 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         )?;
         return Ok(public_job(&job));
     }
-    let neutral_dir = if job.workspace_lease_id.is_some() && job.cwd.is_dir() {
-        job.cwd.as_path()
-    } else if store.home().is_dir() {
+    // The supervisor sits in the ship home, never in a workspace (its own
+    // included): it outlives its job by a moment, and a process inside a
+    // workspace blocks that workspace's release.
+    let neutral_dir = if store.home().is_dir() {
         store.home()
     } else {
         Path::new("/")
@@ -2875,15 +2876,8 @@ fn truncation_marker(dropped: u64) -> Vec<u8> {
 }
 
 pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
-    let neutral_dir = if let Ok(job) = load(store, id) {
-        if job.workspace_lease_id.is_some() && job.cwd.is_dir() {
-            job.cwd
-        } else if store.home().is_dir() {
-            store.home().to_path_buf()
-        } else {
-            PathBuf::from("/")
-        }
-    } else if store.home().is_dir() {
+    // As at spawn: the ship home, never a workspace.
+    let neutral_dir = if store.home().is_dir() {
         store.home().to_path_buf()
     } else {
         PathBuf::from("/")
