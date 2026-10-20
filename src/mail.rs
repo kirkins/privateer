@@ -377,7 +377,7 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
 /// Allocate only runtime outcome IDs, under the caller's write lock. Client
 /// IDs remain untouched. The committed request link, not a computed ID, is the
 /// durable idempotency key. Bound retries even in a pathological collision.
-fn outcome_id(store: &Store, prefix: &str) -> Result<String> {
+pub(crate) fn outcome_id(store: &Store, prefix: &str) -> Result<String> {
     for _ in 0..8 {
         let id = format!("{prefix}-{}", uuid::Uuid::new_v4());
         let occupied: bool = store.connection().query_row(
@@ -1088,10 +1088,20 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     let body = args.get("body").and_then(Value::as_str).unwrap_or("");
     let mut payload = args.get("payload").cloned().unwrap_or(json!({}));
     ensure!(payload.is_object(), "payload must be an object");
-    ensure!(
-        payload.get("request_end").is_none(),
-        "request_end is reserved for runtime closure"
-    );
+    // Runtime-to-runtime payload keys: cross-ship wait notices join request
+    // closures among the things only the runtime may author.
+    for reserved in [
+        "request_end",
+        "wait_subscribe",
+        "wait_unsubscribe",
+        "task_end",
+        "wait_closed",
+    ] {
+        ensure!(
+            payload.get(reserved).is_none(),
+            "payload.{reserved} is reserved for the runtime"
+        );
+    }
     for reserved in ["operator", "attached_to", "attached_ship"] {
         ensure!(
             payload.get(reserved).is_none(),
@@ -2168,6 +2178,20 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     ensure!(payload.is_object(), "payload must be an object");
     typed_payload(kind, &mut payload)?;
     hands_step(kind, to, &payload)?;
+    // Cross-ship wait notices are runtime-to-runtime: applied here, never
+    // written to any inbox, so they wake no first mate and appear as no mail.
+    if payload.get("wait_subscribe").is_some() || payload.get("wait_unsubscribe").is_some() {
+        ensure!(kind == "notice", "a wait notice rides a notice");
+        ensure!(
+            from != CAPTAIN && to != CAPTAIN && to != CREW,
+            "wait notices go between ships"
+        );
+        ensure!(
+            payload.get("wait_subscribe").is_none() || payload.get("wait_unsubscribe").is_none(),
+            "a notice carries one wait instruction"
+        );
+        return crate::waits::deliver_notice(store, id, from, to, &payload);
+    }
     // Files cross a link only on the captain's mail to a ship, and this home,
     // which hosts the ship, keeps only what its own rows say about them. A
     // redelivery of mail already stored was checked when it was placed.

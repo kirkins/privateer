@@ -271,17 +271,57 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
                 params![id, target],
             )?;
         } else {
-            let status = required(&args, "status")?;
-            if !["open", "running", "blocked", "done", "cancelled"].contains(&status) {
-                bail!("invalid task status");
+            // `task.update` may instead set the ships a task is shared with:
+            // the owner's visibility decision for cross-ship waits, not a
+            // status change. A null list clears it. Terminal tasks still
+            // refuse every update.
+            let shared = match args.get("shared_with") {
+                Some(value) if command == "task.update" => {
+                    let empty = json!([]);
+                    Some(crate::waits::shared_names(if value.is_null() {
+                        &empty
+                    } else {
+                        value
+                    })?)
+                }
+                _ => None,
+            };
+            if let Some(names) = &shared {
+                tx.execute(
+                    "UPDATE tasks SET shared_with=?2 WHERE id=?1",
+                    params![id, names.to_string()],
+                )?;
+                store.audit(
+                    "task.share",
+                    &json!({"id":id,"actor":actor,"shared_with":names}),
+                )?;
             }
-            tx.execute(
-                "UPDATE tasks SET status=?2 WHERE id=?1",
-                params![id, status],
-            )?;
-            if matches!(status, "done" | "cancelled") {
-                crate::mail::close_task(store, id, status)?;
-                closed = Some(status.to_owned());
+            match args.get("status").and_then(Value::as_str) {
+                Some(status) => {
+                    if !["open", "running", "blocked", "done", "cancelled"].contains(&status) {
+                        bail!("invalid task status");
+                    }
+                    tx.execute(
+                        "UPDATE tasks SET status=?2 WHERE id=?1",
+                        params![id, status],
+                    )?;
+                    if matches!(status, "done" | "cancelled") {
+                        crate::mail::close_task(store, id, status)?;
+                        crate::waits::task_ended(store, id, status)?;
+                        closed = Some(status.to_owned());
+                    }
+                }
+                None => {
+                    // A malformed status is a refused update, not one half
+                    // applied: `required` keeps the old message for agents.
+                    if args.get("status").is_some() {
+                        required(&args, "status")?;
+                    }
+                    ensure!(
+                        shared.is_some(),
+                        "task.update needs a status or shared_with"
+                    );
+                }
             }
         }
     }
