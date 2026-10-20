@@ -210,7 +210,14 @@ impl Fleet {
     /// variables pointing at the fleet registry and ledger do not race across
     /// test threads when the suite runs concurrently.
     fn in_process<T>(&self, run: impl FnOnce(&privateer::store::Store) -> T) -> T {
-        let _guard = IN_PROCESS_LOCK.lock().unwrap();
+        // A test that panics inside the lock poisons it; recover rather than
+        // fail every later test, since each caller sets both variables again.
+        let _guard = IN_PROCESS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: the lock serializes every writer and reader of these
+        // variables in this test binary, and other threads read the
+        // environment only through std, which takes its own env lock.
         unsafe {
             std::env::set_var("PRIVATEER_FLEET", self.root.join("fleet.sqlite"));
             std::env::set_var("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"));
@@ -218,6 +225,7 @@ impl Fleet {
         let store =
             privateer::store::Store::open(&self.root.join("engineering/.privateer")).unwrap();
         let result = run(&store);
+        // SAFETY: as above, under the same lock.
         unsafe {
             std::env::remove_var("PRIVATEER_FLEET");
             std::env::remove_var("PRIVATEER_RESOURCE_HOME");
@@ -2211,10 +2219,10 @@ fn a_declared_alias_excludes_every_model_that_carries_it() {
     assert!(refused.contains("alias opus"), "{refused}");
 }
 
-/// Two route sets in rapid succession within one timestamp tick correctly
-/// replace the routes file and immediate in-process reads see the updated routes.
+/// Two route sets in a row each replace the routes file, and an in-process read
+/// right after each sees the routes just set (route loading has no cache).
 #[test]
-fn consecutive_routes_set_within_one_tick_updates_in_process_reads() {
+fn consecutive_routes_sets_are_each_seen_by_in_process_reads() {
     let pi_sol = || {
         tiered(
             "bundled:pi",
