@@ -14,6 +14,14 @@ like any other throttle. A stream that recovers keeps running.
 OpenCode also sleeps out a provider's `retry-after` without a log line, so a
 run told to wait longer than the grace period is ended too: its route backs
 off and the crew moves on, instead of holding a slot for an unknown time.
+
+A rate or usage limit is not a stall to wait out: the provider has said the
+allowance is spent, so however long OpenCode would sit there, the answer will
+not change. Such an error ends the run after a short grace instead (5 s by
+default, `PRIVATEER_OPENCODE_RATE_SECS`), still as OpenCode's own final
+`error` event, which the dispatcher reads as a throttle: the route is held
+until its reset at once and the crew can move to another route. Any other
+error, and silence, keep the full stall grace.
 """
 import io
 import json
@@ -26,6 +34,7 @@ import threading
 import time
 
 GRACE_SECS = 300
+RATE_GRACE_SECS = 5
 ERROR = re.compile(r'error\.error="((?:[^"\\]|\\.)*)"')
 SESSION = re.compile(r" session\.id=(\S+)")
 
@@ -52,6 +61,24 @@ def grace():
         return max(0.1, float(os.environ.get("PRIVATEER_OPENCODE_STALL_SECS", GRACE_SECS)))
     except ValueError:
         return GRACE_SECS
+
+
+def rate_grace():
+    """The grace for a rate or usage limit: long enough for a retry the
+    provider does itself to land, short of holding the crew while its
+    allowance is spent."""
+    try:
+        return max(0.1, float(os.environ.get("PRIVATEER_OPENCODE_RATE_SECS", RATE_GRACE_SECS)))
+    except ValueError:
+        return RATE_GRACE_SECS
+
+
+def is_limit(error):
+    """Whether a stream error is a rate or usage limit: the wordings the
+    route ledger reads as a throttle, which is how OpenCode's free tier says
+    its allowance is spent."""
+    lowered = (error or "").lower()
+    return any(sign in lowered for sign in ("rate limit", "rate_limit", "usage limit", "usage_limit"))
 
 
 def run(argv):
@@ -98,15 +125,21 @@ def run(argv):
     for reader in readers:
         reader.start()
     limit = grace()
+    short = rate_grace()
     while child.poll() is None:
-        time.sleep(min(1.0, limit / 4))
+        time.sleep(min(1.0, limit / 4, short / 4))
         with lock:
+            error = state["error"]
             # Silence counts from the error or the last event, whichever came
             # later: the two pipes are read on their own threads, so an event
             # OpenCode printed just before the error may be read after it.
-            stalled = (state["at"] is not None
-                       and time.monotonic() - max(state["at"], state["output"]) >= limit)
-            error = state["error"]
+            waited = (None if state["at"] is None
+                      else time.monotonic() - max(state["at"], state["output"]))
+            # A rate or usage limit is a spent allowance, so it ends the run
+            # after the short grace; any other error, and silence, keep the
+            # full one.
+            ended = short if error is not None and is_limit(error) else limit
+            stalled = waited is not None and waited >= ended
         # A run that ended meanwhile keeps its own exit status.
         if stalled and child.poll() is None:
             child.terminate()
@@ -119,7 +152,7 @@ def run(argv):
             # The final event starts its own line even after a partial one.
             sys.stdout.buffer.write((b"" if state["newline"] else b"\n") + (json.dumps({
                 "type": "error", "source": "privateer-opencode-watch",
-                "stalled_secs": round(limit), "error": {"name": "ProviderStalled", "data": {"message": error}},
+                "stalled_secs": round(ended), "error": {"name": "ProviderStalled", "data": {"message": error}},
             }, separators=(",", ":")) + "\n").encode())
             sys.stdout.buffer.flush()
             return 2

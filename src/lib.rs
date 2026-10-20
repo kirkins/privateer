@@ -13,6 +13,7 @@ pub mod core;
 pub mod credentials;
 pub mod crew;
 mod crew_launch;
+pub mod crew_relaunch;
 pub mod crew_routes;
 pub mod crew_scope;
 pub mod cursor_mail;
@@ -537,6 +538,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .filter(|_| matches!(store.caller(), Caller::Operator))
             {
                 job["_resume_of"] = resumed.clone();
+            }
+            // The crew a relaunch replaces; only the runtime's relaunch sets it.
+            if let Some(relaunched) = args
+                .get("_relaunch_of")
+                .filter(|_| matches!(store.caller(), Caller::Operator))
+            {
+                job["_relaunch_of"] = relaunched.clone();
             }
             if let Some(binding) = charter.get("provider_plugin").filter(|v| !v.is_null()) {
                 job["plugin_binding"] = binding.clone();

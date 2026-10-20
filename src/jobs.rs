@@ -133,6 +133,11 @@ struct Job {
     /// admit the resume's own work through that crew's lineage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_of: Option<String>,
+    /// The crew whose route throttled before it did any work, making this job
+    /// the same crew started again on the next route (see `crew_relaunch`).
+    /// A relaunch is never relaunched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relaunch_of: Option<String>,
     /// Crew hosted in the terminal host: the supervisor runs in its own
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2169,6 +2174,11 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
     let resume_of = matches!(store.caller(), Caller::Operator)
         .then(|| args.get("_resume_of").and_then(Value::as_str))
         .flatten();
+    // A relaunch names the crew whose route throttled before it did any work;
+    // again only the runtime's own launch may say so.
+    let relaunch_of = matches!(store.caller(), Caller::Operator)
+        .then(|| args.get("_relaunch_of").and_then(Value::as_str))
+        .flatten();
     let expected_workspace = args
         .get("workspace_lease_id")
         .map(|v| v.as_str().context("workspace_lease_id must be a string"))
@@ -2294,6 +2304,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .and_then(Value::as_str)
             .map(str::to_owned),
         resume_of: resume_of.map(str::to_owned),
+        relaunch_of: relaunch_of.map(str::to_owned),
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
         spawned_ms: None,
         model_route: args
@@ -3823,6 +3834,29 @@ pub(crate) fn fail_parked(store: &Store, crew: &str, reason: &str) -> Result<()>
             j.finished_ms = Some(Store::now_ms());
             j.reason = Some(reason.to_owned());
         }
+    })?;
+    Ok(())
+}
+
+/// A failed crew the runtime relaunched on another route: the record says
+/// where its work went, so `job.status` and the fleet views show the
+/// continuation. No outcome is written; the job already failed and its
+/// outcome was mailed, and the relaunch notice names the new job. Idempotent,
+/// so a pass that sees the failed job again appends nothing.
+pub(crate) fn note_relaunched(store: &Store, crew: &str, relaunched: &str) -> Result<()> {
+    let note = format!("relaunched as {relaunched} after its route throttled");
+    alter(store, crew, |j| {
+        if j.status != "failed"
+            || j.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(&note))
+        {
+            return;
+        }
+        j.reason = Some(match j.reason.take() {
+            Some(reason) if !reason.is_empty() => format!("{reason}; {note}"),
+            _ => note,
+        });
     })?;
     Ok(())
 }

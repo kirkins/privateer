@@ -1214,6 +1214,9 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
     let routes = crate::routes::scan(store)?;
+    // After the scan, so the throttled route is already held and the relaunch
+    // takes the next one in its list.
+    let relaunched = crate::crew_relaunch::throttled(store)?;
     let work = crate::scheduling::tick(store)?;
     // Before the wakes, so a headless ship's wake takes the notice this tick.
     let backlog = crate::scheduling::backlog_tick(store)?;
@@ -1238,7 +1241,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
     )
 }
 
