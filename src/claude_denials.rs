@@ -145,8 +145,7 @@ fn denials(records: &[Value], since_ms: i64) -> Vec<Value> {
         for block in blocks {
             match block["type"].as_str() {
                 Some("tool_use") => {
-                    if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str())
-                    {
+                    if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
                         uses.insert(id, (name, &block["input"]));
                     }
                 }
@@ -244,7 +243,9 @@ pub(crate) mod tests {
         // Nor is a projects folder that is itself a link.
         let linked = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(
-            outside.path().join(crate::host::claude_project_name(folder)),
+            outside
+                .path()
+                .join(crate::host::claude_project_name(folder)),
             linked.path().join(crate::host::claude_project_name(folder)),
         )
         .unwrap();

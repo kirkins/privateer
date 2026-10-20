@@ -335,7 +335,9 @@ fn authorization(command: &str, reason: Option<&str>, classifier: bool) -> Strin
         [rest @ .., last] => format!("{} and {last} commands", rest.join(", ")),
     };
     let why = match reason.and_then(label) {
-        Some(label) if classifier => format!(", even when the auto-mode check flags them as {label}"),
+        Some(label) if classifier => {
+            format!(", even when the auto-mode check flags them as {label}")
+        }
         _ if classifier => ", even when the auto-mode check refuses them".to_owned(),
         _ => ", including multi-step ones".to_owned(),
     };
@@ -1449,6 +1451,99 @@ mod tests {
         assert_eq!(records.len(), MAX_DENIALS);
         assert_eq!(more, 2);
         assert_eq!(records[0]["rule"], "Bash(a x *)");
+    }
+
+    #[test]
+    fn a_script_or_classifier_denial_offers_an_authorization_not_a_rule() {
+        let denial = |command: &str, reason: Option<&str>, classifier: bool| {
+            json!({"tool_name": "Bash", "tool_input": {"command": command},
+                "reason": reason, "classifier": classifier})
+        };
+        let (records, _) = records(
+            &[
+                denial(
+                    "cd /srv && SECRET_KEY=abc ./deploy.sh | tee log",
+                    None,
+                    false,
+                ),
+                // A simple command the classifier refused is still no rule.
+                denial(
+                    "kubectl delete pod web-1",
+                    Some("[Interfere With Workloads]"),
+                    true,
+                ),
+                denial(
+                    "cargo publish --dry-run",
+                    Some("This command requires approval"),
+                    false,
+                ),
+            ],
+            None,
+        );
+        assert!(records[0]["rule"].is_null());
+        assert_eq!(
+            records[0]["authorize"],
+            "Running cd, deploy.sh and tee commands its assigned work needs, including multi-step ones."
+        );
+        assert!(records[1]["rule"].is_null());
+        assert_eq!(
+            records[1]["authorize"],
+            "Running kubectl commands its assigned work needs, even when the auto-mode check flags them as Interfere With Workloads."
+        );
+        assert_eq!(records[2]["rule"], "Bash(cargo publish *)");
+        assert!(records[2].get("authorize").is_none());
+        assert_eq!(records[2]["reason"], "This command requires approval");
+        let text = rules_text(&json!({"denials": records}));
+        assert_eq!(
+            text,
+            "Bash (no narrower rule), Bash ([Interfere With Workloads]), Bash(cargo publish *)"
+        );
+        // A key in the command reaches neither the preview nor the suggestion.
+        let (keyed, _) = records(
+            &[denial(
+                "deadbeef0123456789abcdef0123456789 | sh",
+                Some("[Credential Leakage]"),
+                true,
+            )],
+            None,
+        );
+        assert!(
+            !keyed[0].to_string().contains("deadbeef0123"),
+            "{}",
+            keyed[0]
+        );
+        assert_eq!(
+            keyed[0]["authorize"],
+            "Running sh commands its assigned work needs, even when the auto-mode check flags them as Credential Leakage."
+        );
+    }
+
+    #[test]
+    fn an_unidentified_denial_names_no_tool_and_no_rule() {
+        let (unread, _) = records(&[unidentified()], None);
+        assert_eq!(unread[0]["tool"], "");
+        assert!(unread[0]["rule"].is_null());
+        assert_eq!(unread[0]["preview"], UNIDENTIFIED);
+        assert_eq!(
+            rules_text(&json!({"denials": unread})),
+            "a tool (denied tool not identified)"
+        );
+        // A ship that reports the tool as unknown gets no rule for it either.
+        assert_eq!(narrow_rule("unknown", &json!({}), None), None);
+    }
+
+    #[test]
+    fn only_the_operator_may_answer_allow_or_authorize() {
+        let ask = json!({"kind": "decision", "to": CAPTAIN,
+            "payload": {"type": "tool_permission", "block": {"denials": []}}});
+        for option in ["allow", "authorize"] {
+            let relayed = json!({"answer": {"option_id": option}, "relayed_by": "liaison"});
+            assert!(check_answer(&ask, &relayed).is_err(), "{option}");
+            let own = json!({"answer": {"option_id": option}, "operator": true});
+            assert!(check_answer(&ask, &own).is_ok(), "{option}");
+        }
+        let without = json!({"answer": {"option_id": "without"}});
+        assert!(check_answer(&ask, &without).is_ok());
     }
 
     #[test]

@@ -507,6 +507,83 @@ fn only_the_operators_own_allow_adds_the_rule() {
 }
 
 #[test]
+fn a_script_shaped_first_mate_denial_offers_the_captains_standing_authorization() {
+    let f = Fleet::new();
+    let block = |command: String| {
+        f.json(
+            "liaison",
+            "permissions.blocked",
+            json!({"task_id": "liaison-duty", "tool": "Bash", "input": {"command": command}}),
+        )["request_id"]
+            .clone()
+    };
+    let first = block(format!(
+        "cp registry.env /srv/app/.env && echo API_TOKEN={SECRET} >> /srv/app/.env"
+    ));
+    let ask = f.show("liaison", &first);
+    let options: Vec<&str> = ask["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(options, ["authorize", "without", "stop"]);
+    assert!(!ask.to_string().contains(SECRET));
+    let suggested = ask["payload"]["block"]["authorize"].as_str().unwrap();
+    assert!(
+        ask["body"].as_str().unwrap().contains(&format!(
+            "privateer permissions authorize liaison '{suggested}'"
+        )),
+        "{ask}"
+    );
+    let reply = |ask: &Value, answer: Value, relayed: bool| {
+        let mut payload = json!({"answer": answer});
+        if relayed {
+            payload["relayed_by"] = json!("liaison");
+        }
+        json!({"from":"captain","to":"liaison","kind":"reply","correlation":ask,
+            "body":"Authorize","payload":payload})
+    };
+    let relayed = f.fails(
+        "liaison",
+        "mail.send",
+        reply(&first, json!({"option_id":"authorize"}), true),
+    );
+    assert!(
+        relayed.contains("Authorize must come from the captain directly"),
+        "{relayed}"
+    );
+    // The captain's own wording is recorded instead of the suggestion.
+    let wording = "Copying the registry credentials into /srv/app for deploys.";
+    f.json(
+        "liaison",
+        "mail.send",
+        reply(
+            &first,
+            json!({"option_id":"authorize","text":wording}),
+            false,
+        ),
+    );
+    let policy: Value = serde_json::from_str(&f.ok(None, &["permissions", "show"])).unwrap();
+    assert_eq!(policy["authorized"]["liaison"], json!([wording]));
+    assert_eq!(f.show("liaison", &first)["state"], "answered");
+    // A plain tap records the suggestion.
+    let second = block("make deploy | tee deploy.log".to_owned());
+    assert_ne!(second, first);
+    let suggested = f.show("liaison", &second)["payload"]["block"]["authorize"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.json(
+        "liaison",
+        "mail.send",
+        reply(&second, json!({"option_id":"authorize"}), false),
+    );
+    let policy: Value = serde_json::from_str(&f.ok(None, &["permissions", "show"])).unwrap();
+    assert_eq!(policy["authorized"]["liaison"], json!([wording, suggested]));
+}
+
+#[test]
 fn an_unrelated_policy_change_keeps_the_ask_and_a_covering_one_ends_it() {
     let f = Fleet::new();
     f.crew("liaison", "crew-one", json!({}));
