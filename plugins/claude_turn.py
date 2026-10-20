@@ -360,6 +360,8 @@ def run(argv, control):
             # reason: never block the turn on a stream nobody will close.
             stop_process(child)
             reader.join(timeout=STOP_GRACE_SECS)
+            with lock:
+                reason = reason or state["reason"]
             if reader.is_alive() or not (turn.complete() and not turn.denied):
                 reason = reason or "stream-eof"
         try:

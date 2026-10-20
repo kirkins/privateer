@@ -11,6 +11,9 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "plugins"))
+from claude_turn import STOP_GRACE_SECS
+
 IDENTITY = "4fa4f4bc-5b2d-4553-8ae1-eb09e501ea63"
 OTHER = "4fa4f4bc-5b2d-4553-8ae1-eb09e501ea64"
 FAKE = r'''#!/usr/bin/env python3
@@ -22,10 +25,18 @@ if pid_file:
 grandchild_file = os.environ.get('CLAUDE_TEST_GRANDCHILD_PID')
 if grandchild_file:
     trap = os.environ.get('CLAUDE_TEST_GRANDCHILD_TRAP_SIGTERM')
-    cmd = ("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
-           if trap else "import time; time.sleep(60)")
+    cmd = ("import os,pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(os.environ['CLAUDE_TEST_GRANDCHILD_PID']).write_text(str(os.getpid())); time.sleep(60)"
+           if trap else
+           "import os,pathlib,time; pathlib.Path(os.environ['CLAUDE_TEST_GRANDCHILD_PID']).write_text(str(os.getpid())); time.sleep(60)")
     proc = subprocess.Popen([sys.executable, "-c", cmd])
-    Path(grandchild_file).write_text(str(proc.pid))
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            if Path(grandchild_file).read_text().strip():
+                break
+        except OSError:
+            pass
+        time.sleep(0.01)
 mode = os.environ.get('CLAUDE_TEST_MODE')
 if mode == 'sleep':
     time.sleep(60)
@@ -206,6 +217,7 @@ class ClaudeTurn(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertEqual(summary["type"], "turn.completed")
+        self.assertGreaterEqual(elapsed, STOP_GRACE_SECS)
         self.assertLess(elapsed, 20.0)
         self.assertTrue(grandchild_pid_file.exists())
         with self.assertRaises(ProcessLookupError):
@@ -382,10 +394,22 @@ class ClaudeTurn(unittest.TestCase):
 
     def test_truncated_and_malformed_streams_fail(self):
         good = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, RESULT])
-        for raw, reason in ((good[:-1], "truncated-stream"), (good+b"not-json\n", "invalid-json")):
-            run, summary = self.run_stream([], raw=raw)
-            self.assertEqual(run.returncode, 2)
-            self.assertEqual(summary["reason"], reason)
+        for raw, reason in ((good[:-1], "truncated-stream"),
+                            (good + b'{"extra":"truncated', "truncated-stream"),
+                            (good+b"not-json\n", "invalid-json")):
+            with self.subTest(reason=reason):
+                run, summary = self.run_stream([], raw=raw)
+                self.assertEqual(run.returncode, 2)
+                self.assertEqual(summary["reason"], reason)
+
+    def test_a_truncated_line_after_a_complete_result_fails(self):
+        # Claude writes a full valid result then terminates or gets killed on a
+        # truncated line: the turn must not settle as completed despite the result.
+        good = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, RESULT])
+        run, summary = self.run_stream([], raw=good + b'{"extra":"truncated')
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(summary["type"], "native.turn.failed")
+        self.assertEqual(summary["reason"], "truncated-stream")
 
     def test_a_reader_reason_survives_killpg_refusing_an_exited_group(self):
         # The reader names the fault before the child is reaped; macOS then
@@ -393,6 +417,7 @@ class ClaudeTurn(unittest.TestCase):
         good = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, RESULT])
         cases = ((dict(events=[INIT, RESULT], resume=OTHER), "resume-identity"),
                  (dict(events=[], raw=good[:-1]), "truncated-stream"),
+                 (dict(events=[], raw=good + b'{"extra":"truncated'), "truncated-stream"),
                  (dict(events=[], raw=good+b"not-json\n"), "invalid-json"))
         for kwargs, reason in cases:
             with self.subTest(reason=reason):
