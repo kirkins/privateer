@@ -102,8 +102,6 @@ def build(harness, request):
     reviewer = role == "reviewer"
     if reviewer and harness not in ("claude", "pi", "pi-signed", "codex"):
         raise ValueError("reviewer role supports only claude, pi and codex")
-    if reviewer and (options.get("resume") is not None or request.get("options", {}).get("resume") is not None):
-        raise ValueError("review requires a fresh session")
     tool_policy = policy(request["context"].get("tool_permissions"))
     options = options_for(harness, options, tool_policy, role)
     mode = selector(options, "mode", ["headless", "interactive"]) or "headless"
@@ -195,6 +193,8 @@ def build(harness, request):
                         argv += ["--add-dir", str(extra)]
         if effort:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+        if reviewer:
+            argv += ["-c", 'web_search="disabled"', "--ignore-user-config"]
         if boolean(options, "ephemeral"):
             if resume or not headless:
                 raise ValueError("ephemeral requires a fresh headless run")
@@ -272,6 +272,8 @@ def build(harness, request):
         argv += ["--chrome" if boolean(options, "chrome") and not reviewer else "--no-chrome"]
         if headless:
             argv += ["--print", "--verbose", "--output-format", "stream-json"]
+        if reviewer:
+            argv += ["--setting-sources", "user", "--strict-mcp-config", "--safe-mode"]
         permissions = selector(options, "permission_mode", ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"])
         if permissions:
             argv += ["--permission-mode", permissions]
@@ -501,6 +503,8 @@ def handle(harness, request):
     repo, argv = build(harness, request)
     bundles = request["context"].get("tool_bundles")
     if bundles is not None:
+        if request["context"].get("role") == "reviewer":
+            raise ValueError("reviewer does not support tool bundles")
         from bundles import validate_plan
         validate_plan(bundles)
         if harness not in ("pi", "claude") or ("claude_version" in bundles) != (harness == "claude"):

@@ -287,6 +287,12 @@ class Permissions(unittest.TestCase):
         self.assertIn("--no-chrome", argv)
         self.assertNotIn("--chrome", argv)
 
+        # Setting sources, MCP config, and safe mode
+        self.assertIn("--setting-sources", argv)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "user")
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--safe-mode", argv)
+
         # No settings or add-dir for operational home
         self.assertNotIn("--settings", argv)
         self.assertNotIn("--add-dir", argv)
@@ -299,6 +305,10 @@ class Permissions(unittest.TestCase):
         self.assertIn("dontAsk", argv_yolo)
         self.assertNotIn("bypassPermissions", argv_yolo)
         self.assertNotIn("Bash(something *)", argv_yolo)
+        self.assertIn("--setting-sources", argv_yolo)
+        self.assertEqual(argv_yolo[argv_yolo.index("--setting-sources") + 1], "user")
+        self.assertIn("--strict-mcp-config", argv_yolo)
+        self.assertIn("--safe-mode", argv_yolo)
         allowed_yolo = argv_yolo[argv_yolo.index("--allowedTools") + 1:argv_yolo.index("--disallowedTools")]
         self.assertEqual(allowed_yolo, ["Read", "Grep", "Glob"])
 
@@ -347,6 +357,11 @@ class Permissions(unittest.TestCase):
         self.assertIn("--sandbox", argv)
         self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
 
+        # Disable web search and ignore user config
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn("-c", argv)
+        self.assertIn('web_search="disabled"', argv)
+
         # No bypass, no add-dir, no control CLI, no resume
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertNotIn("--add-dir", argv)
@@ -360,9 +375,35 @@ class Permissions(unittest.TestCase):
         _, argv_yolo = build("codex", req_yolo)
         self.assertIn("--sandbox", argv_yolo)
         self.assertEqual(argv_yolo[argv_yolo.index("--sandbox") + 1], "read-only")
+        self.assertIn("--ignore-user-config", argv_yolo)
+        self.assertIn("-c", argv_yolo)
+        self.assertIn('web_search="disabled"', argv_yolo)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv_yolo)
         self.assertNotIn("--add-dir", argv_yolo)
         self.assertNotIn("/bin/privateer", argv_yolo)
+
+    def test_reviewer_refuses_tool_bundles_for_claude_and_pi(self):
+        for harness in ["claude", "pi"]:
+            with self.subTest(harness=harness):
+                req = self.request()
+                req["context"]["role"] = "reviewer"
+                req["context"]["tool_bundles"] = {"skills": [], "mcp_servers": []}
+                with self.assertRaises(ValueError) as ctx:
+                    handle(harness, req)
+                self.assertEqual(str(ctx.exception), "reviewer does not support tool bundles")
+
+    def test_claude_reviewer_route_options_bypass_and_chrome_yield_dontask_and_no_chrome(self):
+        for policy_mode in ["standard", "yolo"]:
+            with self.subTest(policy_mode=policy_mode):
+                self.policy = {"mode": policy_mode, "claude_allow": []}
+                req = self.request(permission_mode="bypassPermissions", chrome=True)
+                req["context"]["role"] = "reviewer"
+                _, argv = build("claude", req)
+                self.assertIn("--permission-mode", argv)
+                self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+                self.assertNotIn("bypassPermissions", argv)
+                self.assertIn("--no-chrome", argv)
+                self.assertNotIn("--chrome", argv)
 
 
 if __name__=="__main__":unittest.main()

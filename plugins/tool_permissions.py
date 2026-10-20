@@ -41,6 +41,7 @@ def options_for(harness, options, value, role=None):
         # A review reads code and writes nothing, whatever the fleet's mode.
         if harness == "claude":
             options["permission_mode"] = "dontAsk"
+            options["chrome"] = False
         return options
     if harness == "claude":
         options.setdefault("permission_mode", "acceptEdits")
