@@ -269,8 +269,14 @@ pub(crate) fn preview(tool: &str, input: &Value) -> String {
         "WebFetch" => input["url"].as_str(),
         _ => None,
     };
+    // A heredoc's or here-string's contents are what it feeds a program,
+    // often a password: the preview ends where it starts.
+    let raw = raw.map(|raw| match (tool, raw.find("<<")) {
+        ("Bash", Some(at)) => format!("{}<<…", &raw[..at]),
+        _ => raw.to_owned(),
+    });
     let masked = match raw {
-        Some(raw) => mask(&flat(raw)),
+        Some(raw) => mask(&flat(&raw)),
         None => flat(&mask_json(input).to_string()),
     };
     if masked.chars().count() <= PREVIEW_CHARS {
@@ -289,11 +295,54 @@ pub(crate) fn unidentified() -> Value {
     json!({"tool_name": "", "tool_input": {}, "unidentified": true})
 }
 
+/// The length of a shell word's redirection operator, such as the `2>&` of
+/// `2>&1`, the `>` of `>file` or the `<` of `<file`. None when the word is
+/// no redirection.
+fn redirection(word: &str) -> Option<usize> {
+    let digits = word.len() - word.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = &word[digits..];
+    if !(rest.starts_with(['<', '>']) || rest.starts_with("&>")) {
+        return None;
+    }
+    let mut operator = rest.len() - rest.trim_start_matches(['<', '>', '&']).len();
+    // `>|` clobbers: its bar is the operator's, not a pipe.
+    if rest[..operator].ends_with('>') && rest[operator..].starts_with('|') {
+        operator += 1;
+    }
+    Some(digits + operator)
+}
+
+/// What of a redirection's target still separates commands, such as the `;`
+/// of `>/dev/null;`.
+fn separator_tail(target: &str) -> &str {
+    target
+        .find(|c: char| ";&|()`".contains(c))
+        .map_or("", |at| &target[at..])
+}
+
 /// The programs a shell command runs, at most four: the first word of each
-/// part, without assignments, paths or anything that looks like a key.
+/// part, without assignments, paths or anything that looks like a key. Only
+/// the first line is read, up to any heredoc: what follows is a program's
+/// input, not a program.
 fn programs(command: &str) -> Vec<String> {
+    let line = command.split(['\n', '\r']).next().unwrap_or_default();
+    let line = line.split("<<").next().unwrap_or_default();
+    let mut words = vec![];
+    let mut target = false;
+    for word in line.split_whitespace() {
+        if std::mem::take(&mut target) {
+            words.push(separator_tail(word));
+            continue;
+        }
+        match redirection(word) {
+            Some(operator) if operator == word.len() => target = true,
+            Some(operator) => words.push(separator_tail(&word[operator..])),
+            None => words.push(word),
+        }
+    }
+    let line = words.join(" ");
     let mut found: Vec<String> = vec![];
-    for part in command.split(|c: char| ";&|\n()`".contains(c)) {
+    for part in line.split(|c: char| ";&|()`".contains(c)) {
         let Some(word) = part.split_whitespace().find(|w| !w.contains('=')) else {
             continue;
         };
@@ -1579,6 +1628,32 @@ mod tests {
             keyed[0]["authorize"],
             "Running sh commands its assigned work needs, even when the auto-mode check flags them as Credential Leakage."
         );
+    }
+
+    #[test]
+    fn a_heredoc_or_redirection_never_reaches_the_suggestion_or_preview() {
+        let (found, _) = records(
+            &[json!({"tool_name": "Bash", "classifier": true,
+                "reason": "[Credential Materialization]",
+                "tool_input": {"command": "docker login --password-stdin <<EOF\nS3cr3tPass\nEOF"}})],
+            None,
+        );
+        assert!(!found[0].to_string().contains("S3cr3tPass"), "{}", found[0]);
+        assert_eq!(found[0]["preview"], "docker login --password-stdin <<…");
+        assert_eq!(
+            found[0]["authorize"],
+            "Running docker commands its assigned work needs, even when the auto-mode check flags them as Credential Materialization."
+        );
+        assert_eq!(
+            programs("make deploy >deploy.log 2>&1 && curl -s x > /tmp/out; wc -l < /tmp/out"),
+            ["make", "curl", "wc"]
+        );
+        assert_eq!(
+            programs("make 2>&1|tee log; ls >|out&&pwd"),
+            ["make", "tee", "ls", "pwd"]
+        );
+        assert_eq!(programs("cat <<<\"$TOKEN\" | login"), ["cat"]);
+        assert_eq!(programs("echo one\nsecret-program two"), ["echo"]);
     }
 
     #[test]
