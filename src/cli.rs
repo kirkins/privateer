@@ -32,6 +32,7 @@ pub const VERBS: &[&str] = &[
     "door",
     "machine",
     "grant",
+    "capability",
     "permissions",
     "routes",
     "watch",

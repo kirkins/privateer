@@ -39,6 +39,9 @@ const MAX_ARG: usize = 512;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every probe of one check, together; well inside a move's slow call.
 const CHECK_BUDGET: Duration = Duration::from_secs(30);
+/// Probes refreshed for a directory exchange, together: a dispatcher pass
+/// gives the whole exchange ten seconds, and the cache is only for planning.
+const EXCHANGE_BUDGET: Duration = Duration::from_secs(2);
 /// Probes run at once.
 const PARALLEL: usize = 16;
 /// How long a detected offer is trusted for planning.
@@ -402,11 +405,12 @@ fn declarations(conn: &Connection) -> Result<Vec<(String, String)>> {
 
 /// Whether this machine offers each named term, and why not. `live` probes
 /// every detected term now; otherwise a detection younger than ten minutes
-/// is used. Probes run in parallel within one budget.
+/// is used. Probes run in parallel within `budget`.
 fn evaluate(
     conn: &Connection,
     names: &[String],
     live: bool,
+    budget: Duration,
 ) -> Result<Vec<(String, std::result::Result<&'static str, String>)>> {
     let vocabulary = vocabulary(conn)?;
     let declared = declarations(conn)?;
@@ -450,7 +454,7 @@ fn evaluate(
     }
     if !to_probe.is_empty() {
         let path = crate::service::login_path();
-        let budget = Instant::now() + CHECK_BUDGET;
+        let budget = Instant::now() + budget;
         for batch in to_probe.chunks(PARALLEL) {
             let results: Vec<(usize, std::result::Result<(), String>)> =
                 std::thread::scope(|scope| {
@@ -534,7 +538,7 @@ pub(crate) fn names(value: &Value) -> Result<Vec<String>> {
 /// [{need, why}]}`.
 pub(crate) fn check(conn: &Connection, requires: &[String]) -> Result<Value> {
     let (mut met, mut unmet) = (vec![], vec![]);
-    for (name, verdict) in evaluate(conn, requires, true)? {
+    for (name, verdict) in evaluate(conn, requires, true, CHECK_BUDGET)? {
         match verdict {
             Ok(_) => met.push(json!(name)),
             Err(why) => unmet.push(json!({"need": name, "why": why})),
@@ -547,7 +551,7 @@ pub(crate) fn check(conn: &Connection, requires: &[String]) -> Result<Value> {
 /// fresh enough. `None` when it cannot be read, so the field is omitted.
 pub(crate) fn offered(conn: &Connection) -> Option<Value> {
     let names: Vec<String> = vocabulary(conn).ok()?.into_iter().map(|t| t.name).collect();
-    let verdicts = evaluate(conn, &names, false).ok()?;
+    let verdicts = evaluate(conn, &names, false, EXCHANGE_BUDGET).ok()?;
     Some(json!(
         verdicts
             .into_iter()
@@ -611,7 +615,7 @@ pub(crate) fn machine_offers(args: &Value) -> Result<Value> {
     }
     tx.commit()?;
     let names: Vec<String> = vocabulary(&conn)?.into_iter().map(|t| t.name).collect();
-    let offers: Vec<Value> = evaluate(&conn, &names, true)?
+    let offers: Vec<Value> = evaluate(&conn, &names, true, CHECK_BUDGET)?
         .into_iter()
         .map(|(name, verdict)| match verdict {
             Ok(how) => json!({"name": name, "offered": true, "how": how}),

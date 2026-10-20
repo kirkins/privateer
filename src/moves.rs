@@ -1211,7 +1211,18 @@ fn sides(record: &Value, to: &str) -> Result<(Side, Side, String, String)> {
 /// Ask the ship's machine what the move carries and the other machine
 /// whether it can host it, stopping nothing.
 fn preflight(source: &Side, target: &Side, ship: &str, from: &str, to: &str) -> Result<Value> {
-    let inspected = source.call("move.inspect", json!({"ship": ship}), None)?;
+    let inspected = match source.call("move.inspect", json!({"ship": ship}), None) {
+        Ok(inspected) => inspected,
+        // A ship's machine too old to say declares nothing, and the move
+        // runs as it did before: checked when it begins.
+        Err(error) if format!("{error:#}").contains("unknown move command move.inspect") => {
+            return Ok(json!({"ship": ship, "from": from, "to": to, "requires": [],
+                "pinned": null, "met": [], "unmet": [], "problems": [], "not_idle": [],
+                "folder_bytes": null, "project_count": null, "free_disk_bytes": null,
+                "unchecked": format!("{from} cannot be asked before the move")}));
+        }
+        Err(error) => return Err(error),
+    };
     let requires = inspected["requires"].clone();
     let checked = match target.call(
         "move.check",

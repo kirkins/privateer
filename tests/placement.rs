@@ -681,11 +681,10 @@ fn a_check_reports_and_changes_nothing() {
         "{said}"
     );
     assert!(said.contains("0 projects"), "{said}");
-    let report = laptop.ok(
-        "liaison",
-        "ship.move",
-        json!({"name": "scout", "to": "mac", "check": true}),
-    );
+    let asked = json!({"name": "scout", "to": "mac", "check": true}).to_string();
+    let output = laptop.run("liaison", &["ship.move", "--json", &asked], Some(&ssh));
+    assert!(output.status.success(), "{}", text(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["movable"], false, "{report}");
     assert!(report["folder_bytes"].as_u64().unwrap() > 0, "{report}");
 
