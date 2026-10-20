@@ -1,6 +1,7 @@
 mod support;
 
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
@@ -111,7 +112,11 @@ impl Fleet {
     }
     /// Launch a crew on a route, wait for it and scan what it reported.
     fn run_and_scan(&self, id: &str, route: Option<&str>) -> Value {
-        let mut start = json!({"task_id":"fix","id":id});
+        self.run_task_and_scan("fix", id, route)
+    }
+    /// The same, on another task than the fixture's root one.
+    fn run_task_and_scan(&self, task: &str, id: &str, route: Option<&str>) -> Value {
+        let mut start = json!({"task_id":task,"id":id});
         if let Some(route) = route {
             start["route"] = json!(route);
         }
@@ -1888,11 +1893,123 @@ fn a_reviewer_comes_from_the_review_list_clear_of_the_authors() {
                 "engineering",
                 "feature/not-ours",
                 0,
-                &["claude/-/claude-opus-5-5".to_owned()],
+                &[privateer::review::authors::Declaration {
+                    job_id: "crew-alias".to_owned(),
+                    route: "claude/-/claude-opus-5-5".to_owned(),
+                }],
             )
             .unwrap();
             privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
         })
         .expect("the declaration stands for the job");
     assert_eq!(chosen.choice.name, "sol");
+}
+
+#[test]
+fn a_workspace_branch_scopes_the_authors_and_a_declaration_to_their_jobs() {
+    let pi_sol = || {
+        tiered(
+            "bundled:pi",
+            json!({"model": "gpt-6.1-sol", "provider": "chatgpt-home"}),
+            "plan",
+            1,
+            &["review", "implement"],
+        )
+    };
+    let bare_alias = || {
+        tiered(
+            "bundled:claude",
+            json!({"model": "opus"}),
+            "plan",
+            2,
+            &["implement"],
+        )
+    };
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"writer": bare_alias(), "sol": pi_sol()},
+        "crew": ["writer"],
+        "review": ["sol"]
+    }));
+    // A child of the fixture's task, whose workspace branch a PR would carry,
+    // and a task outside that tree.
+    f.json(
+        None,
+        "task.create",
+        json!({"id":"child","owner":"engineering","title":"Child","parent":"fix"}),
+    );
+    f.json(
+        None,
+        "task.create",
+        json!({"id":"elsewhere","charter_id":"engineering","owner":"engineering",
+               "title":"Elsewhere"}),
+    );
+    let crew = f.run_task_and_scan("child", "crew-child", Some("writer"));
+    assert_eq!(crew["id"], "crew-child", "{crew}");
+    f.run_task_and_scan("elsewhere", "crew-elsewhere", Some("writer"));
+
+    let (authors, chosen) = f.in_process(|store| {
+        // The branch the child task's workspace pushes:
+        // `privateer/<home_hash>/<hash(task)>/<generation>`.
+        let hash = |s: &str| format!("{:x}", sha2::Sha256::digest(s.as_bytes()))[..16].to_owned();
+        let branch = format!(
+            "privateer/{}/{}/g3n3r4t10n",
+            hash(&store.home().to_string_lossy()),
+            hash("child")
+        );
+        let authors =
+            privateer::review::authors::compute(store, "engineering", &branch, 0, &[]).unwrap();
+        // The task tree, not the whole home, is the scope: only the job on
+        // the child is in it, and its bare alias leaves it unknown.
+        assert_eq!(authors.unknown_jobs, vec!["crew-child".to_owned()]);
+        assert!(!authors.crew_jobs.contains_key("claude-opus-5-5"));
+        // A declaration naming a different model than the job is refused,
+        // naming the job: this one names another harness entirely.
+        let refused = privateer::review::authors::compute(
+            store,
+            "engineering",
+            &branch,
+            0,
+            &[privateer::review::authors::Declaration {
+                job_id: "crew-child".to_owned(),
+                route: "pi/chatgpt-home/gpt-6.1-sol".to_owned(),
+            }],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"))
+        .unwrap_err();
+        assert!(refused.contains("crew-child"), "{refused}");
+        assert!(refused.contains("does not fit"), "{refused}");
+        // So no route slips past the gate: the choice still refuses on the
+        // unknown job until the declaration fits it.
+        let refused = privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+            .unwrap_err();
+        assert!(refused.contains("cannot choose a reviewer"), "{refused}");
+        assert!(refused.contains("crew-child"), "{refused}");
+        // The fitting declaration stands for that job alone, adds its model,
+        // and clears exactly it.
+        let authors = privateer::review::authors::compute(
+            store,
+            "engineering",
+            &branch,
+            0,
+            &[privateer::review::authors::Declaration {
+                job_id: "crew-child".to_owned(),
+                route: "claude/-/claude-opus-5-5".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert!(authors.unknown_jobs.is_empty());
+        let reviewer =
+            privateer::crew_routes::choose_reviewer(store, "engineering", &authors).unwrap();
+        (authors, reviewer)
+    });
+    assert_eq!(
+        authors.crew_jobs["claude-opus-5-5"],
+        vec!["crew-child".to_owned()]
+    );
+    assert_eq!(chosen.choice.name, "sol");
+    assert_eq!(chosen.overlap, None);
 }

@@ -17,10 +17,13 @@
 //! `first_mate` list, its wakes and its ordinary errands are
 //! `first_mate_models`: a reviewer whose model is only there is allowed,
 //! with the overlap recorded. A crew job whose model cannot be named (no
-//! route at all, or a bare alias) leaves the set unknown: the review
-//! refuses, naming the job, until the ship declares that job's route.
+//! route at all, or a bare alias) leaves the set unknown: the review refuses,
+//! naming the job, until the ship declares that job's route. A declaration is
+//! keyed to one job: it stands only for the job it names, must fit it (its
+//! harness the job's, its model one the job's alias names), and clears no job
+//! it does not name.
 use crate::store::Store;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Authors {
     /// Each model a crew job in scope ran on, with the jobs that ran on it.
-    /// Declared author routes land here too, naming the declared route.
+    /// A declaration lands here too, naming the job it stands for.
     pub crew_jobs: BTreeMap<String, Vec<String>>,
     /// The models the ship's first mate may have written the code on: its
     /// profile, its `first_mate` list, its wakes and its ordinary errands.
@@ -41,36 +44,39 @@ pub struct Authors {
     pub unknown_jobs: Vec<String>,
 }
 
+/// An author route the ship declares for one crew job whose own route cannot
+/// be read: the job it stands for, by id, and the route that job ran on. One
+/// declaration stands for its job alone, so it can never clear another job
+/// it does not name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    /// The crew job the declaration stands for.
+    pub job_id: String,
+    /// The full route that job ran on: `harness/provider/model`.
+    pub route: String,
+}
+
 /// The author set of a PR. `branch` is its head branch as the forge reports
 /// it; `merge_base_ms` is the time of its merge-base commit on the protected
 /// branch, the fallback scope when the branch is not one of ours. `declared`
-/// holds author routes the ship declares (`harness/provider/model`), which
-/// can only add, and stand for the jobs whose routes cannot be read.
+/// holds the author routes the ship declares for single jobs whose own routes
+/// cannot be read: each must fit the job it names, and can only add.
 pub fn compute(
     store: &Store,
     ship: &str,
     branch: &str,
     merge_base_ms: i64,
-    declared: &[String],
+    declared: &[Declaration],
 ) -> Result<Authors> {
     let mut authors = Authors::default();
-    for route in declared {
-        let Some(model) = crate::routes::model_key(route) else {
-            bail!(
-                "declared author route {route} names no known model; pass its full \
-                 harness/provider/model"
-            );
-        };
-        authors
-            .crew_jobs
-            .entry(model)
-            .or_default()
-            .push(format!("declared author route {route}"));
-    }
     let jobs = match task_of_branch(store, branch)? {
         Some(task) => jobs_of_tree(store, &task)?,
         None => jobs_since(store, merge_base_ms)?,
     };
+    // The crew jobs whose model cannot be named, each with the route it ran
+    // on (None when no route could be read at all), so each declaration can
+    // be checked against the one job it names.
+    let mut unknown: BTreeMap<String, Option<String>> = BTreeMap::new();
     for job in jobs {
         let Some(id) = job["id"].as_str().map(str::to_owned) else {
             continue;
@@ -93,14 +99,73 @@ pub fn compute(
             (Some(model), false) => {
                 authors.crew_jobs.entry(model).or_default().push(id);
             }
-            (None, false) => authors.unknown_jobs.push(id),
+            (None, false) => {
+                unknown.insert(id, route);
+            }
         }
     }
-    if !declared.is_empty() {
-        // The ship's declaration stands for the jobs whose routes it cannot
-        // read, so they no longer refuse the review.
-        authors.unknown_jobs.clear();
+    for declaration in declared {
+        let Some(model) = crate::routes::model_key(&declaration.route) else {
+            bail!(
+                "declared author route {} for job {} names no known model; pass its \
+                 full harness/provider/model",
+                declaration.route,
+                declaration.job_id
+            );
+        };
+        // One declaration stands for the job it names and nothing else, so it
+        // must name a crew job in scope whose model cannot be named: a
+        // declaration for any other job never clears this one.
+        let Some(job_route) = unknown.remove(&declaration.job_id) else {
+            bail!(
+                "declared author route {} does not fit job {}: no crew job in scope \
+                 with that id has a model that cannot be named",
+                declaration.route,
+                declaration.job_id
+            );
+        };
+        if let Some(job_route) = job_route {
+            // The declaration must read as the job it names: its harness the
+            // job's, and its model one the job's bare alias can stand for
+            // (alias opus inside claude-opus-5-5), so a route for another
+            // model, whatever its harness, never fits.
+            let job_harness = job_route.split('/').next().unwrap_or_default();
+            ensure!(
+                declaration.route.split('/').next().unwrap_or_default() == job_harness,
+                "declared author route {} does not fit job {}: the job ran on the \
+                 {job_harness} harness",
+                declaration.route,
+                declaration.job_id
+            );
+            let alias = crate::routes::variant_free(
+                job_route
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .split('#')
+                    .next()
+                    .unwrap_or_default(),
+            )
+            .to_ascii_lowercase();
+            if !alias.is_empty() && alias != "-" {
+                ensure!(
+                    model.contains(&alias),
+                    "declared author route {} does not fit job {}: its model {model} does \
+                     not carry the job's alias {alias}",
+                    declaration.route,
+                    declaration.job_id
+                );
+            }
+        }
+        // The declaration can only add: the model lands in the crew class
+        // with the job it stands for named beside it.
+        authors
+            .crew_jobs
+            .entry(model)
+            .or_default()
+            .push(declaration.job_id.clone());
     }
+    authors.unknown_jobs = unknown.into_keys().collect();
     // The first mate may commit attended, leaving no job at all: its profile
     // route and every route on its first_mate list always count. A home with
     // no ship record or routes file names none of them.
@@ -196,11 +261,17 @@ fn jobs_of_tree(store: &Store, task: &str) -> Result<Vec<Value>> {
 }
 
 /// Every agent job the ship ran at or after a time, oldest first: the
-/// fallback scope when the head branch is not one of ours.
+/// fallback scope when the head branch is not one of ours. A job started
+/// earlier that was still running then counts too (a job still running has
+/// no finish recorded), so a rebase that moves the merge-base forward cannot
+/// drop the crews that wrote the code before it. How branches that are not
+/// ours should count crews beyond that is a captain decision.
 fn jobs_since(store: &Store, since_ms: i64) -> Result<Vec<Value>> {
     let mut statement = store.connection().prepare(
         "SELECT record FROM jobs WHERE json_extract(record,'$.action')='spawn' \
-         AND json_extract(record,'$.created_ms') >= ?1 \
+         AND (json_extract(record,'$.created_ms') >= ?1 \
+              OR json_extract(record,'$.finished_ms') >= ?1 \
+              OR json_extract(record,'$.finished_ms') IS NULL) \
          ORDER BY json_extract(record,'$.created_ms')",
     )?;
     let jobs = statement.query_map([since_ms], |r| r.get::<_, String>(0))?;
@@ -262,6 +333,7 @@ mod tests {
         created_ms: i64,
         route: Option<&str>,
         command: Value,
+        finished_ms: Option<i64>,
     ) {
         store
             .connection()
@@ -270,7 +342,8 @@ mod tests {
                 rusqlite::params![
                     id,
                     json!({"id": id, "task_id": task_id, "action": "spawn",
-                        "created_ms": created_ms, "model_route": route, "command": command})
+                        "created_ms": created_ms, "finished_ms": finished_ms,
+                        "model_route": route, "command": command})
                     .to_string()
                 ],
             )
@@ -286,7 +359,7 @@ mod tests {
                 rusqlite::params![id, format!("task:{task_id}"), task_id],
             )
             .unwrap();
-        job(store, id, task_id, 950, Some(route), json!([]));
+        job(store, id, task_id, 950, Some(route), json!([]), None);
     }
 
     fn wake(store: &Store, id: &str, task_id: &str, route: &str) {
@@ -298,7 +371,7 @@ mod tests {
                 rusqlite::params![id, format!("task:{task_id}")],
             )
             .unwrap();
-        job(store, id, task_id, 950, Some(route), json!([]));
+        job(store, id, task_id, 950, Some(route), json!([]), None);
     }
 
     #[test]
@@ -345,6 +418,7 @@ mod tests {
             1000,
             Some("claude/-/claude-opus-5-5"),
             json!([]),
+            None,
         );
         job(
             &store,
@@ -353,6 +427,7 @@ mod tests {
             2000,
             Some("pi/chatgpt-home/gpt-6.1-sol"),
             json!([]),
+            None,
         );
         job(
             &store,
@@ -368,6 +443,7 @@ mod tests {
                 "--model",
                 "gpt-6-luna"
             ]),
+            None,
         );
         job(
             &store,
@@ -376,6 +452,7 @@ mod tests {
             3000,
             Some("codex/-/gpt-6-luna"),
             json!([]),
+            None,
         );
         let authors = compute(&store, "ship", &branch("child"), 0, &[]).unwrap();
         assert_eq!(
@@ -391,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn jobs_land_in_their_two_classes_and_unknown_crew_jobs_need_a_declaration() {
+    fn jobs_land_in_their_two_classes_and_declarations_fit_their_jobs() {
         let (_temp, store) = home();
         task(&store, "fix", None);
         job(
@@ -401,6 +478,7 @@ mod tests {
             1000,
             Some("claude/-/claude-opus-5-5"),
             json!([]),
+            Some(1400),
         );
         // An errand and a wake are the first mate's, whatever their model.
         errand(
@@ -410,8 +488,12 @@ mod tests {
             "pi/opencode-go/deepseek-v4.1-flash",
         );
         wake(&store, "wake-1", "fix", "pi/chatgpt-home/gpt-6.1-sol");
-        // A crew job whose model cannot be named (a bare alias), and one from
-        // before the merge base, which the fallback scope leaves out.
+        // A crew job whose model cannot be named (a bare alias), and, for the
+        // merge-base fallback, one that finished before the merge base (left
+        // out), one that started before it but finished after it, and one
+        // still running (no finish recorded): the last two were running at or
+        // after the merge-base time, so a rebase that moves it forward cannot
+        // drop them.
         job(
             &store,
             "crew-alias",
@@ -419,6 +501,7 @@ mod tests {
             1200,
             Some("claude/-/opus"),
             json!([]),
+            Some(1500),
         );
         job(
             &store,
@@ -427,11 +510,38 @@ mod tests {
             500,
             Some("codex/-/gpt-6-luna"),
             json!([]),
+            Some(600),
+        );
+        job(
+            &store,
+            "crew-spanning",
+            "fix",
+            700,
+            Some("codex/-/gpt-6-coda"),
+            json!([]),
+            Some(1000),
+        );
+        job(
+            &store,
+            "crew-running",
+            "fix",
+            800,
+            Some("pi/opencode-go/deepseek-v4.1-flash-free"),
+            json!([]),
+            None,
         );
         let authors = compute(&store, "ship", "feature/not-ours", 900, &[]).unwrap();
         assert_eq!(
             authors.crew_jobs,
-            BTreeMap::from([("claude-opus-5-5".to_owned(), vec!["crew-a".to_owned()])])
+            BTreeMap::from([
+                ("claude-opus-5-5".to_owned(), vec!["crew-a".to_owned()]),
+                // The free variant of a route is still its model.
+                (
+                    "deepseek-v4.1-flash".to_owned(),
+                    vec!["crew-running".to_owned()]
+                ),
+                ("gpt-6-coda".to_owned(), vec!["crew-spanning".to_owned()]),
+            ])
         );
         assert_eq!(
             authors.first_mate_models,
@@ -439,31 +549,68 @@ mod tests {
         );
         assert_eq!(authors.unknown_jobs, vec!["crew-alias".to_owned()]);
 
-        // A declaration stands for the jobs whose routes cannot be read, and
-        // can only add crew models.
+        // A declaration that names a different model than the job is refused,
+        // naming the job: another harness (a route that ran no part of it),
+        // and a model that does not carry the job's alias.
+        let declaration = |job_id: &str, route: &str| Declaration {
+            job_id: job_id.to_owned(),
+            route: route.to_owned(),
+        };
+        for route in ["pi/chatgpt-home/gpt-6.1-sol", "claude/-/gpt-6-coda"] {
+            let refused = compute(
+                &store,
+                "ship",
+                "feature/not-ours",
+                900,
+                &[declaration("crew-alias", route)],
+            )
+            .unwrap_err();
+            let text = format!("{refused:#}");
+            assert!(text.contains("crew-alias"), "{route}: {text}");
+            assert!(text.contains("does not fit"), "{route}: {text}");
+        }
+        // A declaration naming a model that cannot be named at all is refused
+        // for that instead, still naming the job.
+        let refused = compute(
+            &store,
+            "ship",
+            "feature/not-ours",
+            900,
+            &[declaration("crew-alias", "claude/-/opus")],
+        )
+        .unwrap_err();
+        let text = format!("{refused:#}");
+        assert!(text.contains("crew-alias"), "{text}");
+        assert!(text.contains("names no known model"), "{text}");
+        // So is one for a job that is not waiting on a declaration: a crew
+        // job whose model is named, and a job that is not there at all.
+        for job_id in ["crew-a", "no-such-job"] {
+            let refused = compute(
+                &store,
+                "ship",
+                "feature/not-ours",
+                900,
+                &[declaration(job_id, "claude/-/claude-opus-5-5")],
+            )
+            .unwrap_err();
+            let text = format!("{refused:#}");
+            assert!(text.contains(job_id), "{text}");
+            assert!(text.contains("does not fit"), "{text}");
+        }
+        // The fitting declaration stands for that job alone, and can only
+        // add crew models.
         let declared = compute(
             &store,
             "ship",
             "feature/not-ours",
             900,
-            &["codex/-/gpt-6-luna".to_owned()],
+            &[declaration("crew-alias", "claude/-/claude-opus-5-5")],
         )
         .unwrap();
         assert!(declared.unknown_jobs.is_empty());
         assert_eq!(
-            declared.crew_jobs["gpt-6-luna"],
-            vec!["declared author route codex/-/gpt-6-luna".to_owned()]
-        );
-        // A declaration that names no known model is refused.
-        assert!(
-            compute(
-                &store,
-                "ship",
-                "feature/not-ours",
-                900,
-                &["claude/-/opus".to_owned()]
-            )
-            .is_err()
+            declared.crew_jobs["claude-opus-5-5"],
+            vec!["crew-a".to_owned(), "crew-alias".to_owned()]
         );
     }
 }

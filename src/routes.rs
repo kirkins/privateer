@@ -302,18 +302,49 @@ pub(crate) fn route_of_argv(command: &Value) -> Option<String> {
 
 /// The model a route runs, as the review gate compares authors and
 /// reviewers: the model part of `harness/provider/model`, only its last `/`
-/// part, any `#effort` dropped, lowercased. So `pi/chatgpt-home/gpt-6.1-sol`
-/// and `codex/-/gpt-6.1-sol` both read `gpt-6.1-sol`, whatever harness or
-/// provider served them. A model of `-`, or a bare alias such as `opus`, is
-/// unknown: an alias names no version, so the runtime cannot know which
-/// model it resolved to and never compares one.
+/// part, any `#effort` dropped, a trailing `[...]` context tag, date stamp or
+/// `-free` variant dropped, lowercased. So `pi/chatgpt-home/gpt-6.1-sol` and
+/// `codex/-/gpt-6.1-sol` both read `gpt-6.1-sol`, whatever harness or
+/// provider served them, and `deepseek-v4.1-flash-free[1m]` reads
+/// `deepseek-v4.1-flash`, the same model its paid route runs. A model of
+/// `-`, or a bare alias such as `opus`, is unknown: an alias names no
+/// version, so the runtime cannot know which model it resolved to and never
+/// compares one.
 pub fn model_key(route: &str) -> Option<String> {
     let model = route.splitn(3, '/').nth(2)?;
     let model = model.rsplit('/').next().unwrap_or_default();
     let model = model.split('#').next().unwrap_or_default();
-    let model = model.to_ascii_lowercase();
+    let lowered = model.to_ascii_lowercase();
+    let model = variant_free(&lowered);
     (!model.is_empty() && model != "-" && model.bytes().any(|b| b.is_ascii_digit()))
-        .then_some(model)
+        .then_some(model.to_owned())
+}
+
+/// A model with its variant suffixes dropped, one at a time until none is
+/// left: a trailing `[...]` context tag (`gpt-6.1-sol[1m]`), a trailing date
+/// stamp (`-20260101`), and a trailing `-free` (the live routes carry
+/// `deepseek-v4.1-flash-free` beside `deepseek-v4.1-flash`). A route's
+/// spelling of a model never hides the model it runs.
+pub(crate) fn variant_free(model: &str) -> &str {
+    let mut model = model;
+    loop {
+        let stripped = if model.ends_with(']') {
+            model.rfind('[').map(|at| &model[..at])
+        } else if let Some(rest) = model.strip_suffix("-free") {
+            Some(rest)
+        } else if model.len() >= 9 && model.is_char_boundary(model.len() - 9) {
+            // A trailing date stamp: a hyphen and eight digits.
+            let (rest, stamp) = model.split_at(model.len() - 9);
+            (stamp.starts_with('-') && stamp[1..].bytes().all(|b| b.is_ascii_digit()))
+                .then_some(rest)
+        } else {
+            None
+        };
+        match stripped {
+            Some(next) => model = next,
+            None => return model,
+        }
+    }
 }
 
 /// A provider throttle in how the run's last reply ended, if any.
@@ -1441,6 +1472,43 @@ mod tests {
         assert_eq!(model_key("claude/-/opus"), None);
         assert_eq!(model_key("claude/-/sonnet"), None);
         assert_eq!(model_key("claude"), None);
+    }
+
+    #[test]
+    fn model_keys_drop_context_tags_date_stamps_and_free_variants() {
+        // A trailing `[...]` context tag names the same model in another
+        // window.
+        assert_eq!(
+            model_key("pi/chatgpt-home/gpt-6.1-sol[1m]").as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        // So does a trailing date stamp.
+        assert_eq!(
+            model_key("codex/-/gpt-6-luna-20260101").as_deref(),
+            Some("gpt-6-luna")
+        );
+        // And a `-free` variant of a route the captain also lists paid.
+        assert_eq!(
+            model_key("opencode/-/opencode-go/deepseek-v4.1-flash-free").as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        // Together they are still one model, whatever its spelling, so an
+        // author on the free variant excludes a reviewer on the paid route.
+        assert_eq!(
+            model_key("opencode/-/opencode-go/deepseek-v4.1-flash-free[1m]").as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            model_key("pi/chatgpt-home/gpt-6.1-sol[1m]"),
+            model_key("pi/chatgpt-home/gpt-6.1-sol")
+        );
+        // A date stamp is a hyphen and eight digits; a shorter run of digits
+        // is the model's own name, as is a tag that opens nothing.
+        assert_eq!(
+            model_key("codex/-/gpt-6-luna-2026").as_deref(),
+            Some("gpt-6-luna-2026")
+        );
+        assert_eq!(model_key("claude/-/opus[1m]"), None);
     }
 
     #[test]
