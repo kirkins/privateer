@@ -216,6 +216,9 @@ impl Store {
             ("events", "time_ms", "INTEGER"),
             // A ship's backlog order: open tasks with a rank start first.
             ("tasks", "rank", "INTEGER"),
+            // The ships a task is shared with, as JSON: empty (NULL) unless the
+            // owner sets it, so nothing becomes visible on upgrade.
+            ("tasks", "shared_with", "TEXT"),
         ] {
             let present: bool = migrate.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
@@ -268,6 +271,7 @@ impl Store {
         crate::presence::init(&store)?;
         crate::scheduling::init(&store)?;
         crate::block_ask::init(&store)?;
+        crate::waits::init(&store)?;
         Ok(store)
     }
 
@@ -323,10 +327,14 @@ impl Store {
             .context("corrupt charter record")
     }
     pub fn task(&self, id: &str) -> Result<Value> {
-        self.connection.query_row("SELECT id,charter_id,owner,title,status,parent,depth,handoff_to FROM tasks WHERE id=?1", [id], |r| {
+        self.connection.query_row("SELECT id,charter_id,owner,title,status,parent,depth,handoff_to,shared_with FROM tasks WHERE id=?1", [id], |r| {
+            // A shared_with column the runtime cannot parse denies everyone,
+            // which is the safe direction for a visibility list.
+            let shared: Option<String> = r.get(8)?;
             Ok(json!({"id":r.get::<_,String>(0)?,"charter_id":r.get::<_,String>(1)?,"owner":r.get::<_,String>(2)?,
                 "title":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"parent":r.get::<_,Option<String>>(5)?,
-                "depth":r.get::<_,i64>(6)?,"handoff_to":r.get::<_,Option<String>>(7)?}))
+                "depth":r.get::<_,i64>(6)?,"handoff_to":r.get::<_,Option<String>>(7)?,
+                "shared_with": shared.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!([]))}))
         }).optional()?.ok_or_else(|| anyhow::anyhow!("unknown task {id}"))
     }
     pub fn authorize(&self, task_id: &str, action: &str) -> Result<Value> {

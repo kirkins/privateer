@@ -56,6 +56,7 @@ mod tool_bundles;
 mod transcript;
 mod usage;
 mod usage_carry;
+pub mod waits;
 pub mod watch;
 pub mod workspace;
 
