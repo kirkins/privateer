@@ -406,7 +406,8 @@ fn authorization_text(records: &[Value]) -> Option<String> {
         .filter_map(|d| d["authorize"].as_str())
         .collect();
     texts.dedup();
-    (!texts.is_empty()).then(|| clip(&texts.join(" "), 500))
+    // Its words are ASCII, so 498 characters and the ellipsis fit 500 bytes.
+    (!texts.is_empty()).then(|| clip(&texts.join(" "), 498))
 }
 
 fn hex(text: impl AsRef<[u8]>) -> String {
@@ -1180,7 +1181,15 @@ pub(crate) fn check_answer(thread: &Value, payload: &Value) -> Result<()> {
         payload["answer"]["option_id"].as_str(),
         Some("allow" | "authorize")
     );
-    if !is_ask(thread) || !widens || payload["operator"] == true {
+    if !is_ask(thread) || !widens {
+        return Ok(());
+    }
+    if payload["operator"] == true {
+        // The wording is checked before the reply commits, so a refusal is
+        // the captain's to see, not a failure after "answered".
+        if payload["answer"]["option_id"] == "authorize" {
+            wording(thread, payload)?;
+        }
         return Ok(());
     }
     let rules = rules_text(&thread["payload"]["block"]);
@@ -1192,6 +1201,29 @@ pub(crate) fn check_answer(thread: &Value, payload: &Value) -> Result<()> {
     anyhow::bail!(
         "Allow must come from the captain directly; ask the captain to tap Allow or run `privateer permissions allow '<rule>'` ({rules})"
     )
+}
+
+/// The authorization an `authorize` answer records: the captain's own
+/// wording, when the answer carries one, else the ask's suggestion. Either is
+/// one line of at most 500 bytes, as the fleet policy keeps it.
+fn wording(ask: &Value, payload: &Value) -> Result<String> {
+    let option_label = ask["payload"]["decision"]["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|o| o["id"] == "authorize")
+        .and_then(|o| o["label"].as_str());
+    let text = payload["answer"]["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && Some(*t) != option_label)
+        .or(ask["payload"]["block"]["authorize"].as_str())
+        .context("the ask offers no authorization; answer with the wording to record")?;
+    anyhow::ensure!(
+        text.len() <= 500 && !text.chars().any(char::is_control),
+        "an authorization is one line of at most 500 characters; shorten the wording or run `privateer permissions authorize SHIP 'TEXT'`"
+    );
+    Ok(text.to_owned())
 }
 
 /// Apply the captain's answer to a block ask that lives in this home, then,
@@ -1244,20 +1276,7 @@ fn apply(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
             )?;
         }
         Some("authorize") if reply["payload"]["operator"] == true => {
-            // The captain's own wording, when the answer carries one, is
-            // recorded instead of the suggestion.
-            let option_label = ask["payload"]["decision"]["options"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|o| o["id"] == "authorize")
-                .and_then(|o| o["label"].as_str());
-            let text = reply["payload"]["answer"]["text"]
-                .as_str()
-                .map(str::trim)
-                .filter(|t| !t.is_empty() && Some(*t) != option_label)
-                .or(block["authorize"].as_str())
-                .context("the ask offers no authorization")?;
+            let text = wording(ask, &reply["payload"])?;
             crate::permissions::set(
                 &crate::store::Caller::Operator,
                 &json!({"authorize": {"ship": ship, "text": text}}),
@@ -1579,7 +1598,8 @@ mod tests {
     #[test]
     fn only_the_operator_may_answer_allow_or_authorize() {
         let ask = json!({"kind": "decision", "to": CAPTAIN,
-            "payload": {"type": "tool_permission", "block": {"denials": []}}});
+            "payload": {"type": "tool_permission",
+                "block": {"denials": [], "authorize": "Running make commands."}}});
         for option in ["allow", "authorize"] {
             let relayed = json!({"answer": {"option_id": option}, "relayed_by": "liaison"});
             assert!(check_answer(&ask, &relayed).is_err(), "{option}");
@@ -1606,6 +1626,37 @@ mod tests {
         let mut older = ask.clone();
         older["block"].as_object_mut().unwrap().remove("authorized");
         assert!(covered(&other, "new", &older));
+    }
+
+    #[test]
+    fn the_captains_authorize_wording_is_checked_before_it_is_answered() {
+        let ask = json!({"kind": "decision", "to": CAPTAIN,
+            "payload": {"type": "tool_permission", "block": {"denials": [],
+                "authorize": "Running make commands its assigned work needs."},
+                "decision": {"options": [{"id": "authorize",
+                    "label": "Authorize: Running make commands its assigned work needs."}]}}});
+        let answer = |text: &str| json!({"answer": {"option_id": "authorize", "text": text}, "operator": true});
+        for refused in [
+            "x".repeat(501),
+            "Running make.\nAnd anything else.".to_owned(),
+            "Running make\tcommands.".to_owned(),
+        ] {
+            let error = check_answer(&ask, &answer(&refused)).unwrap_err();
+            assert!(error.to_string().contains("one line"), "{error}");
+        }
+        let own = "Running make for deploys.";
+        check_answer(&ask, &answer(own)).unwrap();
+        assert_eq!(wording(&ask, &answer(own)).unwrap(), own);
+        // A tap, or a reply that only repeats the label, takes the suggestion.
+        for tap in [
+            "",
+            "Authorize: Running make commands its assigned work needs.",
+        ] {
+            assert_eq!(
+                wording(&ask, &answer(tap)).unwrap(),
+                "Running make commands its assigned work needs."
+            );
+        }
     }
 
     #[test]

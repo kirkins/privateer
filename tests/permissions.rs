@@ -553,6 +553,18 @@ fn a_script_shaped_first_mate_denial_offers_the_captains_standing_authorization(
         relayed.contains("Authorize must come from the captain directly"),
         "{relayed}"
     );
+    // Wording the policy cannot keep is refused before it is answered.
+    let refused = f.fails(
+        "liaison",
+        "mail.send",
+        reply(
+            &first,
+            json!({"option_id":"authorize","text":"Copying credentials.\nAnd more."}),
+            false,
+        ),
+    );
+    assert!(refused.contains("one line"), "{refused}");
+    assert_eq!(f.show("liaison", &first)["state"], "open");
     // The captain's own wording is recorded instead of the suggestion.
     let wording = "Copying the registry credentials into /srv/app for deploys.";
     f.json(
