@@ -1551,9 +1551,10 @@ fn a_crew_started_with_timeout_secs_keeps_it_on_resume() {
 fn a_crew_started_without_timeout_secs_resumes_with_the_charter_default() {
     let f = Fleet::new();
     f.set_mode("gated");
-    let charter_timeout = f.json(None, "charter.show", json!({"id": "engineering"}))["job_timeout_secs"]
-        .as_u64()
-        .unwrap();
+    let charter_timeout =
+        f.json(None, "charter.show", json!({"id": "engineering"}))["job_timeout_secs"]
+            .as_u64()
+            .unwrap();
     f.json(
         Some("engineering"),
         "agent.start",
