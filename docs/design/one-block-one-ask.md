@@ -58,6 +58,9 @@ The code lives in `src/block_ask.rs`; `src/permissions.rs` keeps the policy itse
 | `rule` | the narrowest allow rule (below), or null when none can be derived |
 | `preview` | the input, masked, at most 160 characters |
 | `source` | `denial` (auto-mode stays unverified, see Q2) |
+| `reason` | the refusal's reason, masked, when one was read (a hosted pane's transcript: `[Credential Materialization]`) |
+| `authorize` | for a Bash denial with no rule, or one the auto-mode classifier refused: the standing authorization the card offers instead of `allow` (first mates only) |
+| `unidentified` | true, with an empty `tool`, when the denied tool use could not be read; no rule is offered |
 
 **Narrowest rule**, `block_ask::narrow_rule`, in the fleet's own rule style (`Bash(git *)`):
 

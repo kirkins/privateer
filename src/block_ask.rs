@@ -1459,7 +1459,7 @@ mod tests {
             json!({"tool_name": "Bash", "tool_input": {"command": command},
                 "reason": reason, "classifier": classifier})
         };
-        let (records, _) = records(
+        let (found, _) = records(
             &[
                 denial(
                     "cd /srv && SECRET_KEY=abc ./deploy.sh | tee log",
@@ -1480,20 +1480,20 @@ mod tests {
             ],
             None,
         );
-        assert!(records[0]["rule"].is_null());
+        assert!(found[0]["rule"].is_null());
         assert_eq!(
-            records[0]["authorize"],
+            found[0]["authorize"],
             "Running cd, deploy.sh and tee commands its assigned work needs, including multi-step ones."
         );
-        assert!(records[1]["rule"].is_null());
+        assert!(found[1]["rule"].is_null());
         assert_eq!(
-            records[1]["authorize"],
+            found[1]["authorize"],
             "Running kubectl commands its assigned work needs, even when the auto-mode check flags them as Interfere With Workloads."
         );
-        assert_eq!(records[2]["rule"], "Bash(cargo publish *)");
-        assert!(records[2].get("authorize").is_none());
-        assert_eq!(records[2]["reason"], "This command requires approval");
-        let text = rules_text(&json!({"denials": records}));
+        assert_eq!(found[2]["rule"], "Bash(cargo publish *)");
+        assert!(found[2].get("authorize").is_none());
+        assert_eq!(found[2]["reason"], "This command requires approval");
+        let text = rules_text(&json!({"denials": found}));
         assert_eq!(
             text,
             "Bash (no narrower rule), Bash ([Interfere With Workloads]), Bash(cargo publish *)"
