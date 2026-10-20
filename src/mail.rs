@@ -1790,7 +1790,13 @@ pub(crate) fn closed_captain(store: &Store, peer: &str, limit: usize) -> Result<
             && let Some(by) = closure["by"].as_str()
             && let Some(reply) = find(store, by)?
         {
-            closure["reply"] = envelope(&reply);
+            let reply = envelope(&reply);
+            // A stored envelope can exceed the wire limit even when the send
+            // arguments fit it. The closure still ends the desk's copy; only
+            // the answer is left out, so it cannot strand the copy forever.
+            if reply.to_string().len() <= MAX_MESSAGE_BYTES {
+                closure["reply"] = reply;
+            }
         }
         closures.push(closure);
     }
@@ -1836,6 +1842,7 @@ pub(crate) fn check_closure(closure: &Value) -> Result<()> {
         ensure!(reply.is_object(), "a closure reply must be an object");
         let reply_id = required(reply, "id")?;
         identifier(reply_id)?;
+        identifier(required(reply, "to")?)?;
         ensure!(
             reply["from"] == CAPTAIN,
             "a closure reply is from the captain"
@@ -1844,10 +1851,6 @@ pub(crate) fn check_closure(closure: &Value) -> Result<()> {
         ensure!(
             reply["correlation"].as_str() == Some(closure["id"].as_str().unwrap_or_default()),
             "a closure reply answers the closed item"
-        );
-        ensure!(
-            reply.to_string().len() <= MAX_MESSAGE_BYTES,
-            "a closure reply exceeds 64 KiB"
         );
         ensure!(
             closure["by"].as_str() == Some(reply_id),
@@ -1907,17 +1910,19 @@ pub(crate) fn record_reply_at_desk(store: &Store, reply: &Value) {
             let Ok(other) = Store::open(&home) else {
                 continue;
             };
-            let tx = other.write_transaction()?;
-            let holds: bool = tx.query_row(
+            // Read first: most homes on the machine hold no copy of this ask,
+            // and a read lock is enough to tell. Take the write lock only in
+            // the home that will be changed.
+            let holds: bool = other.connection().query_row(
                 "SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1 AND sender=?2 AND recipient=?3
                    AND kind IN ('request','decision'))",
                 params![correlation, asker, CAPTAIN],
                 |r| r.get(0),
             )?;
             if !holds {
-                tx.commit()?;
                 continue;
             }
+            let tx = other.write_transaction()?;
             let now = Store::now_ms();
             record_copy(&tx, reply, now)?;
             tx.execute(
@@ -1978,18 +1983,23 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
     };
     // The answer given where the ask lived travels with the closure: record
     // it beside the desk's copy, once, so the captain's feed here shows it.
-    // The home must hold the copy the closure closes, not merely a same id.
+    // The home must hold the copy the closure closes, not merely a same id,
+    // and that copy's sender must be the ship the reply answers: a linked
+    // machine cannot address its reply to some other ship hosted here.
     if let Some(reply) = closure.get("reply").filter(|v| !v.is_null()) {
+        let asker = reply["to"].as_str().unwrap_or_default();
         let holds: bool = tx.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM mail
                  WHERE id=?1 AND recipient=?3 AND kind IN ('request','decision')
-                   AND sender IN ({from_peer}))"
+                   AND sender IN ({from_peer}) AND sender=?4)"
             ),
-            params![id, peer, CAPTAIN],
+            params![id, peer, CAPTAIN, asker],
             |r| r.get(0),
         )?;
-        if holds {
+        // A reply too large for the wire is dropped, but the closure still
+        // ends the copy; refusing it would leave the copy open forever.
+        if holds && reply.to_string().len() <= MAX_MESSAGE_BYTES {
             record_copy(&tx, reply, ms)?;
         }
     }
