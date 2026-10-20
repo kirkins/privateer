@@ -428,6 +428,12 @@ mod tests {
         store.connection().query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
+    /// `alert` with no transcripts to read: no test reads the real
+    /// `~/.claude`.
+    fn alert(store: &Store, observed: &[(String, String, String)]) -> Result<Vec<Value>> {
+        alert_in(store, observed, None)
+    }
+
     fn launch(store: &Store, pid: i64, started: &str) {
         store
             .connection()
@@ -696,10 +702,19 @@ mod tests {
     #[test]
     fn the_next_incident_reads_only_denials_after_the_clear() {
         let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        assert_eq!(alert(&store, &observe(DENIED_SCREEN)).unwrap().len(), 1);
-        alert(&store, &observe("$ cargo test\nok")).unwrap();
+        transcript(&store, projects.path(), usize::MAX);
+        let observed = observe(DENIED_SCREEN);
+        assert_eq!(
+            alert_in(&store, &observed, Some(projects.path()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(ask(&store)["block"]["denials"][0]["tool"], "Bash");
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
         let (incident, ms): (String, i64) = store
             .connection()
             .query_row("SELECT incident, ms FROM hosted_automode", [], |r| {
