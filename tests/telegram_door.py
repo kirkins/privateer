@@ -495,6 +495,13 @@ def main() -> int:
             early_tg = pushed[0]["_message_id"]
             assert telegram.called("setMyCommands"), "command menu published"
 
+            # On its first run the door records an update offset that skips
+            # whatever the bot already had queued. An early request reaching
+            # the phone does not prove that happened, and a message sent
+            # before it can be mistaken for backlog and dropped. Speak only
+            # once the offset exists, so the question is newer than the skip.
+            wait_for("the door's first poll offset", lambda: (state / "offset.json").exists())
+
             # A plain message goes to the liaison as a request from the captain.
             question = telegram.message("How is the API refactor going?")
             asked = wait_for("the question in the liaison's mailbox", lambda: [
