@@ -128,8 +128,18 @@ USAGE_FIELDS = (("input_tokens", "input"), ("output_tokens", "output"),
                 ("cache_read_input_tokens", "cacheRead"), ("cache_creation_input_tokens", "cacheWrite"))
 
 
+def rising_result(previous, value):
+    """A later result is accepted only when both carry an integer index and it
+    rises. Without one on both, a repeated result stays an error."""
+    before, after = previous.get("result_index"), value.get("result_index")
+    return (isinstance(before, int) and not isinstance(before, bool)
+            and isinstance(after, int) and not isinstance(after, bool)
+            and after > before)
+
+
 class ClaudeTurn(Turn):
-    """Claude's init names the session and one final result ends the run."""
+    """Claude's init names the session; a run may end more than one turn, each
+    with a result carrying a rising result_index, and the last settles the run."""
 
     def __init__(self, argv, servers=()):
         flags = argv[:argv.index("--")] if "--" in argv else argv
@@ -168,22 +178,22 @@ class ClaudeTurn(Turn):
             super().observe({"type": "session", "id": value.get("session_id")})
             self.check_servers(value.get("mcp_servers"), value.get("tools"))
         elif kind == "result":
-            if self.result is not None:
-                raise ValueError("repeated-result")
             if value.get("session_id") != self.session:
                 raise ValueError("changed-session")
+            if self.result is not None and not rising_result(self.result, value):
+                raise ValueError("repeated-result")
             self.result = value
             denials = value.get("permission_denials")
             self.denied |= bool(denials)
             if isinstance(denials, list):
-                self.denials = [d for d in denials if isinstance(d, dict)]
-            # The result's usage already covers the whole run.
+                self.denials.extend(d for d in denials if isinstance(d, dict))
+            # Each result reports the usage of its own turn, so a run with more
+            # than one result sums them; Claude's modelUsage is cumulative.
             usage = value.get("usage")
-            self.usage = {}
             if isinstance(usage, dict):
                 self.add_usage({new: usage[old] for old, new in USAGE_FIELDS if old in usage})
             if self.usage:
-                self.usage["totalTokens"] = sum(self.usage.values())
+                self.usage["totalTokens"] = sum(n for key, n in self.usage.items() if key != "totalTokens")
 
     def complete(self):
         result = self.result or {}
