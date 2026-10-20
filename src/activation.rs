@@ -1245,6 +1245,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
 /// Run the dispatcher. Only one runs per home, guarded by an exclusive lock
 /// on `<home>/serve.lock` held for the life of the process.
 pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
+    let _ = std::env::set_current_dir(store.home());
     ensure!(
         *store.caller() == Caller::Operator,
         "serve runs as the operator's background service, not as an agent"

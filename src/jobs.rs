@@ -2520,11 +2520,19 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         )?;
         return Ok(public_job(&job));
     }
+    let neutral_dir = if job.workspace_lease_id.is_some() && job.cwd.is_dir() {
+        job.cwd.as_path()
+    } else if store.home().is_dir() {
+        store.home()
+    } else {
+        Path::new("/")
+    };
     let mut cmd = Command::new(&executable);
     cmd.arg("--home")
         .arg(store.home())
         .arg("_job-supervise")
         .arg(&id)
+        .current_dir(neutral_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2867,6 +2875,20 @@ fn truncation_marker(dropped: u64) -> Vec<u8> {
 }
 
 pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
+    let neutral_dir = if let Ok(job) = load(store, id) {
+        if job.workspace_lease_id.is_some() && job.cwd.is_dir() {
+            job.cwd
+        } else if store.home().is_dir() {
+            store.home().to_path_buf()
+        } else {
+            PathBuf::from("/")
+        }
+    } else if store.home().is_dir() {
+        store.home().to_path_buf()
+    } else {
+        PathBuf::from("/")
+    };
+    let _ = std::env::set_current_dir(neutral_dir);
     let result = supervise_inner(store, id);
     if let Err(error) = &result {
         // CLI stderr can be detached. Persist bounded diagnostics so process

@@ -353,6 +353,50 @@ fn live_payloads_keep_the_workspace_after_the_supervisor_dies() {
 }
 
 #[test]
+fn job_supervisor_does_not_inherit_another_workspaces_cwd() {
+    let f = Fixture::new();
+    let w1 = f.acquire("one");
+    let p1 = path(&w1);
+    let mut cmd = f.command(
+        "job.start",
+        json!({
+            "task_id": "two",
+            "id": "job-other",
+            "command": ["/bin/sh", "-c", "sleep 10"],
+            "heavy": false,
+        }),
+    );
+    cmd.current_dir(&p1);
+    let out = cmd.output().unwrap();
+    let _j2 = parse(out);
+    let until = Instant::now() + Duration::from_secs(8);
+    let running = loop {
+        let j = f.ok("job.status", json!({"id": "job-other"}));
+        if j["status"] == "running" {
+            break j;
+        }
+        assert!(Instant::now() < until, "job did not start: {j}");
+        thread::sleep(Duration::from_millis(20));
+    };
+    let _ = &running;
+    #[cfg(target_os = "linux")]
+    {
+        let supervisor_pid = running["supervisor"]["pid"].as_i64().unwrap();
+        let supervisor_cwd = fs::read_link(format!("/proc/{supervisor_pid}/cwd")).unwrap();
+        let p1_canonical = fs::canonicalize(&p1).unwrap_or_else(|_| p1.clone());
+        assert!(
+            !supervisor_cwd.starts_with(&p1) && !supervisor_cwd.starts_with(&p1_canonical),
+            "supervisor cwd {:?} must not sit inside another workspace {:?}",
+            supervisor_cwd,
+            p1
+        );
+    }
+    assert_eq!(f.release(&w1, false)["state"], "released");
+    f.ok("job.cancel", json!({"id": "job-other"}));
+    f.wait("job-other");
+}
+
+#[test]
 fn task_custody_controls_workspace_access_and_list_visibility() {
     let f = Fixture::new();
     let w = f.acquire("one");

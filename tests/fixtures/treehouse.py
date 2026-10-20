@@ -39,6 +39,19 @@ def option(flag):
 
 if args[0] == 'status':
     assert args == ['status', '--json']
+    if sys.platform.startswith('linux'):
+        for slot in slots:
+            slot_path = Path(slot['path']).resolve()
+            procs = []
+            for pid_entry in Path('/proc').iterdir():
+                if pid_entry.name.isdigit() and pid_entry.name != str(os.getpid()):
+                    try:
+                        cwd = (pid_entry / 'cwd').resolve()
+                        if cwd == slot_path or slot_path in cwd.parents:
+                            procs.append(int(pid_entry.name))
+                    except (OSError, ValueError):
+                        pass
+            slot['processes'] = procs
     print(json.dumps(slots))
 elif args[0] == 'get':
     assert '--lease' in args and '--json' in args
