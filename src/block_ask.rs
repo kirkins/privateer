@@ -664,17 +664,7 @@ fn settle_inner(store: &Store, job: &Value) -> Result<Option<Value>> {
     let task_id = job["task_id"].as_str().context("job task")?;
     let task = store.task(task_id)?;
     let ship = task["owner"].as_str().context("task owner")?.to_owned();
-    let scope = if store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)",
-        [job_id],
-        |r| r.get::<_, bool>(0),
-    )? {
-        "wake"
-    } else if crate::errand::is_errand(store, job_id)? {
-        "errand"
-    } else {
-        "crew"
-    };
+    let scope = job_scope(store, job_id)?;
     let (records, more) = records(&denials, job_folder(job).as_deref());
     raise(
         store,
@@ -687,6 +677,24 @@ fn settle_inner(store: &Store, job: &Value) -> Result<Option<Value>> {
         more,
     )
     .map(Some)
+}
+
+/// Who a job's denial stopped: the first mate's own wake, an errand, or a
+/// crew. Only a wake's ask may offer a standing authorization.
+pub(crate) fn job_scope(store: &Store, job_id: &str) -> Result<&'static str> {
+    Ok(
+        if store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)",
+            [job_id],
+            |r| r.get::<_, bool>(0),
+        )? {
+            "wake"
+        } else if crate::errand::is_errand(store, job_id)? {
+            "errand"
+        } else {
+            "crew"
+        },
+    )
 }
 
 /// Open (or find) the block ask for a task's denials, park the task when a

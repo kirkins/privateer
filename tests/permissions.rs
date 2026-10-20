@@ -25,7 +25,8 @@ if '--print' in sys.argv:
  # Like Claude Code 2.1.300 (tests/fixtures/claude): a denied tool use is in the
  # result's permission_denials unless the launch's policy allows it.
  allowed='bypassPermissions' in sys.argv or 'Bash(apify run *)' in sys.argv
- denied=[] if allowed else [{'tool_name':'Bash','tool_use_id':'toolu_1','tool_input':{'command':'apify run actor/x API_TOKEN='+SECRET,'description':'Run the actor'}}]
+ command='cd /srv && make deploy | tee deploy.log' if 'script-model' in sys.argv else 'apify run actor/x API_TOKEN='+SECRET
+ denied=[] if allowed else [{'tool_name':'Bash','tool_use_id':'toolu_1','tool_input':{'command':command,'description':'Run the actor'}}]
  print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'12345678-1234-4234-8234-123456789abc','permission_denials':denied}))
 "#;
 
@@ -652,6 +653,44 @@ fn authorizing_one_ship_records_nothing_for_another_with_the_same_suggestion() {
     let kept = f.show("storefront", &theirs);
     assert_eq!(kept["state"], "open", "{kept}");
     assert!(kept["payload"]["attached_to"].is_null(), "{kept}");
+}
+
+#[test]
+fn a_crews_job_reported_blocked_never_offers_the_ships_authorization() {
+    let f = Fleet::new();
+    let mut options =
+        f.json("liaison", "ship.show", json!({"name":"liaison"}))["first_mate"]["options"].clone();
+    options["model"] = json!("script-model");
+    assert_eq!(
+        f.crew("liaison", "crew-one", json!({"options": options}))["status"],
+        "failed"
+    );
+    let first = f.asks("liaison")[0].clone();
+    assert_eq!(first["payload"]["block"]["scope"], "crew");
+    // A free-text answer ends the ask without settling the denial.
+    f.json(
+        "liaison",
+        "mail.send",
+        json!({"from":"captain","to":"liaison","kind":"reply","correlation":first["id"],
+            "body":"Look at it later"}),
+    );
+    // Its first mate reports the crew's job blocked: still the crew's ask.
+    let raised = f.json(
+        "liaison",
+        "permissions.blocked",
+        json!({"job_id": "crew-one"}),
+    );
+    assert_eq!(raised["duplicate"], false, "{raised}");
+    let ask = f.show("liaison", &raised["request_id"]);
+    assert_eq!(ask["payload"]["block"]["scope"], "crew", "{ask}");
+    assert!(ask["payload"]["block"]["authorize"].is_null(), "{ask}");
+    let options: Vec<&str> = ask["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(options, ["without", "stop"]);
 }
 
 #[test]
