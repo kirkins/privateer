@@ -78,9 +78,11 @@ the adapter's stderr, `state/telegram.log` from the adapter).
   request or decision ends as dismissed and its ship is told so, a notice is
   marked read. The first characters of the id, as `/waiting` shows them, are
   enough when they name one item.
-- **Photos and files** are saved under the door's `state/inbox/` and the ship is
-  told the path. **Voice notes** are transcribed when `[stt]` is configured,
-  otherwise saved like files.
+- **Photos and files** are put into the receiving ship's own home, on this
+  machine or a linked one, and the mail names them in `payload.files`; if the
+  runtime cannot take the file, it stays under the door's `state/inbox/` and the
+  ship is told its path. **Voice notes** are transcribed when `[stt]` is
+  configured, otherwise sent like files.
 - **`/voice on`** speaks each message as a voice note after its text, through
   `[tts]`.
 
