@@ -100,7 +100,12 @@ pub(crate) const OPEN_FOLLOW_UP: &str =
      ORDER BY f.seq LIMIT 1)";
 
 /// Payload keys of the runtime's cross-ship wait notices.
-const WAIT_KEYS: [&str; 4] = ["wait_subscribe", "wait_unsubscribe", "task_end", "wait_closed"];
+const WAIT_KEYS: [&str; 4] = [
+    "wait_subscribe",
+    "wait_unsubscribe",
+    "task_end",
+    "wait_closed",
+];
 
 /// Where a ship's mailbox lives: None for this home, Some(peer) for another.
 fn remote_peer(ship: &Value) -> Option<&str> {

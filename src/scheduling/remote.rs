@@ -76,9 +76,7 @@ pub(super) fn wait(store: &Store, id: &str, owner: &str, wait: &Value) -> Result
     let machine = match reference.get("machine") {
         None => None,
         Some(machine) => {
-            let machine = machine
-                .as_str()
-                .context("ref.machine is a machine name")?;
+            let machine = machine.as_str().context("ref.machine is a machine name")?;
             identifier(machine)?;
             Some(machine)
         }
@@ -268,7 +266,8 @@ pub(crate) fn deliver_notice(
     let carried: Vec<Scheduled> = named
         .iter()
         .filter(|work| {
-            Far::of(work.wait.as_ref().unwrap()).and_then(|far| far.machine) == via.map(str::to_owned)
+            Far::of(work.wait.as_ref().unwrap()).and_then(|far| far.machine)
+                == via.map(str::to_owned)
         })
         .cloned()
         .collect();

@@ -259,9 +259,9 @@ fn close(
     closing: impl Fn(&str) -> bool,
     closed: &Value,
 ) -> Result<Vec<String>> {
-    let mut statement = store
-        .connection()
-        .prepare("SELECT DISTINCT subscriber FROM task_subscriptions WHERE task_id=?1 ORDER BY subscriber")?;
+    let mut statement = store.connection().prepare(
+        "SELECT DISTINCT subscriber FROM task_subscriptions WHERE task_id=?1 ORDER BY subscriber",
+    )?;
     let subscribers = statement
         .query_map([task], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?
