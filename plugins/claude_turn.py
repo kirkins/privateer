@@ -355,6 +355,8 @@ def run(argv, control):
         if reason:
             stop_process(child)
         reader.join(timeout=STOP_GRACE_SECS)
+        with lock:
+            reason = reason or state["reason"]
         if reader.is_alive():
             # A survivor still holds the pipe and the reader ended without a
             # reason: never block the turn on a stream nobody will close.

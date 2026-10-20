@@ -403,8 +403,10 @@ class ClaudeTurn(unittest.TestCase):
                 self.assertEqual(summary["reason"], reason)
 
     def test_a_truncated_line_after_a_complete_result_fails(self):
-        # Claude writes a full valid result then terminates or gets killed on a
-        # truncated line: the turn must not settle as completed despite the result.
+        # Claude writes a full valid result then a truncated line: the reader's
+        # fault must beat the complete result. (The re-reads after the later
+        # reader joins are defensive; reaching them needs a pipe holder that
+        # outlives the group stop, which this test does not build.)
         good = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, RESULT])
         run, summary = self.run_stream([], raw=good + b'{"extra":"truncated')
         self.assertEqual(run.returncode, 2)
