@@ -112,14 +112,19 @@ def signal_group(child, signum):
         child.send_signal(signum)
 
 
+# How long the leader is given to exit on its own after its stream ends, and
+# how long each stop signal is given to take effect.
+STOP_GRACE_SECS = 5
+
+
 def stop_process(child):
     signal_group(child, signal.SIGTERM)
     try:
-        child.wait(timeout=5)
+        child.wait(timeout=STOP_GRACE_SECS)
     except subprocess.TimeoutExpired:
         signal_group(child, signal.SIGKILL)
         try:
-            child.wait(timeout=5)
+            child.wait(timeout=STOP_GRACE_SECS)
         except subprocess.TimeoutExpired:
             pass
 
@@ -319,17 +324,38 @@ def run(argv, control):
                     if now - state["last_event"] >= idle_limit:
                         reason = "stalled"
                         break
+        if not reason and child.poll() is not None and reader.is_alive():
+            # The leader is gone but its stdout is still open: a grandchild
+            # survived it. Stop the group so nothing leaks and the reader can
+            # reach EOF instead of blocking on a pipe a grandchild holds.
+            stop_process(child)
         if not reason:
             # The child exited or the reader ended. Let the reader finish before
             # choosing, so its specific reason never depends on which noticed
             # first. It has at most a pipe buffer left once the child is gone.
-            reader.join(timeout=5)
+            reader.join(timeout=STOP_GRACE_SECS)
             with lock:
                 reason = state["reason"]
         if reason:
             stop_process(child)
-        reader.join(timeout=5)
-        status = child.wait()
+        reader.join(timeout=STOP_GRACE_SECS)
+        if reader.is_alive():
+            # A survivor still holds the pipe and the reader ended without a
+            # reason: never block the turn on a stream nobody will close.
+            reason = reason or "stream-eof"
+            stop_process(child)
+            reader.join(timeout=STOP_GRACE_SECS)
+        try:
+            status = child.wait(timeout=STOP_GRACE_SECS)
+        except subprocess.TimeoutExpired:
+            # The stream hit EOF with no reason while claude kept running. Bound
+            # the wait, stop the whole group, and settle the turn as failed.
+            reason = reason or "stream-eof"
+            stop_process(child)
+            try:
+                status = child.wait(timeout=STOP_GRACE_SECS)
+            except subprocess.TimeoutExpired:
+                status = None
         success = reason is None and status == 0 and turn.complete() and not turn.denied
         summary = {"type": "turn.completed" if success else "native.turn.failed",
                    "harness": "claude", "session_id": turn.session, "native_exit_code": status}

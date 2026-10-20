@@ -30,6 +30,9 @@ stream_path = os.environ.get('CLAUDE_TEST_STREAM')
 if stream_path and Path(stream_path).is_file():
     sys.stdout.buffer.write(Path(stream_path).read_bytes())
     sys.stdout.buffer.flush()
+if mode == 'eof':
+    os.close(1)
+    time.sleep(60)
 if mode == 'stall':
     time.sleep(60)
 raise SystemExit(int(os.environ.get('CLAUDE_TEST_EXIT', '0')))
@@ -152,6 +155,38 @@ class ClaudeTurn(unittest.TestCase):
         self.assertTrue(grandchild_pid_file.exists())
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(grandchild_pid_file.read_text()), 0)
+
+    def test_stream_eof_with_the_child_alive_is_bounded_and_leaves_no_process(self):
+        # Claude closes stdout (EOF) but keeps running: the launcher must not
+        # wait on it forever. It bounds the wait, stops the group, and names the
+        # fault as stream-eof.
+        started = time.monotonic()
+        run, summary = self.run_stream([], env_extra={"CLAUDE_TEST_MODE": "eof"})
+        elapsed = time.monotonic() - started
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(summary["type"], "native.turn.failed")
+        self.assertEqual(summary["reason"], "stream-eof")
+        self.assertLess(elapsed, 9.0)
+        pid_file = self.root / "pid"
+        self.assertTrue(pid_file.exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+
+    def test_a_grandchild_holding_stdout_after_the_leader_exits_is_stopped(self):
+        # The leader exits after a clean run but a grandchild inherited its
+        # stdout. The launcher must not block on that pipe; it stops the group,
+        # so the grandchild is gone and the completed run still settles.
+        grandchild_pid_file = self.root / "grandchild_pid"
+        started = time.monotonic()
+        run, summary = self.run_stream([INIT, RESULT], env_extra={
+            "CLAUDE_TEST_GRANDCHILD_PID": str(grandchild_pid_file)})
+        elapsed = time.monotonic() - started
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertEqual(summary["type"], "turn.completed")
+        self.assertLess(elapsed, 9.0)
+        self.assertTrue(grandchild_pid_file.exists())
         with self.assertRaises(ProcessLookupError):
             os.kill(int(grandchild_pid_file.read_text()), 0)
 
