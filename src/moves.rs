@@ -507,22 +507,22 @@ fn hosting_problems(
     if crate::fleet::members(conn)?.iter().any(|m| m.name == ship) {
         problems.push(format!("{ship} is already a ship on this machine"));
     }
-    if let Some(plugin) = first_mate["manifest"].as_str() {
-        if !(plugin.starts_with("bundled:") || Path::new(plugin).is_file()) {
-            problems.push(format!(
-                "{ship}'s first mate uses the plugin {plugin}, which this machine does not have"
-            ));
-        }
+    if let Some(plugin) = first_mate["manifest"].as_str()
+        && !(plugin.starts_with("bundled:") || Path::new(plugin).is_file())
+    {
+        problems.push(format!(
+            "{ship}'s first mate uses the plugin {plugin}, which this machine does not have"
+        ));
     }
     let harness = first_mate["manifest"]
         .as_str()
         .and_then(crate::bundled::harness);
-    if let Some(binary) = harness.as_deref().and_then(crate::cli::harness_binary) {
-        if !crate::cli::on_path_in(binary, path) {
-            problems.push(format!(
-                "{ship}'s first mate runs {binary}, which is not installed here"
-            ));
-        }
+    if let Some(binary) = harness.as_deref().and_then(crate::cli::harness_binary)
+        && !crate::cli::on_path_in(binary, path)
+    {
+        problems.push(format!(
+            "{ship}'s first mate runs {binary}, which is not installed here"
+        ));
     }
     for project in projects.as_array().into_iter().flatten() {
         let (name, url) = project_entry(project)?;
