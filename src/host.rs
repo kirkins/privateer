@@ -840,6 +840,7 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
         let pane = client.space(
             folder,
             ship,
+            ship,
             &binary,
             store.home(),
             &env,
@@ -979,6 +980,14 @@ pub(crate) fn view_crew(
     )
 }
 
+pub(crate) fn crew_tab_title(ship: &str, task: &str) -> String {
+    if ship.is_empty() {
+        task.to_string()
+    } else {
+        format!("{ship} {task}")
+    }
+}
+
 fn crew_space(
     store: &Store,
     job: &str,
@@ -991,9 +1000,11 @@ fn crew_space(
     let socket = socket().context("no Herdr socket configured")?;
     let mut client = crate::herdr::Client::connect(&socket)?;
     let binary = crate::executable::installed()?;
+    let tab_title = crew_tab_title(ship, task);
     let pane = client.space(
         cwd,
         &format!("└ {task}"),
+        &tab_title,
         &binary,
         store.home(),
         env,
@@ -1047,5 +1058,14 @@ mod tests {
     fn the_trust_step_folder_survives_spaces_and_quotes() {
         assert_eq!(shell_quote("/home/a b"), "'/home/a b'");
         assert_eq!(shell_quote("/home/it's"), r"'/home/it'\''s'");
+    }
+
+    #[test]
+    fn crew_tab_title_formats_ship_and_task() {
+        assert_eq!(
+            super::crew_tab_title("infra", "infra-fix"),
+            "infra infra-fix"
+        );
+        assert_eq!(super::crew_tab_title("", "infra-fix"), "infra-fix");
     }
 }

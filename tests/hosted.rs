@@ -101,11 +101,12 @@ impl Place {
             binary,
         };
         place.ok(&["init", "--harness", "pi"]);
-        // Crew memory is admission's concern, tested apart: these crews run on
-        // whatever memory the test machine has.
+        // Crew memory and disk floors are admission's concern, tested apart: these crews run on
+        // whatever memory and temporary disk space the test machine has.
+        place.json("charter.put", json!({"id":"infra","min_free_bytes":0}));
         place.json(
             "resource.configure",
-            json!({"min_available_memory_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
+            json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1u64 << 20}),
         );
         let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
         first_mate["host"] = json!("herdr");
@@ -383,6 +384,7 @@ struct Herdr {
     #[cfg(feature = "dashboard")]
     creating: Arc<AtomicBool>,
     reject_caption: Arc<AtomicBool>,
+    reject_rename: Arc<AtomicBool>,
     /// The pane the captain's client has focused.
     focus: Arc<Mutex<Option<String>>>,
     /// Herdr answers ok to reports and drops them.
@@ -404,6 +406,7 @@ impl Herdr {
         let reject_create = Arc::new(AtomicBool::new(false));
         let suppress_input = Arc::new(AtomicBool::new(false));
         let reject_caption = Arc::new(AtomicBool::new(false));
+        let reject_rename = Arc::new(AtomicBool::new(false));
         let focus = Arc::new(Mutex::new(None::<String>));
         let focused = focus.clone();
         let drop_reports = Arc::new(AtomicBool::new(false));
@@ -411,6 +414,7 @@ impl Herdr {
         // Each pane's process terminal master, and whether that process still runs.
         let terminals: PaneTerminals = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let reject_label = reject_caption.clone();
+        let reject_ren = reject_rename.clone();
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
@@ -444,6 +448,15 @@ impl Herdr {
                         stream,
                         "{}",
                         json!({"id":request["id"],"error":"fixture host unavailable"})
+                    );
+                    seen.lock().unwrap().push(request);
+                    continue;
+                }
+                if request["method"] == "tab.rename" && reject_ren.load(Ordering::SeqCst) {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id":request["id"],"error":"fixture tab rename refusal"})
                     );
                     seen.lock().unwrap().push(request);
                     continue;
@@ -682,6 +695,7 @@ impl Herdr {
             #[cfg(feature = "dashboard")]
             creating,
             reject_caption,
+            reject_rename,
             focus,
             drop_reports,
         }
@@ -1232,6 +1246,9 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     assert_eq!(create["focus"], false);
     assert_eq!(create["label"], "bridge");
     assert_eq!(create["env"]["PRIVATEER_FLEET"], fleet.to_str().unwrap());
+    let rename = &herdr.calls("tab.rename")[0]["params"];
+    assert_eq!(rename["tab_id"], "w2:t1");
+    assert_eq!(rename["label"], "bridge");
     let input = herdr.calls("pane.send_input")[0]["params"]["text"]
         .as_str()
         .unwrap()
@@ -1647,6 +1664,9 @@ fn hosting_inherits_only_with_the_native_route_and_explicit_overrides_win() {
         "its live first mate has the mail"
     );
     assert_eq!(herdr.calls("workspace.create").len(), 1);
+    let rename = &herdr.calls("tab.rename")[0]["params"];
+    assert_eq!(rename["tab_id"], "w2:t1");
+    assert_eq!(rename["label"], "implicit");
     place.stop_native("implicit");
 }
 
@@ -1955,6 +1975,9 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     let create = &herdr.calls("workspace.create")[0]["params"];
     assert_eq!(create["label"], "infra");
     assert_eq!(create["focus"], false);
+    let rename = &herdr.calls("tab.rename")[0]["params"];
+    assert_eq!(rename["tab_id"], "w2:t1");
+    assert_eq!(rename["label"], "infra");
     assert!(
         herdr.calls("pane.send_input")[0]["params"]["text"]
             .as_str()
@@ -2939,6 +2962,9 @@ fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
     let create = &herdr.calls("workspace.create")[0]["params"];
     assert_eq!(create["label"], "└ infra-fix");
     assert_eq!(create["focus"], false);
+    let rename = &herdr.calls("tab.rename")[0]["params"];
+    assert_eq!(rename["tab_id"], "w2:t1");
+    assert_eq!(rename["label"], "infra infra-fix");
     let mut job = Value::Null;
     until("the crew to finish", || {
         job = place.json("job.status", json!({"id":"crew-1"}));
@@ -3013,6 +3039,9 @@ fn a_hosted_ships_crew_on_another_harness_runs_headless_with_a_viewer_space() {
     let create = &herdr.calls("workspace.create")[0]["params"];
     assert_eq!(create["label"], "└ infra-fix");
     assert_eq!(create["focus"], false);
+    let rename = &herdr.calls("tab.rename")[0]["params"];
+    assert_eq!(rename["tab_id"], "w2:t1");
+    assert_eq!(rename["label"], "infra infra-fix");
     assert!(
         herdr.calls("pane.send_input")[0]["params"]["text"]
             .as_str()
@@ -3975,5 +4004,32 @@ fn fleet_yolo_set_while_a_hosted_first_mate_sleeps_applies_at_its_wake() {
             .any(|w| w == ["--permission-mode", "bypassPermissions"]),
         "{argv}"
     );
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_failed_tab_rename_does_not_fail_a_hosted_launch() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    herdr.reject_rename.store(true, Ordering::SeqCst);
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w2:p1", "{report}");
+    until("native hosted payload", || {
+        place.root.join("pi-pid").exists()
+    });
+    assert_eq!(herdr.calls("tab.rename").len(), 1);
+    assert_eq!(herdr.calls("tab.rename")[0]["params"]["label"], "infra");
     place.stop_native("infra");
 }
