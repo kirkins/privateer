@@ -111,6 +111,8 @@ def build(harness, request):
     if reviewer and resume:
         raise ValueError("review requires a fresh session")
     headless = mode == "headless"
+    if reviewer and not headless:
+        raise ValueError("reviewer requires a headless run")
     argv = [profile["binary"]]
     if harness == "muse":
         transport = selector(options, "transport", ["native", "msp"]) or "native"
