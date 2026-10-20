@@ -708,7 +708,8 @@ fn parked_time_is_not_charged_to_the_crew_budget() {
     f.set_mode("aged");
     f.short_budget();
     start_crew(&f, "crew-9");
-    f.wait("crew-9", &["parked"]);
+    // The resume can follow at once, so the park may already be past.
+    f.wait("crew-9", &["parked", "resumed"]);
     f.wait("child-1", &["succeeded"]);
     f.wait("crew-resume-park-crew-9-1-1", &["succeeded"]);
     let resumed = f.wait("crew-9", &["resumed"]);
@@ -727,7 +728,8 @@ fn parked_time_is_not_charged_to_the_crew_budget() {
 #[test]
 fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    // The child waits for release, so it is still running when the dispatcher stops.
+    f.set_mode("gated");
     let home = f.root.join("engineering/.privateer");
     fs::write(
         home.join("config.json"),
@@ -748,10 +750,20 @@ fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
     };
     service("start");
     start_crew(&f, "crew-10");
-    f.wait("crew-10", &["parked"]);
+    f.wait_park("crew-10");
+    // Starting the service returns before it takes its lock.
+    let ready = Instant::now() + std::time::Duration::from_secs(10);
+    while !privateer::service::running(&home).unwrap() {
+        assert!(
+            Instant::now() < ready,
+            "dispatcher did not acquire its lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     service("stop");
     assert!(!privateer::service::running(&home).unwrap());
     // The heavy job ends while no dispatcher is running.
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     service("start");
     f.wait("crew-10", &["resumed"]);
@@ -780,10 +792,13 @@ fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
 #[test]
 fn a_resume_held_by_a_stow_goes_through_admission() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    // The child waits for release, so it is still running when the stow
+    // lands and the stow holds the resume it triggers.
+    f.set_mode("gated");
     start_crew(&f, "crew-11");
-    f.wait("crew-11", &["parked"]);
+    f.wait_park("crew-11");
     f.ok(None, &["stow"]);
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     std::thread::sleep(std::time::Duration::from_millis(2500));
     assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
