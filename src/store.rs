@@ -327,7 +327,16 @@ impl Store {
             .context("corrupt charter record")
     }
     pub fn task(&self, id: &str) -> Result<Value> {
-        self.connection.query_row("SELECT id,charter_id,owner,title,status,parent,depth,handoff_to,shared_with FROM tasks WHERE id=?1", [id], |r| {
+        // A home opened without migrating (the dashboard's read-only open)
+        // may predate shared_with: it reads as shared with nobody.
+        let columns = "id,charter_id,owner,title,status,parent,depth,handoff_to,shared_with";
+        let statement = match self.connection.prepare_cached(&format!("SELECT {columns} FROM tasks WHERE id=?1")) {
+            Err(error) if error.to_string().contains("no such column: shared_with") => self
+                .connection
+                .prepare_cached(&format!("SELECT {}, NULL FROM tasks WHERE id=?1", columns.trim_end_matches(",shared_with"))),
+            prepared => prepared,
+        };
+        statement?.query_row([id], |r| {
             // A shared_with column the runtime cannot parse denies everyone,
             // which is the safe direction for a visibility list.
             let shared: Option<String> = r.get(8)?;

@@ -1,8 +1,8 @@
 //! The owner side of waits on another ship's task: the ships a task is
 //! shared with, the subscriptions they hold, and the runtime notices that
-//! answer them. See `docs/design/cross-ship-waits.md`. The waiting side of
-//! that design (the `remote` wait, notice verification and resume) is a later
-//! step and is not here. These notices are runtime-to-runtime: `mail.deliver`
+//! answer them. See `docs/design/cross-ship-waits.md`. The waiting side (the
+//! `remote` wait, notice verification and resume) is in
+//! `scheduling::remote`. These notices are runtime-to-runtime: `mail.deliver`
 //! applies them without writing any inbox, and `mail.send` refuses their
 //! payload keys, so only the runtime authors them.
 use crate::store::{Store, identifier};
@@ -50,7 +50,7 @@ pub(crate) fn shared_names(value: &Value) -> Result<Value> {
 
 /// Queue one runtime notice from a ship of this home to a ship behind a
 /// peer, through the existing outbox. Runs in the caller's transaction.
-fn notify(store: &Store, from: &str, to: &str, payload: &Value) -> Result<()> {
+pub(crate) fn notify(store: &Store, from: &str, to: &str, payload: &Value) -> Result<()> {
     crate::mail::record_runtime(
         store,
         &json!({
@@ -245,5 +245,82 @@ pub(crate) fn task_ended(store: &Store, task: &str, status: &str) -> Result<()> 
         "wait.ended",
         &json!({"task":task,"status":status,"subscribers":subscribers.len()}),
     )?;
+    Ok(())
+}
+
+/// Close the subscriptions on `task` held by the ships `closing` selects:
+/// each such subscriber ship gets one `wait_closed` from `owner` with
+/// `closed` as its payload, and its rows go. Runs in the caller's
+/// transaction. Returns the ships told.
+fn close(
+    store: &Store,
+    task: &str,
+    owner: &str,
+    closing: impl Fn(&str) -> bool,
+    closed: &Value,
+) -> Result<Vec<String>> {
+    let mut statement = store
+        .connection()
+        .prepare("SELECT DISTINCT subscriber FROM task_subscriptions WHERE task_id=?1 ORDER BY subscriber")?;
+    let subscribers = statement
+        .query_map([task], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|ship| closing(ship))
+        .collect::<Vec<_>>();
+    drop(statement);
+    for subscriber in &subscribers {
+        notify(store, owner, subscriber, &json!({"wait_closed": closed}))?;
+        store.connection().execute(
+            "DELETE FROM task_subscriptions WHERE task_id=?1 AND subscriber=?2",
+            params![task, subscriber],
+        )?;
+    }
+    Ok(subscribers)
+}
+
+/// The owner handed its task to another ship: a subscriber's ref names the
+/// old owner, which will never report this task's end, so each subscriber
+/// is told `wait_closed` `handed_off`, naming the new owner, and the rows go.
+/// Runs in `task.accept`'s transaction.
+pub(crate) fn handed_off(store: &Store, task: &str, owner: &str, new_owner: &str) -> Result<()> {
+    let told = close(
+        store,
+        task,
+        owner,
+        |_| true,
+        &json!({"task": task, "reason": "handed_off", "owner": new_owner}),
+    )?;
+    if !told.is_empty() {
+        store.audit(
+            "wait.handed_off",
+            &json!({"task":task,"owner":owner,"new_owner":new_owner,"subscribers":told}),
+        )?;
+    }
+    Ok(())
+}
+
+/// The owner narrowed a task's `shared_with`: a subscriber no longer on the
+/// list loses its subscription with the same `wait_closed` `refused` a new
+/// subscribe would get. Runs in `task.update`'s transaction.
+pub(crate) fn unshared(store: &Store, task: &str, owner: &str, shared: &Value) -> Result<()> {
+    let allowed = |ship: &str| {
+        shared
+            .as_array()
+            .is_some_and(|ships| ships.iter().any(|s| s == ship))
+    };
+    let told = close(
+        store,
+        task,
+        owner,
+        |ship| !allowed(ship),
+        &json!({"task": task, "reason": "refused"}),
+    )?;
+    if !told.is_empty() {
+        store.audit(
+            "wait.unshared",
+            &json!({"task":task,"owner":owner,"subscribers":told}),
+        )?;
+    }
     Ok(())
 }

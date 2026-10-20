@@ -99,6 +99,9 @@ pub(crate) const OPEN_FOLLOW_UP: &str =
      AND f.sender=mail.recipient AND f.state='open' AND f.kind IN ('request','decision')
      ORDER BY f.seq LIMIT 1)";
 
+/// Payload keys of the runtime's cross-ship wait notices.
+const WAIT_KEYS: [&str; 4] = ["wait_subscribe", "wait_unsubscribe", "task_end", "wait_closed"];
+
 /// Where a ship's mailbox lives: None for this home, Some(peer) for another.
 fn remote_peer(ship: &Value) -> Option<&str> {
     ship["location"]["peer"].as_str()
@@ -1106,13 +1109,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     ensure!(payload.is_object(), "payload must be an object");
     // Runtime-to-runtime payload keys: cross-ship wait notices join request
     // closures among the things only the runtime may author.
-    for reserved in [
-        "request_end",
-        "wait_subscribe",
-        "wait_unsubscribe",
-        "task_end",
-        "wait_closed",
-    ] {
+    for reserved in std::iter::once("request_end").chain(WAIT_KEYS) {
         ensure!(
             payload.get(reserved).is_none(),
             "payload.{reserved} is reserved for the runtime"
@@ -2196,17 +2193,24 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     hands_step(kind, to, &payload)?;
     // Cross-ship wait notices are runtime-to-runtime: applied here, never
     // written to any inbox, so they wake no first mate and appear as no mail.
-    if payload.get("wait_subscribe").is_some() || payload.get("wait_unsubscribe").is_some() {
+    let waits = WAIT_KEYS
+        .iter()
+        .filter(|key| payload.get(**key).is_some())
+        .count();
+    if waits > 0 {
         ensure!(kind == "notice", "a wait notice rides a notice");
         ensure!(
             from != CAPTAIN && to != CAPTAIN && to != CREW,
             "wait notices go between ships"
         );
-        ensure!(
-            payload.get("wait_subscribe").is_none() || payload.get("wait_unsubscribe").is_none(),
-            "a notice carries one wait instruction"
-        );
-        return crate::waits::deliver_notice(store, id, from, to, &payload);
+        ensure!(waits == 1, "a notice carries one wait instruction");
+        // The owner's side answers subscriptions; the waiting side checks a
+        // report against its waits, and the machine that carried it.
+        if payload.get("wait_subscribe").is_some() || payload.get("wait_unsubscribe").is_some() {
+            return crate::waits::deliver_notice(store, id, from, to, &payload);
+        }
+        let via = optional_str(args, "via")?;
+        return crate::scheduling::remote_notice(store, id, from, to, via, &payload);
     }
     // Files cross a link only on the captain's mail to a ship, and this home,
     // which hosts the ship, keeps only what its own rows say about them. A
