@@ -335,19 +335,28 @@ fn scan_transcript(path: &Path) -> std::io::Result<Scan> {
     }
 }
 
+/// Where Claude keeps its transcripts, one folder per working folder.
+pub(crate) fn claude_projects() -> Option<PathBuf> {
+    claude_config().map(|(dir, _)| dir.join("projects"))
+}
+
 /// Claude keeps a folder's transcripts under its path with every other
-/// character a dash. Only a transcript whose first entrypoint record names the
-/// `cli` entrypoint counts as a conversation `--continue` can resume.
-pub(crate) fn claude_conversation(folder: &Path) -> Conversation {
-    let Some((dir, _)) = claude_config() else {
-        return Conversation::NoTranscript;
-    };
-    let name: String = folder
+/// character a dash.
+pub(crate) fn claude_project_name(folder: &Path) -> String {
+    folder
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let Ok(entries) = std::fs::read_dir(dir.join("projects").join(name)) else {
+        .collect()
+}
+
+/// Only a transcript whose first entrypoint record names the
+/// `cli` entrypoint counts as a conversation `--continue` can resume.
+pub(crate) fn claude_conversation(folder: &Path) -> Conversation {
+    let Some(projects) = claude_projects() else {
+        return Conversation::NoTranscript;
+    };
+    let Ok(entries) = std::fs::read_dir(projects.join(claude_project_name(folder))) else {
         return Conversation::NoTranscript;
     };
     let mut found = false;

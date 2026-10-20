@@ -6,9 +6,10 @@
 //! old policy. The host reads each hosted pane's visible screen as plain text.
 //! When it shows the stop line, one captain notice per incident offers a
 //! relaunch. When it shows the stop line or a denial line, one block ask is
-//! raised for the incident. The screen
-//! names no tool, so the ask names it "unknown" until the transcript shape is
-//! captured.
+//! raised for the incident. The screen names no tool, so the ask names the
+//! tool uses refused since the last incident, with their reasons, from the
+//! pane's own Claude transcript (see `claude_denials`). When that cannot be
+//! read, the ask says the denied tool was not identified and offers no Allow.
 //!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
@@ -142,28 +143,49 @@ fn notice(ship: &str, finding: &Finding) -> String {
 /// screen raises nothing twice, and a readable screen with no block clears it.
 /// A ship without a duty task has nobody to tell.
 pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Result<Vec<Value>> {
+    alert_in(store, observed, crate::host::claude_projects().as_deref())
+}
+
+/// `alert`, reading pane transcripts under Claude's `projects` folder.
+fn alert_in(
+    store: &Store,
+    observed: &[(String, String, String)],
+    projects: Option<&std::path::Path>,
+) -> Result<Vec<Value>> {
     let mut raised = vec![];
     for (ship, _, screen) in observed {
         let tx = store.write_transaction()?;
         let Some(finding) = read(screen) else {
-            // An empty screen is a failed read, not a clear one.
+            // An empty screen is a failed read, not a clear one. A clear keeps
+            // when it was first seen: the next incident's denials come after it.
             if !screen.trim().is_empty() {
-                tx.execute("DELETE FROM hosted_automode WHERE ship=?1", [ship])?;
+                tx.execute(
+                    "UPDATE hosted_automode SET incident='', ms=?2 WHERE ship=?1 AND incident<>''",
+                    params![ship, Store::now_ms()],
+                )?;
             }
             tx.commit()?;
             continue;
         };
-        let launch: String = tx
+        let (launch, launched_ms): (String, i64) = tx
             .query_row(
-                "SELECT pid, started FROM hosted_panes WHERE ship=?1",
+                "SELECT pid, started, recorded_ms FROM hosted_panes WHERE ship=?1",
                 [ship],
                 |row| {
-                    Ok(format!(
-                        "{}:{}",
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?
+                    Ok((
+                        format!("{}:{}", row.get::<_, i64>(0)?, row.get::<_, String>(1)?),
+                        row.get(2)?,
                     ))
                 },
+            )
+            .optional()?
+            .unwrap_or_default();
+        // The last incident, or the clear after it, bounds this one's denials.
+        let last_ms: i64 = tx
+            .query_row(
+                "SELECT ms FROM hosted_automode WHERE ship=?1",
+                [ship],
+                |row| row.get(0),
             )
             .optional()?
             .unwrap_or_default();
@@ -211,10 +233,15 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
         }
         if finding.lockout || count > 0 {
             if let Ok(task) = store.task(&duty_task) {
-                let (records, more) = block_ask::records(
-                    &[json!({"tool_name": "unknown", "tool_input": {}})],
-                    store.home().parent(),
-                );
+                let folder = store.home().parent().map(|f| f.canonicalize().unwrap_or(f.into()));
+                let denials = projects
+                    .zip(folder.as_deref())
+                    .and_then(|(projects, folder)| {
+                        crate::claude_denials::since(projects, folder, last_ms.max(launched_ms))
+                    })
+                    .filter(|denials| !denials.is_empty())
+                    .unwrap_or_else(|| vec![block_ask::unidentified()]);
+                let (records, more) = block_ask::records(&denials, folder.as_deref());
                 block_ask::raise(store, ship, &duty_task, &task, None, "pane", records, more)?;
             }
         }

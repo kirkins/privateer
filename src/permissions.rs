@@ -429,7 +429,7 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
         }
     };
     let denials = if denials.is_empty() {
-        vec![json!({"tool_name": "unknown", "tool_input": {}})]
+        vec![crate::block_ask::unidentified()]
     } else {
         denials
     };

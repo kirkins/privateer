@@ -479,7 +479,7 @@ fn stated_delay_ms(tail: &str, now: i64) -> Option<i64> {
     Some(ms)
 }
 
-fn iso_timestamp_ms(value: &str) -> Option<i64> {
+pub(crate) fn iso_timestamp_ms(value: &str) -> Option<i64> {
     let value = value.trim_start_matches(|c: char| !c.is_ascii_digit());
     let (date, time) = value
         .split_once('T')

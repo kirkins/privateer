@@ -23,6 +23,10 @@ const PREVIEW_CHARS: usize = 160;
 /// line holds at most four inputs of about 4 KB each.
 const DENIAL_TAIL_BYTES: u64 = 64 * 1024;
 const MASK: &str = "•••";
+/// What an ask names when the denied tool use could not be read.
+pub(crate) const UNIDENTIFIED: &str = "denied tool not identified";
+/// What a card shows of a refusal's reason, after masking.
+const REASON_CHARS: usize = 160;
 /// Senders of open requests to a blocked ship who are told about its ask.
 const MAX_REQUESTERS: usize = 5;
 /// The reason a covering policy change ends an ask with.
@@ -148,7 +152,7 @@ pub(crate) fn narrow_rule(tool: &str, input: &Value, base: Option<&Path>) -> Opt
             && tool
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
-            && !matches!(tool, "Bash" | "Edit" | "Write" | "Read") =>
+            && !matches!(tool, "Bash" | "Edit" | "Write" | "Read" | "unknown") =>
         {
             tool.to_owned()
         }
@@ -249,6 +253,13 @@ fn mask_json(value: &Value) -> Value {
     }
 }
 
+/// Text on one line: control characters read as spaces.
+fn flat(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// A short, masked preview of a denied tool use, at most 160 characters.
 pub(crate) fn preview(tool: &str, input: &Value) -> String {
     let raw = match tool {
@@ -259,16 +270,8 @@ pub(crate) fn preview(tool: &str, input: &Value) -> String {
         _ => None,
     };
     let masked = match raw {
-        Some(raw) => mask(
-            &raw.chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect::<String>(),
-        ),
-        None => mask_json(input)
-            .to_string()
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect(),
+        Some(raw) => mask(&flat(raw)),
+        None => flat(&mask_json(input).to_string()),
     };
     if masked.chars().count() <= PREVIEW_CHARS {
         masked
@@ -280,26 +283,128 @@ pub(crate) fn preview(tool: &str, input: &Value) -> String {
     }
 }
 
-/// The ask's denial records: one per distinct rule (or tool, when no rule can
-/// be derived), at most four, and how many more there were.
+/// The denial an ask carries when the denied tool use could not be read: it
+/// names no tool, so it offers no Allow.
+pub(crate) fn unidentified() -> Value {
+    json!({"tool_name": "", "tool_input": {}, "unidentified": true})
+}
+
+/// The programs a shell command runs, at most four: the first word of each
+/// part, without assignments, paths or anything that looks like a key.
+fn programs(command: &str) -> Vec<String> {
+    let mut found: Vec<String> = vec![];
+    for part in command.split(|c: char| ";&|\n()`".contains(c)) {
+        let Some(word) = part.split_whitespace().find(|w| !w.contains('=')) else {
+            continue;
+        };
+        let word = word.rsplit('/').next().unwrap_or(word);
+        if shell_word(word)
+            && !word.starts_with('-')
+            && word.len() <= 32
+            && !secret_shaped(word)
+            && !found.iter().any(|f| f == word)
+        {
+            found.push(word.to_owned());
+        }
+    }
+    found.truncate(4);
+    found
+}
+
+/// A classifier reason's label, `[Credential Materialization]` read as
+/// `Credential Materialization`, when it is a short plain label.
+fn label(reason: &str) -> Option<&str> {
+    let inside = reason.strip_prefix('[')?.split_once(']')?.0.trim();
+    (!inside.is_empty()
+        && inside.len() <= 60
+        && inside
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " -/".contains(c)))
+    .then_some(inside)
+}
+
+/// A standing authorization the captain could record instead of an Allow
+/// rule, in plain words from the programs a command runs and the reason it
+/// was refused. Its words are plain shell words and a plain label, so it
+/// quotes safely in a command line; the captain edits it before keeping it.
+fn authorization(command: &str, reason: Option<&str>, classifier: bool) -> String {
+    let programs = programs(command);
+    let what = match programs.as_slice() {
+        [] => "the shell commands".to_owned(),
+        [one] => format!("{one} commands"),
+        [rest @ .., last] => format!("{} and {last} commands", rest.join(", ")),
+    };
+    let why = match reason.and_then(label) {
+        Some(label) if classifier => format!(", even when the auto-mode check flags them as {label}"),
+        _ if classifier => ", even when the auto-mode check refuses them".to_owned(),
+        _ => ", including multi-step ones".to_owned(),
+    };
+    format!("Running {what} its assigned work needs{why}.")
+}
+
+/// The ask's denial records: one per distinct rule (or authorization, or
+/// tool, when no rule can be derived), at most four, and how many more there
+/// were. A Bash denial no prefix rule covers, or one the auto-mode classifier
+/// refused, gets no Allow rule: an allow rule would not satisfy the
+/// classifier, so it carries a standing authorization to offer instead.
 pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, usize) {
     let mut seen = std::collections::BTreeSet::new();
     let mut records = vec![];
     for denial in denials {
-        let tool = denial["tool_name"].as_str().unwrap_or_default();
-        let input = &denial["tool_input"];
-        let rule = narrow_rule(tool, input, base);
-        if !seen.insert(rule.clone().unwrap_or_else(|| format!("tool:{tool}"))) {
+        if denial["unidentified"] == true {
+            if seen.insert("unidentified".to_owned()) {
+                records.push(json!({"tool": "", "rule": null, "preview": UNIDENTIFIED,
+                    "source": "denial", "unidentified": true}));
+            }
             continue;
         }
-        records.push(
-            json!({"tool": tool, "rule": rule, "preview": preview(tool, input),
-            "source": "denial"}),
-        );
+        let tool = denial["tool_name"].as_str().unwrap_or_default();
+        let input = &denial["tool_input"];
+        let classifier = denial["classifier"] == true;
+        let reason = denial["reason"]
+            .as_str()
+            .map(|reason| clip(&mask(&flat(reason)), REASON_CHARS))
+            .filter(|reason| !reason.trim().is_empty());
+        let derived = narrow_rule(tool, input, base);
+        let authorize = (tool == "Bash" && (derived.is_none() || classifier)).then(|| {
+            authorization(
+                input["command"].as_str().unwrap_or_default(),
+                reason.as_deref(),
+                classifier,
+            )
+        });
+        let rule = if authorize.is_some() { None } else { derived };
+        let key = rule
+            .clone()
+            .or_else(|| authorize.as_ref().map(|a| format!("authorize:{a}")))
+            .unwrap_or_else(|| format!("tool:{tool}"));
+        if !seen.insert(key) {
+            continue;
+        }
+        let mut record = json!({"tool": tool, "rule": rule, "preview": preview(tool, input),
+            "source": "denial"});
+        if let Some(reason) = reason {
+            record["reason"] = json!(reason);
+        }
+        if let Some(authorize) = authorize {
+            record["authorize"] = json!(authorize);
+        }
+        records.push(record);
     }
     let more = records.len().saturating_sub(MAX_DENIALS);
     records.truncate(MAX_DENIALS);
     (records, more)
+}
+
+/// The standing authorization an ask offers: its records' suggestions, one
+/// line of at most 500 characters, as the fleet policy keeps them.
+fn authorization_text(records: &[Value]) -> Option<String> {
+    let mut texts: Vec<&str> = records
+        .iter()
+        .filter_map(|d| d["authorize"].as_str())
+        .collect();
+    texts.dedup();
+    (!texts.is_empty()).then(|| clip(&texts.join(" "), 500))
 }
 
 fn hex(text: impl AsRef<[u8]>) -> String {
@@ -314,6 +419,7 @@ fn names(denials: &[Value]) -> Vec<String> {
             d["rule"]
                 .as_str()
                 .map(str::to_owned)
+                .or_else(|| d["authorize"].as_str().map(|a| format!("authorize:{a}")))
                 .unwrap_or_else(|| format!("tool:{}", d["tool"].as_str().unwrap_or("")))
         })
         .collect();
@@ -328,12 +434,15 @@ pub(crate) fn rules_text(block: &Value) -> String {
     let mut text = denials
         .iter()
         .map(|d| {
-            d["rule"].as_str().map(str::to_owned).unwrap_or_else(|| {
-                format!(
-                    "{} (no narrower rule)",
-                    d["tool"].as_str().unwrap_or("a tool")
-                )
-            })
+            let tool = d["tool"].as_str().filter(|t| !t.is_empty());
+            match (d["rule"].as_str(), d["reason"].as_str()) {
+                (Some(rule), _) => rule.to_owned(),
+                _ if d["unidentified"] == true => format!("a tool ({UNIDENTIFIED})"),
+                (None, Some(reason)) => {
+                    format!("{} ({})", tool.unwrap_or("a tool"), clip(reason, 60))
+                }
+                (None, None) => format!("{} (no narrower rule)", tool.unwrap_or("a tool")),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -583,6 +692,12 @@ pub(crate) fn raise(
         options.push(json!({"id": "allow", "label": clip(&format!("Allow {}", rules.join(", ")), 80),
             "what_happens": clip(&format!("Adds {} to this machine's fleet policy for every Claude ship; every task blocked on it resumes.", rules.join(", ")), 400)}));
     }
+    // A crew or an errand never reads the ship's standing authorizations.
+    let authorize = authorization_text(&records).filter(|_| !matches!(scope, "crew" | "errand"));
+    if let Some(text) = &authorize {
+        options.push(json!({"id": "authorize", "label": clip(&format!("Authorize: {text}"), 80),
+            "what_happens": clip(&format!("Records the standing authorization '{text}' for {ship}; its auto-mode check reads it from its next launch (`privateer host relaunch {ship}`). Answer with your own wording to record that instead."), 400)}));
+    }
     options.push(json!({"id": "without", "label": "Continue without it",
         "what_happens": "The task resumes; its first mate is told the tool stays denied."}));
     options.push(json!({"id": "stop", "label": "Stop the task",
@@ -590,15 +705,22 @@ pub(crate) fn raise(
     let previews: Vec<String> = records
         .iter()
         .map(|d| {
-            format!(
-                "{}: {}",
-                d["tool"].as_str().unwrap_or(""),
-                d["preview"].as_str().unwrap_or("")
-            )
+            let preview = d["preview"].as_str().unwrap_or("");
+            let shown = match d["tool"].as_str().filter(|t| !t.is_empty()) {
+                Some(tool) => format!("{tool}: {preview}"),
+                None => preview.to_owned(),
+            };
+            match d["reason"].as_str() {
+                Some(reason) => format!("{shown} (refused: {reason})"),
+                None => shown,
+            }
         })
         .collect();
-    let block = json!({"key": key, "fleet_key": fleet_key, "ship": ship, "task_id": task_id,
+    let mut block = json!({"key": key, "fleet_key": fleet_key, "ship": ship, "task_id": task_id,
         "job_id": job_id, "scope": scope, "harness": "claude", "denials": records, "more": more});
+    if let Some(text) = &authorize {
+        block["authorize"] = json!(text);
+    }
     let mut payload = json!({"type": "tool_permission", "policy_hash": policy_hash, "block": block,
         "decision": {"question": question, "why": why,
             "blocked": [clip(&format!("{task_id}: {title}"), 200)], "free_text_ok": true,
@@ -615,6 +737,10 @@ pub(crate) fn raise(
     // which reads the captain's standing authorizations, not tool rules.
     let remedy = if all_derived {
         "`privateer permissions allow 'Tool(rule)'` or `privateer permissions yolo`".to_owned()
+    } else if let Some(text) = &authorize {
+        format!(
+            "`privateer permissions authorize {ship} '{text}'` (edit the wording first) or `privateer permissions yolo`"
+        )
     } else {
         format!(
             "`privateer permissions authorize {ship} 'what you allow'` or `privateer permissions yolo`"
@@ -1018,13 +1144,22 @@ pub(crate) fn topic(
     Ok(None)
 }
 
-/// Refuse an `allow` answer that is not the operator's own: a relay, a
-/// bridge or an agent must never widen fleet permissions.
+/// Refuse an `allow` or `authorize` answer that is not the operator's own: a
+/// relay, a bridge or an agent must never widen fleet permissions.
 pub(crate) fn check_answer(thread: &Value, payload: &Value) -> Result<()> {
-    if !is_ask(thread) || payload["answer"]["option_id"] != "allow" || payload["operator"] == true {
+    let widens = matches!(
+        payload["answer"]["option_id"].as_str(),
+        Some("allow" | "authorize")
+    );
+    if !is_ask(thread) || !widens || payload["operator"] == true {
         return Ok(());
     }
     let rules = rules_text(&thread["payload"]["block"]);
+    if payload["answer"]["option_id"] == "authorize" {
+        anyhow::bail!(
+            "Authorize must come from the captain directly; ask the captain to tap Authorize or run `privateer permissions authorize SHIP 'TEXT'` ({rules})"
+        )
+    }
     anyhow::bail!(
         "Allow must come from the captain directly; ask the captain to tap Allow or run `privateer permissions allow '<rule>'` ({rules})"
     )
@@ -1077,6 +1212,30 @@ fn apply(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
             store.audit(
                 "permissions.allowed",
                 &json!({"ask": ask["id"], "rules": rules, "reply": reply["id"]}),
+            )?;
+        }
+        Some("authorize") if reply["payload"]["operator"] == true => {
+            // The captain's own wording, when the answer carries one, is
+            // recorded instead of the suggestion.
+            let option_label = ask["payload"]["decision"]["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|o| o["id"] == "authorize")
+                .and_then(|o| o["label"].as_str());
+            let text = reply["payload"]["answer"]["text"]
+                .as_str()
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && Some(*t) != option_label)
+                .or(block["authorize"].as_str())
+                .context("the ask offers no authorization")?;
+            crate::permissions::set(
+                &crate::store::Caller::Operator,
+                &json!({"authorize": {"ship": ship, "text": text}}),
+            )?;
+            store.audit(
+                "permissions.authorized",
+                &json!({"ask": ask["id"], "ship": ship, "text": text, "reply": reply["id"]}),
             )?;
         }
         Some("without") => {

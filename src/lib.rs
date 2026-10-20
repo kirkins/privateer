@@ -5,6 +5,7 @@ pub mod attention;
 mod automode;
 pub mod away;
 mod block_ask;
+mod claude_denials;
 mod bundled;
 pub mod captain;
 pub mod cli;
