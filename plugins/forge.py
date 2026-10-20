@@ -19,6 +19,10 @@ HTTP redirects are refused outright: urllib's default handler would copy the
 Authorization header to the redirect target and turn a redirected POST into
 a GET. A 3xx reply is an error, never followed.
 
+Proxy environment variables (http_proxy, https_proxy, ...) are ignored: the
+opener is built with an empty ProxyHandler, so the Authorization header is
+never relayed through a proxy.
+
 Operations:
   - pr.view: reads state, base, head sha, mergeable, and required checks at head
   - review.post: posts review (marker lookup to ensure idempotency)
@@ -36,12 +40,15 @@ import urllib.parse
 import urllib.request
 
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
-REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# Anchors are dropped in favour of fullmatch: a trailing `$` would accept a
+# value ending in a newline.
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
 # The marker is the exact string '<!-- privateer-review <id> -->'; the bare id
 # never matches, so a forged or partial mention cannot fake idempotency.
 MARKER_RE = re.compile(r"<!-- privateer-review ([^\s<>]+) -->")
-PAGE_SIZE = 100  # Forgejo's per-page limit; GitHub accepts it too
+PAGE_SIZE = 100  # GitHub's `per_page`; Forgejo does not use per_page at all
+FORGEJO_PAGE_SIZE = 50  # Forgejo's `limit`; its default page is 30, usual max 50
 MAX_PAGES = 20
 
 
@@ -125,7 +132,8 @@ def validate_api(api):
 
 
 def validate_repo(repo):
-    if not isinstance(repo, str) or not REPO_RE.match(repo):
+    # fullmatch, not a `$`-anchored match: a repo ending in a newline is refused.
+    if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
         raise ForgeError("repo is required and must look like 'owner/name' "
                          "(letters, digits, '_', '.', '-' only)")
     if any(segment == ".." for segment in repo.split("/")):
@@ -140,7 +148,7 @@ def validate_pr(pr):
 
 
 def validate_sha(value, field):
-    if not isinstance(value, str) or not SHA_RE.match(value.lower()):
+    if not isinstance(value, str) or not SHA_RE.fullmatch(value.lower()):
         raise ForgeError(f"{field} must be a 40-character hex commit sha")
     return value.lower()
 
@@ -209,7 +217,12 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         )
 
 
-_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+_OPENER = urllib.request.build_opener(
+    # An empty ProxyHandler ignores *_proxy environment variables entirely:
+    # the Authorization header must never be relayed through a proxy.
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler,
+)
 
 
 def build_headers(forge, token):
@@ -284,17 +297,25 @@ def _page_items(data):
     return None
 
 
-def get_pages(url, headers):
-    """GET url following per_page=100 pagination; returns each (status, parsed) page."""
+def get_pages(url, headers, forge):
+    """GET url paginated, returning each (status, parsed) page.
+
+    GitHub pages with `per_page`; Forgejo pages with `limit`, whose default
+    page is 30 and usual maximum is 50. The stop rule is a short or empty
+    page relative to the size actually requested, and MAX_PAGES still caps
+    the walk either way.
+    """
+    size = FORGEJO_PAGE_SIZE if forge == "forgejo" else PAGE_SIZE
+    size_param = "limit" if forge == "forgejo" else "per_page"
     pages = []
     page = 1
     while True:
         sep = "&" if "?" in url else "?"
-        code, data = http_request(f"{url}{sep}per_page={PAGE_SIZE}&page={page}",
+        code, data = http_request(f"{url}{sep}{size_param}={size}&page={page}",
                                   headers=headers)
         pages.append((code, data))
         items = _page_items(data)
-        if code != 200 or not isinstance(items, list) or len(items) < PAGE_SIZE:
+        if code != 200 or not isinstance(items, list) or len(items) < size:
             return pages
         page += 1
         if page > MAX_PAGES:
@@ -348,6 +369,38 @@ def token_identity(api, headers, forge):
 
 
 # ---------------------------------------------------------------------------
+# Check results
+# ---------------------------------------------------------------------------
+
+# A status context and a check run (or two check runs) can share a name. The
+# gate passes only on "success", so any other result must win over it; among
+# the rest, terminal failures outrank cancellations, which outrank neutral or
+# skipped outcomes, which outrank still-running ones. An unknown value is
+# treated as failing.
+RESULT_RANK = {
+    "success": 0,
+    "queued": 1, "pending": 1, "waiting": 1, "in_progress": 1,
+    "neutral": 2, "skipped": 2,
+    "cancelled": 3,
+    "failure": 4, "error": 4, "timed_out": 4, "startup_failure": 4,
+    "action_required": 4,
+}
+UNKNOWN_RESULT_RANK = 4
+
+
+def worse_result(current, new):
+    """Keep the worse of two results reported under the same check name."""
+    if current is None:
+        return new
+    if new is None:
+        return current
+    if (RESULT_RANK.get(str(new).lower(), UNKNOWN_RESULT_RANK)
+            > RESULT_RANK.get(str(current).lower(), UNKNOWN_RESULT_RANK)):
+        return new
+    return current
+
+
+# ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
 
@@ -377,19 +430,21 @@ def pr_view(request):
         for entry in data.get("statuses") or []:
             context = entry.get("context")
             if context:
-                checks[context] = entry.get("state")
+                checks[context] = worse_result(
+                    checks.get(context), entry.get("state"))
 
         for page_code, page in get_pages(
-                f"{api}/repos/{repo}/commits/{head_sha}/check-runs", headers):
+                f"{api}/repos/{repo}/commits/{head_sha}/check-runs", headers, forge):
             if page_code != 200 or not isinstance(page, dict):
                 raise ForgeError(
                     f"failed to read check runs at head: HTTP {page_code}", page_code)
             for run in page.get("check_runs") or []:
                 name = run.get("name")
                 if name:
-                    checks[name] = (run.get("conclusion")
-                                    if run.get("status") == "completed"
-                                    else run.get("status"))
+                    result = (run.get("conclusion")
+                              if run.get("status") == "completed"
+                              else run.get("status"))
+                    checks[name] = worse_result(checks.get(name), result)
     else:
         # Forgejo combined status: latest status per context, not the flat list.
         code, data = http_request(
@@ -448,7 +503,7 @@ def review_post(request):
 
     reviews_url = f"{api}/repos/{repo}/pulls/{pr}/reviews"
     reviews = []
-    for code, data in get_pages(reviews_url, headers):
+    for code, data in get_pages(reviews_url, headers, forge):
         if code != 200 or not isinstance(data, list):
             raise ForgeError(f"failed to read existing reviews: HTTP {code}", code)
         reviews.extend(data)
@@ -464,6 +519,10 @@ def review_post(request):
             continue  # the review must be for the commit being approved
         state = existing.get("state")
         if state == "DISMISSED":
+            continue
+        if existing.get("dismissed") or existing.get("stale"):
+            # Forgejo keeps a dismissed review's state APPROVED and flags it
+            # with `dismissed` (and possibly `stale`) instead of a new state.
             continue
         if state != match_state:
             continue
@@ -496,9 +555,12 @@ def pr_merge(request):
     pr = pick_pr(request)
     head_sha = validate_sha(
         first_of(request, ("head_sha", "sha", "head_commit_id")), "head_sha")
-    method = request.get("method") or request.get("merge_method") or "merge"
-    if method != "merge":
-        raise ForgeError(f"merge method {method!r} is not allowed: only 'merge' is supported")
+    # `method` is only ever the operation name in this adapter (see main);
+    # the merge method comes under `merge_method`, and only "merge" is allowed.
+    merge_method = request.get("merge_method") or "merge"
+    if merge_method != "merge":
+        raise ForgeError(
+            f"merge method {merge_method!r} is not allowed: only 'merge' is supported")
 
     merge_url = f"{api}/repos/{repo}/pulls/{pr}/merge"
     if forge == "github":

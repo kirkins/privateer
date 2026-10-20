@@ -317,6 +317,31 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertEqual(len(self.server.get_requests()), 1)
         self.assertNoRequests(self.evil_server)
 
+    def test_proxy_environment_variables_ignored(self):
+        # The opener is built with an empty ProxyHandler, so http_proxy and
+        # friends never route the request (and its Authorization header)
+        # anywhere but the configured host.
+        self.gh_routes_pr_view()
+        saved = {}
+        for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                    "all_proxy", "ALL_PROXY"):
+            saved[var] = os.environ.pop(var, None)
+            os.environ[var] = f"http://127.0.0.1:{self.evil_port}"
+        try:
+            res = forge.handle("pr.view", self.gh_request(
+                required_checks=["runtime (ubuntu-latest)"]))
+        finally:
+            for var, value in saved.items():
+                if value is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = value
+        self.assertTrue(res["ok"])
+        self.assertNoRequests(self.evil_server)  # nothing reached the "proxy"
+        self.assertEqual(
+            self.server.get_requests()[0]["headers"].get("authorization"),
+            f"Bearer {TOKEN}")
+
     # ---------------------------------------------------------------------
     # URL and field validation (blocking finding 3)
     # ---------------------------------------------------------------------
@@ -401,6 +426,18 @@ class ForgeAdapterTest(unittest.TestCase):
                         body="ok <!-- privateer-review rev-1 -->",
                     ))
                 self.assertNoRequests()
+
+    def test_trailing_newline_in_repo_or_sha_refused(self):
+        # A `$`-anchored match accepts a trailing newline; fullmatch must not.
+        self.gh_routes_pr_view()
+        self.gh_routes_review()
+        with self.assertRaises(forge.ForgeError):
+            forge.handle("pr.view", self.gh_request(repo=GH_REPO + "\n"))
+        self.assertNoRequests()
+        with self.assertRaises(forge.ForgeError):
+            forge.handle("review.post", self.gh_request(
+                commit_id=HEAD_SHA + "\n", body=self.review_body()))
+        self.assertNoRequests()
 
     def test_branch_quoted_in_protection_path(self):
         self.server.routes = {
@@ -537,6 +574,36 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertEqual(len(pages), 2)
         self.assertIn("per_page=100", self.server.get_requests()[-1]["path"])
         self.assertIn("page=2", self.server.get_requests()[-1]["path"])
+
+    def test_github_worst_result_kept_for_shared_check_names(self):
+        # When a status context and a check run (or two check runs) share a
+        # name, the worst result wins regardless of which one was read last.
+        cases = [
+            ("status success, check run failure",
+             [{"context": "shared-ci", "state": "success"}],
+             [{"name": "shared-ci", "status": "completed", "conclusion": "failure"}],
+             "failure"),
+            ("check run failure then success",
+             [],
+             [{"name": "shared-ci", "status": "completed", "conclusion": "failure"},
+              {"name": "shared-ci", "status": "completed", "conclusion": "success"}],
+             "failure"),
+            ("check run success then in-progress",
+             [],
+             [{"name": "shared-ci", "status": "completed", "conclusion": "success"},
+              {"name": "shared-ci", "status": "in_progress"}],
+             "in_progress"),
+        ]
+        for label, statuses, check_runs, expected in cases:
+            with self.subTest(label=label):
+                self.gh_routes_pr_view(statuses=statuses, check_runs=check_runs)
+                self.server.clear_requests()
+                res = forge.handle("pr.view", self.gh_request(
+                    required_checks=["shared-ci"]))
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["checks"]["shared-ci"], expected)
+                self.assertFalse(res["required_checks_ok"])
+                self.assertEqual(res["checks_not_success"], ["shared-ci"])
 
     def test_forgejo_pr_view_uses_combined_status_not_flat_list(self):
         self.server.routes = {
@@ -794,6 +861,105 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertEqual([r["method"] for r in self.server.get_requests()],
                          ["GET", "GET"])
 
+    def test_forgejo_dismissed_review_does_not_count(self):
+        # Forgejo keeps a dismissed review's state APPROVED and flags it with
+        # dismissed (and possibly stale) instead of changing the state.
+        for flags in ({"dismissed": True}, {"stale": True},
+                      {"dismissed": True, "stale": True},
+                      {"dismissed": False, "stale": False}):
+            with self.subTest(flags=flags):
+                self.fj_routes_review(existing=[{
+                    "id": 4330,
+                    "user": {"username": FJ_IDENTITY},
+                    "body": self.review_body("fj-rev-11", text="Dismissed run"),
+                    "commit_id": HEAD_SHA,
+                    "state": "APPROVED",
+                    **flags,
+                }])
+                self.server.clear_requests()
+                res = forge.handle("review.post", self.fj_request(
+                    commit_id=HEAD_SHA, event="APPROVE",
+                    body=self.review_body("fj-rev-11", text="Replay")))
+                self.assertTrue(res["ok"])
+                if any(flags.values()):
+                    self.assertTrue(res["posted"])  # the dismissed review does not count
+                    self.assertEqual(
+                        [r["method"] for r in self.server.get_requests()],
+                        ["GET", "GET", "POST"])
+                else:
+                    self.assertFalse(res["posted"])  # a plain APPROVED review still matches
+                    self.assertEqual(
+                        [r["method"] for r in self.server.get_requests()],
+                        ["GET", "GET"])
+
+    def test_forgejo_review_post_follows_limit_pagination(self):
+        # Forgejo pages with `limit` (default 30, usual max 50), never with
+        # per_page. The fixture honours limit and serves its 30-item default
+        # page when it is absent, so the adapter must send limit=50 to reach
+        # the matching review on page two.
+        matching = {
+            "id": 4331,
+            "user": {"username": FJ_IDENTITY},
+            "body": self.review_body("fj-rev-12", text="Page two"),
+            "commit_id": HEAD_SHA,
+            "state": "APPROVED",
+        }
+
+        def reviews_page(query):
+            size = int(query.get("limit", ["30"])[0])  # Forgejo's default page
+            page = int(query.get("page", ["1"])[0])
+            if page == 1:
+                return 200, [{"id": 6000 + i, "user": {"username": FJ_IDENTITY},
+                              "body": "noise", "commit_id": HEAD_SHA,
+                              "state": "APPROVED"}
+                             for i in range(size)]
+            return 200, [matching]
+
+        self.server.routes = {
+            ("GET", "/api/v1/user"): (200, {"username": FJ_IDENTITY}),
+            ("POST", f"/api/v1/repos/{FJ_REPO}/pulls/5/reviews"): (200, {"id": 4321}),
+        }
+        self.server.page_routes = {
+            ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5/reviews"): reviews_page,
+        }
+        res = forge.handle("review.post", self.fj_request(
+            commit_id=HEAD_SHA, event="APPROVE",
+            body=self.review_body("fj-rev-12")))
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["posted"])
+        self.assertTrue(res["already_exists"])
+        self.assertEqual(res["review_id"], 4331)
+
+        review_reqs = [r for r in self.server.get_requests() if "/reviews" in r["path"]]
+        self.assertEqual(len(review_reqs), 2)  # page two was short, no third page
+        self.assertIn("limit=50", review_reqs[0]["path"])
+        self.assertIn("page=1", review_reqs[0]["path"])
+        self.assertIn("page=2", review_reqs[1]["path"])
+        for req in review_reqs:
+            self.assertNotIn("per_page", req["path"])
+
+    def test_forgejo_pagination_keeps_page_cap(self):
+        def reviews_page(query):
+            size = int(query.get("limit", ["30"])[0])
+            return 200, [{"id": 6000 + i, "user": {"username": FJ_IDENTITY},
+                          "body": "noise", "commit_id": HEAD_SHA,
+                          "state": "APPROVED"}
+                         for i in range(size)]
+
+        self.server.routes = {
+            ("GET", "/api/v1/user"): (200, {"username": FJ_IDENTITY}),
+        }
+        self.server.page_routes = {
+            ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5/reviews"): reviews_page,
+        }
+        with self.assertRaises(forge.ForgeError) as ctx:
+            forge.handle("review.post", self.fj_request(
+                commit_id=HEAD_SHA, event="APPROVE",
+                body=self.review_body("fj-rev-13")))
+        self.assertIn("pagination exceeded", str(ctx.exception))
+        review_reqs = [r for r in self.server.get_requests() if "/reviews" in r["path"]]
+        self.assertEqual(len(review_reqs), forge.MAX_PAGES)
+
     # ---------------------------------------------------------------------
     # pr.merge
     # ---------------------------------------------------------------------
@@ -804,7 +970,8 @@ class ForgeAdapterTest(unittest.TestCase):
                 "sha": OTHER_SHA, "merged": True,
                 "message": "Pull Request successfully merged"}),
         }
-        res = forge.handle("pr.merge", self.gh_request(head_sha=HEAD_SHA, method="merge"))
+        res = forge.handle("pr.merge", self.gh_request(
+            head_sha=HEAD_SHA, merge_method="merge"))
         self.assertTrue(res["ok"])
         self.assertTrue(res["merged"])
         self.assertEqual(res["merge_sha"], OTHER_SHA)
@@ -831,9 +998,21 @@ class ForgeAdapterTest(unittest.TestCase):
                 self.server.clear_requests()
                 with self.assertRaises(forge.ForgeError) as ctx:
                     forge.handle("pr.merge", self.gh_request(
-                        head_sha=HEAD_SHA, method=method))
+                        head_sha=HEAD_SHA, merge_method=method))
                 self.assertIn("only 'merge'", str(ctx.exception))
                 self.assertNoRequests()
+
+    def test_method_key_is_not_the_merge_method(self):
+        # `method` names the operation (the CLI fallback in main), never the
+        # merge method: pr.merge with method="pr.merge" must still merge.
+        self.server.routes = {
+            ("PUT", f"/repos/{GH_REPO}/pulls/10/merge"): (200, {
+                "sha": OTHER_SHA, "merged": True, "message": "merged"}),
+        }
+        res = forge.handle("pr.merge", self.gh_request(
+            head_sha=HEAD_SHA, method="pr.merge"))
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["merged"])
 
     def test_forgejo_merge_success_shape(self):
         self.server.routes = {
