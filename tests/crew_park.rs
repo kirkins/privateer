@@ -708,7 +708,8 @@ fn parked_time_is_not_charged_to_the_crew_budget() {
     f.set_mode("aged");
     f.short_budget();
     start_crew(&f, "crew-9");
-    f.wait("crew-9", &["parked"]);
+    // The resume can follow at once, so the park may already be past.
+    f.wait("crew-9", &["parked", "resumed"]);
     f.wait("child-1", &["succeeded"]);
     f.wait("crew-resume-park-crew-9-1-1", &["succeeded"]);
     let resumed = f.wait("crew-9", &["resumed"]);
@@ -748,7 +749,19 @@ fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
     };
     service("start");
     start_crew(&f, "crew-10");
-    f.wait("crew-10", &["parked"]);
+    // The park record is written as the crew parks, seconds before its child
+    // settles. Waiting for the derived `parked` status instead can miss that
+    // short window and let the resume launch before the dispatcher is stopped.
+    f.wait_park("crew-10");
+    // Starting the service returns before it takes its lock.
+    let ready = Instant::now() + std::time::Duration::from_secs(10);
+    while !privateer::service::running(&home).unwrap() {
+        assert!(
+            Instant::now() < ready,
+            "dispatcher did not acquire its lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     service("stop");
     assert!(!privateer::service::running(&home).unwrap());
     // The heavy job ends while no dispatcher is running.
@@ -782,7 +795,11 @@ fn a_resume_held_by_a_stow_goes_through_admission() {
     let f = Fleet::new();
     f.set_mode("slow");
     start_crew(&f, "crew-11");
-    f.wait("crew-11", &["parked"]);
+    // Observe the park record as soon as it is written, not the derived
+    // `parked` status: on a fast runner the child can settle during the park
+    // grace, so `parked` may be gone before the first poll. The child still
+    // runs here, so the stow below holds the resume it will trigger.
+    f.wait_park("crew-11");
     f.ok(None, &["stow"]);
     f.wait("child-1", &["succeeded"]);
     std::thread::sleep(std::time::Duration::from_millis(2500));
