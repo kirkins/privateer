@@ -194,10 +194,29 @@ impl Fleet {
             )
             .unwrap();
     }
+    /// Run against this fixture's store, ledger and routes file in-process.
+    /// The suite runs with --test-threads=1, and each test that reads these
+    /// in-process sets them before its reads, so the environment is safe.
+    fn in_process<T>(&self, run: impl FnOnce(&privateer::store::Store) -> T) -> T {
+        // SAFETY: see the comment above; no other thread reads these while
+        // this test holds the single test thread.
+        unsafe {
+            std::env::set_var("PRIVATEER_FLEET", self.root.join("fleet.sqlite"));
+            std::env::set_var("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"));
+        }
+        let store =
+            privateer::store::Store::open(&self.root.join("engineering/.privateer")).unwrap();
+        run(&store)
+    }
 }
 
 fn codex(model: &str, cost: &str) -> Value {
     json!({"manifest":"bundled:codex","options":{"model":model,"sandbox":"danger-full-access"},"cost":cost})
+}
+
+/// A ranked route: a manifest with options, a cost, a tier and its uses.
+fn tiered(manifest: &str, options: Value, cost: &str, tier: u64, uses: &[&str]) -> Value {
+    json!({"manifest": manifest, "options": options, "cost": cost, "tier": tier, "uses": uses})
 }
 
 #[test]
@@ -885,8 +904,9 @@ fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
     // The ship's home is its folder's `.privateer`, which holds its config.
     let store = privateer::store::Store::open(&f.root.join("engineering/.privateer")).unwrap();
     // This test reads the routes file and the ledger in-process, so point both
-    // at the fleet's own copies rather than the machine's.
-    // SAFETY: no other test in this binary reads the environment in-process.
+    // at the fleet's own copies rather than the machine's. The suite runs with
+    // --test-threads=1 and each in-process reader sets these first.
+    // SAFETY: the single test thread is held while these are set and read.
     unsafe {
         std::env::set_var("PRIVATEER_FLEET", f.root.join("fleet.sqlite"));
         std::env::set_var("PRIVATEER_RESOURCE_HOME", f.root.join("ledger"));
@@ -1331,7 +1351,8 @@ fn routes_set_warns_about_strength_prefixes_and_errand_routes_without_review() {
         "routes.set",
         json!({
             "routes": {"opus": opus, "luna": luna},
-            "errand": ["opus", "luna"]
+            "errand": ["opus", "luna"],
+            "review": ["opus", "luna"]
         }),
     );
     let warnings: Vec<&str> = reply["warnings"]
@@ -1340,7 +1361,7 @@ fn routes_set_warns_about_strength_prefixes_and_errand_routes_without_review() {
         .iter()
         .map(|w| w.as_str().unwrap())
         .collect();
-    assert_eq!(warnings.len(), 2, "{reply}");
+    assert_eq!(warnings.len(), 3, "{reply}");
     assert!(
         warnings
             .iter()
@@ -1351,6 +1372,13 @@ fn routes_set_warns_about_strength_prefixes_and_errand_routes_without_review() {
         warnings
             .iter()
             .any(|w| w.contains("route luna is on an errand list but has no review use")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w
+                .contains("route luna is on a review list but is not tier 1 with the review use")),
         "{warnings:?}"
     );
 }
@@ -1657,4 +1685,214 @@ fn an_operator_passing_require_with_an_unlisted_manifest_is_refused_as_unlisted(
         !refusal.contains("the captain has listed no routes to choose from"),
         "must not say no routes to choose from: {refusal}"
     );
+}
+
+/// The reviewer a review takes: a captain-set `review` list whose candidates
+/// meet review at tier 1, a crew's model excluded with no exception, a
+/// first-mate overlap allowed in a fresh session, and a crew job whose model
+/// cannot be named refusing the choice until the ship declares its route.
+#[test]
+fn a_reviewer_comes_from_the_review_list_clear_of_the_authors() {
+    let pi_sol = || {
+        tiered(
+            "bundled:pi",
+            json!({"model": "gpt-6.1-sol", "provider": "chatgpt-home"}),
+            "plan",
+            1,
+            &["review", "implement"],
+        )
+    };
+    let opus = || {
+        tiered(
+            "bundled:claude",
+            json!({"model": "claude-opus-5-5"}),
+            "plan",
+            1,
+            &["review", "implement"],
+        )
+    };
+    let quick = || {
+        tiered(
+            "bundled:codex",
+            json!({"model": "model-quick"}),
+            "free",
+            3,
+            &["implement"],
+        )
+    };
+    let reviewer = |f: &Fleet| {
+        f.in_process(|store| {
+            let authors = privateer::review::authors::compute(
+                store,
+                "engineering",
+                "feature/not-ours",
+                0,
+                &[],
+            )
+            .unwrap();
+            privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+        })
+    };
+
+    // No review list at all: refuse, never fall back to another list.
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"steady": codex("model-steady", "credits")},
+        "crew": ["steady"]
+    }));
+    let refused = format!("{:#}", reviewer(&f).unwrap_err());
+    assert!(
+        refused.contains("the captain has listed no review routes for engineering"),
+        "{refused}"
+    );
+
+    // A review list whose routes do not meet review at tier 1 names each one
+    // with its tier and uses.
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"quick": quick(), "sol": pi_sol(), "opus": opus()},
+        "crew": ["quick"],
+        "review": ["quick"]
+    }));
+    let refused = format!("{:#}", reviewer(&f).unwrap_err());
+    assert!(
+        refused.contains("no review route for engineering meets review at tier <= 1"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("quick: tier 3 with uses [implement]"),
+        "{refused}"
+    );
+
+    // An Opus crew wrote some of it: Opus is excluded with no exception and
+    // Sol reviews, fresh, with the author set naming the crew job.
+    f.routes(json!({
+        "routes": {
+            "quick": quick(),
+            "writer": tiered("bundled:claude", json!({"model": "claude-opus-5-5"}), "plan", 2, &["implement"]),
+            "sol": pi_sol(),
+            "opus": opus()
+        },
+        "crew": ["quick", "writer"],
+        "review": ["sol", "opus"]
+    }));
+    let crew = f.run_and_scan("crew-writer", Some("writer"));
+    assert_eq!(crew["id"], "crew-writer", "{crew}");
+    let chosen = reviewer(&f).expect("sol is clear of the authors");
+    assert_eq!(chosen.choice.name, "sol");
+    assert_eq!(chosen.overlap, None);
+    assert!(chosen.fresh, "every review is a new session");
+    assert_eq!(
+        chosen.choice.identity.as_deref(),
+        Some("pi/chatgpt-home/gpt-6.1-sol")
+    );
+    assert!(
+        chosen.choice.why.contains("clear of the code's authors"),
+        "{}",
+        chosen.choice.why
+    );
+    // The review list reaches bearings and the ship profile like any list.
+    let bearings = f.json(None, "ship.bearings", json!({"ship": "engineering"}));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("review: sol (plan; tier 1, uses review/implement)"),
+        "{bearings}"
+    );
+    let profile = f.json(None, "ship.profile", json!({"ship": "engineering"}));
+    assert_eq!(profile["routes"]["review"]["names"], json!(["sol", "opus"]));
+
+    // Nothing left after exclusions: refuse, naming the tier, uses and the
+    // conflicting job of the one candidate.
+    f.routes(json!({
+        "routes": {
+            "quick": quick(),
+            "writer": tiered("bundled:claude", json!({"model": "claude-opus-5-5"}), "plan", 2, &["implement"]),
+            "sol": pi_sol(),
+            "opus": opus()
+        },
+        "crew": ["quick", "writer"],
+        "review": ["opus"]
+    }));
+    let refused = format!("{:#}", reviewer(&f).unwrap_err());
+    assert!(
+        refused.contains("every review route for engineering is excluded by the code's authors"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("opus (tier 1 with uses [review, implement])"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("crew job(s) crew-writer ran on its model claude-opus-5-5"),
+        "{refused}"
+    );
+
+    // A model only the first mate wrote on is allowed, and the overlap is
+    // recorded with the fresh session.
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {
+            "quick": tiered("bundled:codex", json!({"model": "gpt-6-luna"}), "free", 3, &["implement"]),
+            "opus": opus()
+        },
+        "crew": ["quick"],
+        "first_mate": ["opus"],
+        "review": ["opus"]
+    }));
+    f.run_and_scan("crew-quick", Some("quick"));
+    let chosen = reviewer(&f).expect("a first-mate overlap is allowed");
+    assert_eq!(chosen.choice.name, "opus");
+    assert_eq!(chosen.overlap.as_deref(), Some("first_mate"));
+    assert!(chosen.fresh);
+    assert!(
+        chosen
+            .choice
+            .why
+            .contains("overlapping only the first mate's models"),
+        "{}",
+        chosen.choice.why
+    );
+
+    // A crew job whose model cannot be named (here a bare alias) refuses the
+    // choice, naming the job, until the ship declares that job's route.
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {
+            "alias": tiered("bundled:claude", json!({"model": "opus"}), "plan", 3, &["implement"]),
+            "sol": pi_sol()
+        },
+        "crew": ["alias"],
+        "review": ["sol"]
+    }));
+    f.run_and_scan("crew-alias", Some("alias"));
+    let (unknown, refused) = f.in_process(|store| {
+        let authors =
+            privateer::review::authors::compute(store, "engineering", "feature/not-ours", 0, &[])
+                .unwrap();
+        let refused = privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"));
+        (authors.unknown_jobs.clone(), refused.unwrap_err())
+    });
+    assert_eq!(unknown, vec!["crew-alias".to_owned()]);
+    assert!(refused.contains("cannot choose a reviewer"), "{refused}");
+    assert!(refused.contains("crew-alias"), "{refused}");
+    assert!(refused.contains("author_routes"), "{refused}");
+    // Declaring that job's route clears the unknown and adds the model.
+    let chosen = f
+        .in_process(|store| {
+            let authors = privateer::review::authors::compute(
+                store,
+                "engineering",
+                "feature/not-ours",
+                0,
+                &["claude/-/claude-opus-5-5".to_owned()],
+            )
+            .unwrap();
+            privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+        })
+        .expect("the declaration stands for the job");
+    assert_eq!(chosen.choice.name, "sol");
 }

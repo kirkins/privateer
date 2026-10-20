@@ -30,7 +30,7 @@ use std::{
     path::PathBuf,
 };
 
-pub(crate) const KINDS: [&str; 3] = ["crew", "errand", "first_mate"];
+pub(crate) const KINDS: [&str; 4] = ["crew", "errand", "first_mate", "review"];
 const COSTS: [&str; 3] = ["free", "plan", "credits"];
 /// The words a route's `uses` may name: what a route is strong enough to do.
 pub(crate) const USES: [&str; 4] = ["implement", "review", "diagnose", "design"];
@@ -120,7 +120,7 @@ fn validate(value: &Value) -> Result<()> {
         ensure!(
             matches!(
                 key.as_str(),
-                "routes" | "crew" | "errand" | "first_mate" | "ships"
+                "routes" | "crew" | "errand" | "first_mate" | "review" | "ships"
             ),
             "unknown routes setting {key}"
         );
@@ -287,7 +287,7 @@ pub fn load() -> Result<Option<Value>> {
 }
 
 /// Classic task-only homes and isolated pilots are not fleet ships.
-fn for_store(store: &Store) -> Result<Option<Value>> {
+pub(crate) fn for_store(store: &Store) -> Result<Option<Value>> {
     if crate::presence::folder_ship(store).is_some() {
         load()
     } else {
@@ -342,23 +342,45 @@ fn warnings(value: &Value) -> Vec<String> {
             ));
         }
     }
-    let mut errand: Vec<String> = names_of(&value["errand"]);
-    if let Some(ships) = value["ships"].as_object() {
-        for lists in ships.values() {
-            errand.extend(names_of(&lists["errand"]));
-        }
-    }
-    for name in errand {
-        let route = &value["routes"][name.as_str()];
-        if !uses(route).iter().any(|word| word == "review") {
-            warnings.push(format!(
-                "route {name} is on an errand list but has no review use"
-            ));
+    // A review list holds reviewer routes, and a review always needs the
+    // `review` use at tier 1; an errand list may be asked to review.
+    for kind in ["errand", "review"] {
+        for name in listed(value, kind) {
+            let route = &value["routes"][name.as_str()];
+            let review_use = uses(route).iter().any(|word| word == "review");
+            match kind {
+                "review" => {
+                    let tiered = route.get("tier").and_then(Value::as_u64) == Some(1);
+                    if !tiered || !review_use {
+                        warnings.push(format!(
+                            "route {name} is on a review list but is not tier 1 with the review use"
+                        ));
+                    }
+                }
+                _ => {
+                    if !review_use {
+                        warnings.push(format!(
+                            "route {name} is on an errand list but has no review use"
+                        ));
+                    }
+                }
+            }
         }
     }
     warnings.sort();
     warnings.dedup();
     warnings
+}
+
+/// Every route name a kind lists, fleet-wide and per ship.
+fn listed(value: &Value, kind: &str) -> Vec<String> {
+    let mut names = names_of(&value[kind]);
+    if let Some(ships) = value["ships"].as_object() {
+        for lists in ships.values() {
+            names.extend(names_of(&lists[kind]));
+        }
+    }
+    names
 }
 
 fn names_of(list: &Value) -> Vec<String> {
@@ -629,8 +651,183 @@ pub(crate) fn rank(
     keyed.into_iter().map(|(_, name)| name.clone()).collect()
 }
 
-fn identity(route: &Value) -> Option<String> {
+pub(crate) fn identity(route: &Value) -> Option<String> {
     crate::routes::route_of(route["manifest"].as_str()?, &route["options"])
+}
+
+/// The reviewer a review runs on, with the overlap rule's verdict on it.
+#[derive(Clone, Debug)]
+pub struct Reviewer {
+    /// The chosen route, whose `why` line the review record keeps.
+    pub choice: Choice,
+    /// `Some("first_mate")` when the reviewer's model is one only the ship's
+    /// first mate wrote the code on: allowed, and recorded with the review.
+    pub overlap: Option<String>,
+    /// Every review runs in a new session: never a warm one.
+    pub fresh: bool,
+}
+
+/// Review candidates after the overlap rule: what is left to offer, in the
+/// order to offer it, and what the code's authors excluded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReviewOrder {
+    /// Candidates cheapest first, those with no overlap ahead of those that
+    /// overlap only the first mate's models. The model is the overlapping
+    /// one, when the candidate overlaps.
+    pub(crate) offered: Vec<(String, Option<String>)>,
+    /// Excluded candidates, with why: a crew job ran on their model, or their
+    /// own model cannot be named.
+    pub(crate) excluded: Vec<(String, String)>,
+}
+
+/// Order review candidates: routes whose model wrote none of the code first,
+/// then routes that overlap only the first mate's models; within each group
+/// `ranked`'s order (cheapest first). A route whose model a crew job wrote is
+/// excluded outright, with no exception, and so is one whose model cannot be
+/// named.
+pub(crate) fn order_reviewers(
+    ranked: &[String],
+    policy: &Value,
+    authors: &crate::review::authors::Authors,
+) -> ReviewOrder {
+    let mut clean = vec![];
+    let mut overlap = vec![];
+    let mut excluded = vec![];
+    for name in ranked {
+        let route = &policy["routes"][name.as_str()];
+        let model = identity(route)
+            .as_deref()
+            .and_then(crate::routes::model_key);
+        match model {
+            Some(model) if authors.crew_jobs.contains_key(&model) => {
+                let jobs = authors.crew_jobs[&model].join(", ");
+                excluded.push((
+                    name.clone(),
+                    format!("crew job(s) {jobs} ran on its model {model}"),
+                ));
+            }
+            Some(model) if authors.first_mate_models.contains(&model) => {
+                overlap.push((name.clone(), Some(model)));
+            }
+            Some(_) => clean.push((name.clone(), None)),
+            None => excluded.push((
+                name.clone(),
+                "its model cannot be named (no model, or a bare alias such as opus)".to_owned(),
+            )),
+        }
+    }
+    clean.extend(overlap);
+    ReviewOrder {
+        offered: clean,
+        excluded,
+    }
+}
+
+/// The route a review's reviewer runs on: the cheapest route on the ship's
+/// `review` list that meets review at tier 1 and whose model no crew job in
+/// the author set wrote. A model only the first mate wrote on is allowed,
+/// with the overlap recorded. There is no fall back to any other list, and
+/// no warm session: the reply says what is missing instead.
+pub fn choose_reviewer(
+    store: &Store,
+    ship: &str,
+    authors: &crate::review::authors::Authors,
+) -> Result<Reviewer> {
+    ensure!(
+        authors.unknown_jobs.is_empty(),
+        "cannot choose a reviewer for {ship}: the model of crew job(s) {} cannot \
+         be named; declare that job's route in author_routes",
+        authors.unknown_jobs.join(", ")
+    );
+    let policy = for_store(store)?.with_context(|| {
+        format!("the captain has listed no routes to choose a reviewer for {ship} from")
+    })?;
+    let names = order(&policy, ship, "review");
+    ensure!(
+        !names.is_empty(),
+        "the captain has listed no review routes for {ship}"
+    );
+    let require = Require {
+        r#use: Some("review".to_owned()),
+        tier: Some(1),
+    };
+    let qualifying: Vec<String> = names
+        .iter()
+        .filter(|n| meets(&policy["routes"][n.as_str()], Some(&require)))
+        .cloned()
+        .collect();
+    ensure!(
+        !qualifying.is_empty(),
+        "no review route for {ship} meets {}:\n{}",
+        require.summary(),
+        names
+            .iter()
+            .map(|n| {
+                format!(
+                    "  {n}: {}",
+                    describe_strength(&policy["routes"][n.as_str()])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let usage = crate::routes::usage(&crate::jobs::host_ledger(store)?)?;
+    let ordered = order_reviewers(
+        &rank(&qualifying, &policy, &usage, Store::now_ms()),
+        &policy,
+        authors,
+    );
+    ensure!(
+        !ordered.offered.is_empty(),
+        "every review route for {ship} is excluded by the code's authors:\n{}",
+        ordered
+            .excluded
+            .iter()
+            .map(|(name, why)| {
+                format!(
+                    "  {name} ({}): {why}",
+                    describe_strength(&policy["routes"][name.as_str()])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let mut refusals = vec![];
+    for (name, overlap) in ordered.offered {
+        let route = &policy["routes"][name.as_str()];
+        let Some(id) = identity(route) else {
+            refusals.push(format!("{name}: its manifest names no route"));
+            continue;
+        };
+        if let Some(refusal) = crate::routes::refusal_for(store, &id, Who::Crew, limits(route))? {
+            refusals.push(format!("{name}: {refusal}"));
+            continue;
+        }
+        let why = match &overlap {
+            Some(_) => format!(
+                "cheapest on {ship}'s review list clear of the code's authors, \
+                 overlapping only the first mate's models: {name}"
+            ),
+            None => format!("cheapest on {ship}'s review list clear of the code's authors: {name}"),
+        };
+        return Ok(Reviewer {
+            choice: Choice {
+                name: name.clone(),
+                manifest: route["manifest"].clone(),
+                options: route.get("options").cloned().unwrap_or(json!({})),
+                identity: Some(id),
+                tier: route["tier"].as_u64(),
+                uses: uses(route),
+                why,
+            },
+            overlap: overlap.map(|_| "first_mate".to_owned()),
+            fresh: true,
+        });
+    }
+    bail!(
+        "every review route for {ship} is unavailable:\n{}",
+        refusals.join("\n")
+    );
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -751,7 +948,7 @@ pub(crate) fn meets(route: &Value, require: Option<&Require>) -> bool {
 
 /// A route chosen for a launch.
 #[derive(Clone, Debug)]
-pub(crate) struct Choice {
+pub struct Choice {
     pub name: String,
     pub manifest: Value,
     pub options: Value,
@@ -1826,5 +2023,59 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn review_candidates_without_overlap_go_first_and_exclusions_name_jobs() {
+        let policy = json!({"routes": {
+            "gem": route("gemini-3.8-flash-high", json!({
+                "tier": 1, "uses": ["review"], "allowance": {"window_hours": 5}})),
+            "sol": route("gpt-6.1-sol", json!({"tier": 1, "uses": ["review"]})),
+            "opus": route("claude-opus-5-5", json!({"tier": 1, "uses": ["review"]})),
+        }});
+        let mut authors = crate::review::authors::Authors::default();
+        authors.crew_jobs.insert(
+            "gemini-3.8-flash-high".to_owned(),
+            vec!["job-gem".to_owned()],
+        );
+        authors
+            .first_mate_models
+            .insert("claude-opus-5-5".to_owned());
+        // `rank` puts the route with an open window first, and the two
+        // carry-over routes keep the captain's order; the overlap rule then
+        // puts the clean candidate ahead of the overlapping one whatever the
+        // allowance order says, and drops the crew model with its jobs named.
+        let usage = HashMap::from([(
+            "codex/-/gemini-3.8-flash-high".to_owned(),
+            Usage {
+                window_ends_ms: Some(NOW + 2 * HOUR),
+                ..Usage::default()
+            },
+        )]);
+        let ranked = rank(&names(&["opus", "sol", "gem"]), &policy, &usage, NOW);
+        assert_eq!(ranked, names(&["gem", "opus", "sol"]));
+        let ordered = order_reviewers(&ranked, &policy, &authors);
+        assert_eq!(
+            ordered.offered,
+            vec![
+                ("sol".to_owned(), None),
+                ("opus".to_owned(), Some("claude-opus-5-5".to_owned())),
+            ]
+        );
+        assert_eq!(
+            ordered.excluded,
+            vec![(
+                "gem".to_owned(),
+                "crew job(s) job-gem ran on its model gemini-3.8-flash-high".to_owned()
+            )]
+        );
+        // A candidate whose own model cannot be named is excluded too, since
+        // it cannot be shown clear of the authors.
+        let mut aliased = policy.clone();
+        aliased["routes"]["sonnet"] = route("sonnet", json!({"tier": 1, "uses": ["review"]}));
+        let ordered = order_reviewers(&names(&["sonnet"]), &aliased, &authors);
+        assert!(ordered.offered.is_empty());
+        assert_eq!(ordered.excluded.len(), 1);
+        assert!(ordered.excluded[0].1.contains("cannot be named"));
     }
 }

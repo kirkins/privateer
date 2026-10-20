@@ -139,7 +139,7 @@ fn public(store: &Store, w: &Workspace) -> Result<Value> {
     value["owner"] = owner(store, &w.task_id)?["owner"].clone();
     Ok(value)
 }
-fn hash(s: &str) -> String {
+pub(crate) fn hash(s: &str) -> String {
     format!("{:x}", Sha256::digest(s.as_bytes()))[..16].to_owned()
 }
 
