@@ -1,6 +1,6 @@
 # Design: waits on another ship's task
 
-Status: proposed, awaiting the captain's approval; design only, no code. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
+Status: approved by the captain on 2026-10-20. Step 1 (the owner side, `src/waits.rs`) and step 2 (the waiting side, `src/scheduling/remote.rs`) are implemented; steps 3 to 5 are not. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
 
 ## Problem
 
@@ -27,8 +27,10 @@ A new wait kind, `remote`, which names a task in another ship's home:
 Push only. There is no next-check timer.
 
 1. **Subscribe.** When the defer is applied, the waiting home sends the owner a runtime notice `payload.wait_subscribe: {task, subscriber, subscriber_task}`. The owner records one subscription row keyed by (subscriber ship, subscriber task, far task). Re-sending the same subscription adds nothing.
-2. **Report.** When the owner's task reaches a final status (`done`, `cancelled`), the owner sends each subscriber a runtime notice `payload.task_end: {task, status, reason}`. If the task had already ended when the subscription arrives, the owner answers at once with its final status, so a late defer does not wait forever. The owner sends `wait_closed` `{task, reason}` instead when it refuses the subscription (`reason: refused`) or is retired (`reason: retired`). `wait_closed` is not a final status and reports none.
+2. **Report.** When the owner's task reaches a final status (`done`, `cancelled`), the owner sends each subscriber a runtime notice `payload.task_end: {task, status, reason}`. If the task had already ended when the subscription arrives, the owner answers at once with its final status, so a late defer does not wait forever. The owner sends `wait_closed` `{task, reason}` instead when it refuses the subscription (`reason: refused`), later removes the subscriber from `shared_with` (`reason: refused`), hands the task to another ship (`reason: handed_off`, with `owner` naming the new owner), or is retired (`reason: retired`). `wait_closed` is not a final status and reports none.
 3. **Resume.** The waiting home verifies the notice (below), records the satisfied wait in its own transaction, and the scheduler resumes the task with the far status in the resume reason. A `cancelled` status, or a `wait_closed` notice, faults the waiting task; it never resumes as if the dependency succeeded.
+
+   A `task_end` names the far task, not the subscriber's task, so it resolves every waiting task of the addressed ship whose wait names that far ship and task. The resolution is recorded on the wait (`wait.end`), and the task is checked at once: a `done` reopens it as `ready`, with `resumed_by` (shown in `work.status`, bearings and the next offer's prompt) naming the far task and its status. Anything else marks the schedule `fault` with the reason, which raises the scheduling-fault notice to the ship and appears among the captain's needs, as every scheduling fault does. A resolved wait no longer matches, so a repeated `task_end` or a later `wait_closed` changes nothing.
 
 `wait_subscribe`, `wait_unsubscribe`, `task_end` and `wait_closed` are runtime-to-runtime. They are handled before any inbox is written, so they never wake the owner's first mate and never appear as mail. They are reserved the way `request_end` is (`src/mail.rs`, the reserved-payload check near line 1091): an agent's `mail.send` that sets any of these keys is refused, so only the runtime can author them. The notices ride the existing outbox and peer link; no new transport.
 
@@ -43,6 +45,10 @@ The link authenticates a machine, not a ship. A notice is accepted only when all
 - The subscription row matches. The owner accepts a `wait_subscribe` only for a task that exists and is shared with that subscriber. The waiting home accepts a `task_end` or `wait_closed` only for a task whose wait names this far task, so unsolicited reports resume nothing.
 - For `task_end`, `task` matches the wait and `status` is one of `done` or `cancelled`.
 
+A dropped notice is still accepted on the wire, so it never holds up the peer's queue, and is audited as `wait.dropped` with why (`no_wait`, `via` or `status`). A malformed one (no task, two instructions, a non-string field) is refused.
+
+At defer time the ref must name a ship this home reaches through a peer by the route the ref gives: without `machine`, a peer to another home on this machine; with `machine`, that machine's link. A ship hosted by this home is refused (use `task`), as is a ship on another machine named without its machine, so a wait cannot be set that no notice could ever satisfy. The stored wait holds `kind`, `reason` and `ref` only: a resolution in the caller's arguments is not kept.
+
 On one machine this is the same trust `request_end` already gets: the ship that sends is the one the ref names, and the machine is the one the link came in on.
 
 ## Visibility rule
@@ -56,7 +62,9 @@ What crosses the link is the final status and a short reason, and nothing else: 
 ## Unsubscribe and cleanup
 
 - The waiting task is cancelled, or re-deferred with a different ref: the waiting home sends `wait_unsubscribe` for the old subscription before it changes the wait. The owner deletes the row.
-- The waiting task ends by any other path (faulted, or its wait is manually stopped): the same unsubscribe is sent when the task leaves `waiting`.
+- The waiting task ends by any other path (faulted, or its wait is manually stopped): the same unsubscribe is sent when the task leaves `waiting`. Every schedule write compares the old and new record, so this covers a re-defer of any kind, a fresh `task.enqueue`, a park on a block ask, the captain's hold, a stopped ancestor, a lost charter authority, a check failure, the task finishing or being cancelled, and the task's handoff to a new owner. Cancelling, finishing or handing off the waiting task settles its schedule in the same transaction, so the unsubscribe is queued at once.
+- The owner hands its task to another ship (`task.accept`): the old owner, whom every ref names, will never report the end, so it sends each subscriber `wait_closed` with `reason: handed_off` and `owner` naming the new owner, and deletes its rows. The waiting task faults naming the new owner, so its first mate can re-wait on that ship (which must share the task again). An offer that is not accepted changes nothing.
+- The owner removes a ship from `shared_with`: that ship's subscriptions on the task are deleted and it is sent `wait_closed` with `reason: refused`, as a new subscription would be. Its waiting tasks fault.
 - The owner's task ends: the owner sends `task_end` once to each subscriber and deletes its subscription rows, so none outlive the task.
 - The owner ship is retired: the owner's home sends `wait_closed` with `reason: retired` to each subscriber before it stops delivering, then deletes its rows. The waiting task faults with that reason. A retired owner's task can never finish, so the wait must not resume.
 - The waiting ship is retired: `ship.retire` (`src/fleet.rs`) today only revokes the charter, stops the dispatcher and removes registry entries. It cancels no tasks and does not empty the outbox first. So retire gains a step: before stopping the dispatcher, send `wait_unsubscribe` for each remote wait (and `wait_closed` for each subscription it owns) and let the outbox drain. Its waiting tasks need no cancelling: with the charter revoked they are no longer eligible to run.
@@ -84,6 +92,10 @@ Staleness is the honest answer to "no next check": the runtime reports how long 
 | Owner ship retired | `wait_closed` `reason: retired` if the owner's home is still up, and the waiting task faults; otherwise the staleness path. |
 | Ship renamed or scope moved | The ref names the ship; the subscription fails with a clear refusal and the first mate re-defers with the new name. |
 | Far task not shared with this ship | `wait_closed` `reason: refused`, and the waiting task faults. Nothing about the task is revealed. |
+| Ship removed from `shared_with` while waiting | `wait_closed` `reason: refused`; the row is deleted and the waiting task faults. |
+| Far task handed to another ship | `wait_closed` `reason: handed_off`, naming the new owner; the waiting task faults, and its first mate re-waits on the new owner. |
+| Report from another ship, another machine, or with a non-final status | Dropped and audited (`wait.dropped`); nothing resumes. |
+| Repeated `task_end` or `wait_closed` | Nothing: the wait is already resolved. |
 
 ## Implementation order (not part of this task)
 

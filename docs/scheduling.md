@@ -83,6 +83,7 @@ Wait kinds:
 | `attention` | Future `until_ms` | Recheck then; the adapter supplies fresh attention or hands off to a fresh context |
 | `task` | Local task `ref` | Dependency becomes `done`; cancellation faults instead of pretending success |
 | `request` | This task's own open request `ref` | Correlated answer/approval; denial or withdrawal does not silently resume |
+| `remote` | Another ship's task `ref` `{ship, task, machine?}`, shared with this ship by its owner | The owner's `task_end` with `done`, pushed through the outbox; `cancelled` or a `wait_closed` faults. Never polled. See [cross-ship waits](design/cross-ship-waits.md) |
 | `manual` | Reason | Explicit new enqueue after new direction; never a timed auto-resume |
 
 All waits require a reason. Dependencies are checked for scheduling cycles.
