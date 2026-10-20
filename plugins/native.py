@@ -194,7 +194,12 @@ def build(harness, request):
         if effort:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
         if reviewer:
-            argv += ["-c", 'web_search="disabled"', "--ignore-user-config"]
+            argv += [
+                "-c", 'web_search="disabled"',
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--disable", "hooks",
+            ]
         if boolean(options, "ephemeral"):
             if resume or not headless:
                 raise ValueError("ephemeral requires a fresh headless run")
@@ -273,7 +278,7 @@ def build(harness, request):
         if headless:
             argv += ["--print", "--verbose", "--output-format", "stream-json"]
         if reviewer:
-            argv += ["--setting-sources", "user", "--strict-mcp-config", "--safe-mode"]
+            argv += ["--tools", "Read,Grep,Glob", "--setting-sources", "user", "--strict-mcp-config", "--safe-mode"]
         permissions = selector(options, "permission_mode", ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"])
         if permissions:
             argv += ["--permission-mode", permissions]
