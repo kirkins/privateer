@@ -34,9 +34,14 @@ def policy(value=None):
     return value
 
 
-def options_for(harness, options, value):
+def options_for(harness, options, value, role=None):
     value = policy(value)
     options = dict(options)
+    if role == "reviewer":
+        # A review reads code and writes nothing, whatever the fleet's mode.
+        if harness == "claude":
+            options["permission_mode"] = "dontAsk"
+        return options
     if harness == "claude":
         options.setdefault("permission_mode", "acceptEdits")
     if value["mode"] != "yolo":
@@ -76,6 +81,9 @@ def options_for(harness, options, value):
 CLAUDE_DETACHED = ["CronCreate", "ScheduleWakeup", "RemoteTrigger"]
 # A first mate delegates through crew jobs, not Claude's own agents or worktrees.
 CLAUDE_DELEGATION = ["Agent", "Task", "Workflow", "EnterWorktree"]
+# A reviewer reads the checked-out head: no shell, no writes, no network.
+CLAUDE_REVIEWER_ALLOWED = ["Read", "Grep", "Glob"]
+CLAUDE_REVIEWER_DISALLOWED = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]
 
 BUILTIN_FORGE_RULES = {
     "github": {
@@ -91,7 +99,7 @@ FORGE_ALIASES = {
 
 
 def charter_rules(actions, forge=None, role=None, errand=False, policy_value=None):
-    if role == "crew" or errand or not actions:
+    if role in ("crew", "reviewer") or errand or not actions:
         return []
     if isinstance(forge, list):
         forges = forge
@@ -118,7 +126,7 @@ def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship
 
     The classifier trusts settings, not what an agent reads in mail or notes,
     so a captain's standing grant must reach it here or it is asked again."""
-    if role == "crew" or errand or not (actions or authorized):
+    if role in ("crew", "reviewer") or errand or not (actions or authorized):
         return None
     allow = ["$defaults"]
     if "merge_green" in (actions or []):
@@ -172,6 +180,8 @@ def merge_auto_mode_settings(target_settings, incoming_settings):
 
 
 def claude_disallowed(role):
+    if role == "reviewer":
+        return CLAUDE_REVIEWER_DISALLOWED + CLAUDE_DETACHED + CLAUDE_DELEGATION
     return CLAUDE_DETACHED + (CLAUDE_DELEGATION if role == "first_mate" else [])
 
 
@@ -185,6 +195,8 @@ def claude_rules(value, control=None, actions=None, forge=None, role=None, erran
         role = value.get("role")
     if not errand and isinstance(value, dict):
         errand = value.get("errand", False)
+    if role == "reviewer":
+        return list(CLAUDE_REVIEWER_ALLOWED)
     cli = control["cli_argv"][0] if control else os.environ.get("PRIVATEER_CONTROL_CLI")
     extra_charter = charter_rules(actions, forge=forge, role=role, errand=errand, policy_value=pol)
     rules = ([f"Bash({cli}:*)"] if cli else []) + ["Bash(git *)", "Bash(gh *)"] + extra_charter + pol.get("claude_allow", [])
