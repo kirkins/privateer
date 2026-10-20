@@ -6,9 +6,10 @@
 //! old policy. The host reads each hosted pane's visible screen as plain text.
 //! When it shows the stop line, one captain notice per incident offers a
 //! relaunch. When it shows the stop line or a denial line, one block ask is
-//! raised for the incident. The screen
-//! names no tool, so the ask names it "unknown" until the transcript shape is
-//! captured.
+//! raised for the incident. The screen names no tool, so the ask names the
+//! tool uses refused since the last incident, with their reasons, from the
+//! pane's own Claude transcript (see `claude_denials`). When that cannot be
+//! read, the ask says the denied tool was not identified and offers no Allow.
 //!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
@@ -142,28 +143,49 @@ fn notice(ship: &str, finding: &Finding) -> String {
 /// screen raises nothing twice, and a readable screen with no block clears it.
 /// A ship without a duty task has nobody to tell.
 pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Result<Vec<Value>> {
+    alert_in(store, observed, crate::host::claude_projects().as_deref())
+}
+
+/// `alert`, reading pane transcripts under Claude's `projects` folder.
+fn alert_in(
+    store: &Store,
+    observed: &[(String, String, String)],
+    projects: Option<&std::path::Path>,
+) -> Result<Vec<Value>> {
     let mut raised = vec![];
     for (ship, _, screen) in observed {
         let tx = store.write_transaction()?;
         let Some(finding) = read(screen) else {
-            // An empty screen is a failed read, not a clear one.
+            // An empty screen is a failed read, not a clear one. A clear keeps
+            // when it was first seen: the next incident's denials come after it.
             if !screen.trim().is_empty() {
-                tx.execute("DELETE FROM hosted_automode WHERE ship=?1", [ship])?;
+                tx.execute(
+                    "UPDATE hosted_automode SET incident='', ms=?2 WHERE ship=?1 AND incident<>''",
+                    params![ship, Store::now_ms()],
+                )?;
             }
             tx.commit()?;
             continue;
         };
-        let launch: String = tx
+        let (launch, launched_ms): (String, i64) = tx
             .query_row(
-                "SELECT pid, started FROM hosted_panes WHERE ship=?1",
+                "SELECT pid, started, recorded_ms FROM hosted_panes WHERE ship=?1",
                 [ship],
                 |row| {
-                    Ok(format!(
-                        "{}:{}",
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?
+                    Ok((
+                        format!("{}:{}", row.get::<_, i64>(0)?, row.get::<_, String>(1)?),
+                        row.get(2)?,
                     ))
                 },
+            )
+            .optional()?
+            .unwrap_or_default();
+        // The last incident, or the clear after it, bounds this one's denials.
+        let last_ms: i64 = tx
+            .query_row(
+                "SELECT ms FROM hosted_automode WHERE ship=?1",
+                [ship],
+                |row| row.get(0),
             )
             .optional()?
             .unwrap_or_default();
@@ -211,10 +233,18 @@ pub(crate) fn alert(store: &Store, observed: &[(String, String, String)]) -> Res
         }
         if finding.lockout || count > 0 {
             if let Ok(task) = store.task(&duty_task) {
-                let (records, more) = block_ask::records(
-                    &[json!({"tool_name": "unknown", "tool_input": {}})],
-                    store.home().parent(),
-                );
+                let folder = store
+                    .home()
+                    .parent()
+                    .map(|f| f.canonicalize().unwrap_or(f.into()));
+                let denials = projects
+                    .zip(folder.as_deref())
+                    .and_then(|(projects, folder)| {
+                        crate::claude_denials::since(projects, folder, last_ms.max(launched_ms))
+                    })
+                    .filter(|denials| !denials.is_empty())
+                    .unwrap_or_else(|| vec![block_ask::unidentified()]);
+                let (records, more) = block_ask::records(&denials, folder.as_deref());
                 block_ask::raise(store, ship, &duty_task, &task, None, "pane", records, more)?;
             }
         }
@@ -398,6 +428,12 @@ mod tests {
         store.connection().query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
+    /// `alert` with no transcripts to read: no test reads the real
+    /// `~/.claude`.
+    fn alert(store: &Store, observed: &[(String, String, String)]) -> Result<Vec<Value>> {
+        alert_in(store, observed, None)
+    }
+
     fn launch(store: &Store, pid: i64, started: &str) {
         store
             .connection()
@@ -452,7 +488,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM hosted_automode"), 0);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM hosted_automode WHERE incident<>''"
+            ),
+            0
+        );
         assert_eq!(alert(&store, &observe(screen)).unwrap().len(), 1);
     }
 
@@ -516,6 +558,173 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// The pane's transcript, for the ship folder of `store`, under `projects`.
+    fn transcript(store: &Store, projects: &std::path::Path, lines: usize) {
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let dir = projects.join(crate::host::claude_project_name(&folder));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The pane works in the ship's folder.
+        let fixture = crate::claude_denials::tests::FIXTURE
+            .replace("/ships/sysadmin", folder.to_str().unwrap());
+        let text: Vec<&str> = fixture.lines().take(lines).collect();
+        std::fs::write(dir.join("pane.jsonl"), text.join("\n") + "\n").unwrap();
+    }
+
+    /// The one block ask raised for the ship.
+    fn ask(store: &Store) -> Value {
+        let (body, payload): (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT body, payload FROM mail WHERE json_extract(payload,'$.block') IS NOT NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let mut payload: Value = serde_json::from_str(&payload).unwrap();
+        payload["body"] = json!(body);
+        payload
+    }
+
+    fn option_ids(ask: &Value) -> Vec<String> {
+        ask["decision"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    const DENIED_SCREEN: &str =
+        "bash denied by auto mode · [Credential Materialization] · /permissions";
+
+    #[test]
+    fn a_classifier_denied_compound_command_is_named_and_offers_authorize() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // Only the credential copy: the prompt, its tool use and its refusal.
+        transcript(&store, projects.path(), 3);
+        let raised = alert_in(&store, &observe(DENIED_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1);
+        let ask = ask(&store);
+        let denial = &ask["block"]["denials"][0];
+        assert_eq!(denial["tool"], "Bash");
+        assert!(denial["rule"].is_null(), "{denial}");
+        assert_eq!(denial["reason"], "[Credential Materialization]");
+        let preview = denial["preview"].as_str().unwrap();
+        assert!(
+            preview.starts_with("cp ~/.config/sysadmin/registry.env"),
+            "{preview}"
+        );
+        assert!(preview.contains("REGISTRY_TOKEN=•••"), "{preview}");
+        assert!(!ask.to_string().contains("fake0token1value2"), "{ask}");
+        assert_eq!(option_ids(&ask), ["authorize", "without", "stop"]);
+        let text = ask["block"]["authorize"].as_str().unwrap();
+        assert_eq!(
+            text,
+            "Running cp and echo commands its assigned work needs, even when the auto-mode check flags them as Credential Materialization."
+        );
+        let body = ask["body"].as_str().unwrap();
+        assert!(
+            body.contains("(refused: [Credential Materialization])"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "privateer permissions authorize privateer '{text}'"
+            )),
+            "{body}"
+        );
+        assert!(!body.contains("unknown"), "{body}");
+    }
+
+    #[test]
+    fn a_simple_denied_command_offers_its_allow_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        // The pane launched after the credential copy, so only the later
+        // refusal is this incident's.
+        let launched = crate::routes::iso_timestamp_ms("2026-10-20T19:03:30Z").unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms)
+                 VALUES('privateer',10,'a','privateer',?1)",
+                [launched],
+            )
+            .unwrap();
+        transcript(&store, projects.path(), usize::MAX);
+        let screen = "│ 3 consecutive actions were blocked.\n│ Please review the transcript before continuing.";
+        assert_eq!(
+            alert_in(&store, &observe(screen), Some(projects.path()))
+                .unwrap()
+                .len(),
+            1
+        );
+        let ask = ask(&store);
+        let denials = ask["block"]["denials"].as_array().unwrap();
+        assert_eq!(denials.len(), 1, "{denials:?}");
+        assert_eq!(denials[0]["tool"], "Bash");
+        assert_eq!(denials[0]["rule"], "Bash(cargo publish *)");
+        assert_eq!(denials[0]["preview"], "cargo publish --dry-run");
+        assert_eq!(option_ids(&ask), ["allow", "without", "stop"]);
+        assert_eq!(
+            ask["decision"]["options"][0]["label"],
+            "Allow Bash(cargo publish *)"
+        );
+    }
+
+    #[test]
+    fn a_missing_transcript_names_no_tool_and_offers_no_allow() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        assert_eq!(
+            alert_in(&store, &observe(DENIED_SCREEN), Some(projects.path()))
+                .unwrap()
+                .len(),
+            1
+        );
+        let ask = ask(&store);
+        let denial = &ask["block"]["denials"][0];
+        assert_eq!(denial["tool"], "");
+        assert!(denial["rule"].is_null());
+        assert_eq!(denial["preview"], block_ask::UNIDENTIFIED);
+        assert_eq!(option_ids(&ask), ["without", "stop"]);
+        assert!(!ask.to_string().contains("unknown"), "{ask}");
+        let body = ask["body"].as_str().unwrap();
+        assert!(body.contains("denied tool not identified"), "{body}");
+    }
+
+    #[test]
+    fn the_next_incident_reads_only_denials_after_the_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        transcript(&store, projects.path(), usize::MAX);
+        let observed = observe(DENIED_SCREEN);
+        assert_eq!(
+            alert_in(&store, &observed, Some(projects.path()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(ask(&store)["block"]["denials"][0]["tool"], "Bash");
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        let (incident, ms): (String, i64) = store
+            .connection()
+            .query_row("SELECT incident, ms FROM hosted_automode", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(incident, "");
+        assert!(ms > 0);
     }
 
     #[test]

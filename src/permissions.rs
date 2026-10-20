@@ -429,12 +429,17 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
         }
     };
     let denials = if denials.is_empty() {
-        vec![json!({"tool_name": "unknown", "tool_input": {}})]
+        vec![crate::block_ask::unidentified()]
     } else {
         denials
     };
     let folder = store.home().parent().map(std::path::Path::to_path_buf);
     let (records, more) = crate::block_ask::records(&denials, folder.as_deref());
+    // A crew's or an errand's job is asked about as theirs, never as a wake.
+    let scope = match &job_id {
+        Some(job_id) => crate::block_ask::job_scope(store, job_id)?,
+        None => "wake",
+    };
     let tx = store.write_transaction()?;
     let raised = crate::block_ask::raise(
         store,
@@ -442,7 +447,7 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
         &task_id,
         &task,
         job_id.as_deref(),
-        "wake",
+        scope,
         records,
         more,
     )?;

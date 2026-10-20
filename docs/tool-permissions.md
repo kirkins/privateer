@@ -50,6 +50,30 @@ action against them, and they change nothing for ships that do not run in
 auto mode. A decision card whose denial has no narrower rule names this
 command.
 
+A first mate's Bash denial that is a script (a compound, multi-line or piped
+command no prefix rule covers), or that the auto-mode classifier refused, has
+no Allow option. Its card offers **Authorize** instead, with a suggested
+sentence built from the programs the command runs and the classifier's reason,
+for example "Running cp and echo commands its assigned work needs, even when
+the auto-mode check flags them as Credential Materialization." Tapping it
+records that sentence for the ship; an answer with its own text records the
+captain's wording instead, which must be one line of at most 500 characters
+(a longer or multi-line answer is refused when sent, and the card stays open).
+The suggestion names only the programs on the command's first line, up to any
+heredoc, so a heredoc's contents never reach it. The card's body also gives the
+matching `privateer permissions authorize SHIP '...'` command to edit and run.
+Only the captain's own answer authorizes, as with Allow. An authorization is
+that ship's alone: another ship's card with the same suggestion stays its own
+card, is never answered by it, and stays open until its own ship is
+authorized. Crew and errand cards never offer it, including a crew's job its
+first mate reports blocked, since they do not receive authorizations.
+
+When a hosted pane is stopped by auto mode, its card names the refused tool
+uses since the last incident and each one's reason, read from the end of the
+pane's own Claude transcript (`<Claude config>/projects/<folder>/*.jsonl`,
+never through a symlink). If that transcript cannot be read, the card says
+"denied tool not identified" and offers no Allow.
+
 Telegram supports `/yolo on`, `/yolo off`, and `/yolo status` through the existing
 authorized chat/user checks. This is a direct captain command, without inference
 or asking an agent to edit its own settings.

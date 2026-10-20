@@ -7,6 +7,7 @@ pub mod away;
 mod block_ask;
 mod bundled;
 pub mod captain;
+mod claude_denials;
 pub mod cli;
 pub mod context;
 pub mod core;
