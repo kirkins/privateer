@@ -263,9 +263,10 @@ fn jobs_of_tree(store: &Store, task: &str) -> Result<Vec<Value>> {
 /// Every agent job the ship ran at or after a time, oldest first: the
 /// fallback scope when the head branch is not one of ours. A job started
 /// earlier that was still running then counts too (a job still running has
-/// no finish recorded), so a rebase that moves the merge-base forward cannot
-/// drop the crews that wrote the code before it. How branches that are not
-/// ours should count crews beyond that is a captain decision.
+/// no finish recorded). That only rescues crews still running when the new
+/// merge-base commit was made: a rebase after a crew finished still moves
+/// the merge-base past it and drops it. How branches that are not ours
+/// should count earlier crews is a captain decision.
 fn jobs_since(store: &Store, since_ms: i64) -> Result<Vec<Value>> {
     let mut statement = store.connection().prepare(
         "SELECT record FROM jobs WHERE json_extract(record,'$.action')='spawn' \
