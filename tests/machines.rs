@@ -5226,3 +5226,120 @@ fn a_chunked_upload_whose_bytes_do_not_match_its_sha256_is_refused_on_the_other_
         "{committed}"
     );
 }
+
+#[test]
+fn an_agent_is_refused_at_every_gateway_file_command() {
+    let (_temp, _laptop, mac, _ssh) = fixture();
+    let agent = &[("PRIVATEER_ROLE", "agent"), ("PRIVATEER_ACTOR", "fitforge")];
+    for (command, args) in [
+        (
+            "file.begin",
+            json!({"ship": "fitforge", "name": "x", "bytes": 1, "sha256": "0".repeat(64)}),
+        ),
+        (
+            "file.append",
+            json!({"ship": "fitforge", "upload_id": "upload-x", "offset": 0, "data": "YQ=="}),
+        ),
+        (
+            "file.commit",
+            json!({"ship": "fitforge", "upload_id": "upload-x"}),
+        ),
+        (
+            "file.describe",
+            json!({"ship": "fitforge", "file_id": "file-x"}),
+        ),
+    ] {
+        let refused = mac.gateway_with(command, args, agent);
+        assert_eq!(refused["ok"], false, "{command}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("operator command"),
+            "{command}: {refused}"
+        );
+    }
+}
+
+#[test]
+fn another_ships_file_id_is_refused_across_machines_too() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("scout");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let source = laptop.root.join("plan.md");
+    fs::write(&source, b"plan").unwrap();
+    let put = laptop.ok_over(
+        "liaison",
+        "file.put",
+        json!({"to": "fitforge", "name": "plan.md", "content_file": source}),
+        &ssh,
+    );
+    // The captain cannot pass fitforge's file to scout, who lives on the same
+    // machine as fitforge: its machine says whose the file is.
+    let refused = laptop.run(
+        "liaison",
+        &[
+            "captain.send",
+            "--json",
+            &json!({"to": "scout", "body": "Plan.",
+                "payload": {"files": [{"file_id": put["file_id"]}]}})
+            .to_string(),
+        ],
+        Some(&ssh),
+    );
+    let said = text(&refused);
+    assert!(!refused.status.success(), "{said}");
+    assert!(said.contains("fitforge's, not scout's"), "{said}");
+    assert!(messages(&mac, "scout", "notice").is_empty());
+}
+
+#[test]
+fn files_cross_a_link_only_on_the_captains_mail_and_by_its_own_rows() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let source = laptop.root.join("plan.md");
+    fs::write(&source, b"plan").unwrap();
+    let put = laptop.ok_over(
+        "liaison",
+        "file.put",
+        json!({"to": "fitforge", "name": "plan.md", "content_file": source}),
+        &ssh,
+    );
+    let file_id = put["file_id"].clone();
+
+    // A ship's delivered mail cannot carry files: the wake would show them.
+    let refused = mac.gateway(
+        "mail.deliver",
+        json!({"id": "liaison-files", "from": "liaison", "to": "fitforge",
+            "kind": "notice", "body": "Look.",
+            "payload": {"files": [{"file_id": file_id}]}}),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("captain's"),
+        "{refused}"
+    );
+    assert!(messages(&mac, "fitforge", "notice").is_empty());
+
+    // The captain's mail may, and the home that reads it keeps only what its
+    // own rows say: a forged path does not survive the crossing.
+    let delivered = mac.gateway(
+        "mail.deliver",
+        json!({"id": "captain-files", "from": "captain", "to": "fitforge",
+            "kind": "notice", "body": "Plan attached.",
+            "payload": {"files": [{"file_id": file_id, "name": "plan.md", "bytes": 4,
+                "type": "text/markdown", "path": "/home/kirkins/.ssh/id_ed25519"}]}}),
+    );
+    assert_eq!(delivered["ok"], true, "{delivered}");
+    let mail = messages(&mac, "fitforge", "notice");
+    let file = &mail[0]["payload"]["files"][0];
+    assert_eq!(file["file_id"], file_id, "{mail:?}");
+    assert_eq!(file["path"], put["path"], "{mail:?}");
+    assert!(
+        file["path"].as_str().unwrap().contains("fitforge"),
+        "{mail:?}"
+    );
+    assert_eq!(fs::read(file["path"].as_str().unwrap()).unwrap(), b"plan");
+}

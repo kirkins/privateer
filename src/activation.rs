@@ -460,16 +460,9 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
                  answer it in that thread, or withdraw or update it with mail.withdraw or mail.send"
             ));
         }
-        // The captain's files are named, sized and placed where the ship reads them.
-        if payload.contains("\"files\"")
-            && let Ok(parsed) = serde_json::from_str::<Value>(&payload)
-        {
-            summary.push_str(&crate::files::summary(&parsed));
-        }
-        // A crew report's body already states its payload.
-        if from != crate::mail::CREW && payload != "{}" && payload.len() <= 1024 {
-            summary.push_str(&format!("\n  payload {payload}"));
-        }
+        // The captain's files are named, sized and placed where the ship
+        // reads them; no other sender's mail carries them.
+        summary.push_str(&payload_lines(&from, &payload));
         let message = json!({"id": id, "from": from, "correlation": correlation,
             "task_id": r.get::<_, Option<String>>(9)?});
         Ok((
@@ -492,6 +485,32 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
         mail.push(item);
     }
     Ok(mail)
+}
+
+/// The payload part of one mail item's summary: the files a captain's mail
+/// carries, one line each, and the payload line for what is left. Files are
+/// the captain's alone, and they never ride the generic payload line, or a
+/// small mail would show them twice.
+fn payload_lines(from: &str, payload: &str) -> String {
+    let mut lines = String::new();
+    let mut rest = payload.to_string();
+    if payload.contains("\"files\"")
+        && let Ok(parsed) = serde_json::from_str::<Value>(payload)
+    {
+        if from == crate::mail::CAPTAIN {
+            lines.push_str(&crate::files::summary(&parsed));
+        }
+        let mut without = parsed;
+        if let Some(fields) = without.as_object_mut() {
+            fields.remove("files");
+        }
+        rest = without.to_string();
+    }
+    // A crew report's body already states its payload.
+    if from != crate::mail::CREW && rest != "{}" && rest.len() <= 1024 {
+        lines.push_str(&format!("\n  payload {rest}"));
+    }
+    lines
 }
 
 /// The changing part of a wake prompt, appended after the stable brief:
@@ -1497,5 +1516,37 @@ mod tests {
         let idle = wakes[2]["output_idle_ms"].as_i64().unwrap();
         assert!(idle >= 36 * 60 * 1000);
         assert_eq!(idle_duration(idle), "36m");
+    }
+
+    #[test]
+    fn the_wake_names_files_only_on_the_captains_mail_and_once() {
+        let files = r#"{"about":"charts","files":[{"file_id":"file-1","name":"plan.md",
+            "bytes":4,"type":"text/markdown","path":"/ships/apps/files/file-1/plan.md"}]}"#;
+        // The captain's mail: one file line, and a payload line without them.
+        let captain = payload_lines("captain", files);
+        assert!(
+            captain.contains("file plan.md (4 bytes, text/markdown)"),
+            "{captain}"
+        );
+        assert!(
+            captain.contains("/ships/apps/files/file-1/plan.md"),
+            "{captain}"
+        );
+        assert!(captain.contains("payload"), "{captain}");
+        assert!(!captain.contains("\"files\""), "{captain}");
+
+        // Another sender's mail shows no file line at all, whatever its
+        // payload claims, and its payload line carries only the rest.
+        let ship = payload_lines("apps", files);
+        assert!(!ship.contains("file plan.md"), "{ship}");
+        assert!(ship.contains("charts"), "{ship}");
+        assert!(!ship.contains("\"files\""), "{ship}");
+
+        // Files alone leave no payload line behind.
+        let only = r#"{"files":[{"file_id":"file-1","name":"plan.md","bytes":4,
+            "type":"text/markdown","path":"/p"}]}"#;
+        assert_eq!(payload_lines("captain", only).matches('\n').count(), 1);
+        // A crew report's body already states its payload.
+        assert_eq!(payload_lines("crew", files), "");
     }
 }

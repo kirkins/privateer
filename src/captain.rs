@@ -389,9 +389,6 @@ fn answer(args: &Value) -> Result<Value> {
             message[key] = value.clone();
         }
     }
-    if let Some(payload) = message.get_mut("payload") {
-        crate::files::resolve_elsewhere(ask["from"].as_str().unwrap_or_default(), payload)?;
-    }
     let sent = crate::dispatch(&mut target, "mail.send", message)?;
     let record = json!({"id": item.id, "ship": item.ship, "to": ask["from"], "reply": sent["id"]});
     target.audit("captain.reply", &record)?;
@@ -430,7 +427,6 @@ fn send(args: &Value) -> Result<Value> {
     }
     if let Some(payload) = args.get("payload").filter(|v| !v.is_null()) {
         message["payload"] = payload.clone();
-        crate::files::resolve_elsewhere(to, &mut message["payload"])?;
     }
     let mut store = Store::open(&home)?;
     let sent = crate::dispatch(&mut store, "mail.send", message)?;

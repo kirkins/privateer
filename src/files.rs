@@ -9,15 +9,19 @@
 //! gateway's 1 MiB line), and `file.commit` checks the size and sha256 before
 //! the file is made. An upload nobody commits expires and is cleaned up.
 //!
-//! The captain's mail names files as `payload.files: [{file_id}]`. The runtime
-//! fills each one in with its name, size, type and `path`, after checking the
-//! file belongs to the ship the mail is for. A ship reads a file from `path`.
+//! The captain's mail names files as `payload.files: [{file_id}]`, nothing
+//! more: every other field is the runtime's. `mail.send` checks each entry
+//! and fills it in — from the home that hosts the ship when it is on this
+//! machine, else by asking that machine with `file.describe` — and mail that
+//! crosses a machine link is checked again where it lands, against the rows
+//! of the home that reads it. A ship reads a file from `path`.
 use crate::machines;
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,12 +30,25 @@ const CAPTAIN: &str = crate::mail::CAPTAIN;
 pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 /// Stored files kept per ship; the oldest beyond this are removed.
 const KEEP_PER_SHIP: i64 = 200;
+/// The bytes one ship's stored files may total; the oldest beyond it go.
+const SHIP_FILE_BUDGET_BYTES: i64 = 1024 * 1024 * 1024;
 /// The raw bytes one `file.append` carries.
 const CHUNK_BYTES: usize = 512 * 1024;
 /// How long an upload may wait for its commit before it is cleaned up.
 const UPLOAD_TTL_MS: i64 = 60 * 60 * 1000;
 const MAX_NAME_CHARS: usize = 128;
 const MAX_FILES_PER_MESSAGE: usize = 20;
+
+thread_local! {
+    /// The files runtime's clock, so a test can try expiry and pruning order
+    /// by moving its own thread's time without touching anything real.
+    static CLOCK_SHIFT_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// The clock the files runtime runs on.
+fn now_ms() -> i64 {
+    CLOCK_SHIFT_MS.with(|shift| Store::now_ms() + shift.get())
+}
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -105,6 +122,17 @@ fn local_home(ship: &str) -> Result<Option<PathBuf>> {
         .map(|(_, home)| home))
 }
 
+/// Whether this store's home is the one that hosts `ship`: its own record
+/// says it lives here, so its files are this store's rows.
+fn hosted_here(store: &Store, ship: &str) -> Result<bool> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM ships WHERE name=?1
+               AND json_extract(record,'$.location')='here')",
+        [ship],
+        |r| r.get(0),
+    )?)
+}
+
 fn staging_dir(home: &Path) -> PathBuf {
     home.join("files").join("uploads")
 }
@@ -122,6 +150,39 @@ fn entry(home: &Path, file_id: &str, name: &str, bytes: u64, mime: &str) -> Valu
         "path": stored_path(home, file_id, name)})
 }
 
+/// Why a file this home does not hold cannot ride mail for `ship`: another
+/// ship owns it, or it is `ship`'s but lives in `ship`'s home, not this one —
+/// which names both ships either way. `home` names this home's own ship.
+fn foreign_error(file_id: &str, owner: &str, ship: &str, home: Option<&str>) -> String {
+    if owner == ship {
+        return match home {
+            Some(home) => format!(
+                "file {file_id} is {ship}'s, in {ship}'s home on this machine, \
+                 not in {home}'s; write the captain's mail to {ship} in its own home"
+            ),
+            None => format!(
+                "file {file_id} is {ship}'s, in {ship}'s home on this machine, \
+                 not in this one; write the captain's mail to {ship} in its own home"
+            ),
+        };
+    }
+    format!("file {file_id} is {owner}'s, not {ship}'s")
+}
+
+/// This home's own ship, the one whose mail it holds.
+fn home_ship(store: &Store) -> Option<String> {
+    store
+        .connection()
+        .query_row(
+            "SELECT name FROM ships WHERE json_extract(record,'$.location')='here' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
 /// A stored file for `ship`, from this home. Another ship's file is refused by
 /// name, and an unknown one likewise.
 fn lookup(store: &Store, ship: &str, file_id: &str) -> Result<Value> {
@@ -137,9 +198,16 @@ fn lookup(store: &Store, ship: &str, file_id: &str) -> Result<Value> {
     let Some((owner, name, bytes, mime)) = found else {
         let owner = owner_elsewhere(file_id, store.home())
             .with_context(|| format!("no file {file_id} on this machine"))?;
-        bail!("file {file_id} is {owner}'s, not {ship}'s");
+        bail!(
+            "{}",
+            foreign_error(file_id, &owner, ship, home_ship(store).as_deref())
+        );
     };
-    ensure!(owner == ship, "file {file_id} is {owner}'s, not {ship}'s");
+    ensure!(
+        owner == ship,
+        "{}",
+        foreign_error(file_id, &owner, ship, home_ship(store).as_deref())
+    );
     Ok(entry(store.home(), file_id, &name, bytes as u64, &mime))
 }
 
@@ -193,8 +261,11 @@ fn filled(file: &Value) -> bool {
 }
 
 /// Check `payload.files` on mail the captain sends, which only the operator
-/// writes. Each entry is filled in from this home when the ship is here. An
-/// entry the desk already filled in from a linked machine is kept as it is.
+/// writes: each entry names a file as `{file_id}` alone, and the runtime
+/// fills in the rest. A ship hosted in this home has its file read from this
+/// store's own row; a ship behind a machine link is asked there with
+/// `file.describe`, so the mail leaves carrying the path the ship will read.
+/// A caller never supplies the filled-in fields, whatever the ship's home.
 pub(crate) fn check_files(store: &Store, from: &str, to: &str, payload: &mut Value) -> Result<()> {
     let Some(files) = payload.get("files") else {
         return Ok(());
@@ -203,45 +274,43 @@ pub(crate) fn check_files(store: &Store, from: &str, to: &str, payload: &mut Val
         from == CAPTAIN,
         "payload.files is the captain's, on mail to a ship"
     );
+    let hosted = hosted_here(store, to)?;
     let mut checked = vec![];
     for file in references(files)? {
         let file_id = file["file_id"].as_str().unwrap_or_default();
-        if file.get("path").is_some() {
-            ensure!(filled(file), "payload.files entry {file_id} is incomplete");
-            checked.push(file.clone());
+        ensure!(
+            file.as_object().is_some_and(|fields| fields.len() == 1),
+            "payload.files entry {file_id} carries more than file_id; \
+             name a file as {{file_id}} and the runtime fills in the rest"
+        );
+        checked.push(if hosted {
+            lookup(store, to, file_id)?
         } else {
-            checked.push(lookup(store, to, file_id)?);
-        }
+            machines::ship_call(to, "file.describe", json!({"ship": to, "file_id": file_id}))?
+        });
     }
     payload["files"] = Value::Array(checked);
     Ok(())
 }
 
-/// Fill in `payload.files` for a ship on a linked machine, from that machine's
-/// files, so the mail written here carries what the ship will read. A ship on
-/// this machine is filled in when its mail is written.
-pub(crate) fn resolve_elsewhere(to: &str, payload: &mut Value) -> Result<()> {
+/// Check `payload.files` on the captain's mail that crossed a machine link:
+/// the machine that sent it filled each entry in, and this home, which hosts
+/// the ship, replaces every one with what its own rows say, so nothing the
+/// sending side wrote about a file's place is kept.
+pub(crate) fn check_delivered(store: &Store, to: &str, payload: &mut Value) -> Result<()> {
     let Some(files) = payload.get("files") else {
         return Ok(());
     };
-    let files = references(files)?.clone();
-    if local_home(to)?.is_some() {
-        return Ok(());
-    }
-    let mut resolved = vec![];
-    for file in files {
-        if file.get("path").is_some() {
-            resolved.push(file);
-            continue;
-        }
+    let mut checked = vec![];
+    for file in references(files)? {
         let file_id = file["file_id"].as_str().unwrap_or_default();
-        resolved.push(machines::ship_call(
-            to,
-            "file.describe",
-            json!({"ship": to, "file_id": file_id}),
-        )?);
+        ensure!(
+            file.get("path").is_none() || filled(file),
+            "payload.files entry {file_id} is incomplete"
+        );
+        checked.push(lookup(store, to, file_id)?);
     }
-    payload["files"] = Value::Array(resolved);
+    payload["files"] = Value::Array(checked);
     Ok(())
 }
 
@@ -446,9 +515,10 @@ fn upload(store: &Store, ship: &str, args: &Value) -> Result<Upload> {
         .with_context(|| format!("no upload {id} for {ship}; it may have expired"))
 }
 
-/// Remove uploads nobody committed in time, with what they staged.
+/// Remove uploads nobody committed in time, with what they staged, and any
+/// staged part whose row is gone (a crash between staging and recording).
 fn sweep_uploads(store: &Store) -> Result<()> {
-    let cutoff = Store::now_ms() - UPLOAD_TTL_MS;
+    let cutoff = now_ms() - UPLOAD_TTL_MS;
     let expired: Vec<String> = {
         let mut statement = store
             .connection()
@@ -464,6 +534,26 @@ fn sweep_uploads(store: &Store) -> Result<()> {
     store
         .connection()
         .execute("DELETE FROM file_uploads WHERE created_ms < ?1", [cutoff])?;
+    // A staged part with no row is debris: nothing refers to it, and the
+    // folder it waits in is this home's own.
+    let live: HashSet<String> = store
+        .connection()
+        .prepare("SELECT upload_id FROM file_uploads")?
+        .query_map([], |r| {
+            Ok(staging_path(store.home(), &r.get::<_, String>(0)?)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default())
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if let Ok(entries) = fs::read_dir(staging_dir(store.home())) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !live.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -482,12 +572,13 @@ fn begin(store: &Store, ship: &str, args: &Value) -> Result<Value> {
     store.connection().execute(
         "INSERT INTO file_uploads(upload_id,ship,name,bytes,sha256,received,created_ms)
          VALUES(?1,?2,?3,?4,?5,0,?6)",
-        params![id, ship, name, bytes as i64, sha256, Store::now_ms()],
+        params![id, ship, name, bytes as i64, sha256, now_ms()],
     )?;
     Ok(json!({"upload_id": id}))
 }
 
 fn append(store: &Store, ship: &str, args: &Value) -> Result<Value> {
+    sweep_uploads(store)?;
     let upload = upload(store, ship, args)?;
     let offset = args["offset"]
         .as_u64()
@@ -519,6 +610,7 @@ fn append(store: &Store, ship: &str, args: &Value) -> Result<Value> {
 }
 
 fn commit(store: &Store, ship: &str, args: &Value) -> Result<Value> {
+    sweep_uploads(store)?;
     let upload = upload(store, ship, args)?;
     let staged = staging_path(store.home(), &upload.id);
     ensure!(
@@ -545,7 +637,7 @@ fn commit(store: &Store, ship: &str, args: &Value) -> Result<Value> {
     let tx = store.write_transaction()?;
     tx.execute(
         "INSERT INTO files(file_id,ship,name,bytes,type,sha256,created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![file_id, ship, upload.name, bytes as i64, mime, sha256, Store::now_ms()],
+        params![file_id, ship, upload.name, bytes as i64, mime, sha256, now_ms()],
     )?;
     tx.execute("DELETE FROM file_uploads WHERE upload_id=?1", [&upload.id])?;
     let pruned = prune(&tx, ship)?;
@@ -564,18 +656,29 @@ fn commit(store: &Store, ship: &str, args: &Value) -> Result<Value> {
     Ok(entry(store.home(), &file_id, &upload.name, bytes, mime))
 }
 
-/// Keep the newest files per ship; the rows beyond that go, and their ids are
-/// returned so their folders can follow.
+/// Keep each ship's newest files, within both its count and its bytes: the
+/// rows beyond either go, oldest first, and their ids are returned so their
+/// folders can follow.
 fn prune(tx: &Transaction, ship: &str) -> Result<Vec<String>> {
-    let stale: Vec<String> = {
+    let rows: Vec<(String, i64)> = {
         let mut statement = tx.prepare(
-            "SELECT file_id FROM files WHERE ship=?1 AND file_id NOT IN
-               (SELECT file_id FROM files WHERE ship=?1 ORDER BY created_ms DESC, rowid DESC LIMIT ?2)",
+            "SELECT file_id, bytes FROM files WHERE ship=?1 ORDER BY created_ms ASC, rowid ASC",
         )?;
         statement
-            .query_map(params![ship, KEEP_PER_SHIP], |r| r.get(0))?
+            .query_map([ship], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
+    let mut total: i64 = rows.iter().map(|(_, bytes)| bytes).sum();
+    let mut count = rows.len() as i64;
+    let mut stale = vec![];
+    for (file_id, bytes) in rows {
+        if count <= KEEP_PER_SHIP && total <= SHIP_FILE_BUDGET_BYTES {
+            break;
+        }
+        stale.push(file_id);
+        total -= bytes;
+        count -= 1;
+    }
     for file_id in &stale {
         tx.execute("DELETE FROM files WHERE file_id=?1", [file_id])?;
     }
@@ -689,6 +792,17 @@ mod tests {
         (temp, store)
     }
 
+    /// A store that plays a home hosting `ship`, as its own record says.
+    fn hosting(store: &Store, ship: &str) {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO ships(name, record) VALUES(?1, ?2)",
+                params![ship, json!({"name": ship, "location": "here"}).to_string()],
+            )
+            .unwrap();
+    }
+
     fn begin_upload(store: &Store, name: &str, bytes: u64, sha256: &str) -> String {
         let begun = begin(
             store,
@@ -783,6 +897,46 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_upload_is_refused_at_append_and_commit_and_cleaned() {
+        let (_temp, store) = scratch();
+        let id = begin_upload(&store, "a.txt", 5, &"0".repeat(64));
+        append(
+            &store,
+            "apps",
+            &json!({"upload_id": id, "offset": 0, "data": base64_encode(b"he")}),
+        )
+        .unwrap();
+        // An hour passes: the upload is gone, its staging with it.
+        CLOCK_SHIFT_MS.with(|shift| shift.set(UPLOAD_TTL_MS + 1000));
+        let refused = append(
+            &store,
+            "apps",
+            &json!({"upload_id": id, "offset": 2, "data": base64_encode(b"ll")}),
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("may have expired")
+        );
+        assert!(!staging_path(store.home(), &id).exists());
+        let gone = commit(&store, "apps", &json!({"upload_id": id}));
+        assert!(gone.unwrap_err().to_string().contains("may have expired"));
+        CLOCK_SHIFT_MS.with(|shift| shift.set(0));
+    }
+
+    #[test]
+    fn a_staged_part_with_no_row_is_removed_by_the_next_sweep() {
+        let (_temp, store) = scratch();
+        let dir = staging_dir(store.home());
+        fs::create_dir_all(&dir).unwrap();
+        let stray = dir.join("upload-stray.part");
+        fs::write(&stray, b"debris").unwrap();
+        begin_upload(&store, "a.txt", 1, &"0".repeat(64));
+        assert!(!stray.exists());
+    }
+
+    #[test]
     fn each_ship_keeps_its_newest_files_and_no_more() {
         let (_temp, store) = scratch();
         let tx = store.write_transaction().unwrap();
@@ -820,8 +974,51 @@ mod tests {
     }
 
     #[test]
+    fn a_ships_files_stay_within_its_bytes_oldest_first() {
+        let (_temp, store) = scratch();
+        let tx = store.write_transaction().unwrap();
+        // Three files of 600 MiB each: the two oldest go so the newest fit.
+        for (i, bytes) in [600, 600, 600].into_iter().enumerate() {
+            tx.execute(
+                "INSERT INTO files(file_id,ship,name,bytes,type,sha256,created_ms)
+                 VALUES(?1,'apps','a',?2,'t','x',?3)",
+                params![format!("file-{i:03}"), bytes * 1024 * 1024, i as i64],
+            )
+            .unwrap();
+        }
+        let pruned = prune(&tx, "apps").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(pruned, ["file-000", "file-001"]);
+        let kept: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COALESCE(SUM(bytes),0)/1048576 FROM files WHERE ship='apps'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 600);
+    }
+
+    #[test]
+    fn foreign_files_are_refused_naming_both_ships() {
+        // Another ship's file names its owner and the mail's ship.
+        let refused = foreign_error("file-x", "apps", "infra", Some("infra"));
+        assert_eq!(refused, "file file-x is apps's, not infra's");
+        // A file that is the ship's own, read from a home that is not its:
+        // both ships are named, and neither is blamed twice.
+        let misplaced = foreign_error("file-x", "apps", "apps", Some("infra"));
+        assert!(misplaced.contains("apps's home"), "{misplaced}");
+        assert!(misplaced.contains("not in infra's"), "{misplaced}");
+        assert!(!misplaced.contains("apps's, not apps's"), "{misplaced}");
+        let unnamed = foreign_error("file-x", "apps", "apps", None);
+        assert!(unnamed.contains("not in this one"), "{unnamed}");
+    }
+
+    #[test]
     fn mail_fills_in_only_the_ships_own_files() {
         let (_temp, store) = scratch();
+        hosting(&store, "apps");
         let id = begin_upload(&store, "plan.md", 2, &digest(&b"ok"[..]).unwrap().1);
         append(
             &store,
@@ -830,7 +1027,7 @@ mod tests {
         )
         .unwrap();
         let stored = commit(&store, "apps", &json!({"upload_id": id})).unwrap();
-        let file_id = stored["file_id"].as_str().unwrap();
+        let file_id = stored["file_id"].as_str().unwrap().to_string();
 
         let mut payload = json!({"files": [{"file_id": file_id}]});
         check_files(&store, CAPTAIN, "apps", &mut payload).unwrap();
@@ -838,15 +1035,27 @@ mod tests {
         assert_eq!(payload["files"][0]["path"], stored["path"]);
         assert_eq!(payload["files"][0]["type"], "text/markdown");
 
-        let mut other = json!({"files": [{"file_id": file_id}]});
-        let refused = check_files(&store, CAPTAIN, "infra", &mut other);
-        assert!(refused.unwrap_err().to_string().contains("not infra's"));
+        // A caller never fills an entry in, not even with the true fields.
+        let mut filled = json!({"files": [{"file_id": file_id, "name": "plan.md",
+            "bytes": 2, "type": "text/markdown", "path": "/etc/passwd"}]});
+        let refused = check_files(&store, CAPTAIN, "apps", &mut filled);
+        let said = refused.unwrap_err().to_string();
+        assert!(said.contains("carries more than file_id"), "{said}");
+        let mut extra = json!({"files": [{"file_id": file_id, "secret": 1}]});
+        assert!(check_files(&store, CAPTAIN, "apps", &mut extra).is_err());
         let mut unknown = json!({"files": [{"file_id": "file-missing"}]});
         let refused = check_files(&store, CAPTAIN, "apps", &mut unknown);
         assert!(refused.unwrap_err().to_string().contains("file-missing"));
         let mut from_ship = json!({"files": [{"file_id": file_id}]});
         assert!(check_files(&store, "apps", "apps", &mut from_ship).is_err());
-        let mut extra = json!({"files": [{"file_id": file_id, "secret": 1}]});
-        assert!(check_files(&store, CAPTAIN, "apps", &mut extra).is_err());
+
+        // A captain's mail that crossed a link is filled in again from the
+        // rows of the home that reads it: a forged path does not survive.
+        let mut delivered = json!({"files": [{"file_id": file_id, "name": "plan.md",
+            "bytes": 2, "type": "text/markdown", "path": "/home/x/.ssh/id_ed25519"}]});
+        check_delivered(&store, "apps", &mut delivered).unwrap();
+        assert_eq!(delivered["files"][0]["path"], stored["path"]);
+        let mut foreign = json!({"files": [{"file_id": "file-missing"}]});
+        assert!(check_delivered(&store, "apps", &mut foreign).is_err());
     }
 }

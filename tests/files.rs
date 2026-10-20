@@ -195,6 +195,96 @@ fn only_the_captain_puts_files_and_a_ship_gets_only_its_own() {
 }
 
 #[test]
+fn a_filled_in_file_entry_is_refused_whatever_its_path() {
+    let (_temp, root) = fleet();
+    let plan = source(&root, "plan.md", b"plan");
+    let put = ok(run(
+        &root,
+        "apps",
+        false,
+        "file.put",
+        json!({"to": "apps", "name": "plan.md", "content_file": plan}),
+    ));
+    let file_id = put["file_id"].as_str().unwrap();
+
+    // A forged entry that names another ship's file with any path: the caller
+    // never fills an entry in, and the file is looked up by its id alone.
+    let forged = run(
+        &root,
+        "apps",
+        false,
+        "captain.send",
+        json!({"to": "apps", "body": "Plan.",
+            "payload": {"files": [{"file_id": file_id, "name": "plan.md", "bytes": 4,
+                "type": "text/markdown",
+                "path": "/home/kirkins/.ssh/id_ed25519"}]}}),
+    );
+    assert!(!forged.status.success(), "{}", text(&forged));
+    assert!(
+        text(&forged).contains("carries more than file_id"),
+        "{}",
+        text(&forged)
+    );
+    assert!(inbox(&root, "apps").is_empty());
+
+    // Any extra key is refused the same way, even one of the runtime's own.
+    let extra = run(
+        &root,
+        "apps",
+        false,
+        "captain.send",
+        json!({"to": "apps", "body": "Plan.",
+            "payload": {"files": [{"file_id": file_id, "name": "plan.md"}]}}),
+    );
+    assert!(!extra.status.success(), "{}", text(&extra));
+    assert!(
+        text(&extra).contains("carries more than file_id"),
+        "{}",
+        text(&extra)
+    );
+    assert!(inbox(&root, "apps").is_empty());
+}
+
+#[test]
+fn a_ships_own_file_read_from_a_home_that_claims_it_names_both_ships() {
+    let (_temp, root) = fleet();
+    let plan = source(&root, "plan.md", b"plan");
+    let put = ok(run(
+        &root,
+        "apps",
+        false,
+        "file.put",
+        json!({"to": "apps", "name": "plan.md", "content_file": plan}),
+    ));
+    let file_id = put["file_id"].as_str().unwrap();
+
+    // infra's home wrongly records apps as hosted there, as a stale directory
+    // entry can. The captain's mail to apps written in that home cannot carry
+    // apps's file, and the refusal names both ships, not apps twice.
+    let mut wrong_home = privateer::store::Store::open(&root.join("infra/.privateer")).unwrap();
+    privateer::dispatch(
+        &mut wrong_home,
+        "ship.put",
+        json!({"name": "apps", "location": "here"}),
+    )
+    .unwrap();
+    let misplaced = run(
+        &root,
+        "infra",
+        false,
+        "mail.send",
+        json!({"from": "captain", "to": "apps", "kind": "notice", "body": "Plan.",
+            "payload": {"files": [{"file_id": file_id}]}}),
+    );
+    let said = text(&misplaced);
+    assert!(!misplaced.status.success(), "{said}");
+    assert!(said.contains("apps's home"), "{said}");
+    assert!(said.contains("not in infra's"), "{said}");
+    assert!(!said.contains("apps's, not apps's"), "{said}");
+    assert!(inbox(&root, "apps").is_empty());
+}
+
+#[test]
 fn a_file_past_the_cap_is_refused_before_it_is_stored() {
     let (_temp, root) = fleet();
     let big = root.join("sources").join("big.bin");
