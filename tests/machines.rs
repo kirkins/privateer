@@ -4241,6 +4241,72 @@ fn the_ship_profile_of_a_ship_on_another_machine_is_asked_there() {
     assert_eq!(there["first_mate"]["harness"], "codex", "{there}");
 }
 
+/// A reply given where the ask was asked stays in the ship's own home; the
+/// closure that answers the desk's copy carries the reply too, so the
+/// captain's feed at the desk lists what the captain said, once, beside the
+/// ask it answers.
+#[test]
+fn a_reply_given_on_the_linked_machine_reaches_the_desks_feed() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the key?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+
+    // Answered where it was asked: the reply is recorded in scout's home only.
+    let replied = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+
+    // The desk's feed shows the reply once, correlated to the ask.
+    let feed = laptop.ok_over("liaison", "captain.feed", json!({"ship": "scout"}), &ssh);
+    let entries = feed["entries"].as_array().unwrap();
+    let replies: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["id"] == replied["id"])
+        .collect();
+    assert_eq!(replies.len(), 1, "{feed}");
+    assert_eq!(replies[0]["kind"], "reply", "{feed}");
+    assert_eq!(replies[0]["correlation"], asked["id"], "{feed}");
+    assert_eq!(replies[0]["body"], "Yes, rotate it", "{feed}");
+    assert_eq!(replies[0]["home"], "fitforge", "{feed}");
+    let asks: Vec<&Value> = entries.iter().filter(|e| e["id"] == asked["id"]).collect();
+    assert_eq!(asks.len(), 1, "{feed}");
+    assert_eq!(asks[0]["state"], "answered", "{feed}");
+    assert_eq!(asks[0]["answered_by"], replied["id"], "{feed}");
+
+    // Offered once: a repeated pass sends no closure or reply again.
+    collect_now(&laptop);
+    let again = laptop.pass("liaison", &ssh);
+    assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
+    let feed = laptop.ok_over("liaison", "captain.feed", json!({"ship": "scout"}), &ssh);
+    assert_eq!(
+        feed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["id"] == replied["id"])
+            .count(),
+        1,
+        "{feed}"
+    );
+}
+
 fn machine_row<'a>(snapshot: &'a Value, name: &str) -> &'a Value {
     snapshot["machines"]
         .as_array()

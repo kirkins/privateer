@@ -1914,13 +1914,26 @@ fn push_closures(
         return Ok(0);
     }
     let mut closures = vec![];
+    let mut bytes = 0;
     for member in crate::fleet::members(conn)? {
-        if !member.home.is_dir() || closures.len() >= COLLECT_LIMIT {
+        if !member.home.is_dir() || closures.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
             continue;
         }
         let store = Store::open(&member.home)?;
         let room = COLLECT_LIMIT - closures.len();
-        closures.extend(crate::mail::closed_captain(&store, peer, room)?);
+        for closure in crate::mail::closed_captain(&store, peer, room)? {
+            // A closure now carries the answer it records. Stop before the
+            // request outgrows one gateway line; the rest go next pass.
+            let size = closure.to_string().len();
+            if !closures.is_empty() && bytes + size > COLLECT_BYTES {
+                break;
+            }
+            bytes += size;
+            closures.push(closure);
+            if closures.len() >= COLLECT_LIMIT {
+                break;
+            }
+        }
     }
     if closures.is_empty() {
         return Ok(0);
