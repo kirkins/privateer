@@ -565,7 +565,9 @@ mod tests {
         let folder = store.home().parent().unwrap().canonicalize().unwrap();
         let dir = projects.join(crate::host::claude_project_name(&folder));
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = crate::claude_denials::tests::FIXTURE;
+        // The pane works in the ship's folder.
+        let fixture = crate::claude_denials::tests::FIXTURE
+            .replace("/ships/sysadmin", folder.to_str().unwrap());
         let text: Vec<&str> = fixture.lines().take(lines).collect();
         std::fs::write(dir.join("pane.jsonl"), text.join("\n") + "\n").unwrap();
     }

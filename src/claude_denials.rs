@@ -9,7 +9,10 @@
 //!
 //! Only the end of the newest few transcripts is read, a symlink is never
 //! followed, and a transcript the pane did not write (a headless run's) is
-//! skipped. The raw input is handed to `block_ask`, which masks it.
+//! skipped. Claude names a folder's transcripts by its path with every other
+//! character a dash, so `web-app` and `web_app` share one: only records whose
+//! `cwd` is the pane's folder, or inside it, are read. The raw input is handed
+//! to `block_ask`, which masks it.
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -55,9 +58,19 @@ pub(crate) fn since(projects: &Path, folder: &Path, since_ms: i64) -> Option<Vec
         files.truncate(CANDIDATES);
     }
     for (_, path) in files {
-        let Some(records) = tail(&path) else {
+        let Some(mut records) = tail(&path) else {
             continue;
         };
+        // Another folder whose name maps to the same transcripts is not the
+        // pane's.
+        records.retain(|r| {
+            r["cwd"]
+                .as_str()
+                .is_some_and(|cwd| Path::new(cwd).starts_with(folder))
+        });
+        if records.is_empty() {
+            continue;
+        }
         // A headless run (`claude -p`) in the same folder is not the pane.
         let marked = records.iter().any(|r| r["entrypoint"].is_string());
         if marked && !records.iter().any(|r| r["entrypoint"] == "cli") {
@@ -253,6 +266,32 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(since(linked.path(), folder, 0).is_none());
+    }
+
+    #[test]
+    fn a_folder_sharing_the_panes_transcript_name_is_not_the_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let ours = Path::new("/ships/web-app");
+        let theirs = Path::new("/ships/web_app");
+        assert_eq!(
+            crate::host::claude_project_name(ours),
+            crate::host::claude_project_name(theirs)
+        );
+        let dir = temp.path().join(crate::host::claude_project_name(ours));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("theirs.jsonl"),
+            FIXTURE.replace("/ships/sysadmin", "/ships/web_app"),
+        )
+        .unwrap();
+        assert!(since(temp.path(), ours, 0).is_none());
+        // Our own pane, working in a folder inside the ship's, is read.
+        std::fs::write(
+            dir.join("ours.jsonl"),
+            FIXTURE.replace("/ships/sysadmin", "/ships/web-app/src"),
+        )
+        .unwrap();
+        assert_eq!(since(temp.path(), ours, 0).unwrap().len(), 2);
     }
 
     #[test]
