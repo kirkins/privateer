@@ -91,7 +91,7 @@ It belongs here because it needs the same identity-to-route lookup as `choose`. 
 3. **The reviewer route still qualifies.** It must still be tier 1 with `review` in the current routes file. Tier is a minimum (captain answer 1).
 4. **The author set is worked out again now,** and the reviewer still passes the overlap rule (§2), in case a crew ran after the review.
 5. **The production rule** is copied from `delivery.check`: a merge flagged `deploys_production` uses up a matching approval.
-6. **The merge passes the expected head** (GitHub `sha`, Forgejo `head_commit_id`), so a push after step 1 makes the forge refuse it. The forge adapter passes `merge_method: "merge"`, the only supported method.
+6. **The merge passes the expected head** (GitHub `sha`, Forgejo `head_commit_id`), so a push after step 1 makes the forge refuse it. The forge adapter passes `merge_method: "merge"` for GitHub and `Do: "merge"` for Forgejo (plain merge is the only supported method).
 
 **The forge enforces it too.** Ships that skip `pr.merge` are stopped by branch protection (§5), which applies to admins with no override (captain answer 4).
 
@@ -110,7 +110,7 @@ It belongs here because it needs the same identity-to-route lookup as `choose`. 
 - If the head branch isn't one of ours, the scope is every agent job the ship ran since the merge-base commit was made. The merge-base is on the protected branch, so its time is trustworthy.
 
 **Each job lands in one of two classes:**
-- **`crew_models`**: every crew job in scope, plus any `author_routes` the ship declares. Declaring can only add. A declaration (`Declaration { job_id, route }` in `src/review/authors.rs`) is keyed to one job: it stands only for the job it names, must fit it (its harness matches the job, its model is one the job's alias names), and clears no job it does not name.
+- **`crew_models`**: every crew job in scope, plus any `author_routes` the ship declares. Declaring can only add. A declaration (`Declaration { job_id, route }` in `src/review/authors.rs`) is keyed to one job: it stands only for the job it names, must fit it (its harness matches the job, its model is one the job's alias names), and clears no job it does not name. Once #321 merges, a declared job's alias excludes every reviewer whose model carries it, whatever the version.
 - **`first_mate_models`**: the ship's first-mate profile, every route on its `first_mate` list, its wakes and its ordinary errands. Errands land here, as the design review asked.
 - A crew job whose model is unknown makes review refuse, naming the job, until the ship declares that job's route.
 
@@ -152,6 +152,7 @@ The runtime builds the whole prompt. It contains **no** ship note, pins, assignm
 **Output.** The last non-empty line must be exactly `VERDICT: APPROVE` or `VERDICT: CHANGES_REQUESTED`. Anything else counts as `none`.
 
 **Tools: a new `reviewer` role (`plugins/tool_permissions.py`), read-only, no network, no Privateer CLI.**
+- A reviewer launch is headless only (`plugins/native.py` refuses any other mode; PR #320).
 - Claude: `--allowedTools Read Grep Glob`, `--disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch` plus detached and delegation tools, `--tools Read,Grep,Glob`, `--setting-sources user`, `--strict-mcp-config`, `--safe-mode`, `--no-chrome`, and `--permission-mode dontAsk`.
 - Pi: `--tools read,grep,find,ls`, bare flags (`--no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files --no-themes`), and `--no-session`.
 - Codex: `--sandbox read-only`, `-c web_search="disabled"`, `--ignore-user-config`, `--ignore-rules`, `--disable hooks`.
@@ -166,7 +167,7 @@ The runtime builds the whole prompt. It contains **no** ship note, pins, assignm
 ## 4. Sol recognition, and the exact routes change for the captain
 
 **What the code must do.**
-- Pi already passes `--provider` and `--model` (`native.py:250`), and `route_of` already gives `pi/chatgpt-home/gpt-6.1-sol`.
+- Pi already passes `--provider` and `--model` (`plugins/native.py` `build`), and `route_of` already gives `pi/chatgpt-home/gpt-6.1-sol`.
 - New: a `review` list in `validate` and `order` (fleet-wide or per ship, `KINDS`).
 - New: `routes::model_key` normalisation.
 - New: `routes.set` warns when a route on a `review` list lacks tier 1 or the `review` use.
@@ -189,8 +190,8 @@ The same edit applies on the Mac and the server, where `sol` already exists: onl
 ## 5. Tokens and branch protection
 
 **GitHub, per repository** (kirkins/privateer, kirkins/quarterdeck, and others as the captain lists them):
-1. **[hands]** Create a reviewer machine account and add it as a write collaborator. Make a **classic** token with `repo` scope (fine-grained tokens likely can't reach another user's personal repo). Store it with `privateer credential.set --json '{"ref":"forge-reviewer-github"}'` (secret on stdin).
-2. **[hands]** Make a fine-grained token for kirkins: selected repos; Contents, Pull requests and Workflows read-write; Checks, Statuses and Actions read; **no Administration**. Replace the ship user's `gh` login with it (`gh auth login --with-token`), and store the same token as `forge-ship-github` with `credential.set`. Admin work moves to the browser. The SSH push key stays: it can't change settings.
+1. **[hands]** Create a reviewer machine account and add it as a write collaborator. Make a **classic** token with `repo` scope (fine-grained tokens likely can't reach another user's personal repo). Store it with `privateer credential.set --json '{"ref":"forge-reviewer-github"}'` (run in a terminal, paste at the no-echo prompt).
+2. **[hands]** Make a fine-grained token for kirkins: selected repos; Contents, Pull requests and Workflows read-write; Checks, Statuses and Actions read; **no Administration**. Replace the ship user's `gh` login with it (interactive `gh auth login` paste prompt), and store the same token as `forge-ship-github` with `credential.set` (paste at prompt). Admin work moves to the browser. The SSH push key stays: it can't change settings.
 3. **Crew:** a PR adds `.github/CODEOWNERS` with `* @<reviewer>`.
 4. **[hands]** In branch protection on `main`, turn on:
    - require a PR with 1 approval and Code Owner review (`require_code_owner_reviews`);
@@ -201,7 +202,7 @@ The same edit applies on the Mac and the server, where `sol` already exists: onl
    `forges.set` reads this back through `plugins/forge.py protection.read` and warns about anything missing.
 
 **Forgejo, per repository** (git.lobbykit.net/hermes/*):
-1. **[hands]** Create `reviewer`, `merger` and `ships` users, all as non-admin write collaborators (not site admins). Ships' API tokens move to `ships`. Store `forge-reviewer-forgejo` and `forge-merger-forgejo` with `credential.set`.
+1. **[hands]** Create `reviewer`, `merger` and `ships` users, all as non-admin write collaborators (not site admins). Ships' API tokens move to `ships`. Store `forge-reviewer-forgejo` and `forge-merger-forgejo` with `credential.set` (paste at no-echo prompt).
 2. **[hands]** Set protection on the default branch:
    - `enable_push: false`, `apply_to_admins: true`;
    - `required_approvals: 1`, `enable_approvals_whitelist` with `[reviewer]`;
@@ -212,9 +213,9 @@ The same edit applies on the Mac and the server, where `sol` already exists: onl
 
 **Forge adapter (`plugins/forge.py`)**:
 - Protocol: `forge.py <op>` with request on stdin and JSON reply on stdout.
-- Operations: `pr.view`, `review.post` (with marker lookup for idempotency), `pr.merge` (`merge_method: "merge"`), `protection.read`.
+- Operations: `pr.view`, `review.post` (with marker lookup for idempotency), `pr.merge` (`merge_method: "merge"` on GitHub, `Do: "merge"` on Forgejo), `protection.read`.
 - Forge kind: explicit `forge` field (`github` or `forgejo`), passed from `forges.json`.
-- Token handling (fail closed): token read only from the file path named by `PRIVATEER_FORGE_TOKEN_FILE`. Passing tokens in the request or other environment variables is refused.
+- Token handling (fail closed): token read only from the file path named by `PRIVATEER_FORGE_TOKEN_FILE`. Other token environment variables (`PRIVATEER_FORGE_TOKEN`, `GITHUB_TOKEN`, `FORGEJO_TOKEN`) are ignored; passing tokens in the request (`token`, `token_file`) is refused.
 
 **Credential refs are never given to launches.** Any ref named in `forges.json` is refused by `tool_bundles::configure` and by `bundles.py credential_environment`.
 
@@ -226,7 +227,7 @@ The same edit applies on the Mac and the server, where `sol` already exists: onl
 - Files: `src/crew_routes.rs` (`review` kind, warnings, `choose_reviewer`), `src/routes.rs` (`model_key`, Pi/ChatGPT limit messages), new `src/review/authors.rs` (resolve task from branch, merge-base fallback, the two classes, `Declaration { job_id, route }`).
 - Verify: unit tests for `model_key`, the classes and the overlap ordering; `tests/crew_routes.rs` cases for no list, crew exclusion, a first-mate overlap allowed fresh, and an unknown crew job refused.
 
-**2. Read-only reviewer launch (Python).** [Merged, PRs #313, #316]
+**2. Read-only reviewer launch (Python).** [Merged, PRs #313, #316, #320]
 - Files: `plugins/tool_permissions.py` (`reviewer` role), `plugins/native.py` (Claude, Pi and Codex flags, `--no-session`).
 - Verify: plugin argv tests for each harness, showing no Bash, no Write, no control CLI and no resume; tool bundles refused.
 

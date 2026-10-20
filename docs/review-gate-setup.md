@@ -64,7 +64,13 @@ privateer routes show | jq 'del(.applied)
  | .review = ["sol", "opus"]' > ~/routes-new.json && privateer routes set ~/routes-new.json
 ```
 
-On machines where `sol` already exists (such as the server and the Mac), only update its `tier`, `uses`, and the `review` list.
+On machines where `sol` already exists (such as the server and the Mac), update only its `tier`, `uses`, and the `review` list instead of replacing the whole entry:
+```sh
+privateer routes show | jq 'del(.applied)
+ | .routes.sol.tier = 1
+ | .routes.sol.uses = ["review", "diagnose", "design", "implement"]
+ | .review = ["sol", "opus"]' > ~/routes-new.json && privateer routes set ~/routes-new.json
+```
 
 > [!NOTE]
 > - Sol is kept off all `crew` lists so that it never runs as an author by accident.
@@ -84,11 +90,10 @@ Configures forge credentials, repository branch protections, and forge adapter s
 1. Create a dedicated machine account on GitHub (for example, `<reviewer-account>`).
 2. Add the machine account to the repository as a collaborator with **Write** access.
 3. Generate a **classic** personal access token for the reviewer account with `repo` scope (classic tokens ensure access across personal repositories).
-4. Store the token securely in Privateer's credential store:
+4. Store the token securely in Privateer's credential store (run in a terminal and paste the token at the prompt without echo; never pass secrets in command line arguments or pipes):
    ```sh
-   printf "%s" "<TOKEN>" | privateer credential.set --json '{"ref":"forge-reviewer-github"}'
+   privateer credential.set --json '{"ref":"forge-reviewer-github"}'
    ```
-   *(Or run interactively without piping: `privateer credential.set --json '{"ref":"forge-reviewer-github"}'` and enter the token at the hidden prompt).*
 
 #### 2. [hands] Create fine-grained ship token and restrict administration
 1. On the captain's account (`kirkins`), generate a fine-grained personal access token:
@@ -101,13 +106,14 @@ Configures forge credentials, repository branch protections, and forge adapter s
      - Checks: Read-only
      - Commit statuses: Read-only
      - **Administration: No access (None)**
-2. Replace the ship user's CLI login with this restricted token:
+2. Replace the ship user's CLI login with this restricted token via interactive login (never pipe tokens with `--with-token`):
    ```sh
-   printf "%s" "<FINE_GRAINED_TOKEN>" | gh auth login --with-token
+   gh auth login
    ```
-3. Store the token in Privateer's credential store for ship operations:
+   Follow the interactive prompts (choose `GitHub.com`, preferred protocol, and `Paste an authentication token`, then paste the token at the hidden prompt).
+3. Store the token in Privateer's credential store for ship operations (run in a terminal and paste at the no-echo prompt):
    ```sh
-   printf "%s" "<FINE_GRAINED_TOKEN>" | privateer credential.set --json '{"ref":"forge-ship-github"}'
+   privateer credential.set --json '{"ref":"forge-ship-github"}'
    ```
 4. Administrative repository changes (such as adjusting branch protection) now take place in the browser. The ship's SSH key remains for git pushes.
 
@@ -149,10 +155,10 @@ Verify protection settings via Privateer:
    - `merger`: machine account holding exclusive merge permissions.
    - `ships`: machine account for ship API operations.
    All three accounts must be standard non-admin users added as write collaborators to the repository.
-2. Store the tokens in Privateer's credential store:
+2. Store the tokens in Privateer's credential store (run in a terminal and paste each token at the no-echo prompt):
    ```sh
-   printf "%s" "<REVIEWER_TOKEN>" | privateer credential.set --json '{"ref":"forge-reviewer-forgejo"}'
-   printf "%s" "<MERGER_TOKEN>" | privateer credential.set --json '{"ref":"forge-merger-forgejo"}'
+   privateer credential.set --json '{"ref":"forge-reviewer-forgejo"}'
+   privateer credential.set --json '{"ref":"forge-merger-forgejo"}'
    ```
 3. Move ships' forge API configuration to the `ships` user token.
 
@@ -176,12 +182,15 @@ Before enabling on production repositories, verify on a scratch Forgejo repo:
 
 ---
 
-### Section C: Fleet forge configuration (`forges.json`) and runtime adapter
+### Section C: Fleet forge configuration (`forges.json`) and runtime adapter (coming in task 5; not yet available)
 
-#### 1. Fleet forge configuration (`forges.json`)
-The fleet configuration file `forges.json` resides beside `routes.json` in Privateer's fleet directory (`crate::fleet::registry_path().with_extension("json")`). It is operator-managed and contains repository mappings and credential references (no secrets).
+> [!NOTE]
+> This section describes fleet configuration and runtime adapter wiring arriving in **task 5** (B2 wiring). Commands `forges.set` and `forges.show`, as well as the `forges.json` fleet path, do not exist in `src/` or `plugins/` yet.
 
-Configure via the operator command:
+#### 1. [hands] Fleet forge configuration (`forges.json`)
+The fleet configuration file `forges.json` will reside beside `routes.json` in Privateer's fleet directory (`crate::fleet::registry_path().with_extension("json")`). It is captain-only (`[hands]`) and contains repository mappings and credential references (no secrets).
+
+Configure via the captain command [hands] once task 5 lands:
 ```sh
 privateer forges.set --file forges.json
 ```
@@ -195,7 +204,7 @@ Example configuration schema:
 {
   "repos": {
     "github.com/kirkins/privateer": {
-      "kind": "github",
+      "forge": "github",
       "api": "https://api.github.com",
       "branch": "main",
       "reviewer": {
@@ -204,7 +213,7 @@ Example configuration schema:
       }
     },
     "git.lobbykit.net/hermes/app": {
-      "kind": "forgejo",
+      "forge": "forgejo",
       "api": "https://git.lobbykit.net/api/v1",
       "branch": "main",
       "reviewer": {
@@ -226,10 +235,10 @@ The adapter implements the external interface:
 - **Operations:**
   - `pr.view`: Inspects PR state, base, head SHA, mergeability, and required checks at head.
   - `review.post`: Posts an approval or changes request. Searches for `<!-- privateer-review <id> -->` to guarantee idempotency.
-  - `pr.merge`: Executes merge passing expected head SHA with `merge_method: "merge"` (the only permitted method).
+  - `pr.merge`: Executes merge passing expected head SHA with `merge_method: "merge"` on GitHub and `Do: "merge"` on Forgejo (plain merge is the only permitted method).
   - `protection.read`: Validates that branch protection settings match required constraints.
 - **Security & Token Isolation:**
-  - The token is read strictly from the file path provided in `PRIVATEER_FORGE_TOKEN_FILE`. Tokens passed via request JSON or environment variables are rejected.
+  - The token is read strictly from the file path named by `PRIVATEER_FORGE_TOKEN_FILE`. Other token environment variables (`PRIVATEER_FORGE_TOKEN`, `GITHUB_TOKEN`, `FORGEJO_TOKEN`) are ignored; the request keys `token` and `token_file` are refused.
   - Any credential reference named in `forges.json` is banned from tool bundles (`tool_bundles::configure`) and native launch environments (`plugins/bundles.py`), preventing agent access.
 
 #### 3. Residuals and threat model
