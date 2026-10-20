@@ -81,10 +81,9 @@ impl Probe {
         if value.is_null() {
             return Ok(None);
         }
-        let fields = value
-            .as_object()
-            .filter(|o| o.len() == 1)
-            .context("a probe is one of {\"path\": BINARY}, {\"file\": PATH} or {\"argv\": [...]}")?;
+        let fields = value.as_object().filter(|o| o.len() == 1).context(
+            "a probe is one of {\"path\": BINARY}, {\"file\": PATH} or {\"argv\": [...]}",
+        )?;
         let (kind, detail) = fields.iter().next().context("empty probe")?;
         let clean = |text: &str| !text.is_empty() && !text.chars().any(char::is_control);
         Ok(Some(match kind.as_str() {
@@ -117,10 +116,7 @@ impl Probe {
                     "an argv probe has 1 to {MAX_ARGV} arguments"
                 );
                 ensure!(
-                    clean(&argv[0])
-                        && argv
-                            .iter()
-                            .all(|a| a.len() <= MAX_ARG && !a.contains('\0')),
+                    clean(&argv[0]) && argv.iter().all(|a| a.len() <= MAX_ARG && !a.contains('\0')),
                     "an argv probe's arguments are at most {MAX_ARG} bytes, without NUL"
                 );
                 Probe::Argv(argv)
@@ -245,7 +241,10 @@ fn put(conn: &Connection, args: &Value) -> Result<Value> {
 fn remove(conn: &Connection, name: &str) -> Result<Value> {
     refuse_copy(conn)?;
     identifier(name)?;
-    ensure!(known(conn, name)?, "the vocabulary has no capability {name}");
+    ensure!(
+        known(conn, name)?,
+        "the vocabulary has no capability {name}"
+    );
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     for table in ["capabilities", "offer_declarations", "machine_offers"] {
         tx.execute(&format!("DELETE FROM {table} WHERE name=?1"), [name])?;
@@ -357,9 +356,13 @@ fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Resu
     if let Some(home) = std::env::var_os("HOME") {
         command.env("HOME", home);
     }
+    // Named as the captain wrote it, without the directories.
+    let shown = Path::new(&argv[0])
+        .file_name()
+        .map_or_else(|| argv[0].clone(), |n| n.to_string_lossy().into_owned());
     let mut child = command
         .spawn()
-        .map_err(|error| format!("{} could not start: {error}", argv[0]))?;
+        .map_err(|error| format!("{shown} could not start: {error}"))?;
     let pid = child.id();
     let deadline = deadline.min(Instant::now() + PROBE_TIMEOUT);
     let outcome = loop {
@@ -382,8 +385,8 @@ fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Resu
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(match status.code() {
-            Some(code) => format!("{} exited with {code}", argv[0]),
-            None => format!("{} was killed by a signal", argv[0]),
+            Some(code) => format!("{shown} exited with {code}"),
+            None => format!("{shown} was killed by a signal"),
         }),
         Err(error) => Err(format!("{error}")),
     }
@@ -391,7 +394,8 @@ fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Resu
 
 /// What the operator declared or withheld here.
 fn declarations(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut statement = conn.prepare("SELECT name, stance FROM offer_declarations ORDER BY name")?;
+    let mut statement =
+        conn.prepare("SELECT name, stance FROM offer_declarations ORDER BY name")?;
     let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
@@ -410,7 +414,10 @@ fn evaluate(
     let mut verdicts: Vec<(String, Option<std::result::Result<&'static str, String>>)> = vec![];
     let mut to_probe: Vec<(usize, Probe)> = vec![];
     for name in names {
-        let stance = declared.iter().find(|(n, _)| n == name).map(|(_, s)| s.as_str());
+        let stance = declared
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.as_str());
         let verdict = match vocabulary.iter().find(|t| &t.name == name) {
             None => Some(Err("not in this machine's vocabulary".to_owned())),
             Some(_) if stance == Some("withheld") => Some(Err("withheld here".to_owned())),
@@ -453,7 +460,10 @@ fn evaluate(
                             let path = &path;
                             scope.spawn(move || {
                                 if Instant::now() >= budget {
-                                    return (*index, Err("probe not run: the check's time ran out".to_owned()));
+                                    return (
+                                        *index,
+                                        Err("probe not run: the check's time ran out".to_owned()),
+                                    );
                                 }
                                 (*index, run(probe, path, budget))
                             })
@@ -461,7 +471,10 @@ fn evaluate(
                         .collect();
                     handles
                         .into_iter()
-                        .map(|h| h.join().unwrap_or((usize::MAX, Err("probe panicked".into()))))
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or((usize::MAX, Err("probe panicked".into())))
+                        })
                         .collect()
                 });
             for (index, result) in results {
@@ -472,7 +485,12 @@ fn evaluate(
                     "INSERT INTO machine_offers(name, met, why, probed_ms) VALUES(?1, ?2, ?3, ?4)
                      ON CONFLICT(name) DO UPDATE SET met=excluded.met, why=excluded.why,
                        probed_ms=excluded.probed_ms",
-                    params![name, result.is_ok(), result.as_ref().err(), Store::now_ms()],
+                    params![
+                        &*name,
+                        result.is_ok(),
+                        result.as_ref().err(),
+                        Store::now_ms()
+                    ],
                 )?;
                 *verdict = Some(result.map(|()| "detected"));
             }
@@ -665,17 +683,19 @@ mod tests {
 
     fn registry() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE machines(name TEXT PRIMARY KEY, role TEXT NOT NULL);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE machines(name TEXT PRIMARY KEY, role TEXT NOT NULL);")
+            .unwrap();
         init(&conn).unwrap();
         conn
     }
 
     #[test]
     fn a_probe_is_one_of_path_file_or_argv() {
-        assert!(Probe::parse(&json!({"path": "xcodebuild"})).unwrap().is_some());
+        assert!(
+            Probe::parse(&json!({"path": "xcodebuild"}))
+                .unwrap()
+                .is_some()
+        );
         assert!(Probe::parse(&json!({"path": "/usr/bin/xcodebuild"})).is_err());
         assert!(Probe::parse(&json!({"file": "relative"})).is_err());
         assert!(Probe::parse(&json!({"argv": []})).is_err());
@@ -699,7 +719,11 @@ mod tests {
         put(&conn, &json!({"name": "phone", "declared_only": true})).unwrap();
         put(&conn, &json!({"name": "sh", "probe": {"path": "sh"}})).unwrap();
         let listed = list(&conn).unwrap();
-        assert_eq!(listed["capabilities"].as_array().unwrap().len(), 2, "{listed}");
+        assert_eq!(
+            listed["capabilities"].as_array().unwrap().len(),
+            2,
+            "{listed}"
+        );
         assert_eq!(listed["defined_on"], "here");
     }
 
@@ -715,8 +739,11 @@ mod tests {
     #[test]
     fn the_linked_side_keeps_the_copy_it_was_sent() {
         let conn = registry();
-        conn.execute("INSERT INTO machines(name, role) VALUES('laptop', 'collected')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO machines(name, role) VALUES('laptop', 'collected')",
+            [],
+        )
+        .unwrap();
         let refused = put(&conn, &json!({"name": "x", "declared_only": true})).unwrap_err();
         assert!(format!("{refused:#}").contains("define it on the linking machine"));
         absorb(
@@ -736,7 +763,11 @@ mod tests {
     fn offers_are_detected_declared_and_withheld() {
         let conn = registry();
         put(&conn, &json!({"name": "shell", "probe": {"file": "/"}})).unwrap();
-        put(&conn, &json!({"name": "absent", "probe": {"file": "/no/such/path"}})).unwrap();
+        put(
+            &conn,
+            &json!({"name": "absent", "probe": {"file": "/no/such/path"}}),
+        )
+        .unwrap();
         put(&conn, &json!({"name": "phone", "declared_only": true})).unwrap();
         let wanted: Vec<String> = ["shell", "absent", "phone", "typo"]
             .map(str::to_owned)
@@ -764,7 +795,10 @@ mod tests {
         .unwrap();
         let checked = check(&conn, &wanted).unwrap();
         assert_eq!(checked["met"], json!(["phone"]), "{checked}");
-        assert_eq!(checked["unmet"][0], json!({"need": "shell", "why": "withheld here"}));
+        assert_eq!(
+            checked["unmet"][0],
+            json!({"need": "shell", "why": "withheld here"})
+        );
     }
 
     #[test]

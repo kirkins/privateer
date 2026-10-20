@@ -101,7 +101,14 @@ fn print_check(name: &str, report: &Value) {
         None => println!("{name} can move from {from} to {to}; nothing was stopped or changed."),
     }
     let met = names("met");
-    println!("  met: {}", if met.is_empty() { "nothing declared" } else { &met });
+    println!(
+        "  met: {}",
+        if met.is_empty() {
+            "nothing declared"
+        } else {
+            &met
+        }
+    );
     for unmet in report["unmet"].as_array().into_iter().flatten() {
         println!(
             "  unmet: {} ({})",

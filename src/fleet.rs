@@ -136,7 +136,11 @@ fn reach(store: &mut Store, other: &str, other_home: &Path, listing: &Listing) -
         "peer.put",
         json!({"name": peer, "transport": "local", "executable": binary, "home": other_home}),
     )?;
-    crate::mail::dispatch(store, "ship.put", listing.entry(other, json!({"peer": peer})))?;
+    crate::mail::dispatch(
+        store,
+        "ship.put",
+        listing.entry(other, json!({"peer": peer})),
+    )?;
     Ok(true)
 }
 

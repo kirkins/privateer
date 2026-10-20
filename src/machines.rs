@@ -378,7 +378,11 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -
         if current.as_ref().is_some_and(|s| s["location"] == "here") {
             continue;
         }
-        crate::mail::dispatch(store, "ship.put", listing.entry(name, json!({"peer": peer})))?;
+        crate::mail::dispatch(
+            store,
+            "ship.put",
+            listing.entry(name, json!({"peer": peer})),
+        )?;
         installed += 1;
     }
     if prune {
@@ -1041,9 +1045,11 @@ fn keep_offers(conn: &Connection, machine: &str, reported: &Value) -> Result<()>
 /// What a linked machine last said it offers, and when; null if never.
 fn offers_of(conn: &Connection, machine: &str) -> Result<Value> {
     let raw: Option<String> = conn
-        .query_row("SELECT offers FROM machines WHERE name=?1", [machine], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT offers FROM machines WHERE name=?1",
+            [machine],
+            |r| r.get(0),
+        )
         .optional()?
         .flatten();
     Ok(raw
@@ -1122,7 +1128,7 @@ pub(crate) fn linked_for_snapshot(conn: &Connection) -> Result<Vec<Linked>> {
         .map(|m| {
             let ships = cached(conn, &m.name)?
                 .into_iter()
-                .map(|(name, scope, _)| (name, scope))
+                .map(|(name, listing)| (name, listing.scope))
                 .collect();
             Ok((m.name, m.role, ships))
         })

@@ -648,8 +648,7 @@ fn begin(args: &Value) -> Result<Value> {
     let checked = crate::capabilities::check(&conn, &requires)?;
     ensure!(
         checked["unmet"].as_array().is_none_or(Vec::is_empty),
-        "{} does not offer {}",
-        crate::machines::this_machine(),
+        "{ship} cannot move here: this machine does not offer {}",
         unmet_text(&checked["unmet"])
     );
     let mut total = 0u64;
@@ -1231,11 +1230,13 @@ fn preflight(source: &Side, target: &Side, ship: &str, from: &str, to: &str) -> 
         }
         Err(error) => return Err(error),
     };
-    Ok(json!({"ship": ship, "from": from, "to": to, "requires": requires,
+    Ok(
+        json!({"ship": ship, "from": from, "to": to, "requires": requires,
         "pinned": inspected["pinned"], "met": checked["met"], "unmet": checked["unmet"],
         "problems": checked["problems"], "not_idle": inspected["not_idle"],
         "folder_bytes": inspected["folder_bytes"], "project_count": inspected["project_count"],
-        "free_disk_bytes": checked["free_disk_bytes"]}))
+        "free_disk_bytes": checked["free_disk_bytes"]}),
+    )
 }
 
 /// Everything a preflight found that keeps the ship where it is, in one
