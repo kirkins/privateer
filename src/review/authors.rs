@@ -21,7 +21,10 @@
 //! naming the job, until the ship declares that job's route. A declaration is
 //! keyed to one job: it stands only for the job it names, must fit it (its
 //! harness the job's, its model one the job's alias names), and clears no job
-//! it does not name.
+//! it does not name. That fit proves only that the declared model carries the
+//! job's alias, never which version the alias resolved to, so the alias is
+//! kept in the set beside the declared model: a reviewer whose model carries
+//! it is excluded too, whatever its version. The gate only ever over-excludes.
 use crate::store::Store;
 use anyhow::{Result, bail, ensure};
 use rusqlite::OptionalExtension;
@@ -36,6 +39,11 @@ pub struct Authors {
     /// Each model a crew job in scope ran on, with the jobs that ran on it.
     /// A declaration lands here too, naming the job it stands for.
     pub crew_jobs: BTreeMap<String, Vec<String>>,
+    /// Each bare alias a declared job ran on, with the jobs that ran on it.
+    /// A declaration's fit proves its model carries the job's alias, not
+    /// which version the alias resolved to, so the alias is kept: a reviewer
+    /// whose model carries it is excluded, whatever its version.
+    pub crew_aliases: BTreeMap<String, Vec<String>>,
     /// The models the ship's first mate may have written the code on: its
     /// profile, its `first_mate` list, its wakes and its ordinary errands.
     pub first_mate_models: BTreeSet<String>,
@@ -104,7 +112,16 @@ pub fn compute(
             }
         }
     }
+    // One declaration per job: a second for the same job is refused outright,
+    // naming the job, so no ship can hold two versions of one job's route.
+    let mut declared_ids = BTreeSet::new();
     for declaration in declared {
+        ensure!(
+            declared_ids.insert(declaration.job_id.clone()),
+            "job {} is declared twice in author_routes: one declaration stands \
+             for one job",
+            declaration.job_id
+        );
         let Some(model) = crate::routes::model_key(&declaration.route) else {
             bail!(
                 "declared author route {} for job {} names no known model; pass its \
@@ -155,6 +172,17 @@ pub fn compute(
                     declaration.route,
                     declaration.job_id
                 );
+                // The fit above proves only that the declared model carries
+                // the job's alias, never which version the alias resolved to
+                // when the job ran: a job on the bare alias opus declared as
+                // claude/-/claude-opus-4-7 still fits. The alias is kept
+                // beside the declared model, so the review gate can
+                // over-exclude every model that carries it.
+                authors
+                    .crew_aliases
+                    .entry(alias)
+                    .or_default()
+                    .push(declaration.job_id.clone());
             }
         }
         // The declaration can only add: the model lands in the crew class
@@ -612,6 +640,103 @@ mod tests {
         assert_eq!(
             declared.crew_jobs["claude-opus-5-5"],
             vec!["crew-a".to_owned(), "crew-alias".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_declaration_keeps_its_jobs_alias_and_one_stands_per_job() {
+        let (_temp, store) = home();
+        task(&store, "fix", None);
+        // A job on a bare alias, one with no route at all, and one whose
+        // model is named: only the first two wait on declarations.
+        job(
+            &store,
+            "crew-alias",
+            "fix",
+            1000,
+            Some("claude/-/opus"),
+            json!([]),
+            None,
+        );
+        job(&store, "crew-none", "fix", 1100, None, json!([]), None);
+        job(
+            &store,
+            "crew-full",
+            "fix",
+            1200,
+            Some("codex/-/gpt-6-luna"),
+            json!([]),
+            None,
+        );
+        let authors = compute(&store, "ship", "feature/not-ours", 0, &[]).unwrap();
+        assert_eq!(authors.unknown_jobs, vec!["crew-alias", "crew-none"]);
+        assert!(authors.crew_aliases.is_empty());
+        let declaration = |job_id: &str, route: &str| Declaration {
+            job_id: job_id.to_owned(),
+            route: route.to_owned(),
+        };
+
+        // A repeated declaration for one job is refused outright, naming the
+        // job: one declaration stands for one job, so no ship can hold two
+        // versions of its route in play.
+        let refused = compute(
+            &store,
+            "ship",
+            "feature/not-ours",
+            0,
+            &[
+                declaration("crew-alias", "claude/-/claude-opus-4-7"),
+                declaration("crew-alias", "claude/-/claude-opus-5-5"),
+            ],
+        )
+        .unwrap_err();
+        let text = format!("{refused:#}");
+        assert!(text.contains("crew-alias"), "{text}");
+        assert!(text.contains("declared twice"), "{text}");
+
+        // The wrong-version case: the job ran on the bare alias opus, and the
+        // ship declares it claude-opus-4-7. The fit holds, since the declared
+        // model carries the alias, but it proves no version, so the alias is
+        // kept beside the declared model for the gate to over-exclude on.
+        let declared = compute(
+            &store,
+            "ship",
+            "feature/not-ours",
+            0,
+            &[declaration("crew-alias", "claude/-/claude-opus-4-7")],
+        )
+        .unwrap();
+        assert_eq!(
+            declared.crew_jobs["claude-opus-4-7"],
+            vec!["crew-alias".to_owned()]
+        );
+        assert_eq!(
+            declared.crew_aliases,
+            BTreeMap::from([("opus".to_owned(), vec!["crew-alias".to_owned()])])
+        );
+        assert_eq!(declared.unknown_jobs, vec!["crew-none".to_owned()]);
+
+        // A job with no route at all clears on its declaration too, but no
+        // alias can be kept for it: nothing about its model is known to
+        // over-exclude on, so only the declared model lands in the set.
+        let declared = compute(
+            &store,
+            "ship",
+            "feature/not-ours",
+            0,
+            &[
+                declaration("crew-alias", "claude/-/claude-opus-4-7"),
+                declaration("crew-none", "codex/-/gpt-6-luna"),
+            ],
+        )
+        .unwrap();
+        assert!(declared.unknown_jobs.is_empty());
+        assert_eq!(declared.crew_aliases.len(), 1);
+        // The declared model lands in the crew class like any job's own: here
+        // it joins the job that already ran on it.
+        assert_eq!(
+            declared.crew_jobs["gpt-6-luna"],
+            vec!["crew-full".to_owned(), "crew-none".to_owned()]
         );
     }
 }
