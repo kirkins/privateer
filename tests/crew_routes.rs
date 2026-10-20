@@ -2013,3 +2013,193 @@ fn a_workspace_branch_scopes_the_authors_and_a_declaration_to_their_jobs() {
     assert_eq!(chosen.choice.name, "sol");
     assert_eq!(chosen.overlap, None);
 }
+
+/// A declaration's alias fit proves no version: a job that ran on the bare
+/// alias opus, declared as claude-opus-4-7, still excludes every reviewer
+/// whose model carries opus, whatever its version. A second declaration for
+/// the same job is refused, and a crew job with no route at all still
+/// refuses the choice until its own declaration stands, clearing no alias it
+/// cannot name.
+#[test]
+fn a_declared_alias_excludes_every_model_that_carries_it() {
+    let pi_sol = || {
+        tiered(
+            "bundled:pi",
+            json!({"model": "gpt-6.1-sol", "provider": "chatgpt-home"}),
+            "plan",
+            1,
+            &["review", "implement"],
+        )
+    };
+    let opus = || {
+        tiered(
+            "bundled:claude",
+            json!({"model": "claude-opus-5-5"}),
+            "plan",
+            1,
+            &["review", "implement"],
+        )
+    };
+    let alias = || {
+        tiered(
+            "bundled:claude",
+            json!({"model": "opus"}),
+            "plan",
+            3,
+            &["implement"],
+        )
+    };
+    let declared = || privateer::review::authors::Declaration {
+        job_id: "crew-alias".to_owned(),
+        route: "claude/-/claude-opus-4-7".to_owned(),
+    };
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"writer": alias(), "sol": pi_sol(), "opus": opus()},
+        "crew": ["writer"],
+        "review": ["opus", "sol"]
+    }));
+    f.run_and_scan("crew-alias", Some("writer"));
+
+    // The ship declares the job as claude-opus-4-7. The fit holds, since the
+    // declared model carries the alias, but proves no version, so the alias
+    // is kept beside the model and the Opus 5.5 reviewer stays excluded
+    // though its model is not the declared one; Sol, which carries no opus,
+    // reviews.
+    let (aliases, chosen) = f.in_process(|store| {
+        let authors = privateer::review::authors::compute(
+            store,
+            "engineering",
+            "feature/not-ours",
+            0,
+            &[declared()],
+        )
+        .unwrap();
+        assert_eq!(authors.crew_aliases.len(), 1);
+        let chosen = privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+            .expect("sol carries no declared alias");
+        (authors.crew_aliases, chosen)
+    });
+    assert_eq!(
+        aliases,
+        std::collections::BTreeMap::from([("opus".to_owned(), vec!["crew-alias".to_owned()])])
+    );
+    assert_eq!(chosen.choice.name, "sol");
+    assert_eq!(chosen.overlap, None);
+
+    // With the Opus route the only review route left, the refusal names the
+    // job and the alias its model carries.
+    f.routes(json!({
+        "routes": {"writer": alias(), "sol": pi_sol(), "opus": opus()},
+        "crew": ["writer"],
+        "review": ["opus"]
+    }));
+    let refused = f.in_process(|store| {
+        let authors = privateer::review::authors::compute(
+            store,
+            "engineering",
+            "feature/not-ours",
+            0,
+            &[declared()],
+        )
+        .unwrap();
+        privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+            .unwrap_err()
+    });
+    assert!(
+        refused.contains("every review route for engineering is excluded by the code's authors"),
+        "{refused}"
+    );
+    assert!(refused.contains("crew-alias"), "{refused}");
+    assert!(refused.contains("alias opus"), "{refused}");
+
+    // A second declaration for the same job is refused outright, and a crew
+    // job with no route at all (no model_route, no readable argv) refuses the
+    // choice, naming the job, until its own declaration stands; once it does,
+    // it keeps no alias of its own, and the alias rule from the other job's
+    // declaration still decides the choice.
+    let refused = f.in_process(|store| {
+        privateer::review::authors::compute(
+            store,
+            "engineering",
+            "feature/not-ours",
+            0,
+            &[
+                declared(),
+                privateer::review::authors::Declaration {
+                    job_id: "crew-alias".to_owned(),
+                    route: "claude/-/claude-opus-5-5".to_owned(),
+                },
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"))
+        .unwrap_err()
+    });
+    assert!(refused.contains("crew-alias"), "{refused}");
+    assert!(refused.contains("declared twice"), "{refused}");
+
+    let refused = f.in_process(|store| {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES('crew-none',?1)",
+                rusqlite::params![
+                    json!({
+                        "id": "crew-none", "task_id": "fix", "action": "spawn",
+                        "created_ms": 1, "finished_ms": 2,
+                        "model_route": null, "command": []
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        let authors =
+            privateer::review::authors::compute(store, "engineering", "feature/not-ours", 0, &[])
+                .unwrap();
+        assert!(authors.unknown_jobs.contains(&"crew-none".to_owned()));
+        privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+            .unwrap_err()
+    });
+    assert!(refused.contains("cannot choose a reviewer"), "{refused}");
+    assert!(refused.contains("crew-none"), "{refused}");
+    assert!(refused.contains("author_routes"), "{refused}");
+
+    // Both declared: the no-route job's declaration stands with no alias of
+    // its own, and the Opus reviewer is still excluded by the alias job's
+    // declaration alone.
+    let refused = f.in_process(|store| {
+        let authors = privateer::review::authors::compute(
+            store,
+            "engineering",
+            "feature/not-ours",
+            0,
+            &[
+                declared(),
+                privateer::review::authors::Declaration {
+                    job_id: "crew-none".to_owned(),
+                    route: "codex/-/gpt-6-luna".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(authors.unknown_jobs.is_empty());
+        assert_eq!(
+            authors.crew_aliases,
+            std::collections::BTreeMap::from([("opus".to_owned(), vec!["crew-alias".to_owned()])])
+        );
+        privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+            .unwrap_err()
+    });
+    assert!(
+        refused.contains("every review route for engineering is excluded by the code's authors"),
+        "{refused}"
+    );
+    assert!(refused.contains("alias opus"), "{refused}");
+}
