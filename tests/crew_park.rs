@@ -25,6 +25,47 @@ struct Fleet {
     root: PathBuf,
 }
 
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        // Detached dispatchers outlive the CLI that starts them. Stop ours
+        // before TempDir removes its PID file and lock, including on unwind.
+        let home = self.root.join("engineering/.privateer");
+        if !home.join("serve.pid").exists() {
+            return;
+        }
+        let cleanup = || -> Result<(), String> {
+            // Starting the service returns before it takes the lock. Stopping
+            // it in that gap would report "not running" and lose its PID file.
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while !privateer::service::running(&home).map_err(|error| error.to_string())? {
+                if Instant::now() >= deadline {
+                    return Err("dispatcher did not acquire its lock before cleanup".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let output = self
+                .command(None, &["service", "stop"])
+                .env("PRIVATEER_SERVICE", "detached")
+                .output()
+                .map_err(|error| error.to_string())?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).into_owned())
+            }
+        };
+        let Err(failure) = cleanup() else { return };
+        // Keep the PID, lock and logs available if shutdown was not confirmed.
+        self._tmp.disable_cleanup(true);
+        let failure = format!("{failure}; fixture retained at {}", self.root.display());
+        if std::thread::panicking() {
+            eprintln!("fixture dispatcher cleanup failed: {failure}");
+        } else {
+            panic!("fixture dispatcher cleanup failed: {failure}");
+        }
+    }
+}
+
 impl Fleet {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
@@ -189,6 +230,8 @@ esac
         c.current_dir(self.root.join("engineering"))
             .args(args)
             .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
             .env(
                 "PATH",
                 format!(
@@ -301,6 +344,68 @@ esac
             .iter()
             .filter_map(|m| m["body"].as_str().map(str::to_owned))
             .collect()
+    }
+}
+
+#[test]
+fn fixture_dispatcher_stops_on_drop_and_unwind() {
+    // Observe the actual detached process, rather than inferring its death
+    // from a missing fixture directory or an unlocked/deleted lock file.
+    let identity = |pid: i32| {
+        let output = support::command("ps")
+            .args([
+                "-ww",
+                "-p",
+                &pid.to_string(),
+                "-o",
+                "lstart=",
+                "-o",
+                "command=",
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    for (unwind, wait_ready) in [(false, false), (false, true), (true, false), (true, true)] {
+        let f = Fleet::new();
+        f.service("start");
+        let root = f.root.clone();
+        let home = root.join("engineering/.privateer");
+        let ready = Instant::now() + std::time::Duration::from_secs(10);
+        while wait_ready && !privateer::service::running(&home).unwrap() {
+            assert!(
+                Instant::now() < ready,
+                "dispatcher did not acquire its lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let pid: i32 = fs::read_to_string(home.join("serve.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let original = identity(pid);
+        assert!(original.contains(home.to_str().unwrap()), "{original}");
+        if wait_ready {
+            assert!(privateer::service::running(&home).unwrap());
+        }
+        let result = std::panic::catch_unwind(move || {
+            let _fixture = f;
+            assert!(!unwind, "deliberate fixture failure");
+        });
+        assert_eq!(result.is_err(), unwind);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while identity(pid) == original && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let leaked = identity(pid) == original;
+        if leaked {
+            // Failure-only cleanup of this exact fixture process. This does
+            // not turn a leak into a passing result.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        assert!(!leaked, "fixture leaked dispatcher {pid} (unwind={unwind})");
+        assert!(!root.exists(), "fixture directory was not removed");
     }
 }
 
