@@ -55,8 +55,8 @@ HELP = (
     "/digest — send what is held now; /afk every 30m sets how often\n"
     "/voice [on|off] — speak messages as voice notes (needs [tts])\n"
     "/help — this message\n\n"
-    "Photos and files are saved and the ship is handed their path. Voice notes are "
-    "transcribed when [stt] is configured."
+    "Photos and files are handed to the ship itself, on whichever machine it runs. "
+    "Voice notes are transcribed when [stt] is configured."
 )
 
 COMMANDS = [
@@ -404,7 +404,18 @@ class Door:
                 # Answered elsewhere already: follow up instead of failing. A
                 # typed answer cannot go to a request, so it goes as plain words.
                 args = dict(args, kind="request")
-                args.pop("payload", None)
+                # Only the typed answer cannot ride a request; anything else
+                # in the payload (the files of an attachment) still goes.
+                payload = args.get("payload")
+                if isinstance(payload, dict):
+                    payload = dict(payload)
+                    payload.pop("answer", None)
+                    if payload:
+                        args["payload"] = payload
+                    else:
+                        args.pop("payload", None)
+                else:
+                    args.pop("payload", None)
                 try:
                     result = self.runtime.call("send", args)
                 except RuntimeError as again:
@@ -823,9 +834,43 @@ class Door:
         dest = self.fetch(file_id, name, msg_id)
         if not dest:
             return
-        note = f"The captain sent a file: {dest}"
-        args["body"] = f"{caption}\n\n{note}" if caption else note
-        self.send(args, msg_id, f"file {os.path.basename(dest)}")
+        saved = tg.safe_name(name) if name else download_name(dest)
+        ship = args.get("to") or self.recipient()
+        stored = None
+        if ship:
+            try:
+                # The file reaches the ship's own home, on this machine or a
+                # linked one; the runtime fills in its path when the mail lands.
+                stored = self.runtime.call(
+                    "file.put", {"to": ship, "name": saved, "content_file": dest}, timeout=120)
+            except RuntimeError as e:
+                # An older runtime has no file.put at all; that alone falls back
+                # quietly. Any other refusal loses the file for a ship on a
+                # linked machine, so the captain hears about it first.
+                if "unknown door command" not in str(e):
+                    self.say(f"⚠️ couldn't hand {saved} to {ship}: {e}; kept at {dest}",
+                             reply_to=msg_id)
+                tg.log(f"file.put failed for {saved}: {e}; keeping {dest} in the inbox")
+        if stored and stored.get("file_id"):
+            # The runtime fills the path when the mail lands, and the mail must
+            # go to the ship that owns the file, not a default chosen later.
+            args["to"] = ship
+            payload = args.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+                args["payload"] = payload
+            payload["files"] = [{"file_id": stored["file_id"]}]
+            args["body"] = caption or f"The captain sent a file: {saved}"
+            try:
+                os.unlink(dest)
+            except OSError as e:
+                tg.log(f"could not remove the inbox copy {dest}: {e}")
+        else:
+            # No file.put (an older runtime, an unknown command or a refusal):
+            # the ship on this machine can still be told where the file is.
+            note = f"The captain sent a file: {dest}"
+            args["body"] = f"{caption}\n\n{note}" if caption else note
+        self.send(args, msg_id, f"file {saved}")
 
     def handle_voice(self, msg: dict, msg_id, reply_to) -> None:
         import stt
@@ -868,6 +913,15 @@ class Door:
             shown = shown if len(shown) <= 400 else shown[:400].rstrip() + "…"
             self.say(f'🎙️ "{shown}"', reply_to=msg_id, quiet=True)
         self.send(args, msg_id, f"voice {stt.duration_note(voice)}")
+
+
+def download_name(dest: str) -> str:
+    """The file's own name, without the inbox's timestamp and message prefix."""
+    base = os.path.basename(dest)
+    parts = base.split("-", 3)
+    if len(parts) == 4 and len(parts[0]) == 8 and len(parts[1]) == 6:
+        return parts[3]
+    return base
 
 
 def attachment(msg: dict) -> tuple[str, str, int]:

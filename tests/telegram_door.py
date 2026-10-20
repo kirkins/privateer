@@ -37,11 +37,30 @@ class FakeTelegram:
         self.updates: list[dict] = []
         self.next_update = 1
         self.next_message = 1000
+        self.next_file = 0
+        # Telegram file ids to their remote paths, and the bytes at each path.
+        self.file_paths: dict[str, str] = {}
+        self.files: dict[str, bytes] = {}
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                prefix = f"/file/bot{TOKEN}/"
+                assert path.startswith(prefix), path
+                data = fake.files.get(path[len(prefix):])
+                if data is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
@@ -74,6 +93,9 @@ class FakeTelegram:
                 time.sleep(0.05)
         with self.lock:
             self.calls.append((method, form))
+            if method == "getFile":
+                remote = self.file_paths.get(form.get("file_id"))
+                return {"file_path": remote} if remote else None
             if method == "sendMessage":
                 self.next_message += 1
                 form["_message_id"] = self.next_message
@@ -99,6 +121,29 @@ class FakeTelegram:
                    "text": text}
         if reply_to:
             message["reply_to_message"] = {"message_id": reply_to}
+        self.update(message)
+        return ident
+
+    def send_file(self, data: bytes, name: str, caption: str | None = None,
+                  photo: bool = False) -> int:
+        """A photo or document from the captain, downloadable via getFile."""
+        with self.lock:
+            self.next_file += 1
+            file_id = f"file{self.next_file}"
+            self.next_message += 1
+            ident = self.next_message
+        remote = f"documents/{name}"
+        self.file_paths[file_id] = remote
+        self.files[remote] = data
+        if photo:
+            media = {"photo": [{"file_id": file_id, "file_size": len(data),
+                                "width": 800, "height": 600}]}
+        else:
+            media = {"document": {"file_id": file_id, "file_name": name,
+                                  "file_size": len(data)}}
+        message = {"message_id": ident, "chat": {"id": CHAT}, "from": {"id": CAPTAIN}, **media}
+        if caption:
+            message["caption"] = caption
         self.update(message)
         return ident
 
@@ -224,6 +269,107 @@ def check_voice_transcripts() -> None:
     assert len(long["payload"]["answer"]["text"]) <= 4096 and len(long["body"]) > 4096, long["body"][:80]
 
 
+ATTACHMENT_PROBE = """
+import json, os, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+sent, said = [], []
+
+class NoPut:
+    def call(self, command, args=None, timeout=30):
+        raise RuntimeError("unknown door command \\"file.put\\"")
+
+class Refuse:
+    def call(self, command, args=None, timeout=30):
+        raise RuntimeError("cannot reach ship macops")
+
+class AlreadyAnswered:
+    def __init__(self, seen):
+        self.seen = seen
+    def call(self, command, args=None, timeout=30):
+        self.seen.append(args)
+        if args.get("kind") == "reply":
+            raise RuntimeError("mail already answered")
+        return {"returned": None}
+
+class Put:
+    def __init__(self, seen):
+        self.seen = seen
+    def call(self, command, args=None, timeout=30):
+        assert command == "file.put", command
+        self.seen.append(args)
+        return {"file_id": "file7", "name": args["name"]}
+
+def phone(runtime, path, msg_id, spoken=None):
+    d = door.Door({"door": "t", "recipient": "ops"}, {"tts": {}}, runtime)
+    d.say = lambda text, *a, **k: (spoken.append(text) if spoken is not None else None, "")
+    d.send = lambda args, msg_id, label: sent.append(args)
+    d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "request", "body": text}
+    d.fetch = lambda file_id, name, msg_id: path
+    msg = {"message_id": msg_id, "document": {
+        "file_id": "f", "file_name": "notes.bin", "file_size": os.path.getsize(path)}}
+    d.handle_attachment(msg, msg_id, None)
+
+kept = os.path.join(tg.inbox_dir(), "kept.bin")
+open(kept, "wb").write(b"fallback bytes")
+quiet = []
+phone(NoPut(), kept, 3, quiet)
+out = {"fallback": sent[-1], "kept": os.path.exists(kept), "quiet": quiet}
+warned = []
+refused = os.path.join(tg.inbox_dir(), "refused.bin")
+open(refused, "wb").write(b"refused bytes")
+phone(Refuse(), refused, 5, warned)
+out["refusal"], out["warned"] = sent[-1], warned
+seen = []
+stored = os.path.join(tg.inbox_dir(), "stored.bin")
+open(stored, "wb").write(b"stored bytes")
+phone(Put(seen), stored, 4)
+out["put_args"], out["deleted"], out["stored"] = seen, not os.path.exists(stored), sent[-1]
+
+answered = []
+d = door.Door({"door": "t", "recipient": "ops"}, {"tts": {}}, AlreadyAnswered(answered))
+d.say = lambda *a, **k: (None, "")
+d.send({"to": "ops", "kind": "reply", "body": "done",
+        "payload": {"answer": {"text": "done"}, "files": [{"file_id": "file9"}]}}, 6, "reply")
+out["retry"] = answered
+print(json.dumps(out))
+"""
+
+
+def check_attachment_put_and_fallback() -> None:
+    """A file goes through file.put and rides payload.files; when the runtime
+    has no file.put, its inbox path is kept and the ship is told instead. Any
+    other refusal warns the captain. An already-answered retry keeps files."""
+    out = subprocess.run([sys.executable, "-c", ATTACHMENT_PROBE,
+                          str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout)
+    fallback = got["fallback"]
+    assert "The captain sent a file:" in fallback["body"], fallback
+    assert os.path.basename(fallback["body"].rsplit(": ", 1)[1]) == "kept.bin", fallback
+    assert "files" not in (fallback.get("payload") or {}), fallback
+    assert got["kept"], got
+    assert got["quiet"] == [], got["quiet"]
+    refusal = got["refusal"]
+    warned = "⚠️ couldn't hand notes.bin to ops: cannot reach ship macops"
+    assert warned in got["warned"][0], got["warned"]
+    assert refusal["body"].startswith("The captain sent a file: "), refusal
+    assert "files" not in (refusal.get("payload") or {}), refusal
+    reply, retry = got["retry"]
+    assert reply["kind"] == "reply" and reply["payload"]["answer"] == {"text": "done"}, reply
+    assert retry["kind"] == "request", retry
+    assert retry["payload"] == {"files": [{"file_id": "file9"}]}, retry
+    assert got["put_args"] == [{"to": "ops", "name": "notes.bin",
+                                "content_file": got["put_args"][0]["content_file"]}], got
+    assert got["put_args"][0]["content_file"].endswith("stored.bin"), got["put_args"]
+    assert got["deleted"], got
+    stored = got["stored"]
+    assert stored["payload"] == {"files": [{"file_id": "file7"}]}, stored
+    assert stored["body"] == "The captain sent a file: notes.bin", stored
+
+
 class Fleet:
     def __init__(self, binary: str, root: pathlib.Path):
         self.binary, self.root = binary, root
@@ -291,6 +437,17 @@ class Fleet:
     def inbox(self, ship: str, address: str):
         return self.call(ship, "mail.inbox", {"address": address, "all": True})["messages"]
 
+    def remote_inbox(self, root: str, ship: str, address: str):
+        """A linked machine's own fleet record, read where it lives."""
+        env = dict(self.env)
+        env.update({"HOME": root,
+                    "PRIVATEER_FLEET": str(pathlib.Path(root) / "fleet.sqlite"),
+                    "PRIVATEER_RESOURCE_HOME": str(pathlib.Path(root) / "ledger")})
+        out = self.run(["--home", str(pathlib.Path(root) / ship / ".privateer"),
+                        "mail.inbox", "--json",
+                        json.dumps({"address": address, "all": True})], env=env)
+        return json.loads(out.stdout)["messages"]
+
 
 def main() -> int:
     binary = os.path.abspath(sys.argv[1])
@@ -298,6 +455,7 @@ def main() -> int:
     check_age_phrases()
     check_card_rendering()
     check_voice_transcripts()
+    check_attachment_put_and_fallback()
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp).resolve()
         fleet = Fleet(binary, root)
@@ -305,7 +463,7 @@ def main() -> int:
         fleet.ship("ops")
         # A linked machine, before the door starts: its stow is its own, and the
         # door reaches it over the same link the captain does.
-        fleet.other_machine("macops")
+        mac_root = fleet.other_machine("macops")
 
         config = root / "telegram.toml"
         config.write_text(f'bot_token = "{TOKEN}"\nchat_id = "{CHAT}"\n'
@@ -463,6 +621,44 @@ def main() -> int:
             telegram.message("/dismiss no-such-ask")
             wait_for("the unknown-id refusal", lambda: [
                 m for m in telegram.sent()[before:] if "no-such-ask" in m["text"] and "⚠️" in m["text"]])
+
+            # A photo or document from the captain reaches the ship's own home
+            # and rides its mail as payload.files; the door keeps no inbox copy.
+            photo = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
+            telegram.send_file(photo, "chart.png", caption="Quarterly chart",
+                               photo=True)
+            mailed = wait_for("the photo in the liaison's inbox", lambda: [
+                m for m in fleet.inbox("liaison", "liaison")
+                if (m.get("payload") or {}).get("files")])[0]
+            named = mailed["payload"]["files"]
+            assert len(named) == 1, named
+            assert named[0]["name"] == "chart.png", named
+            assert named[0]["bytes"] == len(photo), named
+            assert pathlib.Path(named[0]["path"]).read_bytes() == photo, named
+            assert mailed["body"] == "Quarterly chart", mailed
+            inbox = root / "state" / "doors" / "telegram" / "state" / "inbox"
+            assert not list(inbox.iterdir()), list(inbox.iterdir())
+
+            # A document for the ship on the linked machine crosses the link
+            # too, and only the Mac's own record names its path there.
+            letters = b"from the captain's phone\n"
+            received_before = len(fleet.remote_inbox(mac_root, "macops", "macops"))
+            telegram.message("/to macops")
+            wait_for("the Mac as the default ship", lambda: [
+                m for m in telegram.sent() if "plain messages now go to macops" in m["text"]])
+            telegram.send_file(letters, "note.txt", caption="Read this on the Mac")
+            elsewhere = wait_for("the file on the Mac", lambda: [
+                m for m in fleet.remote_inbox(mac_root, "macops", "macops")[
+                    received_before:]
+                if (m.get("payload") or {}).get("files")])[0]
+            carried = elsewhere["payload"]["files"][0]
+            assert pathlib.Path(carried["path"]).read_bytes() == letters, carried
+            assert carried["name"] == "note.txt", carried
+            assert not list(inbox.iterdir()), list(inbox.iterdir())
+            telegram.message("/to default")
+            wait_for("the liaison as the default ship again", lambda: [
+                m for m in telegram.sent()
+                if "plain messages go to liaison again" in m["text"]])
 
             # A stow names its machine. The Mac is linked (before the door
             # starts, so its calls can reach it), and its hold is its own: this

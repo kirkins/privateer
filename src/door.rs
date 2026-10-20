@@ -17,7 +17,10 @@
 //!
 //! Door to runtime:
 //! - `{"type":"delivered","ref":REF}`: the captain has it; it is not sent again;
-//! - `{"type":"request","id":ID,"command":"send|ships|status|waiting","args":{...}}`.
+//! - `{"type":"request","id":ID,"command":"send|ships|status|waiting|file.put","args":{...}}`.
+//!   `file.put {to, name, content_file}` stores a file the captain sent in the
+//!   receiving ship's own home, on this machine or a linked one, and answers
+//!   with its `file_id` for the mail's `payload.files`.
 //!
 //! Mail is delivered at least once: when the adapter restarts, everything
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
@@ -775,6 +778,19 @@ impl<'a> Session<'a> {
                     request["note"] = note.clone();
                 }
                 crate::dispatch(self.store(&home)?, "captain.dismiss", request)
+            }
+            // The captain sent a file: the door puts it in the receiving
+            // ship's own home, here or on a linked machine, and mails its id.
+            "file.put" => {
+                let to = args
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .context("file.put needs the ship it is for")?
+                    .to_owned();
+                identifier(&to)?;
+                let home = self.home(&to)?;
+                let store = self.store(&home)?;
+                crate::dispatch(store, "file.put", args.clone())
             }
             // Registered front doors carry the captain's explicit commands.
             "permissions" if args.as_object().is_some_and(|a| a.is_empty()) => {
