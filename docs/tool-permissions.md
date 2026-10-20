@@ -57,10 +57,16 @@ sentence built from the programs the command runs and the classifier's reason,
 for example "Running cp and echo commands its assigned work needs, even when
 the auto-mode check flags them as Credential Materialization." Tapping it
 records that sentence for the ship; an answer with its own text records the
-captain's wording instead. The card's body also gives the matching
-`privateer permissions authorize SHIP '...'` command to edit and run. Only the
-captain's own answer authorizes, as with Allow. Crew and errand cards never
-offer it, since they do not receive authorizations.
+captain's wording instead, which must be one line of at most 500 characters
+(a longer or multi-line answer is refused when sent, and the card stays open).
+The suggestion names only the programs on the command's first line, up to any
+heredoc, so a heredoc's contents never reach it. The card's body also gives the
+matching `privateer permissions authorize SHIP '...'` command to edit and run.
+Only the captain's own answer authorizes, as with Allow. An authorization is
+that ship's alone: another ship's card with the same suggestion stays its own
+card, is never answered by it, and stays open until its own ship is
+authorized. Crew and errand cards never offer it, including a crew's job its
+first mate reports blocked, since they do not receive authorizations.
 
 When a hosted pane is stopped by auto mode, its card names the refused tool
 uses since the last incident and each one's reason, read from the end of the
