@@ -1337,6 +1337,7 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         .collect();
     let mut parts = vec![];
     let mut shaped = false;
+    let mut ranked = false;
     let mut idle: Vec<String> = vec![];
     for kind in KINDS {
         let names = order(&policy, ship, kind);
@@ -1346,6 +1347,8 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         let mut shown = vec![];
         for name in names {
             let route = &policy["routes"][name.as_str()];
+            ranked |=
+                kind != "first_mate" && route.get("tier").is_some() && !uses(route).is_empty();
             let cost = route["cost"].as_str().unwrap_or("?");
             let read = states.get(&name);
             let used = read.and_then(|r| r.usage.as_ref());
@@ -1426,10 +1429,19 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
     } else {
         "the first available is used"
     };
-    let mut text = format!(
-        "Routes ({}; {rule}, or pass \"route\":\"<name>\").",
-        parts.join("; ")
-    );
+    // A launch that names a route skips this order, so where routes declare
+    // their strength the line steers launches to `require` instead.
+    let choice = if ranked {
+        format!(
+            "; pass \"require\":{{\"use\":\"<use>\",\"tier\":<n>}} (uses {}; tier 1 is strongest) \
+             for the first in that order that meets it, and name a \"route\":\"<name>\" only when \
+             the work needs that one route, since a named route skips the order",
+            USES.join(", ")
+        )
+    } else {
+        ", or pass \"route\":\"<name>\"".to_owned()
+    };
+    let mut text = format!("Routes ({}; {rule}{choice}).", parts.join("; "));
     if !idle.is_empty() {
         text.push_str(&format!("\nIdle allowances: {}.", idle.join(", ")));
     }
