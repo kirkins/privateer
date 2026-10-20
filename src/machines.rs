@@ -2271,7 +2271,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             install_everywhere(&conn, &machine, &theirs, is_complete(args))?;
             // The linking machine's vocabulary is this one's, and it says
             // what it offers; this one answers with its own offers.
-            crate::capabilities::absorb(&conn, &args["capabilities"])?;
+            crate::capabilities::absorb(&conn, name, &args["capabilities"])?;
             keep_offers(&conn, name, &args["offers"])?;
             // The machine that reached us carries its stow state in the same
             // exchange, so a request here bound to a stow there resolves now.

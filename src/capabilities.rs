@@ -275,10 +275,16 @@ pub(crate) fn carried(conn: &Connection) -> Result<Value> {
 
 /// Keep the vocabulary a linking machine sent. A peer too old to send one
 /// sends nothing, which changes nothing; a list replaces the copy whole.
-pub(crate) fn absorb(conn: &Connection, sent: &Value) -> Result<()> {
+/// Only the machine this one keeps its copy from (`defined_on`) is heard: a
+/// machine linked by two others would otherwise flip between their
+/// vocabularies on every exchange.
+pub(crate) fn absorb(conn: &Connection, from: &str, sent: &Value) -> Result<()> {
     let Some(sent) = sent.as_array() else {
         return Ok(());
     };
+    if defined_on(conn)?.as_deref() != Some(from) {
+        return Ok(());
+    }
     ensure!(
         sent.len() <= MAX_TERMS,
         "a vocabulary holds at most {MAX_TERMS} capabilities"
@@ -752,15 +758,33 @@ mod tests {
         assert!(format!("{refused:#}").contains("define it on the linking machine"));
         absorb(
             &conn,
+            "laptop",
             &json!([{"name": "xcode", "note": "", "probe": {"path": "xcodebuild"}}]),
         )
         .unwrap();
         assert!(known(&conn, "xcode").unwrap());
         // An older peer sends no vocabulary, which changes nothing.
-        absorb(&conn, &Value::Null).unwrap();
+        absorb(&conn, "laptop", &Value::Null).unwrap();
         assert!(known(&conn, "xcode").unwrap());
-        absorb(&conn, &json!([])).unwrap();
+        absorb(&conn, "laptop", &json!([])).unwrap();
         assert!(!known(&conn, "xcode").unwrap());
+    }
+
+    #[test]
+    fn a_machine_linked_by_two_keeps_only_its_defining_linkers_vocabulary() {
+        let conn = registry();
+        conn.execute_batch(
+            "INSERT INTO machines(name, role) VALUES('desk', 'collected');
+             INSERT INTO machines(name, role) VALUES('studio', 'collected');",
+        )
+        .unwrap();
+        let desk = json!([{"name": "xcode", "note": "", "probe": {"path": "xcodebuild"}}]);
+        let studio = json!([{"name": "docker", "note": "", "probe": {"path": "docker"}}]);
+        absorb(&conn, "desk", &desk).unwrap();
+        absorb(&conn, "studio", &studio).unwrap();
+        assert!(known(&conn, "xcode").unwrap());
+        assert!(!known(&conn, "docker").unwrap());
+        assert_eq!(list(&conn).unwrap()["defined_on"], "desk");
     }
 
     #[test]
