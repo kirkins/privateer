@@ -1371,6 +1371,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     {
         crate::block_ask::answered(store, correlation, &stored, true);
     }
+    if kind == "reply" && from == CAPTAIN {
+        record_reply_at_desk(store, &stored);
+    }
     let mut result = annotate(stored, Store::now_ms());
     if let Some((ask, ship)) = attached {
         result["attached_to"] = json!(ask);
@@ -1779,7 +1782,23 @@ pub(crate) fn closed_captain(store: &Store, peer: &str, limit: usize) -> Result<
             "approved" | "denied" => (state.clone(), answered_by, answered_ms),
             _ => (end_reason.unwrap_or_default(), ended_by, ended_ms),
         };
-        closures.push(json!({"id": id, "state": state, "reason": reason, "by": by, "ms": ms}));
+        let mut closure = json!({"id": id, "state": state, "reason": reason, "by": by, "ms": ms});
+        // The answer itself travels with the closure when it was given where
+        // the ask lived, so the desk can record it beside its closed copy and
+        // the captain's feed there shows what the captain said.
+        if matches!(state.as_str(), "answered" | "approved" | "denied")
+            && let Some(by) = closure["by"].as_str()
+            && let Some(reply) = find(store, by)?
+        {
+            let reply = envelope(&reply);
+            // A stored envelope can exceed the wire limit even when the send
+            // arguments fit it. The closure still ends the desk's copy; only
+            // the answer is left out, so it cannot strand the copy forever.
+            if reply.to_string().len() <= MAX_MESSAGE_BYTES {
+                closure["reply"] = reply;
+            }
+        }
+        closures.push(closure);
     }
     Ok(closures)
 }
@@ -1819,7 +1838,105 @@ pub(crate) fn check_closure(closure: &Value) -> Result<()> {
     );
     let reason = closure["reason"].as_str().unwrap_or("");
     ensure!(reason.len() <= 2000, "closure reason exceeds 2000 bytes");
+    if let Some(reply) = closure.get("reply").filter(|v| !v.is_null()) {
+        ensure!(reply.is_object(), "a closure reply must be an object");
+        let reply_id = required(reply, "id")?;
+        identifier(reply_id)?;
+        identifier(required(reply, "to")?)?;
+        ensure!(
+            reply["from"] == CAPTAIN,
+            "a closure reply is from the captain"
+        );
+        ensure!(reply["kind"] == "reply", "a closure reply is a reply");
+        ensure!(
+            reply["correlation"].as_str() == Some(closure["id"].as_str().unwrap_or_default()),
+            "a closure reply answers the closed item"
+        );
+        ensure!(
+            closure["by"].as_str() == Some(reply_id),
+            "a closure reply is the answer the closure records"
+        );
+    }
     Ok(())
+}
+
+/// Record a message in this home as an idle copy: it is never delivered,
+/// woken on or counted unread. An existing copy under the same id is left as
+/// it is, so a copy that arrived normally is not overwritten.
+fn record_copy(conn: &rusqlite::Connection, message: &Value, delivered_ms: i64) -> Result<usize> {
+    let payload = if message["payload"].is_object() {
+        message["payload"].clone()
+    } else {
+        json!({})
+    };
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,delivery,delivered_ms,because_of)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'delivered',?13,?14)",
+        params![
+            required(message, "id")?,
+            required(message, "from")?,
+            required(message, "to")?,
+            required(message, "kind")?,
+            message["correlation"].as_str(),
+            message["task_id"].as_str(),
+            message["request_kind"].as_str(),
+            message["body"].as_str().unwrap_or(""),
+            payload.to_string(),
+            message["urgency"].as_str().unwrap_or("normal"),
+            message["deadline_ms"].as_i64(),
+            message["created_ms"].as_i64().unwrap_or(delivered_ms),
+            delivered_ms,
+            message["because_of"].as_str(),
+        ],
+    )?)
+}
+
+/// A captain's reply written in the asking ship's own home here is also
+/// recorded in any other fleet home on this machine that holds a copy of the
+/// ask (the desk's), and that copy closes too, so the captain's feed there
+/// shows the answer. The copy is idle: it wakes nothing and is delivered
+/// nowhere. Best effort; the reply has already been recorded and delivered.
+pub(crate) fn record_reply_at_desk(store: &Store, reply: &Value) {
+    let result = (|| -> Result<()> {
+        let (Some(correlation), Some(asker)) =
+            (reply["correlation"].as_str(), reply["to"].as_str())
+        else {
+            return Ok(());
+        };
+        if reply["from"] != CAPTAIN || reply["kind"] != "reply" {
+            return Ok(());
+        }
+        for (_, home) in crate::block_ask::other_homes(store.home()) {
+            let Ok(other) = Store::open(&home) else {
+                continue;
+            };
+            // Read first: most homes on the machine hold no copy of this ask,
+            // and a read lock is enough to tell. Take the write lock only in
+            // the home that will be changed.
+            let holds: bool = other.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1 AND sender=?2 AND recipient=?3
+                   AND kind IN ('request','decision'))",
+                params![correlation, asker, CAPTAIN],
+                |r| r.get(0),
+            )?;
+            if !holds {
+                continue;
+            }
+            let tx = other.write_transaction()?;
+            let now = Store::now_ms();
+            record_copy(&tx, reply, now)?;
+            tx.execute(
+                "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3
+                 WHERE id=?1 AND state='open'",
+                params![correlation, reply["id"].as_str().unwrap_or_default(), now],
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("privateer: the captain's reply was not copied to the desk: {error:#}");
+    }
 }
 
 /// Apply a closure a machine behind `peer` sent for a captain request this
@@ -1834,8 +1951,9 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
     let by = closure["by"].as_str();
     let ms = closure["ms"].as_i64().unwrap_or_else(Store::now_ms);
     let from_peer = "SELECT s.name FROM ships s WHERE json_extract(s.record,'$.location.peer')=?2";
+    let tx = store.write_transaction()?;
     let changed = if state == "answered" {
-        store.connection().execute(
+        tx.execute(
             &format!(
                 "UPDATE mail SET state='answered', answered_by=?3, answered_ms=?4
                  WHERE id=?1 AND state='open' AND recipient=?5 AND kind IN ('request','decision')
@@ -1845,7 +1963,7 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
         )?
     } else if matches!(state, "approved" | "denied") {
         // As approval_answer writes an approval outcome on the machine that granted it.
-        store.connection().execute(
+        tx.execute(
             &format!(
                 "UPDATE mail SET state=?3, answered_by=?4, answered_ms=?5, ended_by=?4, ended_ms=?5, end_reason=?3
                  WHERE id=?1 AND state='open' AND recipient=?6 AND kind IN ('request','decision')
@@ -1854,7 +1972,7 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
             params![id, peer, state, by, ms, CAPTAIN],
         )?
     } else {
-        store.connection().execute(
+        tx.execute(
             &format!(
                 "UPDATE mail SET state=?3, ended_by=?4, ended_ms=?5, end_reason=?6
                  WHERE id=?1 AND state='open' AND recipient=?7 AND kind IN ('request','decision')
@@ -1863,6 +1981,29 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
             params![id, peer, state, by, ms, reason, CAPTAIN],
         )?
     };
+    // The answer given where the ask lived travels with the closure: record
+    // it beside the desk's copy, once, so the captain's feed here shows it.
+    // The home must hold the copy the closure closes, not merely a same id,
+    // and that copy's sender must be the ship the reply answers: a linked
+    // machine cannot address its reply to some other ship hosted here.
+    if let Some(reply) = closure.get("reply").filter(|v| !v.is_null()) {
+        let asker = reply["to"].as_str().unwrap_or_default();
+        let holds: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM mail
+                 WHERE id=?1 AND recipient=?3 AND kind IN ('request','decision')
+                   AND sender IN ({from_peer}) AND sender=?4)"
+            ),
+            params![id, peer, CAPTAIN, asker],
+            |r| r.get(0),
+        )?;
+        // A reply too large for the wire is dropped, but the closure still
+        // ends the copy; refusing it would leave the copy open forever.
+        if holds && reply.to_string().len() <= MAX_MESSAGE_BYTES {
+            record_copy(&tx, reply, ms)?;
+        }
+    }
+    tx.commit()?;
     Ok(changed > 0)
 }
 

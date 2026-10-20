@@ -3623,6 +3623,110 @@ fn a_captain_request_answered_on_the_linked_machine_closes_the_desk_copy() {
     assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
 }
 
+/// A closure's answer is recorded only in a home holding the ask, and only
+/// for the ship that ask was addressed from. A linked machine cannot land a
+/// captain reply in another ship's desk-local inbox.
+#[test]
+fn a_closure_reply_addressed_to_another_ship_does_not_reach_its_inbox() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    mac.ship("other");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+    let replied = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    // Readdress the stored answer to a different desk-local ship, as a forged
+    // closure from the linked machine would.
+    ship_database(&laptop, "scout")
+        .execute(
+            "UPDATE mail SET recipient='other' WHERE id=?1",
+            params![replied["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    // The desk-local home for that other ship holds a copy of the same ask.
+    ship_database(&mac, "other")
+        .execute(
+            "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state,delivery)
+             VALUES(?1,'scout','captain','request','Rotate the deploy key?','{}','normal',0,'open','received')",
+            params![asked["id"].as_str().unwrap()],
+        )
+        .unwrap();
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+
+    // The closure closes the copy it names, but its answer was addressed to
+    // another ship and is not recorded in that ship's inbox.
+    let inbox = mac.ok("other", "mail.inbox", json!({"address": "other"}))["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(inbox.iter().all(|m| m["id"] != replied["id"]), "{inbox:?}");
+}
+
+/// A captain's answer whose stored envelope is just over the wire limit is
+/// left out of the closure rather than refusing it: the desk's copy still
+/// closes, instead of waiting forever for a reply that can never be carried.
+#[test]
+fn a_reply_too_large_for_the_wire_still_closes_the_desk_copy() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+    // The send arguments fit, but the stored envelope (with its timestamps and
+    // defaults) is over the limit and cannot travel in a closure.
+    let replied = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "x".repeat(65_300)}),
+    );
+
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+    assert_eq!(audited(&laptop, "liaison", "machine.closure_refused"), 0);
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+    let closed = captain_requests(&mac, "fitforge", "answered");
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["id"], asked["id"]);
+    // The oversized answer itself was not copied; the copy still closed.
+    let copied: i64 = ship_database(&mac, "fitforge")
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE id=?1",
+            [replied["id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(copied, 0);
+}
+
 /// A request withdrawn on the laptop leaves the desk's copy with the same
 /// end reason, so the desk's waiting drops it.
 #[test]
@@ -4239,6 +4343,72 @@ fn the_ship_profile_of_a_ship_on_another_machine_is_asked_there() {
     );
     let there = mac.ok("fitforge", "ship.profile", json!({"ship": "fitforge"}));
     assert_eq!(there["first_mate"]["harness"], "codex", "{there}");
+}
+
+/// A reply given where the ask was asked stays in the ship's own home; the
+/// closure that answers the desk's copy carries the reply too, so the
+/// captain's feed at the desk lists what the captain said, once, beside the
+/// ask it answers.
+#[test]
+fn a_reply_given_on_the_linked_machine_reaches_the_desks_feed() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the key?"}),
+    );
+    assert_eq!(
+        laptop.pass("liaison", &ssh)["machines"][0]["captain_pushed"],
+        1
+    );
+
+    // Answered where it was asked: the reply is recorded in scout's home only.
+    let replied = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+
+    // The desk's feed shows the reply once, correlated to the ask.
+    let feed = laptop.ok_over("liaison", "captain.feed", json!({"ship": "scout"}), &ssh);
+    let entries = feed["entries"].as_array().unwrap();
+    let replies: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["id"] == replied["id"])
+        .collect();
+    assert_eq!(replies.len(), 1, "{feed}");
+    assert_eq!(replies[0]["kind"], "reply", "{feed}");
+    assert_eq!(replies[0]["correlation"], asked["id"], "{feed}");
+    assert_eq!(replies[0]["body"], "Yes, rotate it", "{feed}");
+    assert_eq!(replies[0]["home"], "fitforge", "{feed}");
+    let asks: Vec<&Value> = entries.iter().filter(|e| e["id"] == asked["id"]).collect();
+    assert_eq!(asks.len(), 1, "{feed}");
+    assert_eq!(asks[0]["state"], "answered", "{feed}");
+    assert_eq!(asks[0]["answered_by"], replied["id"], "{feed}");
+
+    // Offered once: a repeated pass sends no closure or reply again.
+    collect_now(&laptop);
+    let again = laptop.pass("liaison", &ssh);
+    assert_eq!(again["machines"][0]["captain_closed"], 0, "{again}");
+    let feed = laptop.ok_over("liaison", "captain.feed", json!({"ship": "scout"}), &ssh);
+    assert_eq!(
+        feed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["id"] == replied["id"])
+            .count(),
+        1,
+        "{feed}"
+    );
 }
 
 fn machine_row<'a>(snapshot: &'a Value, name: &str) -> &'a Value {

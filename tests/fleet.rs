@@ -1984,6 +1984,62 @@ fn the_captain_reads_one_time_ordered_feed_across_homes_a_page_at_a_time() {
     assert_eq!(default["entries"].as_array().unwrap().len(), 50);
 }
 
+/// A desk copy of an ask held in another home on this machine receives the
+/// captain's reply too, so the feed never shows the ask answered without the
+/// answer. The copy is idle: it is not delivered or woken on again.
+#[test]
+fn a_captain_reply_written_in_the_ships_home_reaches_its_desk_copy() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let desk = machine.ship("desk");
+    let asked = machine.json(
+        &apps,
+        "mail.send",
+        json!({"id":"rotate","from":"apps","to":"captain","kind":"request","body":"Rotate the key?"}),
+    );
+    // The desk holds a copy of the ask, as it does for an ask that reached it
+    // over a machine link.
+    let conn = rusqlite::Connection::open(desk.join(".privateer/privateer.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state,delivery)
+         VALUES(?1,'apps','captain','request',?2,'{}','normal',?3,'open','received')",
+        rusqlite::params![
+            asked["id"].as_str(),
+            "Rotate the key?",
+            asked["created_ms"].as_i64()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let replied = machine.json(
+        &apps,
+        "captain.reply",
+        json!({"id": asked["id"], "body": "Yes"}),
+    );
+    let reply_id = replied["reply"]["id"].as_str().unwrap().to_owned();
+
+    // The desk's copy holds the captain's reply, and that reply answered it.
+    let copy = machine.json(&desk, "mail.show", json!({"id": reply_id}));
+    assert_eq!(copy["from"], "captain", "{copy}");
+    assert_eq!(copy["correlation"], asked["id"], "{copy}");
+    assert_eq!(copy["body"], "Yes", "{copy}");
+    let closed = machine.json(&desk, "mail.show", json!({"id": asked["id"]}));
+    assert_eq!(closed["state"], "answered", "{closed}");
+    assert_eq!(closed["answered_by"], reply_id, "{closed}");
+
+    // The feed lists the answer once, correlated to the ask.
+    let feed = machine.json(&apps, "captain.feed", json!({"ship":"apps"}));
+    let replies: Vec<&Value> = feed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["id"] == reply_id.as_str())
+        .collect();
+    assert_eq!(replies.len(), 1, "{feed}");
+    assert_eq!(replies[0]["correlation"], asked["id"], "{feed}");
+}
+
 /// Ships choose their own ids, so two homes can hold unrelated messages
 /// under one id: the feed shows both, not one as a copy of the other.
 #[test]
