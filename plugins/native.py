@@ -98,12 +98,18 @@ def build(harness, request):
                     "permission_mode", "bare", "msp_permissions", "msp_approval_mode"}
     if not isinstance(options, dict) or set(options) - allowed:
         raise ValueError("unknown native option")
+    role = request["context"].get("role")
+    reviewer = role == "reviewer"
+    if reviewer and harness not in ("claude", "pi", "pi-signed", "codex"):
+        raise ValueError("reviewer role supports only claude, pi and codex")
     tool_policy = policy(request["context"].get("tool_permissions"))
-    options = options_for(harness, options, tool_policy)
+    options = options_for(harness, options, tool_policy, role)
     mode = selector(options, "mode", ["headless", "interactive"]) or "headless"
     model = option(options, "model")
     effort = selector(options, "effort", profile["effort"])
     resume = session(option(options, "resume"), profile)
+    if reviewer and resume:
+        raise ValueError("review requires a fresh session")
     headless = mode == "headless"
     argv = [profile["binary"]]
     if harness == "muse":
@@ -167,9 +173,11 @@ def build(harness, request):
         elif resume:
             argv += ["resume"]
         argv += ["-C", repo]
-        if boolean(options, "yolo"):
+        if boolean(options, "yolo") and not reviewer:
             argv += ["--dangerously-bypass-approvals-and-sandbox"]
         sandbox = selector(options, "sandbox", ["read-only", "workspace-write", "danger-full-access"])
+        if reviewer:
+            sandbox = "read-only"
         if sandbox:
             argv += ["--sandbox", sandbox]
             if sandbox == "workspace-write":
@@ -185,6 +193,8 @@ def build(harness, request):
                         argv += ["--add-dir", str(extra)]
         if effort:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+        if reviewer:
+            argv += ["-c", 'web_search="disabled"', "--ignore-user-config"]
         if boolean(options, "ephemeral"):
             if resume or not headless:
                 raise ValueError("ephemeral requires a fresh headless run")
@@ -219,11 +229,13 @@ def build(harness, request):
                 argv += ["--approval-mode", permissions]
             if boolean(options, "bare"):
                 argv += ["--no-extensions", "--no-skills", "--no-rules", "--no-title", "--no-lsp", "--no-pty"]
-        if harness != "omp" and boolean(options, "bare"):
+        if harness != "omp" and (boolean(options, "bare") or reviewer):
             # Per-run resource isolation; retain native authentication and
             # model/provider files, including any private gateway route.
             argv += ["--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
                      "--no-context-files", "--no-themes"]
+        if reviewer:
+            argv += ["--tools", "read,grep,find,ls"]
         if headless and transport != "rpc":
             argv += ["--print"]
         provider = option(options, "provider")
@@ -241,7 +253,7 @@ def build(harness, request):
             argv += ["--thinking", effort]
         if resume:
             argv += ["--resume" if harness == "omp" else "--session", resume]
-        if boolean(options, "ephemeral"):
+        if boolean(options, "ephemeral") or reviewer:
             if resume:
                 raise ValueError("cannot resume an ephemeral session")
             argv += ["--no-session"]
@@ -257,9 +269,11 @@ def build(harness, request):
         # Claude in Chrome drives the captain's own signed-in browser, which
         # Claude may enable for every session by default: only a route that
         # asks for it gets it.
-        argv += ["--chrome" if boolean(options, "chrome") else "--no-chrome"]
+        argv += ["--chrome" if boolean(options, "chrome") and not reviewer else "--no-chrome"]
         if headless:
             argv += ["--print", "--verbose", "--output-format", "stream-json"]
+        if reviewer:
+            argv += ["--setting-sources", "user", "--strict-mcp-config", "--safe-mode"]
         permissions = selector(options, "permission_mode", ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"])
         if permissions:
             argv += ["--permission-mode", permissions]
@@ -307,7 +321,7 @@ def build(harness, request):
         # The home and the shared resource ledger hold the ship's records and
         # crew logs; a crew workspace is elsewhere, so name them for Claude's
         # file tools as Codex and Cursor do.
-        if control:
+        if control and not reviewer:
             for extra in [control["cli_argv"][2], *control.get("writable", [])]:
                 extra = Path(extra).resolve()
                 if extra.is_dir() and str(extra) not in argv:
@@ -489,6 +503,8 @@ def handle(harness, request):
     repo, argv = build(harness, request)
     bundles = request["context"].get("tool_bundles")
     if bundles is not None:
+        if request["context"].get("role") == "reviewer":
+            raise ValueError("reviewer does not support tool bundles")
         from bundles import validate_plan
         validate_plan(bundles)
         if harness not in ("pi", "claude") or ("claude_version" in bundles) != (harness == "claude"):

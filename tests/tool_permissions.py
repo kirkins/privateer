@@ -221,5 +221,189 @@ class Permissions(unittest.TestCase):
         self.assertFalse(any(grant in a for a in allow("bizdev", "first_mate")))
         self.assertFalse(any(grant in a for a in allow("storefront", "crew")))
 
+    def test_reviewer_role_restricts_supported_harnesses(self):
+        req = self.request()
+        req["context"]["role"] = "reviewer"
+        for harness in ["claude", "pi", "pi-signed", "codex"]:
+            with self.subTest(harness=harness):
+                _, argv = build(harness, req)
+                self.assertTrue(len(argv) > 0)
+        unsupported = ["gemini", "cursor", "devin", "grok", "kimi", "muse", "omp", "opencode", "opencode-v2", "rovo"]
+        for harness in unsupported:
+            with self.subTest(harness=harness):
+                with self.assertRaises(ValueError) as ctx:
+                    build(harness, req)
+                self.assertEqual(str(ctx.exception), "reviewer role supports only claude, pi and codex")
+
+    def test_reviewer_role_refuses_session_resume(self):
+        for harness in ["claude", "pi", "pi-signed", "codex"]:
+            with self.subTest(harness=harness):
+                req = self.request(resume="4fa4f4bc-5b2d-4553-8ae1-eb09e501ea63")
+                req["context"]["role"] = "reviewer"
+                with self.assertRaises(ValueError) as ctx:
+                    build(harness, req)
+                self.assertEqual(str(ctx.exception), "review requires a fresh session")
+
+    def test_claude_reviewer_argv_has_no_bash_no_write_no_control_cli_and_no_resume(self):
+        req = self.request()
+        req["context"]["role"] = "reviewer"
+        req["context"]["actions"] = ["inspect", "implement", "test", "publish_pr", "merge_green"]
+        req["context"]["forge"] = "github"
+        _, argv = build("claude", req)
+
+        # Permission mode is dontAsk
+        self.assertIn("--permission-mode", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+
+        # Allowed tools: strictly Read, Grep, Glob
+        self.assertIn("--allowedTools", argv)
+        allowed_idx = argv.index("--allowedTools")
+        disallowed_idx = argv.index("--disallowedTools")
+        allowed = argv[allowed_idx + 1:disallowed_idx]
+        self.assertEqual(allowed, ["Read", "Grep", "Glob"])
+
+        # Disallowed tools: includes Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, CronCreate, ScheduleWakeup, RemoteTrigger, Agent, Task, Workflow, EnterWorktree
+        end_idx = argv.index("--")
+        disallowed = argv[disallowed_idx + 1:end_idx]
+        for tool in ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
+                     "CronCreate", "ScheduleWakeup", "RemoteTrigger", "Agent", "Task", "Workflow", "EnterWorktree"]:
+            self.assertIn(tool, disallowed)
+
+        # No Bash, no Write, no Edit in allowed tools
+        for tool in allowed:
+            self.assertNotIn("Bash", tool)
+            self.assertNotIn("Write", tool)
+            self.assertNotIn("Edit", tool)
+
+        # No control CLI in argv
+        self.assertNotIn("/bin/privateer", argv)
+        for arg in argv:
+            self.assertNotIn("privateer", arg)
+
+        # No resume in argv
+        self.assertNotIn("--resume", argv)
+
+        # No network / chrome
+        self.assertIn("--no-chrome", argv)
+        self.assertNotIn("--chrome", argv)
+
+        # Setting sources, MCP config, and safe mode
+        self.assertIn("--setting-sources", argv)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "user")
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--safe-mode", argv)
+
+        # No settings or add-dir for operational home
+        self.assertNotIn("--settings", argv)
+        self.assertNotIn("--add-dir", argv)
+
+        # Even with fleet yolo policy, reviewer permissions are unaffected
+        self.policy = {"mode": "yolo", "claude_allow": ["Bash(something *)"]}
+        req = self.request()
+        req["context"]["role"] = "reviewer"
+        _, argv_yolo = build("claude", req)
+        self.assertIn("dontAsk", argv_yolo)
+        self.assertNotIn("bypassPermissions", argv_yolo)
+        self.assertNotIn("Bash(something *)", argv_yolo)
+        self.assertIn("--setting-sources", argv_yolo)
+        self.assertEqual(argv_yolo[argv_yolo.index("--setting-sources") + 1], "user")
+        self.assertIn("--strict-mcp-config", argv_yolo)
+        self.assertIn("--safe-mode", argv_yolo)
+        allowed_yolo = argv_yolo[argv_yolo.index("--allowedTools") + 1:argv_yolo.index("--disallowedTools")]
+        self.assertEqual(allowed_yolo, ["Read", "Grep", "Glob"])
+
+    def test_pi_reviewer_argv_has_no_bash_no_write_no_control_cli_and_no_resume(self):
+        for harness in ["pi", "pi-signed"]:
+            with self.subTest(harness=harness):
+                req = self.request()
+                req["context"]["role"] = "reviewer"
+                _, argv = build(harness, req)
+
+                # Bare flags present
+                for bare_flag in ["--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
+                                  "--no-context-files", "--no-themes"]:
+                    self.assertIn(bare_flag, argv)
+
+                # Tools flag: read-only tools
+                self.assertIn("--tools", argv)
+                tools = argv[argv.index("--tools") + 1]
+                self.assertEqual(tools, "read,grep,find,ls")
+                self.assertNotIn("bash", tools)
+                self.assertNotIn("write", tools)
+                self.assertNotIn("edit", tools)
+
+                # Ephemeral flag
+                self.assertIn("--no-session", argv)
+
+                # No control CLI or resume
+                self.assertNotIn("/bin/privateer", argv)
+                self.assertNotIn("--resume", argv)
+                self.assertNotIn("--session", argv)
+
+                # Even with fleet yolo policy
+                self.policy = {"mode": "yolo"}
+                req_yolo = self.request()
+                req_yolo["context"]["role"] = "reviewer"
+                _, argv_yolo = build(harness, req_yolo)
+                self.assertIn("--no-session", argv_yolo)
+                self.assertIn("read,grep,find,ls", argv_yolo)
+
+    def test_codex_reviewer_argv_has_no_bash_no_write_no_control_cli_and_no_resume(self):
+        req = self.request()
+        req["context"]["role"] = "reviewer"
+        _, argv = build("codex", req)
+
+        # Sandbox is read-only
+        self.assertIn("--sandbox", argv)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+
+        # Disable web search and ignore user config
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn("-c", argv)
+        self.assertIn('web_search="disabled"', argv)
+
+        # No bypass, no add-dir, no control CLI, no resume
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("--add-dir", argv)
+        self.assertNotIn("/bin/privateer", argv)
+        self.assertNotIn("resume", argv)
+
+        # Even with explicit yolo or sandbox options or fleet yolo policy
+        self.policy = {"mode": "yolo"}
+        req_yolo = self.request(sandbox="danger-full-access", yolo=True)
+        req_yolo["context"]["role"] = "reviewer"
+        _, argv_yolo = build("codex", req_yolo)
+        self.assertIn("--sandbox", argv_yolo)
+        self.assertEqual(argv_yolo[argv_yolo.index("--sandbox") + 1], "read-only")
+        self.assertIn("--ignore-user-config", argv_yolo)
+        self.assertIn("-c", argv_yolo)
+        self.assertIn('web_search="disabled"', argv_yolo)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv_yolo)
+        self.assertNotIn("--add-dir", argv_yolo)
+        self.assertNotIn("/bin/privateer", argv_yolo)
+
+    def test_reviewer_refuses_tool_bundles_for_claude_and_pi(self):
+        for harness in ["claude", "pi"]:
+            with self.subTest(harness=harness):
+                req = self.request()
+                req["context"]["role"] = "reviewer"
+                req["context"]["tool_bundles"] = {"skills": [], "mcp_servers": []}
+                with self.assertRaises(ValueError) as ctx:
+                    handle(harness, req)
+                self.assertEqual(str(ctx.exception), "reviewer does not support tool bundles")
+
+    def test_claude_reviewer_route_options_bypass_and_chrome_yield_dontask_and_no_chrome(self):
+        for policy_mode in ["standard", "yolo"]:
+            with self.subTest(policy_mode=policy_mode):
+                self.policy = {"mode": policy_mode, "claude_allow": []}
+                req = self.request(permission_mode="bypassPermissions", chrome=True)
+                req["context"]["role"] = "reviewer"
+                _, argv = build("claude", req)
+                self.assertIn("--permission-mode", argv)
+                self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+                self.assertNotIn("bypassPermissions", argv)
+                self.assertIn("--no-chrome", argv)
+                self.assertNotIn("--chrome", argv)
+
 
 if __name__=="__main__":unittest.main()
