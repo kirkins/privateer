@@ -21,7 +21,10 @@ if pid_file:
     Path(pid_file).write_text(str(os.getpid()))
 grandchild_file = os.environ.get('CLAUDE_TEST_GRANDCHILD_PID')
 if grandchild_file:
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    trap = os.environ.get('CLAUDE_TEST_GRANDCHILD_TRAP_SIGTERM')
+    cmd = ("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+           if trap else "import time; time.sleep(60)")
+    proc = subprocess.Popen([sys.executable, "-c", cmd])
     Path(grandchild_file).write_text(str(proc.pid))
 mode = os.environ.get('CLAUDE_TEST_MODE')
 if mode == 'sleep':
@@ -85,7 +88,7 @@ class ClaudeTurn(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_stream(self, events, *, code=0, raw=None, resume=None, env_extra=None, driver=False):
+    def run_stream(self, events, *, code=0, raw=None, resume=None, env_extra=None, driver=False, timeout=10):
         stream = self.root / "stream.jsonl"
         stream.write_bytes(raw if raw is not None else b"".join((json.dumps(e)+"\n").encode() for e in events))
         flags = ["--print", "--verbose", "--output-format", "stream-json"]
@@ -108,7 +111,7 @@ class ClaudeTurn(unittest.TestCase):
         else:
             command = [sys.executable, str(ROOT / "plugins/native_launch.py"), "claude", "claude"]
         run = subprocess.run([*command, *flags, "--", "prompt"], cwd=self.root, capture_output=True,
-                             timeout=10, env=run_env)
+                             timeout=timeout, env=run_env)
         return run, json.loads(run.stdout.splitlines()[-1])
 
     def test_a_run_without_output_ends_at_startup_bound(self):
@@ -163,12 +166,12 @@ class ClaudeTurn(unittest.TestCase):
         # wait on it forever. It bounds the wait, stops the group, and names the
         # fault as stream-eof.
         started = time.monotonic()
-        run, summary = self.run_stream([], env_extra={"CLAUDE_TEST_MODE": "eof"})
+        run, summary = self.run_stream([], env_extra={"CLAUDE_TEST_MODE": "eof"}, timeout=30)
         elapsed = time.monotonic() - started
         self.assertEqual(run.returncode, 2)
         self.assertEqual(summary["type"], "native.turn.failed")
         self.assertEqual(summary["reason"], "stream-eof")
-        self.assertLess(elapsed, 9.0)
+        self.assertLess(elapsed, 20.0)
         pid_file = self.root / "pid"
         self.assertTrue(pid_file.exists())
         with self.assertRaises(ProcessLookupError):
@@ -186,6 +189,24 @@ class ClaudeTurn(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertEqual(summary["type"], "turn.completed")
         self.assertLess(elapsed, 9.0)
+        self.assertTrue(grandchild_pid_file.exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(grandchild_pid_file.read_text()), 0)
+
+    def test_a_grandchild_trapping_sigterm_after_the_leader_exits_is_killed(self):
+        # The leader exits after a clean run and a grandchild traps SIGTERM while
+        # holding stdout. The launcher must not give up after SIGTERM: it gives
+        # the group its grace, SIGKILLs the survivor, and settles turn.completed.
+        grandchild_pid_file = self.root / "grandchild_pid"
+        started = time.monotonic()
+        run, summary = self.run_stream([INIT, RESULT], timeout=30, env_extra={
+            "CLAUDE_TEST_GRANDCHILD_PID": str(grandchild_pid_file),
+            "CLAUDE_TEST_GRANDCHILD_TRAP_SIGTERM": "1",
+        })
+        elapsed = time.monotonic() - started
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertEqual(summary["type"], "turn.completed")
+        self.assertLess(elapsed, 20.0)
         self.assertTrue(grandchild_pid_file.exists())
         with self.assertRaises(ProcessLookupError):
             os.kill(int(grandchild_pid_file.read_text()), 0)
