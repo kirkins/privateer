@@ -2171,6 +2171,7 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     // Files cross a link only on the captain's mail to a ship, and this home,
     // which hosts the ship, keeps only what its own rows say about them. A
     // redelivery of mail already stored was checked when it was placed.
+    let mut files_dropped = false;
     if payload.get("files").is_some() {
         if from == CAPTAIN {
             if by_id(store, id)?.is_none() {
@@ -2181,13 +2182,14 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             // or come from an older machine. Deliver the rest and record the
             // drop; refusing it would retry forever and hold up the queue.
             if let Some(fields) = payload.as_object_mut() {
-                fields.remove("files");
+                let count = fields
+                    .remove("files")
+                    .and_then(|f| f.as_array().map(|a| a.len()))
+                    .unwrap_or(1);
+                fields.insert("files_dropped".to_string(), json!(count));
             }
             if by_id(store, id)?.is_none() {
-                store.audit(
-                    "mail.files_dropped",
-                    &json!({"id": id, "from": from, "to": to}),
-                )?;
+                files_dropped = true;
             }
         }
     }
@@ -2335,6 +2337,12 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         &by_id(store, id)?.context("delivered mail disappeared")?,
     )?;
     tx.commit()?;
+    if files_dropped {
+        store.audit(
+            "mail.files_dropped",
+            &json!({"id": id, "from": from, "to": to}),
+        )?;
+    }
     if answers_here && let Some(correlation) = correlation {
         let stored = by_id(store, id)?.context("delivered mail disappeared")?;
         crate::block_ask::answered(store, correlation, &stored, false);

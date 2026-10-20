@@ -569,7 +569,7 @@ fn sweep_uploads(store: &Store) -> Result<()> {
                 .ok()
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|modified| now_ms() - modified.as_millis() as i64);
-            if age_ms.is_none_or(|age| age >= UPLOAD_TTL_MS) {
+            if age_ms.is_none_or(|age| age.abs() >= UPLOAD_TTL_MS) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -964,6 +964,18 @@ mod tests {
         CLOCK_SHIFT_MS.with(|shift| shift.set(UPLOAD_TTL_MS + 1000));
         begin_upload(&store, "b.txt", 1, &"0".repeat(64));
         assert!(!stray.exists());
+        CLOCK_SHIFT_MS.with(|shift| shift.set(0));
+
+        // An orphan with an mtime in the future (clock stepped back, copied file)
+        // is swept once its absolute age passes the TTL, while a fresh part survives.
+        let future = dir.join("upload-future.part");
+        fs::write(&future, b"future").unwrap();
+        CLOCK_SHIFT_MS.with(|shift| shift.set(-1000));
+        sweep_uploads(&store).unwrap();
+        assert!(future.exists());
+        CLOCK_SHIFT_MS.with(|shift| shift.set(-(UPLOAD_TTL_MS + 1000)));
+        sweep_uploads(&store).unwrap();
+        assert!(!future.exists());
         CLOCK_SHIFT_MS.with(|shift| shift.set(0));
     }
 
