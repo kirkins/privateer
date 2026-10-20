@@ -119,10 +119,26 @@ STOP_GRACE_SECS = 5
 
 def stop_process(child):
     signal_group(child, signal.SIGTERM)
+    deadline = time.monotonic() + STOP_GRACE_SECS
+    if child.poll() is None:
+        try:
+            child.wait(timeout=STOP_GRACE_SECS)
+        except subprocess.TimeoutExpired:
+            pass
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(child.pid, 0)
+        except (ProcessLookupError, PermissionError):
+            break
+        time.sleep(0.05)
     try:
-        child.wait(timeout=STOP_GRACE_SECS)
-    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, 0)
         signal_group(child, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        child.send_signal(signal.SIGKILL)
+    if child.poll() is None:
         try:
             child.wait(timeout=STOP_GRACE_SECS)
         except subprocess.TimeoutExpired:
@@ -342,9 +358,10 @@ def run(argv, control):
         if reader.is_alive():
             # A survivor still holds the pipe and the reader ended without a
             # reason: never block the turn on a stream nobody will close.
-            reason = reason or "stream-eof"
             stop_process(child)
             reader.join(timeout=STOP_GRACE_SECS)
+            if reader.is_alive() or not (turn.complete() and not turn.denied):
+                reason = reason or "stream-eof"
         try:
             status = child.wait(timeout=STOP_GRACE_SECS)
         except subprocess.TimeoutExpired:
