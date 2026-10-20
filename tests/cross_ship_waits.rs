@@ -347,12 +347,21 @@ fn a_subscribe_for_an_ended_task_answers_with_its_final_status() {
 }
 
 #[test]
-fn a_final_status_ends_each_subscription_once_and_deletes_the_rows() {
+fn a_final_status_sends_one_task_end_per_subscriber_and_deletes_the_rows() {
     for status in ["done", "cancelled"] {
         let mut pair = pair();
         share(&mut pair.a, "far-work", json!(["infra", "research"]));
         deliver_wait(&mut pair.a, "sub-1", "wait_subscribe", "far-work");
-        assert_eq!(rows(&pair.a, "far-work"), 1);
+        // A second waiting task of the same ship is its own row, but the
+        // notice goes once per subscriber ship, since it names no waiting task.
+        dispatch(
+            &mut pair.a,
+            "mail.deliver",
+            json!({"id":"sub-2","from":"infra","to":"apps","kind":"notice","payload":{
+                "wait_subscribe": {"task":"far-work","subscriber":"infra","subscriber_task":"waiting-2"}}}),
+        )
+        .unwrap();
+        assert_eq!(rows(&pair.a, "far-work"), 2);
         dispatch(
             &mut pair.a,
             "task.update",

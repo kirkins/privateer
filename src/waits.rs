@@ -140,21 +140,22 @@ fn unsubscribe(store: &Store, from: &str, wait: &Value) -> Result<Value> {
 
 fn subscribe(store: &Store, from: &str, to: &str, wait: &Value) -> Result<Value> {
     let reference = wait_ref(wait)?;
+    // Check, answer and store under one write lock: a task ending between the
+    // visibility check and the insert would otherwise leave a row that no
+    // `task_end` ever clears.
+    let tx = store.write_transaction()?;
     // Accept a subscribe only for a task this home holds, owned by the ship
     // the notice was addressed to, and shared with the sender, who must be
     // the subscriber the notice names. Every other case gets the same
     // refusal, so a missing task is indistinguishable from an unshared one.
+    let task = store.task(reference.task).ok();
     let accepted = from == reference.subscriber
-        && store
-            .task(reference.task)
-            .ok()
-            .filter(|task| {
-                task["owner"] == json!(to)
-                    && task["shared_with"]
-                        .as_array()
-                        .is_some_and(|ships| ships.iter().any(|ship| ship == from))
-            })
-            .is_some();
+        && task.as_ref().is_some_and(|task| {
+            task["owner"] == json!(to)
+                && task["shared_with"]
+                    .as_array()
+                    .is_some_and(|ships| ships.iter().any(|ship| ship == from))
+        });
     if !accepted {
         notify(
             store,
@@ -167,9 +168,10 @@ fn subscribe(store: &Store, from: &str, to: &str, wait: &Value) -> Result<Value>
             &json!({"task":reference.task,"subscriber":reference.subscriber,
                 "subscriber_task":reference.subscriber_task}),
         )?;
+        tx.commit()?;
         return Ok(json!({"task": reference.task, "state": "refused"}));
     }
-    let task = store.task(reference.task)?;
+    let task = task.context("accepted task vanished")?;
     if let Some(status) = task["status"]
         .as_str()
         .filter(|s| matches!(*s, "done" | "cancelled"))
@@ -187,9 +189,9 @@ fn subscribe(store: &Store, from: &str, to: &str, wait: &Value) -> Result<Value>
             &json!({"task":reference.task,"subscriber":reference.subscriber,
                 "subscriber_task":reference.subscriber_task,"status":status}),
         )?;
+        tx.commit()?;
         return Ok(json!({"task": reference.task, "state": "ended"}));
     }
-    let tx = store.write_transaction()?;
     let stored = tx.execute(
         "INSERT OR IGNORE INTO task_subscriptions(task_id,subscriber,subscriber_task,created_ms)
          VALUES(?1,?2,?3,?4)",
@@ -219,7 +221,7 @@ fn subscribe(store: &Store, from: &str, to: &str, wait: &Value) -> Result<Value>
 pub(crate) fn task_ended(store: &Store, task: &str, status: &str) -> Result<()> {
     let mut statement = store
         .connection()
-        .prepare("SELECT subscriber,subscriber_task FROM task_subscriptions WHERE task_id=?1")?;
+        .prepare("SELECT DISTINCT subscriber FROM task_subscriptions WHERE task_id=?1")?;
     let subscribers = statement
         .query_map([task], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

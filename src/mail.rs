@@ -2183,6 +2183,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     if payload.get("wait_subscribe").is_some() || payload.get("wait_unsubscribe").is_some() {
         ensure!(kind == "notice", "a wait notice rides a notice");
         ensure!(
+            from != CAPTAIN && to != CAPTAIN && to != CREW,
+            "wait notices go between ships"
+        );
+        ensure!(
             payload.get("wait_subscribe").is_none() || payload.get("wait_unsubscribe").is_none(),
             "a notice carries one wait instruction"
         );
