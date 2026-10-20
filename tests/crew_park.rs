@@ -41,6 +41,9 @@ impl Drop for Fleet {
             Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
             Err(error) => error.to_string(),
         };
+        // Keep the PID, lock and logs available if shutdown was not confirmed.
+        self._tmp.disable_cleanup(true);
+        let failure = format!("{failure}; fixture retained at {}", self.root.display());
         if std::thread::panicking() {
             eprintln!("fixture dispatcher cleanup failed: {failure}");
         } else {
