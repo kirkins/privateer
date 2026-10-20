@@ -504,6 +504,22 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     job[key] = value.clone();
                 }
             }
+            // A first mate may shorten a crew's deadline, never past the
+            // charter's; absent keeps the charter's job_timeout_secs.
+            if let Some(requested) = args.get("timeout_secs").filter(|v| !v.is_null()) {
+                let secs = requested.as_u64().filter(|secs| *secs > 0).ok_or_else(|| {
+                    anyhow::anyhow!("timeout_secs must be a positive whole number")
+                })?;
+                let cap = charter
+                    .get("job_timeout_secs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(900);
+                anyhow::ensure!(
+                    secs <= cap,
+                    "timeout_secs {secs} exceeds the charter's job_timeout_secs cap of {cap}"
+                );
+                job["timeout_secs"] = serde_json::json!(secs);
+            }
             if let Some(lease) = args.get("_workspace_lease_id") {
                 job["workspace_lease_id"] = lease.clone();
             }

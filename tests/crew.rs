@@ -765,3 +765,53 @@ fn outcome_and_verdict_notices_name_the_route_and_why() {
         "{verdict_body}"
     );
 }
+
+#[test]
+fn a_first_mate_may_shorten_a_crews_deadline_within_the_charter_cap() {
+    let fleet = Fleet::new(now_settings());
+    fleet.mode("crew");
+
+    let not_whole = fleet.refused(
+        "agent.start",
+        json!({"id": "fractional-crew", "task_id": "infra-repair", "timeout_secs": 1.5}),
+        Some("infra"),
+    );
+    assert!(not_whole.contains("positive whole number"), "{not_whole}");
+
+    let over = fleet.refused(
+        "agent.start",
+        json!({"id": "overlong-crew", "task_id": "infra-repair", "timeout_secs": 61}),
+        Some("infra"),
+    );
+    assert!(over.contains("job_timeout_secs"), "{over}");
+    assert!(over.contains("60"), "{over}");
+    assert!(
+        !fleet.ok("job.list", json!({}), None)["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|job| job["id"] == "overlong-crew")
+    );
+
+    let bounded = fleet.ok(
+        "agent.start",
+        json!({"id": "bounded-crew", "task_id": "infra-repair", "timeout_secs": 45}),
+        Some("infra"),
+    );
+    assert_eq!(bounded["timeout_secs"], 45);
+    assert_eq!(
+        wait(&fleet, "bounded-crew", &["succeeded"])["timeout_secs"],
+        45
+    );
+
+    let defaulted = fleet.ok(
+        "agent.start",
+        json!({"id": "default-crew", "task_id": "infra-duty"}),
+        Some("infra"),
+    );
+    assert_eq!(defaulted["timeout_secs"], 60);
+    assert_eq!(
+        wait(&fleet, "default-crew", &["succeeded"])["timeout_secs"],
+        60
+    );
+}

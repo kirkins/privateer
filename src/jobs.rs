@@ -2246,7 +2246,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         .unwrap_or(charter_timeout);
     ensure!(
         timeout_secs > 0 && timeout_secs <= charter_timeout,
-        "job timeout exceeds charter"
+        "job timeout {timeout_secs}s must be a positive whole number no larger than the charter's job_timeout_secs cap of {charter_timeout}s"
     );
     // An optional per-charter share of the host's heavy work.
     let charter_cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
