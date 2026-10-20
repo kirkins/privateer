@@ -22,8 +22,6 @@ use std::time::SystemTime;
 const TAIL_BYTES: u64 = 512 * 1024;
 /// The newest transcripts tried, newest first.
 const CANDIDATES: usize = 4;
-/// Folder entries looked at for the newest transcripts.
-const MAX_ENTRIES: usize = 4096;
 /// How the classifier's refusal starts its result text.
 const CLASSIFIER_REFUSAL: &str = "denied by the Claude Code auto mode classifier";
 /// Clock slack between Claude's record timestamps and the screen read.
@@ -38,20 +36,25 @@ pub(crate) fn since(projects: &Path, folder: &Path, since_ms: i64) -> Option<Vec
     if !std::fs::symlink_metadata(&dir).ok()?.is_dir() {
         return None;
     }
-    let mut files: Vec<(SystemTime, std::path::PathBuf)> = std::fs::read_dir(&dir)
-        .ok()?
-        .take(MAX_ENTRIES)
-        .flatten()
-        .filter_map(|entry| {
-            // The entry's own type: a symlink is not a file here.
-            let regular = entry.file_type().ok()?.is_file();
-            let path = entry.path();
-            (regular && path.extension().is_some_and(|x| x == "jsonl")).then_some(())?;
-            Some((entry.metadata().ok()?.modified().ok()?, path))
-        })
-        .collect();
-    files.sort_by_key(|file| std::cmp::Reverse(file.0));
-    for (_, path) in files.into_iter().take(CANDIDATES) {
+    // The newest few regular transcripts of the whole folder, kept as it is
+    // read, so however many entries it holds, none newer is left unread.
+    let mut files: Vec<(SystemTime, std::path::PathBuf)> = vec![];
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        // The entry's own type: a symlink is not a file here.
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_file())
+            || path.extension().is_none_or(|x| x != "jsonl")
+        {
+            continue;
+        }
+        let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        files.push((modified, path));
+        files.sort_by_key(|file| std::cmp::Reverse(file.0));
+        files.truncate(CANDIDATES);
+    }
+    for (_, path) in files {
         let Some(records) = tail(&path) else {
             continue;
         };
@@ -250,6 +253,31 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(since(linked.path(), folder, 0).is_none());
+    }
+
+    #[test]
+    fn the_newest_transcripts_are_read_however_many_the_folder_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = Path::new("/ships/sysadmin");
+        let dir = temp.path().join(crate::host::claude_project_name(folder));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        for n in 0..(CANDIDATES * 3) {
+            let path = dir.join(format!("old-{n}.jsonl"));
+            // An older pane session that refused nothing.
+            std::fs::write(&path, FIXTURE.lines().next().unwrap()).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            // Neither a folder nor a file of another kind is a transcript.
+            std::fs::create_dir(dir.join(format!("session-{n}"))).unwrap();
+            std::fs::write(dir.join(format!("notes-{n}.txt")), "").unwrap();
+        }
+        std::fs::write(dir.join("pane.jsonl"), FIXTURE).unwrap();
+        assert_eq!(since(temp.path(), folder, 0).unwrap().len(), 2);
     }
 
     #[test]
