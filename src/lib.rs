@@ -44,6 +44,7 @@ pub mod project;
 pub mod releases;
 mod reply;
 pub mod report;
+pub mod review;
 pub mod routes;
 pub mod scheduling;
 pub mod service;

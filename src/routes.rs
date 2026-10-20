@@ -300,6 +300,53 @@ pub(crate) fn route_of_argv(command: &Value) -> Option<String> {
     ))
 }
 
+/// The model a route runs, as the review gate compares authors and
+/// reviewers: the model part of `harness/provider/model`, only its last `/`
+/// part, any `#effort` dropped, a trailing `[...]` context tag, date stamp or
+/// `-free` variant dropped, lowercased. So `pi/chatgpt-home/gpt-6.1-sol` and
+/// `codex/-/gpt-6.1-sol` both read `gpt-6.1-sol`, whatever harness or
+/// provider served them, and `deepseek-v4.1-flash-free[1m]` reads
+/// `deepseek-v4.1-flash`, the same model its paid route runs. A model of
+/// `-`, or a bare alias such as `opus`, is unknown: an alias names no
+/// version, so the runtime cannot know which model it resolved to and never
+/// compares one.
+pub fn model_key(route: &str) -> Option<String> {
+    let model = route.splitn(3, '/').nth(2)?;
+    let model = model.rsplit('/').next().unwrap_or_default();
+    let model = model.split('#').next().unwrap_or_default();
+    let lowered = model.to_ascii_lowercase();
+    let model = variant_free(&lowered);
+    (!model.is_empty() && model != "-" && model.bytes().any(|b| b.is_ascii_digit()))
+        .then_some(model.to_owned())
+}
+
+/// A model with its variant suffixes dropped, one at a time until none is
+/// left: a trailing `[...]` context tag (`gpt-6.1-sol[1m]`), a trailing date
+/// stamp (`-20260101`), and a trailing `-free` (the live routes carry
+/// `deepseek-v4.1-flash-free` beside `deepseek-v4.1-flash`). A route's
+/// spelling of a model never hides the model it runs.
+pub(crate) fn variant_free(model: &str) -> &str {
+    let mut model = model;
+    loop {
+        let stripped = if model.ends_with(']') {
+            model.rfind('[').map(|at| &model[..at])
+        } else if let Some(rest) = model.strip_suffix("-free") {
+            Some(rest)
+        } else if model.len() >= 9 && model.is_char_boundary(model.len() - 9) {
+            // A trailing date stamp: a hyphen and eight digits.
+            let (rest, stamp) = model.split_at(model.len() - 9);
+            (stamp.starts_with('-') && stamp[1..].bytes().all(|b| b.is_ascii_digit()))
+                .then_some(rest)
+        } else {
+            None
+        };
+        match stripped {
+            Some(next) => model = next,
+            None => return model,
+        }
+    }
+}
+
 /// A provider throttle in how the run's last reply ended, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RouteFailure {
@@ -561,6 +608,12 @@ fn classify(log: &str) -> Option<RouteFailure> {
         ]
         .iter()
         .any(|sign| lower.contains(sign));
+    // A ChatGPT plan limit, as Pi reports it from the ChatGPT providers: the
+    // account's shared subscription usage is spent. The exact text comes from
+    // the server logs (2026-10-16); it names no reset, and it covers every
+    // model on that harness and provider, so the account is held on the
+    // probe ladder rather than the short doubling.
+    let chatgpt_plan = lower.contains("subscription sharing usage limit");
     let throttled = free_allowance
         || ["429", "502", "503", "504", "529"]
             .iter()
@@ -591,8 +644,8 @@ fn classify(log: &str) -> Option<RouteFailure> {
         // A hint read out of free text can be misread, so it is capped at two
         // days: a misread never parks its route for longer than that.
         reset_ms: reset_delay_ms(&error, Store::now_ms()).map(|ms| ms.min(MAX_TEXT_RESET_MS)),
-        allowance: free_allowance,
-        account: false,
+        allowance: free_allowance || chatgpt_plan,
+        account: chatgpt_plan,
         ceiling_ms: None,
         probe_step: None,
     })
@@ -1390,6 +1443,101 @@ mod tests {
             "fast#high",
         ]);
         assert_eq!(route_of_argv(&yolo).as_deref(), Some("opencode/acme/fast"));
+    }
+
+    #[test]
+    fn model_keys_compare_routes_by_model_not_by_route() {
+        assert_eq!(
+            model_key("pi/chatgpt-home/gpt-6.1-sol").as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        // The same model behind another harness and provider still matches.
+        assert_eq!(
+            model_key("codex/-/gpt-6.1-sol").as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        // Only the model's last part counts, `#effort` is dropped, and case
+        // is not a difference.
+        assert_eq!(
+            model_key("opencode/-/opencode-go/deepseek-v4.1-flash#high").as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            model_key("claude/-/Claude-Opus-5-5").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        // No model at all, and a bare alias the runtime cannot resolve, are
+        // unknown: they are never compared.
+        assert_eq!(model_key("codex/-/-"), None);
+        assert_eq!(model_key("claude/-/opus"), None);
+        assert_eq!(model_key("claude/-/sonnet"), None);
+        assert_eq!(model_key("claude"), None);
+    }
+
+    #[test]
+    fn model_keys_drop_context_tags_date_stamps_and_free_variants() {
+        // A trailing `[...]` context tag names the same model in another
+        // window.
+        assert_eq!(
+            model_key("pi/chatgpt-home/gpt-6.1-sol[1m]").as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        // So does a trailing date stamp.
+        assert_eq!(
+            model_key("codex/-/gpt-6-luna-20260101").as_deref(),
+            Some("gpt-6-luna")
+        );
+        // And a `-free` variant of a route the captain also lists paid.
+        assert_eq!(
+            model_key("opencode/-/opencode-go/deepseek-v4.1-flash-free").as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        // Together they are still one model, whatever its spelling, so an
+        // author on the free variant excludes a reviewer on the paid route.
+        assert_eq!(
+            model_key("opencode/-/opencode-go/deepseek-v4.1-flash-free[1m]").as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            model_key("pi/chatgpt-home/gpt-6.1-sol[1m]"),
+            model_key("pi/chatgpt-home/gpt-6.1-sol")
+        );
+        // A date stamp is a hyphen and eight digits; a shorter run of digits
+        // is the model's own name, as is a tag that opens nothing.
+        assert_eq!(
+            model_key("codex/-/gpt-6-luna-2026").as_deref(),
+            Some("gpt-6-luna-2026")
+        );
+        assert_eq!(model_key("claude/-/opus[1m]"), None);
+    }
+
+    #[test]
+    fn a_chatgpt_plan_limit_spends_the_providers_account_allowance() {
+        // The exact text Pi reports from the ChatGPT providers (server logs,
+        // 2026-10-16); it names no reset time.
+        let text = "The ChatGPT user has reached their Subscription Sharing usage \
+                    limit. Ask the user to try again after their usage limit resets \
+                    or use an API key instead.";
+        let failure = classify(&error_log(text)).unwrap();
+        assert!(failure.allowance && failure.account, "{failure:?}");
+        assert_eq!(failure.reset_ms, None);
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        record(&conn, "pi/chatgpt-home/gpt-6.1-sol", Some(&failure)).unwrap();
+        // The limit covers the whole provider account, and with no stated
+        // reset it is probed after an hour, not doubled on the short window.
+        assert!(
+            blocked(&conn, "pi/chatgpt-home/gpt-6-luna")
+                .unwrap()
+                .is_some()
+        );
+        assert!((parked_ms(&conn) - ALLOWANCE_PROBE_MS).abs() < 100);
+        record(&conn, "pi/chatgpt-home/gpt-6.1-sol", None).unwrap();
+        assert!(
+            blocked(&conn, "pi/chatgpt-home/gpt-6-luna")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

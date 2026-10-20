@@ -2524,6 +2524,7 @@ fn the_ship_profile_shows_a_hosted_claude_ship_its_routes_and_fleet_permissions(
         json!({"crew":{"list":"ship","names":["cheap","spare"]},
             "errand":{"list":"none","names":[]},
             "first_mate":{"list":"fleet","names":["fast"]},
+            "review":{"list":"none","names":[]},
             "routes":{"cheap":{"cost":"plan","tier":null,"uses":[]},
                 "spare":{"cost":"plan","tier":null,"uses":[]},
                 "fast":{"cost":"plan","tier":null,"uses":[]}}})
