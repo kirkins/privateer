@@ -280,6 +280,19 @@ class NoPut:
     def call(self, command, args=None, timeout=30):
         raise RuntimeError("unknown door command \\"file.put\\"")
 
+class Refuse:
+    def call(self, command, args=None, timeout=30):
+        raise RuntimeError("cannot reach ship macops")
+
+class AlreadyAnswered:
+    def __init__(self, seen):
+        self.seen = seen
+    def call(self, command, args=None, timeout=30):
+        self.seen.append(args)
+        if args.get("kind") == "reply":
+            raise RuntimeError("mail already answered")
+        return {"returned": None}
+
 class Put:
     def __init__(self, seen):
         self.seen = seen
@@ -288,9 +301,9 @@ class Put:
         self.seen.append(args)
         return {"file_id": "file7", "name": args["name"]}
 
-def phone(runtime, path, msg_id):
+def phone(runtime, path, msg_id, spoken=None):
     d = door.Door({"door": "t", "recipient": "ops"}, {"tts": {}}, runtime)
-    d.say = lambda *a, **k: (None, "")
+    d.say = lambda text, *a, **k: (spoken.append(text) if spoken is not None else None, "")
     d.send = lambda args, msg_id, label: sent.append(args)
     d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "request", "body": text}
     d.fetch = lambda file_id, name, msg_id: path
@@ -300,20 +313,34 @@ def phone(runtime, path, msg_id):
 
 kept = os.path.join(tg.inbox_dir(), "kept.bin")
 open(kept, "wb").write(b"fallback bytes")
-phone(NoPut(), kept, 3)
-out = {"fallback": sent[-1], "kept": os.path.exists(kept)}
+quiet = []
+phone(NoPut(), kept, 3, quiet)
+out = {"fallback": sent[-1], "kept": os.path.exists(kept), "quiet": quiet}
+warned = []
+refused = os.path.join(tg.inbox_dir(), "refused.bin")
+open(refused, "wb").write(b"refused bytes")
+phone(Refuse(), refused, 5, warned)
+out["refusal"], out["warned"] = sent[-1], warned
 seen = []
 stored = os.path.join(tg.inbox_dir(), "stored.bin")
 open(stored, "wb").write(b"stored bytes")
 phone(Put(seen), stored, 4)
 out["put_args"], out["deleted"], out["stored"] = seen, not os.path.exists(stored), sent[-1]
+
+answered = []
+d = door.Door({"door": "t", "recipient": "ops"}, {"tts": {}}, AlreadyAnswered(answered))
+d.say = lambda *a, **k: (None, "")
+d.send({"to": "ops", "kind": "reply", "body": "done",
+        "payload": {"answer": {"text": "done"}, "files": [{"file_id": "file9"}]}}, 6, "reply")
+out["retry"] = answered
 print(json.dumps(out))
 """
 
 
 def check_attachment_put_and_fallback() -> None:
     """A file goes through file.put and rides payload.files; when the runtime
-    has no file.put, its inbox path is kept and the ship is told instead."""
+    has no file.put, its inbox path is kept and the ship is told instead. Any
+    other refusal warns the captain. An already-answered retry keeps files."""
     out = subprocess.run([sys.executable, "-c", ATTACHMENT_PROBE,
                           str(ROOT / "plugins" / "telegram")],
                          capture_output=True, text=True, cwd=ROOT)
@@ -324,6 +351,16 @@ def check_attachment_put_and_fallback() -> None:
     assert os.path.basename(fallback["body"].rsplit(": ", 1)[1]) == "kept.bin", fallback
     assert "files" not in (fallback.get("payload") or {}), fallback
     assert got["kept"], got
+    assert got["quiet"] == [], got["quiet"]
+    refusal = got["refusal"]
+    warned = "⚠️ couldn't hand notes.bin to ops: cannot reach ship macops"
+    assert warned in got["warned"][0], got["warned"]
+    assert refusal["body"].startswith("The captain sent a file: "), refusal
+    assert "files" not in (refusal.get("payload") or {}), refusal
+    reply, retry = got["retry"]
+    assert reply["kind"] == "reply" and reply["payload"]["answer"] == {"text": "done"}, reply
+    assert retry["kind"] == "request", retry
+    assert retry["payload"] == {"files": [{"file_id": "file9"}]}, retry
     assert got["put_args"] == [{"to": "ops", "name": "notes.bin",
                                 "content_file": got["put_args"][0]["content_file"]}], got
     assert got["put_args"][0]["content_file"].endswith("stored.bin"), got["put_args"]

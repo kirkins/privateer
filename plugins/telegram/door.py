@@ -404,7 +404,18 @@ class Door:
                 # Answered elsewhere already: follow up instead of failing. A
                 # typed answer cannot go to a request, so it goes as plain words.
                 args = dict(args, kind="request")
-                args.pop("payload", None)
+                # Only the typed answer cannot ride a request; anything else
+                # in the payload (the files of an attachment) still goes.
+                payload = args.get("payload")
+                if isinstance(payload, dict):
+                    payload = dict(payload)
+                    payload.pop("answer", None)
+                    if payload:
+                        args["payload"] = payload
+                    else:
+                        args.pop("payload", None)
+                else:
+                    args.pop("payload", None)
                 try:
                     result = self.runtime.call("send", args)
                 except RuntimeError as again:
@@ -833,8 +844,17 @@ class Door:
                 stored = self.runtime.call(
                     "file.put", {"to": ship, "name": saved, "content_file": dest}, timeout=120)
             except RuntimeError as e:
+                # An older runtime has no file.put at all; that alone falls back
+                # quietly. Any other refusal loses the file for a ship on a
+                # linked machine, so the captain hears about it first.
+                if "unknown door command" not in str(e):
+                    self.say(f"⚠️ couldn't hand {saved} to {ship}: {e}; kept at {dest}",
+                             reply_to=msg_id)
                 tg.log(f"file.put failed for {saved}: {e}; keeping {dest} in the inbox")
         if stored and stored.get("file_id"):
+            # The runtime fills the path when the mail lands, and the mail must
+            # go to the ship that owns the file, not a default chosen later.
+            args["to"] = ship
             payload = args.get("payload")
             if not isinstance(payload, dict):
                 payload = {}
