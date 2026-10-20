@@ -728,7 +728,8 @@ fn parked_time_is_not_charged_to_the_crew_budget() {
 #[test]
 fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    // The child waits for release, so it is still running when the dispatcher stops.
+    f.set_mode("gated");
     let home = f.root.join("engineering/.privateer");
     fs::write(
         home.join("config.json"),
@@ -749,9 +750,6 @@ fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
     };
     service("start");
     start_crew(&f, "crew-10");
-    // The park record is written as the crew parks, seconds before its child
-    // settles. Waiting for the derived `parked` status instead can miss that
-    // short window and let the resume launch before the dispatcher is stopped.
     f.wait_park("crew-10");
     // Starting the service returns before it takes its lock.
     let ready = Instant::now() + std::time::Duration::from_secs(10);
@@ -765,6 +763,7 @@ fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
     service("stop");
     assert!(!privateer::service::running(&home).unwrap());
     // The heavy job ends while no dispatcher is running.
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     service("start");
     f.wait("crew-10", &["resumed"]);
@@ -793,14 +792,13 @@ fn a_park_survives_a_dispatcher_restart_and_resumes_once() {
 #[test]
 fn a_resume_held_by_a_stow_goes_through_admission() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    // The child waits for release, so it is still running when the stow
+    // lands and the stow holds the resume it triggers.
+    f.set_mode("gated");
     start_crew(&f, "crew-11");
-    // Observe the park record as soon as it is written, not the derived
-    // `parked` status: on a fast runner the child can settle during the park
-    // grace, so `parked` may be gone before the first poll. The child still
-    // runs here, so the stow below holds the resume it will trigger.
     f.wait_park("crew-11");
     f.ok(None, &["stow"]);
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     std::thread::sleep(std::time::Duration::from_millis(2500));
     assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
