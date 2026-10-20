@@ -110,7 +110,7 @@ It belongs here because it needs the same identity-to-route lookup as `choose`. 
 - If the head branch isn't one of ours, the scope is every agent job the ship ran since the merge-base commit was made. The merge-base is on the protected branch, so its time is trustworthy.
 
 **Each job lands in one of two classes:**
-- **`crew_models`**: every crew job in scope, plus any `author_routes` the ship declares. Declaring can only add. A declaration (`Declaration { job_id, route }` in `src/review/authors.rs`) is keyed to one job: it stands only for the job it names, must fit it (its harness matches the job, its model is one the job's alias names), and clears no job it does not name. Once #321 merges, a declared job's alias excludes every reviewer whose model carries it, whatever the version.
+- **`crew_models`**: every crew job in scope, plus any `author_routes` the ship declares. Declaring can only add. A declaration (`Declaration { job_id, route }` in `src/review/authors.rs`) is keyed to one job: it stands only for the job it names, must fit it (its harness matches the job, its model is one the job's alias names), and clears no job it does not name. A declared job's alias also excludes every reviewer whose model carries it, whatever the version (PR #321).
 - **`first_mate_models`**: the ship's first-mate profile, every route on its `first_mate` list, its wakes and its ordinary errands. Errands land here, as the design review asked.
 - A crew job whose model is unknown makes review refuse, naming the job, until the ship declares that job's route.
 
