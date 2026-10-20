@@ -253,6 +253,12 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
             "UPDATE tasks SET owner=?2,handoff_to=NULL WHERE id=?1",
             params![id, actor],
         )?;
+        // Ships waiting on this task named its old owner, which will never
+        // report its end; and a remote wait this task held was its old
+        // owner's subscription.
+        let old_owner = task["owner"].as_str().context("task owner missing")?;
+        crate::waits::handed_off(store, id, old_owner, actor)?;
+        crate::scheduling::settle(store, id)?;
     } else {
         if task["owner"] != actor {
             bail!("only the task owner can change this task");
@@ -295,6 +301,7 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
                     "task.share",
                     &json!({"id":id,"actor":actor,"shared_with":names}),
                 )?;
+                crate::waits::unshared(store, id, actor, names)?;
             }
             match args.get("status").and_then(Value::as_str) {
                 Some(status) => {
@@ -308,6 +315,7 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
                     if matches!(status, "done" | "cancelled") {
                         crate::mail::close_task(store, id, status)?;
                         crate::waits::task_ended(store, id, status)?;
+                        crate::scheduling::settle(store, id)?;
                         closed = Some(status.to_owned());
                     }
                 }

@@ -34,18 +34,24 @@ struct Scheduled {
     last_checked_ms: i64,
     lease_until_ms: i64,
     reason: Option<String>,
+    /// Why the runtime last resumed this work, when an event said so: a
+    /// remote task's final status. Shown in the next offer's prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumed_by: Option<String>,
 }
 
 mod backlog;
 mod commands;
 mod delivery;
 mod observation;
+mod remote;
 pub(crate) use backlog::{
     DEFAULT_SECS as BACKLOG_ALARM_SECS, bearings_line as backlog_line, tick as backlog_tick,
 };
 pub use commands::dispatch;
 pub(crate) use delivery::tick;
 pub(crate) use observation::{fault_item, snapshot};
+pub(crate) use remote::{deliver_notice as remote_notice, settle};
 
 pub(crate) fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -88,6 +94,7 @@ fn load(store: &Store, task: &str) -> Result<Option<Scheduled>> {
 fn save(store: &Store, work: &Scheduled) -> Result<()> {
     let raw = serde_json::to_string(work)?;
     ensure!(raw.len() <= 65_536, "task schedule exceeds byte bound");
+    remote::sync(store, load(store, &work.task_id)?.as_ref(), work)?;
     store.connection().execute(
         "INSERT INTO task_schedule(task_id,record) VALUES(?1,?2) ON CONFLICT(task_id) DO UPDATE SET record=excluded.record",
         params![work.task_id, raw])?;
@@ -142,6 +149,7 @@ fn reopen(store: &Store, work: &mut Scheduled) -> Result<()> {
     work.state = "ready".into();
     work.wait = None;
     work.reason = None;
+    work.resumed_by = None;
     work.offer_id = None;
     work.holder = None;
     work.job_id = None;
@@ -298,10 +306,14 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
                 }
                 covered || matches!(request["state"].as_str(), Some("answered" | "approved"))
             }
+            Some("remote") => remote::ready(store, work, &wait, now)?,
             _ => bail!("invalid scheduling wait"),
         };
         if ready {
+            let resumed_by = work.resumed_by.take();
             reopen(store, work)?;
+            work.reason.clone_from(&resumed_by);
+            work.resumed_by = resumed_by;
         }
     } else if matches!(work.state.as_str(), "offered" | "claimed" | "executing") {
         let live = live_jobs(store, &work.task_id)?;
@@ -403,7 +415,7 @@ fn view(work: &Scheduled) -> Value {
     json!({"task_id":work.task_id,"owner":work.owner,"revision":work.revision,"state":work.state,
         "reason":work.reason,"wait":work.wait,"next_check_ms":next_check,
         "last_checked_ms":work.last_checked_ms,"created_ms":work.created_ms,"offer_id":work.offer_id,
-        "lease_until_ms":work.lease_until_ms,"attempts":work.attempts})
+        "lease_until_ms":work.lease_until_ms,"attempts":work.attempts,"resumed_by":work.resumed_by})
 }
 
 /// Serialize this check with job insertion: an unrelated launcher cannot race

@@ -53,6 +53,7 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
         last_checked_ms: now,
         lease_until_ms: 0,
         reason: None,
+        resumed_by: None,
     };
     save(store, &work)?;
     store
@@ -124,9 +125,17 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
                 "wait must reference this task's own open request"
             );
         }
+        "remote" => {}
         "manual" => {}
-        _ => bail!("wait.kind must be time, attention, task, request or manual"),
+        _ => bail!("wait.kind must be time, attention, task, request, remote or manual"),
     }
+    // A remote wait is stored as its validated ref alone, never with a
+    // resolution the caller supplied.
+    let wait = &if kind == "remote" {
+        super::remote::wait(store, id, &work.owner, wait)?
+    } else {
+        wait.clone()
+    };
     let hint = time_wait_hint(store, id, &work.owner, kind, reason)?;
     // Deferring an offer that was taken up is handled work, not a retry.
     if matches!(work.state.as_str(), "offered" | "claimed" | "executing") {
@@ -139,6 +148,7 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
     }
     .into();
     work.reason = Some(reason.into());
+    work.resumed_by = None;
     work.wait = Some(wait.clone());
     work.not_before_ms = wait["until_ms"].as_i64().unwrap_or(0);
     work.last_checked_ms = Store::now_ms();
@@ -227,7 +237,7 @@ fn time_wait_hint(
 }
 
 /// Task ids and mail ids in this home: lowercase letters, digits and hyphens.
-fn is_id_shape(word: &str) -> bool {
+pub(super) fn is_id_shape(word: &str) -> bool {
     let mut chars = word.chars();
     chars
         .next()

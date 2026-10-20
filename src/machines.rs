@@ -150,7 +150,7 @@ struct Machine {
     failures: u32,
 }
 
-fn peer_name(machine: &str) -> String {
+pub(crate) fn peer_name(machine: &str) -> String {
     format!("machine-{machine}")
 }
 

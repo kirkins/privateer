@@ -327,15 +327,24 @@ impl Store {
             .context("corrupt charter record")
     }
     pub fn task(&self, id: &str) -> Result<Value> {
-        self.connection.query_row("SELECT id,charter_id,owner,title,status,parent,depth,handoff_to,shared_with FROM tasks WHERE id=?1", [id], |r| {
-            // A shared_with column the runtime cannot parse denies everyone,
-            // which is the safe direction for a visibility list.
-            let shared: Option<String> = r.get(8)?;
-            Ok(json!({"id":r.get::<_,String>(0)?,"charter_id":r.get::<_,String>(1)?,"owner":r.get::<_,String>(2)?,
-                "title":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"parent":r.get::<_,Option<String>>(5)?,
-                "depth":r.get::<_,i64>(6)?,"handoff_to":r.get::<_,Option<String>>(7)?,
-                "shared_with": shared.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!([]))}))
-        }).optional()?.ok_or_else(|| anyhow::anyhow!("unknown task {id}"))
+        let read = |shared_with: &str| {
+            self.connection.query_row(&format!("SELECT id,charter_id,owner,title,status,parent,depth,handoff_to,{shared_with} FROM tasks WHERE id=?1"), [id], |r| {
+                // A shared_with column the runtime cannot parse denies everyone,
+                // which is the safe direction for a visibility list.
+                let shared: Option<String> = r.get(8)?;
+                Ok(json!({"id":r.get::<_,String>(0)?,"charter_id":r.get::<_,String>(1)?,"owner":r.get::<_,String>(2)?,
+                    "title":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"parent":r.get::<_,Option<String>>(5)?,
+                    "depth":r.get::<_,i64>(6)?,"handoff_to":r.get::<_,Option<String>>(7)?,
+                    "shared_with": shared.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!([]))}))
+            }).optional()
+        };
+        // A home opened without migrating (the dashboard's open) may predate
+        // shared_with: there the task is shared with nobody.
+        let task = match read("shared_with") {
+            Err(error) if error.to_string().contains("no such column: shared_with") => read("NULL"),
+            read => read,
+        };
+        task?.ok_or_else(|| anyhow::anyhow!("unknown task {id}"))
     }
     pub fn authorize(&self, task_id: &str, action: &str) -> Result<Value> {
         self.authorize_inner(task_id, Some(action), false)
