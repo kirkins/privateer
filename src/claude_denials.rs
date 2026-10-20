@@ -50,7 +50,7 @@ pub(crate) fn since(projects: &Path, folder: &Path, since_ms: i64) -> Option<Vec
             Some((entry.metadata().ok()?.modified().ok()?, path))
         })
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
     for (_, path) in files.into_iter().take(CANDIDATES) {
         let Some(records) = tail(&path) else {
             continue;
