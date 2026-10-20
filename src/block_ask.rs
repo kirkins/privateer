@@ -413,15 +413,21 @@ fn hex(text: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(text))
 }
 
-/// What each denial would be allowed by: its rule, else its tool's name.
-fn names(denials: &[Value]) -> Vec<String> {
+/// What each denial would be allowed by: its rule, else its authorization,
+/// else its tool's name. An authorization is the ship's own, so its name
+/// carries the ship: no other ship's ask shares its fleet key.
+fn names(denials: &[Value], ship: &str) -> Vec<String> {
     let mut names: Vec<String> = denials
         .iter()
         .map(|d| {
             d["rule"]
                 .as_str()
                 .map(str::to_owned)
-                .or_else(|| d["authorize"].as_str().map(|a| format!("authorize:{a}")))
+                .or_else(|| {
+                    d["authorize"]
+                        .as_str()
+                        .map(|a| format!("authorize:{ship}:{a}"))
+                })
                 .unwrap_or_else(|| format!("tool:{}", d["tool"].as_str().unwrap_or("")))
         })
         .collect();
@@ -462,17 +468,30 @@ fn clip(text: &str, chars: usize) -> String {
     }
 }
 
+/// A hash of one ship's standing authorizations in a fleet policy.
+fn authorizations_hash(policy: &Value, ship: &str) -> String {
+    hex(policy["authorized"][ship].to_string())
+}
+
 /// Whether the policy now lets every denial of an ask run: `yolo`, or each
-/// derived rule present exactly or by its tool's name. An ask with no
-/// derived rule, or from before asks listed their denials, ends on any
-/// policy change.
+/// derived rule present exactly or by its tool's name. A denial an ask offers
+/// a standing authorization for is covered once the ship's own
+/// authorizations change, never by another ship's. An ask with any other
+/// denial, or from before asks listed their denials, ends on any policy
+/// change.
 pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
     if policy["mode"] == "yolo" {
         return true;
     }
-    let denials = ask["block"]["denials"].as_array();
-    let derived = denials.is_some_and(|d| !d.is_empty() && d.iter().all(|d| d["rule"].is_string()));
-    if !derived {
+    let block = &ask["block"];
+    let seen = block["authorized"].as_str();
+    let denials = block["denials"].as_array();
+    let known = denials.is_some_and(|d| {
+        !d.is_empty()
+            && d.iter()
+                .all(|d| d["rule"].is_string() || (seen.is_some() && d["authorize"].is_string()))
+    });
+    if !known {
         return ask["policy_hash"].as_str() != Some(policy_hash);
     }
     let allowed: Vec<&str> = policy["claude_allow"]
@@ -481,10 +500,16 @@ pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    denials.into_iter().flatten().all(|d| {
-        allowed.contains(&d["rule"].as_str().unwrap_or_default())
-            || allowed.contains(&d["tool"].as_str().unwrap_or_default())
-    })
+    let ship = block["ship"].as_str().unwrap_or_default();
+    denials
+        .into_iter()
+        .flatten()
+        .all(|d| match d["rule"].as_str() {
+            Some(rule) => {
+                allowed.contains(&rule) || allowed.contains(&d["tool"].as_str().unwrap_or_default())
+            }
+            None => seen != Some(&authorizations_hash(policy, ship)),
+        })
 }
 
 /// The open block ask a ship raised for a task, if any.
@@ -629,7 +654,7 @@ pub(crate) fn raise(
     more: usize,
 ) -> Result<Value> {
     let policy_hash = crate::permissions::policy_hash(store)?;
-    let names = names(&records);
+    let names = names(&records, ship);
     let block_text = rules_text(&json!({"denials": records, "more": more}));
     // The captain already chose to do without these rules for this task.
     let declined: i64 = store.connection().query_row(
@@ -722,6 +747,8 @@ pub(crate) fn raise(
         "job_id": job_id, "scope": scope, "harness": "claude", "denials": records, "more": more});
     if let Some(text) = &authorize {
         block["authorize"] = json!(text);
+        let policy = crate::permissions::for_store(store)?;
+        block["authorized"] = json!(authorizations_hash(&policy, ship));
     }
     let mut payload = json!({"type": "tool_permission", "policy_hash": policy_hash, "block": block,
         "decision": {"question": question, "why": why,
@@ -1243,7 +1270,7 @@ fn apply(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
         Some("without") => {
             let policy_hash = crate::permissions::policy_hash(store)?;
             let tx = store.write_transaction()?;
-            for name in names(&records) {
+            for name in names(&records, ship) {
                 tx.execute(
                     "INSERT OR REPLACE INTO permission_declined(ship,task_id,rule,policy_hash,ms) VALUES(?1,?2,?3,?4,?5)",
                     params![ship, task, name, policy_hash, Store::now_ms()],
@@ -1289,6 +1316,9 @@ fn fan_out(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
                 .and_then(|o| o["label"].as_str())
         });
     let operator = reply["payload"]["operator"] == true;
+    let authorizes = answer
+        .as_ref()
+        .is_some_and(|a| a["option_id"] == "authorize");
     let mut homes = vec![store.home().to_path_buf()];
     homes.extend(other_homes(store.home()).into_iter().map(|(_, h)| h));
     for home in homes {
@@ -1308,6 +1338,20 @@ fn fan_out(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
             let Some(attached) = crate::mail::find(&other, &row)? else {
                 continue;
             };
+            // An authorization is the asking ship's alone: another ship's
+            // ask is detached, so the captain sees it on its own.
+            if authorizes && is_ask(&attached) && attached["from"] != ask["from"] {
+                other.connection().execute(
+                    "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
+                     WHERE id=?1 AND state='open'",
+                    [&row],
+                )?;
+                other.audit(
+                    "permissions.detached",
+                    &json!({"ask": row, "from": id, "reply": reply["id"]}),
+                )?;
+                continue;
+            }
             let mut payload = json!({"fanned_from": reply["id"]});
             if let Some(answer) = &answer
                 && attached["kind"] == "decision"
@@ -1544,6 +1588,24 @@ mod tests {
         }
         let without = json!({"answer": {"option_id": "without"}});
         assert!(check_answer(&ask, &without).is_ok());
+    }
+
+    #[test]
+    fn an_authorize_ask_is_covered_by_its_own_ships_authorizations_only() {
+        let before = json!({"authorized": {"storefront": ["Running deploys."]}});
+        let ask = json!({"policy_hash": "old", "block": {"ship": "liaison",
+            "authorized": authorizations_hash(&before, "liaison"),
+            "denials": [{"tool": "Bash", "rule": null, "authorize": "Running make commands."}]}});
+        let other = json!({"authorized": {"storefront": ["Running deploys.", "More."]}});
+        assert!(!covered(&other, "new", &ask));
+        let own = json!({"authorized": {"storefront": ["Running deploys."],
+            "liaison": ["Running make for deploys."]}});
+        assert!(covered(&own, "new", &ask));
+        assert!(covered(&json!({"mode": "yolo"}), "new", &ask));
+        // Without the hash (a crew's ask, or an older one) any change ends it.
+        let mut older = ask.clone();
+        older["block"].as_object_mut().unwrap().remove("authorized");
+        assert!(covered(&other, "new", &older));
     }
 
     #[test]

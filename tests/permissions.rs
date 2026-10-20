@@ -584,6 +584,65 @@ fn a_script_shaped_first_mate_denial_offers_the_captains_standing_authorization(
 }
 
 #[test]
+fn authorizing_one_ship_records_nothing_for_another_with_the_same_suggestion() {
+    let f = Fleet::new();
+    f.init("storefront", "claude");
+    let block = |ship: &str| {
+        f.json(
+            ship,
+            "permissions.blocked",
+            json!({"task_id": format!("{ship}-duty"), "tool": "Bash",
+                "input": {"command": "make deploy | tee deploy.log"}}),
+        )["request_id"]
+            .clone()
+    };
+    let ours = block("liaison");
+    let theirs = block("storefront");
+    let suggested = |ship: &str, id: &Value| {
+        f.show(ship, id)["payload"]["block"]["authorize"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(
+        suggested("liaison", &ours),
+        suggested("storefront", &theirs)
+    );
+    // The same suggestion on another ship is not the same denial.
+    let held = f.show("storefront", &theirs);
+    assert!(held["payload"]["attached_to"].is_null(), "{held}");
+    assert_ne!(
+        held["payload"]["block"]["fleet_key"],
+        f.show("liaison", &ours)["payload"]["block"]["fleet_key"]
+    );
+    // An ask attached anyway (crafted, or from before) is not answered by it.
+    let database = f.root.join("storefront/.privateer/privateer.sqlite");
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE mail SET payload=json_set(payload,'$.attached_to',?2,'$.attached_ship','liaison')
+             WHERE id=?1",
+            rusqlite::params![theirs.as_str().unwrap(), ours.as_str().unwrap()],
+        )
+        .unwrap();
+    f.json(
+        "liaison",
+        "mail.send",
+        json!({"from":"captain","to":"liaison","kind":"reply","correlation":ours,
+            "body":"Authorize","payload":{"answer":{"option_id":"authorize"}}}),
+    );
+    let policy: Value = serde_json::from_str(&f.ok(None, &["permissions", "show"])).unwrap();
+    assert_eq!(
+        policy["authorized"]["liaison"],
+        json!([suggested("liaison", &ours)])
+    );
+    assert!(policy["authorized"]["storefront"].is_null(), "{policy}");
+    let kept = f.show("storefront", &theirs);
+    assert_eq!(kept["state"], "open", "{kept}");
+    assert!(kept["payload"]["attached_to"].is_null(), "{kept}");
+}
+
+#[test]
 fn an_unrelated_policy_change_keeps_the_ask_and_a_covering_one_ends_it() {
     let f = Fleet::new();
     f.crew("liaison", "crew-one", json!({}));
