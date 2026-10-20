@@ -6,6 +6,7 @@ mod automode;
 pub mod away;
 mod block_ask;
 mod bundled;
+pub mod capabilities;
 pub mod captain;
 mod claude_denials;
 pub mod cli;
@@ -183,6 +184,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             activity::list(store, &args)
         }
         "machine" => machines::dispatch(store, command, args),
+        "capability" => capabilities::dispatch(store, command, args),
         "grant" => grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
@@ -203,6 +205,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     | "ship.actions"
                     | "ship.scope"
                     | "ship.consumes"
+                    | "ship.requires"
                     | "ship.consumers"
             ) =>
         {

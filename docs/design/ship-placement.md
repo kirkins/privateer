@@ -1,7 +1,9 @@
 # Proposal: ship placement
 
 Status: a proposal (captain findings 5 and 6, task `privateer-ship-placement`),
-revised after design review. Nothing here is implemented. It builds on [ship
+revised after design review. Declared needs (PR 1) are implemented as described,
+except that `ship.create` does not yet refuse a machine missing a need; owner
+proposals (PR 2) are not. It builds on [ship
 moves and machine owners in the architecture](../architecture.md#linked-machines),
 the [flotillas proposal](flotillas.md) (machine owners, the disk floor) and the
 [cross-machine fleet proposal](cross-machine-fleet.md) (links and gateways).

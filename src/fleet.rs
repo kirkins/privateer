@@ -124,12 +124,7 @@ pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
 
 /// Make `other` reachable from `store`: a local-transport peer to its home
 /// and a directory entry behind it. Ships this home hosts are never touched.
-fn reach(
-    store: &mut Store,
-    other: &str,
-    other_home: &Path,
-    (scope, consumes): &(String, Value),
-) -> Result<bool> {
+fn reach(store: &mut Store, other: &str, other_home: &Path, listing: &Listing) -> Result<bool> {
     let current = crate::mail::dispatch(store, "ship.show", json!({"name": other})).ok();
     if current.as_ref().is_some_and(|s| s["location"] == "here") {
         return Ok(false);
@@ -144,22 +139,48 @@ fn reach(
     crate::mail::dispatch(
         store,
         "ship.put",
-        json!({"name": other, "scope": scope, "location": {"peer": peer}, "consumes": consumes}),
+        listing.entry(other, json!({"peer": peer})),
     )?;
     Ok(true)
 }
 
-/// What a ship's own home says it is for and what it consumes.
-pub(crate) fn directory_entry(store: &mut Store, ship: &str) -> (String, Value) {
+/// A ship as the fleet's directories carry it: what it is for, the ships it
+/// consumes, what it requires of a machine and why it should stay put.
+#[derive(Clone, Debug)]
+pub(crate) struct Listing {
+    pub(crate) scope: String,
+    pub(crate) consumes: Value,
+    pub(crate) requires: Value,
+    pub(crate) pinned: Value,
+}
+
+impl Listing {
+    /// A `ship.put` for this ship behind `location`.
+    pub(crate) fn entry(&self, name: &str, location: Value) -> Value {
+        json!({"name": name, "scope": self.scope, "location": location,
+            "consumes": self.consumes, "requires": self.requires, "pinned": self.pinned})
+    }
+}
+
+/// What a ship's own home says it is for, what it consumes and requires,
+/// and its pin.
+pub(crate) fn directory_entry(store: &mut Store, ship: &str) -> Listing {
     let record = crate::mail::dispatch(store, "ship.show", json!({"name": ship})).ok();
-    let scope = record
-        .as_ref()
-        .and_then(|s| s["scope"].as_str().map(str::to_owned))
-        .unwrap_or_default();
-    let consumes = record
-        .and_then(|s| s.get("consumes").cloned())
-        .unwrap_or_else(|| json!([]));
-    (scope, consumes)
+    let field = |key: &str, empty: Value| {
+        record
+            .as_ref()
+            .and_then(|s| s.get(key).cloned())
+            .unwrap_or(empty)
+    };
+    Listing {
+        scope: record
+            .as_ref()
+            .and_then(|s| s["scope"].as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        consumes: field("consumes", json!([])),
+        requires: field("requires", json!([])),
+        pinned: field("pinned", Value::Null),
+    }
 }
 
 /// Link a ship with every other active ship in the fleet, both ways.
@@ -771,6 +792,146 @@ fn set_consumes(store: &mut Store, args: &Value) -> Result<Value> {
     Ok(json!({"ship": name, "consumes": names, "by": by}))
 }
 
+/// The longest reason a pin may give.
+const MAX_PIN_REASON: usize = 200;
+
+/// A pin as a ship's record carries it: `{reason, by, set_ms}`, where `by` is
+/// the ship that set it or the captain.
+pub(crate) fn check_pin(pin: &Value) -> Result<()> {
+    let reason = pin["reason"].as_str().context("a pin gives a reason")?;
+    ensure!(
+        !reason.trim().is_empty() && reason.chars().count() <= MAX_PIN_REASON,
+        "a pin's reason is 1 to {MAX_PIN_REASON} characters"
+    );
+    let by = pin["by"].as_str().context("a pin names who set it")?;
+    if by != crate::mail::CAPTAIN {
+        identifier(by)?;
+    }
+    ensure!(pin["set_ms"].is_i64(), "a pin records when it was set");
+    Ok(())
+}
+
+/// Record what a ship requires of a machine, from the fleet's vocabulary, and
+/// pin it where it is with a reason. Like what it consumes, a requirement
+/// grants nothing: a ship may set its own, otherwise its creator, a grantee
+/// or the operator. A pin the captain set is changed or cleared only by the
+/// operator; any other pin by the ship itself or by whoever set it. It
+/// reaches every home on this machine at once, and linked machines at their
+/// next directory exchange.
+fn set_requires(store: &mut Store, args: &Value) -> Result<Value> {
+    let name = required(args, "name")?;
+    let requires = args
+        .get("requires")
+        .map(crate::capabilities::names)
+        .transpose()?;
+    // Absent keeps the pin, null clears it, a reason sets it.
+    let pin_change: Option<Option<String>> = match args.get("pinned") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(reason)) => Some(Some(reason.clone())),
+        Some(_) => bail!("pinned is a reason, or null to clear the pin"),
+    };
+    ensure!(
+        requires.is_some() || pin_change.is_some(),
+        "give requires, pinned or both"
+    );
+    let conn = registry()?;
+    for need in requires.iter().flatten() {
+        ensure!(
+            crate::capabilities::known(&conn, need)?,
+            "the fleet's vocabulary has no capability {need}; see capability.list"
+        );
+    }
+    let operator = matches!(store.caller(), Caller::Operator);
+    let by = match store.caller() {
+        Caller::Agent { actor } => actor.clone(),
+        Caller::Operator => crate::mail::CAPTAIN.into(),
+    };
+    let member = if by == name {
+        members(&conn)?
+            .into_iter()
+            .find(|m| m.name == name)
+            .with_context(|| format!("no active ship named {name} in the fleet"))?
+    } else {
+        managed(store, name, "ship.requires", "change the requirements of")?
+    };
+    ensure!(member.home.is_dir(), "{name}'s folder is gone");
+    let own = Store::open(&member.home)?;
+    let tx = own.write_transaction()?;
+    let record: Value = tx
+        .query_row(
+            "SELECT record FROM ships WHERE name=?1 AND json_extract(record,'$.location')='here'",
+            [name],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()?
+        .with_context(|| format!("{name} is not hosted in its fleet home"))?;
+    let current = record.get("pinned").cloned().filter(|p| !p.is_null());
+    let pinned = match pin_change {
+        None => current,
+        Some(next) => {
+            if let Some(pin) = &current {
+                let setter = pin["by"].as_str().unwrap_or(crate::mail::CAPTAIN);
+                if !operator {
+                    ensure!(
+                        setter != crate::mail::CAPTAIN,
+                        "the captain pinned this ship; only the captain unpins it"
+                    );
+                    ensure!(
+                        setter == by || by == name,
+                        "{setter} pinned {name}; only {setter}, {name} or the captain unpins it"
+                    );
+                }
+            }
+            match next {
+                Some(reason) => {
+                    let pin = json!({"reason": reason, "by": by, "set_ms": Store::now_ms()});
+                    check_pin(&pin)?;
+                    Some(pin)
+                }
+                None => None,
+            }
+        }
+    };
+    let requires = match requires {
+        Some(names) => json!(names),
+        None => record.get("requires").cloned().unwrap_or_else(|| json!([])),
+    };
+    let mut updated = record;
+    updated["requires"] = requires.clone();
+    match &pinned {
+        Some(pin) => updated["pinned"] = pin.clone(),
+        None => {
+            if let Some(fields) = updated.as_object_mut() {
+                fields.remove("pinned");
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE ships SET record=?2 WHERE name=?1",
+        params![name, updated.to_string()],
+    )?;
+    tx.commit()?;
+    let peer = format!("fleet-{name}");
+    let (list, pin) = (requires.to_string(), pinned.as_ref().map(Value::to_string));
+    for other in members(&conn)? {
+        if other.name != name && other.home.is_dir() {
+            Store::open(&other.home)?.connection().execute(
+                "UPDATE ships SET record=CASE WHEN ?4 IS NULL
+                   THEN json_remove(json_set(record,'$.requires',json(?2)),'$.pinned')
+                   ELSE json_set(record,'$.requires',json(?2),'$.pinned',json(?4)) END
+                 WHERE name=?1 AND json_extract(record,'$.location.peer')=?3",
+                params![name, list, peer, pin],
+            )?;
+        }
+    }
+    let result = json!({"ship": name, "requires": requires, "pinned": pinned, "by": by});
+    store.audit("ship.requires", &result)?;
+    Ok(result)
+}
+
 /// The ships this home knows to consume `name`, on this machine or a linked
 /// one: who to tell when a contract they rely on changes.
 fn consumers(store: &Store, args: &Value) -> Result<Value> {
@@ -819,6 +980,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "ship.actions" => set_actions(store, &args),
         "ship.scope" => set_scope(store, &args),
         "ship.consumes" => set_consumes(store, &args),
+        "ship.requires" => set_requires(store, &args),
         "ship.consumers" => consumers(store, &args),
         _ => bail!("unknown fleet command {command}"),
     }

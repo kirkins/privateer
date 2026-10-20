@@ -186,6 +186,22 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
         }
         record["consumes"] = consumes;
     }
+    // What it requires of a machine and why it stays put are set with
+    // ship.requires, and kept the same way.
+    for key in ["requires", "pinned"] {
+        let value = match args.get(key) {
+            Some(value) => Some(value.clone()),
+            None => ship(store, name)?.and_then(|existing| existing.get(key).cloned()),
+        };
+        if let Some(value) = value.filter(|v| !v.is_null()) {
+            if key == "requires" {
+                crate::capabilities::names(&value)?;
+            } else {
+                crate::fleet::check_pin(&value)?;
+            }
+            record[key] = value;
+        }
+    }
     if let Some(profile) = args.get("first_mate").filter(|v| !v.is_null()) {
         ensure!(
             location == "here",

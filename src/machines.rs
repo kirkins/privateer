@@ -39,6 +39,7 @@
 //! along with any still-open requests and decisions written earlier, and
 //! leaves the other machine's captain mail where it is. The captain's
 //! answers come back as ordinary collected mail.
+use crate::fleet::Listing;
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -99,6 +100,9 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
         ("machines", "stows", "TEXT NOT NULL DEFAULT '{}'"),
         ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
         ("machines", "usage_cursor", "TEXT"),
+        ("machines", "offers", "TEXT"),
+        ("machine_ships", "requires", "TEXT NOT NULL DEFAULT '[]'"),
+        ("machine_ships", "pinned", "TEXT"),
     ] {
         let present: bool = migrate.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"),
@@ -114,6 +118,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     migrate.commit()?;
     crate::snapshot::init(conn)?;
     crate::usage_carry::init(conn)?;
+    crate::capabilities::init(conn)?;
     Ok(())
 }
 
@@ -183,24 +188,35 @@ fn machine(conn: &Connection, name: &str) -> Result<Machine> {
         .with_context(|| format!("no linked machine named {name}"))
 }
 
-/// A ship as a directory carries it between machines: its name, its scope
-/// and the ships it consumes.
-type Entry = (String, String, Value);
+/// A ship as a directory carries it between machines: its name, its scope,
+/// the ships it consumes, what it requires and its pin.
+type Entry = (String, Listing);
 
 /// The other machine's ships, as last exchanged.
 fn cached(conn: &Connection, machine: &str) -> Result<Vec<Entry>> {
     let mut statement = conn.prepare(
-        "SELECT name, scope, consumes FROM machine_ships WHERE machine=?1 ORDER BY name",
+        "SELECT name, scope, consumes, requires, pinned FROM machine_ships WHERE machine=?1 ORDER BY name",
     )?;
     let rows = statement.query_map([machine], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
     })?;
     rows.map(|row| {
-        let (name, scope, consumes) = row?;
+        let (name, scope, consumes, requires, pinned) = row?;
+        let parse = |text: &str, empty: Value| serde_json::from_str(text).unwrap_or(empty);
         Ok((
             name,
-            scope,
-            serde_json::from_str(&consumes).unwrap_or_else(|_| json!([])),
+            Listing {
+                scope,
+                consumes: parse(&consumes, json!([])),
+                requires: parse(&requires, json!([])),
+                pinned: pinned.map_or(Value::Null, |p| parse(&p, Value::Null)),
+            },
         ))
     })
     .collect()
@@ -239,8 +255,8 @@ fn local_ships(conn: &Connection) -> Result<(Vec<Entry>, bool)> {
             complete = false;
             continue;
         };
-        let (scope, consumes) = crate::fleet::directory_entry(&mut store, &member.name);
-        ships.push((member.name, scope, consumes));
+        let listing = crate::fleet::directory_entry(&mut store, &member.name);
+        ships.push((member.name, listing));
     }
     Ok((ships, complete))
 }
@@ -254,7 +270,13 @@ fn directory(ships: &[Entry]) -> Value {
     json!(
         ships
             .iter()
-            .map(|(name, scope, consumes)| json!({"name": name, "scope": scope, "consumes": consumes}))
+            .map(|(name, listing)| {
+                let mut entry = listing.entry(name, Value::Null);
+                if let Some(fields) = entry.as_object_mut() {
+                    fields.remove("location");
+                }
+                entry
+            })
             .collect::<Vec<_>>()
     )
 }
@@ -274,7 +296,21 @@ fn parse_directory(value: &Value) -> Result<Vec<Entry>> {
             for other in consumes.as_array().context("consumes is a list")? {
                 identifier(other.as_str().context("consumes holds ship names")?)?;
             }
-            Ok((name.to_owned(), scope.to_owned(), consumes))
+            // Nor what it requires, nor a pin.
+            let requires = json!(crate::capabilities::names(&ship["requires"])?);
+            let pinned = ship.get("pinned").cloned().unwrap_or(Value::Null);
+            if !pinned.is_null() {
+                crate::fleet::check_pin(&pinned)?;
+            }
+            Ok((
+                name.to_owned(),
+                Listing {
+                    scope: scope.to_owned(),
+                    consumes,
+                    requires,
+                    pinned,
+                },
+            ))
         })
         .collect()
 }
@@ -287,8 +323,8 @@ fn clashes(conn: &Connection, theirs: &[Entry]) -> Result<Vec<String>> {
         .collect();
     Ok(theirs
         .iter()
-        .filter(|(name, _, _)| ours.contains(name))
-        .map(|(name, _, _)| name.clone())
+        .filter(|(name, _)| ours.contains(name))
+        .map(|(name, _)| name.clone())
         .collect())
 }
 
@@ -310,10 +346,18 @@ fn record(conn: &Connection, machine: &Machine, ships: &[Entry]) -> Result<()> {
         "DELETE FROM machine_ships WHERE machine=?1",
         [&machine.name],
     )?;
-    for (name, scope, consumes) in ships {
+    for (name, listing) in ships {
         tx.execute(
-            "INSERT INTO machine_ships(machine, name, scope, consumes) VALUES(?1, ?2, ?3, ?4)",
-            params![machine.name, name, scope, consumes.to_string()],
+            "INSERT INTO machine_ships(machine, name, scope, consumes, requires, pinned)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                machine.name,
+                name,
+                listing.scope,
+                listing.consumes.to_string(),
+                listing.requires.to_string(),
+                (!listing.pinned.is_null()).then(|| listing.pinned.to_string())
+            ],
         )?;
     }
     tx.commit()?;
@@ -329,7 +373,7 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -
     crate::peers::dispatch(store, "peer.put", machine.peer.clone())?;
     let peer = peer_name(&machine.name);
     let mut installed = 0;
-    for (name, scope, consumes) in ships {
+    for (name, listing) in ships {
         let current = crate::mail::dispatch(store, "ship.show", json!({"name": name})).ok();
         if current.as_ref().is_some_and(|s| s["location"] == "here") {
             continue;
@@ -337,12 +381,12 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -
         crate::mail::dispatch(
             store,
             "ship.put",
-            json!({"name": name, "scope": scope, "location": {"peer": peer}, "consumes": consumes}),
+            listing.entry(name, json!({"peer": peer})),
         )?;
         installed += 1;
     }
     if prune {
-        let listed: Vec<&str> = ships.iter().map(|(name, _, _)| name.as_str()).collect();
+        let listed: Vec<&str> = ships.iter().map(|(name, _)| name.as_str()).collect();
         let gone: Vec<String> = store
             .connection()
             .prepare(
@@ -983,6 +1027,36 @@ fn absorb(conn: &Connection, machine: &str, reported: &Value) -> Result<usize> {
     Ok(ended)
 }
 
+/// Record what a linked machine says it offers. A peer too old to say sends
+/// nothing, which keeps what was known.
+fn keep_offers(conn: &Connection, machine: &str, reported: &Value) -> Result<()> {
+    if let Some(offers) = crate::capabilities::parse_offered(reported) {
+        conn.execute(
+            "UPDATE machines SET offers=?2 WHERE name=?1",
+            params![
+                machine,
+                json!({"offers": offers, "reported_ms": Store::now_ms()}).to_string()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// What a linked machine last said it offers, and when; null if never.
+fn offers_of(conn: &Connection, machine: &str) -> Result<Value> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT offers FROM machines WHERE name=?1",
+            [machine],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(raw
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(Value::Null))
+}
+
 fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
     let response = crate::peers::call_config(
         &machine.peer,
@@ -1010,15 +1084,12 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
         .as_deref()
         .context("link has no local name")?;
     let (ours, complete) = local_ships(conn)?;
-    let result = call(
-        machine,
-        "fleet.link",
-        with_stows(
-            json!({"machine": known_as, "ships": directory(&ours), "complete": complete}),
-            conn,
-        ),
-        timeout,
-    )?;
+    let mut body = json!({"machine": known_as, "ships": directory(&ours), "complete": complete,
+        "capabilities": crate::capabilities::carried(conn)?});
+    if let Some(offers) = crate::capabilities::offered(conn) {
+        body["offers"] = offers;
+    }
+    let result = call(machine, "fleet.link", with_stows(body, conn), timeout)?;
     let theirs = parse_directory(&result["ships"])?;
     let clashing = clashes(conn, &theirs)?;
     ensure!(
@@ -1028,6 +1099,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     );
     record(conn, machine, &theirs)?;
     absorb(conn, &machine.name, &result["stows"])?;
+    keep_offers(conn, &machine.name, &result["offers"])?;
     // An older peer sends no flag, so its directory only adds ships.
     install_everywhere(conn, machine, &theirs, is_complete(&result))?;
     Ok(theirs)
@@ -1056,7 +1128,7 @@ pub(crate) fn linked_for_snapshot(conn: &Connection) -> Result<Vec<Linked>> {
         .map(|m| {
             let ships = cached(conn, &m.name)?
                 .into_iter()
-                .map(|(name, scope, _)| (name, scope))
+                .map(|(name, listing)| (name, listing.scope))
                 .collect();
             Ok((m.name, m.role, ships))
         })
@@ -1465,7 +1537,7 @@ fn add(args: &Value) -> Result<Value> {
     };
     let theirs = exchange(&conn, &machine, None)?;
     Ok(json!({"machine": name, "known_as": known_as,
-        "ships": theirs.iter().map(|(n, _, _)| n).collect::<Vec<_>>()}))
+        "ships": theirs.iter().map(|(n, _)| n).collect::<Vec<_>>()}))
 }
 
 fn list() -> Result<Value> {
@@ -1479,7 +1551,8 @@ fn list() -> Result<Value> {
             "known_as": machine.known_as,
             "refreshed_ms": machine.refreshed_ms,
             "stows": stows_of(&conn, &machine.name)?,
-            "ships": cached(&conn, &machine.name)?.into_iter().map(|(n, _, _)| n).collect::<Vec<_>>(),
+            "offers": offers_of(&conn, &machine.name)?,
+            "ships": cached(&conn, &machine.name)?.into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
         }));
     }
     Ok(json!({"owner": owner(&conn)?, "machines": out}))
@@ -2196,14 +2269,20 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             };
             record(&conn, &machine, &theirs)?;
             install_everywhere(&conn, &machine, &theirs, is_complete(args))?;
+            // The linking machine's vocabulary is this one's, and it says
+            // what it offers; this one answers with its own offers.
+            crate::capabilities::absorb(&conn, name, &args["capabilities"])?;
+            keep_offers(&conn, name, &args["offers"])?;
             // The machine that reached us carries its stow state in the same
             // exchange, so a request here bound to a stow there resolves now.
             let ended = absorb(&conn, name, args.get("stows").unwrap_or(&Value::Null))?;
             let (ours, complete) = local_ships(&conn)?;
-            Ok(with_stows(
-                json!({"ships": directory(&ours), "complete": complete, "requests_ended": ended}),
-                &conn,
-            ))
+            let mut answer =
+                json!({"ships": directory(&ours), "complete": complete, "requests_ended": ended});
+            if let Some(offers) = crate::capabilities::offered(&conn) {
+                answer["offers"] = offers;
+            }
+            Ok(with_stows(answer, &conn))
         }
         _ if delivery => {
             let home = home_of(&conn, required(args, "to")?)?;
@@ -2478,6 +2557,7 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "machine.refresh" => refresh(args.get("name").and_then(Value::as_str)),
         "machine.collect" => collect_now(args.get("name").and_then(Value::as_str)),
         "machine.remove" => remove(required(&args, "name")?),
+        "machine.offers" => crate::capabilities::machine_offers(&args),
         "machine.captain" => match args.get("machine") {
             None => {
                 let conn = crate::fleet::registry()?;

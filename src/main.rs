@@ -167,6 +167,10 @@ fn run() -> Result<()> {
         caller.require_operator("machine")?;
         return privateer::machines::cli(&positional);
     }
+    if command == "capability" && !json_given && !file_given {
+        caller.require_operator("capability")?;
+        return privateer::capabilities::cli(&positional);
+    }
     if command == "grant" && !json_given && !file_given {
         caller.require_operator("grant")?;
         return privateer::grants::cli(&positional);
