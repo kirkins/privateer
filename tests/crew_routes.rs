@@ -2,9 +2,11 @@ mod support;
 
 use serde_json::{Value, json};
 use sha2::Digest;
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, sync::Mutex};
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
+
+static IN_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 struct Fleet {
     _tmp: tempfile::TempDir,
@@ -177,7 +179,11 @@ impl Fleet {
     }
     fn routes(&self, routes: Value) {
         let file = self.root.join("routes.json");
-        fs::write(&file, routes.to_string()).unwrap();
+        let temp = self
+            .root
+            .join(format!("routes-{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&temp, routes.to_string()).unwrap();
+        fs::rename(&temp, &file).unwrap();
         self.ok(None, &["routes", "set", file.to_str().unwrap()]);
     }
     /// The model a launched job's harness was given.
@@ -200,18 +206,31 @@ impl Fleet {
             .unwrap();
     }
     /// Run against this fixture's store, ledger and routes file in-process.
-    /// The suite runs with --test-threads=1, and each test that reads these
-    /// in-process sets them before its reads, so the environment is safe.
+    /// A process-wide lock serializes in-process readers so that environment
+    /// variables pointing at the fleet registry and ledger do not race across
+    /// test threads when the suite runs concurrently.
     fn in_process<T>(&self, run: impl FnOnce(&privateer::store::Store) -> T) -> T {
-        // SAFETY: see the comment above; no other thread reads these while
-        // this test holds the single test thread.
+        // A test that panics inside the lock poisons it; recover rather than
+        // fail every later test, since each caller sets both variables again.
+        let _guard = IN_PROCESS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: the lock serializes every writer and reader of these
+        // variables in this test binary, and other threads read the
+        // environment only through std, which takes its own env lock.
         unsafe {
             std::env::set_var("PRIVATEER_FLEET", self.root.join("fleet.sqlite"));
             std::env::set_var("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"));
         }
         let store =
             privateer::store::Store::open(&self.root.join("engineering/.privateer")).unwrap();
-        run(&store)
+        let result = run(&store);
+        // SAFETY: as above, under the same lock.
+        unsafe {
+            std::env::remove_var("PRIVATEER_FLEET");
+            std::env::remove_var("PRIVATEER_RESOURCE_HOME");
+        }
+        result
     }
 }
 
@@ -906,16 +925,6 @@ fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
             rusqlite::params![now + 3_600_000, now],
         )
         .unwrap();
-    // The ship's home is its folder's `.privateer`, which holds its config.
-    let store = privateer::store::Store::open(&f.root.join("engineering/.privateer")).unwrap();
-    // This test reads the routes file and the ledger in-process, so point both
-    // at the fleet's own copies rather than the machine's. The suite runs with
-    // --test-threads=1 and each in-process reader sets these first.
-    // SAFETY: the single test thread is held while these are set and read.
-    unsafe {
-        std::env::set_var("PRIVATEER_FLEET", f.root.join("fleet.sqlite"));
-        std::env::set_var("PRIVATEER_RESOURCE_HOME", f.root.join("ledger"));
-    }
     // New crew start is refused at 85%:
     let refusal = f.refused(
         Some("engineering"),
@@ -925,13 +934,16 @@ fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
     assert!(refusal.contains("85% of its weekly window"), "{refusal}");
 
     // But a parked crew resuming on its route is permitted to finish:
-    let can_resume = privateer::crew_routes::resume_route(
-        &store,
-        "engineering",
-        "bundled:claude",
-        &json!({"model": "sonnet"}),
-    )
-    .unwrap();
+    let can_resume = f
+        .in_process(|store| {
+            privateer::crew_routes::resume_route(
+                store,
+                "engineering",
+                "bundled:claude",
+                &json!({"model": "sonnet"}),
+            )
+        })
+        .unwrap();
     assert!(can_resume, "parked crew at 85% must be allowed to resume");
 
     // Provider holds still prevent resume:
@@ -942,13 +954,16 @@ fn a_parked_crew_resumes_on_its_route_at_eighty_five_percent() {
             rusqlite::params![now + 3_600_000, now],
         )
         .unwrap();
-    let blocked_resume = privateer::crew_routes::resume_route(
-        &store,
-        "engineering",
-        "bundled:claude",
-        &json!({"model": "sonnet"}),
-    )
-    .unwrap();
+    let blocked_resume = f
+        .in_process(|store| {
+            privateer::crew_routes::resume_route(
+                store,
+                "engineering",
+                "bundled:claude",
+                &json!({"model": "sonnet"}),
+            )
+        })
+        .unwrap();
     assert!(!blocked_resume, "a held route must not resume");
 }
 
@@ -2202,4 +2217,51 @@ fn a_declared_alias_excludes_every_model_that_carries_it() {
         "{refused}"
     );
     assert!(refused.contains("alias opus"), "{refused}");
+}
+
+/// Two route sets in a row each replace the routes file, and an in-process read
+/// right after each sees the routes just set (route loading has no cache).
+#[test]
+fn consecutive_routes_sets_are_each_seen_by_in_process_reads() {
+    let pi_sol = || {
+        tiered(
+            "bundled:pi",
+            json!({"model": "gpt-6.1-sol", "provider": "chatgpt-home"}),
+            "plan",
+            1,
+            &["review", "implement"],
+        )
+    };
+    let opus = || {
+        tiered(
+            "bundled:claude",
+            json!({"model": "claude-opus-5-5"}),
+            "plan",
+            1,
+            &["review", "implement"],
+        )
+    };
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"sol": pi_sol(), "opus": opus()},
+        "crew": ["sol"],
+        "review": ["opus", "sol"]
+    }));
+    // Second rewrite immediately after the first, replacing the review list with only opus:
+    f.routes(json!({
+        "routes": {"sol": pi_sol(), "opus": opus()},
+        "crew": ["sol"],
+        "review": ["opus"]
+    }));
+    let chosen = f.in_process(|store| {
+        let authors =
+            privateer::review::authors::compute(store, "engineering", "feature/not-ours", 0, &[])
+                .unwrap();
+        let reviewer =
+            privateer::crew_routes::choose_reviewer(store, "engineering", &authors).unwrap();
+        reviewer.choice.name
+    });
+    assert_eq!(chosen, "opus");
+    let profile = f.json(None, "ship.profile", json!({"ship": "engineering"}));
+    assert_eq!(profile["routes"]["review"]["names"], json!(["opus"]));
 }
