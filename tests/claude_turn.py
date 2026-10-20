@@ -215,6 +215,48 @@ class ClaudeTurn(unittest.TestCase):
         self.assertEqual(summary["usage"], {"input":2, "output":67, "cacheRead":14166,
                                             "cacheWrite":10049, "totalTokens":24284})
 
+    def test_a_rising_second_result_settles_the_run_with_the_last_result(self):
+        waiting = {**RESULT, "result":"Waiting for the test job to finish.", "result_index":0,
+                   "usage":{"input_tokens":2, "output_tokens":20, "cache_read_input_tokens":100,
+                            "cache_creation_input_tokens":10}}
+        finished = {**RESULT, "result":"The job finished and the work is done.", "result_index":1,
+                    "usage":{"input_tokens":3, "output_tokens":5, "cache_read_input_tokens":200,
+                             "cache_creation_input_tokens":20}}
+        run, summary = self.run_stream([HOOK, INIT, waiting, finished])
+        self.assertEqual((run.returncode, summary["type"]), (0, "turn.completed"), run.stdout)
+        self.assertEqual(summary["session_id"], IDENTITY)
+        self.assertEqual(summary["usage"], {"input":5, "output":25, "cacheRead":300,
+                                            "cacheWrite":30, "totalTokens":360})
+        # The last result, not an earlier provisional one, decides the run.
+        run, summary = self.run_stream([INIT, {**waiting, "is_error":True, "subtype":"error_max_turns"},
+                                        finished])
+        self.assertEqual((run.returncode, summary["type"]), (0, "turn.completed"), run.stdout)
+        run, summary = self.run_stream([INIT, waiting, {**finished, "is_error":True, "subtype":"error_during_execution"}])
+        self.assertEqual((run.returncode, summary["type"]), (2, "native.turn.failed"), run.stdout)
+
+    def test_permission_denials_from_every_result_are_kept(self):
+        waiting = {**RESULT, "result_index":0, "permission_denials":[
+            {"tool_name":"Bash", "tool_input":{"command":"curl -sS https://one.example/"}}]}
+        finished = {**RESULT, "result_index":1, "permission_denials":[
+            {"tool_name":"Write", "tool_input":{"file_path":"/x/two"}}]}
+        run, line = self.run_stream([INIT, waiting, finished])
+        self.assertEqual(run.returncode, 2, run.stdout)
+        self.assertEqual(line["type"], "native.permission_blocked")
+        self.assertEqual([d["tool_name"] for d in line["denials"]], ["Bash", "Write"])
+        self.assertEqual(json.loads(run.stdout.splitlines()[-2])["type"], "native.turn.failed")
+
+    def test_a_repeated_result_without_a_rising_index_still_fails(self):
+        first = {**RESULT, "result_index":0}
+        for second in ({**RESULT, "result_index":0}, {**RESULT, "result_index":-1}, RESULT,
+                       {**RESULT, "result_index":"1"}):
+            with self.subTest(second=second):
+                run, summary = self.run_stream([INIT, first, second])
+                self.assertEqual((run.returncode, summary["type"]), (2, "native.turn.failed"), run.stdout)
+                self.assertEqual(summary["reason"], "repeated-result")
+        run, summary = self.run_stream([INIT, {**RESULT, "result_index":0},
+                                        {**RESULT, "result_index":1, "session_id":OTHER}])
+        self.assertEqual((run.returncode, summary["reason"]), (2, "changed-session"))
+
     def test_exit_zero_cannot_hide_a_failed_missing_or_foreign_result(self):
         failed = {**RESULT, "is_error":True, "result":"API Error: 529 overloaded"}
         for events in ([INIT, failed], [INIT], [RESULT], [INIT, RESULT, RESULT],
