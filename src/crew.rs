@@ -36,7 +36,7 @@ fn clip(text: &str, chars: usize) -> String {
 }
 
 /// The ship hosted here that owns a task, if any.
-fn owning_ship(store: &Store, task_id: &str) -> Result<Option<String>> {
+pub(crate) fn owning_ship(store: &Store, task_id: &str) -> Result<Option<String>> {
     let Ok(task) = store.task(task_id) else {
         return Ok(None);
     };
@@ -51,7 +51,7 @@ fn owning_ship(store: &Store, task_id: &str) -> Result<Option<String>> {
 
 /// A first mate's own wake job or errand, recorded before it starts. An
 /// errand's verdict is its report, so its outcome is not mailed again.
-fn wake_job(store: &Store, job_id: &str) -> Result<bool> {
+pub(crate) fn wake_job(store: &Store, job_id: &str) -> Result<bool> {
     let wake: bool = store.connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM wakes WHERE job_id=?1)",
         [job_id],

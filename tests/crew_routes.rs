@@ -209,7 +209,7 @@ impl Fleet {
     /// A process-wide lock serializes in-process readers so that environment
     /// variables pointing at the fleet registry and ledger do not race across
     /// test threads when the suite runs concurrently.
-    fn in_process<T>(&self, run: impl FnOnce(&privateer::store::Store) -> T) -> T {
+    fn in_process<T>(&self, run: impl FnOnce(&mut privateer::store::Store) -> T) -> T {
         // A test that panics inside the lock poisons it; recover rather than
         // fail every later test, since each caller sets both variables again.
         let _guard = IN_PROCESS_LOCK
@@ -222,9 +222,9 @@ impl Fleet {
             std::env::set_var("PRIVATEER_FLEET", self.root.join("fleet.sqlite"));
             std::env::set_var("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"));
         }
-        let store =
+        let mut store =
             privateer::store::Store::open(&self.root.join("engineering/.privateer")).unwrap();
-        let result = run(&store);
+        let result = run(&mut store);
         // SAFETY: as above, under the same lock.
         unsafe {
             std::env::remove_var("PRIVATEER_FLEET");
@@ -2264,4 +2264,229 @@ fn consecutive_routes_sets_are_each_seen_by_in_process_reads() {
     assert_eq!(chosen, "opus");
     let profile = f.json(None, "ship.profile", json!({"ship": "engineering"}));
     assert_eq!(profile["routes"]["review"]["names"], json!(["opus"]));
+}
+
+/// A codex whose first stream is refused with the free tier's rate limit on
+/// the given models, so a crew on one of them fails at once with a throttle.
+fn throttling_codex(f: &Fleet, models: &[&str]) {
+    let script = format!(
+        "#!/usr/bin/env python3\nimport sys\nthrottled = {models:?}\n\
+         if \"--model\" in sys.argv and sys.argv[sys.argv.index(\"--model\") + 1] in throttled:\n\
+         \x20   print('{{\"type\":\"error\",\"error\":{{\"name\":\"UnknownError\",\"data\":\
+         {{\"message\":\"Rate limit exceeded. Please try again later.\"}}}}}}', flush=True)\n\
+         \x20   raise SystemExit(2)\nraise SystemExit(0)\n"
+    );
+    let path = f.root.join("bin/codex");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// How many jobs this fixture records as relaunches of a throttled crew.
+fn relaunches(f: &Fleet) -> i64 {
+    f.in_process(|store| {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs
+                   WHERE json_extract(record,'$.relaunch_of') IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    })
+}
+
+#[test]
+fn a_crew_throttled_before_any_work_is_relaunched_once_on_the_next_route() {
+    let f = Fleet::new();
+    throttling_codex(&f, &["model-free"]);
+    f.routes(json!({
+        "routes": {"free": codex("model-free", "free"), "paid": codex("model-paid", "plan")},
+        "crew": ["free", "paid"]
+    }));
+    // The first pass has nothing to read yet and leaves the scan cursor
+    // behind; every run after this one is read by it.
+    f.tick();
+    let job = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"throttled"}),
+    );
+    assert_eq!(f.model(&job), "model-free");
+    f.stopped("throttled");
+    // The pass that holds the throttled route relaunches the same crew on the
+    // next one in the list, once.
+    f.tick();
+    f.settled("crew-relaunch-throttled");
+    let relaunched = f.json(None, "job.status", json!({"id":"crew-relaunch-throttled"}));
+    assert_eq!(relaunched["status"], "succeeded", "{relaunched}");
+    assert_eq!(relaunched["relaunch_of"], "throttled");
+    assert_eq!(f.model(&relaunched), "model-paid");
+    // The failed job's record says where its work went, and the route is held.
+    let failed = f.json(None, "job.status", json!({"id":"throttled"}));
+    let reason = failed["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("relaunched as crew-relaunch-throttled"),
+        "{failed}"
+    );
+    let ledger = rusqlite::Connection::open(f.root.join("ledger/resources.sqlite")).unwrap();
+    let error: String = ledger
+        .query_row(
+            "SELECT COALESCE(last_error,'') FROM model_routes WHERE route='codex/-/model-free'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(error.contains("Rate limit"), "{error}");
+    // The ship was told, in mail from crew under the task's focus.
+    let inbox = f.json(
+        Some("engineering"),
+        "mail.inbox",
+        json!({"address":"engineering","all":true,"limit":100}),
+    );
+    let notice = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "crew-relaunch-throttled")
+        .expect("no relaunch notice");
+    let body = notice["body"].as_str().unwrap();
+    assert!(notice["task_id"] == "fix", "{notice}");
+    assert!(body.contains("codex/-/model-free"), "{body}");
+    assert!(body.contains("Rate limit"), "{body}");
+    assert!(body.contains("crew-relaunch-throttled"), "{body}");
+    assert!(body.contains("codex/-/model-paid"), "{body}");
+    // Another pass relaunches nothing more.
+    f.tick();
+    assert_eq!(relaunches(&f), 1);
+}
+
+#[test]
+fn a_relaunch_that_throttles_too_is_never_relaunched_again() {
+    let f = Fleet::new();
+    throttling_codex(&f, &["model-free", "model-paid"]);
+    f.routes(json!({
+        "routes": {"free": codex("model-free", "free"), "paid": codex("model-paid", "plan")},
+        "crew": ["free", "paid"]
+    }));
+    f.tick();
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"throttled"}),
+    );
+    f.stopped("throttled");
+    f.tick();
+    // The relaunch lands on the paid route and throttles there too: it ends
+    // failed for the first mate, not relaunched a second time.
+    f.stopped("crew-relaunch-throttled");
+    f.tick();
+    assert_eq!(relaunches(&f), 1);
+    let relaunched = f.json(None, "job.status", json!({"id":"crew-relaunch-throttled"}));
+    assert_eq!(relaunched["status"], "failed", "{relaunched}");
+    assert_eq!(f.model(&relaunched), "model-paid");
+}
+
+#[test]
+fn a_throttle_whose_route_hold_has_not_landed_yet_waits_for_the_next_pass() {
+    let f = Fleet::new();
+    throttling_codex(&f, &["model-free"]);
+    f.routes(json!({
+        "routes": {"free": codex("model-free", "free"), "paid": codex("model-paid", "plan")},
+        "crew": ["free", "paid"]
+    }));
+    f.tick();
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"throttled"}),
+    );
+    f.stopped("throttled");
+    // The pass runs before the scan has held the route (here, without it):
+    // the crew is left alone, and the pass tries it again rather than
+    // dropping it.
+    f.in_process(|store| privateer::crew_relaunch::throttled(store).unwrap());
+    assert_eq!(relaunches(&f), 0);
+    // Once the hold lands, as the scan's own pass would land it, the next
+    // pass relaunches the crew on the next route in the list.
+    f.back_off("codex/-/model-free");
+    f.tick();
+    f.settled("crew-relaunch-throttled");
+    assert_eq!(relaunches(&f), 1);
+    let relaunched = f.json(None, "job.status", json!({"id":"crew-relaunch-throttled"}));
+    assert_eq!(f.model(&relaunched), "model-paid");
+}
+
+/// A codex whose first launch on the free model is refused with the free
+/// tier's rate limit and whose later launches on it succeed, so one scan
+/// pass can hold a route and then clear it; the paid model always throttles.
+fn once_throttling_codex(f: &Fleet) {
+    let script = r##"#!/usr/bin/env python3
+import json, pathlib, sys
+model = sys.argv[sys.argv.index('--model') + 1]
+runs = pathlib.Path('codex-runs')
+n = int(runs.read_text()) if runs.exists() else 0
+runs.write_text(str(n + 1))
+if model == 'model-paid' or (model == 'model-free' and n == 0):
+    print(json.dumps({'type': 'error', 'error': {'name': 'UnknownError',
+        'data': {'message': 'Rate limit exceeded. Please try again later.'}}}), flush=True)
+    raise SystemExit(2)
+raise SystemExit(0)
+"##;
+    let path = f.root.join("bin/codex");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn a_throttle_a_same_pass_success_cleared_is_skipped_and_blocks_no_later_job() {
+    let f = Fleet::new();
+    once_throttling_codex(&f);
+    f.routes(json!({
+        "routes": {"free": codex("model-free", "free"), "paid": codex("model-paid", "plan")},
+        "crew": ["free", "paid"]
+    }));
+    f.tick();
+    // The first crew throttles on the free route, and a second crew succeeds
+    // on it before any pass reads either, so the pass that holds the route
+    // for the first also clears it for the second: the hold is gone for good.
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"throttled"}),
+    );
+    f.stopped("throttled");
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"after","route":"free"}),
+    );
+    f.settled("after");
+    // A later crew throttles on the paid route, whose hold stands.
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"later","route":"paid"}),
+    );
+    f.stopped("later");
+    f.tick();
+    // The throttled crew is decided for good — skipped, since no hold exists
+    // — and does not block the later throttled crew behind it, which is
+    // relaunched (back onto the free route, whose hold the success cleared).
+    f.settled("crew-relaunch-later");
+    assert_eq!(relaunches(&f), 1);
+    let failed = f.json(None, "job.status", json!({"id":"throttled"}));
+    assert!(
+        !failed["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("relaunched")
+    );
+    let relaunched = f.json(None, "job.status", json!({"id":"crew-relaunch-later"}));
+    assert_eq!(relaunched["relaunch_of"], "later");
+    assert_eq!(relaunched["status"], "succeeded", "{relaunched}");
+    assert_eq!(f.model(&relaunched), "model-free");
+    // The skipped job is never revisited: no later pass relaunches it.
+    f.tick();
+    assert_eq!(relaunches(&f), 1);
 }

@@ -1273,17 +1273,25 @@ fn record_job(
     Ok(())
 }
 
-/// Read the harness jobs that ended since the last pass and back off or clear
-/// their routes. Called by each dispatcher pass; no model call.
-pub fn scan(store: &Store) -> Result<Vec<Value>> {
-    let since: i64 = store
+/// How far the route scan has read: the `finished_ms` of the last job it
+/// has settled in the ledger. A job finished after it has not been read
+/// yet, so whatever it owes the ledger may still land; one finished before
+/// it has been read and decided about, whatever a later read shows.
+pub(crate) fn scanned_ms(store: &Store) -> Result<i64> {
+    Ok(store
         .connection()
         .query_row("SELECT value FROM metadata WHERE key=?1", [CURSOR], |r| {
             r.get::<_, String>(0)
         })
         .optional()?
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(Store::now_ms);
+        .unwrap_or_else(Store::now_ms))
+}
+
+/// Read the harness jobs that ended since the last pass and back off or clear
+/// their routes. Called by each dispatcher pass; no model call.
+pub fn scan(store: &Store) -> Result<Vec<Value>> {
+    let since = scanned_ms(store)?;
     let mut statement = store.connection().prepare(
         "SELECT record FROM jobs WHERE json_extract(record,'$.action')='spawn'
            AND json_extract(record,'$.finished_ms') > ?1
