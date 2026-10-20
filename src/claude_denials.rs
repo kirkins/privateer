@@ -26,7 +26,8 @@ const TAIL_BYTES: u64 = 512 * 1024;
 /// The newest transcripts tried, newest first.
 const CANDIDATES: usize = 4;
 /// How the classifier's refusal starts its result text.
-const CLASSIFIER_REFUSAL: &str = "denied by the Claude Code auto mode classifier";
+const CLASSIFIER_REFUSAL: &str =
+    "Permission for this action was denied by the Claude Code auto mode classifier";
 /// Clock slack between Claude's record timestamps and the screen read.
 const SLACK_MS: i64 = 2_000;
 
@@ -117,14 +118,23 @@ fn result_text(content: &Value) -> String {
 
 /// Whether one tool result is a permission refusal, and its reason: the
 /// classifier's label, or the first line of a rule's refusal. A hook's
-/// error or the person at the pane saying no is not a permission policy.
+/// error or the person at the pane saying no is not a permission policy,
+/// and a result that only quotes the classifier's sentence (a log, a test's
+/// output) is no refusal: the sentence must start the result, or Claude must
+/// have recorded the refusal itself.
 fn refusal(record: &Value, block: &Value, text: &str) -> Option<(Option<String>, bool)> {
     if block["is_error"] != true {
         return None;
     }
     let decision = &record["permissionDecision"];
     let source = decision["source"].as_str().unwrap_or_default();
-    let classifier = decision["decision"] != "accept" && text.contains(CLASSIFIER_REFUSAL);
+    let blocked = [record, block]
+        .iter()
+        .any(|v| v["toolDenialKind"] == "automode-blocked");
+    let classifier = decision["decision"] != "accept"
+        && (blocked
+            || text.trim_start().starts_with(CLASSIFIER_REFUSAL)
+            || (decision["decision"] == "reject" && text.contains(CLASSIFIER_REFUSAL)));
     let rejected =
         decision["decision"] == "reject" && source != "hook" && !source.starts_with("user");
     if !classifier && !rejected {
@@ -238,6 +248,45 @@ pub(crate) mod tests {
         let found = since(temp.path(), folder, after_first).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["tool_input"]["command"], "cargo publish --dry-run");
+    }
+
+    #[test]
+    fn a_result_that_only_quotes_the_classifier_is_no_refusal() {
+        let refusal = format!("{CLASSIFIER_REFUSAL}. Reason: [Credential Leakage]. If you have");
+        let record = |text: &str, extra: Value| {
+            let mut record = json!({"timestamp": "2026-10-20T19:03:12.000Z",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                    "content": text, "is_error": true}]}});
+            for (key, value) in extra.as_object().unwrap() {
+                record[key] = value.clone();
+            }
+            vec![
+                json!({"message": {"content": [{"type": "tool_use", "id": "toolu_1",
+                    "name": "Bash", "input": {"command": "make test"}}]}}),
+                record,
+            ]
+        };
+        // A failed command whose output quotes the sentence.
+        let quoted = format!("make: *** test failed\n{refusal}");
+        assert!(denials(&record(&quoted, json!({})), 0).is_empty());
+        // The sentence starting the result, or Claude's own record of it.
+        let found = denials(&record(&refusal, json!({})), 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["reason"], "[Credential Leakage]");
+        assert_eq!(found[0]["classifier"], true);
+        let marked = denials(
+            &record(&quoted, json!({"toolDenialKind": "automode-blocked"})),
+            0,
+        );
+        assert_eq!(marked[0]["classifier"], true);
+        let rejected = denials(
+            &record(
+                &quoted,
+                json!({"permissionDecision": {"decision": "reject", "source": "config"}}),
+            ),
+            0,
+        );
+        assert_eq!(rejected[0]["classifier"], true);
     }
 
     #[test]
