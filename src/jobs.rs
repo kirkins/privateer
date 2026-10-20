@@ -2520,11 +2520,20 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         )?;
         return Ok(public_job(&job));
     }
+    // The supervisor sits in the ship home, never in a workspace (its own
+    // included): it outlives its job by a moment, and a process inside a
+    // workspace blocks that workspace's release.
+    let neutral_dir = if store.home().is_dir() {
+        store.home()
+    } else {
+        Path::new("/")
+    };
     let mut cmd = Command::new(&executable);
     cmd.arg("--home")
         .arg(store.home())
         .arg("_job-supervise")
         .arg(&id)
+        .current_dir(neutral_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2867,6 +2876,13 @@ fn truncation_marker(dropped: u64) -> Vec<u8> {
 }
 
 pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
+    // As at spawn: the ship home, never a workspace.
+    let neutral_dir = if store.home().is_dir() {
+        store.home().to_path_buf()
+    } else {
+        PathBuf::from("/")
+    };
+    let _ = std::env::set_current_dir(neutral_dir);
     let result = supervise_inner(store, id);
     if let Err(error) = &result {
         // CLI stderr can be detached. Persist bounded diagnostics so process

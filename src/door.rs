@@ -262,6 +262,7 @@ extern "C" fn request_stop(_: libc::c_int) {
 /// One supervisor runs per door, guarded by `<door dir>/lock`.
 pub fn supervise(name: &str) -> Result<()> {
     let dir = directory(name)?;
+    let _ = std::env::set_current_dir(&dir);
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)

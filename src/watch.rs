@@ -54,6 +54,7 @@ struct Followed {
 }
 
 pub fn run(store: &mut Store, ship: &str) -> Result<()> {
+    let _ = std::env::set_current_dir(store.home());
     let record = crate::dispatch(store, "ship.show", json!({"name": ship}))?;
     let harness = record["first_mate"]["manifest"]
         .as_str()
@@ -123,6 +124,7 @@ pub fn run(store: &mut Store, ship: &str) -> Result<()> {
 
 /// Follow one crew job until shortly after it ends.
 pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
+    let _ = std::env::set_current_dir(store.home());
     let load = |store: &Store| -> Result<Value> {
         let raw: String = store
             .connection()

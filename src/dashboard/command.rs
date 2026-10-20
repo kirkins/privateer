@@ -35,6 +35,7 @@ pub fn existing_home(home: &Path) -> Result<()> {
 pub fn json(binary: &Path, home: &Path, verb: &str, args: &Value) -> Result<Value> {
     existing_home(home)?;
     let mut cmd = Command::new(binary);
+    cmd.current_dir(home);
     cmd.arg("--home")
         .arg(home)
         .arg(verb)
@@ -128,6 +129,7 @@ pub fn service(binary: &Path, home: &Path, action: &str) -> Result<Vec<u8>> {
         "invalid service action"
     );
     let mut cmd = Command::new(binary);
+    cmd.current_dir(home);
     cmd.arg("--home").arg(home).arg("service").arg(action);
     run(cmd)
 }

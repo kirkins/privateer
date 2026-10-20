@@ -257,10 +257,16 @@ fn rotate(log: &Path) -> Result<()> {
 }
 
 fn detached(service: &Service, binary: &Path) -> Result<()> {
+    let cwd = service
+        .log
+        .parent()
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| Path::new("/"));
     let log = &service.log;
     rotate(log)?;
     let out = fs::OpenOptions::new().create(true).append(true).open(log)?;
     let mut command = Command::new(binary);
+    command.current_dir(cwd);
     for name in [
         "PRIVATEER_ROLE",
         "PRIVATEER_ACTOR",

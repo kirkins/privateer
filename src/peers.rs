@@ -237,7 +237,14 @@ fn call(peer: &Peer, id: &str, command: &str, args: Value, caller: &Caller) -> R
         ]);
         cmd
     };
+    let peer_home = Path::new(&peer.home);
+    let cwd = if peer_home.is_dir() {
+        peer_home
+    } else {
+        Path::new("/")
+    };
     child_command
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
