@@ -8,16 +8,21 @@
 //! the same crew is started again on the next available route in the
 //! captain's list, once: the relaunch carries the same task (so the same
 //! assignment, which a crew brief reads from the task) and the same launch
-//! settings and work offer, and its route is chosen fresh, skipping the held
-//! one. A relaunch is never relaunched, so a route list throttled across the
-//! board still ends failed, for the first mate to place by hand.
+//! settings and work offer. An explicit manifest and options, or a route the
+//! launch named, are not carried over: the relaunch is placed on the crew's
+//! route list afresh, skipping the held route. A relaunch is never
+//! relaunched, so a route list throttled across the board still ends failed,
+//! for the first mate to place by hand.
 //!
 //! Only a crew that provably did no work is relaunched: the run must have
 //! lasted less than a short window, and its log must show no model output at
-//! all — no assistant message, tool call or finished step, in any harness's
-//! event shape. A run that cannot be shown empty is left to the first mate,
-//! who has the failure outcome; the relaunch itself is reported in a crew
-//! notice and on the failed job's record, and audited.
+//! all — no assistant message, tool call or finished step. That no-work
+//! reading is written for the OpenCode and Claude event shapes (with Pi's,
+//! Codex's and AGY's beside them); an event it cannot place counts as work,
+//! so a harness whose shape it does not know is not relaunched in practice.
+//! A run that cannot be shown empty is left to the first mate, who has the
+//! failure outcome; the relaunch itself is reported in a crew notice and on
+//! the failed job's record, and audited.
 use crate::mail::record_crew;
 use crate::store::{Caller, Store};
 use anyhow::Result;
@@ -82,8 +87,11 @@ pub(crate) fn worked(log: &str) -> bool {
 
 /// Relaunch crews whose route throttled before they did any work. Runs after
 /// the route scan in the same dispatcher pass, so the throttled route is
-/// already held and the launch below takes the next one in the list. Called
-/// by each dispatcher pass; no model call.
+/// already held and the launch below takes the next one in the list. A job
+/// the scan has not read yet waits for the next pass; one the scan has read
+/// is decided for good, so a hold that a same-pass success, time or another
+/// home cleared leaves its crew skipped, never deferring every pass after
+/// it. Called by each dispatcher pass; no model call.
 pub fn throttled(store: &mut Store) -> Result<Vec<Value>> {
     let since: i64 = store
         .connection()
@@ -109,10 +117,10 @@ pub fn throttled(store: &mut Store) -> Result<Vec<Value>> {
     let mut relaunched = vec![];
     for job in jobs {
         match consider(store, &job)? {
-            // A job that is only missing the route hold yet (it settled
-            // between this pass's scan and its own read) is tried again next
-            // pass, so the cursor stops before it; later jobs are re-read
-            // too, which their own idempotency keys make harmless.
+            // Only a job the routes scan has not read yet is deferred (it
+            // settled between that scan and this read), so the cursor stops
+            // before it, and with it every later job, which is behind it in
+            // finish order; a job the scan has read is decided here for good.
             Decision::Deferred => break,
             Decision::Done(entry) => {
                 through = through.max(job["finished_ms"].as_i64().unwrap_or(through));
@@ -160,9 +168,9 @@ fn route_of(job: &Value) -> Option<String> {
         .or_else(|| crate::routes::route_of_argv(&job["command"]))
 }
 
-/// What the pass did with one failed job: settled it, relaunched it (carrying
-/// the entry it reported), or deferred it to the next pass because its route
-/// hold had not landed yet.
+/// What the pass did with one failed job: settled it — relaunched, carrying
+/// the entry it reported, or skipped — or deferred it to the next pass
+/// because the routes scan has not read it yet, so its hold may still land.
 enum Decision {
     Done(Option<Value>),
     Deferred,
@@ -224,9 +232,16 @@ fn consider(store: &mut Store, job: &Value) -> Result<Decision> {
     // The hold the route scan just recorded is the warrant: the relaunch
     // moves the crew because its route is held, and the choice below skips
     // it. A throttle with no hold yet only settled between the scan and this
-    // read, so it waits for the next pass rather than being dropped.
+    // read, so it waits for the next pass — but only while the scan has not
+    // read the job: once it has, a hold that is missing is missing for good,
+    // cleared by a success later in the same pass, by time, or from another
+    // home, and the crew is settled as skipped rather than left deferring
+    // and blocking every job behind it.
     if crate::routes::blocked(&crate::jobs::host_ledger(store)?, &route)?.is_none() {
-        return Ok(Decision::Deferred);
+        if crate::routes::scanned_ms(store)? < job["finished_ms"].as_i64().unwrap_or_default() {
+            return Ok(Decision::Deferred);
+        }
+        return Ok(Decision::Done(None));
     }
     // The first mate may already have placed the work again: a live crew on
     // the task is not run beside.
@@ -307,8 +322,8 @@ fn notice(
     let why = record["route_why"].as_str().unwrap_or_default();
     let body = format!(
         "Crew job {failed} failed on route {route} before doing any work: the provider \
-         throttled ({error}). The route is held until it clears; the same crew was \
-         relaunched as job {resumed} on {on}{}.",
+         throttled or was unavailable ({error}). The route is held until it clears; the \
+         same crew was relaunched as job {resumed} on {on}{}.",
         if why.is_empty() {
             String::new()
         } else {

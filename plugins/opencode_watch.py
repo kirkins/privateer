@@ -20,8 +20,11 @@ allowance is spent, so however long OpenCode would sit there, the answer will
 not change. Such an error ends the run after a short grace instead (5 s by
 default, `PRIVATEER_OPENCODE_RATE_SECS`), still as OpenCode's own final
 `error` event, which the dispatcher reads as a throttle: the route is held
-until its reset at once and the crew can move to another route. Any other
-error, and silence, keep the full stall grace.
+until its reset at once and the crew can move to another route. The short
+grace is only for a run that has not started working, before any event past
+a step start: a crew already at work keeps the full stall grace, since a
+per-minute limit mid-run may be one OpenCode retries itself and the run
+carries on. Any other error, and silence, keep the full stall grace.
 """
 import io
 import json
@@ -88,15 +91,32 @@ def run(argv):
         argv = [argv[0], argv[1], "--print-logs", "--log-level", "INFO", *argv[2:]]
     # The child stays in the job's process group, so cancelling the job ends it.
     child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    state = {"output": time.monotonic(), "error": None, "at": None, "session": None, "newline": True}
+    state = {"output": time.monotonic(), "error": None, "at": None, "session": None,
+             "newline": True, "worked": False}
     lock = threading.Lock()
 
     def forward_stdout():
+        partial = b""
         while chunk := child.stdout.read(65536):
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
+            # A run is at work once any event past a step start has come
+            # through; whether this chunk carried one is settled under the
+            # lock below with the rest of the state.
+            *lines, partial = (partial + chunk).split(b"\n")
+            at_work = False
+            for line in lines:
+                if line.strip():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict) or event.get("type") != "step_start":
+                        at_work = True
             with lock:
                 state["output"], state["newline"] = time.monotonic(), chunk.endswith(b"\n")
+                if at_work:
+                    state["worked"] = True
 
     def forward_stderr():
         for raw in io.BufferedReader(child.stderr, 65536):
@@ -130,15 +150,16 @@ def run(argv):
         time.sleep(min(1.0, limit / 4, short / 4))
         with lock:
             error = state["error"]
+            worked = state["worked"]
             # Silence counts from the error or the last event, whichever came
             # later: the two pipes are read on their own threads, so an event
             # OpenCode printed just before the error may be read after it.
             waited = (None if state["at"] is None
                       else time.monotonic() - max(state["at"], state["output"]))
-            # A rate or usage limit is a spent allowance, so it ends the run
-            # after the short grace; any other error, and silence, keep the
-            # full one.
-            ended = short if error is not None and is_limit(error) else limit
+            # A rate or usage limit before any work is a spent allowance, so
+            # it ends the run after the short grace; once the run is at work,
+            # and for any other error or silence, the full one stands.
+            ended = short if error is not None and is_limit(error) and not worked else limit
             stalled = waited is not None and waited >= ended
         # A run that ended meanwhile keeps its own exit status.
         if stalled and child.poll() is None:

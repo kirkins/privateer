@@ -2416,3 +2416,77 @@ fn a_throttle_whose_route_hold_has_not_landed_yet_waits_for_the_next_pass() {
     let relaunched = f.json(None, "job.status", json!({"id":"crew-relaunch-throttled"}));
     assert_eq!(f.model(&relaunched), "model-paid");
 }
+
+/// A codex whose first launch on the free model is refused with the free
+/// tier's rate limit and whose later launches on it succeed, so one scan
+/// pass can hold a route and then clear it; the paid model always throttles.
+fn once_throttling_codex(f: &Fleet) {
+    let script = r##"#!/usr/bin/env python3
+import json, pathlib, sys
+model = sys.argv[sys.argv.index('--model') + 1]
+runs = pathlib.Path('codex-runs')
+n = int(runs.read_text()) if runs.exists() else 0
+runs.write_text(str(n + 1))
+if model == 'model-paid' or (model == 'model-free' and n == 0):
+    print(json.dumps({'type': 'error', 'error': {'name': 'UnknownError',
+        'data': {'message': 'Rate limit exceeded. Please try again later.'}}}), flush=True)
+    raise SystemExit(2)
+raise SystemExit(0)
+"##;
+    let path = f.root.join("bin/codex");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn a_throttle_a_same_pass_success_cleared_is_skipped_and_blocks_no_later_job() {
+    let f = Fleet::new();
+    once_throttling_codex(&f);
+    f.routes(json!({
+        "routes": {"free": codex("model-free", "free"), "paid": codex("model-paid", "plan")},
+        "crew": ["free", "paid"]
+    }));
+    f.tick();
+    // The first crew throttles on the free route, and a second crew succeeds
+    // on it before any pass reads either, so the pass that holds the route
+    // for the first also clears it for the second: the hold is gone for good.
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"throttled"}),
+    );
+    f.stopped("throttled");
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"after","route":"free"}),
+    );
+    f.settled("after");
+    // A later crew throttles on the paid route, whose hold stands.
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"later","route":"paid"}),
+    );
+    f.stopped("later");
+    f.tick();
+    // The throttled crew is decided for good — skipped, since no hold exists
+    // — and does not block the later throttled crew behind it, which is
+    // relaunched (back onto the free route, whose hold the success cleared).
+    f.settled("crew-relaunch-later");
+    assert_eq!(relaunches(&f), 1);
+    let failed = f.json(None, "job.status", json!({"id":"throttled"}));
+    assert!(
+        !failed["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("relaunched")
+    );
+    let relaunched = f.json(None, "job.status", json!({"id":"crew-relaunch-later"}));
+    assert_eq!(relaunched["relaunch_of"], "later");
+    assert_eq!(relaunched["status"], "succeeded", "{relaunched}");
+    assert_eq!(f.model(&relaunched), "model-free");
+    // The skipped job is never revisited: no later pass relaunches it.
+    f.tick();
+    assert_eq!(relaunches(&f), 1);
+}

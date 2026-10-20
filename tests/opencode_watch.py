@@ -25,13 +25,18 @@ if mode in ('stall','ratelimit','recover'):
     log('false','Rate limit exceeded. Please try again later.')
 if mode=='upstream':
     log('false','upstream_unavailable')
+if mode=='midrun':
+    # A crew already at work: an event past the step start, then a per-minute
+    # limit the provider may retry itself.
+    print(json.dumps({'type':'text','part':{'type':'text','text':'at work'}}),flush=True)
+    log('false','Rate limit exceeded. Please try again later.')
 if mode=='recover':
     # OpenCode retries quietly: the retried stream shows only in its log.
     time.sleep(0.2)
     print('timestamp=2026-10-17T19:52:46Z level=INFO run=1 message=stream providerID=opencode modelID=space-bunny-free '
           'session.id=ses_1 small=false agent=build mode=primary',file=sys.stderr,flush=True)
     time.sleep(3)
-if mode in ('stall','ratelimit','upstream'):
+if mode in ('stall','ratelimit','upstream','midrun'):
     time.sleep(60)
 if mode=='silent':
     time.sleep(3)
@@ -97,6 +102,20 @@ class OpenCodeWatch(unittest.TestCase):
         self.assertEqual(final["stalled_secs"], 1)
         with self.assertRaises(ProcessLookupError):
             os.kill(native["pid"], 0)
+
+    def test_a_rate_limit_mid_run_keeps_the_full_stall_grace(self):
+        # A run that has already printed an event past its step start is at
+        # work: a rate limit there keeps the full stall grace (2 s here, past
+        # the 0.5 s short one), so OpenCode's own retry of a per-minute limit
+        # can still carry the run on.
+        run, _, elapsed = self.run_turn("midrun", stall_secs="2", rate_secs="0.5")
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertGreaterEqual(elapsed, 2)
+        *passed, final = self.events(run)
+        self.assertEqual([event["type"] for event in passed], ["step_start", "text"])
+        self.assertEqual(final["type"], "error")
+        self.assertEqual(final["error"]["data"]["message"], "Rate limit exceeded. Please try again later.")
+        self.assertEqual(final["stalled_secs"], 2)
 
     def test_any_other_error_and_silence_keep_the_full_stall_grace(self):
         # A provider error that is not a limit still waits the full grace:
