@@ -460,6 +460,12 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
                  answer it in that thread, or withdraw or update it with mail.withdraw or mail.send"
             ));
         }
+        // The captain's files are named, sized and placed where the ship reads them.
+        if payload.contains("\"files\"")
+            && let Ok(parsed) = serde_json::from_str::<Value>(&payload)
+        {
+            summary.push_str(&crate::files::summary(&parsed));
+        }
         // A crew report's body already states its payload.
         if from != crate::mail::CREW && payload != "{}" && payload.len() <= 1024 {
             summary.push_str(&format!("\n  payload {payload}"));

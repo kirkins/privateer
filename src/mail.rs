@@ -1162,6 +1162,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     }
     hands_step(kind, to, &payload)?;
     crate::report::check_report(store, from, to, &mut payload)?;
+    crate::files::check_files(store, from, to, &mut payload)?;
     crate::report::check_annotations(from, kind, &payload)?;
     ensure!(
         !body.is_empty() || payload.as_object().is_some_and(|p| !p.is_empty()),

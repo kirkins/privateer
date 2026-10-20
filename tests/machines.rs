@@ -5155,3 +5155,74 @@ fn the_activity_list_pages_across_reached_machine_and_after_time_keeps_reached()
     assert_eq!(after_entries[2]["kind"], "mac.event2");
     assert_eq!(after_entries[2]["at_ms"], T0 + 400);
 }
+
+#[test]
+fn a_file_the_captain_sends_to_a_ship_on_the_other_machine_crosses_in_chunks() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+
+    // More than two chunks of 512 KiB, so the file crosses the link in parts.
+    let data: Vec<u8> = (0..1_258_291).map(|i| (i * 31 % 251) as u8).collect();
+    let source = laptop.root.join("plan.bin");
+    fs::write(&source, &data).unwrap();
+    let put = laptop.ok_over(
+        "liaison",
+        "file.put",
+        json!({"to": "fitforge", "name": "plan.bin", "content_file": source}),
+        &ssh,
+    );
+    assert_eq!(put["ship"], "fitforge", "{put}");
+    assert_eq!(put["type"], "application/octet-stream");
+    let stored = PathBuf::from(put["path"].as_str().unwrap());
+    assert!(stored.starts_with(mac.folder("fitforge")), "{stored:?}");
+    assert_eq!(fs::read(&stored).unwrap(), data);
+
+    // The captain's mail names the file; it reaches the Mac with its path there.
+    let sent = laptop.ok_over(
+        "liaison",
+        "captain.send",
+        json!({"to": "fitforge", "body": "Plan attached.",
+            "payload": {"files": [{"file_id": put["file_id"]}]}}),
+        &ssh,
+    );
+    assert_eq!(sent["mail"]["delivery"], "delivered", "{sent}");
+    let mail = messages(&mac, "fitforge", "notice");
+    let message = mail
+        .iter()
+        .find(|m| m["body"] == "Plan attached.")
+        .unwrap_or_else(|| panic!("no captain mail in {mail:?}"));
+    let file = &message["payload"]["files"][0];
+    assert_eq!(file["file_id"], put["file_id"], "{message}");
+    assert_eq!(file["path"], put["path"], "{message}");
+    assert_eq!(fs::read(file["path"].as_str().unwrap()).unwrap(), data);
+}
+
+#[test]
+fn a_chunked_upload_whose_bytes_do_not_match_its_sha256_is_refused_on_the_other_machine() {
+    let (_temp, _laptop, mac, _ssh) = fixture();
+    let begun = mac.gateway(
+        "file.begin",
+        json!({"ship": "fitforge", "name": "bad.txt", "bytes": 3, "sha256": "0".repeat(64)}),
+    );
+    assert_eq!(begun["ok"], true, "{begun}");
+    let upload = begun["result"]["upload_id"].as_str().unwrap().to_string();
+    // "abc" in base64.
+    let appended = mac.gateway(
+        "file.append",
+        json!({"ship": "fitforge", "upload_id": upload, "offset": 0, "data": "YWJj"}),
+    );
+    assert_eq!(appended["ok"], true, "{appended}");
+    let committed = mac.gateway(
+        "file.commit",
+        json!({"ship": "fitforge", "upload_id": upload}),
+    );
+    assert_eq!(committed["ok"], false, "{committed}");
+    assert!(
+        committed["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not match"),
+        "{committed}"
+    );
+}
