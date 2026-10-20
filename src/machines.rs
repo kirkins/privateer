@@ -1111,6 +1111,35 @@ pub(crate) fn report_from_linked(id: &str) -> Result<Option<Value>> {
     Ok(None)
 }
 
+/// How long a linked machine has to take one file chunk or commit.
+const FILE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A file command for a ship on a linked machine this one reaches: the
+/// machine whose directory lists the ship answers. A ship on a machine that
+/// reaches this one is reached from there, so it is refused here.
+pub(crate) fn ship_call(ship: &str, command: &str, args: Value) -> Result<Value> {
+    identifier(ship)?;
+    let conn = crate::fleet::registry()?;
+    let holder: Option<String> = conn
+        .query_row(
+            "SELECT machine FROM machine_ships WHERE name=?1 LIMIT 1",
+            [ship],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let holder = holder.with_context(|| format!("no ship named {ship} in this fleet"))?;
+    let mut machine = machine(&conn, &holder)?;
+    ensure!(
+        machine.role == "collects",
+        "{ship} is on {holder}, which reaches this machine; run this from {holder}"
+    );
+    let limit = machine.peer["timeout_ms"]
+        .as_u64()
+        .unwrap_or(LINK_TIMEOUT_MS);
+    machine.peer["timeout_ms"] = json!(limit.max(FILE_TIMEOUT.as_millis() as u64));
+    call(&machine, command, args, Some(FILE_TIMEOUT))
+}
+
 /// How long a linked machine has to read or type into a session.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -2129,6 +2158,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "session.read" | "session.send" => crate::session::serve(command, args),
         // A stored report from this machine's homes; never asked further.
         "report.get" => crate::report::serve(args),
+        // A file the captain sends a ship here: its upload and its lookup, for
+        // a ship hosted on this machine; never asked further.
+        "file.begin" | "file.append" | "file.commit" | "file.describe" => {
+            crate::files::serve(command, args)
+        }
         // The captain's desk is here: answer from this machine's homes, and
         // never pass the command on again.
         "captain.waiting" | "captain.feed" | "captain.send" | "captain.reply"

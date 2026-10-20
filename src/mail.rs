@@ -1162,6 +1162,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     }
     hands_step(kind, to, &payload)?;
     crate::report::check_report(store, from, to, &mut payload)?;
+    crate::files::check_files(store, from, to, &mut payload)?;
     crate::report::check_annotations(from, kind, &payload)?;
     ensure!(
         !body.is_empty() || payload.as_object().is_some_and(|p| !p.is_empty()),
@@ -2167,6 +2168,16 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     ensure!(payload.is_object(), "payload must be an object");
     typed_payload(kind, &mut payload)?;
     hands_step(kind, to, &payload)?;
+    // Files cross a link only on the captain's mail to a ship, and this home,
+    // which hosts the ship, keeps only what its own rows say about them. A
+    // redelivery of mail already stored was checked when it was placed.
+    if payload.get("files").is_some() && by_id(store, id)?.is_none() {
+        ensure!(
+            from == CAPTAIN,
+            "payload.files is the captain's, on mail to a ship"
+        );
+        crate::files::check_delivered(store, to, &mut payload)?;
+    }
     // The operator marker crosses a link only on a captain reply that the
     // machine holding this machine's captain desk delivered.
     let via = optional_str(args, "via")?;

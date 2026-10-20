@@ -23,6 +23,7 @@ pub mod door;
 pub mod errand;
 mod executable;
 mod feed;
+pub mod files;
 pub mod fleet;
 pub mod grants;
 pub mod herdr;
@@ -110,6 +111,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "wake.transcript",
     "fleet.snapshot",
     "report.get",
+    "file.put",
     "usage.summary",
     "activity.list",
 ];
@@ -182,6 +184,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "captain" => captain::dispatch(store, command, args),
         "session" => session::dispatch(store, command, args),
         "report" => report::dispatch(store, command, args),
+        "file" => files::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
         "ship" if command == "ship.move" => moves::dispatch(store, command, args),
         "ship" if command == "ship.profile" => {

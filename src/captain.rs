@@ -425,6 +425,9 @@ fn send(args: &Value) -> Result<Value> {
     if let Some(urgency) = args.get("urgency").filter(|v| !v.is_null()) {
         message["urgency"] = urgency.clone();
     }
+    if let Some(payload) = args.get("payload").filter(|v| !v.is_null()) {
+        message["payload"] = payload.clone();
+    }
     let mut store = Store::open(&home)?;
     let sent = crate::dispatch(&mut store, "mail.send", message)?;
     store.audit("captain.send", &json!({"to": to, "id": sent["id"]}))?;
