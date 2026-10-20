@@ -287,7 +287,9 @@ class Permissions(unittest.TestCase):
         self.assertIn("--no-chrome", argv)
         self.assertNotIn("--chrome", argv)
 
-        # Setting sources, MCP config, and safe mode
+        # Built-in tools, setting sources, MCP config, and safe mode
+        self.assertIn("--tools", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
         self.assertIn("--setting-sources", argv)
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "user")
         self.assertIn("--strict-mcp-config", argv)
@@ -305,6 +307,8 @@ class Permissions(unittest.TestCase):
         self.assertIn("dontAsk", argv_yolo)
         self.assertNotIn("bypassPermissions", argv_yolo)
         self.assertNotIn("Bash(something *)", argv_yolo)
+        self.assertIn("--tools", argv_yolo)
+        self.assertEqual(argv_yolo[argv_yolo.index("--tools") + 1], "Read,Grep,Glob")
         self.assertIn("--setting-sources", argv_yolo)
         self.assertEqual(argv_yolo[argv_yolo.index("--setting-sources") + 1], "user")
         self.assertIn("--strict-mcp-config", argv_yolo)
@@ -357,10 +361,14 @@ class Permissions(unittest.TestCase):
         self.assertIn("--sandbox", argv)
         self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
 
-        # Disable web search and ignore user config
+        # Disable web search, hooks, and ignore user config / rules
         self.assertIn("--ignore-user-config", argv)
-        self.assertIn("-c", argv)
+        self.assertIn("--ignore-rules", argv)
+        self.assertIn("--disable", argv)
+        self.assertEqual(argv[argv.index("--disable") + 1], "hooks")
         self.assertIn('web_search="disabled"', argv)
+        ws_idx = argv.index('web_search="disabled"')
+        self.assertEqual(argv[ws_idx - 1], "-c")
 
         # No bypass, no add-dir, no control CLI, no resume
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
@@ -376,8 +384,12 @@ class Permissions(unittest.TestCase):
         self.assertIn("--sandbox", argv_yolo)
         self.assertEqual(argv_yolo[argv_yolo.index("--sandbox") + 1], "read-only")
         self.assertIn("--ignore-user-config", argv_yolo)
-        self.assertIn("-c", argv_yolo)
+        self.assertIn("--ignore-rules", argv_yolo)
+        self.assertIn("--disable", argv_yolo)
+        self.assertEqual(argv_yolo[argv_yolo.index("--disable") + 1], "hooks")
         self.assertIn('web_search="disabled"', argv_yolo)
+        ws_idx_yolo = argv_yolo.index('web_search="disabled"')
+        self.assertEqual(argv_yolo[ws_idx_yolo - 1], "-c")
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv_yolo)
         self.assertNotIn("--add-dir", argv_yolo)
         self.assertNotIn("/bin/privateer", argv_yolo)
