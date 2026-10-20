@@ -39,6 +39,7 @@ const UPLOAD_TTL_MS: i64 = 60 * 60 * 1000;
 const MAX_NAME_CHARS: usize = 128;
 const MAX_FILES_PER_MESSAGE: usize = 20;
 
+#[cfg(test)]
 thread_local! {
     /// The files runtime's clock, so a test can try expiry and pruning order
     /// by moving its own thread's time without touching anything real.
@@ -46,8 +47,15 @@ thread_local! {
 }
 
 /// The clock the files runtime runs on.
+#[cfg(test)]
 fn now_ms() -> i64 {
     CLOCK_SHIFT_MS.with(|shift| Store::now_ms() + shift.get())
+}
+
+/// The clock the files runtime runs on.
+#[cfg(not(test))]
+fn now_ms() -> i64 {
+    Store::now_ms()
 }
 
 pub fn init(store: &Store) -> Result<()> {
@@ -549,7 +557,19 @@ fn sweep_uploads(store: &Store) -> Result<()> {
     if let Ok(entries) = fs::read_dir(staging_dir(store.home())) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !live.contains(&name) {
+            if live.contains(&name) {
+                continue;
+            }
+            // A part with no row is debris once it is older than an upload
+            // may wait. A younger one may be `begin`'s own file, staged just
+            // before its row was inserted by another process.
+            let age_ms = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|modified| now_ms() - modified.as_millis() as i64);
+            if age_ms.is_none_or(|age| age >= UPLOAD_TTL_MS) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -568,12 +588,14 @@ fn begin(store: &Store, ship: &str, args: &Value) -> Result<Value> {
     sweep_uploads(store)?;
     let id = format!("upload-{}", uuid::Uuid::new_v4());
     fs::create_dir_all(staging_dir(store.home()))?;
-    File::create(staging_path(store.home(), &id))?;
+    // Record the upload before staging its part, so a sweep in another
+    // process never sees the file without its row.
     store.connection().execute(
         "INSERT INTO file_uploads(upload_id,ship,name,bytes,sha256,received,created_ms)
          VALUES(?1,?2,?3,?4,?5,0,?6)",
         params![id, ship, name, bytes as i64, sha256, now_ms()],
     )?;
+    File::create(staging_path(store.home(), &id))?;
     Ok(json!({"upload_id": id}))
 }
 
@@ -926,14 +948,23 @@ mod tests {
     }
 
     #[test]
-    fn a_staged_part_with_no_row_is_removed_by_the_next_sweep() {
+    fn a_staged_part_with_no_row_survives_the_sweep_until_it_is_old() {
         let (_temp, store) = scratch();
         let dir = staging_dir(store.home());
         fs::create_dir_all(&dir).unwrap();
         let stray = dir.join("upload-stray.part");
         fs::write(&stray, b"debris").unwrap();
+        // Younger than the upload TTL: it may be `begin`'s file, staged just
+        // before its row in another process.
+        sweep_uploads(&store).unwrap();
+        assert!(stray.exists());
         begin_upload(&store, "a.txt", 1, &"0".repeat(64));
+        assert!(stray.exists());
+        // Older than an upload may wait: no row can still claim it.
+        CLOCK_SHIFT_MS.with(|shift| shift.set(UPLOAD_TTL_MS + 1000));
+        begin_upload(&store, "b.txt", 1, &"0".repeat(64));
         assert!(!stray.exists());
+        CLOCK_SHIFT_MS.with(|shift| shift.set(0));
     }
 
     #[test]

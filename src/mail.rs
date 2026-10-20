@@ -2171,12 +2171,25 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     // Files cross a link only on the captain's mail to a ship, and this home,
     // which hosts the ship, keeps only what its own rows say about them. A
     // redelivery of mail already stored was checked when it was placed.
-    if payload.get("files").is_some() && by_id(store, id)?.is_none() {
-        ensure!(
-            from == CAPTAIN,
-            "payload.files is the captain's, on mail to a ship"
-        );
-        crate::files::check_delivered(store, to, &mut payload)?;
+    if payload.get("files").is_some() {
+        if from == CAPTAIN {
+            if by_id(store, id)?.is_none() {
+                crate::files::check_delivered(store, to, &mut payload)?;
+            }
+        } else {
+            // A non-captain envelope with files can only predate this check
+            // or come from an older machine. Deliver the rest and record the
+            // drop; refusing it would retry forever and hold up the queue.
+            if let Some(fields) = payload.as_object_mut() {
+                fields.remove("files");
+            }
+            if by_id(store, id)?.is_none() {
+                store.audit(
+                    "mail.files_dropped",
+                    &json!({"id": id, "from": from, "to": to}),
+                )?;
+            }
+        }
     }
     // The operator marker crosses a link only on a captain reply that the
     // machine holding this machine's captain desk delivered.
