@@ -5480,18 +5480,28 @@ fn files_cross_a_link_only_on_the_captains_mail_and_by_its_own_rows() {
     let file_id = put["file_id"].clone();
 
     // A ship's delivered mail cannot carry files: the wake would show them.
-    let refused = mac.gateway(
+    // Such mail can only predate that rule or come from an older machine, so
+    // it delivers without the files rather than retrying forever.
+    let delivered = mac.gateway(
         "mail.deliver",
         json!({"id": "liaison-files", "from": "liaison", "to": "fitforge",
             "kind": "notice", "body": "Look.",
             "payload": {"files": [{"file_id": file_id}]}}),
     );
-    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(delivered["ok"], true, "{delivered}");
+    let dropped = messages(&mac, "fitforge", "notice");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["body"], "Look.", "{dropped:?}");
+    assert!(dropped[0]["payload"].get("files").is_none(), "{dropped:?}");
+    let audit = mac.ok("fitforge", "audit.list", json!({"limit": 1000}));
     assert!(
-        refused["error"].as_str().unwrap().contains("captain's"),
-        "{refused}"
+        audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "mail.files_dropped" && e["payload"]["id"] == "liaison-files"),
+        "{audit}"
     );
-    assert!(messages(&mac, "fitforge", "notice").is_empty());
 
     // The captain's mail may, and the home that reads it keeps only what its
     // own rows say: a forged path does not survive the crossing.
@@ -5504,7 +5514,11 @@ fn files_cross_a_link_only_on_the_captains_mail_and_by_its_own_rows() {
     );
     assert_eq!(delivered["ok"], true, "{delivered}");
     let mail = messages(&mac, "fitforge", "notice");
-    let file = &mail[0]["payload"]["files"][0];
+    let plan = mail
+        .iter()
+        .find(|m| m["body"] == "Plan attached.")
+        .unwrap_or_else(|| panic!("{mail:?}"));
+    let file = &plan["payload"]["files"][0];
     assert_eq!(file["file_id"], file_id, "{mail:?}");
     assert_eq!(file["path"], put["path"], "{mail:?}");
     assert!(
