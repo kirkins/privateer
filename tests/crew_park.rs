@@ -1520,3 +1520,57 @@ fn a_crew_under_a_claim_parks_and_resumes_twice_through_the_runtime() {
     // The second resume parked again on its own child, so its job is parked.
     f.wait_park(&resumes[1]);
 }
+
+/// A crew started with timeout_secs keeps that timeout_secs on resume.
+#[test]
+fn a_crew_started_with_timeout_secs_keeps_it_on_resume() {
+    let f = Fleet::new();
+    f.set_mode("gated");
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-short", "manifest": "bundled:claude", "timeout_secs": 45}),
+    );
+    f.wait_park("crew-short");
+    let parked = f.wait("crew-short", &["parked"]);
+    assert_eq!(parked["timeout_secs"], 45, "{parked}");
+    assert_eq!(parked["launch"]["timeout_secs"], 45, "{parked}");
+
+    f.release_child();
+    f.wait("child-1", &["succeeded"]);
+    let resume = f.wait("crew-resume-park-crew-short-1-1", &["succeeded"]);
+    assert_eq!(resume["timeout_secs"], 45, "{resume}");
+    assert_eq!(resume["launch"]["timeout_secs"], 45, "{resume}");
+
+    let crew = f.wait("crew-short", &["resumed"]);
+    assert_eq!(crew["timeout_secs"], 45, "{crew}");
+}
+
+/// A crew started without timeout_secs resumes with the charter default.
+#[test]
+fn a_crew_started_without_timeout_secs_resumes_with_the_charter_default() {
+    let f = Fleet::new();
+    f.set_mode("gated");
+    let charter_timeout =
+        f.json(None, "charter.show", json!({"id": "engineering"}))["job_timeout_secs"]
+            .as_u64()
+            .unwrap();
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-default", "manifest": "bundled:claude"}),
+    );
+    f.wait_park("crew-default");
+    let parked = f.wait("crew-default", &["parked"]);
+    assert_eq!(parked["timeout_secs"], charter_timeout, "{parked}");
+    assert_eq!(parked["launch"]["timeout_secs"], Value::Null, "{parked}");
+
+    f.release_child();
+    f.wait("child-1", &["succeeded"]);
+    let resume = f.wait("crew-resume-park-crew-default-1-1", &["succeeded"]);
+    assert_eq!(resume["timeout_secs"], charter_timeout, "{resume}");
+    assert_eq!(resume["launch"]["timeout_secs"], Value::Null, "{resume}");
+
+    let crew = f.wait("crew-default", &["resumed"]);
+    assert_eq!(crew["timeout_secs"], charter_timeout, "{crew}");
+}

@@ -594,6 +594,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     "cwd": args.get("cwd"),
                     "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false)),
                     "require": require.as_ref().map(|r| r.to_json()),
+                    "timeout_secs": job.get("timeout_secs"),
                 });
             }
             let mut started = jobs::start_agent(store, job.clone())?;
