@@ -1054,9 +1054,17 @@ fn launch_resume(
             "tool_bundles",
             "cwd",
             "require",
+            "timeout_secs",
         ]
     } else {
-        &["heavy", "config", "tool_bundles", "cwd", "require"]
+        &[
+            "heavy",
+            "config",
+            "tool_bundles",
+            "cwd",
+            "require",
+            "timeout_secs",
+        ]
     };
     for key in keys {
         if !launch[key].is_null() {
