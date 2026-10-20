@@ -244,6 +244,26 @@ class Permissions(unittest.TestCase):
                     build(harness, req)
                 self.assertEqual(str(ctx.exception), "review requires a fresh session")
 
+    def test_reviewer_role_refuses_interactive_mode(self):
+        for harness in ["claude", "pi", "pi-signed", "codex"]:
+            with self.subTest(harness=harness):
+                req = self.request(mode="interactive")
+                req["context"]["role"] = "reviewer"
+                with self.assertRaises(ValueError) as ctx:
+                    build(harness, req)
+                self.assertEqual(str(ctx.exception), "reviewer requires a headless run")
+                with self.assertRaises(ValueError) as ctx:
+                    handle(harness, req)
+                self.assertEqual(str(ctx.exception), "reviewer requires a headless run")
+
+                req_default = self.request()
+                req_default["context"]["role"] = "reviewer"
+                _, argv_default = build(harness, req_default)
+                req_headless = self.request(mode="headless")
+                req_headless["context"]["role"] = "reviewer"
+                _, argv_headless = build(harness, req_headless)
+                self.assertEqual(argv_headless, argv_default)
+
     def test_claude_reviewer_argv_has_no_bash_no_write_no_control_cli_and_no_resume(self):
         req = self.request()
         req["context"]["role"] = "reviewer"
