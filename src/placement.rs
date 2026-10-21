@@ -1312,12 +1312,20 @@ fn absorb_proposal(conn: &Connection, from: &str, carried: &Value) -> Result<()>
         "a proposal is limited to 64 KiB"
     );
     match load(conn, id)? {
-        // Ours: the machine it targets ran it, or refused it.
-        Some(ours) if ours.home.is_none() => {
-            if ours.text("to") == from && matches!(state, "moved" | "refused" | "interrupted") {
+        // Ours: the machine it targets is running it, ran it, or refused it.
+        Some(ours) if ours.home.is_none() && ours.text("to") == from => match state {
+            "moved" | "refused" | "interrupted" => {
                 conclude(conn, id, state, carried["outcome"].clone())?;
             }
-        }
+            // Still moving there: the yes has not lapsed while it says so.
+            "moving" => {
+                let now = Store::now_ms();
+                update(conn, id, &["open", "approved"], move |p| {
+                    p.record["moving_seen_ms"] = json!(now);
+                })?;
+            }
+            _ => {}
+        },
         // A copy kept here: the proposing machine's own states replace it,
         // unless this machine already ran it.
         Some(copy) if copy.home.as_deref() == Some(from) => {
@@ -1675,17 +1683,28 @@ pub(crate) fn upkeep(conn: &Connection, owner_store: &Store) -> Result<Value> {
                     )),
                 }
             }
-            "approved"
-                if now
-                    - proposal.record["approved_seen_ms"]
-                        .as_i64()
-                        .unwrap_or(proposal.updated_ms)
-                    >= LAPSE_MS =>
-            {
-                Some((
-                    "refused",
-                    json!({"why": "the captain's yes lapsed before the move could run"}),
-                ))
+            // The lapse counts from the yes, or from when the machine running
+            // the move last said it was still moving.
+            "approved" => {
+                let approved = proposal.record["approved_seen_ms"]
+                    .as_i64()
+                    .unwrap_or(proposal.updated_ms);
+                let moving = proposal.record["moving_seen_ms"].as_i64();
+                if now - approved.max(moving.unwrap_or(0)) < LAPSE_MS {
+                    None
+                } else if moving.is_some() {
+                    let (ship, to) = (proposal.text("ship"), proposal.text("to"));
+                    Some((
+                        "interrupted",
+                        json!({"why": format!("{to} began the move but has not said how it ended for 7 hours"),
+                            "finish": format!("privateer ship move {ship} --here"), "runs_on": to}),
+                    ))
+                } else {
+                    Some((
+                        "refused",
+                        json!({"why": "the captain's yes lapsed before the move could run"}),
+                    ))
+                }
             }
             _ => None,
         };

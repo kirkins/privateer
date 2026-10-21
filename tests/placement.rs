@@ -1717,6 +1717,70 @@ fn a_linked_machines_proposal_moves_its_ship_only_from_that_machine() {
 }
 
 #[test]
+fn a_long_move_is_not_reported_lapsed_while_the_mover_says_it_is_moving() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("rover");
+    link(&laptop, &mac, &ssh);
+    press(&mac, "fitforge", "upkeep", None);
+    refresh(&laptop, &ssh);
+    let proposed = mac.agent_ok(
+        "upkeep",
+        "ship.propose_move",
+        json!({"name": "rover", "to": "laptop", "why": "full"}),
+    );
+    let id = proposed["proposal"].as_str().unwrap().to_owned();
+    let collect = || {
+        let collected = laptop.run("liaison", &["machine", "collect"], Some(&ssh));
+        assert!(collected.status.success(), "{}", text(&collected));
+    };
+    collect();
+    collect();
+    // The yes was seen eight hours ago on the Mac, and the laptop has been
+    // running the move since.
+    let eight_hours_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 8 * 3600 * 1000;
+    mac.conn()
+        .execute(
+            "UPDATE placement_proposals SET state='approved',
+               record=json_set(record,'$.state','approved','$.approved_seen_ms',?2) WHERE id=?1",
+            rusqlite::params![id, eight_hours_ago],
+        )
+        .unwrap();
+    laptop
+        .conn()
+        .execute(
+            "UPDATE placement_proposals SET state='moving',
+               record=json_set(record,'$.state','moving') WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    collect();
+    mac.pass("upkeep", None);
+    let (state, record) = proposal(&mac, &id);
+    assert_eq!(state, "approved", "{record}");
+    assert!(record["moving_seen_ms"].as_i64().is_some(), "{record}");
+    // When the laptop stops saying so for seven hours, the move is
+    // interrupted, not refused, and the captain is told how to finish it.
+    mac.conn()
+        .execute(
+            "UPDATE placement_proposals SET record=json_set(record,'$.moving_seen_ms',?2) WHERE id=?1",
+            rusqlite::params![id, eight_hours_ago],
+        )
+        .unwrap();
+    mac.pass("upkeep", None);
+    let (state, record) = proposal(&mac, &id);
+    assert_eq!(state, "interrupted", "{record}");
+    assert_eq!(
+        record["outcome"]["finish"], "privateer ship move rover --here",
+        "{record}"
+    );
+    assert_eq!(record["outcome"]["runs_on"], "laptop", "{record}");
+}
+
+#[test]
 fn a_changed_lapsed_or_busy_approval_moves_nothing_and_cools_down() {
     let (_temp, laptop, mac, ssh) = fixture();
     let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
