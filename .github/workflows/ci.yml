@@ -55,7 +55,7 @@ jobs:
         run: |
           root="releases/$GITHUB_SHA"
           mkdir -p "$root/bin" "$root/share/privateer"
-          cp target/release/privateer target/release/privateer-dashboard "$root/bin/"
+          cp target/release/privateer target/release/privateer-dashboard target/release/privateer-mcp-broker "$root/bin/"
           cp -R plugins "$root/share/privateer/plugins"
           # The image must know itself as this exact release.
           "$root/bin/privateer" upgrade status | grep -q "\"running_commit\": \"$GITHUB_SHA\""

@@ -36,6 +36,7 @@ pub mod input;
 pub mod jobs;
 pub mod machines;
 pub mod mail;
+pub mod mcp_broker;
 pub mod moves;
 pub mod needs;
 pub mod opencode_mail;

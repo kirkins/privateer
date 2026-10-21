@@ -18,6 +18,12 @@ name = "privateer-dashboard"
 path = "src/bin/privateer-dashboard.rs"
 required-features = ["dashboard"]
 
+# Std, libc, serde_json and sha2 only: never the privateer library, so the
+# installed copy stays the same file across Privateer upgrades.
+[[bin]]
+name = "privateer-mcp-broker"
+path = "src/bin/privateer-mcp-broker.rs"
+
 [dependencies]
 anyhow = "1"
 libc = "0.2"

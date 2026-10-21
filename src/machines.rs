@@ -737,6 +737,23 @@ fn load_problem(
     Ok(body)
 }
 
+/// This machine's owner, when that ship's home is `store`'s: the one
+/// dispatcher that looks after the machine itself.
+pub(crate) fn owner_here(store: &Store) -> Result<Option<String>> {
+    let path = crate::fleet::registry_path()?;
+    if !path.is_file() || !ever_linked(&path) {
+        return Ok(None);
+    }
+    let conn = crate::fleet::registry()?;
+    let Some(ship) = owner(&conn)? else {
+        return Ok(None);
+    };
+    Ok(crate::fleet::members(&conn)?
+        .iter()
+        .any(|m| m.name == ship && m.home == store.home())
+        .then_some(ship))
+}
+
 /// When this process last looked for host-level problems.
 static LAST_ALERT_CHECK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
@@ -751,20 +768,10 @@ pub(crate) fn alert_owner(store: &Store) -> Value {
         *last = Some(std::time::Instant::now());
     }
     let work = || -> Result<Value> {
-        let path = crate::fleet::registry_path()?;
-        if !path.is_file() || !ever_linked(&path) {
-            return Ok(Value::Null);
-        }
-        let conn = crate::fleet::registry()?;
-        let Some(ship) = owner(&conn)? else {
+        let Some(ship) = owner_here(store)? else {
             return Ok(Value::Null);
         };
-        if !crate::fleet::members(&conn)?
-            .iter()
-            .any(|m| m.name == ship && m.home == store.home())
-        {
-            return Ok(Value::Null);
-        }
+        let conn = crate::fleet::registry()?;
         let db = store.connection();
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS machine_alerts(key TEXT PRIMARY KEY, raised_ms INTEGER NOT NULL);",

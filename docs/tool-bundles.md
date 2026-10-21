@@ -361,6 +361,10 @@ A stdio server has `name`, `command`, `sha256` and `timeout`, and optionally
 - There are no `env`, `cwd`, `shell`, `args`, `type` or `headers` keys.
 - `credential` is optional. When given, the server receives that credential's
   file path, never its value.
+- A server many crews share through one upstream connection, as Xcode's
+  `mcpbridge` must be, is pinned as the [MCP broker](mcp-broker.md)'s
+  `proxy` command: the stable broker binary and its `sha256`, which
+  `privateer mcp-broker install` prints.
 
 **Stdio servers are crew-only.** A crew job's teardown ends a stdio server and
 everything it started (see below). A hosted first mate's pane is not a job:
