@@ -75,7 +75,9 @@ else:
         subprocess.run(["sh", str(caller)], env=env)
     text = "done"
 (launches / (job + ".json")).write_text(json.dumps(record))
-print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": text}}))
+session = "session-" + job
+print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}))
+print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": text, "session_id": session}}))
 "#,
             bin = BIN,
             home = home.display().to_string(),
@@ -303,6 +305,22 @@ print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": 
     }
     fn finish(&self, started: &Value) -> Value {
         self.settled(started["errand"].as_str().unwrap());
+        // REVIEW_GATE_DEBUG=1 prints the review job and its logs.
+        if std::env::var_os("REVIEW_GATE_DEBUG").is_some() {
+            let job = self.json(None, "job.status", json!({"id": started["errand"]}));
+            eprintln!("JOB {job}");
+            let dir = self
+                .home()
+                .join("jobs")
+                .join(started["errand"].as_str().unwrap());
+            for entry in walk(&dir) {
+                eprintln!(
+                    "== {}\n{}",
+                    entry.display(),
+                    fs::read_to_string(&entry).unwrap_or_default()
+                );
+            }
+        }
         self.tick();
         self.row(started["review"].as_str().unwrap())
     }
@@ -357,13 +375,30 @@ print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": 
     }
 }
 
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = vec![];
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}
+
 const APPROVE: &str =
     "Read the change.\nFINDING nit src/lib.rs:1 name the widget\nVERDICT: APPROVE\n";
 
 #[test]
 fn the_prompt_is_the_runtimes_alone_and_the_reviewer_reads_a_read_only_worktree() {
     let f = Fleet::new();
-    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus", "sol"]}));
+    // The captain's list is ["opus", "sol"]; until Sol is set up here, Opus
+    // alone qualifies and reviews.
+    let sol = json!({"manifest": "bundled:pi", "options": {"model": "gpt-6.1-sol", "provider": "chatgpt-home"},
+        "cost": "plan", "tier": 2, "uses": ["implement"]});
+    f.routes(json!({"routes": {"opus": opus(), "sol": sol}, "review": ["opus", "sol"]}));
     // The ship's records on the task: none may reach the reviewer.
     f.json(
         Some("engineering"),

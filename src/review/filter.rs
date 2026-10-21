@@ -77,11 +77,15 @@ pub fn findings(reply: &str, tree: &Path, secrets: &[Vec<u8>]) -> Result<Vec<Fin
         if !SEVERITIES.contains(&severity.as_str()) {
             continue;
         }
-        let location = words.next().unwrap_or_default().trim_matches('`');
+        let location = words
+            .next()
+            .unwrap_or_default()
+            .trim_matches('`')
+            .trim_end_matches([':', ',']);
         let Some((file, line_no)) = location.rsplit_once(':') else {
             continue;
         };
-        let Ok(line_no) = line_no.trim_end_matches([':', ',']).parse::<u64>() else {
+        let Ok(line_no) = line_no.parse::<u64>() else {
             continue;
         };
         let file = inside(file, tree).map_err(|path| {
