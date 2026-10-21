@@ -239,9 +239,15 @@ fn observe(
             !oversized,
             "scheduling observation source exceeds byte bound"
         );
-        "UNION ALL SELECT 'schedule',s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id WHERE json_extract(s.record,'$.state')='fault' AND t.status NOT IN ('done','cancelled')"
+        format!(
+            "UNION ALL SELECT 'schedule',s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id WHERE json_extract(s.record,'$.state')='fault' AND t.status NOT IN ('done','cancelled')
+             UNION ALL SELECT 'remote_wait',s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id
+               LEFT JOIN ships sh ON sh.name=json_extract(s.record,'$.owner') WHERE {}",
+            crate::scheduling::remote_wait_stale_where("?4")
+        )
     } else {
-        ""
+        // The query binds the time as ?4 either way.
+        "UNION ALL SELECT 'schedule','' WHERE ?4 IS NULL".to_owned()
     };
     let mut statement = tx.prepare(&format!(
         "SELECT source,id FROM (
@@ -255,7 +261,7 @@ fn observe(
           {schedule_union}
         ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
     let mut rows = statement
-        .query_map(params![now - 60_000, after, limit + 1], |r| {
+        .query_map(params![now - 60_000, after, limit + 1, now], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .map(|row| row.map(|(source, id)| (source, id, None)))
@@ -421,6 +427,27 @@ fn observe(
                     "status",
                     "summary",
                     "created_ms",
+                    "version",
+                ] {
+                    item[key] = state[key].clone();
+                }
+                item["actions"] = json!([]);
+            }
+            "remote_wait" => {
+                // A wait on another ship's task that no report has ended:
+                // shown, never resolved, so the captain can judge the far end.
+                let state = crate::scheduling::remote_wait_item(store, &id, now)?;
+                item["kind"] = json!("blocker");
+                item["evidence"] = json!("stale_remote_wait");
+                for key in [
+                    "ship",
+                    "task_id",
+                    "status",
+                    "summary",
+                    "created_ms",
+                    "waited_ms",
+                    "far",
+                    "link",
                     "version",
                 ] {
                     item[key] = state[key].clone();

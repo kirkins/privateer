@@ -1576,6 +1576,17 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         params![peer, failures, next, now],
     )?;
     tx.commit()?;
+    // A peer that answered, even with a refusal, is heard; one that could not
+    // be reached marks its link down. A link heard again after being down
+    // resyncs the cross-ship waits that ride it.
+    let answered = delivered || refusal.is_some();
+    if let Err(error) = if answered {
+        crate::waits::heard(store, peer).map(|_| ())
+    } else {
+        crate::waits::unheard(store, peer)
+    } {
+        eprintln!("privateer: could not record link {peer}: {error:#}");
+    }
     // A captain's message the peer refused is quarantined: left pending it
     // would hold back every later message to that peer, and retrying a refusal
     // would not change it. The peer answered, so it is not backed off for it.
@@ -1774,6 +1785,9 @@ pub(crate) fn collected(
         )?;
     }
     tx.commit()?;
+    if !delivered.is_empty() || !refused.is_empty() {
+        crate::waits::heard(store, peer)?;
+    }
     Ok(changed)
 }
 
@@ -2177,6 +2191,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             to != CAPTAIN || crate::peers::machine(store, peer)?,
             "the captain's mail stays in its own home for now"
         );
+        // Mail from a ship behind a peer is that link heard.
+        if let Err(error) = crate::waits::heard(store, peer) {
+            eprintln!("privateer: could not record link {peer}: {error:#}");
+        }
     }
     local_address(store, to)?;
     let correlation = optional_str(args, "correlation")?;

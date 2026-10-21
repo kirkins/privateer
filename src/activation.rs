@@ -54,6 +54,15 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
         0,
         86_400,
     ),
+    // A remote wait with no report from the far owner for this long is shown
+    // as stale in the captain's needs and the backlog alarm; it never
+    // resumes or faults by itself (0 shows none).
+    (
+        "remote_wait_stale_secs",
+        crate::scheduling::REMOTE_WAIT_STALE_SECS,
+        0,
+        604_800,
+    ),
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;

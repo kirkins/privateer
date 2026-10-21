@@ -54,6 +54,8 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
         lease_until_ms: 0,
         reason: None,
         resumed_by: None,
+        subscription: None,
+        faults: 0,
     };
     save(store, &work)?;
     store
@@ -67,8 +69,15 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
 fn defer(store: &Store, args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     let tx = store.write_transaction()?;
-    owner(store, id)?;
+    let task = owner(store, id)?;
     let mut work = load(store, id)?.context("task is not scheduled")?;
+    // A wait speaks for the schedule's owner: a remote one subscribes as that
+    // ship. After a handoff that is the old owner, so the new one enqueues
+    // its own assignment first, as the dispatcher's fault asks.
+    ensure!(
+        task["owner"] == json!(work.owner),
+        "task ownership changed; the new owner must enqueue its assignment before deferring it"
+    );
     if matches!(work.state.as_str(), "offered" | "claimed") {
         ensure!(
             args["offer_id"].as_str() == work.offer_id.as_deref(),
