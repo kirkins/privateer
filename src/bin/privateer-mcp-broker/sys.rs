@@ -301,6 +301,8 @@ fn append(path: &Path) -> io::Result<File> {
     )
 }
 
+// st_dev is i32 on macOS, so the casts are needed there.
+#[allow(clippy::unnecessary_cast)]
 fn same_file(file: &File, fd: RawFd) -> bool {
     // SAFETY: fstat into a zeroed stat.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };

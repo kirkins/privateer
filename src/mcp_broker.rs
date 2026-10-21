@@ -628,7 +628,7 @@ fn start(binary: &Path, files: &Files, upstream: &[String]) -> Result<u32> {
     let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
     // SAFETY: getrlimit fills the struct.
     let highest = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-        (limit.rlim_cur as u64).clamp(256, 65_536) as i32
+        limit.rlim_cur.clamp(256, 65_536) as i32
     } else {
         1_024
     };
