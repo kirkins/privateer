@@ -284,7 +284,11 @@ fn notice(set: &[Candidate], high: bool) -> String {
     }
     let stale = set.iter().any(|c| c.stale);
     if set.iter().any(|c| !c.stale) {
-        let each = if stale { "For each other task" } else { "For each" };
+        let each = if stale {
+            "For each other task"
+        } else {
+            "For each"
+        };
         let first = if high {
             format!(
                 "Attention is high: enqueue, defer, hand off or close only; do not start work in this conversation. Enqueued work goes to a fresh coordinator. {each}:"
@@ -662,14 +666,20 @@ mod tests {
             assert!(!alone.contains("task.defer"), "{alone}");
             assert!(!alone.contains("task.enqueue"), "{alone}");
             assert!(!alone.contains("For each"), "{alone}");
-            assert!(alone.contains("do not defer or enqueue it again"), "{alone}");
+            assert!(
+                alone.contains("do not defer or enqueue it again"),
+                "{alone}"
+            );
             assert!(alone.contains("Check the far ship and the link"), "{alone}");
             assert!(alone.ends_with("do not mail them about it."), "{alone}");
             // Beside other work, the usual advice is for the others only.
             let mixed = notice(&[draft(1), stale.clone()], high);
             assert!(mixed.contains("For each other task"), "{mixed}");
             assert!(mixed.contains("task.defer with a real wait"), "{mixed}");
-            assert!(mixed.contains("do not defer or enqueue it again"), "{mixed}");
+            assert!(
+                mixed.contains("do not defer or enqueue it again"),
+                "{mixed}"
+            );
         }
         // Without one, the notice reads as before.
         let plain = notice(&[draft(1)], false);

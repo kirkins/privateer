@@ -109,7 +109,9 @@ const WAIT_KEYS: [&str; 4] = [
 
 /// The cross-ship wait instruction a payload carries, if any.
 pub(crate) fn wait_notice(payload: &Value) -> Option<&'static str> {
-    WAIT_KEYS.into_iter().find(|key| payload.get(*key).is_some())
+    WAIT_KEYS
+        .into_iter()
+        .find(|key| payload.get(*key).is_some())
 }
 
 /// Where a ship's mailbox lives: None for this home, Some(peer) for another.
@@ -1512,22 +1514,14 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         quarantine(store, id, wire_bytes)?;
         return Ok(Delivery::Quarantined);
     }
-    // A wait notice is the runtime's, whoever's flush carries it: the
-    // receiving home accepts one only from the runtime. Only the runtime
-    // authors one, since `mail.send` refuses its keys.
     let notice = wait_notice(&message["payload"]);
-    let response = crate::peers::call_peer_as(
+    let response = crate::peers::call_peer_with_timeout(
         store,
         peer,
         &format!("deliver-{}", uuid::Uuid::new_v4()),
         "mail.deliver",
         envelope,
         timeout,
-        if notice.is_some() {
-            &Caller::Operator
-        } else {
-            store.caller()
-        },
     );
     // A peer that answered and refused the message, as opposed to one that
     // could not be reached; only a refusal is the captain's to hear about.
@@ -2184,18 +2178,22 @@ pub(crate) fn flush_dispatcher(store: &Store, budget: Duration) -> Result<Value>
     flush_pending(store, 50, false, Some(budget), None)
 }
 
-/// Deliver `ship`'s outbox until it is empty or `budget` runs out, retrying
-/// an unreachable peer between passes: a retiring ship's last notices go
-/// before its dispatcher stops. Mail still pending at the end stays queued,
-/// as does mail a collecting machine takes on its own schedule.
-pub(crate) fn drain(store: &Store, ship: &str, budget: Duration) -> Result<Value> {
+/// Let `ship`'s outbox drain until it is empty or `budget` runs out: a
+/// retiring ship's last notices go before its dispatcher stops. When
+/// `deliver`, this process delivers them, retrying an unreachable peer
+/// between passes; otherwise it only waits while the ship's own dispatcher
+/// does. Mail still pending at the end stays queued, as does mail a
+/// collecting machine takes on its own schedule.
+pub(crate) fn drain(store: &Store, ship: &str, budget: Duration, deliver: bool) -> Result<Value> {
     let deadline = Instant::now() + budget;
     let collected = json!(crate::peers::collected(store)?).to_string();
     let mut delivered = 0;
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let pass = flush_from(store, Some(ship.to_owned()), 50, true, Some(left), None)?;
-        delivered += pass["delivered"].as_i64().unwrap_or(0);
+        if deliver {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let pass = flush_from(store, Some(ship.to_owned()), 50, true, Some(left), None)?;
+            delivered += pass["delivered"].as_i64().unwrap_or(0);
+        }
         let pending: i64 = store.connection().query_row(
             "SELECT COUNT(*) FROM mail m JOIN ships s ON s.name=m.recipient
              WHERE m.delivery='pending' AND m.sender=?1
@@ -2206,13 +2204,11 @@ pub(crate) fn drain(store: &Store, ship: &str, budget: Duration) -> Result<Value
         if pending == 0 || Instant::now() >= deadline {
             return Ok(json!({"delivered": delivered, "pending": pending}));
         }
-        std::thread::sleep(
-            DRAIN_RETRY.min(deadline.saturating_duration_since(Instant::now())),
-        );
+        std::thread::sleep(DRAIN_RETRY.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
-/// How long a drain waits before trying an unreachable peer again.
+/// How long a drain waits before looking at the outbox again.
 const DRAIN_RETRY: Duration = Duration::from_millis(500);
 
 /// Application evidence, including on redelivery after a lost transport ack.
@@ -2312,12 +2308,6 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             "wait notices go between ships"
         );
         ensure!(waits == 1, "a notice carries one wait instruction");
-        // The sending runtime delivers these as itself, whoever's flush
-        // carried them, so an agent caller can only be forging one.
-        ensure!(
-            matches!(store.caller(), Caller::Operator),
-            "wait notices come from the runtime"
-        );
         // The owner's side answers subscriptions; the waiting side checks a
         // report against its waits, and the machine that carried it.
         if payload.get("wait_subscribe").is_some() || payload.get("wait_unsubscribe").is_some() {

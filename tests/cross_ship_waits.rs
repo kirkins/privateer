@@ -1720,10 +1720,10 @@ fn one_end_resolves_every_wait_on_the_far_task_past_a_page() {
 
 #[test]
 fn an_agents_own_flush_carries_its_ships_wait_notices() {
-    // An agent's flush (mail.flush, or the attempt mail.send makes) delivers
-    // its own ship's pending mail, runtime notices included. The runtime
-    // carries those as itself, so the owner's home, which accepts a wait
-    // notice only from the runtime, still takes them.
+    // Why mail.deliver does not refuse wait notices from an agent caller: an
+    // agent's flush (mail.flush, or the attempt mail.send makes) delivers its
+    // own ship's pending mail, runtime notices included, and the peer call
+    // carries the agent's identity, so the owner's home sees an agent.
     let mut pair = pair();
     share(&mut pair.a, "far-work", json!(["infra"]));
     waiter(&mut pair.b, "waiting-1");
@@ -1745,41 +1745,19 @@ fn an_agents_own_flush_carries_its_ships_wait_notices() {
         )
         .is_err()
     );
-    // Nor deliver one into a home as if a peer's runtime had carried it.
-    pair.a.set_caller(privateer::store::Caller::Agent {
-        actor: "infra".into(),
-    });
-    for (id, key) in [("agent-sub", "wait_subscribe"), ("agent-unsub", "wait_unsubscribe")] {
-        let forged = dispatch(
-            &mut pair.a,
-            "mail.deliver",
-            json!({"id":id,"from":"infra","to":"apps","kind":"notice","payload":{
-                key:{"task":"far-work","subscriber":"infra","subscriber_task":"waiting-1"}}}),
-        );
-        assert!(
-            format!("{:#}", forged.unwrap_err()).contains("wait notices come from the runtime")
-        );
-    }
-    assert_eq!(rows(&pair.a, "far-work"), 1);
-    pair.b.set_caller(privateer::store::Caller::Agent {
-        actor: "apps".into(),
-    });
-    let forged = dispatch(
-        &mut pair.b,
-        "mail.deliver",
-        json!({"id":"agent-end","from":"apps","to":"infra","kind":"notice",
-            "payload":{"task_end":{"task":"far-work","status":"done"}}}),
-    );
-    assert!(forged.is_err());
-    pair.b.set_caller(privateer::store::Caller::Operator);
-    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
 }
 
 // Step 4: retire, refused wait notices, and the step 3 review follow-ups.
 
-/// Retire `ship` of `home` as the captain does, in a fleet that lists both
-/// homes of the pair, through the real CLI.
+/// Retire `ship` as the captain does, in a fleet that lists both homes of
+/// the pair, through the real CLI.
 fn retire(pair: &Pair, ship: &str) -> Value {
+    retire_as(pair, ship, None)
+}
+
+/// Retire `ship` through the real CLI, as the captain or as `agent`, the
+/// ship that created both ships of the pair.
+fn retire_as(pair: &Pair, ship: &str, agent: Option<&str>) -> Value {
     let root = pair._temp.path().canonicalize().unwrap();
     let (a_home, b_home) = homes(pair);
     let fleet = rusqlite::Connection::open(root.join("fleet.sqlite")).unwrap();
@@ -1793,17 +1771,22 @@ fn retire(pair: &Pair, ship: &str) -> Value {
         fleet
             .execute(
                 "INSERT OR IGNORE INTO ships(name, home, created_by, created_ms)
-                 VALUES(?1, ?2, 'captain', 1)",
-                rusqlite::params![name, home.to_string_lossy()],
+                 VALUES(?1, ?2, ?3, 1)",
+                rusqlite::params![name, home.to_string_lossy(), agent.unwrap_or("captain")],
             )
             .unwrap();
     }
     let home = if ship == "apps" { &a_home } else { &b_home };
-    let output = support::isolated(&root)
+    let mut command = support::isolated(&root);
+    command
         .args(["--home", &home.to_string_lossy(), "ship.retire", "--json"])
-        .arg(json!({"name": ship}).to_string())
-        .output()
-        .unwrap();
+        .arg(json!({"name": ship}).to_string());
+    if let Some(agent) = agent {
+        command
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", agent);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -1881,6 +1864,37 @@ fn retiring_the_waiting_ship_unsubscribes_and_the_owner_rows_go() {
         subscribes
     );
     assert_eq!(rows(&pair.a, "far-work"), 0);
+}
+
+#[test]
+fn an_agents_retire_leaves_the_notices_to_the_retiring_ships_dispatcher() {
+    let mut pair = subscribed();
+    // An agent cannot carry another ship's mail, so its retire only waits
+    // while the retiring ship's dispatcher delivers; a thread flushing that
+    // home as the runtime stands in for the dispatcher here.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_, b_home) = homes(&pair);
+    let dispatcher = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut store = Store::open(&b_home).unwrap();
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                dispatch(&mut store, "mail.flush", json!({})).unwrap();
+            }
+        })
+    };
+    let retired = retire_as(&pair, "infra", Some("research"));
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    dispatcher.join().unwrap();
+    assert_eq!(retired["waits"]["unsubscribed"], 1, "{retired}");
+    // It delivered nothing itself, and found the outbox empty.
+    assert_eq!(
+        retired["waits"]["drain"],
+        json!({"delivered": 0, "pending": 0})
+    );
+    assert_eq!(rows(&pair.a, "far-work"), 0);
+    assert!(audited(&mut pair.b, "wait.notice_dropped").is_empty());
 }
 
 #[test]

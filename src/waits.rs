@@ -549,7 +549,8 @@ fn link(store: &Store, peer: &str, back: bool) -> Result<Option<Value>> {
             .optional()?)
     };
     // A steady link heard moments ago needs no write lock.
-    if !back && matches!(read(store.connection())?, Some((heard, None, _)) if now - heard < HEARD_EVERY_MS)
+    if !back
+        && matches!(read(store.connection())?, Some((heard, None, _)) if now - heard < HEARD_EVERY_MS)
     {
         return Ok(None);
     }

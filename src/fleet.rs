@@ -9,8 +9,9 @@
 //! behind it. A ship may create another ship, but only with a charter whose
 //! actions its own charter already has: delegation never widens authority.
 //! It may retire only ships it created, and change the actions of ships it
-//! created within its own. Retiring revokes the ship's charter, stops its
-//! dispatcher and unlinks it, and keeps its folder.
+//! created within its own. Retiring revokes the ship's charter, ends its
+//! cross-ship waits, stops its dispatcher and unlinks it, and keeps its
+//! folder.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -564,8 +565,9 @@ fn create_here(
         "directory": directory, "untrusted_folder": untrusted}))
 }
 
-/// Retire a ship: revoke its charter, stop its dispatcher, unlink it from
-/// the fleet. Its folder is kept for the captain to archive or delete.
+/// Retire a ship: revoke its charter, close and withdraw its cross-ship waits
+/// and let its outbox drain, stop its dispatcher, unlink it from the fleet.
+/// Its folder is kept for the captain to archive or delete.
 fn retire(store: &mut Store, args: &Value) -> Result<Value> {
     let name = required(args, "name")?;
     let conn = registry()?;
@@ -584,11 +586,15 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
         }
         // Its cross-ship waits end before it stops delivering: subscribers
         // are told it retired, its own subscriptions are withdrawn, and the
-        // outbox gets a bounded chance to carry them. What a peer cannot
+        // outbox gets a bounded chance to carry them. The operator delivers
+        // them from here. An agent cannot carry another ship's mail (the
+        // peer would refuse it, and a job cannot drop its role), so it waits
+        // while the retiring ship's own dispatcher does. What a peer cannot
         // take in time stays queued; the far side then sees a stale wait.
+        let deliver = matches!(store.caller(), Caller::Operator);
         waits = match crate::waits::retire(&target, name) {
             Ok(mut retired) => {
-                retired["drain"] = crate::mail::drain(&target, name, RETIRE_DRAIN)
+                retired["drain"] = crate::mail::drain(&target, name, RETIRE_DRAIN, deliver)
                     .unwrap_or_else(|error| json!({"error": format!("{error:#}")}));
                 retired
             }
