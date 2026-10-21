@@ -584,7 +584,12 @@ impl Broker {
                     .or_insert_with(|| json!({}))
                     .as_object_mut();
                 let Some(params) = params else {
-                    return self.forward(client, id, method, message, None);
+                    return self.refuse(
+                        client,
+                        &id,
+                        &name,
+                        Refusal::Error("tools/call params must be an object".into()),
+                    );
                 };
                 let arguments = params.entry("arguments").or_insert_with(|| json!({}));
                 if !arguments.is_object() {
