@@ -608,3 +608,93 @@ fn stopped_ancestor(store: &Store, task: &str) -> Result<Option<String>> {
     }
     bail!("task ancestry exceeds scheduling limit")
 }
+
+#[cfg(test)]
+pub(super) mod fixture {
+    use super::*;
+
+    /// A home with a charter and one task of `infra`, `work-1`.
+    pub(in crate::scheduling) fn home() -> (tempfile::TempDir, Store) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&root.join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"work-1","charter_id":"project","owner":"infra","title":"Work"}),
+        )
+        .unwrap();
+        (temp, store)
+    }
+
+    /// `work-1` scheduled in `state` with `wait`, saved as the runtime would.
+    pub(in crate::scheduling) fn schedule(store: &Store, state: &str, wait: Option<Value>) {
+        let now = Store::now_ms();
+        let work = Scheduled {
+            task_id: "work-1".into(),
+            owner: "infra".into(),
+            revision: 1,
+            brief: "Continue.".into(),
+            state: state.into(),
+            wait,
+            not_before_ms: 0,
+            offer_id: None,
+            holder: None,
+            job_id: None,
+            profile: None,
+            charter_hash: None,
+            attempts: 0,
+            created_ms: now,
+            last_checked_ms: now,
+            lease_until_ms: 0,
+            reason: None,
+            resumed_by: None,
+            subscription: None,
+            faults: 0,
+        };
+        save(store, &work).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `work-1` as a far task's `done` reopened it: ready, with the resume's
+    /// reason for its next offer.
+    fn resumed(store: &Store) {
+        fixture::schedule(store, "ready", None);
+        let mut work = load(store, "work-1").unwrap().unwrap();
+        work.resumed_by = Some("Remote task far-work of apps ended done".into());
+        work.reason.clone_from(&work.resumed_by);
+        save(store, &work).unwrap();
+    }
+
+    #[test]
+    fn parking_on_an_ask_forgets_an_earlier_resume() {
+        let (_temp, store) = fixture::home();
+        resumed(&store);
+        assert!(park_on_ask(&store, "work-1", "ask-1", "tool permission: Bash(x)").unwrap());
+        let work = load(&store, "work-1").unwrap().unwrap();
+        assert_eq!(work.state, "waiting");
+        assert!(work.resumed_by.is_none(), "{:?}", work.resumed_by);
+    }
+
+    #[test]
+    fn the_captains_hold_forgets_an_earlier_resume() {
+        let (_temp, store) = fixture::home();
+        resumed(&store);
+        assert!(hold(&store, "work-1", "the captain stopped it").unwrap());
+        let work = load(&store, "work-1").unwrap().unwrap();
+        assert_eq!(work.state, "stopped");
+        assert!(work.resumed_by.is_none(), "{:?}", work.resumed_by);
+    }
+}

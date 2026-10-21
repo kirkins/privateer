@@ -630,6 +630,48 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_remote_wait_is_a_candidate_naming_the_far_end() {
+        let (_temp, store) = crate::scheduling::fixture::home();
+        crate::scheduling::fixture::schedule(
+            &store,
+            "waiting",
+            Some(json!({"kind":"remote","reason":"needs it",
+                "ref":{"ship":"apps","task":"far-work","machine":"studio"}})),
+        );
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='blocked' WHERE id='work-1'", [])
+            .unwrap();
+        assert!(candidates(&store, "infra", "").unwrap().is_empty());
+        store
+            .connection()
+            .execute(
+                "UPDATE task_schedule SET record=json_set(record,'$.subscription.since_ms',?1)",
+                [Store::now_ms() - 2 * 3_600_000],
+            )
+            .unwrap();
+        let set = candidates(&store, "infra", "").unwrap();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].id, "work-1");
+        assert!(
+            set[0]
+                .label
+                .starts_with("stale remote wait: 120 min on far-work of apps on studio"),
+            "{}",
+            set[0].label
+        );
+        // Resolved, it is no longer one.
+        store
+            .connection()
+            .execute(
+                "UPDATE task_schedule SET record=json_set(record,'$.wait.end',json('{}'))",
+                [],
+            )
+            .unwrap();
+        assert!(candidates(&store, "infra", "").unwrap().is_empty());
+    }
+
+    #[test]
     fn the_candidate_hash_ignores_order_but_not_revisions() {
         let mut a = vec![draft(1), draft(2)];
         let b = vec![draft(2), draft(1)];
