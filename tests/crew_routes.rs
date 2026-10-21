@@ -1154,6 +1154,10 @@ fn a_ships_own_crew_list_overrides_the_fleet_list_and_says_so() {
         text.contains("errand: steady (credits; unranked) (fleet list)"),
         "{bearings}"
     );
+    // With every route unranked a requirement could never be met, so only
+    // naming a route is offered.
+    assert!(text.contains(r#"or pass "route":"<name>")."#), "{text}");
+    assert!(!text.contains(r#"pass "require""#), "{text}");
     let shown = f.json(None, "routes.show", json!({}));
     assert_eq!(shown["applied"]["engineering"]["crew"], json!("ship"));
     assert_eq!(shown["applied"]["engineering"]["errand"], json!("fleet"));
@@ -1329,6 +1333,13 @@ fn uses_need_a_tier_and_known_words_and_strength_shows_in_bearings_and_profile()
         text.contains("opus (plan; Claude Code; tier 1, uses review/implement)"),
         "{text}"
     );
+    // Ranked routes steer launches to a requirement, which keeps the order,
+    // rather than a route name, which skips it.
+    assert!(
+        text.contains(r#"pass "require":{"use":"<use>","tier":<n>}"#),
+        "{text}"
+    );
+    assert!(text.contains("a named route skips the order"), "{text}");
     let profile = f.json(None, "ship.profile", json!({"ship":"engineering"}));
     assert_eq!(
         profile["routes"]["routes"]["opus"],
