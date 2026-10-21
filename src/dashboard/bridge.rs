@@ -459,6 +459,21 @@ fn execute_as(
     crate::dispatch(&mut store, verb, args)
 }
 
+/// After the bridge grants a privileged command, where the captain runs it:
+/// the home and request id, for a Herdr pane or a terminal.
+pub fn privileged_launch(answer: &Answer) -> Option<(PathBuf, String)> {
+    let item = &answer.need.item;
+    (!answer.deny && item["kind"] == "approval" && item["privileged"].is_object())
+        .then(|| item["source_id"].as_str().map(str::to_owned))
+        .flatten()
+        .map(|id| (answer.need.home.clone(), id))
+}
+
+/// The command line that confirms and runs a granted privileged command.
+pub fn privileged_command_line(home: &Path, id: &str) -> String {
+    format!("privateer --home '{}' privileged run {id}", home.display())
+}
+
 /// A draft owns immutable selection, origin and stable outcome IDs across retries.
 #[derive(Clone, Debug)]
 pub struct Answer {
