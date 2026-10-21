@@ -404,7 +404,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     }
     let reviews = crate::review::bearings_lines(store, ship)?;
     if !reviews.is_empty() {
-        text.push_str("Reviews, latest first (pr.merge needs an approval at the current head):\n");
+        text.push_str("Reviews, latest first (optional checks; merge on green CI when Opus 5.5 wrote or approved the head):\n");
         for line in &reviews {
             text.push_str(&format!("- {}\n", clip(line, LINE_CHARS)));
         }

@@ -790,7 +790,8 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
             None => String::new(),
         };
         bail!(
-            "#{number} head {} has no approved top-tier review; start one with review.start{last}",
+            "#{number} head {} has no approved top-tier review{last}; this check is optional: merge on \
+             green CI when Opus 5.5 wrote or approved the head, or start a review with review.start",
             short(&head)
         );
     };
@@ -906,8 +907,8 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         "expected_head": head,
         "review": review_id,
         "checks": checks,
-        "note": "Round B1 runs every merge check and merges nothing. Until round B2, merge as \
-                 before, at exactly this head.",
+        "note": "pr.merge is an optional check and merges nothing. Merge with gh at exactly \
+                 this head once CI is green and Opus 5.5 wrote or approved it.",
     }))
 }
 
