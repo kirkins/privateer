@@ -458,13 +458,15 @@ pub(crate) const REFUSALS: i64 = 3;
 /// database busy or locked past the busy timeout, a home or the fleet
 /// registry it could not open, a hop beyond it it could not reach. The rpc
 /// loop and a machine gateway answer every error as a refusal, so these are
-/// told apart by their text, and retried as an unreachable peer is.
+/// told apart by their text, and retried as an unreachable peer is. Each
+/// phrase is SQLite's or the runtime's own, never a bare word a ship's name
+/// could hold: "unknown ship busy-worker" is a refusal.
 pub(crate) fn temporary(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     [
         "database is locked",
         "database table is locked",
-        "busy",
+        "database is busy",
         "unable to open database",
         "disk i/o error",
         // Opening a home or the registry: permissions, space, a missing file.
@@ -800,6 +802,7 @@ mod tests {
         for reason in [
             "database is locked",
             "Database is locked: busy",
+            "database is busy",
             "database table is locked",
             "unable to open database file: /x/privateer.sqlite",
             "create Privateer home: Permission denied (os error 13)",
@@ -816,6 +819,10 @@ mod tests {
             "unknown ship apps",
             "wait notice is malformed",
             "peer refused delivery",
+            // A ship's name is not the database's state.
+            "unknown ship busy-worker",
+            "no ship named busy-worker on this machine",
+            "busy-worker is hosted by this home",
         ] {
             assert!(!temporary(reason), "{reason}");
         }

@@ -327,6 +327,18 @@ pub(crate) fn unsubscribe_all(store: &Store, ship: &str) -> Result<usize> {
 pub(super) fn ready(store: &Store, work: &mut Scheduled, wait: &Value, now: i64) -> Result<bool> {
     let end = &wait["end"];
     if !end.is_object() {
+        // A far ship that moved (`ship.move`) reports by its new route, which
+        // the via check refuses: the wait faults now, saying how to re-wait.
+        if let Some(far) = Far::of(wait)
+            && let Some(why) = rerouted(store, &far)?
+        {
+            fault(
+                store,
+                work,
+                format!("Remote wait on {} no longer reaches it: {why}", far.name()),
+                now,
+            )?;
+        }
         return Ok(false);
     }
     let far = Far::of(wait).context("invalid remote wait")?;
@@ -362,6 +374,111 @@ pub(super) fn ready(store: &Store, work: &mut Scheduled, wait: &Value, now: i64)
     };
     fault(store, work, why, now)?;
     Ok(false)
+}
+
+/// Why a remote wait's ref no longer reaches its far ship, when this home now
+/// knows that ship by another route than the one the ref names: it moved to
+/// another machine, to this one, or into this home. Its reports would come by
+/// the new route, and the via check drops them, so the wait could never end.
+/// None while the route holds, and for a ship this home does not know, whose
+/// wait stays and is shown as stale.
+fn rerouted(store: &Store, far: &Far) -> Result<Option<String>> {
+    let Some(record) = crate::mail::ship(store, &far.ship)? else {
+        return Ok(None);
+    };
+    let Some(peer) = record["location"]["peer"].as_str() else {
+        return Ok(Some(format!(
+            "{} is now hosted by this home; wait on its task with kind task",
+            far.ship
+        )));
+    };
+    if !crate::peers::machine(store, peer)? {
+        return Ok(far.machine.as_ref().map(|_| {
+            format!(
+                "{} is now on this machine; re-wait without ref.machine",
+                far.ship
+            )
+        }));
+    }
+    let machine = peer.strip_prefix("machine-").unwrap_or(peer);
+    if far.machine.as_deref() == Some(machine) {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{} is now on machine {machine}; re-wait with ref.machine {machine}",
+        far.ship
+    )))
+}
+
+/// Ship `ship` arrived on this machine from `from` (`ship.move`). Its remote
+/// waits name their far ships as the old machine reached them, so each live
+/// one that no longer reaches its far ship, by the route it names or at all
+/// (a ship not reachable from here was forgotten on arrival), faults now and
+/// its first mate re-waits. Faulting unsubscribes the old subscription by the
+/// route the far ship has now. A ref that still holds (a third machine both
+/// reach by one name) keeps waiting. Its own transaction; returns how many
+/// faulted.
+pub(crate) fn arrived(store: &Store, ship: &str, from: &str) -> Result<usize> {
+    if !available(store)? {
+        return Ok(0);
+    }
+    let tx = store.write_transaction()?;
+    let now = Store::now_ms();
+    let mut faulted = 0;
+    let mut after = String::new();
+    loop {
+        let mut statement = store.connection().prepare(
+            "SELECT task_id FROM task_schedule
+             WHERE json_extract(record,'$.owner')=?1 AND json_extract(record,'$.state')='waiting'
+               AND json_extract(record,'$.wait.kind')='remote'
+               AND json_extract(record,'$.wait.end') IS NULL AND task_id>?2
+             ORDER BY task_id LIMIT ?3",
+        )?;
+        let ids = statement
+            .query_map(params![ship, after, PAGE], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for id in &ids {
+            let Some(mut work) = load(store, id)? else {
+                continue;
+            };
+            let Some(far) = live(&work) else {
+                continue;
+            };
+            let why = match crate::mail::ship(store, &far.ship)? {
+                None => Some(format!(
+                    "{} is not reachable from this machine; re-wait once it is",
+                    far.ship
+                )),
+                Some(_) => rerouted(store, &far)?,
+            };
+            if let Some(why) = why {
+                fault(
+                    store,
+                    &mut work,
+                    format!(
+                        "{ship} moved here from {from}, and its remote wait on {} no longer reaches it: {why}",
+                        far.name()
+                    ),
+                    now,
+                )?;
+                save(store, &work)?;
+                faulted += 1;
+            }
+        }
+        match ids.last() {
+            Some(last) if ids.len() as i64 == PAGE => after.clone_from(last),
+            _ => break,
+        }
+    }
+    if faulted > 0 {
+        store.audit(
+            "wait.arrived",
+            &json!({"ship": ship, "from": from, "faulted": faulted}),
+        )?;
+    }
+    tx.commit()?;
+    Ok(faulted)
 }
 
 /// Apply a `task_end` or `wait_closed` that arrived for ship `to` from ship

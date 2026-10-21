@@ -1806,7 +1806,12 @@ fn collect(
                 .push(json!({"id": id, "end_state": crate::mail::applied_end(&envelope, &result)})),
             Err(error) => {
                 let reason = format!("{error:#}");
-                if to == crate::mail::CAPTAIN || envelope["from"] == crate::mail::CAPTAIN {
+                // A home that could not work just then (its database locked,
+                // say) is told back so the message waits there, pending, for
+                // the next collection; it is not put before the captain.
+                if (to == crate::mail::CAPTAIN || envelope["from"] == crate::mail::CAPTAIN)
+                    && !crate::waits::temporary(&reason)
+                {
                     surface_captain_refusal(conn, &id, &envelope, &reason)?;
                 }
                 refused.push(json!({"id": id, "error": reason}));
