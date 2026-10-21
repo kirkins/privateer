@@ -13,8 +13,18 @@
 //! A secret is a stored credential value whole, any 16-byte piece of one
 //! (one line of a multi-line key is such a piece), the same pieces in
 //! base64 or hex, or a token of a common shape the runtime never stored
-//! (`ghp_`, `gho_`, `github_pat_`, `sk-ant-`, `AKIA`, a PEM header), such
-//! as the forge login of the ship user's own `gh`. A path is any absolute,
+//! (`ghp_`, `gho_`, `github_pat_`, `sk-ant-`, `sk-proj-`, `AKIA`, a JWT, a
+//! PEM header), such as the forge login of the ship user's own `gh`. Pieces
+//! and token shapes are matched in the reply with its whitespace taken out
+//! too, so a value split by spaces or newlines is still found; a piece too
+//! plain to be evidence (fewer than six distinct bytes, such as sixteen of
+//! one character) is skipped, so an honest reply is not refused for it. A
+//! stored value shorter than a piece is matched whole, as written. A run
+//! of 40 or more base64 or hex characters varied enough to be key material
+//! is a secret too, whoever made it, except a run of exactly 40 lowercase
+//! hex digits: a commit sha, which reviews quote. (A key that is 40
+//! lowercase hex digits, such as an old GitHub token, passes that check;
+//! stored, it is still caught as a stored value.) A path is any absolute,
 //! `file:` or home-relative (`~`, `~user`, `$HOME`) path wherever it stands
 //! in a word (`HOME=/x`, `{/x}`, `//x`). Only the worktree and the review
 //! folder's own `diff.patch`, `files.txt` and `pr.md` may be named, and a
@@ -45,7 +55,7 @@ const PIECE: usize = 16;
 pub const FOLDER_FILES: [&str; 3] = ["diff.patch", "files.txt", "pr.md"];
 /// Token prefixes of common shapes, each needing this many token characters
 /// after it to count.
-const TOKEN_PREFIXES: [&str; 8] = [
+const TOKEN_PREFIXES: [&str; 9] = [
     "ghp_",
     "gho_",
     "ghu_",
@@ -53,9 +63,15 @@ const TOKEN_PREFIXES: [&str; 8] = [
     "ghr_",
     "github_pat_",
     "sk-ant-",
+    "sk-proj-",
     "glpat-",
 ];
 const TOKEN_TAIL: usize = 16;
+/// A piece of a stored value with fewer distinct bytes than this is too
+/// plain to count.
+const PIECE_VARIETY: usize = 6;
+/// The shortest run of base64 or hex characters judged as key material.
+const RANDOM_RUN: usize = 40;
 
 /// A reviewer's finding, as stored: its severity, its file relative to the
 /// worktree root, its line, and its text.
@@ -181,11 +197,18 @@ pub fn findings(
 }
 
 /// Why a reply carries a secret, if it does: a stored value or a piece of
-/// one, raw or encoded, or a token of a common shape.
+/// one, raw or encoded, a token of a common shape, or a random-looking run.
 fn secret(reply: &str, secrets: &[Vec<u8>]) -> Option<String> {
     let bytes = reply.as_bytes();
-    let mut pieces: HashSet<&[u8]> = HashSet::new();
-    let mut encoded: Vec<Vec<u8>> = vec![];
+    let compact: String = reply.chars().filter(|c| !c.is_whitespace()).collect();
+    let squeeze = |value: &[u8]| -> Vec<u8> {
+        value
+            .iter()
+            .copied()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect()
+    };
+    let mut values: Vec<Vec<u8>> = vec![];
     for secret in secrets.iter().filter(|s| s.len() >= MIN_SECRET) {
         if secret.len() < PIECE {
             if bytes.windows(secret.len()).any(|w| w == secret.as_slice()) {
@@ -193,18 +216,77 @@ fn secret(reply: &str, secrets: &[Vec<u8>]) -> Option<String> {
             }
             continue;
         }
-        encoded.extend(encodings(secret));
+        values.push(squeeze(secret));
+        values.extend(encodings(secret));
     }
-    for secret in secrets.iter().filter(|s| s.len() >= PIECE) {
-        pieces.extend(secret.windows(PIECE));
-    }
-    for encoding in &encoded {
-        pieces.extend(encoding.windows(PIECE));
-    }
-    if bytes.len() >= PIECE && bytes.windows(PIECE).any(|w| pieces.contains(w)) {
+    let pieces: HashSet<&[u8]> = values
+        .iter()
+        .flat_map(|value| value.windows(PIECE))
+        .filter(|piece| varied(piece))
+        .collect();
+    if compact.len() >= PIECE
+        && compact
+            .as_bytes()
+            .windows(PIECE)
+            .any(|w| pieces.contains(w))
+    {
         return Some("the reply contains a stored credential value, or a piece of one".to_owned());
     }
-    token_shape(reply).map(|shape| format!("the reply contains what looks like a {shape}"))
+    token_shape(reply, false)
+        .or_else(|| token_shape(&compact, true))
+        .or_else(|| random_run(reply).then_some("random key or token"))
+        .map(|shape| format!("the reply contains what looks like a {shape}"))
+}
+
+/// Whether a piece of a stored value has enough distinct bytes to be
+/// evidence of it.
+fn varied(piece: &[u8]) -> bool {
+    piece.iter().collect::<HashSet<_>>().len() >= PIECE_VARIETY
+}
+
+/// Whether the text has a run of base64 or hex characters long and varied
+/// enough to be key material: 40 or more, of every kind its alphabet has
+/// (for base64, a fifth or more each of upper and lower case, and digits;
+/// for hex, digits and letters), whose characters carry nearly as much
+/// information as random ones (4.5 bits each for base64, 3.3 for hex). A
+/// CamelCase name or a path falls short of that; a random key of 40
+/// characters seldom does, and of 60 almost never.
+/// A run of exactly 40 lowercase hex digits is a commit sha and passes.
+fn random_run(text: &str) -> bool {
+    let run_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '_' | '-' | '=');
+    text.split(|c: char| !run_char(c)).any(|run| {
+        let run = run.trim_matches('=');
+        if run.len() < RANDOM_RUN {
+            return false;
+        }
+        let count = |f: fn(&u8) -> bool| run.bytes().filter(|b| f(b)).count();
+        let digits = count(u8::is_ascii_digit);
+        if run.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let lower_sha = run.len() == 40 && !run.bytes().any(|b| b.is_ascii_uppercase());
+            !lower_sha && digits >= 2 && run.len() - digits >= 2 && entropy(run) >= 3.3
+        } else {
+            count(u8::is_ascii_uppercase) * 5 >= run.len()
+                && count(u8::is_ascii_lowercase) * 5 >= run.len()
+                && digits >= 2
+                && entropy(run) >= 4.5
+        }
+    })
+}
+
+/// The Shannon entropy of a text's characters, in bits per character.
+fn entropy(text: &str) -> f64 {
+    let mut counts = std::collections::HashMap::new();
+    for b in text.bytes() {
+        *counts.entry(b).or_insert(0usize) += 1;
+    }
+    let total = text.len() as f64;
+    counts
+        .values()
+        .map(|n| {
+            let p = *n as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 /// A stored value as base64 (standard and URL-safe, at each of the three
@@ -247,8 +329,10 @@ fn encodings(secret: &[u8]) -> Vec<Vec<u8>> {
     found
 }
 
-/// The kind of token a reply carries in a common shape, if any.
-fn token_shape(reply: &str) -> Option<&'static str> {
+/// The kind of token a reply carries in a common shape, if any. In a
+/// reply with its whitespace taken out (`joined`), where prose runs into a
+/// prefix, a token's tail must also mix upper and lower case and digits.
+fn token_shape(reply: &str, joined: bool) -> Option<&'static str> {
     let token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     for prefix in TOKEN_PREFIXES {
         for (at, _) in reply.match_indices(prefix) {
@@ -256,13 +340,31 @@ fn token_shape(reply: &str) -> Option<&'static str> {
             if before.is_some_and(|c| c.is_ascii_alphanumeric()) {
                 continue;
             }
-            let tail = reply[at + prefix.len()..]
+            let tail: String = reply[at + prefix.len()..]
                 .chars()
                 .take_while(|c| token_char(*c))
-                .count();
-            if tail >= TOKEN_TAIL {
+                .collect();
+            let mixed = tail.chars().any(|c| c.is_ascii_uppercase())
+                && tail.chars().any(|c| c.is_ascii_lowercase())
+                && tail.chars().any(|c| c.is_ascii_digit());
+            if tail.len() >= TOKEN_TAIL && (mixed || !joined) {
                 return Some("forge or API token");
             }
+        }
+    }
+    // A JWT: a base64url JSON header, a payload and a signature, by dots.
+    let segment = |text: &str| text.chars().take_while(|c| token_char(*c)).count();
+    for (at, _) in reply.match_indices("eyJ") {
+        if reply[..at].chars().next_back().is_some_and(token_char) {
+            continue;
+        }
+        let header = segment(&reply[at..]);
+        let Some(after) = reply[at + header..].strip_prefix('.') else {
+            continue;
+        };
+        let payload = segment(after);
+        if header >= 10 && payload >= 10 && after[payload..].starts_with('.') {
+            return Some("JWT");
         }
     }
     for (at, _) in reply.match_indices("AKIA") {
@@ -672,5 +774,54 @@ mod tests {
         }
         // The bare prefixes in prose are not tokens.
         assert!(findings("the filter matches ghp_ and AKIA prefixes", allowed(), &[]).is_ok());
+    }
+
+    #[test]
+    fn a_value_split_by_whitespace_new_shapes_and_random_runs_are_refused() {
+        let token = b"forge-token-value-123456".to_vec();
+        let secrets = vec![token];
+        let refused = |reply: &str| findings(reply, allowed(), &secrets).unwrap_err();
+        // A stored value split by spaces or a newline.
+        assert!(refused("forge-tok en-value-12\n3456").contains("piece of one"));
+        assert!(refused("forge- token - value -  1 2 3").contains("piece of one"));
+        for (reply, shape) in [
+            // Token shapes split by whitespace.
+            ("ghp_ABCdef0123 456789abcdef\nXYZ0123", "forge or API token"),
+            ("sk-proj-AbCdEf0123456789ghijkl", "forge or API token"),
+            (
+                "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
+                "JWT",
+            ),
+            ("eyJhbGciOiJIUzI1 NiJ9.eyJzdWIiOiIx MjM0NTY3ODkwIn0.sig", "JWT"),
+            // Random runs no shape names: base64 and hex.
+            ("key: q8Zt3VnX0bK7LmP2rW9yHs4Jd6Fg1Qa5Ce8Tu0Ri", "random key or token"),
+            (
+                "secret 9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08",
+                "random key or token",
+            ),
+            (
+                "secret 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "random key or token",
+            ),
+        ] {
+            assert!(
+                refused(reply).contains(&format!("looks like a {shape}")),
+                "{reply}: {}",
+                refused(reply)
+            );
+        }
+        // Honest text passes: a commit sha, a long name, prose after a
+        // prefix, and stored values' plain pieces (a run of one character).
+        let plain = vec![b"AAAAAAAAAAAAAAAAAAAA-the-real-part-9f8e7d".to_vec()];
+        for reply in [
+            "fixed in 2b758941a42cc5fa76c4de5df7830074b17bc673 and merged",
+            "the test a_value_split_by_whitespace_new_shapes_and_random_runs_are_refused",
+            "ghp_ tokens are forty characters long now",
+            "HashMap2Vec3ToJsonValue4ConverterForTheWidgets",
+            "a rule ================ then AAAAAAAAAAAAAAAAAAAAAAA",
+            "the header eyJ is base64 for a brace",
+        ] {
+            assert!(findings(reply, allowed(), &plain).is_ok(), "{reply}");
+        }
     }
 }
