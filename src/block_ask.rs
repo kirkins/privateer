@@ -448,14 +448,17 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
         if let Some(authorize) = authorize {
             record["authorize"] = json!(authorize);
         }
-        // What a captain approval's command prefix is matched against.
+        // What a captain approval's command prefix is matched against, and
+        // whether the card shows the whole command, byte for byte: not
+        // clipped, cut at a heredoc, flattened or masked.
         if tool == "Bash" && classifier {
             record["classifier"] = json!(true);
-            if let Some(head) = input["command"]
-                .as_str()
-                .and_then(crate::captain_approvals::command_head)
-            {
+            let command = input["command"].as_str();
+            if let Some(head) = command.and_then(crate::captain_approvals::command_head) {
                 record["head"] = json!(head);
+            }
+            if command.is_some_and(|command| record["preview"] == command) {
+                record["whole"] = json!(true);
             }
         }
         records.push(record);

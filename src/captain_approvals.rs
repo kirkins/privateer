@@ -55,17 +55,30 @@ const FRAMING_WORDS: &[&str] = &["authorized", "authorised", "captain", "approve
 /// Commands that run whatever follows them.
 const WRAPPERS: &[&str] = &[
     "env", "sudo", "xargs", "eval", "doas", "su", "exec", "command", "builtin", "nohup", "timeout",
-    "nice", "time", "watch", "ssh",
+    "nice", "time", "watch", "ssh", "coproc", "!",
 ];
 /// Characters that make a shell line more than one simple command.
 const METACHARACTERS: &str = ";&|<>()$`\\";
+/// Characters bash quotes, globs, expands or comments with, so the word it
+/// runs is not the word written.
+const EXPANSIONS: &str = "'\"*?[]{}~#";
+/// Characters that change how a line reads without showing: zero-width
+/// spaces and joiners, direction marks and overrides, and the byte-order mark.
+const INVISIBLE: &[std::ops::RangeInclusive<char>] = &[
+    '\u{200B}'..='\u{200F}',
+    '\u{202A}'..='\u{202E}',
+    '\u{2060}'..='\u{2069}',
+    '\u{FEFF}'..='\u{FEFF}',
+];
 /// The most words and characters of a command a prefix is matched against.
 const MAX_HEAD_WORDS: usize = 16;
 const MAX_HEAD_CHARS: usize = 200;
 /// How recent an approval or a reply must be to act on in one tap.
 const ONE_TAP_MS: i64 = 86_400_000;
 /// Shells and interpreters, refused alone or running inline code.
-const INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "node"];
+const INTERPRETERS: &[&str] = &[
+    "bash", "sh", "zsh", "dash", "ksh", "fish", "node", "perl", "ruby",
+];
 /// Words that make a free-text reply something other than a plain yes.
 const REFUSALS: &[&str] = &[
     "no",
@@ -210,13 +223,48 @@ pub(crate) fn lint(store: &Store, ship: &str, field: &str, text: &str) -> Result
     Ok(())
 }
 
+/// The words bash runs for a line holding one simple command, split as bash
+/// splits them, on spaces and tabs. None when the line holds a shell
+/// operator, redirection, quoting, glob, expansion or comment, or any other
+/// whitespace, control or invisible character, so no word written is a
+/// different word run.
+fn shell_words(line: &str) -> Option<Vec<&str>> {
+    let plain = !line.chars().any(|c| {
+        METACHARACTERS.contains(c)
+            || EXPANSIONS.contains(c)
+            || ((c.is_whitespace() || c.is_control()) && c != ' ' && c != '\t')
+            || INVISIBLE.iter().any(|range| range.contains(&c))
+    });
+    plain.then(|| line.split([' ', '\t']).filter(|w| !w.is_empty()).collect())
+}
+
+/// Whether an interpreter's argument makes it run code written inline
+/// rather than a script: `-c`, `-e` or `--eval`, alone or in a flag cluster
+/// (`bash -lc`, `python3 -Sc`, `node -pe`), node's `-p` or `--print`, and
+/// python's `-m`.
+fn inline_code(program: &str, word: &str) -> bool {
+    if matches!(word, "--eval" | "--print" | "--command") {
+        return true;
+    }
+    let Some(flags) = word.strip_prefix('-').filter(|f| !f.starts_with('-')) else {
+        return false;
+    };
+    let letters: String = flags
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    letters.contains(['c', 'e'])
+        || (program == "node" && letters.contains('p'))
+        || (program.starts_with("python") && letters.contains('m'))
+}
+
 pub(crate) fn check_prefix(prefix: &str) -> Result<()> {
-    ensure!(
-        !prefix.chars().any(|c| METACHARACTERS.contains(c)),
-        "approves.command_prefix must be one simple command, without ; & | < > ( ) $ ` or \\"
-    );
-    let mut words = prefix.split_whitespace();
-    let first = words.next().unwrap_or_default();
+    let Some(words) = shell_words(prefix) else {
+        anyhow::bail!(
+            "approves.command_prefix must be plain words of one simple command, separated by spaces, without ; & | < > ( ) $ ` \\ ' \" * ? [ ] {{ }} ~ #"
+        )
+    };
+    let first = words.first().copied().unwrap_or_default();
     ensure!(
         !first.is_empty() && !first.contains('='),
         "approves.command_prefix must start with the program it runs, not an assignment"
@@ -228,12 +276,10 @@ pub(crate) fn check_prefix(prefix: &str) -> Result<()> {
     );
     let interpreter = INTERPRETERS.contains(&program) || program.starts_with("python");
     if interpreter {
-        let rest: Vec<&str> = words.collect();
+        let rest = &words[1..];
         ensure!(
             rest.iter().any(|w| !w.starts_with('-'))
-                && !rest
-                    .iter()
-                    .any(|w| matches!(*w, "-c" | "-e" | "--eval" | "-m")),
+                && !rest.iter().any(|w| inline_code(program, w)),
             "approves.command_prefix cannot be just a shell or interpreter; name the script it runs"
         );
     }
@@ -241,29 +287,28 @@ pub(crate) fn check_prefix(prefix: &str) -> Result<()> {
 }
 
 /// The words of a Bash command a prefix is matched against, when it is one
-/// simple command: one line, no shell operator, redirection or expansion, a
-/// program first rather than an assignment, at most 16 words and 200
+/// simple command whose words are the words bash runs (see `shell_words`):
+/// a program first rather than an assignment, at most 16 words and 200
 /// characters, and nothing a card would mask or that looks like a key.
 pub(crate) fn command_head(command: &str) -> Option<Vec<String>> {
-    let simple = !command
-        .chars()
-        .any(|c| (c.is_control() && c != '\t') || METACHARACTERS.contains(c))
-        && command.trim().chars().count() <= MAX_HEAD_CHARS
-        && crate::block_ask::mask(command) == command;
-    let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
-    (simple
+    let words = shell_words(command)?;
+    (command.trim_matches([' ', '\t']).chars().count() <= MAX_HEAD_CHARS
+        && crate::block_ask::mask(command) == command
         && (1..=MAX_HEAD_WORDS).contains(&words.len())
         && !words[0].contains('=')
         && !words.iter().any(|w| crate::block_ask::secret_shaped(w)))
-    .then_some(words)
+    .then(|| words.into_iter().map(str::to_owned).collect())
 }
 
 /// Whether a command prefix covers a command's head: its words are the
 /// head's first words, each exactly, so `make release` covers `make release
 /// --dry-run` but never `make releasex` or `sudo make release`.
 pub(crate) fn covers(prefix: &str, head: &[String]) -> bool {
-    let words: Vec<&str> = prefix.split_whitespace().collect();
-    !words.is_empty() && words.len() <= head.len() && words.iter().zip(head).all(|(p, h)| p == h)
+    shell_words(prefix).is_some_and(|words| {
+        !words.is_empty()
+            && words.len() <= head.len()
+            && words.iter().zip(head).all(|(p, h)| p == h)
+    })
 }
 
 fn hours(ttl_secs: u64) -> String {
@@ -885,6 +930,10 @@ fn record_block(
     if !open_task(store, ship, &task) {
         return skip("the approval's task is no longer open, so nothing was approved");
     }
+    // Live or lapsed, an approval given more than 24 h ago is asked again.
+    if now - created_ms >= ONE_TAP_MS {
+        return skip("the approval is older than 24 h, so nothing was approved; ask again");
+    }
     if expires_ms > now {
         // Still live: the session that was refused did not carry it, and
         // its next launch does.
@@ -902,9 +951,6 @@ fn record_block(
             json!({"recorded": false, "covered_by": id, "applies": applies,
             "note": note(applies, &action)}),
         ));
-    }
-    if now - created_ms >= ONE_TAP_MS {
-        return skip("the approval is older than 24 h, so nothing was approved; ask again");
     }
     let ttl = u64::try_from((expires_ms - created_ms) / 1000)
         .unwrap_or(1)
@@ -1102,16 +1148,21 @@ fn carried(store: &Store, ship: &str, scope: &str, job_id: Option<&str>) -> Resu
     Ok(started.map_or(Carried::Unknown, Carried::Before))
 }
 
-/// The exact step a block card offers to approve: "Run" and the masked
-/// previews of its refused commands, and, for one command a prefix can
-/// match, that command's words as the prefix. None when either would not
-/// pass as a ship's own `approves` would.
+/// The exact step a block card offers to approve: "Run" and its refused
+/// commands, and, for one command a prefix can match, that command's words
+/// as the prefix. None when the card shows any command less than whole
+/// (clipped, cut at a heredoc, flattened or masked), so the captain never
+/// approves what they did not see, or when the step would not pass as a
+/// ship's own `approves` would.
 fn step(
     store: &Store,
     ship: &str,
     records: &[Value],
     heads: &[Option<Vec<String>>],
 ) -> Option<(String, Option<String>)> {
+    if !records.iter().all(|d| d["whole"] == true) {
+        return None;
+    }
     let previews: Vec<String> = records
         .iter()
         .map(|d| format!("`{}`", d["preview"].as_str().unwrap_or_default()))
@@ -1669,10 +1720,57 @@ mod tests {
             "ssh host make",
             "/usr/bin/sudo make",
             " ",
+            // Quoted, globbed, braced, tilded or commented: bash runs
+            // another word than the one written.
+            "'sudo' make release",
+            "su''do make",
+            "\"sudo\" make release",
+            "{sudo,} make",
+            "/usr/bin/sud? make",
+            "/usr/bin/su* make",
+            "[s]udo make",
+            "~/bin/deploy",
+            "make #release",
+            // Whitespace bash does not split on, and invisible characters.
+            "make\u{a0}release",
+            "make\u{2003}release",
+            "make\u{200b} release",
+            "make\u{202e}esaeler",
+            "make\u{b}release",
+            // Interpreters running inline code, however the flag is spelled.
+            "bash \"-c\" x",
+            "bash -lc x",
+            "bash -c x",
+            "sh -ec x",
+            "zsh -xc x",
+            "python3 -Sc x",
+            "python3 -c x",
+            "python3 -m http",
+            "python3 -mhttp x",
+            "node -pe x",
+            "node -e1 x",
+            "node -p x",
+            "node --print x",
+            "node --eval x",
+            "perl -e x",
+            "ruby -e x",
+            "bash",
+            "bash -l",
+            "coproc make",
+            "! make",
         ] {
             assert!(check_prefix(bad).is_err(), "{bad}");
         }
-        for good in ["make release", "./scripts/ship.sh --prod", "cargo publish"] {
+        for good in [
+            "make release",
+            "./scripts/ship.sh --prod",
+            "cargo publish",
+            "make\trelease",
+            "bash scripts/release.sh",
+            "bash -x scripts/release.sh",
+            "python3 -u tools/ship.py",
+            "make release-2.0 v=1",
+        ] {
             check_prefix(good).unwrap();
         }
     }
@@ -1706,9 +1804,21 @@ mod tests {
             "curl -u bob https://bob:pw@x.io",
             "",
             "   ",
+            "'sudo' make release",
+            "su''do make",
+            "{sudo,} make",
+            "/usr/bin/sud? make",
+            "\"sudo\" make release",
+            "make\u{a0}release",
+            "make\u{85}release",
+            "make release\u{2028}rm x",
+            "make\u{200b} release",
+            "make ~/release",
+            "make release # now",
         ] {
             assert_eq!(command_head(compound), None, "{compound}");
         }
+        assert_eq!(command_head("make\trelease").unwrap(), ["make", "release"]);
         let long = format!("make {}", "x ".repeat(16));
         assert_eq!(command_head(&long), None);
         assert_eq!(command_head(&format!("make {}", "x".repeat(200))), None);
@@ -1731,6 +1841,10 @@ mod tests {
             assert!(!covers("make release", &head(other)), "{other}");
         }
         assert!(!covers("", &head("make")));
+        // Only spaces and tabs split words, in a prefix as in a head.
+        assert!(!covers("make\u{a0}release", &head("make release")));
+        assert!(!covers("'make' release", &head("make release")));
+        assert_eq!(command_head("make\u{a0}release --dry-run"), None);
         // A compound command has no head, so no prefix covers it.
         assert_eq!(command_head("make  release; rm x"), None);
     }
@@ -1872,7 +1986,21 @@ mod tests {
             )
             .unwrap();
         drop(store);
+        // The dashboard's open cannot migrate it, so refuses it up front.
+        #[cfg(feature = "dashboard")]
+        {
+            let refused = Store::open_existing_action(&home, crate::store::Caller::Operator);
+            assert!(
+                refused
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("incompatible existing action schema")
+            );
+        }
         let store = Store::open(&home).unwrap();
+        #[cfg(feature = "dashboard")]
+        Store::open_existing_action(&home, crate::store::Caller::Operator).unwrap();
         let block = "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
             created_ms,expires_ms,source,applies_at) VALUES('a2','apps','main','q2','r2','Run x',1,2,'block','wake')";
         store.connection().execute_batch(block).unwrap();
