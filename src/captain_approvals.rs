@@ -1834,6 +1834,61 @@ mod tests {
         );
     }
 
+    /// A home from before block cards keeps its approvals and takes a
+    /// block card's.
+    #[test]
+    fn an_older_approvals_table_is_rebuilt_to_take_block_approvals() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&home).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"main","charter_id":"project","owner":"apps","title":"Deliver"}),
+        )
+        .unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "DROP TABLE captain_approvals;
+                 CREATE TABLE captain_approvals(id TEXT PRIMARY KEY,ship TEXT NOT NULL,
+                   task_id TEXT NOT NULL REFERENCES tasks(id),request_id TEXT NOT NULL,reply_id TEXT NOT NULL UNIQUE,
+                   action TEXT NOT NULL,command_prefix TEXT,created_ms INTEGER NOT NULL,expires_ms INTEGER NOT NULL,
+                   revoked_ms INTEGER,source TEXT NOT NULL CHECK(source IN ('reply','option')));
+                 INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,created_ms,expires_ms,source)
+                   VALUES('a1','apps','main','q1','r1','Deploy',1,2,'reply');",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&home).unwrap();
+        let block = "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+            created_ms,expires_ms,source,applies_at) VALUES('a2','apps','main','q2','r2','Run x',1,2,'block','wake')";
+        store.connection().execute_batch(block).unwrap();
+        let kept: Vec<(String, String)> = store
+            .connection()
+            .prepare("SELECT id, source FROM captain_approvals ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            kept,
+            [("a1".into(), "reply".into()), ("a2".into(), "block".into())]
+        );
+        // Opened again, it is not rebuilt.
+        drop(store);
+        Store::open(&home).unwrap();
+    }
+
     #[test]
     fn a_received_copy_records_nothing() {
         let temp = tempfile::tempdir().unwrap();

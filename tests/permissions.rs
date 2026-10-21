@@ -22,6 +22,13 @@ if '--print' in sys.argv:
   print(json.dumps({'type':'rate_limit_event','rate_limit_info':{'status':'rejected','rateLimitType':'five_hour','resetsAt':int(time.time())+3*3600}}))
   print(json.dumps({'type':'result','subtype':'success','is_error':True,'result':"You've hit your limit · resets 3pm",'session_id':'12345678-1234-4234-8234-123456789abc','permission_denials':[]}))
   sys.exit(0)
+ # A turn auto mode's classifier refused: the denial line, as the runtime
+ # reads it, for the command the test chose.
+ if 'classifier-model' in sys.argv:
+  command=pathlib.Path(os.environ['CAPTURE_ARGV']).with_name('denied-command').read_text()
+  print(json.dumps({'type':'native.permission_blocked','denials':[{'tool_name':'Bash','tool_input':{'command':command},'reason':'[Production Deploy]','classifier':True}]}))
+  print(json.dumps({'type':'result','subtype':'success','is_error':True,'result':'Refused','session_id':'12345678-1234-4234-8234-123456789abc','permission_denials':[]}))
+  sys.exit(0)
  # Like Claude Code 2.1.300 (tests/fixtures/claude): a denied tool use is in the
  # result's permission_denials unless the launch's policy allows it.
  allowed='bypassPermissions' in sys.argv or 'Bash(apify run *)' in sys.argv
@@ -1509,5 +1516,411 @@ fn errand_launch_gets_no_forge_rules() {
                 "errand launch settings must NOT carry merge_green: {settings:?}"
             );
         }
+    }
+}
+
+/// Liaison's first mate, its crews and its errands run on a model whose
+/// every turn auto mode's classifier refuses.
+fn classified() -> Fleet {
+    let f = Fleet::new();
+    let mut profile = f.json("liaison", "ship.show", json!({"name":"liaison"}));
+    profile["first_mate"]["options"]["model"] = json!("classifier-model");
+    f.json("liaison", "ship.put", profile);
+    f
+}
+
+/// A wake whose Bash `command` the classifier refuses, and the ask it raises.
+fn refused_wake(f: &Fleet, command: &str) -> Value {
+    fs::write(f.root.join("denied-command"), command).unwrap();
+    f.json(
+        "liaison",
+        "mail.send",
+        json!({"from":"captain","to":"liaison","kind":"request","body":"Release it"}),
+    );
+    f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
+    for job in f.json("liaison", "job.list", json!({}))["jobs"]
+        .as_array()
+        .unwrap()
+    {
+        f.wait("liaison", job["id"].as_str().unwrap());
+    }
+    let ask = f
+        .asks("liaison")
+        .into_iter()
+        .rfind(|a| f.show("liaison", &a["id"])["state"] == "open")
+        .expect("the refused wake's ask");
+    assert_eq!(ask["payload"]["block"]["scope"], "wake", "{ask}");
+    ask
+}
+
+/// An ask's options, as (id, recommended).
+fn offered(ask: &Value) -> Vec<(String, bool)> {
+    ask["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o["id"].as_str().unwrap().to_owned(),
+                o["recommended"] == true,
+            )
+        })
+        .collect()
+}
+
+fn option<'a>(ask: &'a Value, id: &str) -> &'a Value {
+    ask["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == id)
+        .unwrap_or_else(|| panic!("no option {id}: {ask}"))
+}
+
+/// The captain's answer to `ask`: `option`, with `text` beside it, or as a
+/// door sends a plain tap, its label.
+fn tap(ask: &Value, option: &str, text: &str) -> Value {
+    let label = self::option(ask, option)["label"].clone();
+    let mut answer = json!({"option_id": option});
+    if !text.is_empty() {
+        answer["text"] = json!(text);
+    }
+    json!({"from":"captain","to":"liaison","kind":"reply","correlation":ask["id"],
+        "body": if text.is_empty() { label } else { json!(text) },
+        "payload":{"answer":answer}})
+}
+
+/// The captain's free-text answer, which ends an ask and approves nothing.
+fn set_aside(f: &Fleet, ask: &Value) {
+    f.json(
+        "liaison",
+        "mail.send",
+        json!({"from":"captain","to":"liaison","kind":"reply","correlation":ask["id"],
+            "body":"Look at it later"}),
+    );
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// A captain approval of liaison's for `make release`, created and expiring
+/// at the times given.
+fn plant_approval(f: &Fleet, id: &str, created_ms: i64, expires_ms: i64) {
+    rusqlite::Connection::open(f.root.join("liaison/.privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,
+               created_ms,expires_ms,source)
+             VALUES(?1,'liaison','liaison-duty','q-'||?1,'r-'||?1,'Run make release','make release',?2,?3,'reply')",
+            rusqlite::params![id, created_ms, expires_ms],
+        )
+        .unwrap();
+}
+
+fn approvals(f: &Fleet) -> Vec<Value> {
+    f.json(
+        "liaison",
+        "captain_approval.list",
+        json!({"ship":"liaison"}),
+    )["approvals"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// What an attended first-mate launch tells auto mode the captain allows.
+fn launch_allows(f: &Fleet) -> Vec<String> {
+    f.ok(Some("liaison"), &["start", "claude"]);
+    let args: Vec<String> =
+        serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    args.iter()
+        .position(|a| a == "--settings")
+        .map(|i| serde_json::from_str::<Value>(&args[i + 1]).unwrap()["autoMode"]["allow"].clone())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_wakes_classifier_refusal_offers_the_captain_this_exact_step_for_24_hours() {
+    let f = classified();
+    let ask = refused_wake(&f, "make release --dry-run");
+    let block = &ask["payload"]["block"];
+    assert_eq!(block["denials"][0]["classifier"], true, "{ask}");
+    assert_eq!(
+        block["denials"][0]["head"],
+        json!(["make", "release", "--dry-run"])
+    );
+    assert_eq!(
+        block["approve"],
+        json!({"action":"Run `make release --dry-run`","command_prefix":"make release --dry-run"})
+    );
+    assert!(block.get("approvals").is_none(), "{ask}");
+    assert_eq!(
+        offered(&ask),
+        [
+            ("authorize".to_owned(), false),
+            ("approve".to_owned(), true),
+            ("without".to_owned(), false),
+            ("stop".to_owned(), false)
+        ]
+    );
+    let approve = option(&ask, "approve");
+    assert_eq!(
+        approve["label"],
+        "Approve for 24 h: Run `make release --dry-run`"
+    );
+    let what = approve["what_happens"].as_str().unwrap();
+    assert!(
+        what.contains("\"Run `make release --dry-run`\"") && what.contains("24 h from your tap"),
+        "{what}"
+    );
+    // Relayed, it is refused before it answers anything.
+    let mut relayed = tap(&ask, "approve", "");
+    relayed["payload"]["relayed_by"] = json!("liaison");
+    let refused = f.fails("liaison", "mail.send", relayed);
+    assert!(
+        refused.contains("must come from the captain directly"),
+        "{refused}"
+    );
+    // A ship cannot answer as the captain at all.
+    let agent = f
+        .command(
+            Some("liaison"),
+            &["mail.send", "--json", &tap(&ask, "approve", "").to_string()],
+        )
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(!agent.status.success());
+    assert_eq!(f.show("liaison", &ask["id"])["state"], "open");
+    assert!(approvals(&f).is_empty());
+    // The captain's own tap records one approval bound to the ask and reply.
+    let reply = f.json("liaison", "mail.send", tap(&ask, "approve", ""));
+    assert_eq!(reply["approval"]["recorded"], true, "{reply}");
+    assert_eq!(reply["approval"]["applies"], "wake", "{reply}");
+    assert_eq!(f.show("liaison", &ask["id"])["state"], "answered");
+    let rows = approvals(&f);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["source"], "block");
+    assert_eq!(row["request_id"], ask["id"]);
+    assert_eq!(row["reply_id"], reply["id"]);
+    assert_eq!(row["action"], "Run `make release --dry-run`");
+    assert_eq!(row["command_prefix"], "make release --dry-run");
+    assert_eq!(
+        row["expires_ms"].as_i64().unwrap() - row["created_ms"].as_i64().unwrap(),
+        86_400_000
+    );
+    assert_eq!(row["live"], true);
+    let told = launch_allows(&f);
+    assert!(
+        told.iter().any(|t| t.starts_with(&format!(
+            "The captain approved this in reply {} to request {}, for ship liaison only",
+            reply["id"].as_str().unwrap(),
+            ask["id"].as_str().unwrap()
+        )) && t.ends_with(
+            ": Run `make release --dry-run` Only commands that begin exactly with: make release --dry-run"
+        )),
+        "{told:?}"
+    );
+    // Nothing in the fleet policy changed for it.
+    let policy: Value = serde_json::from_str(&f.ok(None, &["permissions", "show"])).unwrap();
+    assert!(policy["authorized"]["liaison"].is_null(), "{policy}");
+}
+
+#[test]
+fn a_hedged_tap_on_approve_records_nothing() {
+    let f = classified();
+    let ask = refused_wake(&f, "make release --dry-run");
+    let reply = f.json(
+        "liaison",
+        "mail.send",
+        tap(&ask, "approve", "yes but wait for CI"),
+    );
+    assert_eq!(reply["approval"]["recorded"], false, "{reply}");
+    assert!(
+        reply["approval"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was approved"),
+        "{reply}"
+    );
+    assert!(approvals(&f).is_empty());
+}
+
+#[test]
+fn a_crews_or_an_errands_classifier_refusal_offers_no_captain_approval() {
+    let f = classified();
+    fs::write(f.root.join("denied-command"), "make release --dry-run").unwrap();
+    let now = now_ms();
+    plant_approval(&f, "approval-live", now - 60_000, now + 3_600_000);
+    let errand = f.json(
+        "liaison",
+        "errand.start",
+        json!({"focus":"task:liaison-duty","brief":"Release it"}),
+    );
+    f.wait("liaison", errand["errand"].as_str().unwrap());
+    let asks = f.asks("liaison");
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert_eq!(asks[0]["payload"]["block"]["scope"], "errand");
+    assert_eq!(
+        asks[0]["payload"]["block"]["denials"][0]["classifier"],
+        true
+    );
+    let ids: Vec<String> = offered(&asks[0]).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, ["without", "stop"], "{}", asks[0]);
+    set_aside(&f, &asks[0]);
+    assert_eq!(f.crew("liaison", "crew-one", json!({}))["status"], "failed");
+    let ask = f
+        .asks("liaison")
+        .into_iter()
+        .find(|a| a["id"] != asks[0]["id"])
+        .expect("the crew's ask");
+    assert_eq!(ask["payload"]["block"]["scope"], "crew");
+    let ids: Vec<String> = offered(&ask).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, ["without", "stop"], "{ask}");
+    for absent in ["approve", "approvals"] {
+        assert!(ask["payload"]["block"].get(absent).is_none(), "{ask}");
+    }
+}
+
+#[test]
+fn a_recent_approval_the_session_lacked_is_offered_and_its_tap_records_nothing() {
+    let f = classified();
+    let now = now_ms();
+    // Given while the wake ran, so the wake never carried it.
+    plant_approval(&f, "approval-given", now + 600_000, now + 3_600_000);
+    // Given more than 24 h ago, and lapsed: never renewed in one tap.
+    plant_approval(&f, "approval-old", now - 25 * 3_600_000, now - 3_600_000);
+    let ask = refused_wake(&f, "make release --dry-run");
+    assert_eq!(
+        ask["payload"]["block"]["approvals"],
+        json!(["approval-given"])
+    );
+    assert_eq!(
+        offered(&ask),
+        [
+            ("authorize".to_owned(), false),
+            ("as_approved_1".to_owned(), true),
+            ("approve".to_owned(), false),
+            ("without".to_owned(), false),
+            ("stop".to_owned(), false)
+        ]
+    );
+    let reuse = option(&ask, "as_approved_1");
+    assert_eq!(reuse["label"], "As approved: Run make release");
+    let what = reuse["what_happens"].as_str().unwrap();
+    assert!(
+        what.contains("\"Run make release\"")
+            && what.contains(" UTC")
+            && what.contains("nothing to relaunch"),
+        "{what}"
+    );
+    let reply = f.json("liaison", "mail.send", tap(&ask, "as_approved_1", ""));
+    assert_eq!(reply["approval"]["recorded"], false, "{reply}");
+    assert_eq!(reply["approval"]["covered_by"], "approval-given", "{reply}");
+    assert_eq!(reply["approval"]["applies"], "wake", "{reply}");
+    assert_eq!(f.show("liaison", &ask["id"])["state"], "answered");
+    assert_eq!(approvals(&f).len(), 2);
+}
+
+#[test]
+fn an_approval_that_expired_within_24_hours_is_renewed_by_its_tap() {
+    let f = classified();
+    let now = now_ms();
+    plant_approval(&f, "approval-lapsed", now - 2 * 3_600_000, now - 3_600_000);
+    let ask = refused_wake(&f, "make release --dry-run");
+    assert_eq!(
+        ask["payload"]["block"]["approvals"],
+        json!(["approval-lapsed"])
+    );
+    let what = option(&ask, "as_approved_1")["what_happens"]
+        .as_str()
+        .unwrap();
+    assert!(
+        what.starts_with("Renews captain approval approval-lapsed"),
+        "{what}"
+    );
+    let reply = f.json("liaison", "mail.send", tap(&ask, "as_approved_1", ""));
+    assert_eq!(reply["approval"]["recorded"], true, "{reply}");
+    let renewed = approvals(&f)
+        .into_iter()
+        .find(|r| r["id"] == reply["approval"]["id"])
+        .unwrap();
+    assert_eq!(renewed["action"], "Run make release");
+    assert_eq!(renewed["command_prefix"], "make release");
+    assert_eq!(renewed["request_id"], ask["id"]);
+    assert_eq!(renewed["reply_id"], reply["id"]);
+    assert_eq!(renewed["source"], "block");
+    assert_eq!(renewed["live"], true);
+    assert_eq!(
+        renewed["expires_ms"].as_i64().unwrap() - renewed["created_ms"].as_i64().unwrap(),
+        3_600_000
+    );
+    let audit = f.json("liaison", "audit.list", json!({"limit":100}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "permissions.approval_recorded")
+        .cloned()
+        .unwrap();
+    assert_eq!(audit["payload"]["renews"], "approval-lapsed", "{audit}");
+}
+
+#[test]
+fn an_approval_the_refused_session_carried_is_named_and_approve_recommended() {
+    let f = classified();
+    let now = now_ms();
+    plant_approval(&f, "approval-carried", now - 3_600_000, now + 3_600_000);
+    let ask = refused_wake(&f, "make release --dry-run");
+    assert!(ask["payload"]["block"].get("approvals").is_none(), "{ask}");
+    assert!(
+        ask["payload"]["decision"]["why"]
+            .as_str()
+            .unwrap()
+            .contains(
+                "Auto mode refused this although captain approval approval-carried (Run make release) was in its session."
+            ),
+        "{ask}"
+    );
+    assert!(
+        offered(&ask).contains(&("approve".to_owned(), true)),
+        "{ask}"
+    );
+}
+
+#[test]
+fn a_prefix_is_never_recommended_for_a_command_it_does_not_begin() {
+    let f = classified();
+    let now = now_ms();
+    plant_approval(&f, "approval-given", now + 600_000, now + 3_600_000);
+    for (command, approve) in [
+        ("sudo make release", None),
+        ("make releasex", Some(true)),
+        ("make release; x", Some(true)),
+    ] {
+        let ask = refused_wake(&f, command);
+        let options = offered(&ask);
+        assert!(
+            options.contains(&("as_approved_1".to_owned(), false)),
+            "{command}: {ask}"
+        );
+        assert_eq!(
+            options
+                .iter()
+                .find(|(id, _)| id == "approve")
+                .map(|(_, r)| *r),
+            approve,
+            "{command}: {ask}"
+        );
+        set_aside(&f, &ask);
     }
 }
