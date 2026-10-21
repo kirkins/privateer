@@ -1785,8 +1785,11 @@ pub(crate) fn collected(
         )?;
     }
     tx.commit()?;
-    if !delivered.is_empty() || !refused.is_empty() {
-        crate::waits::heard(store, peer)?;
+    // The collecting machine answered for its mail: the link is heard.
+    if (!delivered.is_empty() || !refused.is_empty())
+        && let Err(error) = crate::waits::heard(store, peer)
+    {
+        eprintln!("privateer: could not record link {peer}: {error:#}");
     }
     Ok(changed)
 }
