@@ -13,7 +13,7 @@
 //! writes the database directly is not stopped here.
 use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -1201,6 +1201,7 @@ fn note(applies: &str, action: &str) -> String {
 
 pub(crate) struct Row {
     pub(crate) id: String,
+    ship: String,
     task: String,
     request: String,
     reply: String,
@@ -1208,58 +1209,163 @@ pub(crate) struct Row {
     pub(crate) prefix: Option<String>,
     pub(crate) created_ms: i64,
     pub(crate) expires_ms: i64,
+    revoked_ms: Option<i64>,
+    pub(crate) source: String,
 }
 
 /// Whether `ship` owns `task` and it is open under an active charter.
 fn open_task(store: &Store, ship: &str, task: &str) -> bool {
-    store.task(task).is_ok_and(|t| t["owner"] == ship) && store.active_charter(task).is_ok()
+    task_open(store.connection(), ship, task)
 }
 
-/// A ship's unrevoked approvals matching `filter` (a condition on
-/// `created_ms` and `expires_ms` against `?2`), in `order`, on a task the
-/// ship still owns, open under an active charter.
-fn rows(store: &Store, ship: &str, filter: &str, order: &str, at: i64) -> Result<Vec<Row>> {
-    let mut statement = store.connection().prepare(&format!(
-        "SELECT id,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms
-         FROM captain_approvals WHERE ship=?1 AND revoked_ms IS NULL AND {filter} ORDER BY {order}"
+/// `open_task` read from the tables alone, so a read-only open sees what the
+/// runtime sees: the ship owns the task, it is not done or cancelled, no
+/// task above it is cancelled, and its charter is active. Anything unreadable
+/// is not open.
+fn task_open(conn: &Connection, ship: &str, task: &str) -> bool {
+    let read = |id: &str| {
+        conn.query_row(
+            "SELECT owner,status,parent,charter_id FROM tasks WHERE id=?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+    };
+    let Ok(Some((owner, status, mut parent, charter))) = read(task) else {
+        return false;
+    };
+    if owner != ship || matches!(status.as_str(), "done" | "cancelled") {
+        return false;
+    }
+    // Tasks nest a few levels; the bound only stops a corrupt cycle.
+    for _ in 0..1000 {
+        let Some(id) = parent else {
+            let data: Option<String> = conn
+                .query_row("SELECT data FROM charters WHERE id=?1", [&charter], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .ok()
+                .flatten();
+            return data
+                .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+                .is_some_and(|c| c["active"] == true);
+        };
+        let Ok(Some((_, status, next, _))) = read(&id) else {
+            return false;
+        };
+        if status == "cancelled" {
+            return false;
+        }
+        parent = next;
+    }
+    false
+}
+
+/// Where an approval stands at `now`. This is the one rule launches, list,
+/// show and the dashboard read: `revoked` once the captain revokes it,
+/// `closed` once its task is done, cancelled or handed to another owner or
+/// its charter is inactive, `expired` past its expiry, and otherwise `live`.
+pub(crate) fn state(conn: &Connection, row: &Row, now: i64) -> &'static str {
+    if row.revoked_ms.is_some() {
+        "revoked"
+    } else if !task_open(conn, &row.ship, &row.task) {
+        "closed"
+    } else if row.expires_ms <= now {
+        "expired"
+    } else {
+        "live"
+    }
+}
+
+/// The approvals matching `condition` (SQL on `captain_approvals`), in
+/// `order`.
+fn select(
+    conn: &Connection,
+    condition: &str,
+    args: impl rusqlite::Params,
+    order: &str,
+) -> Result<Vec<Row>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,
+           revoked_ms,source
+         FROM captain_approvals WHERE {condition} ORDER BY {order}"
     ))?;
     let rows = statement
-        .query_map(params![ship, at], |r| {
+        .query_map(args, |r| {
             Ok(Row {
                 id: r.get(0)?,
-                task: r.get(1)?,
-                request: r.get(2)?,
-                reply: r.get(3)?,
-                action: r.get(4)?,
-                prefix: r.get(5)?,
-                created_ms: r.get(6)?,
-                expires_ms: r.get(7)?,
+                ship: r.get(1)?,
+                task: r.get(2)?,
+                request: r.get(3)?,
+                reply: r.get(4)?,
+                action: r.get(5)?,
+                prefix: r.get(6)?,
+                created_ms: r.get(7)?,
+                expires_ms: r.get(8)?,
+                revoked_ms: r.get(9)?,
+                source: r.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows
-        .into_iter()
-        .filter(|row| open_task(store, ship, &row.task))
-        .collect())
+    Ok(rows)
 }
 
 /// A ship's live approvals: not revoked, not expired, and on a task the ship
 /// still owns, open under an active charter.
 pub(crate) fn live(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
-    rows(store, ship, "expires_ms>?2", "created_ms, id", now)
+    live_in(store.connection(), ship, now)
+}
+
+/// `live` on a plain connection, such as the dashboard's read-only one.
+pub(crate) fn live_in(conn: &Connection, ship: &str, now: i64) -> Result<Vec<Row>> {
+    Ok(select(
+        conn,
+        "ship=?1 AND revoked_ms IS NULL AND expires_ms>?2",
+        params![ship, now],
+        "created_ms, id",
+    )?
+    .into_iter()
+    .filter(|row| state(conn, row, now) == "live")
+    .collect())
+}
+
+/// A ship's live approvals read from a home no runtime opened: one from
+/// before captain approvals has none, and nothing is created or migrated.
+#[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+pub(crate) fn live_read(conn: &Connection, ship: &str, now: i64) -> Result<Vec<Row>> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approvals')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(vec![]);
+    }
+    live_in(conn, ship, now)
 }
 
 /// The approvals a block card may offer to use again in one tap: created in
 /// the last 24 h, not revoked, on a task the ship still owns and is open,
 /// newest first. An expired one is renewed by the tap.
 pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
-    rows(
-        store,
-        ship,
-        "created_ms>?2",
+    let conn = store.connection();
+    Ok(select(
+        conn,
+        "ship=?1 AND revoked_ms IS NULL AND created_ms>?2",
+        params![ship, now - ONE_TAP_MS],
         "created_ms DESC, id",
-        now - ONE_TAP_MS,
-    )
+    )?
+    .into_iter()
+    .filter(|row| matches!(state(conn, row, now), "live" | "expired"))
+    .collect())
 }
 
 /// The one sentence the classifier reads for an approval. A command prefix
@@ -1395,49 +1501,151 @@ pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+/// The ship a list or show may read: the operator any, or every ship when
+/// none is named; an agent only its own, named.
+fn reader_ship<'a>(store: &Store, ship: Option<&'a str>) -> Result<Option<&'a str>> {
+    match store.caller() {
+        Caller::Operator => Ok(ship),
+        Caller::Agent { actor } => {
+            let ship = ship.with_context(|| {
+                format!("an agent lists only its own captain approvals; pass ship {actor}")
+            })?;
+            ensure!(
+                ship == actor,
+                "agent {actor} cannot read {ship}'s captain approvals"
+            );
+            Ok(Some(ship))
+        }
+    }
+}
+
+/// Rows as list and show give them: each with its `state` and, when live,
+/// the `sentence` a launch now tells auto mode.
+fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
+    let conn = store.connection();
+    let mut told: std::collections::BTreeMap<&str, Vec<(String, String)>> = Default::default();
+    let mut out = vec![];
+    for row in rows {
+        let state = state(conn, row, now);
+        let sentence = if state == "live" {
+            if !told.contains_key(row.ship.as_str()) {
+                told.insert(&row.ship, current_set(store, &row.ship, now)?);
+            }
+            told[row.ship.as_str()]
+                .iter()
+                .find(|(id, _)| *id == row.id)
+                .map(|(_, sentence)| sentence.clone())
+        } else {
+            None
+        };
+        out.push(json!({"id": row.id, "ship": row.ship, "task_id": row.task,
+            "request_id": row.request, "reply_id": row.reply, "action": row.action,
+            "command_prefix": row.prefix, "created_ms": row.created_ms,
+            "expires_ms": row.expires_ms, "revoked_ms": row.revoked_ms, "source": row.source,
+            "live": state == "live", "state": state, "sentence": sentence}));
+    }
+    Ok(out)
+}
+
 fn list(store: &Store, args: &Value) -> Result<Value> {
-    let ship = required(args, "ship")?;
-    crate::store::identifier(ship)?;
+    let named = match args.get("ship").filter(|v| !v.is_null()) {
+        Some(_) => Some(required(args, "ship")?),
+        None => None,
+    };
+    let ship = reader_ship(store, named)?;
+    if let Some(ship) = ship {
+        crate::store::identifier(ship)?;
+    }
+    let live_only = match args.get("live_only").filter(|v| !v.is_null()) {
+        Some(flag) => flag.as_bool().context("live_only must be true or false")?,
+        None => false,
+    };
     let now = Store::now_ms();
-    let live: Vec<String> = live(store, ship, now)?.into_iter().map(|r| r.id).collect();
-    let mut statement = store.connection().prepare(
-        "SELECT id,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,revoked_ms,source
-         FROM captain_approvals WHERE ship=?1 ORDER BY created_ms DESC, id LIMIT 100",
-    )?;
-    let approvals = statement
-        .query_map([ship], |r| {
-            Ok(json!({"id": r.get::<_, String>(0)?, "ship": ship, "task_id": r.get::<_, String>(1)?,
-                "request_id": r.get::<_, String>(2)?, "reply_id": r.get::<_, String>(3)?,
-                "action": r.get::<_, String>(4)?, "command_prefix": r.get::<_, Option<String>>(5)?,
-                "created_ms": r.get::<_, i64>(6)?, "expires_ms": r.get::<_, i64>(7)?,
-                "revoked_ms": r.get::<_, Option<i64>>(8)?, "source": r.get::<_, String>(9)?}))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
+    let order = "created_ms DESC, id LIMIT 100";
+    let rows = if live_only {
+        select(
+            store.connection(),
+            "(?1 IS NULL OR ship=?1) AND revoked_ms IS NULL AND expires_ms>?2",
+            params![ship, now],
+            order,
+        )?
+    } else {
+        select(store.connection(), "(?1 IS NULL OR ship=?1)", [ship], order)?
+    };
+    let approvals: Vec<Value> = described(store, &rows, now)?
         .into_iter()
-        .map(|mut row| {
-            row["live"] = json!(live.iter().any(|id| row["id"] == id.as_str()));
-            row
-        })
-        .collect::<Vec<_>>();
+        .filter(|row| !live_only || row["state"] == "live")
+        .collect();
     Ok(json!({"ship": ship, "approvals": approvals}))
+}
+
+fn show(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    let row = select(store.connection(), "id=?1", [id], "id")?
+        .into_iter()
+        .next()
+        .with_context(|| format!("no captain approval {id}"))?;
+    if let Caller::Agent { actor } = store.caller() {
+        ensure!(*actor == row.ship, "captain approval {id} is not yours");
+    }
+    let now = Store::now_ms();
+    let mut shown = described(store, std::slice::from_ref(&row), now)?.remove(0);
+    let conn = store.connection();
+    shown["applies_at"] = json!(conn.query_row(
+        "SELECT applies_at FROM captain_approvals WHERE id=?1",
+        [id],
+        |r| r.get::<_, Option<String>>(0)
+    )?);
+    let mut carried = vec![];
+    let mut statement = conn.prepare(
+        "SELECT pid, recorded_ms, approvals_ids FROM hosted_panes WHERE ship=?1 ORDER BY pid",
+    )?;
+    let panes = statement
+        .query_map([&row.ship], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (pid, launched_ms, ids) in panes {
+        let ids: Vec<String> = ids
+            .and_then(|ids| serde_json::from_str(&ids).ok())
+            .unwrap_or_default();
+        if ids.iter().any(|carried| carried == id) {
+            carried.push(json!({"pid": pid, "launched_ms": launched_ms}));
+        }
+    }
+    shown["carried_by"] = json!(carried);
+    Ok(shown)
+}
+
+/// When a revoke reaches the ship's session.
+fn revoke_note(applies: &str, ship: &str) -> String {
+    match applies {
+        "relaunch" => format!("stops at {ship}'s next idle point"),
+        "wake" => "next wake no longer carries it".to_owned(),
+        _ => "next launch no longer carries it".to_owned(),
+    }
 }
 
 fn revoke(store: &Store, args: &Value) -> Result<Value> {
     store.caller().require_operator("captain_approval.revoke")?;
     let id = required(args, "id")?;
-    let revoked: Option<Option<i64>> = store
+    let row: Option<(String, Option<i64>)> = store
         .connection()
         .query_row(
-            "SELECT revoked_ms FROM captain_approvals WHERE id=?1",
+            "SELECT ship, revoked_ms FROM captain_approvals WHERE id=?1",
             [id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some(revoked) = revoked else {
+    let Some((ship, revoked)) = row else {
         bail!("no captain approval {id}");
     };
     if let Some(revoked_ms) = revoked {
-        return Ok(json!({"id": id, "revoked_ms": revoked_ms, "already": true}));
+        return Ok(json!({"id": id, "ship": ship, "revoked_ms": revoked_ms, "already": true}));
     }
     let now = Store::now_ms();
     store.connection().execute(
@@ -1445,12 +1653,15 @@ fn revoke(store: &Store, args: &Value) -> Result<Value> {
         params![id, now],
     )?;
     store.audit("permissions.approval_revoked", &json!({"id": id}))?;
-    Ok(json!({"id": id, "revoked_ms": now, "already": false}))
+    let applies = crate::host::upgrade::approval_applies(store, &ship)?;
+    Ok(json!({"id": id, "ship": ship, "revoked_ms": now, "already": false,
+        "applies": applies, "note": revoke_note(applies, &ship)}))
 }
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "captain_approval.list" => list(store, &args),
+        "captain_approval.show" => show(store, &args),
         "captain_approval.revoke" => {
             ensure!(
                 *store.caller() == Caller::Operator,
@@ -1460,6 +1671,31 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         _ => bail!("unknown command {command}"),
     }
+}
+
+const USAGE: &str = "usage: privateer permissions approvals [list [SHIP] | show ID | revoke ID]";
+
+/// The captain's terminal verbs: `privateer permissions approvals [list
+/// [SHIP] | show ID | revoke ID]`, printing what the JSON commands answer.
+pub fn cli(home: Option<std::path::PathBuf>, args: &[String], caller: &Caller) -> Result<()> {
+    let (command, request) = match args {
+        [] => ("captain_approval.list", json!({})),
+        [verb] if verb == "list" => ("captain_approval.list", json!({})),
+        [verb, ship] if verb == "list" => ("captain_approval.list", json!({"ship": ship})),
+        [verb, id] if verb == "show" => ("captain_approval.show", json!({"id": id})),
+        [verb, id] if verb == "revoke" => ("captain_approval.revoke", json!({"id": id})),
+        _ => bail!("{USAGE}"),
+    };
+    if command == "captain_approval.revoke" {
+        caller.require_operator(command)?;
+    }
+    let home = home.context(
+        "not inside a ship folder (no .privateer here or above); run `privateer init`, or pass --home",
+    )?;
+    let mut store = Store::open_as(&home, caller.clone())?;
+    let result = crate::dispatch(&mut store, command, request)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
 }
 
 #[cfg(test)]

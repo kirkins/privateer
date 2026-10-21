@@ -8,7 +8,7 @@ mod block_ask;
 mod bundled;
 pub mod capabilities;
 pub mod captain;
-mod captain_approvals;
+pub mod captain_approvals;
 mod claude_denials;
 pub mod cli;
 pub mod context;
