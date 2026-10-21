@@ -1049,9 +1049,19 @@ fn claude_launch_derives_merge_rules_from_charter_actions() {
     f.ok(Some("hub-ship"), &["start", "claude"]);
     let args: Vec<String> =
         serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+    // merge_green carries no gh merge rule: merging goes through pr.merge
+    // after a top-tier review, and gh pr merge is disallowed outright.
     assert!(
-        args.contains(&"Bash(gh pr merge *)".into()),
-        "merge_green on GitHub carries gh pr merge: {args:?}"
+        !args.contains(&"Bash(gh pr merge *)".into()),
+        "merge_green on GitHub no longer carries gh pr merge: {args:?}"
+    );
+    let disallowed = args
+        .iter()
+        .position(|a| a == "--disallowedTools")
+        .expect("disallowed tools");
+    assert!(
+        args[disallowed..].contains(&"Bash(gh pr merge:*)".into()),
+        "gh pr merge is disallowed: {args:?}"
     );
     assert!(
         args.contains(&"Bash(gh pr create *)".into()),
