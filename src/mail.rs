@@ -830,7 +830,14 @@ const DECISION_FIELDS: &[&str] = &[
     "free_text_ok",
     "group",
 ];
-const OPTION_FIELDS: &[&str] = &["id", "label", "what_happens", "cost", "recommended"];
+const OPTION_FIELDS: &[&str] = &[
+    "id",
+    "label",
+    "what_happens",
+    "cost",
+    "recommended",
+    "approves",
+];
 const MAX_DECISION_OPTIONS: usize = 8;
 
 /// A string whose length in characters is within `min..=max`. Errors name the
@@ -965,8 +972,14 @@ pub(crate) fn typed_payload(kind: &str, payload: &mut Value) -> Result<()> {
     if kind != "decision" {
         return Ok(());
     }
+    let declared = payload.get("approves").is_some();
+    ensure!(
+        !declared || payload.get("decision").is_some(),
+        "a decision with payload.approves marks at least one option approves: true"
+    );
     if let Some(decision) = payload.get("decision").cloned() {
         validate_decision(&decision)?;
+        crate::captain_approvals::check_options(&decision, declared)?;
         // Older doors show only plain choices, so the labels stand in for them.
         if payload.get("choices").is_none() {
             payload["choices"] = json!(
@@ -1030,11 +1043,12 @@ fn check_answer(decision: &Value, answer: &Value) -> Result<()> {
 }
 
 /// A payload without the fields the runtime adds for its topic, which may
-/// differ on a replay once the ask it named has closed.
+/// differ on a replay once the ask it named has closed, or for the approval
+/// a reply recorded.
 fn without_topic(payload: &Value) -> Value {
     let mut payload = payload.clone();
     if let Some(fields) = payload.as_object_mut() {
-        for key in ["about", "attached_to", "attached_ship"] {
+        for key in ["about", "attached_to", "attached_ship", "approval"] {
             fields.remove(key);
         }
     }
@@ -1164,6 +1178,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             "fanned_from",
             "block_notice",
             "block_cleared",
+            "approval",
         ] {
             ensure!(
                 payload.get(reserved).is_none(),
@@ -1249,6 +1264,23 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     if kind == "decision" {
         ensure!(to == CAPTAIN, "decisions are addressed to the captain");
     }
+    // The step a yes approves is frozen here, and the body the captain reads
+    // says what it grants, on every surface that shows it.
+    let approving = crate::captain_approvals::declare(
+        store,
+        from,
+        to,
+        kind,
+        request_kind,
+        task_id,
+        &mut payload,
+    )?;
+    let body = match &approving {
+        Some(line) if body.is_empty() => line.clone(),
+        Some(line) => format!("{body}\n\n{line}"),
+        None => body.to_owned(),
+    };
+    let body = body.as_str();
     let opens = matches!(kind, "request" | "decision");
     bind(&mut payload, opens)?;
     let deadline_ms = match args.get("reply_within_secs").filter(|v| !v.is_null()) {
@@ -1278,7 +1310,16 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     }
 
     let tx = store.write_transaction()?;
-    if operator && correlation.is_some_and(|c| crate::block_ask::is_ask_id(store, c)) {
+    // A request that declares approves is marked as a block ask is, so the
+    // home that holds it can tell the captain's own yes from a relayed one.
+    let approves = |c: &str| {
+        by_id(store, c)
+            .ok()
+            .flatten()
+            .is_some_and(|thread| thread["payload"].get("approves").is_some())
+    };
+    if operator && correlation.is_some_and(|c| crate::block_ask::is_ask_id(store, c) || approves(c))
+    {
         payload["operator"] = json!(true);
     }
     // The topic is the runtime's: the captain decision this mail is about.
@@ -1340,10 +1381,12 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         Some(peer) => crate::peers::direct_machine(store, peer)?,
         None => false,
     };
+    let mut answering = None;
     if let Some(correlation) = correlation {
         match by_id(store, correlation)? {
             Some(thread) => {
                 if kind == "reply" {
+                    answering = Some(thread.clone());
                     ensure!(
                         matches!(thread["kind"].as_str(), Some("request" | "decision")),
                         "only requests and decisions take replies"
@@ -1377,6 +1420,13 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         }
     }
     let now = Store::now_ms();
+    // Recorded with the reply, in the home that holds the original request.
+    if let Some(request) = &answering
+        && let Some(approval) =
+            crate::captain_approvals::record(store, request, &id, body, &payload, now)?
+    {
+        payload["approval"] = approval;
+    }
     tx.execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,because_of)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
@@ -1432,6 +1482,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         crate::placement::answered(store, correlation, &stored);
     }
     let mut result = annotate(stored, Store::now_ms());
+    if let Some(approval) = result["payload"].get("approval").cloned() {
+        result["approval"] = approval;
+    }
     if let Some((ask, ship)) = attached {
         result["attached_to"] = json!(ask);
         result["note"] = json!(format!(
@@ -2446,6 +2499,7 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             })
     };
     let answers_here = kind == "reply" && !elsewhere(correlation)?;
+    let mut answering = None;
     if answers_here {
         let correlation = correlation.context("a reply names the request it answers")?;
         let request =
@@ -2465,8 +2519,20 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         if let (Some(answer), Some(decision)) = (payload.get("answer"), typed_decision(&request)) {
             check_answer(decision, answer)?;
         }
+        answering = Some(request);
     }
     let now = Store::now_ms();
+    // Only this home's own record of an approval reaches the stored reply,
+    // never one the other side wrote.
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("approval");
+    }
+    if let Some(request) = &answering
+        && let Some(approval) =
+            crate::captain_approvals::record(store, request, id, body, &payload, now)?
+    {
+        payload["approval"] = approval;
+    }
     tx.execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms,because_of)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11,?13)",

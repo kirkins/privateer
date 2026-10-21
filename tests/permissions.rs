@@ -289,6 +289,90 @@ fn the_captains_standing_authorization_reaches_that_ships_auto_mode_classifier()
 }
 
 #[test]
+fn the_captains_approval_reaches_first_mate_launches_until_it_is_revoked() {
+    let f = Fleet::new();
+    let allow = |f: &Fleet| -> Vec<String> {
+        let args: Vec<String> =
+            serde_json::from_slice(&fs::read(f.root.join("argv.json")).unwrap()).unwrap();
+        args.iter()
+            .position(|a| a == "--settings")
+            .map(|i| {
+                serde_json::from_str::<Value>(&args[i + 1]).unwrap()["autoMode"]["allow"].clone()
+            })
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let asked = f
+        .command(
+            Some("liaison"),
+            &[
+                "mail.send",
+                "--json",
+                &json!({"id":"q-55","from":"liaison","to":"captain","kind":"request",
+                    "task_id":"liaison-duty","body":"Build 55 passed CI.",
+                    "payload":{"approves":{"action":"Submit build 55 to TestFlight"}}})
+                .to_string(),
+            ],
+        )
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "liaison")
+        .output()
+        .unwrap();
+    assert!(
+        asked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    let answered = f.json(
+        "liaison",
+        "mail.send",
+        json!({"from":"captain","to":"liaison","kind":"reply","correlation":"q-55","body":"Submit build 55"}),
+    );
+    assert_eq!(answered["approval"]["recorded"], true, "{answered}");
+    let approved = format!(
+        "The captain approved this in reply {} to request q-55, for ship liaison only, until ",
+        answered["id"].as_str().unwrap()
+    );
+    let carries = |allow: &[String]| {
+        allow
+            .iter()
+            .any(|a| a.starts_with(&approved) && a.ends_with(" UTC: Submit build 55 to TestFlight"))
+    };
+    // A hosted or attended pane gets it at its next launch.
+    f.ok(Some("liaison"), &["start", "claude"]);
+    assert!(carries(&allow(&f)), "{:?}", allow(&f));
+    // A crew's launch never does.
+    assert!(
+        !f.plan("liaison")
+            .to_string()
+            .contains("The captain approved this")
+    );
+    // A wake does.
+    f.json(
+        "liaison",
+        "mail.send",
+        json!({"id":"work","from":"captain","to":"liaison","kind":"request","body":"do the task"}),
+    );
+    f.ok(Some("liaison"), &["serve", "--json", "{\"once\":true}"]);
+    let jobs = f.json("liaison", "job.list", json!({}))["jobs"].clone();
+    let wake = jobs[0]["id"].as_str().unwrap().to_owned();
+    f.wait("liaison", &wake);
+    let woke = allow(&f);
+    assert!(carries(&woke), "{woke:?}");
+    // Revoked, the next launch no longer carries it.
+    f.json(
+        "liaison",
+        "captain_approval.revoke",
+        json!({"id":answered["approval"]["id"]}),
+    );
+    f.ok(Some("liaison"), &["start", "claude"]);
+    assert!(!carries(&allow(&f)));
+}
+
+#[test]
 fn attended_launches_receive_the_same_fleet_policy() {
     let f = Fleet::new();
     f.ok(None, &["permissions", "yolo"]);

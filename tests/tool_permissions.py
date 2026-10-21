@@ -221,6 +221,44 @@ class Permissions(unittest.TestCase):
         self.assertFalse(any(grant in a for a in allow("bizdev", "first_mate")))
         self.assertFalse(any(grant in a for a in allow("storefront", "crew")))
 
+    APPROVED = ("The captain approved this in reply r-1 to request q-1, for ship storefront only, "
+                "until 2026-10-22 12:00 UTC: Submit build 55 to TestFlight")
+
+    def test_the_captains_approvals_reach_only_a_first_mates_allow(self):
+        self.policy = {"mode":"standard", "claude_allow":[], "approved":[self.APPROVED]}
+        def settings(role, errand=False, actions=None):
+            req = self.request(permission_mode="auto")
+            req["context"].update(owner="storefront", role=role, errand=errand, actions=actions)
+            _, argv = build("claude", req)
+            return json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else None
+        # An approval alone, with no charter actions, still reaches the wake.
+        wake = settings("first_mate")
+        self.assertIn(self.APPROVED, wake["autoMode"]["allow"])
+        self.assertFalse(any(self.APPROVED in e for e in wake["autoMode"]["environment"]))
+        self.assertNotIn("deny", wake["autoMode"])
+        self.assertIn(self.APPROVED, settings("first_mate", actions=["inspect"])["autoMode"]["allow"])
+        for role, errand in [("crew", False), ("reviewer", False), ("first_mate", True)]:
+            with self.subTest(role=role, errand=errand):
+                found = settings(role, errand=errand, actions=["inspect"])
+                self.assertFalse(found and any(self.APPROVED in a for a in found["autoMode"]["allow"]))
+
+    def test_attended_argv_carries_the_captains_approvals(self):
+        value = {"mode":"standard", "claude_allow":[], "ship":"storefront", "approved":[self.APPROVED]}
+        argv = attended_argv("claude", ["claude"], value)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["autoMode"]["allow"][0], "$defaults")
+        self.assertIn(self.APPROVED, settings["autoMode"]["allow"])
+        self.assertFalse(any(self.APPROVED in e for e in settings["autoMode"]["environment"]))
+        # No approval and no actions: nothing for the classifier.
+        argv = attended_argv("claude", ["claude"], {"mode":"standard", "claude_allow":[], "approved":[]})
+        self.assertNotIn("--settings", argv)
+
+    def test_malformed_approvals_are_refused(self):
+        for approved in ["one", [1], [""], ["x" * 601], [f"a{i}" for i in range(9)], {"a": "b"}]:
+            with self.subTest(approved=approved):
+                with self.assertRaises(ValueError):
+                    attended_argv("claude", ["claude"], {"mode":"standard", "claude_allow":[], "approved":approved})
+
     def test_reviewer_role_restricts_supported_harnesses(self):
         req = self.request()
         req["context"]["role"] = "reviewer"

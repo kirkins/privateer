@@ -385,6 +385,9 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     for line in crate::block_ask::bearings_lines(store, ship)? {
         text.push_str(&format!("{line}\n"));
     }
+    for line in crate::captain_approvals::bearings_lines(store, ship)? {
+        text.push_str(&format!("{line}\n"));
+    }
     for (title, items) in [
         ("Open tasks", &tasks),
         ("Requests you owe a reply", &owed),

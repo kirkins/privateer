@@ -1243,6 +1243,12 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         }
         policy["ship"] = json!(ship);
         policy["role"] = json!("first_mate");
+        // The captain's live approvals, read at each launch of the pane.
+        policy["approved"] = json!(crate::captain_approvals::sentences(
+            &store,
+            &ship,
+            Store::now_ms()
+        )?);
         let policy = serde_json::to_string(&policy)?;
         let mut command = std::process::Command::new("python3");
         command.arg(plugins.join("native_launch.py"));
