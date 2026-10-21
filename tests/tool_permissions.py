@@ -114,11 +114,19 @@ class Permissions(unittest.TestCase):
         self.assertTrue(any("merge_green" in r for r in settings["autoMode"]["allow"]))
         self.assertTrue(any("publish_pr" in r for r in settings["autoMode"]["allow"]))
 
-        # GitHub forge
+        # GitHub forge: no gh merge rule; gh pr merge is disallowed outright and
+        # the auto-mode text sends merging through pr.merge after a review.
         req["context"]["forge"] = "github"
         _, argv = build("claude", req)
-        self.assertIn("Bash(gh pr merge *)", argv)
+        self.assertNotIn("Bash(gh pr merge *)", argv)
         self.assertIn("Bash(gh pr create *)", argv)
+        disallowed = argv[argv.index("--disallowedTools") + 1:]
+        self.assertIn("Bash(gh pr merge:*)", disallowed)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        merge_text = [r for r in settings["autoMode"]["allow"] if "merge_green" in r]
+        self.assertEqual(len(merge_text), 1)
+        self.assertIn("pr.merge after a top-tier review", merge_text[0])
+        self.assertNotIn("without a human review", merge_text[0])
 
         # Ship without merge_green
         req["context"]["actions"] = ["inspect", "implement", "test", "publish_pr"]

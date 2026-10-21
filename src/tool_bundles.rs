@@ -42,6 +42,18 @@ fn load(store: &Store) -> Result<Value> {
     .context("invalid tool bundle registry")
 }
 
+/// This home's approved bundle registry, if the captain configured one.
+pub(crate) fn registry(store: &Store) -> Result<Option<Value>> {
+    let raw: Option<String> = store
+        .connection()
+        .query_row("SELECT value FROM metadata WHERE key=?1", [KEY], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    raw.map(|raw| serde_json::from_str(&raw).context("invalid tool bundle registry"))
+        .transpose()
+}
+
 /// Use the same bounded, redacting adapter protocol as harness planning. This
 /// does not run a harness or read any native credential store.
 fn qualify(
@@ -143,6 +155,18 @@ pub(crate) fn configure(store: &mut Store, args: Value) -> Result<Value> {
         "bundle registry too large"
     );
     qualify(registry, None, crate::plugins::Wait::Declared)?;
+    // A forge token is never given to a launch: a ref forges.json names
+    // stays the runtime's own, for the forge adapter alone.
+    let forge_refs = crate::forges::credential_refs()?;
+    if let Some(named) = crate::forges::bundle_refs(registry)
+        .into_iter()
+        .find(|r| forge_refs.contains(r))
+    {
+        anyhow::bail!(
+            "credential {named} is a forge credential named in forges.json; a forge token is \
+             never given to a launch"
+        );
+    }
     // A name/version cannot be retargeted. Operators must publish a new ref
     // when content, path or roles change, even if an old ref was deselected.
     let tx = store.connection().unchecked_transaction()?;

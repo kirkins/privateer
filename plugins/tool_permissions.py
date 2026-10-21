@@ -86,12 +86,15 @@ CLAUDE_DELEGATION = ["Agent", "Task", "Workflow", "EnterWorktree"]
 CLAUDE_REVIEWER_ALLOWED = ["Read", "Grep", "Glob"]
 CLAUDE_REVIEWER_DISALLOWED = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]
 
+# Merging is not a gh rule: a ship merges through pr.merge, after a top-tier
+# review of the exact head, and `gh pr merge` is disallowed outright.
 BUILTIN_FORGE_RULES = {
     "github": {
         "publish_pr": "Bash(gh pr create *)",
-        "merge_green": "Bash(gh pr merge *)",
     },
 }
+# Merging goes through the runtime's pr.merge, never gh.
+CLAUDE_NO_FORGE_MERGE = ["Bash(gh pr merge:*)"]
 
 FORGE_ALIASES = {
     "gh": "github",
@@ -131,8 +134,8 @@ def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship
         return None
     allow = ["$defaults"]
     if "merge_green" in (actions or []):
-        allow.append("Merging this ship's own pull requests once CI is green is authorized by the ship's "
-                     "charter (merge_green), even without a human review.")
+        allow.append("Merging this ship's own pull requests (merge_green) goes through pr.merge after a "
+                     "top-tier review of the exact head; never merge with gh.")
     if "publish_pr" in (actions or []):
         allow.append("Creating and publishing pull requests is authorized by the ship's charter (publish_pr).")
     allow += [f"The captain has authorized this: {text}" for text in authorized]
@@ -183,7 +186,7 @@ def merge_auto_mode_settings(target_settings, incoming_settings):
 def claude_disallowed(role):
     if role == "reviewer":
         return CLAUDE_REVIEWER_DISALLOWED + CLAUDE_DETACHED + CLAUDE_DELEGATION
-    return CLAUDE_DETACHED + (CLAUDE_DELEGATION if role == "first_mate" else [])
+    return CLAUDE_DETACHED + (CLAUDE_DELEGATION if role == "first_mate" else []) + CLAUDE_NO_FORGE_MERGE
 
 
 def claude_rules(value, control=None, actions=None, forge=None, role=None, errand=False):

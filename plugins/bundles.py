@@ -298,15 +298,43 @@ def credential_directory(env):
     return Path(fleet).with_suffix('.credentials')
 
 
+def forge_refs(env):
+    """The credential refs the captain's forges.json names, beside the fleet
+    registry as the runtime resolves it. A forge token is the runtime's own,
+    for its forge adapter alone, so no launch is given one. A file that cannot
+    be read or parsed names every ref: the launch fails closed."""
+    path = credential_directory(env).with_suffix('.forges.json')
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    try:
+        repos = json.loads(raw)['repos']
+        refs = set()
+        for entry in repos.values():
+            for role in ('reviewer', 'merger'):
+                if isinstance(entry.get(role), dict) and isinstance(entry[role].get('credential'), str):
+                    refs.add(entry[role]['credential'])
+        return refs
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def credential_environment(value, env):
     """PRIVATEER_CREDENTIAL_<NAME>_FILE for each of the plan's own credentials,
     after checking its stored file: a regular 0600 file this user owns, in a
-    0700 directory, with bundle-path checks on every component. Never reads it."""
+    0700 directory, with bundle-path checks on every component. Never reads it.
+    A ref forges.json names is refused: forge tokens are never given to a launch."""
     found = {}
     require(isinstance(value, dict))
     credentials(value.get('credentials', []))
     if not value.get('credentials'):
         return found
+    banned = forge_refs(env)
+    require(banned is not None)
+    require(not any(item['ref'] in banned for item in value['credentials']))
     directory = credential_directory(env)
     require(present(directory))
     safe_path(str(directory), directory=True)

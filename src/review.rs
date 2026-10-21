@@ -14,13 +14,19 @@
 //!
 //! Settlement (from `errand::settle`) reads the verdict from the reply's
 //! last line and keeps only the structured findings, filtered (`filter`): a
-//! reply carrying a stored credential value or a path outside the worktree
-//! is refused and nothing of it is kept, so round B2 posts only filtered
-//! records. The worktree is removed then.
+//! reply carrying a secret or a path outside the worktree is refused and
+//! nothing of it is kept, so only filtered records are posted. The worktree
+//! is removed then, and the verdict is posted to the forge as the reviewer
+//! account (`post`): an approval only while the PR's head is still the one
+//! reviewed, or it is `stale`. A post that fails is retried on the next
+//! ticks (`tick`), idempotent through the review's marker, and the ship
+//! hears when it lands or is given up on.
 //!
-//! `pr.merge` runs every merge check in order and, in round B1, merges
-//! nothing: it says the merge may go ahead at the exact head. Round B2 adds
-//! posting to the forge and the merge itself.
+//! `pr.merge` runs every merge check in order, then merges as the merger
+//! account at exactly the head it checked, so a push since makes the forge
+//! refuse it. The repository must be in the captain's forges.json
+//! (`crate::forges`), which names its forge, protected branch, required
+//! checks and accounts.
 //!
 //! Only a first mate reviews or merges: crew are refused by the crew role's
 //! default deny, and an errand is refused here. Under one OS user this is a
@@ -46,6 +52,14 @@ const NO_VERDICT_ATTEMPTS: i64 = 2;
 const CAPTAIN_NOTICE_AT: i64 = 4;
 /// Reviews shown in a ship's bearings.
 const BEARINGS_REVIEWS: i64 = 5;
+/// Tries at posting one verdict: at settlement, then on each of the next
+/// three ticks.
+const POST_TRIES: i64 = 4;
+/// Days a settled review's folder (its diff and text) is kept.
+const FOLDER_DAYS: i64 = 7;
+
+pub(crate) use filter::clip;
+pub(crate) use pr::run as run_bounded;
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -63,6 +77,23 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS review_pr ON reviews(repo, pr, created_ms);
          CREATE INDEX IF NOT EXISTS review_ship ON reviews(ship, created_ms);",
     )?;
+    // Round B2: the forges.json entry a review posts through, and its tries.
+    let columns: Vec<String> = store
+        .connection()
+        .prepare("SELECT name FROM pragma_table_info('reviews')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (column, definition) in [
+        ("forge_key", "TEXT"),
+        ("post_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("folder_removed_ms", "INTEGER"),
+    ] {
+        if !columns.iter().any(|c| c == column) {
+            store.connection().execute_batch(&format!(
+                "ALTER TABLE reviews ADD COLUMN {column} {definition};"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -89,9 +120,13 @@ fn pr_number(args: &Value) -> Result<u64> {
         .context("pr must be a pull request number")
 }
 
-/// The task, its charter and its clone, for a ship that owns the task and may
-/// merge its work.
-fn task_clone(store: &Store, ship: &str, args: &Value) -> Result<(String, PathBuf, pr::Clone)> {
+/// The task, its charter, its clone and the clone's forges.json entry, for a
+/// ship that owns the task and may merge its work.
+fn task_clone(
+    store: &Store,
+    ship: &str,
+    args: &Value,
+) -> Result<(String, PathBuf, pr::Clone, crate::forges::Repo)> {
     let task_id = required(args, "task_id")?.to_owned();
     let charter = store.authorize(&task_id, "merge_green")?;
     ensure!(
@@ -105,7 +140,8 @@ fn task_clone(store: &Store, ship: &str, args: &Value) -> Result<(String, PathBu
         .map(|r| r.as_str().context("repo must be owner/name"))
         .transpose()?;
     let clone = pr::locate(&charter_repo, requested)?;
-    Ok((task_id, charter_repo, clone))
+    let forge = crate::forges::for_origin(clone.host.as_deref(), &clone.repo)?;
+    Ok((task_id, charter_repo, clone, forge))
 }
 
 /// The author routes a ship declares, one per crew job whose own route
@@ -281,8 +317,9 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
         "notes are at most {NOTES_CHARS} characters"
     );
     let declared = declarations(args)?;
-    let (task_id, charter_repo, clone) = task_clone(store, &ship, args)?;
-    let live = pr::view(&clone, number)?;
+    let (task_id, charter_repo, clone, forge) = task_clone(store, &ship, args)?;
+    let required = crate::forges::required_checks(&forge)?;
+    let live = pr::view(&forge, number, &required)?;
     ensure!(
         live.state == "open",
         "#{number} in {} is {}; only an open pull request is reviewed",
@@ -362,14 +399,14 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
             "INSERT INTO reviews(id, ship, task_id, forge, repo, pr, base_ref, base_sha, head_ref,
                head_sha, head_tree, errand_id, route_name, route_identity, route_model, route_tier,
                route_uses, route_why, overlap, fresh, authors, declared, folder, clone, verdict,
-               post_state, created_ms)
+               post_state, created_ms, forge_key)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,
-               ?23,?24,'running','none',?25)",
+               ?23,?24,'running','none',?25,?26)",
             params![
                 id,
                 ship,
                 task_id,
-                clone.forge,
+                forge.forge,
                 clone.repo,
                 number,
                 live.base,
@@ -390,7 +427,8 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
                 declared_json(&declared).to_string(),
                 path(&folder),
                 path(&clone.dir),
-                Store::now_ms()
+                Store::now_ms(),
+                forge.key
             ],
         )?;
         tx.commit()?;
@@ -566,6 +604,8 @@ pub(crate) fn settle(
                 Store::now_ms()
             ],
         )?;
+        pr::remove(Some(Path::new(&clone)), &folder);
+        post(store, &id)?;
     }
     pr::remove(Some(Path::new(&clone)), &folder);
     store.connection().execute(
@@ -595,9 +635,10 @@ fn summary(review: &Value) -> String {
     let verdict = text("verdict");
     let mut body = match verdict.as_str() {
         "approve" | "changes_requested" => format!(
-            "Review of #{number} at {}: {}, not posted (posting to the forge arrives in round B2).\n",
+            "Review of #{number} at {}: {}, {}.\n",
             short(&head),
-            verdict_word(&verdict)
+            verdict_word(&verdict),
+            post_words(review)
         ),
         "none" => format!(
             "Review of #{number} at {}: no verdict, because {}. Nothing will be posted.\n",
@@ -651,10 +692,34 @@ fn summary(review: &Value) -> String {
     body
 }
 
+/// What became of a verdict's post, for its notices.
+fn post_words(review: &Value) -> String {
+    let error = review["post_error"].as_str().unwrap_or_default();
+    match review["post_state"].as_str().unwrap_or_default() {
+        "posted" => "posted".to_owned(),
+        "stale" => format!(
+            "not posted: {error}; the approval is stale, and a new review.start reviews the new head"
+        ),
+        "failed" => {
+            let left = POST_TRIES - review["post_attempts"].as_i64().unwrap_or_default();
+            if left > 0 {
+                format!("not posted yet: {error}; it is tried again {left} more time(s)")
+            } else {
+                format!(
+                    "not posted: {error}; posting gave up after {POST_TRIES} tries, so the \
+                     captain's reviewer token or the forge needs attention"
+                )
+            }
+        }
+        _ => "not posted yet".to_owned(),
+    }
+}
+
 const COLUMNS: &str = "id, ship, task_id, forge, repo, pr, base_ref, base_sha, head_ref, head_sha,
     errand_id, route_name, route_identity, route_model, route_tier, route_uses, route_why, overlap,
     fresh, authors, declared, verdict, findings, refusal, post_state, created_ms, finished_ms,
-    cleaned_ms";
+    cleaned_ms, forge_key, post_attempts, forge_review_id, post_error, posted_ms, merged_ms,
+    merge_sha, folder";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     let parsed = |at: usize| -> rusqlite::Result<Value> {
@@ -677,6 +742,14 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "refusal": r.get::<_, Option<String>>(23)?, "post_state": r.get::<_, String>(24)?,
         "created_ms": r.get::<_, i64>(25)?, "finished_ms": r.get::<_, Option<i64>>(26)?,
         "cleaned_ms": r.get::<_, Option<i64>>(27)?,
+        "forge_key": r.get::<_, Option<String>>(28)?,
+        "post_attempts": r.get::<_, i64>(29)?,
+        "forge_review_id": r.get::<_, Option<String>>(30)?,
+        "post_error": r.get::<_, Option<String>>(31)?,
+        "posted_ms": r.get::<_, Option<i64>>(32)?,
+        "merged_ms": r.get::<_, Option<i64>>(33)?,
+        "merge_sha": r.get::<_, Option<String>>(34)?,
+        "folder": r.get::<_, String>(35)?,
     }))
 }
 
@@ -686,6 +759,178 @@ fn record(store: &Store, id: &str) -> Result<Value> {
         [id],
         row,
     )?)
+}
+
+/// The review as the forge shows it: the verdict, the reviewer route, the
+/// filtered findings, and the marker that makes posting idempotent. Built
+/// from the stored record alone; nothing of the reply beyond its filtered
+/// findings is in it.
+fn post_body(review: &Value) -> String {
+    let text = |key: &str| review[key].as_str().unwrap_or_default();
+    let mut body = format!(
+        "**Privateer review: {}** at `{}`\n\nReviewed by route {} ({}, tier {}) in a fresh, \
+         read-only session.\n",
+        verdict_word(text("verdict")),
+        text("head_sha"),
+        text("route_name"),
+        text("route_identity"),
+        review["route_tier"]
+    );
+    let findings: Vec<Finding> =
+        serde_json::from_value(review["findings"].clone()).unwrap_or_default();
+    if findings.is_empty() {
+        body.push_str("\nNo findings.\n");
+    } else {
+        body.push_str("\nFindings:\n");
+        for f in &findings {
+            body.push_str(&format!(
+                "- {} `{}:{}` {}\n",
+                f.severity, f.file, f.line, f.text
+            ));
+        }
+    }
+    body.push_str(&format!("\n<!-- privateer-review {} -->\n", text("id")));
+    body
+}
+
+/// Post a finished verdict to the forge as the reviewer account, once: an
+/// approval only while the PR is open at the reviewed head, else it is
+/// `stale`; a change request at the reviewed head whatever the PR's head is
+/// now. A failure is recorded as `failed` with its try counted; the forge
+/// adapter finds the review's marker among the reviewer's reviews before it
+/// posts, so a try after a post whose reply was lost posts nothing twice.
+fn post(store: &Store, id: &str) -> Result<()> {
+    let review = record(store, id)?;
+    let verdict = review["verdict"].as_str().unwrap_or_default();
+    if !matches!(review["post_state"].as_str(), Some("pending" | "failed"))
+        || !matches!(verdict, "approve" | "changes_requested")
+    {
+        return Ok(());
+    }
+    let head = review["head_sha"].as_str().unwrap_or_default().to_owned();
+    let number = review["pr"].as_u64().unwrap_or_default();
+    let tried = (|| -> Result<std::result::Result<Option<String>, String>> {
+        let forge = crate::forges::for_key(
+            review["forge_key"]
+                .as_str()
+                .context("the review names no forges.json entry")?,
+        )?;
+        if verdict == "approve" {
+            let required = crate::forges::required_checks(&forge)?;
+            let live = pr::view(&forge, number, &required)?;
+            if live.state != "open" {
+                return Ok(Err(format!("#{number} is {}", live.state)));
+            }
+            if live.head_sha != head {
+                return Ok(Err(format!(
+                    "the head moved to {} before it was posted",
+                    short(&live.head_sha)
+                )));
+            }
+        }
+        let reply = crate::forges::call(
+            &forge,
+            &forge.reviewer,
+            "review.post",
+            json!({"pr": number, "commit_id": head,
+                "event": if verdict == "approve" { "APPROVE" } else { "REQUEST_CHANGES" },
+                "body": post_body(&review), "reviewer": forge.reviewer.account}),
+        )?;
+        Ok(Ok(match &reply["review_id"] {
+            Value::Null => None,
+            Value::String(id) => Some(id.clone()),
+            other => Some(other.to_string()),
+        }))
+    })();
+    let connection = store.connection();
+    match tried {
+        Ok(Ok(forge_id)) => connection.execute(
+            "UPDATE reviews SET post_state='posted', forge_review_id=?2, posted_ms=?3,
+               post_error=NULL, post_attempts=post_attempts+1
+             WHERE id=?1 AND post_state IN ('pending','failed')",
+            params![id, forge_id, Store::now_ms()],
+        )?,
+        Ok(Err(why)) => connection.execute(
+            "UPDATE reviews SET post_state='stale', post_error=?2
+             WHERE id=?1 AND post_state IN ('pending','failed')",
+            params![id, why],
+        )?,
+        Err(error) => connection.execute(
+            "UPDATE reviews SET post_state='failed', post_error=?2, post_attempts=post_attempts+1
+             WHERE id=?1 AND post_state IN ('pending','failed')",
+            params![id, filter::clip(&format!("{error:#}"), 300)],
+        )?,
+    };
+    Ok(())
+}
+
+/// Each tick: try again the verdicts whose post failed or never ran (a
+/// restart between settlement and posting), telling the ship when one lands
+/// late, goes stale or is given up on; and remove the folders of reviews
+/// settled more than a week ago.
+pub(crate) fn tick(store: &Store) -> Result<Vec<Value>> {
+    let due: Vec<(String, String)> = store
+        .connection()
+        .prepare(
+            "SELECT id, post_state FROM reviews WHERE post_state IN ('pending','failed')
+               AND verdict IN ('approve','changes_requested') AND post_attempts < ?1
+             ORDER BY finished_ms LIMIT 10",
+        )?
+        .query_map([POST_TRIES], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut tried = vec![];
+    for (id, before) in due {
+        post(store, &id)?;
+        let review = record(store, &id)?;
+        let after = review["post_state"].as_str().unwrap_or_default().to_owned();
+        let attempts = review["post_attempts"].as_i64().unwrap_or_default();
+        let notice = match after.as_str() {
+            "posted" if before == "failed" => Some(("posted", "normal")),
+            "stale" => Some(("stale", "normal")),
+            "failed" if attempts >= POST_TRIES => Some(("post-failed", "normal")),
+            _ => None,
+        };
+        if let Some((what, urgency)) = notice {
+            crate::mail::record_crew(
+                store.connection(),
+                &json!({"id": format!("{id}-{what}"), "to": review["ship"], "kind": "notice",
+                    "task_id": review["task_id"], "urgency": urgency,
+                    "payload": {"review": id, "post_state": after},
+                    "body": format!("Review of #{} at {}: {}, {}.\nReview {id}; review.list shows it.\n",
+                        review["pr"], short(review["head_sha"].as_str().unwrap_or_default()),
+                        verdict_word(review["verdict"].as_str().unwrap_or_default()),
+                        post_words(&review))}),
+            )?;
+        }
+        tried.push(json!({"review": id, "post_state": after}));
+    }
+    // Old review folders: only this home's own, by the path recorded.
+    let reviews = store.home().join("reviews");
+    let old = store
+        .connection()
+        .prepare(
+            "SELECT id, folder FROM reviews WHERE cleaned_ms IS NOT NULL AND finished_ms < ?1
+               AND folder_removed_ms IS NULL ORDER BY finished_ms LIMIT 20",
+        )?
+        .query_map([Store::now_ms() - FOLDER_DAYS * 86_400_000], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    for (id, folder) in old {
+        store.connection().execute(
+            "UPDATE reviews SET folder_removed_ms=?2 WHERE id=?1",
+            params![id, Store::now_ms()],
+        )?;
+        let folder = PathBuf::from(folder);
+        if folder.parent().and_then(|p| std::fs::canonicalize(p).ok())
+            == std::fs::canonicalize(&reviews).ok()
+            && folder.is_dir()
+            && !folder.join("tree").exists()
+        {
+            let _ = std::fs::remove_dir_all(&folder);
+        }
+    }
+    Ok(tried)
 }
 
 /// `review.list {"ship"?, "pr"?, "repo"?}`: an agent sees its own ship's.
@@ -729,7 +974,13 @@ pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
             let findings = r["findings"].as_array().map_or(0, Vec::len);
             match text("verdict") {
                 "running" => format!("#{number} {head} review running {by} ({})", text("errand_id")),
-                "approve" => format!("#{number} {head} APPROVE {by}, not posted yet{declared}"),
+                "approve" if r["merged_ms"].is_i64() => {
+                    format!("#{number} {head} APPROVE {by}, posted and merged{declared}")
+                }
+                "approve" => format!(
+                    "#{number} {head} APPROVE {by}, {}{declared}",
+                    filter::clip(&post_words(r), 160)
+                ),
                 "changes_requested" => format!(
                     "#{number} {head} CHANGES_REQUESTED {by}: {findings} finding(s) in {}{declared}",
                     text("id")
@@ -745,14 +996,16 @@ pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
 }
 
 /// `pr.merge {"task_id", "pr", "repo"?, "deploys_production"?, "environment"?}`:
-/// every merge check, in order. Round B1 merges nothing.
+/// every merge check, in order, then the merge itself at the checked head.
 fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     let ship = first_mate(store, "pr.merge")?;
     let number = pr_number(args)?;
-    let (task_id, _, clone) = task_clone(store, &ship, args)?;
+    let (task_id, _, clone, forge) = task_clone(store, &ship, args)?;
     let mut checks = vec![];
-    // 1. The live PR, read from the forge now.
-    let live = pr::view(&clone, number)?;
+    // 1. The live PR, read from the forge now, its required checks from
+    // forges.json or branch protection, never every check.
+    let checks_needed = crate::forges::required_checks(&forge)?;
+    let live = pr::view(&forge, number, &checks_needed)?;
     let head = live.head_sha.clone();
     ensure!(
         live.state == "open",
@@ -760,7 +1013,9 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         clone.repo,
         live.state
     );
-    let branch = pr::default_branch(&clone.dir)?;
+    // The protected branch is the captain's, from forges.json: never the
+    // clone's origin/HEAD, which a ship can change.
+    let branch = forge.branch.clone();
     ensure!(
         live.base == branch,
         "#{number} merges into {}, not the protected branch {branch}",
@@ -772,7 +1027,9 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         short(&head),
         live.checks_detail
     );
-    checks.push(json!({"check": "live_pr", "head": head, "base": branch}));
+    checks.push(
+        json!({"check": "live_pr", "head": head, "base": branch, "required_checks": checks_needed}),
+    );
     // 2. A finished approving review at that exact head.
     let latest: Option<String> = store
         .connection()
@@ -825,8 +1082,10 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         verdict_word(verdict)
     );
     ensure!(
-        review["post_state"] != "stale",
-        "#{number}'s approval {review_id} is stale: the head moved before it was posted"
+        review["post_state"] == "posted",
+        "#{number}'s approval {review_id} is {}: the forge must hold the reviewer's approval \
+         at the head before a merge",
+        post_words(&review)
     );
     let name = review["route_name"].as_str().unwrap_or_default().to_owned();
     let recorded_uses = review["route_uses"].as_array().cloned().unwrap_or_default();
@@ -895,8 +1154,8 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     }
     checks.push(json!({"check": "authors", "authors": authors_json(&authors)}));
     // 5. Production: a merge that deploys needs an approval of this exact
-    // artifact and environment. Round B1 merges nothing, so it is checked and
-    // left unconsumed.
+    // artifact and environment, used up by the merge.
+    let mut production = None;
     if args.get("deploys_production") == Some(&json!(true)) {
         let environment = required(args, "environment")?;
         let charter = store.authorize(&task_id, "merge_green")?;
@@ -912,24 +1171,60 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         let Some(approval) = approval else {
             bail!("production requires approval of this exact artifact and environment");
         };
-        checks.push(json!({"check": "production", "approval": approval, "consumed": false}));
+        checks.push(json!({"check": "production", "approval": approval}));
+        production = Some((
+            approval,
+            environment.to_owned(),
+            crate::core::hash(&charter),
+        ));
     }
-    // 6. The merge would pass the expected head, so a push since step 1
-    // makes the forge refuse it.
+    // 6. The merge, as the merger account, passing the expected head: a push
+    // since step 1 makes the forge refuse it.
+    let merged = crate::forges::call(
+        &forge,
+        &forge.merger,
+        "pr.merge",
+        json!({"pr": number, "head_sha": head, "merge_method": "merge"}),
+    )
+    .with_context(|| format!("merge #{number} at {}", short(&head)))?;
+    ensure!(
+        merged["merged"] != false,
+        "the forge did not merge #{number}: {}",
+        merged["message"].as_str().unwrap_or("no reason given")
+    );
+    let merge_sha = merged["merge_sha"].as_str().map(str::to_owned);
+    let tx = store.write_transaction()?;
+    if let Some((approval, environment, charter_hash)) = &production {
+        let used = tx.execute(
+            "UPDATE approvals SET consumed=1 WHERE id=?1 AND task_id=?2 AND artifact=?3
+               AND environment=?4 AND charter_hash=?5 AND consumed=0",
+            params![approval, task_id, head, environment, charter_hash],
+        )?;
+        ensure!(
+            used == 1,
+            "#{number} merged at {}, but production approval {approval} was used up meanwhile; \
+             tell the captain",
+            short(&head)
+        );
+    }
+    tx.execute(
+        "UPDATE reviews SET merged_ms=?2, merge_sha=?3 WHERE id=?1",
+        params![review_id, Store::now_ms(), merge_sha],
+    )?;
+    tx.commit()?;
     store.audit(
-        "pr.merge.checked",
-        &json!({"ship": ship, "repo": clone.repo, "pr": number, "head": head, "review": review_id}),
+        "pr.merge",
+        &json!({"ship": ship, "repo": forge.key, "pr": number, "head": head, "review": review_id,
+            "merge_sha": merge_sha, "production": production.as_ref().map(|p| &p.0)}),
     )?;
     Ok(json!({
-        "allowed": true,
-        "merged": false,
+        "merged": true,
         "repo": clone.repo,
         "pr": number,
-        "expected_head": head,
+        "head": head,
+        "merge_sha": merge_sha,
         "review": review_id,
         "checks": checks,
-        "note": "Round B1 runs every merge check and merges nothing. Until round B2, merge as \
-                 before, at exactly this head.",
     }))
 }
 

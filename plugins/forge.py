@@ -24,7 +24,8 @@ opener is built with an empty ProxyHandler, so the Authorization header is
 never relayed through a proxy.
 
 Operations:
-  - pr.view: reads state, base, head sha, mergeable, and required checks at head
+  - pr.view: reads state, base, head sha and ref, title, body, url, mergeable,
+    and required checks at head
   - review.post: posts review (marker lookup to ensure idempotency)
   - pr.merge: executes merge passing the expected head commit (merge method only)
   - protection.read: reads branch protection and returns configured settings and warnings
@@ -464,6 +465,10 @@ def pr_view(request):
         "base": (pr_data.get("base") or {}).get("ref"),
         "base_sha": (pr_data.get("base") or {}).get("sha"),
         "head_sha": head_sha,
+        "head_ref": (pr_data.get("head") or {}).get("ref"),
+        "title": pr_data.get("title") or "",
+        "body": pr_data.get("body") or "",
+        "url": pr_data.get("html_url") or pr_data.get("url") or "",
         "mergeable": pr_data.get("mergeable"),
         "merged": pr_data.get("merged", False),
         "checks": checks,

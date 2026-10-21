@@ -28,6 +28,7 @@ mod executable;
 mod feed;
 pub mod files;
 pub mod fleet;
+pub mod forges;
 pub mod grants;
 pub mod herdr;
 pub mod host;
@@ -103,6 +104,8 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "credential.set",
     "credential.list",
     "credential.remove",
+    "forges.set",
+    "forges.show",
     "stow.start",
     "stow.status",
     "stow.resume",
@@ -161,6 +164,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "permissions" => permissions::dispatch(store, command, args),
         "routes" => crew_routes::dispatch(store, command, args),
+        "forges" => forges::dispatch(store, command, args),
         "work" => scheduling::dispatch(store, command, args),
         "task" if matches!(command, "task.enqueue" | "task.defer") => {
             scheduling::dispatch(store, command, args)

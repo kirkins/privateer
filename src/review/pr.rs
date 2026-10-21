@@ -1,13 +1,11 @@
 //! The pull request a review or a merge check reads, read by the runtime
 //! itself, never taken from the ship, and the local checkout it is read in.
 //!
-//! Round B1 reads GitHub through the ship user's own `gh` login, read only:
-//! `gh pr view` for the PR and `gh pr checks` for its checks at the head.
-//! Round B2 replaces this with `plugins/forge.py pr.view` and `forges.json`.
-//! A debug build (the test suites) may name a fake adapter in
-//! `PRIVATEER_FORGE_ADAPTER`, run as `<adapter> pr.view` with the request on
-//! stdin, as forge.py is; a release build ignores the variable, so a ship
-//! cannot swap the reader by its environment.
+//! The PR is read through the forge adapter (`crate::forges::call`,
+//! `pr.view`) with the reviewer account's token, for the repository's entry
+//! in the captain's forges.json: its forge, API, protected branch and
+//! required checks come from there, never from the clone, whose remote and
+//! git config a ship can change.
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -21,12 +19,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Changed files the prompt lists; the rest are in files.txt.
 const LISTED_FILES: usize = 100;
 
-/// The local clone of a PR's repository: its folder, its forge kind and its
-/// `owner/name`.
+/// The local clone of a PR's repository: its folder, its origin's host
+/// (none for a local path) and its `owner/name`.
 #[derive(Clone, Debug)]
 pub struct Clone {
     pub dir: PathBuf,
-    pub forge: String,
+    pub host: Option<String>,
     pub repo: String,
 }
 
@@ -61,7 +59,7 @@ pub struct Files {
 
 /// Run a command with a bounded wait, its stdin given and its stdout and
 /// stderr read whole.
-fn run(mut command: Command, input: Option<&[u8]>) -> Result<std::process::Output> {
+pub fn run(mut command: Command, input: Option<&[u8]>) -> Result<std::process::Output> {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -184,14 +182,9 @@ pub fn locate(charter_repo: &Path, requested: Option<&str>) -> Result<Clone> {
         let Some((host, repo)) = repo_of_url(&url) else {
             continue;
         };
-        let forge = git(&dir, &["config", "--get", "privateer.forge"])
-            .ok()
-            .filter(|f| !f.is_empty())
-            .or_else(|| (host.as_deref() == Some("github.com")).then(|| "github".to_owned()))
-            .unwrap_or_default();
-        clones.push(Clone { dir, forge, repo });
+        clones.push(Clone { dir, host, repo });
     }
-    let found = match requested {
+    match requested {
         Some(repo) => clones
             .into_iter()
             .find(|c| c.repo.eq_ignore_ascii_case(repo))
@@ -200,7 +193,7 @@ pub fn locate(charter_repo: &Path, requested: Option<&str>) -> Result<Clone> {
                     "no clone of {repo} in {} or its projects/ folder",
                     charter_repo.display()
                 )
-            })?,
+            }),
         None => {
             ensure!(
                 clones.len() == 1,
@@ -208,34 +201,9 @@ pub fn locate(charter_repo: &Path, requested: Option<&str>) -> Result<Clone> {
                 charter_repo.display(),
                 clones.len()
             );
-            clones.remove(0)
+            Ok(clones.remove(0))
         }
-    };
-    ensure!(
-        !found.forge.is_empty(),
-        "the forge of {} is unknown: set it with git config privateer.forge github",
-        found.repo
-    );
-    Ok(found)
-}
-
-/// The branch the charter's PRs merge into: origin's default branch.
-pub fn default_branch(dir: &Path) -> Result<String> {
-    if let Ok(head) = git(
-        dir,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) {
-        return Ok(head.strip_prefix("origin/").unwrap_or(&head).to_owned());
     }
-    let advertised = git(dir, &["ls-remote", "--symref", "origin", "HEAD"])?;
-    advertised
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("ref: refs/heads/")
-                .and_then(|s| s.split_whitespace().next())
-                .map(str::to_owned)
-        })
-        .context("cannot determine origin's default branch")
 }
 
 fn sha(value: &Value, what: &str) -> Result<String> {
@@ -254,34 +222,16 @@ fn text(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_owned()
 }
 
-/// The PR as the forge reports it now.
-pub fn view(clone: &Clone, number: u64) -> Result<Pr> {
-    if cfg!(debug_assertions)
-        && let Some(adapter) = std::env::var_os("PRIVATEER_FORGE_ADAPTER").filter(|a| !a.is_empty())
-    {
-        return view_adapter(Path::new(&adapter), clone, number);
-    }
-    ensure!(
-        clone.forge == "github",
-        "round B1 reads only GitHub pull requests; {} on {} needs forges.json (round B2)",
-        clone.repo,
-        clone.forge
-    );
-    view_gh(clone, number)
-}
-
-fn view_adapter(adapter: &Path, clone: &Clone, number: u64) -> Result<Pr> {
-    let mut command = Command::new(adapter);
-    command.arg("pr.view");
-    let request = json!({"forge": clone.forge, "repo": clone.repo, "pr": number});
-    let output = run(command, Some(request.to_string().as_bytes()))?;
-    let reply: Value = serde_json::from_slice(&output.stdout)
-        .context("the forge adapter's pr.view reply is not JSON")?;
-    ensure!(
-        reply["ok"] == true,
-        "the forge adapter could not read #{number}: {}",
-        reply["error"].as_str().unwrap_or("no reason given")
-    );
+/// The PR as the forge reports it now, its `required` checks judged at the
+/// head.
+pub fn view(forge: &crate::forges::Repo, number: u64, required: &[String]) -> Result<Pr> {
+    let reply = crate::forges::call(
+        forge,
+        &forge.reviewer,
+        "pr.view",
+        json!({"pr": number, "required_checks": required}),
+    )
+    .with_context(|| format!("read #{number} in {}", forge.key))?;
     let failing: Vec<String> = reply["checks_not_success"]
         .as_array()
         .map(|a| {
@@ -292,7 +242,11 @@ fn view_adapter(adapter: &Path, clone: &Clone, number: u64) -> Result<Pr> {
         })
         .unwrap_or_default();
     Ok(Pr {
-        state: text(&reply["state"]).to_ascii_lowercase(),
+        state: if reply["merged"] == true {
+            "merged".to_owned()
+        } else {
+            text(&reply["state"]).to_ascii_lowercase()
+        },
         base: text(&reply["base"]),
         base_sha: sha(&reply["base_sha"], "base sha")?,
         head_sha: sha(&reply["head_sha"], "head sha")?,
@@ -300,7 +254,7 @@ fn view_adapter(adapter: &Path, clone: &Clone, number: u64) -> Result<Pr> {
         title: text(&reply["title"]),
         body: text(&reply["body"]),
         url: text(&reply["url"]),
-        checks_ok: reply["required_checks_ok"] == true,
+        checks_ok: reply["required_checks_ok"] == true && !required.is_empty(),
         checks_detail: if failing.is_empty() {
             String::new()
         } else {
@@ -309,81 +263,8 @@ fn view_adapter(adapter: &Path, clone: &Clone, number: u64) -> Result<Pr> {
     })
 }
 
-fn gh(args: &[&str]) -> Result<(bool, Vec<u8>, String)> {
-    let mut command = Command::new("gh");
-    command.args(args).env("GH_PROMPT_DISABLED", "1");
-    let output = run(command, None).context("run gh to read the pull request")?;
-    Ok((
-        output.status.success(),
-        output.stdout,
-        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-    ))
-}
-
-fn view_gh(clone: &Clone, number: u64) -> Result<Pr> {
-    let n = number.to_string();
-    let (ok, stdout, stderr) = gh(&[
-        "pr",
-        "view",
-        &n,
-        "--repo",
-        &clone.repo,
-        "--json",
-        "state,baseRefName,baseRefOid,headRefName,headRefOid,title,body,url",
-    ])?;
-    ensure!(ok, "gh could not read #{n} in {}: {stderr}", clone.repo);
-    let pr: Value = serde_json::from_slice(&stdout).context("gh pr view did not reply JSON")?;
-    // The required checks, as the forge's branch protection names them; with
-    // none required, every check at the head.
-    let checks = |required: bool| -> Result<Option<Vec<Value>>> {
-        let mut args = vec!["pr", "checks", &n, "--repo", &clone.repo];
-        if required {
-            args.push("--required");
-        }
-        args.extend(["--json", "name,bucket"]);
-        let (_, stdout, _) = gh(&args)?;
-        Ok(serde_json::from_slice::<Vec<Value>>(&stdout)
-            .ok()
-            .filter(|c| !c.is_empty()))
-    };
-    let found = match checks(true)? {
-        Some(found) => Some(found),
-        None => checks(false)?,
-    };
-    let (checks_ok, checks_detail) = match found {
-        None => (false, "no checks reported at the head".to_owned()),
-        Some(found) => {
-            let failing: Vec<String> = found
-                .iter()
-                .filter(|c| !matches!(c["bucket"].as_str(), Some("pass" | "skipping")))
-                .map(|c| format!("{} ({})", text(&c["name"]), text(&c["bucket"])))
-                .collect();
-            (
-                failing.is_empty(),
-                if failing.is_empty() {
-                    String::new()
-                } else {
-                    format!("not green: {}", failing.join(", "))
-                },
-            )
-        }
-    };
-    Ok(Pr {
-        state: text(&pr["state"]).to_ascii_lowercase(),
-        base: text(&pr["baseRefName"]),
-        base_sha: sha(&pr["baseRefOid"], "base sha")?,
-        head_sha: sha(&pr["headRefOid"], "head sha")?,
-        head_ref: text(&pr["headRefName"]),
-        title: text(&pr["title"]),
-        body: text(&pr["body"]),
-        url: text(&pr["url"]),
-        checks_ok,
-        checks_detail,
-    })
-}
-
-/// Fetch commits the clone lacks from origin: by sha, then, on GitHub, the
-/// PR's head ref.
+/// Fetch commits the clone lacks from origin: by sha, then the PR's head
+/// ref, which GitHub and Forgejo both publish.
 pub fn fetch(clone: &Clone, number: u64, shas: &[&str]) -> Result<()> {
     let present = |sha: &str| {
         git(
@@ -399,7 +280,7 @@ pub fn fetch(clone: &Clone, number: u64, shas: &[&str]) -> Result<()> {
     let mut args = vec!["fetch", "--no-tags", "--quiet", "origin"];
     args.extend(missing.iter().copied());
     let by_sha = git(&clone.dir, &args);
-    if clone.forge == "github" && missing.iter().any(|s| !present(s)) {
+    if missing.iter().any(|s| !present(s)) {
         let pull = format!("refs/pull/{number}/head");
         git(
             &clone.dir,

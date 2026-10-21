@@ -197,7 +197,10 @@ class ForgeAdapterTest(unittest.TestCase):
             ("GET", f"/repos/{GH_REPO}/pulls/10"): (200, {
                 "state": "open",
                 "base": {"ref": "main", "sha": BASE_SHA},
-                "head": {"sha": HEAD_SHA},
+                "head": {"sha": HEAD_SHA, "ref": "privateer/abc/def/1"},
+                "title": "Fix the widget",
+                "body": "It works.",
+                "html_url": "https://github.com/kirkins/privateer/pull/10",
                 "mergeable": True,
                 "merged": False,
             }),
@@ -260,6 +263,16 @@ class ForgeAdapterTest(unittest.TestCase):
             self.server.get_requests()[0]["headers"].get("authorization"),
             f"Bearer {TOKEN}",
         )
+
+    def test_pr_view_carries_the_head_ref_and_the_authors_text(self):
+        # The runtime finds the task from the head branch and builds the
+        # review prompt from the title and body: pr.view returns them.
+        self.gh_routes_pr_view()
+        res = forge.handle("pr.view", self.gh_request(required_checks=["runtime (ubuntu-latest)"]))
+        self.assertEqual(res["head_ref"], "privateer/abc/def/1")
+        self.assertEqual(res["title"], "Fix the widget")
+        self.assertEqual(res["body"], "It works.")
+        self.assertEqual(res["url"], "https://github.com/kirkins/privateer/pull/10")
 
     def test_missing_token_file_fails_with_no_request(self):
         os.environ["PRIVATEER_FORGE_TOKEN_FILE"] = str(

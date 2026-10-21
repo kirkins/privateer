@@ -206,6 +206,25 @@ pub(crate) fn stored_values() -> Result<Vec<Vec<u8>>> {
     Ok(values)
 }
 
+/// The file holding a stored credential, for the one child process the
+/// runtime gives it to (the forge adapter): a regular 0600 file, one link,
+/// in the checked directory. Never its value.
+pub(crate) fn file_of(name: &str) -> Result<PathBuf> {
+    ensure!(valid_ref(name), "invalid credential ref {name}");
+    let dir = checked(false)?.with_context(|| {
+        format!("credential {name} is not stored; store it with credential.set")
+    })?;
+    let path = dir.join(name);
+    let info = fs::symlink_metadata(&path).with_context(|| {
+        format!("credential {name} is not stored; store it with credential.set")
+    })?;
+    ensure!(
+        info.file_type().is_file() && info.mode() & 0o777 == 0o600 && info.nlink() == 1,
+        "credential {name} is not a private 0600 file; store it again with credential.set"
+    );
+    Ok(path)
+}
+
 fn remove(args: &Value) -> Result<Value> {
     let name = reference(args, "credential.remove")?;
     let Some(dir) = checked(false)? else {
