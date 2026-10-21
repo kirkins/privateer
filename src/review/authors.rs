@@ -230,20 +230,32 @@ pub fn compute(
 
 /// The task a PR head branch was cut from, when it is one of this home's
 /// workspace branches: `privateer/<home_hash>/<hash(task)>/<generation>`.
-/// The ship's word for the task is never taken.
+/// The ship's word for the task is never taken. A branch of that shape from
+/// another home, or naming no task of this one, is refused: its crews are
+/// another home's jobs, which this home cannot count, and the merge-base
+/// fallback over this home's own jobs would leave them out of the author set.
+/// Only a branch no Privateer home made falls back (captain decision Q2).
 pub fn task_of_branch(store: &Store, branch: &str) -> Result<Option<String>> {
     let parts: Vec<&str> = branch.split('/').collect();
-    if parts.len() != 4
-        || parts[0] != "privateer"
-        || parts[1] != crate::workspace::hash(&store.home().to_string_lossy())
-    {
+    if parts.len() != 4 || parts[0] != "privateer" {
         return Ok(None);
     }
+    ensure!(
+        parts[1] == crate::workspace::hash(&store.home().to_string_lossy()),
+        "head branch {branch} is another Privateer home's workspace branch: its crews are \
+         that home's jobs, so this home cannot work out who wrote it; review it from that home"
+    );
     let mut statement = store.connection().prepare("SELECT id FROM tasks")?;
     let tasks = statement.query_map([], |r| r.get::<_, String>(0))?;
-    Ok(tasks
+    let task = tasks
         .filter_map(|t| t.ok())
-        .find(|id| crate::workspace::hash(id) == parts[2]))
+        .find(|id| crate::workspace::hash(id) == parts[2]);
+    ensure!(
+        task.is_some(),
+        "head branch {branch} is one of this home's workspace branches, but names no task \
+         this home has, so its authors cannot be worked out"
+    );
+    Ok(task)
 }
 
 /// A task's whole tree: its top ancestor and every descendant of that
@@ -434,17 +446,19 @@ mod tests {
             task_of_branch(&store, &branch("fix")).unwrap().as_deref(),
             Some("fix")
         );
-        // Not a workspace branch, another home's branch, or a task this home
-        // does not have: the merge-base fallback applies.
+        // A branch no home made: the merge-base fallback applies.
         assert_eq!(task_of_branch(&store, "feature/thing").unwrap(), None);
-        assert_eq!(
-            task_of_branch(&store, "privateer/0011223344556677/feed/other").unwrap(),
-            None
-        );
-        assert_eq!(
-            task_of_branch(&store, &branch("no-such-task")).unwrap(),
-            None
-        );
+        assert_eq!(task_of_branch(&store, "privateer/feature").unwrap(), None);
+        // Another home's workspace branch, or one naming a task this home
+        // does not have: refused, never the fallback over this home's jobs.
+        let foreign = task_of_branch(&store, "privateer/0011223344556677/feed/other")
+            .unwrap_err()
+            .to_string();
+        assert!(foreign.contains("another Privateer home's"), "{foreign}");
+        let unknown = task_of_branch(&store, &branch("no-such-task"))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("names no task"), "{unknown}");
 
         // The scope is the whole tree: the top ancestor, descendants and
         // siblings under it, never a task outside it.

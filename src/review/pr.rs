@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 /// How long one forge read or git fetch may take.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Changed files the prompt lists; the rest are in files.txt.
-const LISTED_FILES: usize = 200;
+const LISTED_FILES: usize = 100;
 
 /// The local clone of a PR's repository: its folder, its forge kind and its
 /// `owner/name`.
@@ -55,6 +55,8 @@ pub struct Files {
     pub pr_md: PathBuf,
     /// `git diff --name-status` of the change, bounded for the prompt.
     pub listing: String,
+    /// Symlinks in the worktree that led outside it, cut to plain files.
+    pub cut: Vec<String>,
 }
 
 /// Run a command with a bounded wait, its stdin given and its stdout and
@@ -459,6 +461,35 @@ fn set_writable(path: &Path, writable: bool) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
+/// Replace each symlink in the worktree that leaves it (or leads nowhere)
+/// with a plain file saying so: the reviewer's file tools follow links, and a
+/// PR may carry one to the ship user's secrets. The paths cut, relative.
+fn cut_outward_links(tree: &Path, dir: &Path, cut: &mut Vec<String>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let info = std::fs::symlink_metadata(&path)?;
+        if info.file_type().is_symlink() {
+            let inward = std::fs::canonicalize(&path).is_ok_and(|t| t.starts_with(tree));
+            if !inward {
+                std::fs::remove_file(&path)?;
+                std::fs::write(
+                    &path,
+                    "(a symlink leading outside the worktree, cut by the review runtime)\n",
+                )?;
+                cut.push(
+                    path.strip_prefix(tree)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        } else if info.is_dir() && path.file_name().is_none_or(|n| n != ".git") {
+            cut_outward_links(tree, &path, cut)?;
+        }
+    }
+    Ok(())
+}
+
 /// The review folder: a detached, read-only worktree at the head, the diff
 /// from the merge-base, its file stats and the PR's text.
 pub fn prepare(clone: &Clone, folder: &Path, live: &Pr, number: u64) -> Result<Files> {
@@ -476,6 +507,8 @@ pub fn prepare(clone: &Clone, folder: &Path, live: &Pr, number: u64) -> Result<F
             &live.head_sha,
         ],
     )?;
+    let mut cut = vec![];
+    cut_outward_links(&std::fs::canonicalize(&tree)?, &tree, &mut cut)?;
     let diff_args = [
         "-c",
         "diff.external=",
@@ -522,6 +555,7 @@ pub fn prepare(clone: &Clone, folder: &Path, live: &Pr, number: u64) -> Result<F
         stats,
         pr_md,
         listing,
+        cut,
     })
 }
 

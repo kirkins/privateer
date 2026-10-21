@@ -192,20 +192,31 @@ fn check_limits(
         attempts.len(),
         attempts.join(", ")
     );
-    let same_tree: Option<String> = tx
+    // An approval that carried a must-fix is recorded as no verdict, but it
+    // found the same fault: it blocks the same files as a change request
+    // does, so an empty commit cannot buy a fresh look at identical code.
+    let same_tree: Option<(String, String)> = tx
         .query_row(
-            "SELECT head_sha FROM reviews WHERE repo=?1 AND pr=?2 AND head_tree=?3
-               AND verdict='changes_requested' ORDER BY created_ms DESC LIMIT 1",
+            "SELECT head_sha, verdict FROM reviews WHERE repo=?1 AND pr=?2 AND head_tree=?3
+               AND (verdict='changes_requested' OR EXISTS(SELECT 1 FROM json_each(
+                 CASE WHEN json_valid(findings) THEN findings ELSE '[]' END)
+                 WHERE json_extract(value,'$.severity')='must-fix'))
+               ORDER BY created_ms DESC LIMIT 1",
             params![repo, number, tree],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if let Some(earlier) = same_tree {
+    if let Some((earlier, verdict)) = same_tree {
         bail!(
-            "#{number} at {} has the same file tree as {}, which got changes requested; \
+            "#{number} at {} has the same file tree as {}, which got {}; \
              change the files, not only the commits",
             short(head),
-            short(&earlier)
+            short(&earlier),
+            if verdict == "changes_requested" {
+                "changes requested"
+            } else {
+                "a must-fix finding"
+            }
         );
     }
     Ok(())
@@ -336,6 +347,7 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
         title: &live.title,
         body: &live.body,
         notes,
+        cut: &files.cut,
     });
     let recorded = (|| -> Result<i64> {
         let tx = store.write_transaction()?;
@@ -381,16 +393,6 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
                 Store::now_ms()
             ],
         )?;
-        if before + 1 == CAPTAIN_NOTICE_AT {
-            crate::mail::record_runtime(
-                store,
-                &json!({"id": format!("{id}-captain"), "from": ship, "to": crate::mail::CAPTAIN,
-                    "kind": "notice", "task_id": task_id, "urgency": "normal", "payload": {"review": id},
-                    "body": format!("{ship} has started review {CAPTAIN_NOTICE_AT} of #{number} in {}, \
-                        now at {}. Repeated reviews of one PR may mean it is being reviewed until one \
-                        approves; review.list shows them.", clone.repo, short(&live.head_sha))}),
-            )?;
-        }
         tx.commit()?;
         Ok(before + 1)
     })();
@@ -423,6 +425,18 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
             .execute("DELETE FROM reviews WHERE id=?1", [&id])?;
         pr::remove(Some(&clone.dir), &folder);
         return Err(error);
+    }
+    // Only once the review runs: a launch that failed is no attempt, and the
+    // next one is still this PR's fourth.
+    if attempt == CAPTAIN_NOTICE_AT {
+        crate::mail::record_runtime(
+            store,
+            &json!({"id": format!("{id}-captain"), "from": ship, "to": crate::mail::CAPTAIN,
+                "kind": "notice", "task_id": task_id, "urgency": "normal", "payload": {"review": id},
+                "body": format!("{ship} has started review {CAPTAIN_NOTICE_AT} of #{number} in {}, \
+                    now at {}. Repeated reviews of one PR may mean it is being reviewed until one \
+                    approves; review.list shows them.", clone.repo, short(&live.head_sha))}),
+        )?;
     }
     store.audit(
         "review.start",
@@ -512,7 +526,7 @@ pub(crate) fn settle(
                         "refused: the stored credentials could not be read to filter the reply ({error:#})"
                     )),
                 ),
-                Ok(secrets) => match filter::findings(reply, &tree, &secrets) {
+                Ok(secrets) => match filter::findings(reply, filter::Allowed { tree: &tree, folder: &folder }, &secrets) {
                     Err(why) => ("failed", vec![], Some(format!("refused by the filter: {why}"))),
                     Ok(found) => match filter::verdict(reply) {
                         "approve" if found.iter().any(|f| f.severity == "must-fix") => (
@@ -795,6 +809,14 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         );
     };
     let review = record(store, &review_id)?;
+    ensure!(
+        review["ship"] == ship.as_str() && review["task_id"] == task_id.as_str(),
+        "#{number} head {}: its review {review_id} was asked by {} for task {}, not by {ship} \
+         for {task_id}",
+        short(&head),
+        review["ship"].as_str().unwrap_or_default(),
+        review["task_id"].as_str().unwrap_or_default()
+    );
     let verdict = review["verdict"].as_str().unwrap_or_default();
     ensure!(
         verdict == "approve",

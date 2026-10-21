@@ -1,15 +1,27 @@
 //! What a review's reply may leave behind: its verdict and its structured
-//! findings, filtered where the record is stored, so a later post carries
-//! only filtered records.
+//! findings, filtered where the record is stored, so a post carries only
+//! filtered records.
 //!
 //! The verdict is read from the reply's last non-empty line alone, matched
 //! exactly; anything else is `none`. A finding is one line, `FINDING
 //! <severity> <path>:<line> <text>`, whose path names a file inside the
 //! review's worktree. Everything else in the reply is the reviewer's working
 //! and is not kept. A reply is refused outright, keeping nothing, when it
-//! carries a stored credential value or names a path outside the worktree:
-//! the runtime never stores, and so never posts, such a review.
-use std::path::{Component, Path};
+//! carries a secret or names a path outside the worktree: the runtime never
+//! stores, and so never posts, such a review.
+//!
+//! A secret is a stored credential value whole, any 16-byte piece of one
+//! (one line of a multi-line key is such a piece), the same pieces in
+//! base64 or hex, or a token of a common shape the runtime never stored
+//! (`ghp_`, `gho_`, `github_pat_`, `sk-ant-`, `AKIA`, a PEM header), such
+//! as the forge login of the ship user's own `gh`. A path is any absolute,
+//! `file:`, home-relative (`~`, `~user`, `$HOME`) or escaping (`..`) path
+//! wherever it stands in a word (`HOME=/x`, `{/x}`, `//x`). Only the
+//! worktree and the review folder's own `diff.patch`, `files.txt` and
+//! `pr.md` may be named, and a kept finding names them relative, so the
+//! record never carries the captain's folder layout.
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
 /// Severities a finding may carry, in the order a summary lists them.
 pub const SEVERITIES: [&str; 3] = ["must-fix", "should-fix", "nit"];
@@ -19,6 +31,24 @@ const FINDING_CHARS: usize = 500;
 /// Stored credentials shorter than this are not searched for: a value that
 /// short matches ordinary prose and would refuse honest reviews.
 const MIN_SECRET: usize = 8;
+/// A piece of a stored value this long, found anywhere in a reply, is a
+/// leak of that value.
+const PIECE: usize = 16;
+/// The review folder's own files, which a reviewer may name.
+pub const FOLDER_FILES: [&str; 3] = ["diff.patch", "files.txt", "pr.md"];
+/// Token prefixes of common shapes, each needing this many token characters
+/// after it to count.
+const TOKEN_PREFIXES: [&str; 8] = [
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "sk-ant-",
+    "glpat-",
+];
+const TOKEN_TAIL: usize = 16;
 
 /// A reviewer's finding, as stored: its severity, its file relative to the
 /// worktree root, its line, and its text.
@@ -28,6 +58,28 @@ pub struct Finding {
     pub file: String,
     pub line: u64,
     pub text: String,
+}
+
+/// What a reply may name: the worktree, and the review folder it sits in for
+/// that folder's own files.
+#[derive(Clone, Copy, Debug)]
+pub struct Allowed<'a> {
+    pub tree: &'a Path,
+    pub folder: &'a Path,
+}
+
+impl Allowed<'_> {
+    fn names(&self, path: &Path) -> bool {
+        path.starts_with(self.tree) || FOLDER_FILES.iter().any(|f| path == self.folder.join(f))
+    }
+    /// Text with the worktree and the review folder written relative.
+    fn relative(&self, text: &str) -> String {
+        let tree = self.tree.to_string_lossy();
+        let folder = self.folder.to_string_lossy();
+        text.replace(&format!("{tree}/"), "")
+            .replace(tree.as_ref(), ".")
+            .replace(&format!("{folder}/"), "")
+    }
 }
 
 /// The verdict a reply's last non-empty line gives: `approve`,
@@ -40,19 +92,17 @@ pub fn verdict(reply: &str) -> &'static str {
     }
 }
 
-/// The structured findings of a reply, or why the reply is refused. `tree` is
-/// the worktree the reviewer read; `secrets` are the stored credential values.
-pub fn findings(reply: &str, tree: &Path, secrets: &[Vec<u8>]) -> Result<Vec<Finding>, String> {
-    for secret in secrets.iter().filter(|s| s.len() >= MIN_SECRET) {
-        if reply
-            .as_bytes()
-            .windows(secret.len())
-            .any(|window| window == secret.as_slice())
-        {
-            return Err("the reply contains a stored credential value".to_owned());
-        }
+/// The structured findings of a reply, or why the reply is refused.
+/// `secrets` are the stored credential values.
+pub fn findings(
+    reply: &str,
+    allowed: Allowed,
+    secrets: &[Vec<u8>],
+) -> Result<Vec<Finding>, String> {
+    if let Some(why) = secret(reply, secrets) {
+        return Err(why);
     }
-    if let Some(path) = outside_path(reply, tree) {
+    if let Some(path) = outside_path(reply, allowed) {
         return Err(format!(
             "the reply names a path outside the worktree: {}",
             clip(&path, 120)
@@ -88,12 +138,17 @@ pub fn findings(reply: &str, tree: &Path, secrets: &[Vec<u8>]) -> Result<Vec<Fin
         let Ok(line_no) = line_no.parse::<u64>() else {
             continue;
         };
-        let file = inside(file, tree).map_err(|path| {
+        // A finding on the review folder's own diff or text names no file
+        // of the change: it is dropped, not refused.
+        let Some(file) = inside(file, allowed).map_err(|path| {
             format!(
                 "a finding names a path outside the worktree: {}",
                 clip(&path, 120)
             )
-        })?;
+        })?
+        else {
+            continue;
+        };
         let text = words
             .next()
             .unwrap_or_default()
@@ -104,21 +159,138 @@ pub fn findings(reply: &str, tree: &Path, secrets: &[Vec<u8>]) -> Result<Vec<Fin
                 severity,
                 file,
                 line: line_no,
-                text: clip(text, FINDING_CHARS),
+                text: clip(&allowed.relative(text), FINDING_CHARS),
             });
         }
     }
     Ok(kept)
 }
 
-/// A finding's file as a path relative to the worktree root, or the path
-/// itself when it leaves the worktree. An absolute path inside the worktree
-/// is made relative; `..`, a home-relative path or any other absolute path
-/// is outside.
-fn inside(file: &str, tree: &Path) -> Result<String, String> {
+/// Why a reply carries a secret, if it does: a stored value or a piece of
+/// one, raw or encoded, or a token of a common shape.
+fn secret(reply: &str, secrets: &[Vec<u8>]) -> Option<String> {
+    let bytes = reply.as_bytes();
+    let mut pieces: HashSet<&[u8]> = HashSet::new();
+    let mut encoded: Vec<Vec<u8>> = vec![];
+    for secret in secrets.iter().filter(|s| s.len() >= MIN_SECRET) {
+        if secret.len() < PIECE {
+            if bytes.windows(secret.len()).any(|w| w == secret.as_slice()) {
+                return Some("the reply contains a stored credential value".to_owned());
+            }
+            continue;
+        }
+        encoded.extend(encodings(secret));
+    }
+    for secret in secrets.iter().filter(|s| s.len() >= PIECE) {
+        pieces.extend(secret.windows(PIECE));
+    }
+    for encoding in &encoded {
+        pieces.extend(encoding.windows(PIECE));
+    }
+    if bytes.len() >= PIECE && bytes.windows(PIECE).any(|w| pieces.contains(w)) {
+        return Some("the reply contains a stored credential value, or a piece of one".to_owned());
+    }
+    token_shape(reply).map(|shape| format!("the reply contains what looks like a {shape}"))
+}
+
+/// A stored value as base64 (standard and URL-safe, at each of the three
+/// byte alignments it can take inside a longer encoded text, less the last
+/// group that alignment changes) and as hex.
+fn encodings(secret: &[u8]) -> Vec<Vec<u8>> {
+    const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut found = vec![];
+    for shift in 0..3 {
+        let part = &secret[shift.min(secret.len())..];
+        for alphabet in [STANDARD, URL] {
+            let mut text = vec![];
+            for chunk in part.chunks(3) {
+                let n = chunk.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b))
+                    << (8 * (3 - chunk.len()));
+                for i in 0..=chunk.len() {
+                    text.push(alphabet[((n >> (18 - 6 * i)) & 63) as usize]);
+                }
+            }
+            text.truncate(text.len().saturating_sub(4));
+            found.push(text);
+        }
+    }
+    let hex = |upper: bool| -> Vec<u8> {
+        secret
+            .iter()
+            .flat_map(|b| {
+                let s = if upper {
+                    format!("{b:02X}")
+                } else {
+                    format!("{b:02x}")
+                };
+                s.into_bytes()
+            })
+            .collect()
+    };
+    found.push(hex(false));
+    found.push(hex(true));
+    found
+}
+
+/// The kind of token a reply carries in a common shape, if any.
+fn token_shape(reply: &str) -> Option<&'static str> {
+    let token_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    for prefix in TOKEN_PREFIXES {
+        for (at, _) in reply.match_indices(prefix) {
+            let before = reply[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let tail = reply[at + prefix.len()..]
+                .chars()
+                .take_while(|c| token_char(*c))
+                .count();
+            if tail >= TOKEN_TAIL {
+                return Some("forge or API token");
+            }
+        }
+    }
+    for (at, _) in reply.match_indices("AKIA") {
+        let before = reply[..at].chars().next_back();
+        let tail: String = reply[at + 4..].chars().take(17).collect();
+        let key = tail
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            .count();
+        if !before.is_some_and(|c| c.is_ascii_alphanumeric()) && key == 16 {
+            return Some("cloud access key");
+        }
+    }
+    for (at, _) in reply.match_indices("-----BEGIN") {
+        let rest = &reply[at + "-----BEGIN".len()..];
+        let label: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || *c == ' ')
+            .collect();
+        if rest[label.len()..].starts_with("-----") || label.trim().is_empty() {
+            return Some("PEM key or certificate");
+        }
+    }
+    None
+}
+
+/// A finding's file as a path relative to the worktree root; None for one of
+/// the review folder's own files; or the path itself when it leaves the
+/// worktree. An absolute path inside the worktree is made relative; `..`, a
+/// home-relative path or any other absolute path is outside.
+fn inside(file: &str, allowed: Allowed) -> Result<Option<String>, String> {
     let path = Path::new(file);
     let relative = if path.is_absolute() {
-        path.strip_prefix(tree).map_err(|_| file.to_owned())?
+        let normal = normalize(path);
+        if FOLDER_FILES
+            .iter()
+            .any(|f| normal == allowed.folder.join(f))
+        {
+            return Ok(None);
+        }
+        path.strip_prefix(allowed.tree)
+            .map_err(|_| file.to_owned())?
     } else {
         path
     };
@@ -128,38 +300,119 @@ fn inside(file: &str, tree: &Path) -> Result<String, String> {
     if file.is_empty() || file.starts_with('~') || !normal || relative.as_os_str().is_empty() {
         return Err(file.to_owned());
     }
-    Ok(relative.to_string_lossy().into_owned())
+    Ok(Some(relative.to_string_lossy().into_owned()))
 }
 
-/// The first absolute or home-relative path the text names outside the
-/// worktree. Words are split on whitespace and on the quotes, brackets and
-/// punctuation that wrap a path in prose; a URL's path is not a path here.
-fn outside_path(text: &str, tree: &Path) -> Option<String> {
+/// An absolute path with `.` and `..` resolved lexically and repeated
+/// slashes collapsed; `..` never climbs past the root.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normal.pop();
+            }
+            Component::Normal(part) => normal.push(part),
+            _ => {}
+        }
+    }
+    normal
+}
+
+/// Whether a relative path climbs above where it starts.
+fn escapes(path: &str) -> bool {
+    let mut depth = 0i64;
+    for part in path.split('/') {
+        match part {
+            ".." => depth -= 1,
+            "" | "." => {}
+            _ => depth += 1,
+        }
+        if depth < 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// The first path the text names outside what it may name. Words are split
+/// on whitespace and on the quotes, brackets, braces and operators that
+/// wrap a path in prose or code, so a path inside `HOME=/x` or `{/x}` is a
+/// word of its own. A URL is not a path, except a `file:` one.
+fn outside_path(text: &str, allowed: Allowed) -> Option<String> {
     let wrapping = |c: char| {
         c.is_whitespace()
             || matches!(
                 c,
-                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';'
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '<'
+                    | '>'
+                    | '{'
+                    | '}'
+                    | ','
+                    | ';'
+                    | '='
+                    | '|'
+                    | '&'
+                    | '*'
             )
     };
-    text.split(wrapping).find_map(|word| {
-        let word = word.trim_end_matches(['.', ':', '!', '?']);
+    text.split(wrapping).find_map(|raw| {
+        if raw.is_empty() {
+            return None;
+        }
+        let word = raw.trim_end_matches(['.', ':', '!', '?']);
         let word = word.split_once(':').map_or(word, |(path, rest)| {
-            if rest
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == ':' || c == '-')
+            if !path.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ':' || c == '-')
             {
                 path
             } else {
                 word
             }
         });
-        let named = (word.starts_with('/') && word.len() > 1 && !word.starts_with("//"))
-            || word.starts_with("~/")
-            || word == "~";
-        let path = Path::new(word);
-        let escapes = path.components().any(|c| c == Component::ParentDir);
-        (named && (escapes || !path.starts_with(tree))).then(|| word.to_owned())
+        let outside = |path: &str| -> bool {
+            !path.is_empty() && path != "/" && !allowed.names(&normalize(Path::new(path)))
+        };
+        let lower = word.to_ascii_lowercase();
+        let named = if let Some(rest) = lower.strip_prefix("file:") {
+            // file:/x, file:///x and file://host/x all name /x.
+            let rest = &word[word.len() - rest.len()..];
+            let rest = rest
+                .strip_prefix("//")
+                .map_or(rest, |r| r.find('/').map_or("", |at| &r[at..]));
+            outside(if rest.is_empty() { "/" } else { rest }) || rest.is_empty()
+        } else if word.contains("://") {
+            false
+        } else if let Some(rest) = word.strip_prefix('~') {
+            rest.is_empty()
+                || rest.starts_with('/')
+                || rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '+' || c == '-')
+        } else if let Some(rest) = word.strip_prefix('$') {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && (rest[name.len()..].starts_with('/')
+                    || matches!(name.as_str(), "HOME" | "USERPROFILE")
+                    || name.starts_with("XDG_"))
+        } else if word.starts_with('/') {
+            word.len() > 1 && outside(word)
+        } else {
+            (word.contains('/') || word == "..") && escapes(word)
+        };
+        (named
+            || (raw.contains('/') && !raw.contains("://") && !raw.starts_with('/') && escapes(raw)))
+        .then(|| word.to_owned())
     })
 }
 
@@ -175,6 +428,16 @@ pub fn clip(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
+    const TREE: &str = "/srv/reviews/r1/tree";
+    const FOLDER: &str = "/srv/reviews/r1";
+
+    fn allowed() -> Allowed<'static> {
+        Allowed {
+            tree: Path::new(TREE),
+            folder: Path::new(FOLDER),
+        }
+    }
+
     #[test]
     fn the_verdict_is_the_last_non_empty_line_matched_exactly() {
         assert_eq!(verdict("ok\nVERDICT: APPROVE\n\n"), "approve");
@@ -187,14 +450,14 @@ mod tests {
 
     #[test]
     fn findings_keep_structure_inside_the_worktree_and_refuse_the_rest() {
-        let tree = Path::new("/srv/reviews/r1/tree");
         let reply = "Looked at it.\n\
             - FINDING must-fix src/a.rs:12 the lock is dropped early\n\
-            FINDING nit /srv/reviews/r1/tree/src/b.rs:3: a typo\n\
+            FINDING nit /srv/reviews/r1/tree/src/b.rs:3: a typo, see /srv/reviews/r1/tree/src/c.rs:4\n\
             FINDING bogus src/c.rs:1 ignored\n\
             FINDING should-fix src/d.rs ignored without a line\n\
+            FINDING nit /srv/reviews/r1/diff.patch:9 hunk header, dropped\n\
             VERDICT: CHANGES_REQUESTED";
-        let kept = findings(reply, tree, &[]).unwrap();
+        let kept = findings(reply, allowed(), &[]).unwrap();
         assert_eq!(
             kept,
             vec![
@@ -208,40 +471,106 @@ mod tests {
                     severity: "nit".into(),
                     file: "src/b.rs".into(),
                     line: 3,
-                    text: "a typo".into()
+                    text: "a typo, see src/c.rs:4".into()
                 },
             ]
         );
+        // No kept text carries the captain's folder layout.
+        assert!(!format!("{kept:?}").contains("/srv/"));
+    }
+
+    #[test]
+    fn every_way_of_naming_a_path_outside_is_refused() {
         for reply in [
             "FINDING nit ../outside.rs:1 escapes",
             "FINDING nit /etc/passwd:1 outside",
             "see /home/captain/.ssh/id_ed25519 for the key",
             "the token lives in ~/.config/gh/hosts.yml",
             "read /srv/reviews/r1/tree/../../secrets.txt",
+            "HOME=/home/kirkins/.ssh",
+            "file:///etc/passwd",
+            "file:/etc/passwd",
+            "{/etc/passwd}",
+            "//etc/passwd",
+            "~kirkins/notes",
+            "~",
+            "$HOME/.config/gh/hosts.yml",
+            "${HOME}/.ssh",
+            "it reads $HOME",
+            "$XDG_STATE_HOME",
+            "the text says ../../.. somewhere",
+            "src/../../escape.rs",
+            "a/../..",
+            "/srv/reviews/r1/other.txt",
+            "/srv/reviews/r1/treehouse/x",
         ] {
-            let refused = findings(reply, tree, &[]).unwrap_err();
+            let refused = findings(reply, allowed(), &[]).unwrap_err();
             assert!(
                 refused.contains("outside the worktree"),
                 "{reply}: {refused}"
             );
         }
-        // A URL's path and a path inside the worktree are not refused.
-        assert!(
-            findings(
-                "https://github.com/a/b/pull/3 and /srv/reviews/r1/tree/x.rs",
-                tree,
-                &[]
-            )
-            .is_ok()
-        );
-        let refused = findings(
-            "it printed hunter2-secret-value",
-            tree,
-            &[b"hunter2-secret-value".to_vec()],
-        )
-        .unwrap_err();
-        assert!(refused.contains("stored credential value"), "{refused}");
-        // A value too short to search for is not one.
-        assert!(findings("abc", tree, &[b"abc".to_vec()]).is_ok());
+        // A URL, prose, a path inside the worktree, and the review folder's
+        // own files are not refused.
+        for reply in [
+            "https://github.com/a/b/pull/3 and /srv/reviews/r1/tree/x.rs",
+            "the diff is /srv/reviews/r1/diff.patch, and /srv/reviews/r1/pr.md: fine.",
+            "and/or, ~5 minutes, $5, src/../lib.rs, ... and done.",
+            "the cost is $PATH-free",
+        ] {
+            assert!(findings(reply, allowed(), &[]).is_ok(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_stored_value_whole_in_part_or_encoded_is_refused() {
+        let key = b"-----KEY-----\nAAAAB3NzaC1yc2EAAAADAQABAAABgQC7\nZZZZsecondlineofthekeyZZZZ\n"
+            .to_vec();
+        let token = b"forge-token-value-123456".to_vec();
+        let secrets = vec![key, token.clone(), b"short-12".to_vec(), b"abc".to_vec()];
+        let refused = |reply: &str| findings(reply, allowed(), &secrets).unwrap_err();
+        assert!(refused("it printed forge-token-value-123456").contains("stored credential"));
+        // Part of a value, and one line of a multi-line key.
+        assert!(refused("prefix token-value-12345 suffix").contains("piece of one"));
+        assert!(refused("ZZZZsecondlineofthekeyZZZZ").contains("piece of one"));
+        // Base64 at each alignment, URL-safe, and hex.
+        for prefix in ["", "x", "xy"] {
+            let mut text = prefix.as_bytes().to_vec();
+            text.extend(&token);
+            text.extend(b" trailing");
+            let encoded = String::from_utf8(encodings(&text)[0].clone()).unwrap();
+            // A whole-text standard encoding with no shift.
+            assert!(
+                refused(&format!("blob: {encoded}")).contains("piece of one"),
+                "{prefix}: {encoded}"
+            );
+        }
+        let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(refused(&hex).contains("piece of one"));
+        // A short stored value is matched whole; a tiny one not at all.
+        assert!(refused("short-12").contains("stored credential"));
+        assert!(findings("abc", allowed(), &secrets).is_ok());
+    }
+
+    #[test]
+    fn tokens_of_common_shapes_are_refused_though_never_stored() {
+        for reply in [
+            "gho_16C7e42F292c6912E7710c838347Ae178B4a",
+            "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            "AKIAIOSFODNN7EXAMPLE",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN",
+        ] {
+            assert!(
+                findings(reply, allowed(), &[])
+                    .unwrap_err()
+                    .contains("looks like a"),
+                "{reply}"
+            );
+        }
+        // The bare prefixes in prose are not tokens.
+        assert!(findings("the filter matches ghp_ and AKIA prefixes", allowed(), &[]).is_ok());
     }
 }
