@@ -95,12 +95,16 @@ available for reuse under Treehouse's ordinary cleanup rules.
 Before those checks, once the workspace's jobs are idle, release asks the
 [MCP broker](mcp-broker.md#windows-and-routing-step-3) to close any Xcode
 window it opened for the workspace: Xcode can write into the worktree and hold
-files there, and the checks must see it gone. If a running broker cannot close
-the window, the release is refused and the lease is kept. With no broker
-running, the release goes ahead and the window left open is audited
+files there, and the checks must see it gone. The broker is asked only when its
+record lists a window under the workspace, so a hung broker holds up no other
+release. If a running broker cannot close the window, or does not answer within
+35 s, the release is refused and the lease is kept. With no broker running, the
+release goes ahead and the window left open is audited
 (`workspace.xcode_window_unclosed`). The dispatcher's sweep closes the window
 the same way before it releases a workspace, and a failure there alerts the
-task's owner.
+task's owner. A record whose Treehouse lease moved to another task is marked
+released without the close when another live lease holds the same checkout:
+that window is the new holder's now.
 
 To retain clean committed work that has not landed, explicitly pass
 `"archive":true` to release. Privateer saves HEAD under

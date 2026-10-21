@@ -331,18 +331,29 @@ After each `initialize`, the broker sends its own `tools/list` under a broker
 id that is never delivered to a client, following `nextCursor`. It caches each
 tool's `inputSchema`, and lists again on `notifications/tools/list_changed`
 (which still reaches every client). A tool is **window-bound** when its
-`inputSchema.properties` has `tabIdentifier`. A tool the cache does not show is
-treated as window-bound when the call passes a `tabIdentifier`.
+`inputSchema.properties` has `tabIdentifier`, or when a call passes a
+`tabIdentifier`. A tool the cache does not show makes the broker list the tools
+again, once per call. Still missing, a call that passes a `tabIdentifier` is
+refused (`the upstream does not list the tool X`), and any other call is
+forwarded as window-free.
 
 For each client `tools/call`:
 
-- **Path arguments** are checked first, for every tool. A string argument
-  named `path`, or whose name ends in `Path`, `path`, `Dir` or `Directory`
-  (nested objects and arrays included), must stay in the client's workspace:
-  - an absolute value must resolve inside the root (the realpath of its
-    deepest existing ancestor, with no `..` in the rest);
-  - a relative value may not contain a `..` component;
-  - an unrouted client may not pass an absolute path at all.
+- **Path arguments** are checked first, for every tool. An argument is a path
+  when it is named `path`, `file`, `uri`, `url`, `source`, `destination`,
+  `target`, `dir` or `directory` (or a plural of these), or when its name ends
+  in `Path`, `path`, `File`, `Dir`, `Directory`, `Uri` or `Url` (or a plural).
+  Its string value, and every string in arrays under it, must stay in the
+  client's workspace. Nested objects and arrays are searched too.
+  - A `file:` URL is checked as the path it names, percent-decoded. A URL for
+    another host is refused. Under a `uri` or `url` name, another scheme
+    (`https:`) names no file and passes.
+  - An absolute value must resolve inside the root: the realpath of its deepest
+    existing ancestor, with no `..` in the rest.
+  - A relative value is taken from the root and must resolve inside it the same
+    way, so neither `..` nor a symlink in the worktree leads out.
+  - An unrouted client may pass no absolute path, and no relative one holding
+    `..`.
 - **`XcodeListWindows`** is forwarded, and its answer is filtered to the
   client's root, in `structuredContent.windows`, in a text item holding the
   same JSON, and in text lines (empty when the client is unrouted). The broker
@@ -365,7 +376,8 @@ XcodeListWindows result. It reads `structuredContent.windows[{tabIdentifier,
 workspacePath}]`, the same JSON as text, and text lines that carry
 `tabIdentifier: X` and `workspacePath: Y`. A window belongs to a root when the
 realpath of its `workspacePath` lies inside the root, by path components (not
-a string prefix). The root's tab is cached. The cache is filled by a
+a string prefix). Those realpaths are taken before the broker's state lock, so
+no filesystem call runs under it. The root's tab is cached. The cache is filled by a
 broker-internal XcodeListWindows when a call finds no cached tab, and refreshed
 by every window list that passes through the broker. A window the user closed
 therefore stays cached until the next list: the call fails upstream, and the
@@ -385,20 +397,25 @@ A window-bound call whose root has no window opens one:
   a single `Package.swift` directory. More than one gives an error listing the
   candidates relative to the root.
 - **One open per root at a time.** The broker runs `window_open` with the
-  project's absolute path appended. Other clients of that root wait on the same
-  opening. For 120 s after an open, a root whose window has not shown is still
-  opening, and its calls wait rather than open again.
-- **Waiting for the window.** The broker lists windows every second until one
-  belongs to the root, within `--ready-wait-secs` of the call's start. Past
-  that, the call gets `busy::busy` with `Xcode is opening this workspace's
-  window`, retry after 15 s.
-- **A failed open.** If the helper exits non-zero, the call gets an error with
-  the helper's first stderr line, escaped. It is never retried within the
-  call.
+  project's absolute path appended, on a thread of its own. The call that
+  started it, and other calls of that root, wait on the same opening, but only
+  until their call's deadline (`--ready-wait-secs` from its start): then they
+  get `busy::busy` with `Xcode is opening this workspace's window`, retry after
+  15 s. The helper keeps running, and its outcome is recorded when it ends. For
+  120 s after a successful open, a root whose window has not shown is still
+  opening, and its calls wait for the window rather than open again.
+- **Waiting for the window.** Once the helper has exited 0, the broker lists
+  windows every second until one belongs to the root, within the same
+  deadline. Past that, the call gets the same busy answer. No tool call is held
+  past `--ready-wait-secs` (default 60 s).
+- **A failed open.** If the helper exits non-zero, the calls waiting on it get
+  an error with the helper's first stderr line, escaped. It is never retried
+  within a call; the next call opens again.
 - **The record.** `{root, project, tab, opened_ms}` goes into
-  `run/xcode.windows.json` (written with the same temporary-file, `O_NOFOLLOW`
-  and `fstat` rules as every broker file), and `tab` is filled in once a list
-  shows the window. Only windows the broker opened are recorded.
+  `run/xcode.windows.json` when the helper starts, and is dropped if it fails.
+  The file is written with the same temporary-file, `O_NOFOLLOW` and `fstat`
+  rules as every broker file, and `tab` is filled in once a list shows the
+  window. Only windows the broker opened are recorded.
 
 ### Closing on release
 
@@ -408,23 +425,36 @@ A connection may send a control line instead of a hello:
 {"privateer_control": 1, "close_workspace": "/ABS/ROOT"}
 ```
 
-The broker runs `window_close` for each recorded window under that root, drops
-those windows from the record and the root's tab from the cache, and answers
-one line: `{"closed": [PROJECT...]}` or `{"error": "..."}`. Windows the broker
-did not open are never closed. Any same-uid peer may send the line. A spurious
-close is only an inconvenience: the window reopens on the next call.
+`ROOT` must be absolute and normalized, and it (or its realpath) must lie
+strictly inside a configured workspace pool: `/`, a pool itself and anything
+outside the pools are refused with an error. The broker runs `window_close` for
+each recorded window under that root, drops those windows from the record and
+the root's tab from the cache, and answers one line: `{"closed": [PROJECT...]}`
+or `{"error": "..."}`. An open still running for a root under it is marked to
+close its window when the helper ends, and is listed as `"opening":
+[PROJECT...]` beside `closed`. Windows the broker did not open are never
+closed. Any same-uid peer may send the line. A spurious close is only an
+inconvenience: the window reopens on the next call.
 
-`close_workspace(root)` in `src/mcp_broker.rs` sends it. It connects to
-`run/xcode.sock` with a 30 s overall timeout and checks the peer's uid. With no
-socket, or a free lock, the broker is not running: it returns `NotRunning`, and
-audits `workspace.xcode_window_unclosed` if `xcode.windows.json` lists the
-root. Workspace release calls it once the workspace's jobs are idle and before
-the uncommitted-work and process checks. Xcode can write into the worktree and
+`close_workspace(root)` in `src/mcp_broker.rs` sends it. It first reads
+`xcode.windows.json` (with the same link and owner checks as every broker file)
+and returns at once, without connecting, when no window is recorded under the
+root, so a broker that hangs holds up only the release of a workspace it opened
+a window for. Otherwise, with no socket or a free lock, the broker is not
+running: it returns `NotRunning` and audits `workspace.xcode_window_unclosed`.
+With a running broker, it connects without blocking (a hung broker's full
+listen backlog cannot stall it) and checks the peer's uid, all within a 35 s
+overall timeout. That is longer than the broker's 30 s helper deadline, so a
+close helper the broker had to kill comes back as the broker's error rather
+than as silence. Workspace release calls it once the workspace's jobs are idle
+and before the uncommitted-work and process checks. Xcode can write into the worktree and
 hold files there, and those checks must see it gone. An error from a running
 broker refuses the release (`could not close the Xcode window for this
 workspace: ...`), and the lease is kept. The dispatcher's sweep calls it too,
 before any path that marks a workspace released; a failure there goes through
-the sweep's alert to the task's owner. See
+the sweep's alert to the task's owner. When the sweep finds that a record's
+Treehouse lease moved to another task, it skips the close if another live lease
+holds the same checkout, since that window is the new holder's now. See
 [workspaces](workspaces.md#inspect-and-release).
 
 ### Helpers and defaults
@@ -439,11 +469,14 @@ a script.
 - **macOS defaults**, written by install:
   - open: `["/usr/bin/open", "-g", "-a", "Xcode"]`. `-g` keeps the captain's
     focus; drop it if the Mac shows that the window then fails to open.
-  - close: `/usr/bin/osascript` with a fixed script, one `-e` per line: `on
-    run argv`, `if application "Xcode" is running then`, `tell application
-    "Xcode" to close (every workspace document whose path is (item 1 of argv))
-    saving no`, `end if`, `end run`. It never launches Xcode just to close a
-    window.
+  - close: `/usr/bin/osascript` with a fixed script, one `-e` per line. It
+    takes the recorded project path as `item 1 of argv`. If Xcode is running,
+    it closes, `saving no`, every workspace document whose `path` is that path
+    or starts with it followed by `/` (Xcode may report an `X.xcodeproj` as
+    `X.xcodeproj/project.xcworkspace`). It walks the documents last first, so
+    closing one does not shift the rest, and exits 0 when none matches. It
+    never launches Xcode just to close a window. The path is never part of the
+    script.
 - **Elsewhere there are no defaults.** A window-bound call that needs a window
   opened is refused with `no window helper configured`. Tests configure fakes.
 
@@ -458,7 +491,21 @@ the broker's state lock is held.
   whether Xcode's file tools take absolute or project-relative paths;
 - `open -g -a Xcode PROJECT` opening a window that XcodeListWindows then lists,
   and how long that takes;
-- the AppleScript close (`workspace document`, `path`, `saving no`);
+- the AppleScript close (`workspace document`, `path`, `saving no`, `starts
+  with`, and walking the documents last first);
+- that the close exits 0 when no document matches, and when Xcode is not
+  running;
+- which document path Xcode reports for an opened `.xcodeproj` (the project
+  itself, or `X.xcodeproj/project.xcworkspace`) and for a `Package.swift`
+  directory;
+- a denied Automation prompt: the close then fails, so the release of every
+  workspace with a recorded window is refused (and the sweep alerts its owner)
+  until the Allow is given in System Settings. `privateer mcp-broker stop` is
+  the way out: with no broker running, release goes ahead and audits the window
+  left open;
+- whether any Xcode tool passes source text or a build target name under one
+  of the path argument names (`source`, `target`); such a value is checked as a
+  path, and source text could be refused;
 - the one-time Automation prompt ("privateer-mcp-broker wants to control
   Xcode"), and which binary macOS holds responsible for it: the stable broker,
   or the launchd dispatcher's release binary. In the second case the Allow
@@ -518,20 +565,39 @@ The suite covers:
   with the mismatch logged; window tools refused and DocumentationSearch passed
   outside the pools; the peer pid in the state file;
 - path arguments outside the root or with `..` refused and not forwarded;
-- lazy open: discovery's preferences, one open for two concurrent clients, the
-  busy answer within the ready wait plus 1 s, ambiguous projects, `--project`
-  inside and outside the root, and a failing helper;
+- lazy open: discovery's preferences, ambiguous projects, `--project` inside
+  and outside the root, and a failing helper (whose window leaves the record);
+- a slow open (`fake_xcode_window.py --hold`): two concurrent clients cause one
+  open, and the opener and the waiter both get busy within the ready wait plus
+  1 s, the waiter on the running open (no window list while it waits), then the
+  next call uses the window;
+- a window that never shows giving the busy answer within the ready wait plus
+  1 s;
 - close: only the windows the broker opened, and after a broker restart;
-- a changed tool list refreshing which tools are window-bound;
+  control roots of `/`, a pool, a path outside the pools, a relative or
+  non-normalized path refused; a close during an open closing the window when
+  the open ends;
+- a changed tool list refreshing which tools are window-bound; a tool missing
+  from the list listed again once, refused with a `tabIdentifier`, forwarded
+  without one;
 - install writing the pools and helpers into the pinned config, and refusing
   relative, non-normalized or shell helpers and bad pools.
 
 `cargo test --test workspaces` checks that release closes a recorded window
 before its clean check, that a failing close keeps the lease, that release
-proceeds and audits the window with no broker, and that sweep closes too.
+proceeds and audits the window with no broker, and that sweep closes too. A
+broker that accepts and never answers does not delay a release with no
+recorded window, and refuses one with a recorded window after 35 s, keeping the
+lease. Sweep leaves the window of a checkout another task's lease now holds,
+and closes the one of a checkout nobody holds.
+
+`cargo test --bin privateer-mcp-broker` checks the routing rules directly:
+window parsing and filtering, path arguments (names, `file:` URLs, arrays,
+relative paths and symlinks), discovery and roots.
 
 `cargo test --lib mcp_broker` checks the dispatcher's temporary-file and
-upstream-group checks directly, and `cargo test --test releases` checks that the
+upstream-group checks directly, a connect to a listener with a full backlog
+failing by its deadline, and the Mac close script passing the helper checks, and `cargo test --test releases` checks that the
 release layout ships the broker and that install takes it from a release.
 
 ## Not verified (Mac only)
@@ -558,12 +624,15 @@ None of these can be checked on Linux:
   keeps the root it connected with.
 - A window the user closes stays cached for its root until the next window
   list; the call that finds it gone fails upstream.
-- A tool that takes `tabIdentifier` but is missing from the cached tool list
-  (between a `list_changed` and the next list) is forwarded unchanged unless
-  the call names a tab.
 - A tool call that needs a window blocks that client's connection while the
-  window is looked up or opened: up to `--ready-wait-secs`, or the open
-  helper's 30 s deadline if that ends later.
+  window is looked up or opened, up to `--ready-wait-secs`.
+- A `close_workspace` runs the close helper once per recorded window under the
+  root, each with a 30 s deadline. A root with more than one recorded window
+  can therefore outlast the release's 35 s wait; the release is then refused
+  and the lease kept.
+- A window whose open helper exits before Xcode shows it (`open -g` returns at
+  once) can appear after a close that found no document to close. It is then
+  left open, and no longer recorded.
 
 - Sandboxes keep crews out of the run directory, not the user's own unsandboxed
   processes. Any process running as this user outside a sandbox can still stop
