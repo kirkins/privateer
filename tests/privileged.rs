@@ -301,7 +301,15 @@ fn a_granted_command_runs_once_as_sudo_k_with_a_cleared_environment() {
         serde_json::from_str(&fs::read_to_string(machine.root.join("sudo.json")).unwrap()).unwrap();
     assert_eq!(seen["argv"], json!(["-k", "--", "/usr/bin/id", "-u"]));
     assert_eq!(seen["cwd"], "/");
-    let mut env: Vec<String> = seen["env"].as_object().unwrap().keys().cloned().collect();
+    // macOS adds __CF_USER_TEXT_ENCODING to every process it starts, even
+    // with a cleared environment; it is not ours to pass or to strip.
+    let mut env: Vec<String> = seen["env"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|key| *key != "__CF_USER_TEXT_ENCODING")
+        .cloned()
+        .collect();
     env.sort();
     assert_eq!(env, ["LANG", "PATH", "TERM"], "{seen}");
     assert_eq!(seen["env"]["PATH"], "/usr/sbin:/usr/bin:/sbin:/bin");
@@ -527,10 +535,11 @@ fn staging_refuses_each_class_of_command() {
         refused(&|a| a["reason"] = json!(reason), "control character");
     }
     // The working folder is root's all the way up, named without a symlink.
-    refused(
-        &|a| a["cwd"] = json!(machine.root),
-        "writable by group or others",
-    );
+    // A folder its group can write: the temporary folder is not that on every
+    // platform (macOS keeps it under the user's own /var/folders).
+    let shared = own_folder("shared");
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+    refused(&|a| a["cwd"] = json!(shared), "writable by group or others");
     refused(&|a| a["cwd"] = json!("/usr/../usr"), "'..'");
     let real = own_folder("real");
     let link = real.with_file_name(format!("privileged-{}-link", std::process::id()));
