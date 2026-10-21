@@ -1642,6 +1642,81 @@ fn an_approval_waits_unused_until_its_proposal_is_runnable() {
 }
 
 #[test]
+fn an_approved_move_never_resumes_a_move_it_did_not_start() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "move_keep", Some(&ssh));
+    // The operator's own move of scout to the Mac, interrupted.
+    laptop
+        .conn()
+        .execute(
+            "INSERT INTO moves(id, role, ship, state, detail, updated_ms)
+             VALUES('operator-move', 'run', 'scout', 'started', ?1, 1)",
+            [json!({"to": "mac", "machine": "mac", "peer": "machine-mac"}).to_string()],
+        )
+        .unwrap();
+    laptop.run_moves("liaison", Some(&ssh));
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "refused", "{record}");
+    assert!(
+        record["outcome"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("an earlier move of scout (operator-move) is started and unfinished"),
+        "{record}"
+    );
+    assert!(laptop.folder("scout").exists());
+    assert_eq!(laptop.moves(), ["run:started"]);
+}
+
+#[test]
+fn a_linked_machines_proposal_moves_its_ship_only_from_that_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("rover");
+    link(&laptop, &mac, &ssh);
+    press(&mac, "fitforge", "upkeep", None);
+    refresh(&laptop, &ssh);
+    // The Mac's proposal says the ship comes from somewhere else.
+    mac.conn()
+        .execute(
+            "UPDATE machines SET known_as=NULL, calls_here='studio' WHERE name='laptop'",
+            [],
+        )
+        .unwrap();
+    let proposed = mac.agent_ok(
+        "upkeep",
+        "ship.propose_move",
+        json!({"name": "rover", "to": "laptop", "why": "full"}),
+    );
+    let id = proposed["proposal"].as_str().unwrap().to_owned();
+    assert_eq!(proposal(&mac, &id).1["from"], "studio");
+    for _ in 0..2 {
+        let collected = laptop.run("liaison", &["machine", "collect"], Some(&ssh));
+        assert!(collected.status.success(), "{}", text(&collected));
+    }
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "open", "{record}");
+    answer(
+        &laptop,
+        record["decision"].as_str().unwrap(),
+        "move_keep",
+        Some(&ssh),
+    );
+    laptop.run_moves("liaison", Some(&ssh));
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "refused", "{record}");
+    assert!(
+        record["outcome"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("only a move from mac to this machine (laptop) runs here"),
+        "{record}"
+    );
+    assert!(laptop.moves().is_empty(), "{:?}", laptop.moves());
+    assert!(mac.folder("rover").exists());
+}
+
+#[test]
 fn a_changed_lapsed_or_busy_approval_moves_nothing_and_cools_down() {
     let (_temp, laptop, mac, ssh) = fixture();
     let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);

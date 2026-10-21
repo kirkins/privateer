@@ -2000,6 +2000,18 @@ fn run_one(conn: &Connection, approval: &Approval, proposal: &Proposal, now: i64
         );
     }
     let ship = proposal.text("ship").to_owned();
+    // A linked machine's proposal moves its ship from that machine to this
+    // one, and from nowhere else.
+    if let Some(home) = &proposal.home {
+        let here = known_there(conn, home).unwrap_or_default();
+        if proposal.text("from") != home || proposal.text("to") != here {
+            return refused(format!(
+                "the proposal names {} to {}, but only a move from {home} to this machine ({here}) runs here; nothing moved",
+                proposal.text("from"),
+                proposal.text("to")
+            ));
+        }
+    }
     let moving = update(conn, &proposal.id, &["open", "approved"], |p| {
         p.record["moving_ms"] = json!(Store::now_ms());
         p.state = "moving".into();
@@ -2045,8 +2057,14 @@ fn run_one(conn: &Connection, approval: &Approval, proposal: &Proposal, now: i64
         if let Some(why) = check_refusal(&check, needed(&eligible), &to) {
             return Ok(refused(why));
         }
-        let moved = crate::moves::run(&json!({"name": ship,
-            "to": if proposal.home.is_none() { proposal.text("to") } else { "here" }}))?;
+        // Only a move of its own, from where the proposal says, preflighted:
+        // never an unfinished move of the ship this one did not start.
+        let mut request = json!({"name": ship, "fresh": true,
+            "to": if proposal.home.is_none() { proposal.text("to") } else { "here" }});
+        if let Some(home) = &proposal.home {
+            request["from"] = json!(home);
+        }
+        let moved = crate::moves::run(&request)?;
         let id = moved["move"].as_str().unwrap_or("").to_owned();
         let mut outcome = json!({"state": "moved", "move": id, "cleanup": approval.cleanup,
             "cleaned": false});

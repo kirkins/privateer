@@ -1507,6 +1507,14 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
             },
         )
         .optional()?;
+    // An approved placement starts its own move, always with the preflight.
+    if args["fresh"].as_bool().unwrap_or(false)
+        && let Some((id, state, _)) = &unfinished
+    {
+        bail!(
+            "an earlier move of {ship} ({id}) is {state} and unfinished; `privateer ship move` finishes it first"
+        );
+    }
     let (id, prior, record) = match unfinished {
         Some((id, state, detail)) => {
             let record: Value = serde_json::from_str(&detail)?;
@@ -1524,6 +1532,12 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
         ),
     };
     let machine = required(&record, "machine")?.to_owned();
+    if let Some(from) = args["from"].as_str() {
+        ensure!(
+            to == "here" && machine == from,
+            "{ship} lives on {machine}, not on {from}; nothing moved"
+        );
+    }
     let peer = required(&record, "peer")?.to_owned();
     let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
