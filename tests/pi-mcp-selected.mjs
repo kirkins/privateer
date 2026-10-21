@@ -1,8 +1,14 @@
 // Selected-MCP helper tests: registry-shaped refusals, token handling and the
 // readiness gate. No network, real secrets or Pi process. Run: node tests/pi-mcp-selected.mjs
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
-  EXIT_UNAVAILABLE, foreignTool, gate, loadEntries, missing, parseRecords, prefixOf, readToken, serverEntry, UnavailableError,
+  EXIT_UNAVAILABLE, fileDigest, foreignTool, gate, interpreter, isStdio, LAUNCHER, loadEntries, missing, parseRecords,
+  prefixOf, readToken, serverEntry, stdioEntry, UnavailableError,
 } from "../plugins/pi-mcp/selected.mjs";
 
 const SENTINEL = `SENTINEL-${"a".repeat(24)}`;
@@ -163,5 +169,99 @@ function clock() {
 for (const url of ["https://evil.example\\.good.example/mcp", "https://mcp.example.test\\/mcp", "https://mcp example.test/mcp", "https://mcp.example.test/mcp\n"]) {
   assert.throws(() => parseRecords(env([record({ url })])), undefined, JSON.stringify(url));
 }
+
+// Pinned stdio records: the same refusals as the bundle loader, then an entry
+// that runs Privateer's launcher with the record, never the command directly.
+const PIN = "a".repeat(64);
+const stdio = (overrides = {}) => ({ name: "xcode", command: ["/usr/bin/xcrun", "mcpbridge"], sha256: PIN, timeout: 10, ...overrides });
+const stdioRefusals = {
+  "url beside command": stdio({ url: "https://mcp.example.test/mcp" }),
+  "env key": stdio({ env: { A: "b" } }),
+  "cwd key": stdio({ cwd: "/" }),
+  "shell key": stdio({ shell: true }),
+  "args key": stdio({ args: ["-x"] }),
+  "headers key": stdio({ headers: { A: "b" } }),
+  "missing sha256": (({ sha256, ...rest }) => rest)(stdio()),
+  "uppercase sha256": stdio({ sha256: "A".repeat(64) }),
+  "short sha256": stdio({ sha256: "a".repeat(63) }),
+  "relative command": stdio({ command: ["xcrun"] }),
+  "dot segment": stdio({ command: ["/usr/bin/./xcrun"] }),
+  "parent segment": stdio({ command: ["/usr/lib/../bin/xcrun"] }),
+  "empty segment": stdio({ command: ["/usr//bin/xcrun"] }),
+  "trailing slash": stdio({ command: ["/usr/bin/xcrun/"] }),
+  "home command": stdio({ command: ["~/bin/xcrun"] }),
+  "dollar argument": stdio({ command: ["/usr/bin/xcrun", "$HOME"] }),
+  "braced dollar argument": stdio({ command: ["/usr/bin/xcrun", "${HOME}"] }),
+  "bang argument": stdio({ command: ["/usr/bin/xcrun", "!cmd"] }),
+  "home argument": stdio({ command: ["/usr/bin/xcrun", "~/x"] }),
+  "control argument": stdio({ command: ["/usr/bin/xcrun", "a\nb"] }),
+  "empty argument": stdio({ command: ["/usr/bin/xcrun", ""] }),
+  "long argument": stdio({ command: ["/usr/bin/xcrun", "x".repeat(4097)] }),
+  "non-string argument": stdio({ command: ["/usr/bin/xcrun", 7] }),
+  "string command": stdio({ command: "/usr/bin/xcrun" }),
+  "empty command": stdio({ command: [] }),
+  "33 elements": stdio({ command: ["/usr/bin/xcrun", ...Array(32).fill("x")] }),
+  "bad credential": stdio({ credential: "xcode" }),
+};
+for (const shell of ["sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "csh", "tcsh", "ash", "busybox", "env"]) {
+  stdioRefusals[`shell ${shell}`] = stdio({ command: [`/bin/${shell}`, "-c", "true"] });
+}
+for (const [label, value] of Object.entries(stdioRefusals)) {
+  assert.throws(() => parseRecords(env([value])), undefined, label);
+}
+assert.equal(parseRecords(env([stdio(), stdio({ name: "docs", credential: "DOCS_TOKEN", description: "Docs" })])).length, 2);
+assert.equal(isStdio(stdio()), true);
+assert.equal(isStdio(record()), false);
+// A stdio and an HTTP server share the one namespace rule.
+assert.throws(() => parseRecords(env([stdio({ name: "a-b" }), record({ name: "a-b" })])), { message: "collision" });
+
+const PYTHON = "/usr/bin/python3";
+assert.equal(LAUNCHER, fileURLToPath(new URL("../plugins/mcp_stdio.py", import.meta.url)));
+assert.equal(interpreter({ PRIVATEER_MCP_PYTHON: PYTHON }), PYTHON);
+for (const bad of [undefined, "python3", "/usr/bin/node", "/usr/$X/python3", "~/python3"]) {
+  assert.throws(() => interpreter({ PRIVATEER_MCP_PYTHON: bad }), undefined, String(bad));
+}
+assert.deepEqual(stdioEntry(stdio({ credential: "XCODE_TOKEN", description: "Xcode" }), "/fleet/xcode", PYTHON), {
+  name: "xcode",
+  config: {
+    command: PYTHON,
+    args: ["-I", LAUNCHER, JSON.stringify({ command: ["/usr/bin/xcrun", "mcpbridge"], sha256: PIN, credential: { file: "/fleet/xcode", name: "XCODE_TOKEN" } })],
+    env: {}, timeout: 10, exposure: "direct", description: "Xcode",
+  },
+  source: "privateer-selected",
+  scope: "extension",
+});
+assert.equal(JSON.parse(stdioEntry(stdio(), undefined, PYTHON).config.args[2]).credential, undefined);
+for (const file of [undefined, "fleet/x", "/fleet/$HOME", "!/fleet"]) {
+  assert.throws(() => stdioEntry(stdio({ credential: "XCODE_TOKEN" }), file, PYTHON), undefined, String(file));
+}
+// The loader re-pins: a matching digest loads, drift names only its server.
+const pinned = { ...env([stdio()]), PRIVATEER_MCP_PYTHON: PYTHON };
+assert.equal(loadEntries(pinned, read, () => PIN)[0].config.command, PYTHON);
+for (const [label, environment, digest] of [
+  ["drift", pinned, () => "b".repeat(64)],
+  ["unreadable", pinned, () => { throw new Error("ENOENT"); }],
+  ["no interpreter", env([stdio()]), () => PIN],
+  ["missing credential path", { ...env([stdio({ credential: "XCODE_TOKEN" })]), PRIVATEER_MCP_PYTHON: PYTHON }, () => PIN],
+]) {
+  try {
+    loadEntries(environment, read, digest);
+    assert.fail(`${label} must refuse`);
+  } catch (error) {
+    assert.ok(error instanceof UnavailableError, label);
+    assert.equal(error.server, "xcode", label);
+  }
+}
+// Its default digest reads a regular file and refuses a symlink.
+const scratch = mkdtempSync(join(tmpdir(), "pi-mcp-selected-"));
+try {
+  writeFileSync(join(scratch, "server"), "fixture\n");
+  symlinkSync(join(scratch, "server"), join(scratch, "linked"));
+  assert.equal(fileDigest(join(scratch, "server")), createHash("sha256").update("fixture\n").digest("hex"));
+  assert.throws(() => fileDigest(join(scratch, "linked")));
+} finally {
+  rmSync(scratch, { recursive: true });
+}
+
 assert.equal(EXIT_UNAVAILABLE, 78);
 console.log("pi-mcp-selected: ok");
