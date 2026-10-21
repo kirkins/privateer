@@ -138,6 +138,20 @@ pub(crate) fn record_settings(store: &Store, ship: &str) -> Result<()> {
     Ok(())
 }
 
+/// Record the captain approvals this pane's session launches with, as told to
+/// its auto-mode classifier. Auto mode reads them only at launch.
+pub(crate) fn record_approvals(store: &Store, ship: &str, sentences: &[String]) -> Result<()> {
+    store.connection().execute(
+        "UPDATE hosted_panes SET approvals_digest=?3 WHERE ship=?1 AND pid=?2",
+        params![
+            ship,
+            std::process::id(),
+            crate::captain_approvals::digest(sentences)
+        ],
+    )?;
+    Ok(())
+}
+
 /// Record the native harness this pane spawned, so its exit can be checked.
 pub(crate) fn harness(store: &Store, ship: &str, harness: u32) -> Result<()> {
     let started = crate::jobs::process_identity(harness)?;
@@ -174,18 +188,27 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
     };
     let image = kernel_image(pid).unwrap_or(recorded);
     let current = current_for(&image)?;
-    // A pane recorded before settings were tracked has no digest to judge.
-    let launched: Option<String> = store
+    // A pane recorded before settings or approvals were tracked has no digest
+    // to judge.
+    let (launched, approvals): (Option<String>, Option<String>) = store
         .connection()
         .query_row(
-            "SELECT settings_digest FROM hosted_panes WHERE ship=?1",
+            "SELECT settings_digest, approvals_digest FROM hosted_panes WHERE ship=?1",
             [ship],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?
-        .flatten();
+        .unwrap_or_default();
     let settings_changed =
         launched.is_some_and(|launched| launched != settings_digest(&settings_paths(store)));
+    // An approval recorded, revoked, expired or ended with its task since
+    // launch. Reported only; the pane is not relaunched for it.
+    let approvals_changed = match approvals {
+        Some(approvals) => {
+            approvals != crate::captain_approvals::current_digest(store, ship, Store::now_ms())?
+        }
+        None => false,
+    };
     Ok(Some(json!({
         "pid": pid,
         "executable": image,
@@ -193,6 +216,7 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
         "current_commit": current,
         "drift": behind(&image, current.as_deref()),
         "settings_changed": settings_changed,
+        "approvals_changed": approvals_changed,
     })))
 }
 
