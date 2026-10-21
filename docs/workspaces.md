@@ -92,19 +92,24 @@ a squash merge can qualify through a Git merge-tree content comparison. Unknown
 or conflicting containment preserves the checkout. Ignored build caches remain
 available for reuse under Treehouse's ordinary cleanup rules.
 
-Before those checks, once the workspace's jobs are idle, release asks the
-[MCP broker](mcp-broker.md#windows-and-routing-step-3) to close any Xcode
-window it opened for the workspace: Xcode can write into the worktree and hold
-files there, and the checks must see it gone. The broker is asked only when its
-record lists a window under the workspace, so a hung broker holds up no other
-release. If a running broker cannot close the window, or does not answer within
-35 s, the release is refused and the lease is kept. With no broker running, the
-release goes ahead and the window left open is audited
-(`workspace.xcode_window_unclosed`). The dispatcher's sweep closes the window
-the same way before it releases a workspace, and a failure there alerts the
-task's owner. A record whose Treehouse lease moved to another task is marked
-released without the close when another live lease holds the same checkout:
-that window is the new holder's now.
+Before those checks, once the workspace's jobs are idle, release asks each
+[MCP broker](mcp-broker.md#closing-on-release) instance that opened a window
+for the workspace to close it: an upstream's window (an Xcode window, in the
+[Xcode example](mcp-broker-xcode.md)) can write into the worktree and hold
+files there, and the checks must see it gone. Only the instances whose record
+lists a window under the workspace are asked, all in parallel under one 35 s
+deadline, so a hung broker holds up no other release and a release waits at
+most 35 s however many instances there are. If a running instance cannot close
+its window, or does not answer in time, the release is refused, the error names
+the instance (`could not close the NAME window for this workspace: ...`), and
+the lease is kept. A recorded but stopped instance cannot close anything: the
+release goes ahead and the window left open is audited as
+`workspace.mcp_window_unclosed`, with the `instance` (this was
+`workspace.xcode_window_unclosed` before brokers were named). The dispatcher's
+sweep closes the windows the same way before it releases a workspace, and a
+failure there alerts the task's owner. A record whose Treehouse lease moved to
+another task is marked released without the close when another live lease
+holds the same checkout: that window is the new holder's now.
 
 To retain clean committed work that has not landed, explicitly pass
 `"archive":true` to release. Privateer saves HEAD under
