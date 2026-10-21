@@ -1051,6 +1051,9 @@ impl Broker {
         }
         if let (true, Some(opened)) = (close_after, opened) {
             let (closed, failure) = self.close_windows(vec![opened]);
+            // A client may have listed the window while it was open: its tab
+            // is gone now, so the slot's next task must look it up again.
+            self.lock().tabs.remove(&root);
             self.log.line(&format!(
                 "closed {} window opened after its workspace {} was released{}",
                 closed.len(),
