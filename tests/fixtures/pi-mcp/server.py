@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Authless stdio MCP fake. JSONL markers contain no environment/credential values."""
+"""Authless stdio MCP fake. JSONL markers contain no environment/credential
+values: the start marker lists the environment's names only, PATH, and
+its open descriptors.
+
+Modes: normal, disconnected, hang-init; stubborn starts a grandchild that
+ignores SIGTERM in this process group, escaped one that also leaves it
+(setsid). Each child's pid and start time are recorded, so a test can show
+it is gone."""
 import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
+
+# A grandchild that outlives a polite stop: SIGTERM ignored, closed stdio.
+STUBBORN = 'import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nwhile True: time.sleep(1)\n'
 
 
 def tools():
@@ -35,13 +46,44 @@ def response(request, identity):
     raise ValueError('unsupported fixture method')
 
 
+def started(pid):
+    """A process's start time on Linux, which names it across pid reuse; None
+    where there is no /proc (macOS)."""
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+    except FileNotFoundError:
+        return None
+    return stat[stat.rindex(')') + 2:].split()[19]
+
+
+def descriptors():
+    """This process's open descriptors, before it opens any: /proc/self/fd on
+    Linux, /dev/fd elsewhere. The listing's own descriptor is closed by the
+    time it returns, so only those still open are kept."""
+    directory = '/proc/self/fd' if Path('/proc/self/fd').is_dir() else '/dev/fd'
+    listed = sorted(int(name) for name in os.listdir(directory))
+    def open_(fd):
+        try:
+            os.fstat(fd)
+            return True
+        except OSError:
+            return False
+    return [fd for fd in listed if open_(fd)]
+
+
 def main():
+    fds = descriptors()
     marker, identity, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
     def record(event, **fields):
         with marker.open('a') as stream:
             stream.write(json.dumps({'event': event, **fields}) + '\n')
-    record('start', pid=os.getpid(), pgid=os.getpgrp(),
-           start=Path('/proc/self/stat').read_text().split()[21])
+    record('start', pid=os.getpid(), pgid=os.getpgrp(), start=started(os.getpid()), env=sorted(os.environ),
+           path=os.environ.get('PATH'), fds=fds)
+    if mode in ('stubborn', 'escaped'):
+        child = subprocess.Popen([sys.executable, '-I', '-c', STUBBORN], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=mode == 'escaped')
+        record('child', pid=child.pid, pgid=os.getpgid(child.pid), start=started(child.pid))
     def stop(_sig, _frame):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
@@ -67,6 +109,25 @@ def main():
             print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
     finally:
         record('stop')
+
+
+def alive(event):
+    """True while the recorded process runs and is not a zombie: the same
+    start time too, where /proc records one."""
+    state = subprocess.run(['ps', '-p', str(event['pid']), '-o', 'stat='], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith('Z') and started(event['pid']) == event['start']
+
+
+def outliving(events, grace=3):
+    """The fake's recorded processes still running after `grace` seconds, then
+    killed: a native probe runs outside a job, so nothing else would end them."""
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(alive(e) for e in events if e['event'] in ('start', 'child')):
+        time.sleep(0.1)
+    found = [e for e in events if e['event'] in ('start', 'child') and alive(e)]
+    for event in found:
+        os.kill(event['pid'], 9)
+    return found
 
 
 if __name__ == '__main__':

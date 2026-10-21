@@ -2,6 +2,7 @@
 """Deterministic bounded Claude launch tests with a fake claude. No model,
 network, real HOME or real Claude settings: every test runs in a temporary
 HOME, CLAUDE_CONFIG_DIR, XDG and PRIVATEER_FLEET."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import bundles
 import claude_bundles
 import native_launch
 from native import handle
+import stdio_pins
 
 SESSION = '00000000-0000-4000-8000-000000000001'
 ATTENDED = str(ROOT / 'plugins/attended-claude')
@@ -432,6 +434,112 @@ class ClaudeBundles(unittest.TestCase):
         argv, env = execute.call_args.args[1:]
         self.assertFalse([a for a in argv if a.startswith('--mcp-config')])
         self.assertNotIn('PRIVATEER_MCP_SERVERS', env)
+
+    def stdio_server(self, data=b'\x7fELF fixture\n'):
+        """A pinnable stand-in for a server's executable, which these tests
+        never run: (path, sha256), in a private directory."""
+        server = stdio_pins.private_directory(self) / 'xcrun'
+        server.write_bytes(data)
+        server.chmod(0o755)
+        return str(server), hashlib.sha256(data).hexdigest()
+
+    def test_selected_stdio_server_runs_through_the_launcher_with_its_credential_path_only(self):
+        server, digest = self.stdio_server()
+        xcode = {'name': 'xcode', 'command': [server, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10,
+                 'credential': 'XCODE_TOKEN'}
+        self.registry['bundles'] = [
+            {'ref': 'xcode@1', 'roles': ['crew'], 'mcp_servers': [xcode],
+             'credentials': [{'name': 'XCODE_TOKEN', 'ref': 'xcode-token'}]},
+            {'ref': 'other@1', 'roles': ['crew'], 'mcp_servers': [dict(xcode, name='other', credential='OTHER')],
+             'credentials': [{'name': 'OTHER', 'ref': 'other'}]}]
+        # Not a header token: the server reads its own file, so nothing checks its shape here.
+        path = self.store('xcode-token', b'SENTINEL-STDIO two words')
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan(['xcode@1']))
+        argv, env = execute.call_args.args[1:]
+        configs = [a for a in argv if a.startswith('--mcp-config=')]
+        self.assertEqual(len(configs), 1)
+        self.assertIn('--strict-mcp-config', argv)
+        config = Path(configs[0].split('=', 1)[1])
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+        entry = json.loads(config.read_text())['mcpServers']
+        self.assertEqual(list(entry), ['xcode'])
+        self.assertEqual(entry['xcode'], {'type': 'stdio', 'command': bundles.interpreter(),
+                                          'args': ['-I', str(ROOT / 'plugins/mcp_stdio.py'), entry['xcode']['args'][2]],
+                                          'env': {}})
+        self.assertEqual(json.loads(entry['xcode']['args'][2]), {
+            'command': xcode['command'], 'sha256': digest, 'credential': {'name': 'XCODE_TOKEN', 'file': str(path)}})
+        self.assertNotIn('SENTINEL-STDIO', json.dumps([argv, env]) + config.read_text())
+        self.assertNotIn('PRIVATEER_MCP_PYTHON', env)
+        # The header check is for HTTP servers only: none runs for stdio.
+        with patch.object(claude_bundles.subprocess, 'run') as helper:
+            claude_bundles.check_headers([xcode], env)
+        helper.assert_not_called()
+        # A credential path Claude would expand refuses, naming the field.
+        os.environ['PRIVATEER_FLEET'] = str(self.base / 'a$b/fleet.sqlite')
+        (self.base / 'a$b').mkdir()
+        (self.base / 'a$b/fleet.credentials').mkdir(mode=0o700)
+        (self.base / 'a$b/fleet.credentials/xcode-token').write_bytes(b'x')
+        (self.base / 'a$b/fleet.credentials/xcode-token').chmod(0o600)
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe(), \
+                self.assertRaises(bundles.Refused) as refused:
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan(['xcode@1']))
+        self.assertEqual(refused.exception.field, 'mcp_servers.credential')
+        execute.assert_not_called()
+        os.environ['PRIVATEER_FLEET'] = str(self.base / 'fleet.sqlite')
+        # Without a credential, the spec carries none.
+        self.registry['bundles'][0]['mcp_servers'] = [{k: v for k, v in xcode.items() if k != 'credential'}]
+        self.registry['bundles'][0]['credentials'] = []
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan(['xcode@1']))
+        argv, env = execute.call_args.args[1:]
+        config = Path(next(a for a in argv if a.startswith('--mcp-config=')).split('=', 1)[1])
+        self.assertNotIn('credential', json.loads(json.loads(config.read_text())['mcpServers']['xcode']['args'][2]))
+        self.assertFalse([k for k in env if k.startswith('PRIVATEER_CREDENTIAL_')])
+
+    def test_a_first_mate_never_carries_a_stdio_server(self):
+        """A hosted first mate's pane is not a job: its plan and its attended
+        launch refuse a stdio server, while an HTTP one still loads."""
+        server, digest = self.stdio_server()
+        xcode = {'name': 'xcode', 'command': [server, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10}
+        docs = {'name': 'docs', 'url': 'https://mcp.example.test/mcp', 'credential': 'DOCS_TOKEN', 'timeout': 5}
+        self.registry['bundles'] = [
+            {'ref': 'xcode@1', 'roles': ['first_mate', 'crew'], 'mcp_servers': [xcode]},
+            {'ref': 'docs@1', 'roles': ['first_mate', 'crew'], 'mcp_servers': [docs],
+             'credentials': [{'name': 'DOCS_TOKEN', 'ref': 'docs-search'}]}]
+        message = ('stdio MCP servers run only in crew jobs, whose teardown ends them; '
+                   'first_mate launches are not jobs')
+        with self.assertRaises(bundles.StdioRole) as refused:
+            bundles.plan(self.registry, ['xcode@1'], 'first_mate', 'claude')
+        self.assertEqual(str(refused.exception), message)
+        crew = self.plan(['xcode@1'])
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe() as probe, \
+                self.assertRaises(bundles.StdioRole):
+            native_launch.launch('claude', ['claude'], bundles=crew, attended=True)
+        probe.assert_not_called()
+        execute.assert_not_called()
+        # A wake's job preflight plans as first_mate too.
+        request = {'method': 'command', 'context': {'repo': str(self.repo), 'title': 'brief', 'control': {},
+                                                    'role': 'first_mate', 'tool_bundles': crew}, 'options': {}}
+        with self.assertRaises(bundles.StdioRole):
+            handle('claude', request)
+        # HTTP servers stay for a first mate, attended included.
+        self.store('docs-search', b'SENTINEL-MCP-TOKEN\n')
+        first_mate = bundles.plan(self.registry, ['docs@1'], 'first_mate', 'claude')
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', ['claude'], bundles=first_mate, attended=True)
+        argv = execute.call_args.args[1]
+        self.assertEqual(len([a for a in argv if a.startswith('--mcp-config')]), 1)
+
+    def test_stdio_pin_drift_refuses_a_claude_launch_before_its_probe(self):
+        server, digest = self.stdio_server()
+        record = {'name': 'xcode', 'command': [server], 'timeout': 10, 'sha256': digest}
+        self.registry['bundles'] = [{'ref': 'xcode@1', 'roles': ['crew'], 'mcp_servers': [record]}]
+        plan = self.plan(['xcode@1'])
+        Path(server).write_bytes(b'\x7fELF fixture\n# changed\n')
+        with patch.object(native_launch.os, 'execvpe') as execute:
+            self.refuses(lambda: native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=plan))
+        execute.assert_not_called()
 
     def test_a_pi_only_registry_refusal_names_claude_version(self):
         registry = {k: v for k, v in self.registry.items() if k != 'claude_version'}

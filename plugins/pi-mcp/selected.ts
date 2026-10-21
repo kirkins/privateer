@@ -1,6 +1,8 @@
-// Privateer's run-selected MCP servers: remote streamable-HTTP only, each with a
-// Bearer token read from a credential file inside this Pi process. Loaded only
-// by a bounded Pi run that selects servers; helpers and the gate are in selected.mjs.
+// Privateer's run-selected MCP servers: remote streamable HTTP, each with a
+// Bearer token read from a credential file inside this Pi process, or local
+// stdio with a pinned executable re-hashed here before Pi spawns it. Loaded
+// only by a bounded Pi run that selects servers; helpers and the gate are in
+// selected.mjs.
 import { createMcpExtension } from "@earendil-works/pi-coding-agent";
 import { foreignTool, gate, loadEntries, parseRecords, unavailable, UnavailableError } from "./selected.mjs";
 

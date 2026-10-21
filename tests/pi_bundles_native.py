@@ -71,6 +71,7 @@ class FixtureHTTPServer(http.server.ThreadingHTTPServer):
 # reaches it; a gate that refuses never does). Both loopback, both per test.
 sys.path.insert(0, str(ROOT / 'tests/fixtures/pi-mcp'))
 import server as mcp_fixture
+STDIO_SERVER = ROOT / 'tests/fixtures/pi-mcp/server.py'
 
 
 class McpHandler(http.server.BaseHTTPRequestHandler):
@@ -374,6 +375,63 @@ class Native(unittest.TestCase):
         self.assertEqual(run.returncode, 78, run.stderr[-600:])
         self.assertEqual(model.connections, 0)
         self.assertEqual(mcp.seen, [], 'a token Pi could expand must never be sent')
+
+
+    def test_selected_stdio_server_env_ambient_and_lifetime(self):
+        """A pinned stdio server: the gate passes once its tools list, ambient
+        stdio servers never start, and the fake records the environment names
+        Pi passes it. Reports which of its processes outlive Pi; the job's
+        teardown ends those (tests/tool_bundles.rs proves it)."""
+        model = CountingServer(ModelHandler)
+        self.addCleanup(model.server_close)
+        self.addCleanup(model.shutdown)
+        fleet = self.base / 'stdio/fleet.sqlite'
+        directory = fleet.with_suffix('.credentials')
+        fleet.parent.mkdir()
+        directory.mkdir(mode=0o700)
+        (directory / 'stdio-token').write_text(SENTINEL_TOKEN + '\n')
+        (directory / 'stdio-token').chmod(0o600)
+        (self.agent / 'models.json').write_text(json.dumps({'providers': {'spike': {
+            'baseUrl': f'{model.url}/v1', 'api': 'openai-completions', 'apiKey': 'unused',
+            'models': [{'id': 'm'}]}}}))
+        # Claude's project file too: neither harness may start it.
+        ambient = self.base / 'ambient-project.jsonl'
+        (self.repo / '.mcp.json').write_text(json.dumps({'mcpServers': {'ambient-project': {
+            'command': sys.executable, 'args': [str(STDIO_SERVER), str(ambient), 'ambient', 'normal']}}}))
+        python = os.path.realpath(sys.executable)
+        marker = self.base / 'stdio.jsonl'
+        registry = copy.deepcopy(self.registry)
+        registry['integrations']['extensions'] = []
+        registry['bundles'].append({'ref': 'stdio@1', 'roles': ['crew'],
+                                    'credentials': [{'name': 'STDIO_TOKEN', 'ref': 'stdio-token'}],
+                                    'mcp_servers': [{'name': 'fixture', 'credential': 'STDIO_TOKEN', 'timeout': 10,
+                                                     'command': [python, '-I', str(STDIO_SERVER), str(marker),
+                                                                 'selected', 'stubborn'],
+                                                     'sha256': hashlib.sha256(Path(python).read_bytes()).hexdigest()}]})
+        plan = bundles.plan(registry, ['stdio@1'], 'crew')
+        env = dict(self.env, PRIVATEER_FLEET=str(fleet), PRIVATEER_PROBE_AMBIENT='1', LANG='C.UTF-8',
+                   TMPDIR=str(self.base))
+        args = [sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(plan),
+                'pi', 'pi', '--offline', '--no-session', '--model', 'spike/m', '--print', '--', 'hello']
+        run = subprocess.run(args, cwd=self.repo, env=env, text=True, capture_output=True, stdin=subprocess.DEVNULL,
+                             timeout=60)
+        events = [json.loads(line) for line in marker.read_text().splitlines()] if marker.exists() else []
+        survivors = mcp_fixture.outliving(events)
+        self.assertGreater(model.connections, 0, (run.returncode, run.stdout[-400:], run.stderr[-600:]))
+        starts = [e for e in events if e['event'] == 'start']
+        self.assertTrue(starts)
+        self.assertIn('tools/list', [e.get('method') for e in events if e['event'] == 'request'])
+        for directory in (self.agent, self.repo / '.pi'):
+            self.assertFalse((directory / 'mcp-connected').exists())
+        self.assertFalse(ambient.exists())
+        names = starts[0]['env']
+        # Privateer's launcher passes exactly these, not the harness's environment.
+        self.assertEqual(names, ['HOME', 'LANG', 'PATH', 'PRIVATEER_CREDENTIAL_STDIO_TOKEN_FILE', 'TMPDIR'])
+        self.assertEqual(starts[0]['path'], '/usr/bin:/bin')
+        self.assertNotIn(SENTINEL_TOKEN, marker.read_text() + run.stdout + run.stderr)
+        print(json.dumps({'case': 'selected-stdio', 'native_pi': self.version, 'exit': run.returncode,
+                          'starts': len(starts), 'env_names': names,
+                          'outliving_pi': [e['event'] for e in survivors]}), flush=True)
 
 
 if __name__ == '__main__':

@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / 'plugins'))
 import bundles
 import pi_bundles
 from native import handle
+import stdio_pins
 
 # Option rows as Pi's --help lists them, keyed by the flag each row declares.
 PI_ROWS = {
@@ -607,6 +608,236 @@ class Bundles(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), self.probe() as probe, self.assertRaises(ValueError):
             native_launch.launch('pi', ['pi', '--print', '--', 'brief'], bundles=bundles.plan(registry, ['docs@1'], 'crew'))
         probe.assert_not_called()
+
+
+    # Pinned stdio servers. A private directory under the checkout holds the
+    # executables whose names, modes and links the records and refusals need;
+    # only a test that runs a server pins a real Python (stdio_pins).
+    def stdio_server(self):
+        if not hasattr(self, '_stdio_server'):
+            self._stdio_server = self.executable_copy(self.private_directory(), 'xcrun')
+        return self._stdio_server
+
+    def stdio_record(self, **change):
+        server, digest = self.stdio_server()
+        record = {'name': 'xcode', 'command': [server, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10}
+        record.update(change)
+        return {key: value for key, value in record.items() if value is not None}
+
+    def stdio_bundle(self, ref='xcode@1', servers=None, credentials=()):
+        return {'ref': ref, 'roles': ['first_mate', 'crew'], 'credentials': list(credentials),
+                'mcp_servers': [self.stdio_record()] if servers is None else servers}
+
+    def private_directory(self):
+        return stdio_pins.private_directory(self)
+
+    def executable_copy(self, directory, name, mode=0o755, data=b'\x7fELF fixture\n'):
+        path = directory / name
+        path.write_bytes(data)
+        path.chmod(mode)
+        return str(path), hashlib.sha256(data).hexdigest()
+
+    def refuses_server(self, record, field, credentials=()):
+        with self.assertRaises(bundles.Refused) as refused:
+            bundles.validate_registry(self.registry_with(self.stdio_bundle(servers=[record], credentials=credentials)))
+        self.assertEqual(refused.exception.field, field, record)
+        self.assertEqual(str(refused.exception), f'bundle xcode@1 refused: {field}')
+
+    def test_stdio_registry_accepts_a_pinned_command_and_refuses_every_unsafe_shape(self):
+        bundles.validate_registry(self.registry_with(self.stdio_bundle()))
+        # A credential is optional for stdio; when named it must be declared.
+        token = [{'name': 'XCODE_TOKEN', 'ref': 'xcode-token'}]
+        bundles.validate_registry(self.registry_with(self.stdio_bundle(
+            servers=[self.stdio_record(credential='XCODE_TOKEN', description='Xcode tools')], credentials=token)))
+        self.refuses_server(self.stdio_record(credential='XCODE_TOKEN'), 'mcp_servers.credential')
+        private = self.private_directory()
+        good, good_sha = self.executable_copy(private, 'server')
+        bundles.validate_registry(self.registry_with(self.stdio_bundle(servers=[self.stdio_record(command=[good], sha256=good_sha)])))
+        # Shells and env by basename, though each is a real, pinned, private file.
+        for name in bundles.SHELLS:
+            shell, digest = self.executable_copy(private, name)
+            with self.subTest(shell=name):
+                self.refuses_server(self.stdio_record(command=[shell, '-c', 'true'], sha256=digest), 'mcp_servers.command')
+        link = private / 'linked'
+        link.symlink_to(good)
+        (private / 'open').mkdir(mode=0o775)
+        (private / 'open').chmod(0o775)
+        writable_parent, open_sha = self.executable_copy(private / 'open', 'server')
+        world, world_sha = self.executable_copy(private, 'world', mode=0o757)
+        group, group_sha = self.executable_copy(private, 'group', mode=0o775)
+        plain_file, plain_sha = self.executable_copy(private, 'not-executable', mode=0o644)
+        # A #! script: its pin would not cover the interpreter it runs.
+        script, script_sha = self.executable_copy(private, 'script', data=b'#!/usr/bin/python3\n')
+        (private / 'directory').mkdir(mode=0o755)
+        commands = [
+            ([script], script_sha), ([str(link)], good_sha), ([writable_parent], open_sha), ([world], world_sha), ([group], group_sha),
+            ([plain_file], plain_sha), ([str(private / 'directory')], good_sha), ([str(private / 'missing')], good_sha),
+            (['server'], good_sha), ([str(private) + '/./server'], good_sha), ([str(private) + '/../' + private.name + '/server'], good_sha),
+            ([str(private) + '//server'], good_sha), ([], good_sha), (good, good_sha), ([good] * 33, good_sha),
+            ([good, '$HOME'], good_sha), ([good, '${HOME}/x'], good_sha), ([good, '!cmd'], good_sha),
+            ([good, '~/x'], good_sha), ([good, 'a\nb'], good_sha), ([good, ''], good_sha), ([good, 'x' * 4097], good_sha),
+            ([good, 7], good_sha), (['~/server'], good_sha),
+        ]
+        for command, digest in commands:
+            with self.subTest(command=command if len(command) < 5 else len(command)):
+                self.refuses_server(self.stdio_record(command=command, sha256=digest), 'mcp_servers.command')
+        # Pin drift, and a pin that is not a sha256.
+        self.refuses_server(self.stdio_record(command=[good], sha256='0' * 64), 'mcp_servers.sha256')
+        self.refuses_server(self.stdio_record(command=[good], sha256=good_sha.upper()), 'mcp_servers.sha256')
+        # No env, cwd or shell; never a url beside a command; an unpinned command refuses.
+        for change in ({'env': {'A': 'b'}}, {'cwd': '/'}, {'shell': True}, {'args': ['-x']}, {'type': 'stdio'},
+                       {'headers': {'A': 'b'}}, {'url': 'https://mcp.example.test/mcp'}, {'sha256': None},
+                       {'timeout': None}, {'command': None, 'url': 'https://mcp.example.test/mcp'}):
+            with self.subTest(change=change):
+                self.refuses_server(self.stdio_record(**change), 'mcp_servers')
+        for change, field in (({'timeout': 0}, 'mcp_servers.timeout'), ({'name': 'Xcode'}, 'mcp_servers.name'),
+                              ({'description': 'a$b'}, 'mcp_servers.description')):
+            self.refuses_server(self.stdio_record(**change), field)
+        # HTTP keeps its shape: a sha256 beside a url refuses as an unknown key.
+        with self.assertRaises(bundles.Refused):
+            bundles.validate_registry(self.registry_with(self.mcp_bundle(servers=[self.mcp_record(sha256=good_sha)])))
+
+    def test_stdio_pin_is_checked_again_at_selection_and_launch(self):
+        private = self.private_directory()
+        server, digest = self.executable_copy(private, 'server')
+        registry = self.registry_with(self.stdio_bundle(servers=[self.stdio_record(command=[server, '--stdio'], sha256=digest)]))
+        plan = bundles.plan(registry, ['xcode@1'], 'crew')
+        self.assertEqual(plan['mcp_servers'], registry['bundles'][0]['mcp_servers'])
+        bundles.validate_plan(plan)
+        Path(server).write_bytes(b'\x7fELF fixture\n# changed\n')
+        with self.assertRaises(bundles.Refused) as refused:
+            bundles.plan(registry, ['xcode@1'], 'crew')
+        self.assertEqual(refused.exception.field, 'mcp_servers.sha256')
+        with self.probe() as probe, self.assertRaises(ValueError):
+            self.preflight(plan)
+        probe.assert_not_called()
+
+    def test_stdio_pi_launch_sets_records_interpreter_and_only_its_credential_path(self):
+        import native_launch
+        directory = self.base / 'fleet.credentials'
+        directory.mkdir(mode=0o700)
+        for ref in ('xcode-token', 'other'):
+            (directory / ref).write_bytes(b'SENTINEL-STDIO-TOKEN')
+            (directory / ref).chmod(0o600)
+        registry = self.registry_with(self.stdio_bundle(servers=[self.stdio_record(credential='XCODE_TOKEN')],
+                                                        credentials=[{'name': 'XCODE_TOKEN', 'ref': 'xcode-token'}]),
+                                      self.stdio_bundle('plain@1', servers=[self.stdio_record(name='plain')]),
+                                      self.registry['bundles'][0])
+        env = dict(self.env, PRIVATEER_FLEET=str(self.base / 'fleet.sqlite'), PRIVATEER_MCP_PYTHON='/inherited/python3',
+                   PRIVATEER_CREDENTIAL_OTHER_FILE=str(directory / 'other'))
+        def launch(selected):
+            with patch.dict(os.environ, env, clear=True), self.probe(), \
+                    patch.object(native_launch.os, 'execvpe') as execute:
+                native_launch.launch('pi', ['pi', '--print', '--', 'brief'], bundles=bundles.plan(registry, selected, 'crew'))
+            return execute.call_args.args[1:]
+        argv, launched = launch(['xcode@1'])
+        self.assertIn(str(ROOT / 'plugins/pi-mcp/selected.ts'), argv)
+        self.assertEqual(launched['PRIVATEER_MCP_PYTHON'], bundles.interpreter())
+        self.assertTrue(Path(launched['PRIVATEER_MCP_PYTHON']).is_absolute())
+        self.assertEqual([r['command'] for r in json.loads(launched['PRIVATEER_MCP_SERVERS'])], [self.stdio_record()['command']])
+        self.assertEqual({k: v for k, v in launched.items() if k.startswith('PRIVATEER_CREDENTIAL_')},
+                         {'PRIVATEER_CREDENTIAL_XCODE_TOKEN_FILE': str(directory / 'xcode-token')})
+        self.assertNotIn('SENTINEL-STDIO-TOKEN', json.dumps([argv, launched]))
+        # Without a credential nothing is checked or passed; an HTTP-only or
+        # server-free run never gets an interpreter it would not use.
+        argv, launched = launch(['plain@1'])
+        self.assertFalse([k for k in launched if k.startswith('PRIVATEER_CREDENTIAL_')])
+        self.assertEqual(launched['PRIVATEER_MCP_PYTHON'], bundles.interpreter())
+        argv, launched = launch(['selected@1'])
+        self.assertNotIn('PRIVATEER_MCP_PYTHON', launched)
+
+    def test_stdio_servers_plan_and_launch_only_for_crew_jobs(self):
+        """Only a crew job's teardown ends a stdio server: a first mate's plan,
+        job preflight and attended pane all refuse one. HTTP stays for every role."""
+        import native_launch
+        message = ('stdio MCP servers run only in crew jobs, whose teardown ends them; '
+                   'first_mate launches are not jobs')
+        registry = self.registry_with(self.stdio_bundle(), self.mcp_bundle())
+        crew = bundles.plan(registry, ['xcode@1'], 'crew')
+        self.assertEqual(crew['mcp_servers'], [self.stdio_record()])
+        for selected in (['xcode@1'], ['xcode@1', 'docs@1']):
+            with self.subTest(selected=selected), self.assertRaises(bundles.StdioRole) as refused:
+                bundles.plan(registry, selected, 'first_mate')
+            self.assertEqual(str(refused.exception), message)
+        # Through the adapter protocol the runtime reads, refusal text and all.
+        request = json.dumps({'id': '1', 'version': 1, 'method': 'validate', 'registry': registry,
+                              'selection': ['xcode@1'], 'role': 'first_mate', 'harness': 'pi'})
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/bundles.py')], input=request + '\n',
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(json.loads(run.stdout)['error'], message)
+        self.assertLessEqual(len(message), 200)
+        self.assertEqual(bundles.plan(registry, ['docs@1'], 'first_mate')['mcp_servers'], [self.mcp_record()])
+        # A job's preflight: a wake plans as first_mate, a reviewer never carries bundles.
+        request = {'method': 'command', 'context': {'repo': str(self.repo), 'title': 'brief', 'control': {},
+                                                    'role': 'first_mate', 'tool_bundles': crew}, 'options': {}}
+        with self.assertRaises(bundles.StdioRole):
+            handle('pi', request)
+        request['context']['role'] = 'crew'
+        self.assertIn('--tool-bundles', handle('pi', request)['argv'])
+        request['context'].update(role='first_mate', tool_bundles=bundles.plan(registry, ['docs@1'], 'first_mate'))
+        self.assertIn('--tool-bundles', handle('pi', request)['argv'])
+        # The attended pane, before any credential, probe or harness.
+        with patch.dict(os.environ, self.env, clear=True), self.probe() as probe, \
+                patch.object(native_launch.os, 'execvpe') as execute, self.assertRaises(bundles.StdioRole):
+            native_launch.launch('pi', ['pi'], bundles=crew, attended=True)
+        probe.assert_not_called()
+        execute.assert_not_called()
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(crew),
+                              '--attended-policy', '{"mode":"standard","claude_allow":[]}', 'pi', 'pi'],
+                             env=self.env, cwd=self.repo, capture_output=True, text=True, timeout=30)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (2, '', message + '\n'))
+
+    def test_stdio_launcher_execs_only_the_pinned_command_with_a_minimal_environment(self):
+        # The launcher runs under this Python, unpinned; the server under a
+        # pinned one, which may differ (a macOS framework Python is unpinnable).
+        python, digest = stdio_pins.require_pinned_python(self)
+        server = ROOT / 'tests/fixtures/pi-mcp/server.py'
+        marker = self.base / 'launched.jsonl'
+        record = self.stdio_record(command=[python, '-I', str(server), str(marker), 'selected', 'disconnected'],
+                                   sha256=digest, credential='XCODE_TOKEN')
+        argv = bundles.stdio_argv(record, '/fleet/xcode-token')
+        self.assertEqual(argv[:3], [bundles.interpreter(), '-I', str(ROOT / 'plugins/mcp_stdio.py')])
+        self.assertEqual(json.loads(argv[3]), {'command': record['command'], 'sha256': digest,
+                                               'credential': {'name': 'XCODE_TOKEN', 'file': '/fleet/xcode-token'}})
+        # What a harness hands its servers: its own whole environment.
+        harness = {'HOME': str(self.base), 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'TMPDIR': str(self.base),
+                   'PATH': f'{self.base}:/usr/bin:/bin', 'ANTHROPIC_API_KEY': 'SENTINEL-PROVIDER',
+                   'CLAUDE_CODE_MESSAGING_TOKEN': 'SENTINEL-MESSAGING', 'PRIVATEER_MCP_SERVERS': '[]',
+                   'PRIVATEER_CREDENTIAL_OTHER_FILE': '/fleet/other', 'PYTHONPATH': str(self.base),
+                   'DEVELOPER_DIR': '/Applications/Xcode.app'}
+        # A harness's descriptors beyond stdio: the launcher closes them all.
+        inherited = [os.open(os.devnull, os.O_RDONLY) for _ in range(3)]
+        for fd in inherited:
+            self.addCleanup(os.close, fd)
+        run = subprocess.run(argv, env=harness, capture_output=True, text=True, timeout=30, pass_fds=inherited)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        start = json.loads(marker.read_text().splitlines()[0])
+        self.assertEqual(start['env'], ['HOME', 'LANG', 'LC_ALL', 'PATH', 'PRIVATEER_CREDENTIAL_XCODE_TOKEN_FILE', 'TMPDIR'])
+        self.assertEqual(start['path'], '/usr/bin:/bin')
+        self.assertEqual(start['fds'], [0, 1, 2])
+        # exec in place: the harness's child is the server, in the harness's group.
+        self.assertEqual(start['pgid'], os.getpgrp())
+        # Any drift or unexpected record refuses with one fixed line, before the server starts.
+        marker.unlink()
+        def spec(**change):
+            value = json.loads(argv[3])
+            value.update(change)
+            return json.dumps({k: v for k, v in value.items() if v is not None})
+        private = self.private_directory()
+        shell, shell_sha = self.executable_copy(private, 'bash')
+        for label, args in (('drift', [spec(sha256='0' * 64)]), ('extra key', [spec(env={'A': 'b'})]),
+                            ('shell', [spec(command=[shell, '-c', 'true'], sha256=shell_sha)]),
+                            ('expansion', [spec(credential={'name': 'XCODE_TOKEN', 'file': '/fleet/$HOME'})]),
+                            ('relative file', [spec(credential={'name': 'XCODE_TOKEN', 'file': 'fleet/x'})]),
+                            ('lowercase name', [spec(credential={'name': 'xcode', 'file': '/fleet/x'})]),
+                            ('no pin', [spec(sha256=None)]), ('not json', ['{']), ('two specs', [argv[3], argv[3]]),
+                            ('none', [])):
+            with self.subTest(label=label):
+                refused = subprocess.run(argv[:3] + args, env=harness, capture_output=True, text=True, timeout=30)
+                self.assertEqual((refused.returncode, refused.stdout), (78, ''))
+                self.assertEqual(refused.stderr, 'privateer: stdio MCP server refused: its executable or record '
+                                                 'no longer matches its approval.\n')
+                self.assertFalse(marker.exists())
 
 
 if __name__ == '__main__':

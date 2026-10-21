@@ -52,6 +52,12 @@ fn selected_plan(value: &Value) -> Value {
 /// and reports the session it was given, or a new one, as Claude's
 /// stream-json does, around `turn`.
 fn fake_claude(root: &Path, bin: &Path, log: &Path, turn: &str) {
+    fake_claude_with(root, bin, log, "", turn);
+}
+
+/// `fake_claude` running `prelude` before its init event, which `prelude`
+/// may extend through the `init` dict, as Claude reports its MCP servers there.
+fn fake_claude_with(root: &Path, bin: &Path, log: &Path, prelude: &str, turn: &str) {
     use std::os::unix::fs::PermissionsExt;
     let python = support::python();
     let script = root.join("claude.py");
@@ -67,7 +73,9 @@ with open({}, "a") as f:
     f.write(json.dumps(args) + "\n")
 flags = args[:args.index("--")]
 session = flags[flags.index("--resume") + 1] if "--resume" in flags else str(uuid.uuid4())
-print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}), flush=True)
+init = {{"type": "system", "subtype": "init", "session_id": session}}
+{prelude}
+print(json.dumps(init), flush=True)
 {turn}
 print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "session_id": session}}), flush=True)
 "#, json!(log))).unwrap();
@@ -109,6 +117,21 @@ fn deterministic_python_bundle_validation() {
             .unwrap();
         assert!(status.success(), "{suite}");
     }
+}
+
+#[test]
+fn selected_mcp_gate_helpers_refuse_unsafe_records() {
+    let output = support::command("node")
+        .arg("tests/pi-mcp-selected.mjs")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Node is required to check the selected-MCP gate");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -363,6 +386,40 @@ fn first_mate_selection_is_not_an_inherited_harness_option() {
     );
     let explicit = selected_plan(&plan(&mut store, Some(json!([]))).unwrap());
     assert_eq!(explicit["skills"], json!([]));
+}
+
+/// A hosted first mate's pane is not a job, so its stop could leave a stdio
+/// server running: the runtime refuses one in a first mate's selection, with
+/// the adapter's reason, while HTTP servers and a crew's stdio server stay.
+#[test]
+fn a_first_mate_selection_refuses_stdio_servers_and_keeps_http() {
+    let (_temp, mut store, mut config) = fixture();
+    let python = fs::canonicalize("/usr/bin/python3").unwrap();
+    let digest = format!("{:x}", Sha256::digest(fs::read(&python).unwrap()));
+    let bundles = config["bundles"].as_array_mut().unwrap();
+    bundles.push(json!({"ref":"stdio@1","roles":["crew","first_mate"],
+        "mcp_servers":[{"name":"xcode","timeout":10,"sha256":digest,"command":[python,"-I","/srv/mcp/server.py"]}]}));
+    bundles.push(json!({"ref":"docs@1","roles":["crew","first_mate"],
+        "credentials":[{"name":"DOCS_TOKEN","ref":"docs-search"}],
+        "mcp_servers":[{"name":"docs","url":"https://mcp.example.test/mcp","credential":"DOCS_TOKEN","timeout":5}]}));
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    let profile = |selected: Value| {
+        json!({"manifest":"bundled:pi","duty_task":"task","options":{"provider":"chosen","model":"exact"},
+            "tool_bundles":selected})
+    };
+    for selected in [json!(["stdio@1"]), json!(["docs@1", "stdio@1"])] {
+        let error = privateer::activation::profile(&store, "ship", &profile(selected)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "stdio MCP servers run only in crew jobs, whose teardown ends them; \
+             first_mate launches are not jobs"
+        );
+    }
+    let validated =
+        privateer::activation::profile(&store, "ship", &profile(json!(["docs@1"]))).unwrap();
+    assert_eq!(validated["tool_bundles"], json!(["docs@1"]));
+    let crew = selected_plan(&plan(&mut store, Some(json!(["stdio@1"]))).unwrap());
+    assert_eq!(crew["mcp_servers"][0]["command"][0], json!(python));
 }
 
 #[test]
@@ -1126,4 +1183,163 @@ fn a_parked_bounded_crew_whose_plan_changed_is_not_resumed() {
         "{:?}",
         parked.mail
     );
+}
+
+/// A bounded Claude crew's stdio MCP server, with a grandchild that ignores
+/// SIGTERM, ends with the crew's job: inside the server's process group
+/// (`stubborn`) or in a session of its own (`escaped`). The fake claude spawns
+/// each server from its --mcp-config as Claude does, then exits without
+/// stopping it, as Claude 2.1.300 and Pi 1.3.0 leave such a grandchild
+/// (tests/claude_bundles_native.py, tests/pi_bundles_native.py).
+#[test]
+fn a_bounded_crews_stdio_mcp_server_and_its_stubborn_grandchild_end_with_its_job() {
+    use std::time::{Duration, Instant};
+    let (temp, mut store, mut config) = fixture();
+    store
+        .connection()
+        .execute(
+            "UPDATE charters SET data=json_set(data,'$.job_timeout_secs',300) WHERE id='charter'",
+            [],
+        )
+        .unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    // A root-owned interpreter: nothing in its path is writable or a link.
+    let python = fs::canonicalize("/usr/bin/python3").unwrap();
+    let digest = format!("{:x}", Sha256::digest(fs::read(&python).unwrap()));
+    let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi-mcp/server.py");
+    let marker = |mode: &str| root.join(format!("{mode}.jsonl"));
+    config["claude_version"] = json!("2.1.300");
+    for mode in ["stubborn", "escaped"] {
+        config["bundles"].as_array_mut().unwrap().push(json!({
+            "ref": format!("{mode}@1"), "roles": ["crew"],
+            "mcp_servers": [{"name": mode, "timeout": 10, "sha256": digest,
+                "command": [python, "-I", server, marker(mode), "selected", mode]}]}));
+    }
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    let home = store.home().to_owned();
+    let claude = root.join("claude-config");
+    fs::create_dir(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        json!({"model":"exact"}).to_string(),
+    )
+    .unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = root.join("claude-argv.jsonl");
+    // Claude starts each configured server with its own environment plus the
+    // entry's, and reports it connected at init once its tools list.
+    let prelude = r#"import pathlib, time
+config = next(a.split("=", 1)[1] for a in flags if a.startswith("--mcp-config="))
+servers = json.load(open(config))["mcpServers"]
+for name, entry in servers.items():
+    # Privateer's launcher, by absolute interpreter path, with the pinned command in its spec.
+    assert entry["type"] == "stdio" and entry["env"] == {} and entry["command"].startswith("/"), entry
+    assert entry["args"][0] == "-I" and entry["args"][1].endswith("/plugins/mcp_stdio.py"), entry
+    subprocess.Popen([entry["command"], *entry["args"]], env={**os.environ, **entry["env"]},
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    marker = pathlib.Path(json.loads(entry["args"][2])["command"][3])
+    deadline = time.monotonic() + 30
+    while not (marker.exists() and '"child"' in marker.read_text()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+# Long enough for the job to record what left its process group.
+time.sleep(1.5)
+init["mcp_servers"] = [{"name": name, "status": "connected"} for name in servers]
+init["tools"] = ["mcp__" + name + "__echo" for name in servers]"#;
+    fake_claude_with(&root, &bin, &log, prelude, "");
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        bin.display(),
+        support::python().parent().unwrap().display()
+    );
+    let run = |agent: bool, command: &str, args: Value| -> Value {
+        let mut cli = support::command(support::BIN);
+        cli.args(["--home", home.to_str().unwrap(), command, "--json"])
+            .arg(args.to_string())
+            .env("HOME", &root)
+            .env("PATH", &path)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"))
+            .env("PRIVATEER_SERVICE", "none")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH");
+        if agent {
+            cli.env("PRIVATEER_ROLE", "agent")
+                .env("PRIVATEER_ACTOR", "ship");
+        }
+        let output = cli.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    run(false, "ship.put", json!({"name":"ship","scope":"ship"}));
+    run(
+        false,
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,
+            "max_load_per_cpu":1024,"ramp_secs":0,
+            "crew_memory_bytes":{"claude":1u64 << 20}}),
+    );
+    let active = |pid: i64| {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8(output.stdout).unwrap();
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    };
+    for mode in ["stubborn", "escaped"] {
+        let id = format!("crew-{mode}");
+        run(
+            true,
+            "agent.start",
+            json!({"task_id":"task","id":id,"manifest":"bundled:claude",
+                "tool_bundles":[format!("{mode}@1")],"options":{"model":"exact"}}),
+        );
+        let until = Instant::now() + Duration::from_secs(90);
+        let job = loop {
+            let job = run(false, "job.status", json!({"id":id}));
+            if matches!(
+                job["status"].as_str(),
+                Some("succeeded" | "failed" | "cancelled" | "timed_out" | "orphaned")
+            ) {
+                break job;
+            }
+            assert!(Instant::now() < until, "{id} never settled: {job}");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(job["status"], "succeeded", "{job}");
+        let events: Vec<Value> = fs::read_to_string(marker(mode))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let pids: Vec<i64> = events
+            .iter()
+            .filter(|e| e["event"] == "start" || e["event"] == "child")
+            .map(|e| e["pid"].as_i64().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2, "{events:?}");
+        let child = events.iter().find(|e| e["event"] == "child").unwrap();
+        assert_eq!(
+            child["pgid"] == child["pid"],
+            mode == "escaped",
+            "{mode}: {child}"
+        );
+        // The job settled only after its descendants were gone; a short grace
+        // for the kernel to reap what it killed.
+        let until = Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(|pid| active(*pid)) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for pid in &pids {
+            assert!(!active(*pid), "{mode}: process {pid} outlived its job");
+        }
+    }
 }
