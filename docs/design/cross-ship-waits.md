@@ -1,6 +1,6 @@
 # Design: waits on another ship's task
 
-Status: approved by the captain on 2026-10-20. Step 1 (the owner side, `src/waits.rs`), step 2 (the waiting side, `src/scheduling/remote.rs`) and step 3 (resync on reconnect, staleness, subscription nonces) are implemented; steps 4 and 5 are not. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
+Status: approved by the captain on 2026-10-20. Step 1 (the owner side, `src/waits.rs`), step 2 (the waiting side, `src/scheduling/remote.rs`), step 3 (resync on reconnect, staleness, subscription nonces) and step 4 (retire, dropped refusals) are implemented; step 5 is not. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
 
 ## Problem
 
@@ -96,9 +96,25 @@ A resync runs in the home's own transaction and is audited as `wait.resync` `{pe
 
 A final status still pending in the owner's outbox is delivered as before when the link returns; the resync's answer then arrives as a repeat and is dropped as `no_wait`.
 
+A link resyncs at most once a minute (`resynced_ms`). One that comes back sooner is recorded as heard but stays owed a resync, which runs the first time it is heard after the spacing. Whether a link has come back is decided under the home's write lock, so two processes hearing it at once resync it once. A resync that fails is rolled back whole (nothing half sent) and audited as `wait.resync_failed`, but the link is still recorded as heard, so it does not retry a full resync on every delivery. A resync that sends nothing is not audited. A waiting task whose charter is revoked is not resubscribed.
+
 On one machine there is no network link, but a peer is still a subprocess call into another home, which fails if that home or its executable cannot be reached. The same rule applies: the failure marks the link down, the next answered delivery or mail from that home resyncs, and a single home has no peers and nothing to resync.
 
 Staleness is measured from the subscription's `since_ms` (a wait from before step 3 from its schedule's creation) against the waiting ship's `first_mate.remote_wait_stale_secs` (default 3600, `0` shows none, at most a week). A stale wait is a `runtime.needs` blocker with `evidence: "stale_remote_wait"`, and a backlog alarm candidate labelled `stale remote wait`, each naming the far task, ship and machine and when the link was last heard. Neither changes the wait.
+
+### As built (step 4)
+
+`ship.retire` (`src/fleet.rs`) revokes the charter, then, in the retiring ship's home and one transaction (`waits::retire`), closes every subscription on a task that ship owns with `wait_closed` `{reason: retired}` (one per subscription generation, nonce echoed) and deletes the rows, and queues `wait_unsubscribe` for each live remote wait the ship holds, with its nonce. Its schedules are left as they are. This is audited as `wait.retired` `{ship, tasks, closed, unsubscribed}` when it did anything. The ship's outbox then drains, for at most 15 seconds, before the dispatcher stops: when the operator retires, this process delivers the mail itself, retrying an unreachable peer between passes; an agent cannot carry another ship's mail (the peer would refuse it, and a job cannot drop its role), so its retire only waits while the retiring ship's own dispatcher delivers. Mail behind a collecting machine is not waited for. What is still pending at the end stays queued, and the far side falls back to the staleness path. The reply's `waits` reports what was closed, unsubscribed and drained.
+
+A peer that refuses a `task_end`, `wait_closed`, `wait_subscribe` or `wait_unsubscribe` (it answered, with an error) has the notice marked `delivery: dropped` with the refusal, not left pending, so it is never retried and the peer's later mail is not held behind it or backed off for it. The same applies when a collecting machine reports one refused. A refused `task_end` or `wait_closed` also deletes the owner's row of the generation it answered (same subscriber, task and nonce), if one was stored again meanwhile. Each drop is audited as `wait.notice_dropped` `{id, notice, from, to, task, reason, rows}`. `mail.outbox` lists dropped mail with `delivery: "dropped"`; it is not quarantined, so it raises nothing for the captain. A notice that could not reach the peer at all is still retried as before.
+
+A refused `wait_subscribe` leaves the waiting task `waiting`, shown as stale after the threshold. Faulting it at once is a possible follow-up, but a refusal can be transient.
+
+Fault notices: a schedule that faulted before fault counts were stored (under step 2) counts its existing first notice, so its next different fault in the same revision gets its own id and wakes the first mate.
+
+The backlog alarm does not advise re-deferring a stale remote wait. It says the wait is already deferred and resumes on the owner's report, and to check the far ship and the link it rides, or to close or hand off the task.
+
+Not built: `mail.deliver` still accepts wait notices from an agent caller. An agent's flush delivers its ship's runtime notices under the agent's identity, and a peer call from inside a job cannot drop to the runtime's role. Refusing agent callers would therefore first need the agent's flush to leave wait notices to the dispatcher, without holding the agent's own mail behind them.
 
 ## Failure cases
 
@@ -109,6 +125,8 @@ Staleness is measured from the subscription's `since_ms` (a wait from before ste
 | Far task cancelled or closed unsuccessfully | `task_end` carries the status; the waiting task faults. |
 | Subscription for an already-ended task | Owner answers at once with its final status. |
 | Owner ship retired | `wait_closed` `reason: retired` if the owner's home is still up, and the waiting task faults; otherwise the staleness path. |
+| Waiting ship retired | `wait_unsubscribe` for each live remote wait; the owner deletes its rows. Its tasks are not cancelled. |
+| A peer refuses a wait notice | Dropped (`delivery: dropped`), never retried; later mail to that peer still flows. A refused report deletes the matching owner row. |
 | Ship renamed or scope moved | The ref names the ship; the subscription fails with a clear refusal and the first mate re-defers with the new name. |
 | Far task not shared with this ship | `wait_closed` `reason: refused`, and the waiting task faults. Nothing about the task is revealed. |
 | Ship removed from `shared_with` while waiting | `wait_closed` `reason: refused`; the row is deleted and the waiting task faults. |
