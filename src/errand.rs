@@ -301,6 +301,48 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     }))
 }
 
+/// A review's errand, as `review.start` launches it: its own id, the route
+/// the reviewer was chosen on, and the prompt the runtime built whole.
+pub(crate) struct ReviewLaunch<'a> {
+    pub id: &'a str,
+    pub ship: &'a str,
+    pub task_id: &'a str,
+    pub brief: &'a str,
+    pub choice: &'a crate::crew_routes::Choice,
+    pub prompt: &'a str,
+}
+
+/// Run a review as an errand: always a fresh session, never a warm one, with
+/// no tool bundles or plugin config, and no records of the focus. Its job
+/// runs under the reviewer role in the review's worktree.
+pub(crate) fn start_review(store: &mut Store, launch: &ReviewLaunch) -> Result<()> {
+    let choice = launch.choice;
+    let harness = crate::activation::harness_id(&json!({"manifest": choice.manifest}));
+    let focus = format!("task:{}", launch.task_id);
+    store.connection().execute(
+        "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms, harness, route, route_why)
+         VALUES(?1, ?2, ?3, ?4, ?5, 'fresh', 'running', ?6, ?7, ?8, ?9)",
+        params![launch.id, launch.ship, focus, launch.task_id, launch.brief, Store::now_ms(),
+            harness, choice.name, choice.why],
+    )?;
+    let start = json!({"id": launch.id, "task_id": launch.task_id, "manifest": choice.manifest,
+        "options": choice.options, "wake": launch.prompt, "route_name": choice.name,
+        "route_why": choice.why});
+    if let Err(error) = crate::dispatch(store, "agent.start", start) {
+        store.connection().execute(
+            "UPDATE errands SET status='failed', finished_ms=?2, error=?3 WHERE id=?1",
+            params![launch.id, Store::now_ms(), format!("{error:#}")],
+        )?;
+        return Err(error);
+    }
+    crate::herdr::errands::reconcile(store);
+    store.audit(
+        "errand.start",
+        &json!({"errand": launch.id, "ship": launch.ship, "focus": focus, "review": true}),
+    )?;
+    Ok(())
+}
+
 /// The last assistant reply in a harness's JSON event log: Pi-family
 /// `message_end`, Codex `agent_message` items and Claude's `result`.
 pub(crate) fn last_reply(log: &str) -> Option<String> {
@@ -385,19 +427,25 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
             [&id],
             |r| r.get(0),
         )?;
-        let session = crate::activation::read_session(&harness, &log);
-        bind(
-            store,
-            &id,
-            &ship,
-            &focus,
-            &harness,
-            outcome,
-            session.as_deref(),
-        )?;
+        // A review records its filtered verdict before its notice is mailed,
+        // and its session is never kept: every review starts fresh.
+        let review = crate::review::settle(store, &id, status, outcome, reply.as_deref())?;
+        if review.is_none() {
+            let session = crate::activation::read_session(&harness, &log);
+            bind(
+                store,
+                &id,
+                &ship,
+                &focus,
+                &harness,
+                outcome,
+                session.as_deref(),
+            )?;
+        }
         let usage = crate::activation::usage(&log);
-        let mut body = match &reply {
-            Some(reply) if outcome == "succeeded" => {
+        let mut body = match (&review, &reply) {
+            (Some(review), _) => review.body.clone(),
+            (None, Some(reply)) if outcome == "succeeded" => {
                 format!("Errand on {focus}, verdict:\n{reply}")
             }
             _ => format!(
@@ -405,14 +453,14 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 logs.display()
             ),
         };
-        if body.chars().count() > VERDICT_CHARS {
+        if review.is_none() && body.chars().count() > VERDICT_CHARS {
             body = format!(
                 "{}…\n(The full reply is in {}/stdout.log.)",
                 body.chars().take(VERDICT_CHARS).collect::<String>(),
                 logs.display()
             );
         }
-        if let Some(why) = &route_why {
+        if let Some(why) = route_why.as_ref().filter(|_| review.is_none()) {
             if !body.ends_with('\n') {
                 body.push('\n');
             }
@@ -436,6 +484,10 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         } else {
             "high"
         };
+        if let Some(review) = &review {
+            payload["review"] = review.payload.clone();
+            urgency = review.urgency;
+        }
         // An errand stopped by a tool denial: the captain has the ask, and its
         // answer wakes the ship, so this verdict waits for that.
         if outcome == "failed"

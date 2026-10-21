@@ -399,6 +399,13 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             }
         }
     }
+    let reviews = crate::review::bearings_lines(store, ship)?;
+    if !reviews.is_empty() {
+        text.push_str("Reviews, latest first (pr.merge needs an approval at the current head):\n");
+        for line in &reviews {
+            text.push_str(&format!("- {}\n", clip(line, LINE_CHARS)));
+        }
+    }
     let errands = crate::errand::active(store, ship)?;
     if !errands.is_empty() {
         text.push_str("Errands running (their verdicts arrive as mail):\n");

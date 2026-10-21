@@ -108,6 +108,7 @@ It belongs here because it needs the same identity-to-route lookup as `choose`. 
 **Which jobs count.** The runtime finds the task from the PR's head branch, never from the ship's word. PR branches are workspace branches, `privateer/<home_hash>/<hash(task)>/<gen>`, so the runtime hashes the ship's tasks and matches the middle part.
 - The scope is that task's whole tree: the top ancestor and every descendant.
 - If the head branch isn't one of ours, the scope is every agent job the ship ran since the merge-base commit was made. The merge-base is on the protected branch, so its time is trustworthy.
+- Known gap, accepted by the captain (Q2, 2026-10-20): on such a branch, a rebase onto a newer protected branch moves the merge-base later, so a crew that ran before the new merge-base drops out of the author set although its commits remain.
 
 **Each job lands in one of two classes:**
 - **`crew_models`**: every crew job in scope, plus any `author_routes` the ship declares. Declaring can only add. A declaration (`Declaration { job_id, route }` in `src/review/authors.rs`) is keyed to one job: it stands only for the job it names, must fit it (its harness matches the job, its model is one the job's alias names), and clears no job it does not name. A declared job's alias also excludes every reviewer whose model carries it, whatever the version (PR #321).
