@@ -1,18 +1,18 @@
-"""Stand-ins for `open -a Xcode PROJECT` and the AppleScript close, acting on
-the windows file the fake mcpbridge lists (--windows there).
+"""Stand-ins for a profile's open and close helpers, acting on the windows
+file the fake upstream lists (--windows there).
 
-  fake_xcode_window.py open|close --windows FILE --log FILE [options] PROJECT
+  fake_window.py open|close --windows FILE --log FILE [options] PROJECT
 
 Both append their argv to --log, one JSON line each.
 
-open:   add {"tabIdentifier": "tab-N", "workspacePath": PROJECT}
+open:   add {"target": "win-N", "path": PROJECT}
   --delay SECS   add it this much later, from a detached child, and exit now
   --hold SECS    keep running this long, then add it and exit (a slow open)
   --never        exit 0 and never add it
   --fail         print one line on stderr and exit 3
-close:  remove every window whose workspacePath is PROJECT
+close:  remove every window whose path is PROJECT
   --fail         print one line on stderr and exit 4
-  --remove PATH  also delete PATH (a file "Xcode" left in the worktree)
+  --remove PATH  also delete PATH (a file the window left in the worktree)
 """
 import argparse
 import fcntl
@@ -50,11 +50,11 @@ def change(update):
 
 
 def add(windows):
-    used = {w['tabIdentifier'] for w in windows}
+    used = {w['target'] for w in windows}
     number = 1
-    while f'tab-{number}' in used:
+    while f'win-{number}' in used:
         number += 1
-    return windows + [{'tabIdentifier': f'tab-{number}', 'workspacePath': options.project}]
+    return windows + [{'target': f'win-{number}', 'path': options.project}]
 
 
 with open(options.log, 'a') as stream:
@@ -62,7 +62,7 @@ with open(options.log, 'a') as stream:
 
 if options.action == 'open':
     if options.fail:
-        sys.stderr.write('LSOpenURLsWithRole() failed: "no such app"\nsecond line\n')
+        sys.stderr.write('open failed: "no such app"\nsecond line\n')
         sys.exit(3)
     if options.never:
         sys.exit(0)
@@ -81,8 +81,8 @@ if options.action == 'open':
     change(add)
 else:
     if options.fail:
-        sys.stderr.write('execution error: Xcode got an error (-1708)\n')
+        sys.stderr.write('execution error: the window would not close (-1708)\n')
         sys.exit(4)
-    change(lambda windows: [w for w in windows if w['workspacePath'] != options.project])
+    change(lambda windows: [w for w in windows if w['path'] != options.project])
     if options.remove and os.path.exists(options.remove):
         os.remove(options.remove)

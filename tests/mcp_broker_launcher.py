@@ -52,9 +52,9 @@ class Launcher(unittest.TestCase):
             self.skipTest(f'the executable rule refuses the copy: {stdio_pins.refused_part(pinned)}')
         state = tempfile.mkdtemp(prefix='broker-launcher-')
         self.addCleanup(shutil.rmtree, state, True)
-        socket = os.path.join(state, 's', 'xcode.sock')
+        socket = os.path.join(state, 's', 'fake.sock')
         serve = subprocess.Popen(
-            [str(pinned), 'serve', '--state-dir', os.path.join(state, 's'), '--name', 'xcode', '--',
+            [str(pinned), 'serve', '--state-dir', os.path.join(state, 's'), '--name', 'fake', '--',
              os.path.realpath(sys.executable), '-I', str(FAKE)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.addCleanup(end, serve, serve.terminate)
@@ -86,7 +86,7 @@ class Launcher(unittest.TestCase):
             self.assertTrue(line, client.stderr.read().decode() if client.poll() is not None else 'closed')
             message = json.loads(line)
             answers[message.get('id')] = message
-        self.assertEqual(answers[1]['result']['serverInfo']['name'], 'fake-mcpbridge')
+        self.assertEqual(answers[1]['result']['serverInfo']['name'], 'fake-upstream')
         self.assertEqual(answers[2]['result']['content'][0]['text'], 'through the launcher')
         self.assertFalse(answers[2]['result']['isError'])
 

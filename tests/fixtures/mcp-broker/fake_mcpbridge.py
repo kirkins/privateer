@@ -1,5 +1,7 @@
-"""A stand-in for `xcrun mcpbridge`: a newline-delimited JSON-RPC MCP server
-on stdio, scripted by argv (the broker gives it a minimal environment).
+"""A stand-in upstream MCP server: newline-delimited JSON-RPC on stdio,
+scripted by argv (the broker gives it a minimal environment). Its window
+tool, target argument and fields come from a routing profile, the same file
+the broker pins, so one fake serves every profile.
 
   --record FILE        append every message received, one JSON line each,
                        plus {"started": PID} at start
@@ -7,10 +9,15 @@ on stdio, scripted by argv (the broker gives it a minimal environment).
   --crash-after N      exit after receiving the Nth tools/call, once: a marker
                        FILE.crashed beside --record keeps a restart from
                        crashing again
-  --windows FILE       Xcode's windows: a JSON list of {tabIdentifier,
-                       workspacePath}, read at each XcodeListWindows
-  --windows-text       answer XcodeListWindows in the text form only
-                       (otherwise structuredContent, with the same JSON as text)
+  --profile FILE       the routing profile (default: fake_profile.json beside
+                       this file): routing.list.tool lists the windows,
+                       routing.target_argument names one, and the list's
+                       items, target_field, path_field, text_target and
+                       text_path shape the answer
+  --windows FILE       the open windows: a JSON list of {target, path}, read
+                       at each list
+  --windows-text       answer the list in the text form only (otherwise at
+                       list.items, with structuredContent's JSON as text)
 
 Tools (tools/call name):
   echo    {"text"}            answer with the text
@@ -20,13 +27,13 @@ Tools (tools/call name):
   ask     {}                  send a server request, answer with the error
                               code the client side gave it
   crash   {}                  exit at once, mid-call
-  XcodeListWindows {}         the windows in --windows
-  XcodeRead {tabIdentifier, filePath}   answer with the tab and path it got
-  BuildProject {tabIdentifier}          answer with the tab it got
-  DocumentationSearch {query}           window-free: answer with the query
-  XcodeGrep {pattern}         window-free until `retool`, then it takes
-                              tabIdentifier too
-  retool  {}                  give XcodeGrep a tabIdentifier and send
+  LIST (the profile's list tool) {}   the windows in --windows
+  Read {TARGET, filePath}     answer with the window and path it got
+  Build {TARGET}              answer with the window it got
+  Search {query}              window-free: answer with the query
+  Grep {pattern}              window-free until `retool`, then it takes
+                              TARGET too
+  retool  {}                  give Grep a TARGET and send
                               notifications/tools/list_changed
 """
 import argparse
@@ -42,28 +49,41 @@ parser.add_argument('--init-delay', type=float, default=0)
 parser.add_argument('--crash-after', type=int, default=0)
 parser.add_argument('--windows')
 parser.add_argument('--windows-text', action='store_true')
+parser.add_argument('--profile', default=os.path.join(os.path.dirname(__file__), 'fake_profile.json'))
 options = parser.parse_args()
+with open(options.profile) as stream:
+    ROUTING = json.load(stream)['routing']
+LIST = ROUTING['list']
+TARGET = ROUTING['target_argument']
 
 out_lock = threading.Lock()
 cancelled = set()
 asked = {}
 calls = 0
 retooled = False
-TAB = {'tabIdentifier': {'type': 'string'}}
+WINDOW = {TARGET: {'type': 'string'}}
 
 
 def tools():
     """Each tool's name and inputSchema properties."""
     listed = {name: {} for name in ('echo', 'slow', 'notify', 'ask', 'crash', 'retool')}
     listed.update({
-        'XcodeListWindows': {},
-        'XcodeRead': dict(TAB, filePath={'type': 'string'}),
-        'BuildProject': dict(TAB),
-        'DocumentationSearch': {'query': {'type': 'string'}},
-        'XcodeGrep': dict(TAB, pattern={'type': 'string'}) if retooled else {'pattern': {'type': 'string'}},
+        LIST['tool']: {},
+        'Read': dict(WINDOW, filePath={'type': 'string'}),
+        'Build': dict(WINDOW),
+        'Search': {'query': {'type': 'string'}},
+        'Grep': dict(WINDOW, pattern={'type': 'string'}) if retooled else {'pattern': {'type': 'string'}},
     })
     return [{'name': name, 'inputSchema': {'type': 'object', 'properties': properties}}
             for name, properties in listed.items()]
+
+
+def at_pointer(pointer, value):
+    """A result holding `value` at JSON pointer `pointer`."""
+    parts = [p.replace('~1', '/').replace('~0', '~') for p in pointer.split('/')[1:]]
+    for part in reversed(parts):
+        value = {part: value}
+    return value
 
 
 def list_windows(request_id):
@@ -72,13 +92,14 @@ def list_windows(request_id):
         with open(options.windows) as stream:
             windows = json.load(stream)
     if options.windows_text:
-        lines = ['Open Xcode windows:'] + [
-            f"* tabIdentifier: {w['tabIdentifier']}, workspacePath: {w['workspacePath']}" for w in windows]
+        lines = ['Open windows:'] + [
+            f"* {LIST['text_target']}{w['target']}, {LIST['text_path']}{w['path']}" for w in windows]
         result = {'content': [{'type': 'text', 'text': '\n'.join(lines)}], 'isError': False}
     else:
-        body = {'windows': windows}
-        result = {'content': [{'type': 'text', 'text': json.dumps(body)}],
-                  'structuredContent': body, 'isError': False}
+        items = [{LIST['target_field']: w['target'], LIST['path_field']: w['path']} for w in windows]
+        result = at_pointer(LIST['items'], items)
+        mirror = result.get('structuredContent', result)
+        result.update({'content': [{'type': 'text', 'text': json.dumps(mirror)}], 'isError': False})
     send({'jsonrpc': '2.0', 'id': request_id, 'result': result})
 
 
@@ -146,16 +167,16 @@ def call(request_id, params):
         result(request_id, 'notified')
     elif name == 'ask':
         threading.Thread(target=ask, args=(request_id,), daemon=True).start()
-    elif name == 'XcodeListWindows':
+    elif name == LIST['tool']:
         list_windows(request_id)
-    elif name == 'XcodeRead':
-        result(request_id, f"read {arguments.get('filePath')} in tab {arguments.get('tabIdentifier')}")
-    elif name == 'BuildProject':
-        result(request_id, f"built in tab {arguments.get('tabIdentifier')}")
-    elif name == 'DocumentationSearch':
+    elif name == 'Read':
+        result(request_id, f"read {arguments.get('filePath')} in window {arguments.get(TARGET)}")
+    elif name == 'Build':
+        result(request_id, f"built in window {arguments.get(TARGET)}")
+    elif name == 'Search':
         result(request_id, f"found {arguments.get('query')}")
-    elif name == 'XcodeGrep':
-        result(request_id, f"grep in tab {arguments.get('tabIdentifier')}")
+    elif name == 'Grep':
+        result(request_id, f"grep in window {arguments.get(TARGET)}")
     elif name == 'retool':
         retooled = True
         send({'jsonrpc': '2.0', 'method': 'notifications/tools/list_changed'})
@@ -179,7 +200,7 @@ def main():
             send({'jsonrpc': '2.0', 'id': request_id, 'result': {
                 'protocolVersion': message['params']['protocolVersion'],
                 'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'fake-mcpbridge', 'version': '1.0'}}})
+                'serverInfo': {'name': 'fake-upstream', 'version': '1.0'}}})
         elif method == 'tools/list':
             send({'jsonrpc': '2.0', 'id': request_id, 'result': {'tools': tools()}})
         elif method == 'tools/call':
