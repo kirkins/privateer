@@ -15,7 +15,11 @@ use std::{
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 struct Fixture {
     _temp: tempfile::TempDir,
+    _data: tempfile::TempDir,
     root: PathBuf,
+    /// XDG_DATA_HOME, kept short: macOS caps a socket path at 104 bytes,
+    /// and its per-user temp dir alone takes about 60.
+    data: PathBuf,
     repo: PathBuf,
     home: PathBuf,
 }
@@ -70,9 +74,16 @@ impl Fixture {
             )
             .unwrap();
         }
+        let data_dir = tempfile::Builder::new()
+            .prefix("pd")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let data = data_dir.path().canonicalize().unwrap();
         Self {
             _temp: temp,
+            _data: data_dir,
             root,
+            data,
             repo,
             home,
         }
@@ -97,7 +108,7 @@ impl Fixture {
         .env("PRIVATEER_SERVICE", "none")
         .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
         // Short, so the MCP broker's socket path fits macOS's limit.
-        .env("XDG_DATA_HOME", self.root.join("d"));
+        .env("XDG_DATA_HOME", &self.data);
         c
     }
     fn run(&self, verb: &str, args: Value) -> Output {
@@ -1741,7 +1752,7 @@ struct XcodeBroker {
 
 impl XcodeBroker {
     fn run_dir(f: &Fixture) -> PathBuf {
-        f.root.join("d/privateer/mcp-broker/run")
+        f.data.join("privateer/mcp-broker/run")
     }
 
     /// Record a window the broker opened for `root`, as a broker that has
