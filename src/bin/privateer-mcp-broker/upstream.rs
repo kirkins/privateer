@@ -346,13 +346,16 @@ fn route(
                 message.insert("id".into(), pending.id.clone());
                 // A client's window list: seen whole, delivered for its root.
                 let mut record = false;
-                if let (Some(root), Some(result)) = (&pending.windows, message.get_mut("result")) {
+                let routed = broker.routing.as_ref().map(|r| &r.list);
+                if let (Some(list), Some(root), Some(result)) =
+                    (routed, &pending.windows, message.get_mut("result"))
+                {
                     // Resolved with the state unlocked: a realpath can be slow.
                     drop(state);
-                    let resolved = route::resolved_paths(result);
+                    let resolved = route::resolved_paths(result, list);
                     state = broker.lock();
-                    record = broker.observe(&mut state, result, &resolved);
-                    filter_windows(result, root.as_deref(), &resolved);
+                    record = broker.observe(list, &mut state, result, &resolved);
+                    filter_windows(result, list, root.as_deref(), &resolved);
                 }
                 broker.deliver(&state, pending.client, &Value::Object(message));
                 drop(state);

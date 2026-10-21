@@ -1,0 +1,20 @@
+{
+  "label": "Fake",
+  "routing": {
+    "target_argument": "windowId",
+    "list": {
+      "tool": "ListWindows",
+      "items": "/structuredContent/windows",
+      "target_field": "windowId",
+      "path_field": "root",
+      "text_target": "windowId: ",
+      "text_path": "root: "
+    },
+    "project": {
+      "kinds": [{"dir_suffix": ".proj"}, {"dir_with_file": "Fake.toml"}],
+      "max_depth": 3,
+      "skip_dirs": ["vendor"],
+      "skip_hidden": true
+    }
+  }
+}

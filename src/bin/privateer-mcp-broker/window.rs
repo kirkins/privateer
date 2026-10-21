@@ -1,7 +1,7 @@
-//! Opening and closing Xcode windows: the configured helper commands, run
-//! with the broker's minimal environment, in `/`, with a deadline; and the
-//! record of the windows the broker opened, so that it, or a broker started
-//! after it, closes exactly those.
+//! Opening and closing an upstream's windows: the profile's helper
+//! commands, run with the broker's minimal environment, in `/`, with a
+//! deadline; and the record of the windows the broker opened, so that it, or
+//! a broker started after it, closes exactly those.
 use crate::{sys, upstream};
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
@@ -16,60 +16,20 @@ use std::time::{Duration, Instant};
 const HELPER_DEADLINE: Duration = Duration::from_secs(30);
 /// The most of a helper's stderr that is read.
 const HELPER_OUTPUT: u64 = 64 * 1024;
-/// Executables a helper may not be: a shell would run whatever it is told.
-const SHELLS: [&str; 12] = [
-    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "env", "busybox", "xargs",
-];
-
 /// A window the broker opened.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Opened {
     pub root: PathBuf,
     pub project: PathBuf,
-    /// Learned once a window list shows it.
-    pub tab: Option<String>,
+    /// The window's target, learned once a window list shows it.
+    pub target: Option<String>,
     pub opened_ms: u64,
 }
 
 impl Opened {
     pub fn json(&self) -> Value {
-        json!({"root": self.root, "project": self.project, "tab": self.tab, "opened_ms": self.opened_ms})
+        json!({"root": self.root, "project": self.project, "target": self.target, "opened_ms": self.opened_ms})
     }
-}
-
-/// A helper argv as `--window-open` and `--window-close` give it: a JSON
-/// array whose first element is an absolute, normalized path that is not a
-/// shell.
-pub fn helper_argv(text: &str) -> Result<Vec<String>, String> {
-    let argv: Vec<String> =
-        serde_json::from_str(text).map_err(|_| format!("{text} is not a JSON array of strings"))?;
-    let valid = (1..=32).contains(&argv.len())
-        && argv
-            .iter()
-            .all(|a| a.len() <= 4096 && !a.chars().any(char::is_control));
-    if !valid {
-        return Err("a window helper has 1 to 32 arguments without control characters".into());
-    }
-    let program = Path::new(&argv[0]);
-    let normalized = program.is_absolute()
-        && program.components().all(|c| {
-            matches!(
-                c,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            )
-        })
-        && !argv[0].ends_with('/');
-    if !normalized {
-        return Err("a window helper must start with an absolute, normalized path".into());
-    }
-    let base = program
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if SHELLS.contains(&base.as_str()) {
-        return Err(format!("a window helper may not be {base}"));
-    }
-    Ok(argv)
 }
 
 /// Run `argv` with `project` appended. Its first stderr line, escaped, is
@@ -155,7 +115,7 @@ pub fn load(path: &Path) -> Vec<Opened> {
             (root.is_absolute() && project.is_absolute()).then(|| Opened {
                 root,
                 project,
-                tab: w["tab"].as_str().map(str::to_owned),
+                target: w["target"].as_str().map(str::to_owned),
                 opened_ms: w["opened_ms"].as_u64().unwrap_or(0),
             })
         })

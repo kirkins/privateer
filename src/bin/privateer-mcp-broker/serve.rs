@@ -2,7 +2,8 @@
 //! socket and the upstream, and maps every client's ids onto broker-unique
 //! ones so their answers never cross.
 use crate::lines::{self, Line};
-use crate::route::{self, LIST_WINDOWS, TAB};
+use crate::profile::{List, PathArguments, Routing};
+use crate::route;
 use crate::window::{self, Opened};
 use crate::{BROKER_VERSION, MAX_LINE, ServeOptions, busy, sys, upstream};
 use serde_json::{Map, Value, json};
@@ -46,8 +47,8 @@ pub struct Pending {
     pub method: String,
     pub generation: u64,
     pub token: Option<String>,
-    /// A client's XcodeListWindows: its answer is filtered to this root
-    /// (to nothing when the client has none).
+    /// A client's call of the profile's list tool: its answer is filtered
+    /// to this root (to nothing when the client has none).
     pub windows: Option<Option<PathBuf>>,
 }
 
@@ -116,8 +117,8 @@ pub struct State {
     pub tools: Option<Arc<HashMap<String, Value>>>,
     pub tools_epoch: u64,
     pub internal: HashMap<u64, Internal>,
-    /// Each workspace root's window, as the last window list showed it.
-    tabs: HashMap<PathBuf, String>,
+    /// Each workspace root's window target, as the last window list showed it.
+    targets: HashMap<PathBuf, String>,
     /// The windows the broker opened (`NAME.windows.json`).
     windows: Vec<Opened>,
     opening: HashMap<PathBuf, Opening>,
@@ -138,8 +139,11 @@ pub struct Broker {
     pub ready_wait: Duration,
     pub upstream_argv: Vec<String>,
     pub pools: Vec<PathBuf>,
-    pub window_open: Option<Vec<String>>,
-    pub window_close: Option<Vec<String>>,
+    /// Argument names that hold paths, beyond the built-in ones.
+    pub path_arguments: PathArguments,
+    /// How tools bind to windows; `None` for a plain shared broker, which
+    /// binds nothing, records nothing and has nothing to close.
+    pub routing: Option<Routing>,
     pub windows_file: PathBuf,
     /// Held while the window record is written, so writes land in order.
     record_io: Mutex<()>,
@@ -228,9 +232,9 @@ impl Broker {
                 .clients
                 .iter()
                 .map(|(id, c)| {
-                    let tab = c.root.as_ref().and_then(|root| state.tabs.get(root));
+                    let target = c.root.as_ref().and_then(|root| state.targets.get(root));
                     json!({"id": id, "pid": c.pid, "peer_pid": c.peer_pid, "cwd": c.cwd,
-                        "peer_cwd": c.peer_cwd, "root": c.root, "tab": tab})
+                        "peer_cwd": c.peer_cwd, "root": c.root, "target": target})
                 })
                 .collect();
             clients.sort_by_key(|c| c["id"].as_u64());
@@ -239,6 +243,8 @@ impl Broker {
                 "version": BROKER_VERSION,
                 "pid": std::process::id(),
                 "name": self.name,
+                "label": self.label,
+                "routing": self.routing.is_some(),
                 "socket": self.socket,
                 "upstream": {
                     "command": self.upstream_argv[0],
@@ -532,9 +538,10 @@ impl Broker {
         }
     }
 
-    /// A client's `tools/call`: its path arguments checked, a window-bound
-    /// tool given the client's own window, and XcodeListWindows filtered to
-    /// the client's root. Nothing refused is forwarded.
+    /// A client's `tools/call`: its path arguments checked, and, with
+    /// routing, a window-bound tool given the client's own window and the
+    /// list tool's answer filtered to the client's root. Nothing refused is
+    /// forwarded.
     fn call(self: &Arc<Self>, client: u64, id: Value, mut message: Map<String, Value>) {
         let deadline = Instant::now() + self.ready_wait;
         let method = "tools/call".to_owned();
@@ -552,10 +559,14 @@ impl Broker {
             .and_then(|p| p.get("arguments"))
             .cloned()
             .unwrap_or(Value::Null);
-        if let Err(why) = route::check_paths(&arguments, root.as_deref()) {
+        if let Err(why) = route::check_paths(&arguments, root.as_deref(), &self.path_arguments) {
             return self.refuse(client, &id, &name, Refusal::Error(why));
         }
-        if name == LIST_WINDOWS {
+        let Some(routing) = &self.routing else {
+            return self.forward(client, id, method, message, None);
+        };
+        let target = routing.target_argument.as_str();
+        if name == routing.list.tool {
             return self.forward(client, id, method, message, Some(root));
         }
         let mut tools = match self.tools(deadline) {
@@ -572,16 +583,16 @@ impl Broker {
             };
         }
         let bound = match tools.get(&name) {
-            Some(schema) => route::window_bound(schema) || arguments.get(TAB).is_some(),
+            Some(schema) => route::window_bound(schema, target) || arguments.get(target).is_some(),
             // Still not listed: never forwarded with a window it names, and
             // otherwise window-free.
-            None if arguments.get(TAB).is_some() => {
+            None if arguments.get(target).is_some() => {
                 return self.refuse(
                     client,
                     &id,
                     &name,
                     Refusal::Error(format!(
-                        "the upstream does not list the tool {}; a call naming a tabIdentifier is not forwarded",
+                        "the upstream does not list the tool {}; a call naming a {target} is not forwarded",
                         sys::quoted(&name, 64)
                     )),
                 );
@@ -596,16 +607,17 @@ impl Broker {
                 client,
                 &id,
                 &name,
-                Refusal::Error(
-                    "Xcode window tools work only from a Privateer task workspace".into(),
-                ),
+                Refusal::Error(format!(
+                    "{} window tools work only from a Privateer task workspace",
+                    self.label
+                )),
             );
         };
-        let tab = match self.window_for(client, &root, deadline) {
-            Ok(tab) => tab,
+        let window = match self.window_for(routing, client, &root, deadline) {
+            Ok(window) => window,
             Err(refusal) => return self.refuse(client, &id, &name, refusal),
         };
-        match arguments.get(TAB) {
+        match arguments.get(target) {
             None | Some(Value::Null) => {
                 let params = message
                     .entry("params")
@@ -623,9 +635,9 @@ impl Broker {
                 if !arguments.is_object() {
                     *arguments = json!({});
                 }
-                arguments[TAB] = json!(tab);
+                arguments[target] = json!(window);
             }
-            Some(given) if given.as_str() == Some(tab.as_str()) => {}
+            Some(given) if given.as_str() == Some(window.as_str()) => {}
             Some(given) => {
                 let shown: String = given
                     .as_str()
@@ -638,7 +650,8 @@ impl Broker {
                     &id,
                     &name,
                     Refusal::Error(format!(
-                        "tabIdentifier {shown} is not this workspace's Xcode window; call XcodeListWindows"
+                        "{target} {shown} is not this workspace's {} window; call {}",
+                        self.label, routing.list.tool
                     )),
                 );
             }
@@ -748,7 +761,13 @@ impl Broker {
                 break;
             }
         }
-        let bound = tools.values().filter(|s| route::window_bound(s)).count();
+        let bound = match &self.routing {
+            Some(routing) => tools
+                .values()
+                .filter(|s| route::window_bound(s, &routing.target_argument))
+                .count(),
+            None => 0,
+        };
         let tools = Arc::new(tools);
         let mut state = self.lock();
         if state.tools_epoch == epoch {
@@ -791,30 +810,26 @@ impl Broker {
         });
     }
 
-    /// The tab of `root`'s window: the cached one, else the one a window
-    /// list shows, else the one a window opened for it shows.
+    /// The target of `root`'s window: the cached one, else the one a
+    /// window list shows, else the one a window opened for it shows.
     fn window_for(
         self: &Arc<Self>,
+        routing: &Routing,
         client: u64,
         root: &Path,
         deadline: Instant,
     ) -> Result<String, Refusal> {
-        if let Some(tab) = self.lock().tabs.get(root).cloned() {
-            return Ok(tab);
+        if let Some(target) = self.lock().targets.get(root).cloned() {
+            return Ok(target);
         }
-        if let Some(tab) = self.list_for(root, deadline)? {
-            return Ok(tab);
+        if let Some(target) = self.list_for(&routing.list, root, deadline)? {
+            return Ok(target);
         }
-        self.open(client, root, deadline)?;
-        let opening = || {
-            Refusal::Busy(
-                "Xcode is opening this workspace's window".into(),
-                OPEN_RETRY_SECS,
-            )
-        };
+        self.open(routing, client, root, deadline)?;
+        let opening = || Refusal::Busy(self.opening_reason(), OPEN_RETRY_SECS);
         loop {
-            match self.list_for(root, deadline) {
-                Ok(Some(tab)) => return Ok(tab),
+            match self.list_for(&routing.list, root, deadline) {
+                Ok(Some(target)) => return Ok(target),
                 Ok(None) => {}
                 // Out of time while asking: the window is what it waits for.
                 Err(Refusal::Busy(..)) => return Err(opening()),
@@ -828,11 +843,21 @@ impl Broker {
         }
     }
 
-    /// Ask the upstream for its windows; `root`'s tab, if one is there.
-    fn list_for(&self, root: &Path, deadline: Instant) -> Result<Option<String>, Refusal> {
+    /// Why a call waits on its window.
+    fn opening_reason(&self) -> String {
+        format!("{} is opening this workspace's window", self.label)
+    }
+
+    /// Ask the upstream for its windows; `root`'s target, if one is there.
+    fn list_for(
+        &self,
+        list: &List,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<Option<String>, Refusal> {
         let result = self.ask(
             "tools/call",
-            json!({"name": LIST_WINDOWS, "arguments": {}}),
+            json!({"name": list.tool, "arguments": {}}),
             deadline,
         )?;
         if result.get("isError") == Some(&json!(true)) {
@@ -841,45 +866,47 @@ impl Broker {
                 .and_then(Value::as_str)
                 .unwrap_or("no message");
             return Err(Refusal::Error(format!(
-                "cannot list Xcode's windows: {}",
+                "cannot list the {} windows: {}",
+                self.label,
                 text.chars().take(300).collect::<String>()
             )));
         }
-        let resolved = route::resolved_paths(&result);
-        let (tab, record) = {
+        let resolved = route::resolved_paths(&result, list);
+        let (target, record) = {
             let mut state = self.lock();
-            let record = self.observe(&mut state, &result, &resolved);
-            (state.tabs.get(root).cloned(), record)
+            let record = self.observe(list, &mut state, &result, &resolved);
+            (state.targets.get(root).cloned(), record)
         };
         if record {
             self.save_windows();
         }
         self.publish();
-        Ok(tab)
+        Ok(target)
     }
 
     /// Learn each known root's window from a window list: the cache gains
     /// what it shows and loses what it no longer shows, and a window the
-    /// broker opened gets its tab recorded. True when the record changed.
-    /// `resolved` is `route::resolved_paths(result)`, taken before `state`
-    /// was locked.
+    /// broker opened gets its target recorded. True when the record changed.
+    /// `resolved` is `route::resolved_paths(result, list)`, taken before
+    /// `state` was locked.
     pub fn observe(
         &self,
+        list: &List,
         state: &mut State,
         result: &Value,
         resolved: &HashMap<String, Option<PathBuf>>,
     ) -> bool {
-        let seen: Vec<(String, Option<PathBuf>)> = route::windows(result)
+        let seen: Vec<(String, Option<PathBuf>)> = route::windows(result, list)
             .into_iter()
-            .map(|(tab, path)| {
+            .map(|(target, path)| {
                 let real = resolved.get(&path).cloned().flatten();
-                (tab, real)
+                (target, real)
             })
             .collect();
         let in_root = |root: &Path| -> Vec<String> {
             seen.iter()
                 .filter(|(_, path)| path.as_deref().is_some_and(|p| route::inside(p, root)))
-                .map(|(tab, _)| tab.clone())
+                .map(|(target, _)| target.clone())
                 .collect()
         };
         let mut changed = false;
@@ -887,10 +914,10 @@ impl Broker {
             let shown = seen
                 .iter()
                 .find(|(_, path)| path.as_deref() == Some(opened.project.as_path()))
-                .map(|(tab, _)| tab.clone())
+                .map(|(target, _)| target.clone())
                 .or_else(|| in_root(&opened.root).into_iter().next());
-            if opened.tab.is_none() && shown.is_some() {
-                opened.tab = shown;
+            if opened.target.is_none() && shown.is_some() {
+                opened.target = shown;
                 changed = true;
             }
         }
@@ -900,7 +927,7 @@ impl Broker {
             .filter_map(|c| c.root.clone())
             .collect();
         roots.extend(state.windows.iter().map(|w| w.root.clone()));
-        roots.extend(state.tabs.keys().cloned());
+        roots.extend(state.targets.keys().cloned());
         roots.sort();
         roots.dedup();
         for root in roots {
@@ -909,23 +936,30 @@ impl Broker {
                 .windows
                 .iter()
                 .filter(|w| w.root == root)
-                .filter_map(|w| w.tab.clone())
-                .find(|tab| mine.contains(tab));
+                .filter_map(|w| w.target.clone())
+                .find(|target| mine.contains(target));
             match ours.or_else(|| mine.into_iter().next()) {
-                Some(tab) => state.tabs.insert(root, tab),
-                None => state.tabs.remove(&root),
+                Some(target) => state.targets.insert(root, target),
+                None => state.targets.remove(&root),
             };
         }
         changed
     }
 
     /// Open `root`'s window: one open per root at a time, the others wait
-    /// on it. The project is the client's `--project` or the one discovery
-    /// finds. The helper runs on its own thread: a call waits for it only
-    /// until `deadline`, then is busy, and the helper's outcome is recorded
+    /// on it. The project is the client's `--project`, or the one discovery
+    /// finds by the profile's kinds, or with no kinds the root itself. The
+    /// helper runs on its own thread: a call waits for it only until
+    /// `deadline`, then is busy, and the helper's outcome is recorded
     /// whenever it ends. A failed open is the error of the calls waiting on
     /// it, never retried within one.
-    fn open(self: &Arc<Self>, client: u64, root: &Path, deadline: Instant) -> Result<(), Refusal> {
+    fn open(
+        self: &Arc<Self>,
+        routing: &Routing,
+        client: u64,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<(), Refusal> {
         let (cwd, chosen) = {
             let state = self.lock();
             let c = state.clients.get(&client);
@@ -934,19 +968,21 @@ impl Broker {
                 c.and_then(|c| c.project.clone()),
             )
         };
-        let project = match chosen {
-            Some(rel) => route::chosen_project(&rel, root),
-            None => {
+        let project = match (chosen, &routing.project) {
+            (Some(rel), kinds) => route::chosen_project(&rel, root, kinds.as_ref()),
+            (None, Some(kinds)) => {
                 let mut bases: Vec<&Path> = cwd.iter().map(PathBuf::as_path).collect();
                 bases.push(root);
-                route::discover(&bases, root)
+                route::discover(&bases, root, kinds)
             }
+            (None, None) => Ok(root.to_path_buf()),
         }
         .map_err(Refusal::Error)?;
-        let Some(argv) = self.window_open.clone() else {
-            return Err(Refusal::Error(
-                "no window helper configured: cannot open this workspace's Xcode window".into(),
-            ));
+        let Some(argv) = routing.open.clone() else {
+            return Err(Refusal::Error(format!(
+                "no window helper configured: cannot open this workspace's {} window",
+                self.label
+            )));
         };
         let mut state = self.lock();
         match state.opening.get(root) {
@@ -971,7 +1007,7 @@ impl Broker {
                 state.windows.push(Opened {
                     root: root.to_path_buf(),
                     project: project.clone(),
-                    tab: None,
+                    target: None,
                     opened_ms: sys::now_ms() as u64,
                 });
                 drop(state);
@@ -993,10 +1029,7 @@ impl Broker {
                 Some(o) if o.running => {
                     let now = Instant::now();
                     if now >= deadline {
-                        return Err(Refusal::Busy(
-                            "Xcode is opening this workspace's window".into(),
-                            OPEN_RETRY_SECS,
-                        ));
+                        return Err(Refusal::Busy(self.opening_reason(), OPEN_RETRY_SECS));
                     }
                     state = self
                         .changed
@@ -1013,8 +1046,12 @@ impl Broker {
     /// The open helper's thread: run it, drop the window from the record if
     /// it failed, and close it again if the workspace was released meanwhile.
     fn run_open(&self, argv: &[String], root: PathBuf, project: PathBuf) {
-        let outcome = window::run(argv, &project)
-            .map_err(|why| format!("could not open this workspace's Xcode window: {why}"));
+        let outcome = window::run(argv, &project).map_err(|why| {
+            format!(
+                "could not open this workspace's {} window: {why}",
+                self.label
+            )
+        });
         let (close_after, opened) = {
             let mut state = self.lock();
             let mine = |w: &Opened| w.root == root && w.project == project;
@@ -1024,7 +1061,7 @@ impl Broker {
                 state.windows.push(Opened {
                     root: root.clone(),
                     project: project.clone(),
-                    tab: None,
+                    target: None,
                     opened_ms: sys::now_ms() as u64,
                 });
             }
@@ -1051,9 +1088,9 @@ impl Broker {
         }
         if let (true, Some(opened)) = (close_after, opened) {
             let (closed, failure) = self.close_windows(vec![opened]);
-            // A client may have listed the window while it was open: its tab
-            // is gone now, so the slot's next task must look it up again.
-            self.lock().tabs.remove(&root);
+            // A client may have listed the window while it was open: its
+            // target is gone now, so the slot's next task must look it up again.
+            self.lock().targets.remove(&root);
             self.log.line(&format!(
                 "closed {} window opened after its workspace {} was released{}",
                 closed.len(),
@@ -1124,7 +1161,8 @@ impl Broker {
         let mut closed = vec![];
         let mut failure = None;
         for target in targets {
-            let outcome = match &self.window_close {
+            let close = self.routing.as_ref().and_then(|r| r.close.as_ref());
+            let outcome = match close {
                 Some(argv) => window::run(argv, &target.project),
                 None => Err("no window helper configured".into()),
             };
@@ -1141,7 +1179,8 @@ impl Broker {
                 }
                 Err(why) => {
                     failure = Some(format!(
-                        "could not close the Xcode window of {}: {why}",
+                        "could not close the {} window of {}: {why}",
+                        self.label,
                         target.project.display()
                     ));
                     break;
@@ -1176,7 +1215,7 @@ impl Broker {
             (targets, opening)
         };
         let (closed, failure) = self.close_windows(targets);
-        self.lock().tabs.retain(|root, _| !under(root));
+        self.lock().targets.retain(|root, _| !under(root));
         self.log.line(&format!(
             "client {client}: close_workspace {}: closed {}{}{}",
             sys::quoted(&given.to_string_lossy(), 4096),
@@ -1282,10 +1321,11 @@ impl Broker {
 /// `route::resolved_paths` of the list.
 pub fn filter_windows(
     result: &mut Value,
+    list: &List,
     root: Option<&Path>,
     resolved: &HashMap<String, Option<PathBuf>>,
 ) {
-    route::filter_windows(result, |_, path| {
+    route::filter_windows(result, list, |_, path| {
         root.is_some_and(|root| {
             resolved
                 .get(path)
@@ -1318,11 +1358,12 @@ pub fn run(options: ServeOptions) -> i32 {
     let ServeOptions {
         dir,
         name,
+        label,
         ready_wait,
         upstream,
         pools,
-        window_open,
-        window_close,
+        path_arguments,
+        routing,
     } = options;
     if let Err(error) = sys::private_dir(&dir) {
         eprintln!("privateer-mcp-broker: {error}");
@@ -1399,15 +1440,15 @@ pub fn run(options: ServeOptions) -> i32 {
         socket.display()
     ));
     let broker = Arc::new(Broker {
-        label: busy::label(&name),
+        label,
         name,
         dir,
         socket: socket.clone(),
         ready_wait,
         upstream_argv: upstream,
         pools,
-        window_open,
-        window_close,
+        path_arguments,
+        routing,
         windows_file,
         record_io: Mutex::new(()),
         state: Mutex::new(State {
@@ -1429,7 +1470,7 @@ pub fn run(options: ServeOptions) -> i32 {
             tools: None,
             tools_epoch: 0,
             internal: HashMap::new(),
-            tabs: HashMap::new(),
+            targets: HashMap::new(),
             windows,
             opening: HashMap::new(),
         }),
