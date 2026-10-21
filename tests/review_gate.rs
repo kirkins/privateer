@@ -137,8 +137,21 @@ if op == "pr.merge":
     pr = fixture()
     if request["head_sha"] != pr["head_sha"]:
         reply({{"ok": False, "error": "HTTP 409 Head branch was modified", "status_code": 409}})
+    plan = root / "merge-plan"
+    steps = plan.read_text().split() if plan.exists() else []
+    step = steps.pop(0) if steps else "ok"
+    plan.write_text(" ".join(steps))
+    if step == "refuse":
+        reply({{"ok": False, "error": "merge failed: HTTP 405 not mergeable", "status_code": 405}})
+    if step == "fail":
+        reply({{"ok": False, "error": "merge failed: HTTP 502 bad gateway", "status_code": 502}})
     with open(root / "merges.log", "a") as merges:
         merges.write(json.dumps(request) + "\n")
+    if step == "lost":
+        # Merged on the forge, but the reply never arrives.
+        pr.update({{"state": "closed", "merged": True, "merge_sha": "e" * 40}})
+        (root / "prs" / ("%s.json" % request["pr"])).write_text(json.dumps(pr))
+        reply({{"ok": False, "error": "network error contacting the forge API: timeout"}})
     reply({{"ok": True, "merged": True, "merge_sha": "f" * 40}})
 reply({{"ok": False, "error": "unsupported forge operation: " + op}})
 "#
@@ -438,6 +451,17 @@ reply({{"ok": False, "error": "unsupported forge operation: " + op}})
                     .to_owned()
             })
             .collect()
+    }
+    /// Whether a production approval has been used up.
+    fn consumed(&self, approval: &str) -> bool {
+        let db = rusqlite::Connection::open(self.home().join("privateer.sqlite")).unwrap();
+        db.query_row(
+            "SELECT consumed FROM approvals WHERE id=?1",
+            [approval],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
     }
     /// Launch a crew on a route and wait for it to end.
     fn crew(&self, id: &str, route: &str) {
@@ -1193,6 +1217,71 @@ fn an_approved_head_merges_through_pr_merge() {
             .contains("APPROVE by opus (tier 1), posted and merged"),
         "{bearings}"
     );
+}
+
+#[test]
+fn a_lost_merge_reply_is_settled_by_reading_the_pr_again() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 42 }\n")],
+        "Fix",
+    );
+    f.pr(42, &head, "feature");
+    let row = f.review(42, APPROVE, json!({}));
+    assert_eq!(row["post_state"], "posted", "{row}");
+    f.json(
+        None,
+        "approval.grant",
+        json!({"id": "deploy-42", "task_id": "fix", "artifact": head,
+            "environment": "production", "approver": "captain"}),
+    );
+    let production = json!({"task_id": "fix", "pr": 42, "deploys_production": true,
+        "environment": "production"});
+    // A clear refusal is reported as it is, with no second read.
+    fs::write(f.root.join("merge-plan"), "refuse").unwrap();
+    let views = ops_of(&f, "pr.view").len();
+    let refused = f.refused(Some("engineering"), "pr.merge", production.clone());
+    assert!(
+        refused.contains("the forge refused to merge #42") && refused.contains("HTTP 405"),
+        "{refused}"
+    );
+    assert_eq!(ops_of(&f, "pr.view").len(), views + 1);
+    assert!(!f.consumed("deploy-42"));
+    // An answer that is no refusal (a 5xx): read again, #42 is still open,
+    // so the merge is reported as not done and the approval is kept.
+    fs::write(f.root.join("merge-plan"), "fail").unwrap();
+    let refused = f.refused(Some("engineering"), "pr.merge", production.clone());
+    assert!(
+        refused.contains("got no clear answer") && refused.contains("HTTP 502"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&format!("is open at {}, not merged at that head", &head[..7])),
+        "{refused}"
+    );
+    assert!(!f.consumed("deploy-42"));
+    assert!(!f.row(row["id"].as_str().unwrap())["merged_ms"].is_i64());
+    // The forge merges but the reply is lost: read again, #42 is merged at
+    // the expected head, so the merge is recorded and the approval used up.
+    fs::write(f.root.join("merge-plan"), "lost").unwrap();
+    let merged = f.json(Some("engineering"), "pr.merge", production);
+    assert_eq!(merged["merged"], true, "{merged}");
+    assert_eq!(merged["merge_sha"], "e".repeat(40));
+    assert!(
+        merged["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["check"] == "merge_reply_lost" && c["error"].as_str().unwrap().contains("timeout")),
+        "{merged}"
+    );
+    assert!(f.consumed("deploy-42"));
+    let row = f.row(row["id"].as_str().unwrap());
+    assert!(row["merged_ms"].is_i64(), "{row}");
+    assert_eq!(row["merge_sha"], "e".repeat(40));
+    assert_eq!(ops_of(&f, "pr.merge").len(), 3);
 }
 
 #[test]

@@ -471,6 +471,7 @@ def pr_view(request):
         "url": pr_data.get("html_url") or pr_data.get("url") or "",
         "mergeable": pr_data.get("mergeable"),
         "merged": pr_data.get("merged", False),
+        "merge_sha": pr_data.get("merge_commit_sha") if pr_data.get("merged") else None,
         "checks": checks,
         "required_checks": required,
         "required_checks_ok": required_checks_ok,

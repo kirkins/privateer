@@ -1243,20 +1243,66 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         ));
     }
     // 6. The merge, as the merger account, passing the expected head: a push
-    // since step 1 makes the forge refuse it.
-    let merged = crate::forges::call(
+    // since step 1 makes the forge refuse it. A reply that is neither a merge
+    // nor a clear refusal (a timeout, a 5xx, no reply) may hide a merge that
+    // happened, so the PR is read again: merged at the expected head, the
+    // merge is recorded; otherwise the merge is reported as not done.
+    let mut recovered = None;
+    let merge_sha = match crate::forges::exchange(
         &forge,
         &forge.merger,
         "pr.merge",
         json!({"pr": number, "head_sha": head, "merge_method": "merge"}),
-    )
-    .with_context(|| format!("merge #{number} at {}", short(&head)))?;
-    ensure!(
-        merged["merged"] != false,
-        "the forge did not merge #{number}: {}",
-        merged["message"].as_str().unwrap_or("no reason given")
-    );
-    let merge_sha = merged["merge_sha"].as_str().map(str::to_owned);
+        None,
+    ) {
+        Ok(reply) if reply["ok"] == true => {
+            ensure!(
+                reply["merged"] != false,
+                "the forge did not merge #{number}: {}",
+                reply["message"].as_str().unwrap_or("no reason given")
+            );
+            reply["merge_sha"].as_str().map(str::to_owned)
+        }
+        Ok(reply)
+            if reply["status_code"]
+                .as_u64()
+                .is_some_and(|code| (400..500).contains(&code)) =>
+        {
+            bail!(
+                "the forge refused to merge #{number} at {}: {}",
+                short(&head),
+                reply["error"].as_str().unwrap_or("no reason given")
+            )
+        }
+        lost => {
+            let why = match lost {
+                Ok(reply) => reply["error"]
+                    .as_str()
+                    .unwrap_or("no reason given")
+                    .to_owned(),
+                Err(error) => format!("{error:#}"),
+            };
+            let why = filter::clip(&why, 300);
+            let now = pr::view(&forge, number, &[], None).with_context(|| {
+                format!(
+                    "the merge of #{number} at {} got no clear answer ({why}), and #{number} \
+                     could not be read again; check the forge before merging again",
+                    short(&head)
+                )
+            })?;
+            ensure!(
+                now.state == "merged" && now.head_sha == head,
+                "the merge of #{number} at {} got no clear answer ({why}); read again, #{number} \
+                 is {} at {}, not merged at that head",
+                short(&head),
+                now.state,
+                short(&now.head_sha)
+            );
+            checks.push(json!({"check": "merge_reply_lost", "error": why, "merged": true}));
+            recovered = Some(why);
+            now.merge_sha
+        }
+    };
     let tx = store.write_transaction()?;
     if let Some((approval, environment, charter_hash)) = &production {
         let used = tx.execute(
@@ -1279,7 +1325,8 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     store.audit(
         "pr.merge",
         &json!({"ship": ship, "repo": forge.key, "pr": number, "head": head, "review": review_id,
-            "merge_sha": merge_sha, "production": production.as_ref().map(|p| &p.0)}),
+            "merge_sha": merge_sha, "production": production.as_ref().map(|p| &p.0),
+            "reply_lost": recovered}),
     )?;
     Ok(json!({
         "merged": true,
