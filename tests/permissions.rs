@@ -720,6 +720,11 @@ fn an_unrelated_policy_change_keeps_the_ask_and_a_covering_one_ends_it() {
         .cloned()
         .unwrap();
     assert_eq!(told["urgency"], "normal");
+    assert_eq!(told["payload"]["granted"], true, "{told}");
+    assert!(
+        told["body"].as_str().unwrap().contains("now allows"),
+        "{told}"
+    );
     assert_eq!(
         f.crew("liaison", "crew-two", json!({}))["status"],
         "succeeded"
@@ -826,6 +831,168 @@ fn relays_and_the_same_denial_elsewhere_join_the_open_ask_and_share_its_answer()
     // The captain chose to do without: a repeat opens nothing new.
     f.crew("liaison", "crew-two", json!({}));
     assert_eq!(f.asks("liaison").len(), 1);
+}
+
+/// The ids of the asks `captain.waiting` shows as their own cards, and how
+/// many items each carries.
+fn waiting_cards(f: &Fleet) -> Vec<(Value, Value)> {
+    f.json("liaison", "captain.waiting", json!({}))["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["mail"]["id"].clone(), w["attached"].clone()))
+        .collect()
+}
+
+#[test]
+fn a_denial_no_rule_narrows_never_joins_another_ships_ask() {
+    let f = Fleet::new();
+    f.init("storefront", "claude");
+    // Each ship's crew is denied a compound command: no rule narrows it.
+    let mut options =
+        f.json("liaison", "ship.show", json!({"name":"liaison"}))["first_mate"]["options"].clone();
+    options["model"] = json!("script-model");
+    for ship in ["liaison", "storefront"] {
+        assert_eq!(
+            f.crew(ship, &format!("{ship}-crew"), json!({"options": options}))["status"],
+            "failed"
+        );
+    }
+    let ours = f.asks("liaison")[0].clone();
+    let theirs = f.asks("storefront")[0].clone();
+    assert!(ours["payload"]["block"]["denials"][0]["rule"].is_null());
+    for ask in [&ours, &theirs] {
+        assert!(ask["payload"]["attached_to"].is_null(), "{ask}");
+    }
+    let cards = waiting_cards(&f);
+    for ask in [&ours, &theirs] {
+        assert!(cards.iter().any(|(id, _)| *id == ask["id"]), "{cards:?}");
+    }
+    // A tool the ship reports only as unknown is named by its tool alone, so
+    // two ships' denials of it share a fleet key, but not an ask.
+    let unknown = |ship: &str| {
+        f.json(
+            ship,
+            "task.create",
+            json!({"id": format!("{ship}-other"), "charter_id": ship, "owner": ship,
+                "title": "Other work"}),
+        );
+        f.json(
+            ship,
+            "permissions.blocked",
+            json!({"task_id": format!("{ship}-other"), "tool": "unknown", "input": {}}),
+        )["request_id"]
+            .clone()
+    };
+    let first = unknown("liaison");
+    let second = unknown("storefront");
+    let held = f.show("storefront", &second);
+    assert_eq!(
+        held["payload"]["block"]["fleet_key"],
+        f.show("liaison", &first)["payload"]["block"]["fleet_key"]
+    );
+    assert!(held["payload"]["attached_to"].is_null(), "{held}");
+    let cards = waiting_cards(&f);
+    for id in [&first, &second] {
+        assert!(cards.iter().any(|(card, _)| card == id), "{cards:?}");
+    }
+}
+
+#[test]
+fn the_same_derived_rule_on_two_ships_is_one_ask() {
+    let f = Fleet::new();
+    f.init("storefront", "claude");
+    let block = |ship: &str| {
+        f.json(
+            ship,
+            "permissions.blocked",
+            json!({"task_id": format!("{ship}-duty"), "tool": "Bash",
+                "input": {"command": "kubectl apply -f web.yaml"}}),
+        )["request_id"]
+            .clone()
+    };
+    let ours = block("liaison");
+    let theirs = block("storefront");
+    let held = f.show("storefront", &theirs);
+    assert_eq!(
+        held["payload"]["block"]["denials"][0]["rule"],
+        "Bash(kubectl apply *)"
+    );
+    assert_eq!(held["payload"]["attached_to"], ours, "{held}");
+    let cards = waiting_cards(&f);
+    assert!(!cards.iter().any(|(id, _)| *id == theirs), "{cards:?}");
+    let card = cards.iter().find(|(id, _)| *id == ours).unwrap();
+    assert_eq!(card.1, 1, "{cards:?}");
+}
+
+#[test]
+fn a_policy_change_for_one_ship_leaves_another_ships_attached_ask_on_its_own() {
+    let f = Fleet::new();
+    f.init("storefront", "claude");
+    f.crew("liaison", "crew-one", json!({}));
+    let ours = f.asks("liaison")[0]["id"].clone();
+    let theirs = f.json(
+        "storefront",
+        "permissions.blocked",
+        json!({"task_id": "storefront-duty", "tool": "Bash",
+            "input": {"command": "make deploy | tee deploy.log"}}),
+    )["request_id"]
+        .clone();
+    // Attached anyway, as an older runtime attached it.
+    rusqlite::Connection::open(f.root.join("storefront/.privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE mail SET payload=json_set(payload,'$.attached_to',?2,'$.attached_ship','liaison','$.about',?2)
+             WHERE id=?1",
+            rusqlite::params![theirs.as_str().unwrap(), ours.as_str().unwrap()],
+        )
+        .unwrap();
+    assert!(!waiting_cards(&f).iter().any(|(id, _)| *id == theirs));
+    // The captain allows liaison's rule; it covers nothing storefront asked.
+    f.ok(None, &["permissions", "allow", "Bash(apify run *)"]);
+    assert_eq!(f.show("liaison", &ours)["end_reason"], "policy changed");
+    let kept = f.show("storefront", &theirs);
+    assert_eq!(kept["state"], "open", "{kept}");
+    assert!(kept["payload"]["attached_to"].is_null(), "{kept}");
+    assert!(kept["payload"]["about"].is_null(), "{kept}");
+    assert!(waiting_cards(&f).iter().any(|(id, _)| *id == theirs));
+}
+
+#[test]
+fn an_ask_an_unrelated_policy_change_ends_says_nothing_was_granted() {
+    let f = Fleet::new();
+    let mut options =
+        f.json("liaison", "ship.show", json!({"name":"liaison"}))["first_mate"]["options"].clone();
+    options["model"] = json!("script-model");
+    f.crew("liaison", "crew-one", json!({"options": options}));
+    let ask = f.asks("liaison")[0].clone();
+    assert!(ask["payload"]["block"]["denials"][0]["rule"].is_null());
+    // No rule names the denial, so any change ends the ask for one retry.
+    f.ok(None, &["permissions", "allow", "Bash(other-tool *)"]);
+    let ended = f.show("liaison", &ask["id"]);
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    let reason = ended["end_reason"].as_str().unwrap();
+    assert_ne!(reason, "policy changed");
+    assert!(
+        reason.contains("nothing this ask named was granted"),
+        "{reason}"
+    );
+    let told = f.json("liaison", "mail.inbox", json!({"address":"liaison"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["payload"]["block_cleared"] == true)
+        .cloned()
+        .unwrap();
+    assert_eq!(told["payload"]["granted"], false, "{told}");
+    let body = told["body"].as_str().unwrap();
+    assert!(
+        body.contains("nothing was granted for this request"),
+        "{body}"
+    );
+    assert!(body.contains("Retry the step once"), "{body}");
+    assert!(body.contains("permissions.blocked"), "{body}");
+    assert!(!body.contains("now allows"), "{body}");
 }
 
 #[test]

@@ -4180,6 +4180,72 @@ fn a_relay_on_the_other_machine_joins_the_ask_at_the_desk_and_only_the_desks_all
 }
 
 #[test]
+fn a_desk_copy_of_an_ask_no_rule_narrows_stays_its_own_card() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("scout");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let blocked = |ship: &str, task: &str, tool: &str, input: Value| {
+        if !task.ends_with("-duty") {
+            mac.ok(
+                ship,
+                "task.create",
+                json!({"id": task, "charter_id": ship, "owner": ship, "title": "Other work"}),
+            );
+        }
+        mac.ok(
+            ship,
+            "permissions.blocked",
+            json!({"task_id": task, "tool": tool, "input": input}),
+        )["request_id"]
+            .clone()
+    };
+    // Two ships report a tool only as unknown: the same fleet key, no rule.
+    let first = blocked("fitforge", "fitforge-duty", "unknown", json!({}));
+    let second = blocked("scout", "scout-duty", "unknown", json!({}));
+    // Attached at the origin anyway, as an older runtime attached it.
+    rusqlite::Connection::open(mac.folder("scout").join(".privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE mail SET payload=json_set(payload,'$.attached_to',?2,'$.attached_ship','fitforge','$.about',?2)
+             WHERE id=?1",
+            params![second.as_str().unwrap(), first.as_str().unwrap()],
+        )
+        .unwrap();
+    // The same derived rule on both ships is one ask, at the origin and at the desk.
+    let rule = json!({"command": "kubectl apply -f web.yaml"});
+    let shared = blocked("fitforge", "fitforge-k8s", "Bash", rule.clone());
+    let joined = blocked("scout", "scout-k8s", "Bash", rule);
+    assert_eq!(
+        mac.ok("scout", "mail.show", json!({"id": joined}))["payload"]["attached_to"],
+        shared
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert!(
+        pass["machines"][0]["delivered"].as_u64() >= Some(4),
+        "{pass}"
+    );
+    let copy = laptop.ok("liaison", "mail.show", json!({"id": second}));
+    assert_eq!(copy["delivery"], "received", "{copy}");
+    assert!(copy["payload"]["attached_to"].is_null(), "{copy}");
+    assert!(copy["payload"]["about"].is_null(), "{copy}");
+    let joined_copy = laptop.ok("liaison", "mail.show", json!({"id": joined}));
+    assert_eq!(
+        joined_copy["payload"]["attached_to"], shared,
+        "{joined_copy}"
+    );
+    let waiting = laptop.ok("liaison", "captain.waiting", json!({}));
+    let items = waiting["waiting"].as_array().unwrap();
+    for id in [&first, &second, &shared] {
+        assert!(items.iter().any(|w| w["mail"]["id"] == *id), "{waiting}");
+    }
+    assert!(
+        !items.iter().any(|w| w["mail"]["id"] == joined),
+        "{waiting}"
+    );
+}
+
+#[test]
 fn the_captain_replies_to_and_dismisses_an_ask_from_the_other_machine_by_prefix() {
     let (_temp, laptop, mac, ssh) = fixture();
     assert!(link(&laptop, &mac, &ssh).status.success());

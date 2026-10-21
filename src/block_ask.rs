@@ -623,9 +623,9 @@ fn shared_denials(denials: &[Value], more: u64) -> bool {
 /// other payload may.
 pub(crate) fn may_join(payload: &Value) -> bool {
     payload["type"] != "tool_permission"
-        || payload["block"]["denials"].as_array().is_some_and(|d| {
-            shared_denials(d, payload["block"]["more"].as_u64().unwrap_or(0))
-        })
+        || payload["block"]["denials"]
+            .as_array()
+            .is_some_and(|d| shared_denials(d, payload["block"]["more"].as_u64().unwrap_or(0)))
 }
 
 /// An open primary ask for the same denial under the same policy, raised by
@@ -1843,6 +1843,63 @@ mod tests {
         let mut older = ask.clone();
         older["block"].as_object_mut().unwrap().remove("authorized");
         assert!(covered(&other, "new", &older));
+    }
+
+    #[test]
+    fn only_asks_whose_every_denial_is_a_derived_rule_join_another_ships() {
+        let ask = |denials: Value, more: u64| json!({"type": "tool_permission", "block": {"denials": denials, "more": more}});
+        assert!(may_join(&ask(
+            json!([{"tool": "Bash", "rule": "Bash(kubectl apply *)"}]),
+            0
+        )));
+        for refused in [
+            ask(json!([{"tool": "Bash", "rule": null}]), 0),
+            ask(json!([{"tool": "unknown", "rule": null}]), 0),
+            ask(json!([{"tool": "", "rule": null, "unidentified": true}]), 0),
+            ask(
+                json!([{"tool": "Bash", "rule": null, "authorize": "Running make."}]),
+                0,
+            ),
+            ask(
+                json!([{"tool": "Bash", "rule": "Bash(make *)"}, {"tool": "Bash", "rule": null}]),
+                0,
+            ),
+            // What it counted but does not list may name no rule.
+            ask(json!([{"tool": "Bash", "rule": "Bash(make *)"}]), 1),
+            ask(json!([]), 0),
+            json!({"type": "tool_permission", "block": {}}),
+        ] {
+            assert!(!may_join(&refused), "{refused}");
+        }
+        // Other captain mail joins by its topic as before.
+        assert!(may_join(&json!({"about": "permissions-x"})));
+    }
+
+    #[test]
+    fn a_policy_change_ends_a_no_rule_ask_without_granting_it() {
+        let policy = json!({"claude_allow": ["Bash(apify run *)"]});
+        let ask = |denials: Value| json!({"policy_hash": "old", "block": {"denials": denials}});
+        let derived = ask(json!([{"tool": "Bash", "rule": "Bash(apify run *)"}]));
+        assert!(grants(&policy, &derived) && covered(&policy, "new", &derived));
+        let other = ask(json!([{"tool": "Bash", "rule": "Bash(make *)"}]));
+        assert!(!grants(&policy, &other) && !covered(&policy, "new", &other));
+        let none = ask(json!([{"tool": "unknown", "rule": null}]));
+        assert!(!grants(&policy, &none));
+        assert!(covered(&policy, "new", &none));
+        assert!(!covered(&policy, "old", &none));
+        assert!(grants(&json!({"mode": "yolo"}), &none));
+        let ended = |reason: &str| {
+            json!({"id": "permissions-1", "state": "withdrawn", "end_reason": reason,
+                "payload": {"type": "tool_permission", "block": {"denials": [{"tool": "unknown", "rule": null}]}}})
+        };
+        let ungranted = resumed_by_policy(&ended(POLICY_CHANGED_UNGRANTED)).unwrap();
+        assert!(ungranted.contains("nothing was granted"), "{ungranted}");
+        assert!(ungranted.contains("permissions.blocked"), "{ungranted}");
+        let granted = resumed_by_policy(&ended(POLICY_CHANGED)).unwrap();
+        assert!(granted.contains("now allows"), "{granted}");
+        assert!(
+            resumed_by_policy(&ended("merged ask permissions-2 ended: policy changed")).is_none()
+        );
     }
 
     #[test]
