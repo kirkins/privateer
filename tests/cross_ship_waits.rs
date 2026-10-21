@@ -7,6 +7,8 @@ use privateer::{dispatch, store::Store};
 use serde_json::{Value, json};
 use std::fs;
 
+mod support;
+
 /// Two homes on one machine: `apps` in `a` owns the waited-on task, `infra`
 /// in `b` is the subscribing ship. Each home reaches the other as a peer.
 struct Pair {
@@ -1205,10 +1207,23 @@ fn ping(store: &mut Store, id: &str, from: &str, to: &str) {
     .unwrap();
 }
 
+/// Move a home's last resyncs a minute and more into the past, as if that
+/// long had gone by: a link resyncs at most once a minute.
+fn later(store: &Store) {
+    store
+        .connection()
+        .execute(
+            "UPDATE wait_links SET resynced_ms=resynced_ms-61000 WHERE resynced_ms IS NOT NULL",
+            [],
+        )
+        .unwrap();
+}
+
 /// Take the waiting home's link to the owner down and bring it back: a
 /// message fails to reach the owner, then the next flush reaches it, which
-/// is the link heard again.
+/// is the link heard again. Each outage comes after the resync spacing.
 fn outage(pair: &mut Pair, id: &str) {
+    later(&pair.b);
     let (a_home, _) = homes(pair);
     link(&mut pair.b, "home-a", &a_home, false);
     ping(&mut pair.b, id, "infra", "apps");
@@ -1285,16 +1300,15 @@ fn a_link_back_resubscribes_and_the_owner_answers_a_missed_end() {
     let resumed = work(&mut pair.b, "waiting-1");
     assert_eq!(resumed["state"], "ready", "{resumed}");
     assert!(resumed["resumed_by"].as_str().unwrap().contains("done"));
-    // A replay changes nothing: the resolved wait is not sent again, and a
-    // repeated answer finds no wait.
+    // A replay changes nothing: the resolved wait is not sent again, a
+    // resync that sends nothing is not audited, and a repeated answer finds
+    // no wait.
     let sent = outbox(&pair.b, "apps").len();
+    let resynced = audited(&mut pair.b, "wait.resync").len();
     outage(&mut pair, "ping-3");
     let after = outbox(&pair.b, "apps");
     assert_eq!(after.len(), sent + 1, "only the ping: {after:?}");
-    assert_eq!(
-        audited(&mut pair.b, "wait.resync").last().unwrap()["resubscribed"],
-        0
-    );
+    assert_eq!(audited(&mut pair.b, "wait.resync").len(), resynced);
     let repeated = report(
         &mut pair.b,
         "end-again",
@@ -1332,12 +1346,13 @@ fn an_owner_link_back_reports_a_subscribed_task_that_ended_without_its_report() 
     let faulted = work(&mut pair.b, "waiting-1");
     assert_eq!(faulted["state"], "fault", "{faulted}");
     assert!(faulted["reason"].as_str().unwrap().contains("cancelled"));
-    // Again: nothing more to report.
+    // Again: nothing more to report, and nothing audited.
+    later(&pair.a);
     link(&mut pair.a, "home-b", &b_home, false);
     ping(&mut pair.a, "owner-ping-2", "apps", "infra");
     link(&mut pair.a, "home-b", &b_home, true);
     dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
-    assert_eq!(audited(&mut pair.a, "wait.resync")[1]["answered"], 0);
+    assert_eq!(audited(&mut pair.a, "wait.resync").len(), 1);
     assert_eq!(nonces(&pair.a, "infra", "task_end").len(), 1);
 }
 
@@ -1729,5 +1744,630 @@ fn an_agents_own_flush_carries_its_ships_wait_notices() {
                     "subscriber_task":"other"}}}),
         )
         .is_err()
+    );
+}
+
+// Step 4: retire, refused wait notices, and the step 3 review follow-ups.
+
+/// Retire `ship` as the captain does, in a fleet that lists both homes of
+/// the pair, through the real CLI.
+fn retire(pair: &Pair, ship: &str) -> Value {
+    retire_as(pair, ship, None)
+}
+
+/// Retire `ship` through the real CLI, as the captain or as `agent`, the
+/// ship that created both ships of the pair.
+fn retire_as(pair: &Pair, ship: &str, agent: Option<&str>) -> Value {
+    let root = pair._temp.path().canonicalize().unwrap();
+    let (a_home, b_home) = homes(pair);
+    let fleet = rusqlite::Connection::open(root.join("fleet.sqlite")).unwrap();
+    fleet
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
+        )
+        .unwrap();
+    for (name, home) in [("apps", &a_home), ("infra", &b_home)] {
+        fleet
+            .execute(
+                "INSERT OR IGNORE INTO ships(name, home, created_by, created_ms)
+                 VALUES(?1, ?2, ?3, 1)",
+                rusqlite::params![name, home.to_string_lossy(), agent.unwrap_or("captain")],
+            )
+            .unwrap();
+    }
+    let home = if ship == "apps" { &a_home } else { &b_home };
+    let mut command = support::isolated(&root);
+    command
+        .args(["--home", &home.to_string_lossy(), "ship.retire", "--json"])
+        .arg(json!({"name": ship}).to_string());
+    if let Some(agent) = agent {
+        command
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", agent);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn retiring_the_owner_closes_its_waits_as_retired_and_faults_the_waiters() {
+    let mut pair = subscribed();
+    let nonce = nonce_of(&pair.b, "waiting-1").unwrap();
+    let retired = retire(&pair, "apps");
+    assert_eq!(retired["retired"], true, "{retired}");
+    let waits = &retired["waits"];
+    assert_eq!(waits["closed"], 1, "{retired}");
+    assert_eq!(waits["tasks"], json!(["far-work"]));
+    // Its notices left before it stopped: the drain carried them.
+    assert_eq!(waits["drain"], json!({"delivered": 1, "pending": 0}));
+    assert_eq!(rows(&pair.a, "far-work"), 0);
+    let closed: Vec<Value> = outbox(&pair.a, "infra")
+        .into_iter()
+        .filter(|m| m["payload"]["wait_closed"].is_object())
+        .collect();
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(
+        closed[0]["payload"]["wait_closed"],
+        json!({"task":"far-work","reason":"retired","nonce":nonce})
+    );
+    assert_eq!(closed[0]["delivery"], "delivered");
+    // The waiting task faults with that reason and never resumes.
+    let faulted = work(&mut pair.b, "waiting-1");
+    assert_eq!(faulted["state"], "fault", "{faulted}");
+    assert!(
+        faulted["reason"]
+            .as_str()
+            .unwrap()
+            .contains("was closed: retired"),
+        "{faulted}"
+    );
+    pass(&mut pair.b);
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "fault");
+    // The owner removed the row itself: nothing is sent back.
+    assert!(wait_payloads(&pair.b, "apps", "wait_unsubscribe").is_empty());
+    assert_eq!(audited(&mut pair.a, "wait.retired").len(), 1);
+    no_wait_mail(&mut pair.b);
+}
+
+#[test]
+fn retiring_the_waiting_ship_unsubscribes_and_the_owner_rows_go() {
+    let mut pair = subscribed();
+    let nonce = nonce_of(&pair.b, "waiting-1").unwrap();
+    let retired = retire(&pair, "infra");
+    let waits = &retired["waits"];
+    assert_eq!(waits["unsubscribed"], 1, "{retired}");
+    assert_eq!(waits["closed"], 0, "{retired}");
+    assert_eq!(waits["drain"], json!({"delivered": 1, "pending": 0}));
+    assert_eq!(rows(&pair.a, "far-work"), 0);
+    assert_eq!(
+        nonces(&pair.b, "apps", "wait_unsubscribe"),
+        vec![json!(nonce)]
+    );
+    // Its waiting task is not cancelled; its schedule is left as it was.
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
+    assert_eq!(
+        dispatch(&mut pair.b, "task.show", json!({"id":"waiting-1"})).unwrap()["status"],
+        "blocked"
+    );
+    // Its charter revoked, a link heard again does not subscribe it anew.
+    dispatch(&mut pair.b, "charter.revoke", json!({"id":"project"})).unwrap();
+    let subscribes = wait_payloads(&pair.b, "apps", "wait_subscribe").len();
+    outage(&mut pair, "after-retire");
+    assert_eq!(
+        wait_payloads(&pair.b, "apps", "wait_subscribe").len(),
+        subscribes
+    );
+    assert_eq!(rows(&pair.a, "far-work"), 0);
+}
+
+#[test]
+fn an_agents_retire_leaves_the_notices_to_the_retiring_ships_dispatcher() {
+    let mut pair = subscribed();
+    // An agent cannot carry another ship's mail, so its retire only waits
+    // while the retiring ship's dispatcher delivers; a thread flushing that
+    // home as the runtime stands in for the dispatcher here.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_, b_home) = homes(&pair);
+    let dispatcher = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut store = Store::open(&b_home).unwrap();
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                dispatch(&mut store, "mail.flush", json!({})).unwrap();
+            }
+        })
+    };
+    let retired = retire_as(&pair, "infra", Some("research"));
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    dispatcher.join().unwrap();
+    assert_eq!(retired["waits"]["unsubscribed"], 1, "{retired}");
+    // It delivered nothing itself, and found the outbox empty.
+    assert_eq!(
+        retired["waits"]["drain"],
+        json!({"delivered": 0, "pending": 0})
+    );
+    assert_eq!(rows(&pair.a, "far-work"), 0);
+    assert!(audited(&mut pair.b, "wait.notice_dropped").is_empty());
+}
+
+/// How often a peer refused one message, and its delivery.
+fn refusals(store: &Store, id_like: &str) -> (i64, String) {
+    store
+        .connection()
+        .query_row(
+            "SELECT delivery_refusals, delivery FROM mail WHERE payload LIKE ?1 ORDER BY seq LIMIT 1",
+            [format!("%{id_like}%")],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_wait_notice_refused_three_times_is_dropped_and_later_mail_to_that_peer_still_flows() {
+    let mut pair = pair();
+    share(&mut pair.a, "far-work", json!(["infra"]));
+    // The owner's home no longer hosts apps (retired there, say): it refuses
+    // anything addressed to it, every time.
+    pair.a
+        .connection()
+        .execute("DELETE FROM ships WHERE name='apps'", [])
+        .unwrap();
+    waiter(&mut pair.b, "waiting-1");
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    // Mail behind the refused subscription waits while it is retried.
+    ping(&mut pair.b, "after-refusal", "infra", "research");
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (1, "pending".into()));
+    assert_eq!(outbox(&pair.b, "research")[0]["delivery"], "pending");
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (2, "pending".into()));
+    assert!(audited(&mut pair.b, "wait.notice_dropped").is_empty());
+    // The third refusal drops it, and the mail behind it goes in that pass.
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    let sent = outbox(&pair.b, "apps");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["delivery"], "dropped");
+    assert_eq!(outbox(&pair.b, "research")[0]["delivery"], "delivered");
+    let dropped = audited(&mut pair.b, "wait.notice_dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["notice"], "wait_subscribe");
+    assert_eq!(dropped[0]["to"], "apps");
+    assert_eq!(dropped[0]["refusals"], 3);
+    // It is never retried again, and the peer is not left backed off.
+    for _ in 0..2 {
+        dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    }
+    assert_eq!(audited(&mut pair.b, "wait.notice_dropped").len(), 1);
+    let failures: i64 = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM mail_delivery_retry WHERE peer='home-a' AND failures>0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(failures, 0);
+    ping(&mut pair.b, "later", "infra", "research");
+    assert_eq!(
+        outbox(&pair.b, "research").last().unwrap()["delivery"],
+        "delivered"
+    );
+    let listed = dispatch(&mut pair.b, "mail.outbox", json!({"delivery":"dropped"})).unwrap();
+    assert_eq!(listed["messages"].as_array().unwrap().len(), 1, "{listed}");
+    // Nothing quarantined, so nothing for the captain to chase.
+    assert_eq!(
+        dispatch(&mut pair.b, "mail.flush", json!({})).unwrap()["quarantined"],
+        0
+    );
+}
+
+#[test]
+fn a_refused_report_is_dropped_on_its_third_refusal_and_only_then_the_owner_deletes_its_row() {
+    let mut pair = subscribed();
+    let nonce = nonce_of(&pair.b, "waiting-1").unwrap();
+    // The waiting home no longer knows apps, so it refuses apps's mail.
+    pair.b
+        .connection()
+        .execute("DELETE FROM ships WHERE name='apps'", [])
+        .unwrap();
+    dispatch(
+        &mut pair.a,
+        "task.update",
+        json!({"id":"far-work","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    // A replay of the same subscription was stored before the answer came
+    // back refused: that generation's row goes with the dropped report.
+    pair.a
+        .connection()
+        .execute(
+            "INSERT INTO task_subscriptions(task_id,subscriber,subscriber_task,created_ms,nonce)
+             VALUES('far-work','infra','waiting-1',1,?1),('far-work','infra','waiting-2',1,'other')",
+            [&nonce],
+        )
+        .unwrap();
+    ping(&mut pair.a, "later", "research", "infra");
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    // Refused twice: still owed, and the row stays.
+    assert_eq!(refusals(&pair.a, "task_end"), (2, "pending".into()));
+    assert_eq!(rows(&pair.a, "far-work"), 2);
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    let ends: Vec<Value> = outbox(&pair.a, "infra")
+        .into_iter()
+        .filter(|m| m["payload"]["task_end"].is_object())
+        .collect();
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0]["delivery"], "dropped");
+    assert_eq!(
+        outbox(&pair.a, "infra").last().unwrap()["delivery"],
+        "delivered"
+    );
+    let dropped = audited(&mut pair.a, "wait.notice_dropped");
+    assert_eq!(dropped[0]["notice"], "task_end");
+    assert_eq!(dropped[0]["rows"], 1);
+    // Another generation's row is not the refused one's.
+    assert_eq!(rows(&pair.a, "far-work"), 1);
+}
+
+#[test]
+fn a_refusal_that_clears_delivers_the_report_and_the_wait_resumes() {
+    let mut pair = subscribed();
+    let apps: String = pair
+        .b
+        .connection()
+        .query_row("SELECT record FROM ships WHERE name='apps'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    pair.b
+        .connection()
+        .execute("DELETE FROM ships WHERE name='apps'", [])
+        .unwrap();
+    dispatch(
+        &mut pair.a,
+        "task.update",
+        json!({"id":"far-work","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.a, "task_end"), (1, "pending".into()));
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
+    // The waiting home knows apps again: the retry is delivered.
+    pair.b
+        .connection()
+        .execute(
+            "INSERT INTO ships(name, record) VALUES('apps', ?1)",
+            [&apps],
+        )
+        .unwrap();
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.a, "task_end"), (1, "delivered".into()));
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "ready");
+    assert!(audited(&mut pair.a, "wait.notice_dropped").is_empty());
+}
+
+#[test]
+fn a_busy_peer_is_retried_with_backoff_and_never_dropped() {
+    let mut pair = pair();
+    share(&mut pair.a, "far-work", json!(["infra"]));
+    // The owner's home answers every subscription with the error a write
+    // past its busy timeout gives.
+    pair.a
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER busy BEFORE INSERT ON task_subscriptions
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+        )
+        .unwrap();
+    waiter(&mut pair.b, "waiting-1");
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    for _ in 0..4 {
+        dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    }
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (0, "pending".into()));
+    let (attempts, error): (i64, String) = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT delivery_attempts, delivery_error FROM mail WHERE recipient='apps'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempts, 4);
+    assert!(error.contains("database is locked"), "{error}");
+    assert!(audited(&mut pair.b, "wait.notice_dropped").is_empty());
+    // Backed off as an unreachable peer is, though the link is heard.
+    let (failures, down): (i64, Option<i64>) = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT r.failures, l.down_ms FROM mail_delivery_retry r
+             JOIN wait_links l ON l.peer=r.peer WHERE r.peer='home-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(failures, 4);
+    assert_eq!(down, None);
+    // Once the owner's home can write again, the subscription arrives.
+    pair.a
+        .connection()
+        .execute_batch("DROP TRIGGER busy;")
+        .unwrap();
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (0, "delivered".into()));
+    assert_eq!(rows(&pair.a, "far-work"), 1);
+}
+
+#[test]
+fn a_link_back_resyncs_at_most_once_a_minute_and_stays_owed_one() {
+    let mut pair = subscribed();
+    outage(&mut pair, "ping-0");
+    assert_eq!(audited(&mut pair.b, "wait.resync").len(), 1);
+    // Down and back again at once: no second resync yet, but the link is
+    // still marked as owing one.
+    let (a_home, _) = homes(&pair);
+    link(&mut pair.b, "home-a", &a_home, false);
+    ping(&mut pair.b, "ping-1", "infra", "apps");
+    link(&mut pair.b, "home-a", &a_home, true);
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(audited(&mut pair.b, "wait.resync").len(), 1);
+    let down: Option<i64> = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT down_ms FROM wait_links WHERE peer='home-a'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(down.is_some());
+    // The first hearing after the spacing pays it.
+    later(&pair.b);
+    ping(&mut pair.b, "ping-2", "infra", "apps");
+    assert_eq!(audited(&mut pair.b, "wait.resync").len(), 2);
+}
+
+fn link_state(store: &Store) -> (i64, Option<i64>) {
+    store
+        .connection()
+        .query_row(
+            "SELECT heard_ms, down_ms FROM wait_links WHERE peer='home-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_failed_resync_sends_nothing_half_done_and_stays_owed_until_after_the_spacing() {
+    let mut pair = subscribed();
+    // A second waiting task whose notice cannot be written: the resync fails
+    // on it after it has already resubscribed waiting-1.
+    waiter(&mut pair.b, "zz-late");
+    defer_remote(&mut pair.b, "zz-late", far()).unwrap();
+    exchange(&mut pair);
+    pair.b
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER full BEFORE INSERT ON mail
+             WHEN json_extract(NEW.payload,'$.wait_subscribe.subscriber_task')='zz-late'
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )
+        .unwrap();
+    let subscribes = wait_payloads(&pair.b, "apps", "wait_subscribe").len();
+    outage(&mut pair, "ping-0");
+    let failed = audited(&mut pair.b, "wait.resync_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["peer"], "home-a");
+    assert!(audited(&mut pair.b, "wait.resync").is_empty());
+    assert_eq!(
+        wait_payloads(&pair.b, "apps", "wait_subscribe").len(),
+        subscribes
+    );
+    // The link is heard, and still owed its resync.
+    let (heard, down) = link_state(&pair.b);
+    assert!(heard > 0);
+    assert!(down.is_some());
+    // Not tried again on every delivery inside the spacing.
+    ping(&mut pair.b, "ping-1", "infra", "apps");
+    assert_eq!(audited(&mut pair.b, "wait.resync_failed").len(), 1);
+    // After it, the first hearing pays the resync it still owes.
+    pair.b
+        .connection()
+        .execute_batch("DROP TRIGGER full;")
+        .unwrap();
+    later(&pair.b);
+    ping(&mut pair.b, "ping-2", "infra", "apps");
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(resyncs[0]["resubscribed"], 2);
+    assert_eq!(
+        wait_payloads(&pair.b, "apps", "wait_subscribe").len(),
+        subscribes + 2
+    );
+    assert_eq!(link_state(&pair.b).1, None);
+}
+
+#[test]
+fn a_malformed_schedule_is_skipped_and_audited_and_the_rest_resync() {
+    let mut pair = subscribed();
+    waiter(&mut pair.b, "zz-broken");
+    defer_remote(&mut pair.b, "zz-broken", far()).unwrap();
+    exchange(&mut pair);
+    pair.b
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.revision','x') WHERE task_id='zz-broken'",
+            [],
+        )
+        .unwrap();
+    let subscribes = wait_payloads(&pair.b, "apps", "wait_subscribe").len();
+    outage(&mut pair, "ping-0");
+    assert!(audited(&mut pair.b, "wait.resync_failed").is_empty());
+    let skipped = audited(&mut pair.b, "wait.resync_skipped");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["task"], "zz-broken");
+    assert_eq!(skipped[0]["peer"], "home-a");
+    assert!(
+        skipped[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid task schedule"),
+        "{skipped:?}"
+    );
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(resyncs[0]["resubscribed"], 1);
+    assert_eq!(
+        wait_payloads(&pair.b, "apps", "wait_subscribe").len(),
+        subscribes + 1
+    );
+    assert_eq!(link_state(&pair.b).1, None);
+}
+
+#[test]
+fn a_wait_whose_charter_cannot_be_checked_is_skipped_and_audited_on_resync() {
+    let mut pair = subscribed();
+    // A second waiting task under its own charter, which then cannot be read.
+    let repo = pair._temp.path().canonicalize().unwrap().join("repo");
+    dispatch(
+        &mut pair.b,
+        "charter.put",
+        json!({"id":"other","objective":"Other","repo":repo,"min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.b,
+        "task.create",
+        json!({"id":"zz-other","charter_id":"other","owner":"infra","title":"Waits too"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.b,
+        "task.enqueue",
+        json!({"id":"zz-other","brief":"Continue once the dependency is done."}),
+    )
+    .unwrap();
+    defer_remote(&mut pair.b, "zz-other", far()).unwrap();
+    exchange(&mut pair);
+    pair.b
+        .connection()
+        .execute("UPDATE charters SET data='not json' WHERE id='other'", [])
+        .unwrap();
+    outage(&mut pair, "ping-0");
+    assert!(audited(&mut pair.b, "wait.resync_failed").is_empty());
+    let skipped = audited(&mut pair.b, "wait.resync_skipped");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["task"], "zz-other");
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(resyncs[0]["resubscribed"], 1);
+}
+
+#[test]
+fn two_processes_hearing_a_link_come_back_resync_it_once() {
+    let mut pair = subscribed();
+    let (a_home, b_home) = homes(&pair);
+    link(&mut pair.b, "home-a", &a_home, false);
+    ping(&mut pair.b, "ping-0", "infra", "apps");
+    link(&mut pair.b, "home-a", &a_home, true);
+    // Several deliveries from the owner's home arrive at once, each in its
+    // own process, and each hears the link that was down.
+    let start = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let threads: Vec<_> = (0..6)
+        .map(|n| {
+            let (start, home) = (start.clone(), b_home.clone());
+            std::thread::spawn(move || {
+                let mut store = Store::open(&home).unwrap();
+                start.wait();
+                dispatch(
+                    &mut store,
+                    "mail.deliver",
+                    json!({"id":format!("hello-{n}"),"from":"apps","to":"infra",
+                        "kind":"notice","body":"hello"}),
+                )
+                .unwrap();
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(wait_payloads(&pair.b, "apps", "wait_subscribe").len(), 2);
+}
+
+#[test]
+fn a_resync_that_sends_nothing_is_not_audited() {
+    let mut pair = pair();
+    // The link is known, then down and back, with no wait riding it.
+    ping(&mut pair.b, "ping-0", "infra", "apps");
+    outage(&mut pair, "ping-1");
+    let resynced: Option<i64> = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT resynced_ms FROM wait_links WHERE peer='home-a'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(resynced.is_some(), "the resync ran");
+    assert!(audited(&mut pair.b, "wait.resync").is_empty());
+}
+
+#[test]
+fn a_fault_from_before_fault_counts_still_lets_the_next_fault_wake_the_first_mate() {
+    let mut pair = pair();
+    waiter(&mut pair.b, "waiting-1");
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    exchange(&mut pair);
+    assert_eq!(
+        fault_notices(&pair.b, "waiting-1"),
+        ["scheduling-fault-waiting-1-1"]
+    );
+    // As a schedule faulted under step 2 stored it: no fault count.
+    pair.b
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_remove(record,'$.faults') WHERE task_id='waiting-1'",
+            [],
+        )
+        .unwrap();
+    // The same fault again still sends nothing new.
+    report(
+        &mut pair.b,
+        "closed-again",
+        "apps",
+        json!({"wait_closed":{"task":"far-work","reason":"refused"}}),
+    );
+    pass(&mut pair.b);
+    assert_eq!(fault_notices(&pair.b, "waiting-1").len(), 1);
+    // A different fault in the same revision has its own notice.
+    defer_remote(
+        &mut pair.b,
+        "waiting-1",
+        json!({"ship":"research","task":"other-work"}),
+    )
+    .unwrap();
+    assert_eq!(work(&mut pair.b, "waiting-1")["revision"], 1);
+    exchange(&mut pair);
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "fault");
+    assert_eq!(
+        fault_notices(&pair.b, "waiting-1"),
+        [
+            "scheduling-fault-waiting-1-1",
+            "scheduling-fault-waiting-1-1-2"
+        ]
     );
 }

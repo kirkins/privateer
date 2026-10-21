@@ -20,6 +20,9 @@ const MAX_SHARED: usize = 100;
 const RESYNC_GAP_MS: i64 = 4 * crate::machines::CONTACT_MS;
 /// A link heard again within this long is not recorded again.
 const HEARD_EVERY_MS: i64 = 10_000;
+/// A link resyncs at most this often. One that comes back sooner stays owed
+/// a resync, which runs the first time it is heard after the spacing.
+const RESYNC_EVERY_MS: i64 = 60_000;
 
 pub(crate) fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -411,6 +414,118 @@ pub(crate) fn unshared(store: &Store, task: &str, owner: &str, shared: &Value) -
     Ok(())
 }
 
+/// Ship `ship` of this home is being retired: each subscription on a task it
+/// owns is closed `retired`, as its subscribers' waits can never be answered
+/// now, and `wait_unsubscribe` goes for each live remote wait it holds. Its
+/// waiting tasks need no cancelling: with its charter revoked they no longer
+/// run, and a resync skips them. One transaction; the caller then drains the
+/// outbox before the dispatcher stops.
+pub(crate) fn retire(store: &Store, ship: &str) -> Result<Value> {
+    let tx = store.write_transaction()?;
+    let mut statement = store.connection().prepare(
+        "SELECT DISTINCT ts.task_id FROM task_subscriptions ts JOIN tasks t ON t.id=ts.task_id
+         WHERE t.owner=?1 ORDER BY ts.task_id",
+    )?;
+    let tasks = statement
+        .query_map([ship], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut closed = 0;
+    for task in &tasks {
+        let told = close(
+            store,
+            task,
+            ship,
+            |_| true,
+            &json!({"task": task, "reason": "retired"}),
+        )?;
+        closed += told.len();
+    }
+    let unsubscribed = crate::scheduling::unsubscribe_all(store, ship)?;
+    let outcome = json!({"ship": ship, "tasks": tasks, "closed": closed,
+        "unsubscribed": unsubscribed});
+    if closed > 0 || unsubscribed > 0 {
+        store.audit("wait.retired", &outcome)?;
+    }
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// How many times a peer may refuse one wait notice before it is dropped.
+pub(crate) const REFUSALS: i64 = 3;
+
+/// Whether a peer's refusal says only that it could not work just then: its
+/// database busy or locked past the busy timeout, a home or the fleet
+/// registry it could not open, a hop beyond it it could not reach. The rpc
+/// loop and a machine gateway answer every error as a refusal, so these are
+/// told apart by their text, and retried as an unreachable peer is.
+pub(crate) fn temporary(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "database is locked",
+        "database table is locked",
+        "busy",
+        "unable to open database",
+        "disk i/o error",
+        // Opening a home or the registry: permissions, space, a missing file.
+        "os error",
+        "privateer home",
+        "existing ship home",
+        "fleet registry",
+        "peer transport",
+        "peer call timed out",
+    ]
+    .iter()
+    .any(|text| reason.contains(text))
+}
+
+/// A peer refused the wait notice `message` this home sent, for a reason
+/// `temporary` does not cover. It is retried with the usual backoff, and on
+/// its `REFUSALS`th refusal dropped rather than left pending, where it would
+/// hold back every later message to that peer and be refused again. A
+/// dropped `task_end` or `wait_closed` takes the subscription it answered
+/// with it; until then the row stays. Runs in the caller's transaction;
+/// returns whether the notice was dropped now.
+pub(crate) fn refused(store: &Store, message: &Value, reason: &str) -> Result<bool> {
+    let id = message["id"].as_str().context("message id")?;
+    let reason: String = reason.chars().take(4096).collect();
+    let refusals: Option<i64> = store
+        .connection()
+        .query_row(
+            "UPDATE mail SET delivery_refusals=delivery_refusals+1
+             WHERE id=?1 AND delivery='pending' RETURNING delivery_refusals",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(refusals) = refusals.filter(|n| *n >= REFUSALS) else {
+        return Ok(false);
+    };
+    store.connection().execute(
+        "UPDATE mail SET delivery='dropped', delivery_error=?2 WHERE id=?1 AND delivery='pending'",
+        params![id, reason],
+    )?;
+    let key = crate::mail::wait_notice(&message["payload"]).context("not a wait notice")?;
+    let body = &message["payload"][key];
+    let task = body["task"].as_str();
+    let mut rows = 0;
+    if matches!(key, "task_end" | "wait_closed")
+        && let (Some(task), Some(subscriber)) = (task, message["to"].as_str())
+    {
+        // The generation the notice answered, and only that one.
+        rows = store.connection().execute(
+            "DELETE FROM task_subscriptions WHERE task_id=?1 AND subscriber=?2 AND nonce IS ?3",
+            params![task, subscriber, body["nonce"].as_str()],
+        )?;
+    }
+    store.audit(
+        "wait.notice_dropped",
+        &json!({"id": id, "notice": key, "from": message["from"], "to": message["to"],
+            "task": task, "reason": reason, "refusals": refusals, "rows": rows}),
+    )?;
+    Ok(true)
+}
+
 /// When `peer` was last heard from, if this home has recorded it. Read-only;
 /// a home from before link tracking has heard nothing.
 pub(crate) fn last_heard(store: &Store, peer: &str) -> Result<Option<i64>> {
@@ -462,42 +577,106 @@ pub(crate) fn link_back(store: &Store, peer: &str) -> Result<Option<Value>> {
 
 fn link(store: &Store, peer: &str, back: bool) -> Result<Option<Value>> {
     let now = Store::now_ms();
-    let row: Option<(i64, Option<i64>)> = store
-        .connection()
-        .query_row(
-            "SELECT heard_ms, down_ms FROM wait_links WHERE peer=?1",
-            [peer],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
+    type Row = (i64, Option<i64>, Option<i64>);
+    let read = |conn: &rusqlite::Connection| -> Result<Option<Row>> {
+        Ok(conn
+            .query_row(
+                "SELECT heard_ms, down_ms, resynced_ms FROM wait_links WHERE peer=?1",
+                [peer],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    };
+    // A steady link heard moments ago needs no write lock.
+    if !back
+        && matches!(read(store.connection())?, Some((heard, None, _)) if now - heard < HEARD_EVERY_MS)
+    {
+        return Ok(None);
+    }
+    // Decide under the write lock, so two processes hearing the same link
+    // come back do not both resync it.
+    let tx = store.write_transaction()?;
+    let row = read(&tx)?;
     let collected =
         || -> Result<bool> { Ok(crate::peers::collected(store)?.iter().any(|p| p == peer)) };
     let back = back
         || match row {
             None => false,
-            Some((_, Some(_))) => true,
-            Some((heard, None)) => now - heard > RESYNC_GAP_MS && collected()?,
+            Some((_, Some(_), _)) => true,
+            Some((heard, None, _)) => now - heard > RESYNC_GAP_MS && collected()?,
         };
-    if !back && row.is_some_and(|(heard, _)| now - heard < HEARD_EVERY_MS) {
-        return Ok(None);
-    }
-    let tx = store.write_transaction()?;
-    tx.execute(
-        "INSERT INTO wait_links(peer, heard_ms) VALUES(?1, ?2)
-         ON CONFLICT(peer) DO UPDATE SET heard_ms=excluded.heard_ms, down_ms=NULL",
-        params![peer, now],
-    )?;
-    let resync = if back {
+    let recent = row.is_some_and(|(heard, ..)| now - heard < HEARD_EVERY_MS);
+    if !back {
+        if recent {
+            return Ok(None);
+        }
         tx.execute(
-            "UPDATE wait_links SET resynced_ms=?2 WHERE peer=?1",
+            "INSERT INTO wait_links(peer, heard_ms) VALUES(?1, ?2)
+             ON CONFLICT(peer) DO UPDATE SET heard_ms=excluded.heard_ms",
             params![peer, now],
         )?;
-        Some(resync(store, peer)?)
-    } else {
-        None
+        tx.commit()?;
+        return Ok(None);
+    }
+    if row
+        .and_then(|(_, _, resynced)| resynced)
+        .is_some_and(|at| now - at < RESYNC_EVERY_MS)
+    {
+        // Too soon after the last resync: the link stays owed one, even when
+        // it was heard moments ago and was not marked down (a machine link
+        // contacted again after failing).
+        let owed = row.is_some_and(|(_, down, _)| down.is_some());
+        if !recent || !owed {
+            tx.execute(
+                "UPDATE wait_links SET heard_ms=?2, down_ms=COALESCE(down_ms, ?2) WHERE peer=?1",
+                params![peer, now],
+            )?;
+            tx.commit()?;
+        }
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO wait_links(peer, heard_ms, resynced_ms) VALUES(?1, ?2, ?2)
+         ON CONFLICT(peer) DO UPDATE SET heard_ms=excluded.heard_ms, down_ms=NULL,
+           resynced_ms=excluded.resynced_ms",
+        params![peer, now],
+    )?;
+    // A resync that fails leaves nothing half sent. The link is heard, and
+    // still owed its resync, which is tried again after the spacing rather
+    // than on every delivery.
+    tx.execute_batch("SAVEPOINT resync")?;
+    let outcome = match resync(store, peer) {
+        Ok(outcome) => {
+            tx.execute_batch("RELEASE resync")?;
+            outcome
+        }
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO resync; RELEASE resync")?;
+            tx.execute(
+                "UPDATE wait_links SET down_ms=?2 WHERE peer=?1",
+                params![peer, row.and_then(|(_, down, _)| down).unwrap_or(now)],
+            )?;
+            let error = format!("{error:#}");
+            eprintln!("privateer: resync of link {peer} failed: {error}");
+            let failed = json!({"peer": peer, "error": error});
+            store.audit("wait.resync_failed", &failed)?;
+            failed
+        }
     };
     tx.commit()?;
-    Ok(resync)
+    Ok(Some(outcome))
+}
+
+/// A row a resync of `peer` could not read is skipped and audited, so one
+/// bad schedule or task does not hold back every other wait on the link.
+pub(crate) fn skipped(store: &Store, peer: &str, task: &str, error: &anyhow::Error) -> Result<()> {
+    let error = format!("{error:#}");
+    eprintln!("privateer: resync of link {peer} skipped {task}: {error}");
+    store.audit(
+        "wait.resync_skipped",
+        &json!({"peer": peer, "task": task, "error": error}),
+    )?;
+    Ok(())
 }
 
 /// Resync the waits that ride `peer`, in the caller's transaction. The
@@ -528,8 +707,19 @@ pub(crate) fn resync(store: &Store, peer: &str) -> Result<Value> {
     drop(statement);
     let mut answered = 0;
     for (task, subscriber, subscriber_task, nonce) in rows {
-        let record = store.task(&task)?;
-        let owner = record["owner"].as_str().context("task owner missing")?;
+        // A task that cannot be read is skipped, not the whole resync.
+        let read = store.task(&task).and_then(|record| {
+            let owner = record["owner"].as_str().context("task owner missing")?;
+            Ok((owner.to_owned(), record))
+        });
+        let (owner, record) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                skipped(store, peer, &task, &error)?;
+                continue;
+            }
+        };
+        let owner = owner.as_str();
         let ended = record["status"]
             .as_str()
             .filter(|s| matches!(*s, "done" | "cancelled"));
@@ -552,6 +742,82 @@ pub(crate) fn resync(store: &Store, peer: &str) -> Result<Value> {
         answered += 1;
     }
     let outcome = json!({"peer": peer, "resubscribed": resubscribed, "answered": answered});
-    store.audit("wait.resync", &outcome)?;
+    if resubscribed > 0 || answered > 0 {
+        store.audit("wait.resync", &outcome)?;
+    }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_back_heard_moments_ago_and_inside_the_spacing_stays_owed_its_resync() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap().join("home");
+        let mut store = Store::open(&home).unwrap();
+        crate::dispatch(
+            &mut store,
+            "peer.put",
+            json!({"name":"machine-studio","transport":"collected"}),
+        )
+        .unwrap();
+        init(&store).unwrap();
+        let down = |store: &Store| -> Option<i64> {
+            store
+                .connection()
+                .query_row(
+                    "SELECT down_ms FROM wait_links WHERE peer='machine-studio'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // The machine is contacted again after failing: a resync runs.
+        assert!(link_back(&store, "machine-studio").unwrap().is_some());
+        assert_eq!(down(&store), None);
+        // Failing and contacted again at once, inside both the hearing window
+        // and the resync spacing: no resync yet, but one is owed.
+        assert!(link_back(&store, "machine-studio").unwrap().is_none());
+        assert!(down(&store).is_some());
+        // Inside the spacing it stays owed, and is paid after it.
+        assert!(heard(&store, "machine-studio").unwrap().is_none());
+        assert!(down(&store).is_some());
+        store
+            .connection()
+            .execute(
+                "UPDATE wait_links SET resynced_ms=resynced_ms-?1",
+                [RESYNC_EVERY_MS + 1],
+            )
+            .unwrap();
+        assert!(heard(&store, "machine-studio").unwrap().is_some());
+        assert_eq!(down(&store), None);
+    }
+
+    #[test]
+    fn only_errors_that_say_the_peer_could_not_work_just_then_are_temporary() {
+        for reason in [
+            "database is locked",
+            "Database is locked: busy",
+            "database table is locked",
+            "unable to open database file: /x/privateer.sqlite",
+            "create Privateer home: Permission denied (os error 13)",
+            "No such file or directory (os error 2)",
+            "agents require an existing ship home",
+            "fleet registry directory",
+            "peer transport exited with exit status: 255: ssh: connect refused",
+            "peer call timed out after 30000 milliseconds",
+        ] {
+            assert!(temporary(reason), "{reason}");
+        }
+        for reason in [
+            "no ship named apps on this machine",
+            "unknown ship apps",
+            "wait notice is malformed",
+            "peer refused delivery",
+        ] {
+            assert!(!temporary(reason), "{reason}");
+        }
+    }
 }
