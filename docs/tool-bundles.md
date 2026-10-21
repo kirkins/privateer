@@ -7,10 +7,11 @@ install packages, edit native configuration, replace `HOME`/the agent directory,
 search credential stores, or infer which personal extensions are required.
 
 The first stage supports named/versioned **local skills and their supporting
-scripts/files**. Remote streamable-HTTP MCP servers load for Pi and Claude runs that
-select them, see [Selected MCP servers](#selected-mcp-servers-pi-and-claude-http). stdio MCP servers
-and optional executable tool extensions are deferred: definitions containing
-those fields fail validation, rather than silently dropping them. The separate
+scripts/files**. Remote streamable-HTTP MCP servers and pinned local stdio MCP
+servers load for Pi and Claude runs that select them, see
+[Selected MCP servers](#selected-mcp-servers-pi-and-claude). Optional executable
+tool extensions are deferred: definitions containing those fields fail
+validation, rather than silently dropping them. The separate
 [stage-two offline MCP factory qualification](pi-mcp-stage2-qualification.md)
 holds the Pi factory fixtures and limits. A bundle
 may name [credentials](#credentials) its scripts need; a launch gets the path of
@@ -265,7 +266,7 @@ integrations cannot load into Claude, so a Claude plan needs `extensions:[]`.
 Dropping the user setting source drops personal hooks, skills and plugins;
 `--strict-mcp-config` drops personal and claude.ai MCP connectors, and only the
 run's selected servers load, through Privateer's own `--mcp-config` (see
-[Selected MCP servers](#selected-mcp-servers-pi-and-claude-http)). The working folder's `.claude` settings (Privateer's own hooks and
+[Selected MCP servers](#selected-mcp-servers-pi-and-claude)). The working folder's `.claude` settings (Privateer's own hooks and
 permissions), its project instructions and its own `.claude/skills` still
 load. Each selected skill root is passed straight to `--plugin-dir`, where
 Claude loads it as `<name>:<name>`. Claude's built-in skills and plugins load in
@@ -317,23 +318,59 @@ This is exposure hygiene, not credential isolation; whether a personal
 `~/.claude/CLAUDE.md` or auto-memory follows the setting sources is not yet
 qualified.
 
-## Selected MCP servers (Pi and Claude, HTTP)
+## Selected MCP servers (Pi and Claude)
 
-A bundle may hold `mcp_servers`, at most four, each with exactly `name` (a lowercase
-slug, at most 32 characters), `url`, `credential` (a name the same bundle declares
-under `credentials`), `timeout` (an integer from 1 to 300) and an optional
-`description` (printable, at most 200 characters). The URL is `https`, or `http`
-only to `127.0.0.1`, `[::1]` or `localhost`, with no userinfo, fragment, backslash
-or whitespace. The host is letters, digits, dots and hyphens or a bracketed IPv6
-literal, and any port must parse. A plan
-holds at most eight servers, unique after lower-casing and `-` to `_`. A bundle
-needs a skill or a server. Any other key (`headers`, `command`, `env`, `oauth`,
-`exposure`...) refuses, as does any string holding `$`, a leading `!` or a control
-character.
+A bundle may hold `mcp_servers`, at most four. Each is either a remote
+streamable-HTTP server (`url`) or a local stdio server (`command`), never both.
+
+An HTTP server has exactly `name` (a lowercase slug, at most 32 characters),
+`url`, `credential` (a name the same bundle declares under `credentials`),
+`timeout` (an integer from 1 to 300) and an optional `description` (printable, at
+most 200 characters). The URL is `https`, or `http` only to `127.0.0.1`, `[::1]`
+or `localhost`, with no userinfo, fragment, backslash or whitespace. The host is
+letters, digits, dots and hyphens or a bracketed IPv6 literal, and any port must
+parse.
+
+A stdio server has `name`, `command`, `sha256` and `timeout`, and optionally
+`credential` and `description`:
+
+```json
+{"name": "xcode", "command": ["/usr/bin/xcrun", "mcpbridge"],
+ "sha256": "<sha256 of /usr/bin/xcrun>", "timeout": 30}
+```
+
+- `command` is an argv array of 1 to 32 strings. Each is at most 4096 characters
+  and holds no `$`, leading `!`, leading `~` or control character: Pi expands `$`
+  and a leading `~/`.
+- Element 0 is the executable: an absolute, normalized path. Its file must be a
+  regular file its owner may execute, and its contents must match `sha256`.
+  Every component from `/` down must be owned by root or this user, must not be
+  a symlink and must not be group- or world-writable. Root-owned
+  `/usr/bin/xcrun` qualifies; a temporary directory never does, because `/tmp`
+  is world-writable.
+- Shells and `env` refuse by basename (`sh`, `bash`, `zsh`, `dash`, `fish`,
+  `ksh`, `mksh`, `csh`, `tcsh`, `ash`, `busybox`, `env`), since either runs
+  whatever its arguments say.
+- The pin covers the executable only, not what it loads. An interpreter
+  (`python3 server.py`) or a trampoline (`xcrun`) runs files the pin does not
+  name.
+- There are no `env`, `cwd`, `shell`, `args`, `type` or `headers` keys.
+- `credential` is optional. When given, the server receives that credential's
+  file path, never its value.
+
+The pin is checked when the registry is configured, when a run is planned, at
+each launch's preflight, and again by the launcher just before exec (Pi's gate
+also re-hashes it as it loads). A drifted executable refuses
+(`mcp_servers.sha256`) before any probe or model turn.
+
+A plan holds at most eight servers of either kind, unique after lower-casing and
+`-` to `_`. A bundle needs a skill or a server. Any other key (`headers`, `env`,
+`oauth`, `exposure`...) refuses, as does any string holding `$`, a leading `!` or
+a control character.
 
 Only a run that selects the bundle loads its servers. For Pi, the launcher sets
-`PRIVATEER_MCP_SERVERS` to the selected records (names, URLs, credential names,
-timeouts, descriptions; no paths or values) and adds Privateer's
+`PRIVATEER_MCP_SERVERS` to the selected records (names, URLs or pinned commands,
+credential names, timeouts, descriptions; no credential paths or values) and adds Privateer's
 `plugins/pi-mcp/selected.ts` gate. Each Bearer token is read from its
 captain-stored credential file inside the Pi process, and is sent only as an
 `Authorization` header to that server, with `exposure: direct`. The gate passes
@@ -342,7 +379,8 @@ refuses, before any model turn, when another extension registered a server, a
 token file is missing or malformed, a server is refused (401) or lists no tools
 within `min(30, timeout)` seconds. A refusal exits 78 with one line naming only
 the server. Plans without servers are unchanged, and a run gets no MCP tool unless
-it selects one.
+it selects one. A stdio server gets the same gate; its entry is the launcher
+below, and its readiness is the same tools check.
 
 A bounded Claude run gets the same records in `PRIVATEER_MCP_SERVERS` and one
 `--mcp-config=<file>` beside `--strict-mcp-config`, so no other server loads. The file
@@ -364,10 +402,74 @@ get the pre-launch token check but no connection check; Claude's `/mcp` shows ea
 server's state there. The record's `timeout` and `description` are not mapped into
 Claude's config.
 
+### How a stdio server starts, and what it receives
+
+Neither harness runs a stdio server's command directly. Both run Privateer's
+launcher, `plugins/mcp_stdio.py`:
+
+- The launcher is the runtime's own copy, beside the bundle loader; a bundle
+  cannot name another.
+- It runs under the runtime's own interpreter by absolute path, with `-I`. That
+  path is `/proc/self/exe` on Linux, or `sys.executable` resolved elsewhere, and
+  must be named `python*`. It is never a PATH lookup, which could find a mise
+  shim.
+- Its one argument is a runtime-written spec: the pinned command, its `sha256`,
+  and the server's credential name and file path if it has one. It never reads
+  the record from its environment.
+- It re-pins the executable, then `execve`s it in place: the same pid and
+  process group, with no fork or `setsid`.
+- On any drift or unexpected spec it exits 78 with one fixed line and starts
+  nothing.
+
+For Claude, the `--mcp-config` entry is
+`{"type":"stdio","command":"<interpreter>","args":["-I","<plugins>/mcp_stdio.py","<spec>"],"env":{}}`.
+No header helper runs for a stdio server. A credential path Claude would expand
+(holding `$`) refuses (`mcp_servers.credential`). For Pi, the launcher sets
+`PRIVATEER_MCP_PYTHON` to the same interpreter, and the gate builds the
+equivalent entry (`command`, `args`, an empty `env`, the record's `timeout`,
+`exposure: direct`).
+
+Both harnesses give a stdio server their whole environment, measured with
+Claude Code 2.1.300 and Pi 1.3.0. That includes `ANTHROPIC_API_KEY` and
+`ANTHROPIC_BASE_URL` when they are set, Claude's `CLAUDE_CODE_MESSAGING_SOCKET`,
+`CLAUDE_CODE_MESSAGING_TOKEN` and `CLAUDE_CODE_SESSION_ID`, `PI_CODING_AGENT_DIR`,
+`PRIVATEER_MCP_SERVERS`, `PRIVATEER_FLEET`, every selected credential's
+`_FILE` path, and anything else in the harness environment. **None of that
+reaches the server.** The launcher replaces it with exactly:
+
+- `PATH=/usr/bin:/bin`;
+- `HOME`, `LANG`, `TMPDIR` and any `LC_*`, when the harness has them;
+- `PRIVATEER_CREDENTIAL_<NAME>_FILE` for the server's own credential, if it
+  names one.
+
+Nothing else is passed, including `DEVELOPER_DIR` (`xcrun` falls back to
+`xcode-select`) and `PYTHONPATH`. The native probes assert this exact set under
+both harnesses, and `tests/pi_bundles.py` asserts it for the launcher alone. The
+server's working directory is the harness's.
+
+A server's processes end with the run's job. The harness spawns the launcher,
+the launcher execs the server, and the server stays in the process group the
+harness gave it, inside the job's session. A SIGTERM-ignoring grandchild
+outlives the harness itself:
+
+- Claude exits normally and leaves its group running.
+- Pi 1.3.0's `--print` exit leaves it too.
+
+Until the job ends, that grandchild keeps running. A crew job is started with
+`cleanup_descendants`. When its leader exits, the job signals its process group,
+and every recorded descendant that left the group, with SIGTERM and then SIGKILL
+after 2 s. `tests/tool_bundles.rs` proves this for a grandchild in the server's
+group and for one in a session of its own. The job records descendants that left
+its group by sampling every 500 ms. A process that leaves the group, and whose
+parent exits, between two samples is not found.
+
 Limits: the token sits in the Pi process's memory; a same-user agent can still
-read the credential file; URLs are not content-pinned; stdio servers are not
-supported yet. A token that goes bad after launch (the file changed mid-run) makes
-Claude reconnect without the header; a hosted session has no connection check.
+read the credential file; URLs are not content-pinned. A token that goes bad
+after launch (the file changed mid-run) makes Claude reconnect without the
+header; a hosted session has no connection check. A stdio pin covers the
+executable, not what it loads. Between the launcher's re-pin and its `execve`,
+the path can still be swapped, but only by root or this user, who own every
+component.
 
 - The agent can read its own credential file; this is an accepted limit.
 - Redirects are followed, but `Authorization` is dropped on a cross-origin redirect.
@@ -389,6 +491,24 @@ python3 tests/pi_offline_netns.py -- python3 tests/pi_bundles_native.py /absolut
 python3 tests/claude_bundles.py
 python3 tests/claude_bundles_native.py /absolute/installed/native/claude
 ```
+
+The stdio cases: the deterministic suites cover every refusal (shells and `env`,
+relative or unnormalized paths, symlinks, writable ancestors, non-executable
+files, pin drift at selection, preflight and the launcher, `$`/`!`/`~` and
+control characters, `env`/`cwd`/`shell` keys, `url` beside `command`), the
+Claude and Pi entries, and the launcher's environment and in-place exec. Each
+native probe's `test_selected_stdio_server_env_ambient_and_lifetime` runs a
+pinned stdio fake (`tests/fixtures/pi-mcp/server.py`) through the real launcher
+and harness. It asserts:
+
+- the server connects with tools (the Pi gate passes; Claude's init reports it
+  `connected` and `claude_turn.py`'s check passes);
+- seeded ambient stdio servers never start: user and project Claude config,
+  `.mcp.json`, and Pi's agent and project `mcp.json`;
+- the exact environment above reaches the server.
+
+The probe also reports which of the fake's processes outlive the harness,
+before killing them; it runs outside a job.
 
 The Claude suites run in a temporary HOME, `CLAUDE_CONFIG_DIR` and XDG. The
 deterministic one uses a fake `claude` for argv plans and each refusal; the
