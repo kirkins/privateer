@@ -1253,13 +1253,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         // when `continuation` is Some) may refresh in place when they change.
         let approved = crate::captain_approvals::launch_set(&store, &ship, Store::now_ms())?;
         let first = if hosted {
-            crate::host::upgrade::record_approvals(
-                &store,
-                &ship,
-                &approved,
-                continuation.is_some(),
-            )
-            .unwrap_or_default()
+            crate::host::upgrade::record_approvals(&store, &ship, &approved, continuation.is_some())
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -1403,12 +1398,12 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     })
                 },
             ) {
-                    Ok(child) => child,
-                    Err(error) => {
-                        let _ = crate::presence::leave(&store, &ship, &holder);
-                        return Err(error);
-                    }
-                };
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = crate::presence::leave(&store, &ship, &holder);
+                    return Err(error);
+                }
+            };
             if hosted {
                 // A failure to record readiness leaves the conservative reserved retry
                 // in place; never abandon an already spawned native process over it.

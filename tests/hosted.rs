@@ -4185,7 +4185,11 @@ fn approval_refreshed(place: &Place, native: i32, holder: &str) -> i32 {
         pid.is_some_and(|pid| pid != native)
             && env.trim().split_once(' ').is_some_and(|(_, h)| h != holder)
     });
-    assert_eq!(unsafe { libc::kill(native, 0) }, -1, "the old harness runs on");
+    assert_eq!(
+        unsafe { libc::kill(native, 0) },
+        -1,
+        "the old harness runs on"
+    );
     place.native_pid()
 }
 
@@ -4306,7 +4310,11 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
     fs::rename(&aside, &transcript).unwrap();
     approval_idle(&place, 20);
     let second = approval_refreshed(&place, native, &holder);
-    assert_eq!(approval_wrapper(&place), wrapper, "the pane itself restarted");
+    assert_eq!(
+        approval_wrapper(&place),
+        wrapper,
+        "the pane itself restarted"
+    );
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
     assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
@@ -4321,7 +4329,10 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
         vec![json!({"ship":"infra","added":[id],"removed":[]})]
     );
     let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
-    assert_eq!(bearings["hosted_pane"]["approvals_changed"], false, "{bearings}");
+    assert_eq!(
+        bearings["hosted_pane"]["approvals_changed"], false,
+        "{bearings}"
+    );
     assert!(
         bearings["hosted_pane"]["approvals_refreshed_ms"].is_i64(),
         "{bearings}"
@@ -4375,8 +4386,7 @@ fn a_hosted_pi_pane_never_refreshes_for_an_approval() {
     let approval = approval_granted(&place, "q-7", "Deploy build 7 to staging");
     assert_eq!(approval["applies"], "next_launch", "{approval}");
     assert_eq!(
-        approval["note"],
-        "recorded; applies at your next launch.",
+        approval["note"], "recorded; applies at your next launch.",
         "{approval}"
     );
     let flag: Option<i64> = place
@@ -4392,7 +4402,10 @@ fn a_hosted_pi_pane_never_refreshes_for_an_approval() {
     approval_stays_put(&place, native, "a Pi session");
     assert!(approval_refreshes(&place).is_empty());
     let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
-    assert_eq!(bearings["hosted_pane"]["approvals_changed"], true, "{bearings}");
+    assert_eq!(
+        bearings["hosted_pane"]["approvals_changed"], true,
+        "{bearings}"
+    );
     place.stop_native("infra");
 }
 
