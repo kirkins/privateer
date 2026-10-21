@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Authless stdio MCP fake. JSONL markers contain no environment/credential
-values: the start marker lists the environment's names only.
+values: the start marker lists the environment's names only, and PATH.
 
 Modes: normal, disconnected, hang-init; stubborn starts a grandchild that
 ignores SIGTERM in this process group, escaped one that also leaves it
@@ -45,21 +45,28 @@ def response(request, identity):
     raise ValueError('unsupported fixture method')
 
 
+def started(pid):
+    """A process's start time on Linux, which names it across pid reuse; None
+    where there is no /proc (macOS)."""
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+    except FileNotFoundError:
+        return None
+    return stat[stat.rindex(')') + 2:].split()[19]
+
+
 def main():
     marker, identity, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
     def record(event, **fields):
         with marker.open('a') as stream:
             stream.write(json.dumps({'event': event, **fields}) + '\n')
-    record('start', pid=os.getpid(), pgid=os.getpgrp(),
-           start=Path('/proc/self/stat').read_text().split()[21], env=sorted(os.environ))
+    record('start', pid=os.getpid(), pgid=os.getpgrp(), start=started(os.getpid()), env=sorted(os.environ),
+           path=os.environ.get('PATH'))
     if mode in ('stubborn', 'escaped'):
         child = subprocess.Popen([sys.executable, '-I', '-c', STUBBORN], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=mode == 'escaped')
-        # Its start time, once the kernel has it, names this process and no reuse.
-        stat = Path(f'/proc/{child.pid}/stat').read_text()
-        record('child', pid=child.pid, pgid=os.getpgid(child.pid),
-               start=stat[stat.rindex(')') + 2:].split()[19])
+        record('child', pid=child.pid, pgid=os.getpgid(child.pid), start=started(child.pid))
     def stop(_sig, _frame):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
@@ -88,13 +95,10 @@ def main():
 
 
 def alive(event):
-    """True while the recorded process runs: same pid and start time, not a zombie."""
-    try:
-        stat = Path(f"/proc/{event['pid']}/stat").read_text()
-    except FileNotFoundError:
-        return False
-    fields = stat[stat.rindex(')') + 2:].split()
-    return fields[0] != 'Z' and fields[19] == event['start']
+    """True while the recorded process runs and is not a zombie: the same
+    start time too, where /proc records one."""
+    state = subprocess.run(['ps', '-p', str(event['pid']), '-o', 'stat='], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith('Z') and started(event['pid']) == event['start']
 
 
 def outliving(events, grace=3):

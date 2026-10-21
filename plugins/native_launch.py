@@ -44,10 +44,16 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         # Paths only, never values: the plan and argv carry names and refs.
         secrets = credential_environment(bundles, env)
         if bundles.get("mcp_servers"):
-            # Records only (names, URLs, credential names, limits): the token
-            # is read from its file inside the harness, never passed here.
+            # Records only (names, URLs or pinned commands, credential names,
+            # limits): a token is read from its file inside the harness, and a
+            # stdio server gets only its file's path, never a value.
             # Pi's gate and the headless Claude check both read them.
             env["PRIVATEER_MCP_SERVERS"] = json.dumps(bundles["mcp_servers"], separators=(",", ":"), sort_keys=True)
+            if harness == "pi" and any("command" in server for server in bundles["mcp_servers"]):
+                # Pi's gate runs each stdio server through Privateer's launcher
+                # with this interpreter, by absolute path: never a PATH lookup.
+                from bundles import interpreter
+                env["PRIVATEER_MCP_PYTHON"] = interpreter()
     if bundles is not None and harness == "claude":
         from claude_bundles import check_headers, preflight
         check_headers(bundles.get("mcp_servers", []), {**env, **secrets})

@@ -19,8 +19,8 @@ import hashlib
 import stat
 import subprocess
 
-from bundles import (SEMVER, at, credential_directory, credential_environment, file_bytes, plain, present,
-                     require, require_flags, safe_path, validate_plan)
+from bundles import (SEMVER, at, credential_directory, credential_environment, file_bytes, present, require,
+                     require_flags, safe_path, stdio_argv, validate_plan)
 
 # Keep the project's .claude settings (Privateer's hooks and permissions) and
 # drop the user source; no MCP servers unless --mcp-config names them.
@@ -210,17 +210,14 @@ def config_directory(env):
 
 def mcp_entry(server, helper, paths):
     """One server's Claude config. HTTP: its header comes from HEADERS reading
-    its credential file. stdio: the pinned argv, and in env only its own
-    credential's file path, never a value."""
+    its credential file. stdio: Privateer's launcher, which re-pins the
+    command and runs it with a minimal environment, never Claude's own."""
     if "url" in server:
         return {"type": "http", "url": server["url"], "headersHelper": f"{helper} {server['credential']}"}
-    env = {}
-    if "credential" in server:
-        name = f"PRIVATEER_CREDENTIAL_{server['credential']}_FILE"
-        # Claude expands ${VAR} in a config's env values.
-        at("mcp_servers.credential", lambda: require(name in paths and plain(paths[name])))
-        env[name] = paths[name]
-    return {"type": "stdio", "command": server["command"][0], "args": server["command"][1:], "env": env}
+    file = paths.get(f"PRIVATEER_CREDENTIAL_{server['credential']}_FILE") if "credential" in server else None
+    # Claude expands ${VAR} in a config's command and args.
+    argv = at("mcp_servers.credential", lambda: stdio_argv(server, file))
+    return {"type": "stdio", "command": argv[0], "args": argv[1:], "env": {}}
 
 
 def mcp_config(servers, env, plan=None):

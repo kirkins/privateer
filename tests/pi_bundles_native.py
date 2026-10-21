@@ -409,7 +409,8 @@ class Native(unittest.TestCase):
                                                                  'selected', 'stubborn'],
                                                      'sha256': hashlib.sha256(Path(python).read_bytes()).hexdigest()}]})
         plan = bundles.plan(registry, ['stdio@1'], 'crew')
-        env = dict(self.env, PRIVATEER_FLEET=str(fleet), PRIVATEER_PROBE_AMBIENT='1')
+        env = dict(self.env, PRIVATEER_FLEET=str(fleet), PRIVATEER_PROBE_AMBIENT='1', LANG='C.UTF-8',
+                   TMPDIR=str(self.base))
         args = [sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(plan),
                 'pi', 'pi', '--offline', '--no-session', '--model', 'spike/m', '--print', '--', 'hello']
         run = subprocess.run(args, cwd=self.repo, env=env, text=True, capture_output=True, stdin=subprocess.DEVNULL,
@@ -424,7 +425,9 @@ class Native(unittest.TestCase):
             self.assertFalse((directory / 'mcp-connected').exists())
         self.assertFalse(ambient.exists())
         names = starts[0]['env']
-        self.assertIn('PRIVATEER_CREDENTIAL_STDIO_TOKEN_FILE', names)
+        # Privateer's launcher passes exactly these, not the harness's environment.
+        self.assertEqual(names, ['HOME', 'LANG', 'PATH', 'PRIVATEER_CREDENTIAL_STDIO_TOKEN_FILE', 'TMPDIR'])
+        self.assertEqual(starts[0]['path'], '/usr/bin:/bin')
         self.assertNotIn(SENTINEL_TOKEN, marker.read_text() + run.stdout + run.stderr)
         print(json.dumps({'case': 'selected-stdio', 'native_pi': self.version, 'exit': run.returncode,
                           'starts': len(starts), 'env_names': names,

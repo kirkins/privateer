@@ -4,6 +4,7 @@
 // token file is read here, never passed through argv, env values, logs or errors.
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 export const EXIT_UNAVAILABLE = 78;
 const READY_SECONDS = 30;
@@ -99,15 +100,27 @@ export function serverEntry(record, token) {
   return { name: record.name, config, source: "privateer-selected", scope: "extension" };
 }
 
-/** The config for one selected stdio server: its pinned argv and, in env, only
- *  its own credential's file path. No cwd, and nothing Pi would expand. */
-export function stdioEntry(record, credentialFile) {
-  const env = {};
+/** Privateer's stdio launcher (plugins/mcp_stdio.py): the runtime's own copy, never a bundle's path. */
+export const LAUNCHER = fileURLToPath(new URL("../mcp_stdio.py", import.meta.url));
+
+/** The interpreter the launcher set for the launcher: absolute, never a PATH lookup. */
+export function interpreter(env) {
+  const path = env.PRIVATEER_MCP_PYTHON;
+  if (typeof path !== "string" || !path.startsWith("/") || !plain(path) || !/^python/.test(path.split("/").at(-1))) throw new Error("interpreter");
+  return path;
+}
+
+/** The config for one selected stdio server: Privateer's launcher, given the
+ *  pinned argv and only its own credential's file path. The launcher re-pins
+ *  the command and runs it with a minimal environment, not Pi's own; the
+ *  config's env stays empty, with no cwd and nothing Pi would expand. */
+export function stdioEntry(record, credentialFile, python) {
+  const spec = { command: record.command, sha256: record.sha256 };
   if ("credential" in record) {
     if (typeof credentialFile !== "string" || !credentialFile.startsWith("/") || !plain(credentialFile)) throw new Error("credential");
-    env[`PRIVATEER_CREDENTIAL_${record.credential}_FILE`] = credentialFile;
+    spec.credential = { file: credentialFile, name: record.credential };
   }
-  const config = { command: record.command[0], args: record.command.slice(1), env, timeout: record.timeout, exposure: "direct" };
+  const config = { command: python, args: ["-I", LAUNCHER, JSON.stringify(spec)], env: {}, timeout: record.timeout, exposure: "direct" };
   if ("description" in record) config.description = record.description;
   return { name: record.name, config, source: "privateer-selected", scope: "extension" };
 }
@@ -134,7 +147,7 @@ export function loadEntries(env, read, digest = fileDigest) {
       if (isStdio(record)) {
         // The pin again, as late as this process can check it.
         if (digest(record.command[0]) !== record.sha256) throw new Error("pin");
-        return stdioEntry(record, file);
+        return stdioEntry(record, file, interpreter(env));
       }
       return serverEntry(record, readToken(file, read));
     } catch {

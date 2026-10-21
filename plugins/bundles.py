@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 from urllib.parse import urlsplit
 
 from protocol import serve
@@ -300,6 +301,30 @@ def command(value):
     except OSError:
         # Missing or unreadable: a refusal that carries no path.
         raise Refused() from None
+
+
+def interpreter():
+    """This Python's own executable by absolute path, for running a runtime
+    helper: never a PATH lookup, which can find an activation shim (mise)
+    first. Linux names it in /proc; elsewhere sys.executable resolved."""
+    proc = Path('/proc/self/exe')
+    path = Path(os.readlink(proc)) if proc.exists() else Path(sys.executable).resolve()
+    require(path.is_absolute() and path.name.startswith('python') and plain(str(path)))
+    return str(path)
+
+
+# The runtime's stdio launcher, run by interpreter() for every stdio server.
+STDIO_LAUNCHER = Path(__file__).resolve().with_name('mcp_stdio.py')
+
+
+def stdio_argv(server, credential_file=None):
+    """The argv a harness runs for one stdio server: the launcher and its
+    SPEC, which carries the pinned command and its credential's path only."""
+    value = {'command': server['command'], 'sha256': server['sha256']}
+    if 'credential' in server:
+        require(isinstance(credential_file, str) and plain(credential_file))
+        value['credential'] = {'name': server['credential'], 'file': credential_file}
+    return [interpreter(), '-I', str(STDIO_LAUNCHER), json.dumps(value, separators=(',', ':'), sort_keys=True)]
 
 
 def mcp_server(value, names):

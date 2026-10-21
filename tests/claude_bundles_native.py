@@ -141,7 +141,8 @@ class NativeInventory(unittest.TestCase):
                                                   'command': [python, '-I', str(STDIO_SERVER), str(markers['selected']),
                                                               'selected', 'stubborn'],
                                                   'sha256': hashlib.sha256(Path(python).read_bytes()).hexdigest()}]}]}
-        env = dict(self.env, PRIVATEER_PROBE_AMBIENT='1', CLAUDE_CODE_MAX_RETRIES='0')
+        env = dict(self.env, PRIVATEER_PROBE_AMBIENT='1', CLAUDE_CODE_MAX_RETRIES='0', LANG='C.UTF-8',
+                   TMPDIR=str(self.base))
         with patch.dict(os.environ, env, clear=True):
             plan = bundles.plan(registry, ['stdio@1'], 'crew', 'claude')
         run = subprocess.run([sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(plan),
@@ -163,7 +164,9 @@ class NativeInventory(unittest.TestCase):
         starts = [e for e in events if e['event'] == 'start']
         self.assertTrue(starts)
         names = starts[0]['env']
-        self.assertIn('PRIVATEER_CREDENTIAL_STDIO_TOKEN_FILE', names)
+        # Privateer's launcher passes exactly these, not the harness's environment.
+        self.assertEqual(names, ['HOME', 'LANG', 'PATH', 'PRIVATEER_CREDENTIAL_STDIO_TOKEN_FILE', 'TMPDIR'])
+        self.assertEqual(starts[0]['path'], '/usr/bin:/bin')
         self.assertNotIn(SENTINEL_TOKEN, markers['selected'].read_text() + run.stdout + run.stderr)
         config = next(Path(a.split('=', 1)[1]) for a in claude_bundles.preflight(plan, ['claude', '--print', '--', 'x'],
                                                                                 cwd=self.repo, env=env)
