@@ -403,6 +403,12 @@ struct Herdr {
     dashboards: Arc<Mutex<Vec<DashboardChild>>>,
     #[cfg(feature = "dashboard")]
     slow_create: Arc<AtomicBool>,
+    /// Dashboard launches Herdr accepted but has not started yet, as a pane
+    /// whose shell starts late. `release_dashboards` starts them.
+    #[cfg(feature = "dashboard")]
+    hold_dashboards: Arc<AtomicBool>,
+    #[cfg(feature = "dashboard")]
+    held: Arc<Mutex<Vec<Command>>>,
     #[cfg(feature = "dashboard")]
     creating: Arc<AtomicBool>,
     reject_caption: Arc<AtomicBool>,
@@ -450,6 +456,13 @@ impl Herdr {
         let creating = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "dashboard")]
         let (slow, entered) = (slow_create.clone(), creating.clone());
+        #[cfg(feature = "dashboard")]
+        let (hold_dashboards, held) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        #[cfg(feature = "dashboard")]
+        let (holding, holds) = (hold_dashboards.clone(), Arc::clone(&held));
         std::thread::spawn(move || {
             let mut created: Vec<Value> = vec![];
             for stream in listener.incoming() {
@@ -603,9 +616,10 @@ impl Herdr {
                         }
                         #[cfg(feature = "dashboard")]
                         if created[n - 2].get("PRIVATEER_BRIDGE_TOKEN").is_some() {
-                            let child = DashboardChild::spawn(shell);
-                            if let Some(running) = running.upgrade() {
-                                running.lock().unwrap().push(child);
+                            if holding.load(Ordering::SeqCst) {
+                                holds.lock().unwrap().push(shell);
+                            } else if let Some(running) = running.upgrade() {
+                                running.lock().unwrap().push(DashboardChild::spawn(shell));
                             }
                         } else {
                             spawn_in_pane(&terminals, id, shell);
@@ -715,6 +729,10 @@ impl Herdr {
             #[cfg(feature = "dashboard")]
             slow_create,
             #[cfg(feature = "dashboard")]
+            hold_dashboards,
+            #[cfg(feature = "dashboard")]
+            held,
+            #[cfg(feature = "dashboard")]
             creating,
             reject_caption,
             reject_rename,
@@ -799,6 +817,14 @@ impl Herdr {
             .iter()
             .map(|(id, _)| id.clone())
             .collect()
+    }
+    /// Start the dashboard launches held back by `hold_dashboards`.
+    #[cfg(feature = "dashboard")]
+    fn release_dashboards(&self) {
+        self.hold_dashboards.store(false, Ordering::SeqCst);
+        let held = std::mem::take(&mut *self.held.lock().unwrap());
+        let mut dashboards = self.dashboards.lock().unwrap();
+        dashboards.extend(held.into_iter().map(DashboardChild::spawn));
     }
     /// What a dashboard bridge wait observed: each launched dashboard, the
     /// panes, and the requests Herdr answered.
@@ -1510,7 +1536,43 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     herdr.spaces.lock().unwrap().retain(|(id, _)| id != "w3");
     herdr.suppress_input.store(false, Ordering::SeqCst);
     retry();
+    // The launched dashboard starts while a fleet writer still holds the
+    // registry, as its launching dispatcher may. Its one-shot handshake waits
+    // the lock out instead of exiting and leaving the bridge unadopted.
+    herdr.hold_dashboards.store(true, Ordering::SeqCst);
     assert_eq!(tick(&infra)["bridge"]["status"], "launched");
+    let writer = rusqlite::Connection::open(&fleet).unwrap();
+    writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    herdr.release_dashboards();
+    let guard = fs::File::open(coordination.join("guard")).unwrap();
+    let mut handshakes = 0;
+    let mut inside = false;
+    let deadline = Instant::now() + Duration::from_secs(wait_secs(60));
+    // Two separate holds of the guard while the registry stays locked are a
+    // retried handshake; an exited dashboard is the failure this guards.
+    while handshakes < 2 {
+        use std::os::fd::AsRawFd;
+        let free = unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if free {
+            unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_UN) };
+        } else if !inside {
+            handshakes += 1;
+        }
+        inside = !free;
+        let state = herdr.dashboards.lock().unwrap()[1].describe();
+        assert!(
+            state.contains(": running;"),
+            "dashboard gave up its handshake behind a locked registry: {state}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a retried dashboard handshake\n{}",
+            bridge_observed(&coordination, &herdr)
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(claim()["adopted"], false);
+    drop(writer);
     until_observed(
         "recreated direct dashboard adoption",
         60,
