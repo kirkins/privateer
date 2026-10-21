@@ -2,7 +2,7 @@
 //! route what it says, and restart it with backoff when it exits.
 use crate::lines::{self, Line};
 use crate::serve::{Broker, Phase, exited, filter_windows};
-use crate::{BROKER_VERSION, MAX_LINE, sys};
+use crate::{BROKER_VERSION, MAX_LINE, route, sys};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -347,8 +347,12 @@ fn route(
                 // A client's window list: seen whole, delivered for its root.
                 let mut record = false;
                 if let (Some(root), Some(result)) = (&pending.windows, message.get_mut("result")) {
-                    record = broker.observe(&mut state, result);
-                    filter_windows(result, root.as_deref());
+                    // Resolved with the state unlocked: a realpath can be slow.
+                    drop(state);
+                    let resolved = route::resolved_paths(result);
+                    state = broker.lock();
+                    record = broker.observe(&mut state, result, &resolved);
+                    filter_windows(result, root.as_deref(), &resolved);
                 }
                 broker.deliver(&state, pending.client, &Value::Object(message));
                 drop(state);

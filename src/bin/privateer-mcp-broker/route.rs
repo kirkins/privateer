@@ -2,6 +2,7 @@
 //! workspace a client works in, which Xcode window is that workspace's, what
 //! path a tool call may name, and which project opens a workspace's window.
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -82,6 +83,19 @@ pub fn windows(result: &Value) -> Vec<(String, String)> {
         }
     }
     found
+}
+
+/// Each window path a list names, resolved: what a window belongs to is
+/// worked out from these before the broker's state is locked, so no
+/// realpath runs under it.
+pub fn resolved_paths(result: &Value) -> HashMap<String, Option<PathBuf>> {
+    windows(result)
+        .into_iter()
+        .map(|(_, path)| {
+            let real = resolve(Path::new(&path));
+            (path, real)
+        })
+        .collect()
 }
 
 /// Keep only the windows `keep` accepts, in every form of the result. Text
@@ -176,28 +190,73 @@ pub fn window_bound(schema: &Value) -> bool {
         .is_some_and(|properties| properties.contains_key(TAB))
 }
 
-/// Whether an argument names a path: `path`, or a name ending in `Path`,
-/// `path`, `Dir` or `Directory`.
+/// Argument names that hold a path, or a list of them.
+const PATH_NAMES: [&str; 18] = [
+    "path",
+    "paths",
+    "file",
+    "files",
+    "uri",
+    "uris",
+    "url",
+    "urls",
+    "source",
+    "sources",
+    "destination",
+    "destinations",
+    "target",
+    "targets",
+    "dir",
+    "dirs",
+    "directory",
+    "directories",
+];
+/// Endings of argument names that hold a path (`filePath`, `outputDir`...).
+const PATH_SUFFIXES: [&str; 14] = [
+    "Path",
+    "Paths",
+    "path",
+    "paths",
+    "File",
+    "Files",
+    "Dir",
+    "Dirs",
+    "Directory",
+    "Directories",
+    "Uri",
+    "URI",
+    "Url",
+    "URL",
+];
+
+/// Whether an argument names a path: one of `PATH_NAMES`, or a name ending
+/// in one of `PATH_SUFFIXES`.
 fn path_argument(name: &str) -> bool {
-    ["Path", "path", "Dir", "Directory"]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
+    PATH_NAMES.contains(&name) || PATH_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
-/// Refuse a path argument that leaves the client's workspace: an absolute
-/// path must resolve inside `root`, a relative one may not hold `..`, and an
-/// unrouted client (no root) may pass no absolute path at all. Nested
-/// objects and arrays are checked too.
+/// Whether an argument names a URI: only a `file:` one is a path there.
+fn uri_argument(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with("uri")
+        || lower.ends_with("url")
+        || lower.ends_with("uris")
+        || lower.ends_with("urls")
+}
+
+/// Refuse a path argument that leaves the client's workspace. An absolute
+/// path must resolve inside `root`; a relative one is taken from `root` and
+/// must resolve inside it too. An unrouted client (no root) may pass no
+/// absolute path at all, nor a relative one holding `..`. A `file:` URL is
+/// checked as the path it names. Nested objects and arrays are checked too,
+/// and so is every string in an array (at any depth) under a path name.
 pub fn check_paths(arguments: &Value, root: Option<&Path>) -> Result<(), String> {
     match arguments {
         Value::Object(map) => {
             for (name, value) in map {
                 if path_argument(name) {
-                    let paths: Vec<&str> = match value {
-                        Value::String(text) => vec![text.as_str()],
-                        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
-                        _ => vec![],
-                    };
+                    let mut paths = vec![];
+                    strings(value, &mut paths);
                     for path in paths {
                         check_path(name, path, root)?;
                     }
@@ -211,27 +270,101 @@ pub fn check_paths(arguments: &Value, root: Option<&Path>) -> Result<(), String>
     }
 }
 
+/// Every string in `value` and in the arrays under it.
+fn strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => out.push(text),
+        Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+        _ => {}
+    }
+}
+
 fn check_path(name: &str, text: &str, root: Option<&Path>) -> Result<(), String> {
-    let path = Path::new(text);
     let shown: String = text.chars().take(512).collect();
-    if path.is_absolute() {
-        let Some(root) = root else {
-            return Err(format!(
-                "{name}: absolute paths work only from a Privateer task workspace"
-            ));
-        };
-        return match resolve(path) {
+    let decoded;
+    let text = match file_url(text) {
+        Some(Ok(path)) => {
+            decoded = path;
+            decoded.as_str()
+        }
+        Some(Err(())) => return Err(format!("{name} {shown:?} is not a local file URL")),
+        // Another scheme under a URI name (https:, for example) names no file.
+        None if uri_argument(name) && has_scheme(text) => return Ok(()),
+        None => text,
+    };
+    let path = Path::new(text);
+    let outside = |root: &Path| {
+        format!(
+            "{name} {shown:?} lies outside this workspace ({})",
+            root.display()
+        )
+    };
+    match root {
+        None if path.is_absolute() => Err(format!(
+            "{name}: absolute paths work only from a Privateer task workspace"
+        )),
+        None if path.components().any(|c| c == Component::ParentDir) => {
+            Err(format!("{name} {shown:?} may not contain `..`"))
+        }
+        None => Ok(()),
+        Some(root) => match resolve(&root.join(path)) {
             Some(real) if inside(&real, root) => Ok(()),
-            _ => Err(format!(
-                "{name} {shown:?} lies outside this workspace ({})",
-                root.display()
-            )),
-        };
+            _ => Err(outside(root)),
+        },
     }
-    if path.components().any(|c| c == Component::ParentDir) {
-        return Err(format!("{name} {shown:?} may not contain `..`"));
+}
+
+/// Whether `text` starts with a URI scheme (`https:`, `file:`...).
+fn has_scheme(text: &str) -> bool {
+    let Some((scheme, _)) = text.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// The path a `file:` URL names, percent-decoded: `None` when `text` is not
+/// one, an error when it names another host or does not decode.
+fn file_url(text: &str) -> Option<Result<String, ()>> {
+    let rest = text
+        .get(..5)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        .map(|_| &text[5..])?;
+    let path = match rest.strip_prefix("//") {
+        Some(authority) => {
+            let (host, path) = authority.split_at(authority.find('/').unwrap_or(authority.len()));
+            if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+                return Some(Err(()));
+            }
+            path
+        }
+        None => rest,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = path
+                .get(at + 1..at + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            let Some(byte) = hex else {
+                return Some(Err(()));
+            };
+            out.push(byte);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
     }
-    Ok(())
+    Some(
+        String::from_utf8(out)
+            .map_err(|_| ())
+            .and_then(|p| if p.contains('\0') { Err(()) } else { Ok(p) }),
+    )
 }
 
 /// What discovery found below one directory.
@@ -386,18 +519,39 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         let sibling = root.with_file_name("ws2");
         fs::create_dir_all(&sibling).unwrap();
-        let ok = json!({"filePath": root.join("src/new.swift"), "query": "/etc/passwd"});
-        assert!(check_paths(&ok, Some(&root)).is_ok());
+        std::os::unix::fs::symlink(&sibling, root.join("src/out")).unwrap();
+        let inside_url = format!("file://{}", root.join("src/a%20b.swift").display());
+        for ok in [
+            json!({"filePath": root.join("src/new.swift"), "query": "/etc/passwd"}),
+            json!({"filePaths": [root.join("src/a.swift"), "src/b.swift"]}),
+            json!({"files": [["src/a.swift"]], "target": "App"}),
+            json!({"uri": inside_url, "url": "https://developer.apple.com/x"}),
+            json!({"source": "src/../src/a.swift"}),
+        ] {
+            assert!(check_paths(&ok, Some(&root)).is_ok(), "{ok}");
+        }
         for bad in [
             json!({"filePath": sibling.join("x")}),
             json!({"path": root.join("new/../../ws2/x")}),
             json!({"projectDir": "src/../../x"}),
             json!({"nested": {"outputDirectory": "/tmp"}}),
+            json!({"paths": ["src/a.swift", sibling]}),
+            json!({"files": [["src/a.swift", "/etc/passwd"]]}),
+            json!({"file": "src/out/x.swift"}),
+            json!({"destination": "../ws2"}),
+            json!({"source": "/etc"}),
+            json!({"target": sibling}),
+            json!({"uri": format!("file://{}", sibling.display())}),
+            json!({"url": "file:///etc/passwd"}),
+            json!({"documentURL": "file://otherhost/x"}),
+            json!({"uri": format!("file://{}/%2e%2e/ws2", root.display())}),
         ] {
             assert!(check_paths(&bad, Some(&root)).is_err(), "{bad}");
         }
         assert!(check_paths(&json!({"filePath": root.join("src")}), None).is_err());
         assert!(check_paths(&json!({"filePath": "src/a.swift"}), None).is_ok());
+        assert!(check_paths(&json!({"files": ["src/../x"]}), None).is_err());
+        assert!(check_paths(&json!({"url": "file:///tmp/x"}), None).is_err());
     }
 
     #[test]

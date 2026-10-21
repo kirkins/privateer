@@ -12,7 +12,7 @@ use std::io::{BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -59,9 +59,13 @@ pub struct Internal {
 
 /// One workspace's window opening, or its last one.
 struct Opening {
+    /// The open helper still runs, on its own thread.
     running: bool,
     at: Instant,
     error: Option<String>,
+    /// The workspace was released while the helper ran: close what it
+    /// opened once it ends.
+    close_after: bool,
 }
 
 struct Client {
@@ -337,7 +341,7 @@ impl Broker {
         self.disconnect(id);
     }
 
-    fn message(&self, client: u64, line: &[u8], first: bool) {
+    fn message(self: &Arc<Self>, client: u64, line: &[u8], first: bool) {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
@@ -418,7 +422,7 @@ impl Broker {
         self.publish();
     }
 
-    fn request(&self, client: u64, message: Map<String, Value>) {
+    fn request(self: &Arc<Self>, client: u64, message: Map<String, Value>) {
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -530,7 +534,7 @@ impl Broker {
     /// A client's `tools/call`: its path arguments checked, a window-bound
     /// tool given the client's own window, and XcodeListWindows filtered to
     /// the client's root. Nothing refused is forwarded.
-    fn call(&self, client: u64, id: Value, mut message: Map<String, Value>) {
+    fn call(self: &Arc<Self>, client: u64, id: Value, mut message: Map<String, Value>) {
         let deadline = Instant::now() + self.ready_wait;
         let method = "tools/call".to_owned();
         let Some(root) = self.lock().clients.get(&client).map(|c| c.root.clone()) else {
@@ -553,13 +557,36 @@ impl Broker {
         if name == LIST_WINDOWS {
             return self.forward(client, id, method, message, Some(root));
         }
-        let tools = match self.tools(deadline) {
+        let mut tools = match self.tools(deadline) {
             Ok(tools) => tools,
             Err(refusal) => return self.refuse(client, &id, &name, refusal),
         };
-        // A tool the list does not show yet is bound when it names a window.
-        let bound =
-            tools.get(&name).is_some_and(route::window_bound) || arguments.get(TAB).is_some();
+        // A tool the cached list does not show: the list may be stale, so it
+        // is listed again, once.
+        if !tools.contains_key(&name) {
+            self.forget_tools(&tools);
+            tools = match self.tools(deadline) {
+                Ok(tools) => tools,
+                Err(refusal) => return self.refuse(client, &id, &name, refusal),
+            };
+        }
+        let bound = match tools.get(&name) {
+            Some(schema) => route::window_bound(schema) || arguments.get(TAB).is_some(),
+            // Still not listed: never forwarded with a window it names, and
+            // otherwise window-free.
+            None if arguments.get(TAB).is_some() => {
+                return self.refuse(
+                    client,
+                    &id,
+                    &name,
+                    Refusal::Error(format!(
+                        "the upstream does not list the tool {}; a call naming a tabIdentifier is not forwarded",
+                        sys::quoted(&name, 64)
+                    )),
+                );
+            }
+            None => false,
+        };
         if !bound {
             return self.forward(client, id, method, message, None);
         }
@@ -734,6 +761,20 @@ impl Broker {
         Ok(tools)
     }
 
+    /// Drop the cached tool list, if it is still `seen`, so the next call
+    /// lists again.
+    fn forget_tools(&self, seen: &Arc<HashMap<String, Value>>) {
+        let mut state = self.lock();
+        if state
+            .tools
+            .as_ref()
+            .is_some_and(|tools| Arc::ptr_eq(tools, seen))
+        {
+            state.tools = None;
+            state.tools_epoch += 1;
+        }
+    }
+
     /// List the upstream's tools now, off the calling thread.
     pub fn refresh_tools(self: &Arc<Self>) {
         let broker = self.clone();
@@ -751,7 +792,12 @@ impl Broker {
 
     /// The tab of `root`'s window: the cached one, else the one a window
     /// list shows, else the one a window opened for it shows.
-    fn window_for(&self, client: u64, root: &Path, deadline: Instant) -> Result<String, Refusal> {
+    fn window_for(
+        self: &Arc<Self>,
+        client: u64,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<String, Refusal> {
         if let Some(tab) = self.lock().tabs.get(root).cloned() {
             return Ok(tab);
         }
@@ -798,9 +844,10 @@ impl Broker {
                 text.chars().take(300).collect::<String>()
             )));
         }
+        let resolved = route::resolved_paths(&result);
         let (tab, record) = {
             let mut state = self.lock();
-            let record = self.observe(&mut state, &result);
+            let record = self.observe(&mut state, &result, &resolved);
             (state.tabs.get(root).cloned(), record)
         };
         if record {
@@ -813,10 +860,20 @@ impl Broker {
     /// Learn each known root's window from a window list: the cache gains
     /// what it shows and loses what it no longer shows, and a window the
     /// broker opened gets its tab recorded. True when the record changed.
-    pub fn observe(&self, state: &mut State, result: &Value) -> bool {
+    /// `resolved` is `route::resolved_paths(result)`, taken before `state`
+    /// was locked.
+    pub fn observe(
+        &self,
+        state: &mut State,
+        result: &Value,
+        resolved: &HashMap<String, Option<PathBuf>>,
+    ) -> bool {
         let seen: Vec<(String, Option<PathBuf>)> = route::windows(result)
             .into_iter()
-            .map(|(tab, path)| (tab, route::resolve(Path::new(&path))))
+            .map(|(tab, path)| {
+                let real = resolved.get(&path).cloned().flatten();
+                (tab, real)
+            })
             .collect();
         let in_root = |root: &Path| -> Vec<String> {
             seen.iter()
@@ -863,8 +920,11 @@ impl Broker {
 
     /// Open `root`'s window: one open per root at a time, the others wait
     /// on it. The project is the client's `--project` or the one discovery
-    /// finds. A failed open is the call's error, never retried within it.
-    fn open(&self, client: u64, root: &Path, deadline: Instant) -> Result<(), Refusal> {
+    /// finds. The helper runs on its own thread: a call waits for it only
+    /// until `deadline`, then is busy, and the helper's outcome is recorded
+    /// whenever it ends. A failed open is the error of the calls waiting on
+    /// it, never retried within one.
+    fn open(self: &Arc<Self>, client: u64, root: &Path, deadline: Instant) -> Result<(), Refusal> {
         let (cwd, chosen) = {
             let state = self.lock();
             let c = state.clients.get(&client);
@@ -882,13 +942,37 @@ impl Broker {
             }
         }
         .map_err(Refusal::Error)?;
-        let Some(argv) = self.window_open.as_ref() else {
+        let Some(argv) = self.window_open.clone() else {
             return Err(Refusal::Error(
                 "no window helper configured: cannot open this workspace's Xcode window".into(),
             ));
         };
-        let mut waited = false;
         let mut state = self.lock();
+        match state.opening.get(root) {
+            Some(o) if o.running => {}
+            Some(o) if o.error.is_none() && o.at.elapsed() < OPEN_GRACE => return Ok(()),
+            _ => {
+                state.opening.insert(
+                    root.to_path_buf(),
+                    Opening {
+                        running: true,
+                        at: Instant::now(),
+                        error: None,
+                        close_after: false,
+                    },
+                );
+                drop(state);
+                self.log.line(&format!(
+                    "opening the window of {} with {}",
+                    sys::quoted(&root.to_string_lossy(), 4096),
+                    sys::quoted(&project.to_string_lossy(), 4096)
+                ));
+                let broker = self.clone();
+                let root = root.to_path_buf();
+                std::thread::spawn(move || broker.run_open(&argv, root, project));
+                state = self.lock();
+            }
+        }
         loop {
             match state.opening.get(root) {
                 Some(o) if o.running => {
@@ -899,66 +983,67 @@ impl Broker {
                             OPEN_RETRY_SECS,
                         ));
                     }
-                    waited = true;
                     state = self
                         .changed
                         .wait_timeout(state, deadline - now)
                         .unwrap_or_else(|p| p.into_inner())
                         .0;
                 }
-                Some(o) if waited => {
-                    return o.error.clone().map_or(Ok(()), |e| Err(Refusal::Error(e)));
-                }
-                Some(o) if o.error.is_none() && o.at.elapsed() < OPEN_GRACE => return Ok(()),
-                _ => break,
+                Some(o) => return o.error.clone().map_or(Ok(()), |e| Err(Refusal::Error(e))),
+                None => return Ok(()),
             }
         }
-        state.opening.insert(
-            root.to_path_buf(),
-            Opening {
-                running: true,
-                at: Instant::now(),
-                error: None,
-            },
-        );
-        drop(state);
-        self.log.line(&format!(
-            "opening the window of {} with {}",
-            sys::quoted(&root.to_string_lossy(), 4096),
-            sys::quoted(&project.to_string_lossy(), 4096)
-        ));
+    }
+
+    /// The open helper's thread: run it, record what it opened, and close
+    /// that again if the workspace was released meanwhile.
+    fn run_open(&self, argv: &[String], root: PathBuf, project: PathBuf) {
         let outcome = window::run(argv, &project)
             .map_err(|why| format!("could not open this workspace's Xcode window: {why}"));
-        {
+        let opened = Opened {
+            root: root.clone(),
+            project: project.clone(),
+            tab: None,
+            opened_ms: sys::now_ms() as u64,
+        };
+        let close_after = {
             let mut state = self.lock();
             if outcome.is_ok() {
                 state
                     .windows
                     .retain(|w| !(w.root == root && w.project == project));
-                state.windows.push(Opened {
-                    root: root.to_path_buf(),
-                    project: project.clone(),
-                    tab: None,
-                    opened_ms: sys::now_ms() as u64,
-                });
+                state.windows.push(opened.clone());
             }
+            let close_after = state.opening.get(&root).is_some_and(|o| o.close_after);
             state.opening.insert(
-                root.to_path_buf(),
+                root.clone(),
                 Opening {
                     running: false,
                     at: Instant::now(),
                     error: outcome.as_ref().err().cloned(),
+                    close_after: false,
                 },
             );
             self.changed.notify_all();
-        }
+            close_after
+        };
         if let Err(why) = &outcome {
             self.log.line(&sys::quoted(why, 400));
-        } else {
-            self.save_windows();
-            self.publish();
+            return;
         }
-        outcome.map_err(Refusal::Error)
+        self.save_windows();
+        if close_after {
+            let (closed, failure) = self.close_windows(vec![opened]);
+            self.log.line(&format!(
+                "closed {} window opened after its workspace {} was released{}",
+                closed.len(),
+                sys::quoted(&root.to_string_lossy(), 4096),
+                failure
+                    .as_deref()
+                    .map_or(String::new(), |f| format!("; {}", sys::quoted(f, 400)))
+            ));
+        }
+        self.publish();
     }
 
     /// Write the window record as it is now.
@@ -972,32 +1057,50 @@ impl Broker {
     }
 
     /// A control line instead of a hello. Only `close_workspace` exists:
-    /// close every window the broker opened under that root.
+    /// close every window the broker opened under that root, which must lie
+    /// strictly inside a workspace pool.
     fn control(&self, client: u64, control: &Map<String, Value>) {
-        let answer = match control.get("close_workspace").and_then(Value::as_str) {
-            Some(root) if root.starts_with('/') && root.len() <= 4096 => {
-                self.close_workspace(client, Path::new(root))
-            }
-            _ => {
-                json!({"error": "expected {\"privateer_control\":1,\"close_workspace\":ABS_ROOT}"})
-            }
+        let roots = control
+            .get("close_workspace")
+            .and_then(Value::as_str)
+            .filter(|root| root.len() <= 4096)
+            .map(|root| self.pooled_roots(Path::new(root)))
+            .unwrap_or_default();
+        let answer = match roots.first() {
+            Some(given) => self.close_workspace(client, given.clone(), &roots),
+            None => json!({"error":
+                "expected {\"privateer_control\":1,\"close_workspace\":ROOT} with ROOT an absolute, normalized path strictly inside a workspace pool"}),
         };
         self.reply(client, answer);
     }
 
-    fn close_workspace(&self, client: u64, given: &Path) -> Value {
-        let mut roots = vec![given.to_path_buf()];
-        if let Ok(real) = fs::canonicalize(given) {
-            roots.push(real);
+    /// `given` and its realpath, each kept only when it is absolute,
+    /// normalized and strictly inside a workspace pool; `/`, a pool itself
+    /// and anything outside the pools give none.
+    fn pooled_roots(&self, given: &Path) -> Vec<PathBuf> {
+        let normalized = given.is_absolute()
+            && given
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+        if !normalized {
+            return vec![];
         }
-        let under = |path: &Path| roots.iter().any(|root| route::inside(path, root));
-        let targets: Vec<Opened> = self
-            .lock()
-            .windows
-            .iter()
-            .filter(|w| under(&w.root))
-            .cloned()
-            .collect();
+        let mut roots = vec![given.to_path_buf()];
+        roots.extend(route::resolve(given));
+        roots.dedup();
+        roots
+            .into_iter()
+            .filter(|root| {
+                self.pools
+                    .iter()
+                    .any(|pool| root != pool && route::inside(root, pool))
+            })
+            .collect()
+    }
+
+    /// Run `window_close` for each of `targets`, dropping each one closed
+    /// from the record; stop at the first failure. The record is saved.
+    fn close_windows(&self, targets: Vec<Opened>) -> (Vec<PathBuf>, Option<String>) {
         let mut closed = vec![];
         let mut failure = None;
         for target in targets {
@@ -1011,7 +1114,9 @@ impl Broker {
                     state
                         .windows
                         .retain(|w| !(w.root == target.root && w.project == target.project));
-                    state.opening.remove(&target.root);
+                    if state.opening.get(&target.root).is_some_and(|o| !o.running) {
+                        state.opening.remove(&target.root);
+                    }
                     closed.push(target.project);
                 }
                 Err(why) => {
@@ -1023,14 +1128,43 @@ impl Broker {
                 }
             }
         }
-        self.lock().tabs.retain(|root, _| !under(root));
         if !closed.is_empty() {
             self.save_windows();
         }
+        (closed, failure)
+    }
+
+    fn close_workspace(&self, client: u64, given: PathBuf, roots: &[PathBuf]) -> Value {
+        let under = |path: &Path| roots.iter().any(|root| route::inside(path, root));
+        let (targets, opening) = {
+            let mut state = self.lock();
+            // An open still running finishes by closing what it opened.
+            let mut opening = 0;
+            for (root, o) in state.opening.iter_mut() {
+                if o.running && under(root) {
+                    o.close_after = true;
+                    opening += 1;
+                }
+            }
+            let targets: Vec<Opened> = state
+                .windows
+                .iter()
+                .filter(|w| under(&w.root))
+                .cloned()
+                .collect();
+            (targets, opening)
+        };
+        let (closed, failure) = self.close_windows(targets);
+        self.lock().tabs.retain(|root, _| !under(root));
         self.log.line(&format!(
-            "client {client}: close_workspace {}: closed {}{}",
+            "client {client}: close_workspace {}: closed {}{}{}",
             sys::quoted(&given.to_string_lossy(), 4096),
             closed.len(),
+            if opening > 0 {
+                format!("; {opening} still opening, closed when the open ends")
+            } else {
+                String::new()
+            },
             failure
                 .as_deref()
                 .map_or(String::new(), |f| format!("; {}", sys::quoted(f, 400)))
@@ -1116,11 +1250,19 @@ impl Broker {
 }
 
 /// A window list as one client may see it: only the windows inside its
-/// root, and none for a client without one.
-pub fn filter_windows(result: &mut Value, root: Option<&Path>) {
+/// root, and none for a client without one. `resolved` is
+/// `route::resolved_paths` of the list.
+pub fn filter_windows(
+    result: &mut Value,
+    root: Option<&Path>,
+    resolved: &HashMap<String, Option<PathBuf>>,
+) {
     route::filter_windows(result, |_, path| {
         root.is_some_and(|root| {
-            route::resolve(Path::new(path)).is_some_and(|real| route::inside(&real, root))
+            resolved
+                .get(path)
+                .and_then(Option::as_ref)
+                .is_some_and(|real| route::inside(real, root))
         })
     });
 }
