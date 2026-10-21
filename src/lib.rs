@@ -40,7 +40,7 @@ pub mod needs;
 pub mod opencode_mail;
 pub mod peers;
 pub mod permissions;
-mod placement;
+pub mod placement;
 pub mod plugins;
 pub mod presence;
 mod profile;

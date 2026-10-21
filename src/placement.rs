@@ -1677,9 +1677,27 @@ pub(crate) fn upkeep(conn: &Connection, owner_store: &Store) -> Result<Value> {
 static LAST_OFFERS: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 const OFFERS_EVERY: Duration = Duration::from_secs(300);
 
+/// The machine's placement lock, beside its registry. A runner holds it for
+/// the whole of its moves, so whoever holds it knows no move is running.
+fn placement_lock(registry: &Path, wait: bool) -> Result<Option<fs::File>> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(registry.with_file_name("placement.lock"))?;
+    use std::os::fd::AsRawFd;
+    let how = if wait {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    Ok((unsafe { libc::flock(lock.as_raw_fd(), how) } == 0).then_some(lock))
+}
+
 /// One dispatcher pass: keep this machine's offers fresh for the exchange,
-/// and run each approved move this machine is the one to run. One
-/// dispatcher on this machine does it at a time.
+/// close moves a crash interrupted, and start the runner when an approved
+/// move here is ready. The move never runs in a dispatcher: moving a ship
+/// stops the ship's own dispatcher, which may be the one ticking.
 pub(crate) fn tick(store: &Store) -> Value {
     let work = || -> Result<Value> {
         let path = crate::fleet::registry_path()?;
@@ -1693,16 +1711,9 @@ pub(crate) fn tick(store: &Store) -> Value {
         {
             return Ok(Value::Null);
         }
-        let lock_path = path.with_file_name("placement.lock");
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)?;
-        use std::os::fd::AsRawFd;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let Some(lock) = placement_lock(&path, false)? else {
             return Ok(Value::Null);
-        }
+        };
         let refresh = LAST_OFFERS
             .lock()
             .map(|mut last| {
@@ -1716,19 +1727,125 @@ pub(crate) fn tick(store: &Store) -> Value {
         if refresh {
             crate::capabilities::refresh(&conn);
         }
-        let ran = run_approvals(&conn)?;
-        conn.execute(
-            "DELETE FROM placement_approvals WHERE expires_ms<?1",
-            [Store::now_ms() - CARRY_CLOSED_MS],
-        )?;
-        Ok(json!(ran))
+        let mut report = json!({});
+        if !runnable(&conn)?.is_empty() {
+            // Let go first: the runner waits for the lock, then holds it.
+            drop(lock);
+            report["runner"] = json!(spawn_runner(&path, store.home())?);
+        }
+        Ok(if report == json!({}) {
+            Value::Null
+        } else {
+            report
+        })
     };
     work().unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     )
 }
 
+/// Start `privateer _placement-run` in a session of its own, so stopping the
+/// dispatcher that started it, which a move may do, never stops it.
+fn spawn_runner(registry: &Path, home: &Path) -> Result<u32> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let executable = crate::executable::supervisor()?;
+    let mut command = Command::new(&executable);
+    command
+        .arg("--fleet")
+        .arg(registry)
+        .arg("--home")
+        .arg(home)
+        .arg("_placement-run")
+        // Never inside a ship folder: the move may delete it.
+        .current_dir(registry.parent().unwrap_or(Path::new("/")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start the placement runner {}", executable.display()))?;
+    let pid = child.id();
+    // A long-lived dispatcher reaps it; a one-pass one exits and it is adopted.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
+/// `privateer _placement-run`, started by a dispatcher: wait for the
+/// placement lock, close moves a crash interrupted, and run each approved
+/// move this machine is the one to run, holding the lock throughout. Its
+/// outcomes are recorded on the proposals; this returns them as well.
+pub fn runner() -> Result<Value> {
+    let path = crate::fleet::registry_path()?;
+    let conn = crate::fleet::registry()?;
+    let _lock = placement_lock(&path, true)?.context("the placement lock")?;
+    let ran = run_approvals(&conn)?;
+    conn.execute(
+        "DELETE FROM placement_approvals WHERE expires_ms<?1",
+        [Store::now_ms() - CARRY_CLOSED_MS],
+    )?;
+    Ok(json!({"ran": ran}))
+}
+
 fn run_approvals(conn: &Connection) -> Result<Vec<Value>> {
+    let mut ran = vec![];
+    for (approval, proposal) in runnable(conn)? {
+        let now = Store::now_ms();
+        let claimed = conn.execute(
+            "UPDATE placement_approvals SET used_ms=?2 WHERE proposal=?1 AND used_ms IS NULL",
+            params![approval.proposal, now],
+        )?;
+        if claimed == 0 {
+            continue;
+        }
+        let outcome = run_one(conn, &approval, &proposal, now);
+        let state = outcome["state"].as_str().unwrap_or("refused").to_owned();
+        finish(conn, &proposal, &state, outcome.clone())?;
+        ran.push(
+            json!({"proposal": proposal.id, "ship": approval.ship, "state": state,
+            "outcome": outcome}),
+        );
+    }
+    Ok(ran)
+}
+
+/// Record how a move this machine ran ended: on its own proposal, which
+/// closes it, or on the copy, which the exchange carries back.
+fn finish(conn: &Connection, proposal: &Proposal, state: &str, outcome: Value) -> Result<()> {
+    match &proposal.home {
+        None => {
+            conclude(conn, &proposal.id, state, outcome)?;
+        }
+        Some(_) => {
+            let next = state.to_owned();
+            update(
+                conn,
+                &proposal.id,
+                &["open", "approved", "moving"],
+                move |p| {
+                    p.record["outcome"] = outcome;
+                    p.state = next;
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The approvals this machine is the one to run, each with its proposal, once
+/// that proposal is open or approved here. One whose proposal has not arrived
+/// or is not runnable yet stays unused until it is, or until it expires.
+fn runnable(conn: &Connection) -> Result<Vec<(Approval, Proposal)>> {
     let mut statement = conn.prepare(
         "SELECT proposal, ship, from_machine, to_machine, binding, cleanup, expires_ms
          FROM placement_approvals WHERE used_ms IS NULL ORDER BY approved_ms",
@@ -1747,56 +1864,24 @@ fn run_approvals(conn: &Connection) -> Result<Vec<Value>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    let mut ran = vec![];
+    let mut out = vec![];
     for approval in approvals {
         let Some(proposal) = load(conn, &approval.proposal)? else {
             continue;
         };
+        if !matches!(proposal.state.as_str(), "open" | "approved") {
+            continue;
+        }
         // Only the linking side of the proposal's link runs it.
         let mover = match &proposal.home {
             None => role(conn, proposal.text("to"))?.as_deref() == Some("collects"),
             Some(home) => role(conn, home)?.as_deref() == Some("collects"),
         };
-        if !mover {
-            continue;
+        if mover {
+            out.push((approval, proposal));
         }
-        let now = Store::now_ms();
-        let claimed = conn.execute(
-            "UPDATE placement_approvals SET used_ms=?2 WHERE proposal=?1 AND used_ms IS NULL",
-            params![approval.proposal, now],
-        )?;
-        if claimed == 0 {
-            continue;
-        }
-        if !matches!(proposal.state.as_str(), "open" | "approved") {
-            ran.push(json!({"proposal": proposal.id, "skipped": proposal.state}));
-            continue;
-        }
-        let outcome = run_one(conn, &approval, &proposal, now);
-        let state = outcome["state"].as_str().unwrap_or("refused").to_owned();
-        match &proposal.home {
-            None => {
-                conclude(conn, &proposal.id, &state, outcome.clone())?;
-            }
-            Some(_) => {
-                let (next, kept) = (state.clone(), outcome.clone());
-                update(
-                    conn,
-                    &proposal.id,
-                    &["open", "approved", "moving"],
-                    move |p| {
-                        p.record["outcome"] = kept;
-                        p.state = next;
-                    },
-                )?;
-            }
-        }
-        ran.push(
-            json!({"proposal": proposal.id, "ship": approval.ship, "state": state,
-            "outcome": outcome}),
-        );
     }
-    Ok(ran)
+    Ok(out)
 }
 
 /// Run the one move an approval names, once: refuse when it lapsed, when the

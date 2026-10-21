@@ -128,6 +128,17 @@ impl Machine {
             .unwrap_or(Value::Null)
     }
 
+    /// One dispatcher pass in a ship's home, and the placement runner it
+    /// started, if any, to its end: approved moves run detached from every
+    /// dispatcher.
+    fn run_moves(&self, ship: &str, ssh: Option<&Path>) -> Value {
+        let ran = self.pass(ship, ssh);
+        if let Some(pid) = ran["placement"]["runner"].as_u64() {
+            gone(&pid.to_string());
+        }
+        ran
+    }
+
     /// A command as the agent `actor`, which may reach the other machine.
     fn agent_via(&self, actor: &str, command: &str, args: Value, ssh: &Path) -> Output {
         self.run(
@@ -264,6 +275,15 @@ fn move_ship(laptop: &Machine, args: &[&str], ssh: &Path) -> Output {
     let mut argv = vec!["ship", "move"];
     argv.extend_from_slice(args);
     laptop.run("liaison", &argv, Some(ssh))
+}
+
+/// Wait up to two minutes for a process to end.
+fn gone(pid: &str) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while alive(pid) {
+        assert!(std::time::Instant::now() < until, "{pid} is still running");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Whether a process is still running (a zombie awaiting its reaper is not).
@@ -911,8 +931,9 @@ fn a_lasting_disk_alert_lets_the_owner_propose_and_the_captains_yes_moves_the_sh
 
     answer(&laptop, &decision, "move_clean", Some(&ssh));
     assert_eq!(approvals(&laptop).len(), 1);
-    let ran = laptop.pass("liaison", Some(&ssh));
-    assert_eq!(ran["placement"][0]["state"], "moved", "{ran}");
+    let ran = laptop.run_moves("liaison", Some(&ssh));
+    assert!(ran["placement"]["runner"].is_u64(), "{ran}");
+    assert_eq!(proposal(&laptop, &id).0, "moved");
     let arrived = mac.ok("scout", "ship.show", json!({"name": "scout"}));
     assert_eq!(arrived["location"], "here", "{arrived}");
     assert!(arrived["last_moved_ms"].as_i64().is_some(), "{arrived}");
@@ -954,9 +975,50 @@ fn a_lasting_disk_alert_lets_the_owner_propose_and_the_captains_yes_moves_the_sh
         .conn()
         .execute("UPDATE placement_approvals SET used_ms=NULL", [])
         .unwrap();
-    laptop.pass("liaison", Some(&ssh));
+    let ran = laptop.run_moves("liaison", Some(&ssh));
+    assert!(ran["placement"].is_null(), "{ran}");
     assert_eq!(laptop.moves().len(), moves_before);
     assert_eq!(proposal(&laptop, &id).0, "moved");
+}
+
+/// Wait up to two minutes for a proposal to reach `state`.
+fn await_state(machine: &Machine, id: &str, state: &str) -> Value {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let (now, record) = proposal(machine, id);
+        if now == state {
+            return record;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "proposal {id} is {now}, not {state}: {record}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn the_moved_ships_own_dispatcher_starts_the_move_without_stopping_it() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "move_clean", Some(&ssh));
+    // scout's own dispatcher, in the background as a service runs it, is the
+    // only one ticking. The move stops it; the move must outlive that.
+    let started = laptop
+        .command("scout", &["service", "start"], Some(&ssh))
+        .env("PRIVATEER_SERVICE", "detached")
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{}", text(&started));
+    let dispatcher =
+        fs::read_to_string(laptop.folder("scout").join(".privateer/serve.pid")).unwrap();
+    let record = await_state(&laptop, &id, "moved");
+    assert_eq!(record["outcome"]["cleaned"], true, "{record}");
+    assert!(!alive(&dispatcher), "the move stopped scout's dispatcher");
+    let arrived = mac.ok("scout", "ship.show", json!({"name": "scout"}));
+    assert_eq!(arrived["location"], "here", "{arrived}");
+    assert!(!laptop.folder("scout").exists());
+    assert!(approvals(&laptop)[0].1.is_some(), "the approval was used");
 }
 
 #[test]
@@ -1010,8 +1072,8 @@ fn a_linked_machines_proposal_waits_for_the_linking_machines_check_and_keeps_the
     );
 
     answer(&laptop, &decision, "move_keep", Some(&ssh));
-    let ran = laptop.pass("liaison", Some(&ssh));
-    assert_eq!(ran["placement"][0]["state"], "moved", "{ran}");
+    laptop.run_moves("liaison", Some(&ssh));
+    assert_eq!(proposal(&laptop, &id).0, "moved");
     let arrived = laptop.ok("rover", "ship.show", json!({"name": "rover"}));
     assert_eq!(arrived["location"], "here", "{arrived}");
     // The Mac learns how it ended, keeps the folder and holds proposals.
@@ -1412,8 +1474,7 @@ fn a_changed_lapsed_or_busy_approval_moves_nothing_and_cools_down() {
             [],
         )
         .unwrap();
-    let ran = laptop.pass("liaison", Some(&ssh));
-    assert_eq!(ran["placement"][0]["state"], "refused", "{ran}");
+    laptop.run_moves("liaison", Some(&ssh));
     assert!(laptop.folder("scout").exists());
     assert!(laptop.moves().is_empty(), "{:?}", laptop.moves());
     let (state, record) = proposal(&laptop, &id);
@@ -1449,7 +1510,7 @@ fn a_lapsed_yes_or_a_ship_that_became_busy_is_not_moved() {
         .conn()
         .execute("UPDATE placement_approvals SET expires_ms=1", [])
         .unwrap();
-    laptop.pass("liaison", Some(&ssh));
+    laptop.run_moves("liaison", Some(&ssh));
     let (state, record) = proposal(&laptop, &id);
     assert_eq!(state, "refused");
     assert!(
@@ -1473,7 +1534,7 @@ fn a_lapsed_yes_or_a_ship_that_became_busy_is_not_moved() {
             [],
         )
         .unwrap();
-    laptop.pass("liaison", Some(&ssh));
+    laptop.run_moves("liaison", Some(&ssh));
     let (state, record) = proposal(&laptop, &id);
     assert_eq!(state, "refused", "{record}");
     assert!(
