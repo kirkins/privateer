@@ -59,6 +59,22 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// The canonical path of a process's executable: /proc on Linux, ps on
+/// macOS (whose comm column is the full path).
+fn exe_of(pid: i32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let exe = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    #[cfg(not(target_os = "linux"))]
+    let exe = {
+        let out = Command::new("/bin/ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+    };
+    fs::canonicalize(exe).ok()
+}
+
 /// A broker the test started itself, stopped with SIGTERM when dropped.
 struct Broker {
     child: Child,
@@ -757,8 +773,8 @@ impl Drop for Detached {
         else {
             return;
         };
-        let ours = fs::read_link(format!("/proc/{pid}/exe"))
-            .is_ok_and(|exe| exe.to_string_lossy().contains("privateer-mcp-broker"));
+        let ours =
+            exe_of(pid).is_some_and(|exe| exe.to_string_lossy().contains("privateer-mcp-broker"));
         if ours {
             // SAFETY: signalling this test's own broker.
             unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -928,10 +944,7 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     let (theirs, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
     assert_eq!(theirs, pid, "the broker leads its own session");
     assert_ne!(theirs, ours);
-    assert_eq!(
-        fs::read_link(format!("/proc/{pid}/exe")).ok(),
-        Some(machine.stable())
-    );
+    assert_eq!(exe_of(pid), fs::canonicalize(machine.stable()).ok());
     // The dispatcher that started it is gone; the broker still serves.
     let mut client = Client::connect(&machine.dir().join("xcode.sock"));
     assert_eq!(
