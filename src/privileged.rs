@@ -45,6 +45,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 const KILL_GRACE: Duration = Duration::from_secs(5);
 const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const MAX_ID_BYTES: usize = 48;
 /// Needs pages the door reads to find the item, as the bridge does.
 const NEEDS_PAGES: usize = 4;
 const USAGE: &str = "usage: privateer privileged run ID [--timeout-secs N] | list";
@@ -379,7 +380,9 @@ pub fn display(arg: &str) -> String {
         match c {
             '\'' => out.push_str("\\'"),
             '\\' => out.push_str("\\\\"),
-            ' '..='~' => out.push(c),
+            // A backtick could end a code block on a surface that renders
+            // markdown, and show the rest of the command as something else.
+            ' '..='_' | 'a'..='~' => out.push(c),
             _ => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
         }
     }
@@ -448,11 +451,14 @@ fn stage(store: &Store, args: &Value) -> Result<Value> {
         }
         None => crate::mail::outcome_id(store, "privileged")?,
     };
-    // Herdr's launch words are the only way the bridge opens a run.
+    // Herdr's launch words are the only way the bridge opens a run, and a
+    // phone's button carries the id in at most 64 bytes.
     ensure!(
-        id.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)),
-        "a privileged request id uses only letters, digits, '-', '_' and '.'"
+        id.len() <= MAX_ID_BYTES
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)),
+        "a privileged request id is at most {MAX_ID_BYTES} letters, digits, '-', '_' and '.'"
     );
     let machine = crate::machines::this_machine();
     let program = checked.program.to_str().context("program path")?.to_owned();
@@ -1088,6 +1094,16 @@ pub(crate) fn door_answer(args: &Value) -> Result<Value> {
                             .is_some_and(|a| a.contains(&json!(verb))),
                     "{id} cannot be answered now (expired, changed or not approvable here)"
                 );
+                // The hash the captain's phone showed, when it names one: a
+                // grant answers that command and no other.
+                if let Some(shown) = args.get("hash").filter(|v| !v.is_null()) {
+                    let shown = shown.as_str().context("hash must be a string")?;
+                    let hash = item["privileged"]["hash"].as_str().unwrap_or("");
+                    ensure!(
+                        shown.len() >= CONFIRM_CHARS && hash.starts_with(shown),
+                        "{id} changed since your phone showed it; nothing was answered"
+                    );
+                }
                 let mut answer = json!({"request_id": id, "expected_version": item["version"],
                     "task_id": item["task_id"], "artifact": item["artifact"],
                     "environment": item["environment"], "approver": crate::mail::CAPTAIN});
@@ -1174,5 +1190,63 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             "privileged.run runs only from the captain's terminal: privateer privileged run ID"
         ),
         _ => bail!("unknown command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_quotes_anything_odd_and_escapes_backticks_and_non_ascii() {
+        assert_eq!(display("/usr/bin/id"), "/usr/bin/id");
+        assert_eq!(display(""), "''");
+        assert_eq!(display("a b"), "'a b'");
+        assert_eq!(display("it's"), "'it\\'s'");
+        assert_eq!(display("```"), "'\\u{60}\\u{60}\\u{60}'");
+        assert_eq!(display("caf\u{e9}"), "'caf\\u{e9}'");
+        assert_eq!(display("\u{202e}rtl"), "'\\u{202e}rtl'");
+    }
+
+    #[test]
+    fn refused_programs_match_exact_names_and_prefixes() {
+        for name in [
+            "sh",
+            "env",
+            "sudo",
+            "python3.12",
+            "perl5.38",
+            "vim",
+            "php8",
+            "lua5.4",
+        ] {
+            assert!(refused_class(name).is_some(), "{name}");
+        }
+        for name in ["id", "systemctl", "apt-get", "shred", "envsubst", "suspend"] {
+            assert!(refused_class(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_binding_is_canonical_and_covers_every_field() {
+        let args = vec!["-u".to_owned()];
+        let base = binding("r", "apps", "t", "m", "/usr/bin/id", "aa", &args, "/");
+        assert_eq!(
+            base.to_string(),
+            r#"{"argv":["/usr/bin/id","-u"],"cwd":"/","machine":"m","program":"/usr/bin/id","program_sha256":"aa","request_id":"r","ship":"apps","task_id":"t","v":1}"#
+        );
+        let hash = crate::core::hash(&base);
+        for other in [
+            binding("r2", "apps", "t", "m", "/usr/bin/id", "aa", &args, "/"),
+            binding("r", "infra", "t", "m", "/usr/bin/id", "aa", &args, "/"),
+            binding("r", "apps", "t2", "m", "/usr/bin/id", "aa", &args, "/"),
+            binding("r", "apps", "t", "m2", "/usr/bin/id", "aa", &args, "/"),
+            binding("r", "apps", "t", "m", "/usr/bin/ls", "aa", &args, "/"),
+            binding("r", "apps", "t", "m", "/usr/bin/id", "bb", &args, "/"),
+            binding("r", "apps", "t", "m", "/usr/bin/id", "aa", &[], "/"),
+            binding("r", "apps", "t", "m", "/usr/bin/id", "aa", &args, "/tmp"),
+        ] {
+            assert_ne!(crate::core::hash(&other), hash, "{other}");
+        }
     }
 }

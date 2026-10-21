@@ -290,11 +290,13 @@ class Door:
                   "typed": typed}
         markup = self.decision_markup(mail) if kind == "decision" else None
         if privileged is not None:
-            # Only the runtime writes this kind; the buttons answer it through
+            # The hash this card shows rides the button, so a tap answers
+            # this exact command. Only the runtime writes this kind; the buttons answer it through
             # the door's approval command, never as a reply.
+            shown = str(privileged.get("hash", ""))[:8]
             markup = {"inline_keyboard": [[
-                {"text": "Approve", "callback_data": f"pa:{mail.get('id')}:grant"},
-                {"text": "Deny", "callback_data": f"pa:{mail.get('id')}:deny"}]]}
+                {"text": "Approve", "callback_data": f"pa:{mail.get('id')}:g:{shown}"},
+                {"text": "Deny", "callback_data": f"pa:{mail.get('id')}:d:{shown}"}]]}
             typed = True
         pieces = tg.split_markdown(body, TEXT_LIMIT) or [body]
         markdown = self.cfg.get("markdown", True)
@@ -525,9 +527,12 @@ class Door:
             tg.write_state(TARGET, {"ship": ship})
             self.say(f"➡️ plain messages now go to {ship}. /to default resets.", quiet=True)
         elif data.startswith("pa:"):
-            _, mail_id, action = data.split(":", 2)
+            # Telegram carries at most 64 bytes: the id, g or d, the hash's start.
+            _, mail_id, code, shown = (data.split(":", 3) + [""])[:4]
+            action = {"g": "grant", "d": "deny"}.get(code, code)
             try:
-                result = self.runtime.call("approval", {"id": mail_id, "action": action})
+                result = self.runtime.call("approval", {"id": mail_id, "action": action,
+                                                        "hash": shown or None})
             except RuntimeError as e:
                 self.say(f"⚠️ not answered: {e}", reply_to=msg.get("message_id"))
                 return
@@ -1022,7 +1027,7 @@ def shown_arg(arg) -> str:
             out.append("\\'")
         elif c == "\\":
             out.append("\\\\")
-        elif " " <= c <= "~":
+        elif " " <= c <= "~" and c != "`":
             out.append(c)
         else:
             out.append("\\u{%x}" % ord(c))
@@ -1032,9 +1037,10 @@ def shown_arg(arg) -> str:
 def privileged_text(staged: dict) -> str:
     """The exact command, one argument per line, then where, why and its hash."""
     argv = "\n".join(shown_arg(a) for a in staged.get("argv") or [])
+    reason = str(staged.get("reason", "")).replace("`", "'")
     return (f"**Run as root on {staged.get('machine', '?')}**\n```\n{argv}\n```\n"
             f"in `{shown_arg(staged.get('cwd', ''))}`\n"
-            f"Reason: {staged.get('reason', '')}\n"
+            f"Reason: {reason}\n"
             f"Hash `{staged.get('hash', '')}`")
 
 

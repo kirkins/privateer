@@ -527,6 +527,9 @@ fn staging_refuses_each_class_of_command() {
         &|a| a["program"] = json!(open),
         "writable by group or others",
     );
+    // An id too long for a phone's button, or not a launch word.
+    refused(&|a| a["id"] = json!("x".repeat(49)), "at most 48");
+    refused(&|a| a["id"] = json!("a:b"), "at most 48");
     // Another ship's task.
     refused(&|a| a["task_id"] = json!("nope"), "nope");
     // Nothing was staged.

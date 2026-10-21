@@ -33,9 +33,15 @@ for line in sys.stdin:
     if message["type"] == "mail" and "hold" not in message["mail"]["body"]:
         print(json.dumps({"type": "delivered", "ref": message["ref"]}), flush=True)
     # The captain taps Approve on anything that asks for an approval.
+    # A tap carries the hash the phone showed; a stale one answers nothing.
     if message["type"] == "mail" and message["mail"].get("request_kind"):
-        ask("approve-" + message["mail"]["id"], "approval",
-            {"id": message["mail"]["id"], "action": "grant"})
+        mail = message["mail"]
+        shown = ((mail.get("payload") or {}).get("privileged") or {}).get("hash", "")[:8]
+        if shown:
+            ask("stale-" + mail["id"], "approval",
+                {"id": mail["id"], "action": "grant", "hash": "00000000"})
+        ask("approve-" + mail["id"], "approval",
+            {"id": mail["id"], "action": "grant", "hash": shown or None})
 "#;
 
 struct Fleet {
@@ -521,6 +527,15 @@ fn the_door_approves_a_privileged_command_but_never_a_production_approval() {
         .then(|| e.to_vec())
     });
     stop(supervisor);
+    let stale = response(&entries, &format!("stale-{privileged_id}")).unwrap();
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert!(
+        stale["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed since your phone showed it"),
+        "{stale}"
+    );
     let granted = response(&entries, &format!("approve-{privileged_id}")).unwrap();
     assert_eq!(granted["ok"], true, "{granted}");
     assert_eq!(granted["result"]["action"], "approval.grant");
