@@ -357,6 +357,130 @@ fn a_hedged_reply_records_nothing_and_says_why() {
     assert!(rows(&mut store).is_empty());
 }
 
+#[test]
+fn only_a_plain_yes_or_the_actions_own_words_record() {
+    let (_temp, mut store) = home();
+    let not_plain =
+        json!({"recorded":false,"why":"reply was not a plain yes; ask again with a decision"});
+    for (i, body) in [
+        "n",
+        "nvm",
+        "nogo",
+        "nein",
+        "hmm",
+        "yes after CI",
+        "yes when tests pass",
+        "go once green",
+        "after lunch",
+        "tomorrow",
+        "next week",
+        "yes for staging",
+        "show me the diff",
+        "why",
+        "what is this",
+        "let me check",
+        "hang on",
+        "thanks",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("q-loose-{i}");
+        ask(&mut store, &id);
+        let approval = &reply(&mut store, &id, body)["payload"]["approval"];
+        assert_eq!(*approval, not_plain, "{body}");
+    }
+    // Every apostrophe form of "don't" is the refusal it reads as.
+    for (i, body) in ["Don\u{2018}t", "Don`t", "Don\u{2bc}t", "Don't"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("q-dont-{i}");
+        ask(&mut store, &id);
+        let approval = &reply(&mut store, &id, body)["payload"]["approval"];
+        assert_eq!(approval["recorded"], false, "{body}");
+        assert!(
+            approval["why"].as_str().unwrap().contains("don't"),
+            "{body}"
+        );
+    }
+    assert!(rows(&mut store).is_empty());
+    for (i, body) in [
+        "Submit build 55",
+        "yes",
+        "ok do it",
+        "Go ahead",
+        "Approved",
+        "lgtm",
+        "yes please",
+        "ok, submit it",
+        "TestFlight build 55",
+        "Yes, ship it now. Thanks!",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("q-yes-{i}");
+        ask(&mut store, &id);
+        let approval = reply(&mut store, &id, body)["payload"]["approval"].clone();
+        assert_eq!(approval["recorded"], true, "{body}: {approval}");
+        // Keep under the live cap.
+        dispatch(
+            &mut store,
+            "captain_approval.revoke",
+            json!({"id":approval["id"]}),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn a_ships_own_buttons_cannot_ride_an_approving_request() {
+    let (_temp, mut store) = home();
+    // The dashboard sends a tapped choice back as the reply's text, so
+    // "Pass" would otherwise answer an approving request.
+    refused(
+        ask_with(&mut store, "q-buttons", |a| {
+            a["payload"]["choices"] = json!(["Go", "Pass"])
+        }),
+        "use kind decision with an approving option for buttons",
+    );
+    // Without approves, a request keeps its plain choices.
+    ask_with(&mut store, "q-plain", |a| {
+        a["payload"] = json!({"choices": ["Go", "Pass"]})
+    })
+    .unwrap();
+    // A decision's choices are its labels, and a tap that sends a label
+    // without an option id records nothing.
+    let sent = decision(&mut store, "d-tap", ship_or_hold(), true).unwrap();
+    assert_eq!(sent["payload"]["choices"], json!(["Ship it", "Hold"]));
+    for (i, label) in ["Ship it", "Hold"].iter().enumerate() {
+        let id = format!("d-tap-{i}");
+        decision(&mut store, &id, ship_or_hold(), true).unwrap();
+        let approval = &reply(&mut store, &id, label)["payload"]["approval"];
+        assert_eq!(approval["recorded"], false, "{label}: {approval}");
+    }
+    // An approving option tapped with words that are not a plain yes records nothing.
+    for (id, body, recorded) in [
+        ("d-label", "Ship it", true),
+        ("d-later", "yes after CI", false),
+        ("d-staging", "for staging", false),
+    ] {
+        decision(&mut store, id, ship_or_hold(), true).unwrap();
+        let answered = send(
+            &mut store,
+            json!({"from":"captain","to":"apps","kind":"reply","correlation":id,"body":body,
+                "payload":{"answer":{"option_id":"ship"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            answered["payload"]["approval"]["recorded"], recorded,
+            "{id}: {answered}"
+        );
+    }
+    assert_eq!(rows(&mut store).len(), 1);
+}
+
 fn decision(store: &mut Store, id: &str, options: Value, approves: bool) -> anyhow::Result<Value> {
     let mut payload = json!({"decision":{"question":"Ship build 55?","options":options}});
     if approves {

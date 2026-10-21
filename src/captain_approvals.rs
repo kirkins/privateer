@@ -431,7 +431,9 @@ fn hedged(text: &str) -> Option<String> {
         .iter()
         .find(|refusal| {
             let parts: Vec<&str> = refusal.split(' ').collect();
-            words.windows(parts.len()).any(|w| w.iter().eq(parts.iter()))
+            words
+                .windows(parts.len())
+                .any(|w| w.iter().eq(parts.iter()))
         })
         .map(|w| (*w).to_owned())
         .or_else(|| {
@@ -526,7 +528,11 @@ pub(crate) fn record(
                 "the captain's reply carries \"{word}\", so it is not a plain yes and nothing was approved; ask again with a decision"
             ));
         }
-        if !plain(&text, &words(approves["action"].as_str().unwrap_or_default()), true) {
+        if !plain(
+            &text,
+            &words(approves["action"].as_str().unwrap_or_default()),
+            true,
+        ) {
             return skip(NOT_PLAIN);
         }
         "reply"
@@ -819,6 +825,57 @@ mod tests {
         for wordless in ["👎", "👍", "❌", "✋", "!!", "55"] {
             assert!(!worded(wordless), "{wordless}");
         }
+    }
+
+    #[test]
+    fn a_reply_is_plain_only_in_yes_words_or_the_actions_own() {
+        let own = words("Submit build 55 to TestFlight");
+        for yes in [
+            "Submit build 55",
+            "yes",
+            "ok do it",
+            "Go ahead",
+            "Approved",
+            "lgtm",
+            "yes please",
+            "ok, submit it",
+            "Y",
+            "K",
+        ] {
+            assert!(plain(yes, &own, true), "{yes}");
+        }
+        for loose in [
+            "n",
+            "nvm",
+            "nogo",
+            "nein",
+            "hmm",
+            "yes after CI",
+            "yes when tests pass",
+            "go once green",
+            "after lunch",
+            "tomorrow",
+            "next week",
+            "yes for staging",
+            "show me the diff",
+            "why",
+            "what is this",
+            "let me check",
+            "hang on",
+            "thanks",
+            "please",
+            "submit it",
+        ] {
+            assert!(!plain(loose, &own, true), "{loose}");
+        }
+        // Beside a chosen option, the option itself is the yes.
+        assert!(plain("thanks", &own, false));
+        assert!(!plain("after CI", &own, false));
+        for dont in ["Don‘t", "Don`t", "Donʼt", "Don’t", "DON'T"] {
+            assert_eq!(words(dont), ["don't"], "{dont}");
+            assert_eq!(hedged(dont).as_deref(), Some("don't"), "{dont}");
+        }
+        assert_eq!(words("'ok', ship it!"), ["ok", "ship", "it"]);
     }
 
     #[test]
