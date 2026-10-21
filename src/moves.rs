@@ -252,6 +252,55 @@ fn projects(folder: &Path) -> Result<(Vec<Value>, Vec<String>)> {
     Ok((found, problems))
 }
 
+/// What cloning a ship's projects afresh puts on disk: each project's git
+/// objects and its tracked files, without the build caches and other ignored
+/// files a folder gathers. A project git cannot read counts whole.
+pub(crate) fn clone_bytes(folder: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(folder.join("projects")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| {
+            let path = e.path();
+            cloned_bytes(&path).unwrap_or_else(|| crate::placement::tree_bytes(&path))
+        })
+        .sum()
+}
+
+fn cloned_bytes(project: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let git = |args: &[&str]| -> Option<Vec<u8>> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    // Loose and packed objects, in KiB.
+    let counted = String::from_utf8(git(&["count-objects", "-v"])?).ok()?;
+    let objects: u64 = counted
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| matches!(*key, "size" | "size-pack"))
+        .filter_map(|(_, kib)| kib.trim().parse::<u64>().ok())
+        .sum();
+    let tracked: u64 = git(&["ls-files", "-z"])?
+        .split(|b| *b == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| {
+            fs::symlink_metadata(project.join(std::ffi::OsStr::from_bytes(name))).ok()
+        })
+        .map(|m| m.len())
+        .sum();
+    Some(objects * 1024 + tracked)
+}
+
 /// Runtime files that belong to the machine rather than the ship.
 fn skipped(relative: &Path) -> bool {
     let parts: Vec<String> = relative

@@ -615,10 +615,13 @@ pub(crate) fn eligibility(conn: &Connection, ship: &str, now: i64) -> Result<Val
         None
     };
     let folder = member.home.parent().context("ship folder")?;
+    // All of it is freed here; only what a clone puts there is needed there.
     let project_bytes = tree_bytes(&folder.join("projects"));
+    let clone_bytes = crate::moves::clone_bytes(folder);
     Ok(
         json!({"ship": ship, "eligible": reasons.is_empty(), "reasons": reasons,
         "folder_bytes": inspected["folder_bytes"], "project_bytes": project_bytes,
+        "clone_bytes": clone_bytes,
         "project_count": inspected["project_count"], "requires": inspected["requires"],
         "first_mate": inspected["first_mate"], "projects": inspected["projects"],
         "last_worked_ms": last_worked, "jobs_last_day": jobs_last_day(&store, now)}),
@@ -657,9 +660,19 @@ fn names(value: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The disk a move of an eligibility report needs on its target.
+/// The disk a move of an eligibility report, or of what a proposal carries,
+/// needs on its target: the folder and what cloning its projects puts there,
+/// not the build caches it gathered here. A report without the clone size
+/// counts the projects whole.
 fn needed(eligible: &Value) -> u64 {
-    eligible["folder_bytes"].as_u64().unwrap_or(0) + eligible["project_bytes"].as_u64().unwrap_or(0)
+    eligible["folder_bytes"].as_u64().unwrap_or(0) + cloned(eligible)
+}
+
+fn cloned(eligible: &Value) -> u64 {
+    eligible["clone_bytes"]
+        .as_u64()
+        .or_else(|| eligible["project_bytes"].as_u64())
+        .unwrap_or(0)
 }
 
 /// Each machine at the other end of one of this machine's links, and
@@ -895,7 +908,8 @@ fn propose(store: &Store, args: &Value) -> Result<Value> {
             "free_disk_bytes": free, "floor_bytes": floor},
         "carries": {"requires": requires, "first_mate": eligible["first_mate"],
             "projects": eligible["projects"], "folder_bytes": eligible["folder_bytes"],
-            "project_bytes": eligible["project_bytes"], "project_count": eligible["project_count"]},
+            "project_bytes": eligible["project_bytes"], "clone_bytes": eligible["clone_bytes"],
+            "project_count": eligible["project_count"]},
         "last_worked_ms": eligible["last_worked_ms"]});
     let mut proposal = Proposal {
         id: id.clone(),
@@ -1002,7 +1016,7 @@ fn write_decision(owner_store: &Store, proposal: &Proposal) -> Result<()> {
     } else {
         format!(
             "its projects are cloned again on {to} (about {} there)",
-            size(projects)
+            size(cloned(carries))
         )
     };
     let question = format!("Move {ship} from {from} to {to}?");
@@ -1034,7 +1048,8 @@ fn write_decision(owner_store: &Store, proposal: &Proposal) -> Result<()> {
         ]},
         "placement": {"id": proposal.id, "ship": ship, "from": from, "to": to,
             "pressure": {"key": pressure["key"], "held_secs": pressure["held_secs"]},
-            "folder_bytes": folder, "project_bytes": projects, "project_count": count,
+            "folder_bytes": folder, "project_bytes": projects,
+            "clone_bytes": cloned(carries), "project_count": count,
             "check": record["check"], "binding": record["binding"]}
     });
     crate::mail::typed_payload("decision", &mut payload)?;
@@ -1377,9 +1392,7 @@ fn accept_check(conn: &Connection, from: &str, id: &str, answer: &Value) -> Resu
         return Ok(());
     }
     ensure!(answer.is_object(), "a check answer is an object");
-    let carries = &proposal.record["carries"];
-    let bytes = carries["folder_bytes"].as_u64().unwrap_or(0)
-        + carries["project_bytes"].as_u64().unwrap_or(0);
+    let bytes = needed(&proposal.record["carries"]);
     if let Some(refused) = check_refusal(answer, bytes, from) {
         conclude(conn, id, "unfit", json!({"why": refused}))?;
         return Ok(());
@@ -2123,6 +2136,45 @@ mod tests {
             .unwrap();
         restart_clocks(&conn).unwrap();
         assert!(pressed(&conn).unwrap()[0].since_ms > 1);
+    }
+
+    #[test]
+    fn the_room_needed_counts_what_a_clone_puts_there_not_build_caches() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("projects/app");
+        fs::create_dir_all(app.join("target")).unwrap();
+        fs::write(app.join(".gitignore"), "target/\n").unwrap();
+        fs::write(app.join("main.rs"), vec![b'x'; 4096]).unwrap();
+        fs::write(app.join("target/cache"), vec![0u8; 4 << 20]).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&app)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        // A folder git cannot read counts whole.
+        let notes = temp.path().join("projects/notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("a"), vec![0u8; 1000]).unwrap();
+        let all = tree_bytes(&temp.path().join("projects"));
+        let clone = crate::moves::clone_bytes(temp.path());
+        assert!(all > 4 << 20, "{all}");
+        assert!(clone >= 4096 + 1000 && clone < 1 << 20, "{clone}");
+        let report = json!({"folder_bytes": 10, "project_bytes": all, "clone_bytes": clone});
+        assert_eq!(needed(&report), 10 + clone);
+        // An older report without it counts the projects whole.
+        assert_eq!(
+            needed(&json!({"folder_bytes": 10, "project_bytes": all})),
+            10 + all
+        );
     }
 
     #[test]
