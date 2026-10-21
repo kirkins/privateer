@@ -122,12 +122,15 @@ home on this machine. A copy carried to a desk on another machine is shown
 with no actions, because the program file, the sudo and the terminal are on
 the machine that staged it.
 
-The door's new request, `{"command":"approval","args":{"id","action"}}`,
+The door's new request, `{"command":"approval","args":{"id","action","hash"?}}`,
 finds the home on this machine that holds the request and re-reads its needs
 item. It then dispatches the item's own grant or deny with `request_id` and
 `expected_version`, as the captain. It refuses every kind but
 `privileged_action`, so production approvals do not quietly become
-approvable from the phone.
+approvable from the phone. When `hash` is given (the Telegram buttons carry the first 8
+characters of the hash the card showed), the item's hash must start with it,
+so a tap answers the command the captain read and no other. Request ids are at
+most 48 bytes, so the button's data fits Telegram's 64.
 
 ## Run
 
