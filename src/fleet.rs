@@ -576,11 +576,24 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
             "ship home changed since selection; refresh before retiring"
         );
     }
+    let mut waits = Value::Null;
     let dispatcher = if member.home.is_dir() {
         let mut target = Store::open(&member.home)?;
         if target.charter(name).is_ok() {
             crate::core::dispatch(&mut target, "charter.revoke", json!({"id": name}))?;
         }
+        // Its cross-ship waits end before it stops delivering: subscribers
+        // are told it retired, its own subscriptions are withdrawn, and the
+        // outbox gets a bounded chance to carry them. What a peer cannot
+        // take in time stays queued; the far side then sees a stale wait.
+        waits = match crate::waits::retire(&target, name) {
+            Ok(mut retired) => {
+                retired["drain"] = crate::mail::drain(&target, name, RETIRE_DRAIN)
+                    .unwrap_or_else(|error| json!({"error": format!("{error:#}")}));
+                retired
+            }
+            Err(error) => json!({"error": format!("{error:#}")}),
+        };
         crate::service::stop(&member.home, name)
             .unwrap_or_else(|error| format!("could not stop its dispatcher: {error:#}"))
     } else {
@@ -610,9 +623,12 @@ fn retire(store: &mut Store, args: &Value) -> Result<Value> {
     let directory = crate::machines::announce(Some(&*store));
     Ok(
         json!({"ship": name, "retired": true, "dispatcher": dispatcher,
-        "folder_kept": member.home.parent(), "directory": directory}),
+        "folder_kept": member.home.parent(), "directory": directory, "waits": waits}),
     )
 }
+
+/// How long a retiring ship's outbox may take to drain.
+const RETIRE_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Set the actions of a ship's charter. An agent may change only ships it
 /// created, and only to actions its own charter has: granting never widens

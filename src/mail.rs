@@ -107,6 +107,11 @@ const WAIT_KEYS: [&str; 4] = [
     "wait_closed",
 ];
 
+/// The cross-ship wait instruction a payload carries, if any.
+pub(crate) fn wait_notice(payload: &Value) -> Option<&'static str> {
+    WAIT_KEYS.into_iter().find(|key| payload.get(*key).is_some())
+}
+
 /// Where a ship's mailbox lives: None for this home, Some(peer) for another.
 fn remote_peer(ship: &Value) -> Option<&str> {
     ship["location"]["peer"].as_str()
@@ -1450,6 +1455,8 @@ enum Delivery {
     Delivered,
     Failed,
     Quarantined,
+    /// A refused wait notice, never retried; see `waits::refused`.
+    Dropped,
 }
 
 /// Classify a legacy wire-invalid record without changing its facts or
@@ -1505,13 +1512,22 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         quarantine(store, id, wire_bytes)?;
         return Ok(Delivery::Quarantined);
     }
-    let response = crate::peers::call_peer_with_timeout(
+    // A wait notice is the runtime's, whoever's flush carries it: the
+    // receiving home accepts one only from the runtime. Only the runtime
+    // authors one, since `mail.send` refuses its keys.
+    let notice = wait_notice(&message["payload"]);
+    let response = crate::peers::call_peer_as(
         store,
         peer,
         &format!("deliver-{}", uuid::Uuid::new_v4()),
         "mail.deliver",
         envelope,
         timeout,
+        if notice.is_some() {
+            &Caller::Operator
+        } else {
+            store.caller()
+        },
     );
     // A peer that answered and refused the message, as opposed to one that
     // could not be reached; only a refusal is the captain's to hear about.
@@ -1586,6 +1602,15 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         crate::waits::unheard(store, peer)
     } {
         eprintln!("privateer: could not record link {peer}: {error:#}");
+    }
+    // A refused wait notice is dropped: left pending it would hold back every
+    // later message to that peer, and its subscription is gone either way.
+    if let Some(reason) = refusal.as_deref().filter(|_| notice.is_some()) {
+        let tx = store.write_transaction()?;
+        crate::waits::refused(store, &message, reason)?;
+        tx.execute("DELETE FROM mail_delivery_retry WHERE peer=?1", [peer])?;
+        tx.commit()?;
+        return Ok(Delivery::Dropped);
     }
     // A captain's message the peer refused is quarantined: left pending it
     // would hold back every later message to that peer, and retrying a refusal
@@ -1666,6 +1691,18 @@ fn flush_pending(
         Caller::Agent { actor } => Some(actor.clone()),
         Caller::Operator => None,
     };
+    flush_from(store, sender, max_attempts, manual, budget, only_peer)
+}
+
+/// Deliver `sender`'s pending mail, or every ship's when None.
+fn flush_from(
+    store: &Store,
+    sender: Option<String>,
+    max_attempts: i64,
+    manual: bool,
+    budget: Option<Duration>,
+    only_peer: Option<&str>,
+) -> Result<Value> {
     let deadline = budget.map(|budget| Instant::now() + budget);
     // Mail behind a collected peer waits for its machine to take it.
     let collected = json!(crate::peers::collected(store)?).to_string();
@@ -1709,7 +1746,7 @@ fn flush_pending(
                 attempted += 1;
                 failed.push(peer);
             }
-            Delivery::Quarantined => {}
+            Delivery::Quarantined | Delivery::Dropped => {}
         }
     }
     let (pending, quarantined): (i64, i64) = store.connection().query_row(
@@ -1776,6 +1813,20 @@ pub(crate) fn collected(
         )?;
     }
     for (id, error) in refused {
+        // A refused wait notice is dropped, as on a delivery this home makes.
+        if let Some(message) = by_id(store, id)?.filter(|m| {
+            m["delivery"] == "pending"
+                && wait_notice(&m["payload"]).is_some()
+                && ship(store, m["to"].as_str().unwrap_or(""))
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .and_then(remote_peer)
+                    == Some(peer)
+        }) {
+            changed += usize::from(crate::waits::refused(store, &message, error)?);
+            continue;
+        }
         changed += tx.execute(
             &format!(
                 "UPDATE mail SET delivery='quarantined', delivery_attempts=delivery_attempts+1,
@@ -2133,6 +2184,37 @@ pub(crate) fn flush_dispatcher(store: &Store, budget: Duration) -> Result<Value>
     flush_pending(store, 50, false, Some(budget), None)
 }
 
+/// Deliver `ship`'s outbox until it is empty or `budget` runs out, retrying
+/// an unreachable peer between passes: a retiring ship's last notices go
+/// before its dispatcher stops. Mail still pending at the end stays queued,
+/// as does mail a collecting machine takes on its own schedule.
+pub(crate) fn drain(store: &Store, ship: &str, budget: Duration) -> Result<Value> {
+    let deadline = Instant::now() + budget;
+    let collected = json!(crate::peers::collected(store)?).to_string();
+    let mut delivered = 0;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let pass = flush_from(store, Some(ship.to_owned()), 50, true, Some(left), None)?;
+        delivered += pass["delivered"].as_i64().unwrap_or(0);
+        let pending: i64 = store.connection().query_row(
+            "SELECT COUNT(*) FROM mail m JOIN ships s ON s.name=m.recipient
+             WHERE m.delivery='pending' AND m.sender=?1
+               AND json_extract(s.record, '$.location.peer') NOT IN (SELECT value FROM json_each(?2))",
+            params![ship, collected],
+            |r| r.get(0),
+        )?;
+        if pending == 0 || Instant::now() >= deadline {
+            return Ok(json!({"delivered": delivered, "pending": pending}));
+        }
+        std::thread::sleep(
+            DRAIN_RETRY.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+/// How long a drain waits before trying an unreachable peer again.
+const DRAIN_RETRY: Duration = Duration::from_millis(500);
+
 /// Application evidence, including on redelivery after a lost transport ack.
 /// Read the stored closure, not an untrusted duplicate envelope's payload.
 fn closure_receipt(store: &Store, closure: &Value) -> Result<Value> {
@@ -2230,6 +2312,12 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             "wait notices go between ships"
         );
         ensure!(waits == 1, "a notice carries one wait instruction");
+        // The sending runtime delivers these as itself, whoever's flush
+        // carried them, so an agent caller can only be forging one.
+        ensure!(
+            matches!(store.caller(), Caller::Operator),
+            "wait notices come from the runtime"
+        );
         // The owner's side answers subscriptions; the waiting side checks a
         // report against its waits, and the machine that carried it.
         if payload.get("wait_subscribe").is_some() || payload.get("wait_unsubscribe").is_some() {
@@ -2557,8 +2645,8 @@ fn outbox(store: &Store, args: &Value) -> Result<Value> {
     };
     let delivery = optional_str(args, "delivery")?;
     ensure!(
-        delivery.is_none_or(|d| matches!(d, "pending" | "quarantined" | "delivered")),
-        "delivery must be pending, quarantined or delivered"
+        delivery.is_none_or(|d| matches!(d, "pending" | "quarantined" | "delivered" | "dropped")),
+        "delivery must be pending, quarantined, delivered or dropped"
     );
     let after = args
         .get("after_seq")
@@ -2569,7 +2657,7 @@ fn outbox(store: &Store, args: &Value) -> Result<Value> {
     let mut statement = store.connection().prepare(
         "SELECT seq,id,sender,recipient,kind,correlation,task_id,request_kind,urgency,
            deadline_ms,created_ms,state,delivery,delivery_attempts,substr(delivery_error,1,1024),delivered_ms
-         FROM mail WHERE delivery IN ('pending','quarantined','delivered')
+         FROM mail WHERE delivery IN ('pending','quarantined','delivered','dropped')
            AND (?1 IS NULL OR sender=?1) AND (?2 IS NULL OR delivery=?2) AND seq>?3
          ORDER BY seq LIMIT ?4",
     )?;

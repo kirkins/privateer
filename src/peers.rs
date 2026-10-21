@@ -380,6 +380,20 @@ pub(crate) fn call_peer_with_timeout(
     args: Value,
     timeout: Option<Duration>,
 ) -> Result<Value> {
+    call_peer_as(store, name, id, command, args, timeout, store.caller())
+}
+
+/// As `call_peer_with_timeout`, carrying `caller` rather than this store's:
+/// the runtime delivering what it authored for a ship.
+pub(crate) fn call_peer_as(
+    store: &Store,
+    name: &str,
+    id: &str,
+    command: &str,
+    args: Value,
+    timeout: Option<Duration>,
+    caller: &Caller,
+) -> Result<Value> {
     init(store)?;
     token(name, 64, "peer name")?;
     let config: String = store
@@ -402,7 +416,7 @@ pub(crate) fn call_peer_with_timeout(
             .timeout_ms
             .min(timeout.as_millis().clamp(1, 120_000) as u64);
     }
-    let response = call(&peer, id, command, args, store.caller())?;
+    let response = call(&peer, id, command, args, caller)?;
     store.audit(
         "peer.called",
         &json!({"name":name,"command":command,"correlation_id":id,"ok":response["ok"]}),

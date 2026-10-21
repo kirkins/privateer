@@ -231,6 +231,14 @@ pub(crate) fn resubscribe(store: &Store, peer: &str) -> Result<usize> {
             let Some(far) = live(&work) else {
                 continue;
             };
+            // Work whose charter was revoked (its ship retired, say) no
+            // longer runs, and its retirement already unsubscribed it.
+            if !matches!(
+                store.observe_active_charter(&work.task_id, |_| Ok(())),
+                Ok(Some(_))
+            ) {
+                continue;
+            }
             if work.subscription.is_none() {
                 work.subscription = Some(Subscription {
                     nonce: uuid::Uuid::new_v4().simple().to_string(),
@@ -246,6 +254,53 @@ pub(crate) fn resubscribe(store: &Store, peer: &str) -> Result<usize> {
                 "wait_subscribe",
                 work.subscription.as_ref(),
                 true,
+            )?;
+            sent += 1;
+        }
+        match ids.last() {
+            Some(last) if ids.len() as i64 == PAGE => after.clone_from(last),
+            _ => return Ok(sent),
+        }
+    }
+}
+
+/// Ship `ship` is being retired: send `wait_unsubscribe` for each live
+/// remote wait it holds, with the nonce it holds, in the caller's
+/// transaction. The schedules are left as they are: with the charter revoked
+/// they no longer run. Returns how many were sent.
+pub(crate) fn unsubscribe_all(store: &Store, ship: &str) -> Result<usize> {
+    if !available(store)? {
+        return Ok(0);
+    }
+    let mut sent = 0;
+    let mut after = String::new();
+    loop {
+        let mut statement = store.connection().prepare(
+            "SELECT task_id FROM task_schedule
+             WHERE json_extract(record,'$.owner')=?1 AND json_extract(record,'$.state')='waiting'
+               AND json_extract(record,'$.wait.kind')='remote'
+               AND json_extract(record,'$.wait.end') IS NULL AND task_id>?2
+             ORDER BY task_id LIMIT ?3",
+        )?;
+        let ids = statement
+            .query_map(params![ship, after, PAGE], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for id in &ids {
+            let Some(work) = load(store, id)? else {
+                continue;
+            };
+            let Some(far) = live(&work) else {
+                continue;
+            };
+            notice(
+                store,
+                &work.owner,
+                &work.task_id,
+                &far,
+                "wait_unsubscribe",
+                work.subscription.as_ref(),
+                false,
             )?;
             sent += 1;
         }

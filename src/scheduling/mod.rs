@@ -74,7 +74,7 @@ pub(crate) use delivery::tick;
 pub(crate) use observation::{fault_item, snapshot};
 pub(crate) use remote::{
     STALE_SECS as REMOTE_WAIT_STALE_SECS, deliver_notice as remote_notice, resubscribe, settle,
-    stale_item as remote_wait_item, stale_where as remote_wait_stale_where,
+    stale_item as remote_wait_item, stale_where as remote_wait_stale_where, unsubscribe_all,
 };
 
 pub(crate) fn init(store: &Store) -> Result<()> {
@@ -161,17 +161,31 @@ fn finish_wake(store: &Store, work: &Scheduled, status: &str, now: i64) -> Resul
 /// nothing new. The first fault of a revision keeps the original id.
 fn fault(store: &Store, work: &mut Scheduled, reason: impl Into<String>, now: i64) -> Result<()> {
     let reason: String = reason.into().chars().take(1000).collect();
+    let id = |faults: u32| match faults {
+        1 => format!("scheduling-fault-{}-{}", work.task_id, work.revision),
+        n => format!("scheduling-fault-{}-{}-{n}", work.task_id, work.revision),
+    };
+    // A schedule that faulted before faults were counted stores none, though
+    // its first notice was sent: count that one, or the next fault would
+    // reuse its id and be discarded.
+    if work.faults == 0 {
+        let sent: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1)",
+            [id(1)],
+            |r| r.get(0),
+        )?;
+        if sent {
+            work.faults = 1;
+        }
+    }
     let repeated = work.state == "fault" && work.reason.as_deref() == Some(reason.as_str());
     if !repeated || work.faults == 0 {
         work.faults = work.faults.saturating_add(1);
     }
+    let id = id(work.faults);
     work.state = "fault".into();
     work.reason = Some(reason);
     finish_wake(store, work, "failed", now)?;
-    let id = match work.faults {
-        1 => format!("scheduling-fault-{}-{}", work.task_id, work.revision),
-        n => format!("scheduling-fault-{}-{}-{n}", work.task_id, work.revision),
-    };
     crate::mail::record_crew(
         store.connection(),
         &json!({"id": id,

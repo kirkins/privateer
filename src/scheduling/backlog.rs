@@ -30,12 +30,16 @@ pub(super) fn init(store: &Store) -> Result<()> {
 }
 
 /// A task nothing will start, with the schedule revision it was seen at.
+#[derive(Clone)]
 struct Candidate {
     id: String,
     title: String,
     rank: Option<i64>,
     revision: u64,
     label: String,
+    /// A remote wait no report has ended: already deferred, so the advice
+    /// for it is to look at the far ship, not to defer it again.
+    stale: bool,
 }
 
 /// A ship's alarm row: the last fire, the spacing before the next, and what
@@ -196,6 +200,7 @@ fn candidates(store: &Store, ship: &str, duty: &str) -> Result<Vec<Candidate>> {
             rank,
             revision: revision.map_or(0, |r| r.max(0) as u64),
             label,
+            stale: false,
         });
     }
     // Remote waits no report has ended past the ship's staleness threshold:
@@ -244,6 +249,7 @@ fn candidates(store: &Store, ship: &str, duty: &str) -> Result<Vec<Candidate>> {
                 far["task"].as_str().unwrap_or(""),
                 far["ship"].as_str().unwrap_or("")
             ),
+            stale: true,
         });
     }
     Ok(set)
@@ -276,15 +282,26 @@ fn notice(set: &[Candidate], high: bool) -> String {
             set.len() - LISTED
         ));
     }
-    let first = if high {
-        "Attention is high: enqueue, defer, hand off or close only; do not start work in this conversation. Enqueued work goes to a fresh coordinator. For each"
-    } else {
-        "For each: write assignment:<id> and task.enqueue it; or"
-    };
-    text.push_str(&format!(
-        "{first}{} enqueue and task.defer with a real wait; or task.update status blocked with the reason in its task note; or task.handoff; or close it with evidence. This check does not need the captain; do not mail them about it.",
-        if high { ":" } else { "" }
-    ));
+    let stale = set.iter().any(|c| c.stale);
+    if set.iter().any(|c| !c.stale) {
+        let each = if stale { "For each other task" } else { "For each" };
+        let first = if high {
+            format!(
+                "Attention is high: enqueue, defer, hand off or close only; do not start work in this conversation. Enqueued work goes to a fresh coordinator. {each}:"
+            )
+        } else {
+            format!("{each}: write assignment:<id> and task.enqueue it; or")
+        };
+        text.push_str(&format!(
+            "{first} enqueue and task.defer with a real wait; or task.update status blocked with the reason in its task note; or task.handoff; or close it with evidence. "
+        ));
+    }
+    if stale {
+        text.push_str(
+            "A stale remote wait is already deferred and resumes on the far owner's report; do not defer or enqueue it again. Check the far ship and the link it rides (machine list, mail.outbox), or close or hand off the task if the dependency no longer applies. ",
+        );
+    }
+    text.push_str("This check does not need the captain; do not mail them about it.");
     text
 }
 
@@ -608,6 +625,7 @@ mod tests {
             rank: (n == 0).then_some(2),
             revision: 0,
             label: "unscheduled".into(),
+            stale: false,
         }
     }
 
@@ -627,6 +645,36 @@ mod tests {
         ));
         assert!(!high.contains("write assignment"));
         assert!(high.len() < 2_048, "{}", high.len());
+    }
+
+    #[test]
+    fn the_advice_for_a_stale_remote_wait_is_to_check_the_far_end_not_to_re_defer() {
+        let stale = Candidate {
+            id: "waiting-1".into(),
+            title: "Waits".into(),
+            rank: None,
+            revision: 1,
+            label: "stale remote wait: 120 min on far-work of apps, link not heard".into(),
+            stale: true,
+        };
+        for high in [false, true] {
+            let alone = notice(std::slice::from_ref(&stale), high);
+            assert!(!alone.contains("task.defer"), "{alone}");
+            assert!(!alone.contains("task.enqueue"), "{alone}");
+            assert!(!alone.contains("For each"), "{alone}");
+            assert!(alone.contains("do not defer or enqueue it again"), "{alone}");
+            assert!(alone.contains("Check the far ship and the link"), "{alone}");
+            assert!(alone.ends_with("do not mail them about it."), "{alone}");
+            // Beside other work, the usual advice is for the others only.
+            let mixed = notice(&[draft(1), stale.clone()], high);
+            assert!(mixed.contains("For each other task"), "{mixed}");
+            assert!(mixed.contains("task.defer with a real wait"), "{mixed}");
+            assert!(mixed.contains("do not defer or enqueue it again"), "{mixed}");
+        }
+        // Without one, the notice reads as before.
+        let plain = notice(&[draft(1)], false);
+        assert!(plain.contains("For each: write assignment"), "{plain}");
+        assert!(!plain.contains("stale remote wait is already"), "{plain}");
     }
 
     #[test]
