@@ -149,6 +149,7 @@ pub fn snapshot() -> Snapshot {
                 })
                 .into_iter()
                 .collect(),
+            approvals: Vec::new(),
             error: None,
         });
     }

@@ -61,6 +61,10 @@ pub struct App {
     pub history_read: Option<Mail>,
     pub answer: Option<Answer>,
     pub answer_action: Option<Answer>,
+    /// The revoke chooser for the selected ship's captain approvals.
+    pub revoke: Option<super::approvals::Chooser>,
+    /// A revoke chosen, for the worker.
+    pub revoke_action: Option<super::approvals::Revoke>,
     pub needs_focus: bool,
     pub inbox_open: bool,
     pub mail: Vec<Mail>,
@@ -134,6 +138,7 @@ impl App {
         let waiting = self.form.is_some()
             || self.composer.is_some()
             || self.answer.is_some()
+            || self.revoke.is_some()
             || self.mail_pending;
         if self.notice.is_empty()
             || waiting
@@ -595,8 +600,13 @@ impl App {
             }
             return false;
         }
+        if self.revoke.is_some() {
+            self.revoke_key(key);
+            return false;
+        }
         match key {
             KeyCode::Char('i') => self.open_inbox(),
+            KeyCode::Char('x') if self.revocable().is_some() => self.begin_revoke(),
             KeyCode::Char('v')
                 if !self.inbox_open && self.composer.is_none() && self.form.is_none() =>
             {
@@ -631,7 +641,11 @@ impl App {
         false
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        if self.voyage.is_some() || self.composer.is_some() || self.answer.is_some() {
+        if self.voyage.is_some()
+            || self.composer.is_some()
+            || self.answer.is_some()
+            || self.revoke.is_some()
+        {
             return;
         }
         let point = Position::new(event.column, event.row);
@@ -741,6 +755,7 @@ impl App {
         if open.len() > SHOWN {
             lines.push(Line::from(format!("+{} more open", open.len() - SHOWN)));
         }
+        lines.extend(super::approvals::lines(ship, crate::store::Store::now_ms()));
         if ship.remote.is_some() {
             let pending = self
                 .snapshot
@@ -766,6 +781,10 @@ impl App {
         let mut lines = Vec::new();
         if !self.notice.is_empty() {
             lines.push(Line::from(clean(&self.notice, 8192)));
+        }
+        if let Some(chooser) = &self.revoke {
+            lines.extend(self.revoke_lines(chooser));
+            return lines;
         }
         if let Some(answer) = &self.answer {
             let item = &answer.need.item;
@@ -1171,11 +1190,20 @@ impl App {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(if self.voyage.is_some() {
-                    "v / Esc: back to bridge · q quit"
+                    "v / Esc: back to bridge · q quit".to_owned()
                 } else if self.inbox_open {
-                    "i history · Enter mark read · PgUp/PgDn scroll · Esc bridge · q quit"
+                    "i history · Enter mark read · PgUp/PgDn scroll · Esc bridge · q quit".to_owned()
+                } else if self.revoke.is_some() {
+                    "↑↓ pick approval · Enter revoke · Esc cancel".to_owned()
                 } else {
-                    "↑↓ select · Tab Fleet/Needs · Enter focus/answer · i history · v voyage · q quit"
+                    format!(
+                        "↑↓ select · Tab Fleet/Needs · Enter focus/answer · {}i history · v voyage · q quit",
+                        if self.revocable().is_some() {
+                            "x revoke approval · "
+                        } else {
+                            ""
+                        }
+                    )
                 }),
                 Line::styled(
                     if self.mail_pending {

@@ -1214,3 +1214,291 @@ fn voyage_counts_a_ship_working_only_from_its_own_fresh_herdr_pane() {
     app.herdr_age = Some(10);
     assert!(app.working_ships().is_empty(), "a stale view says nothing");
 }
+
+/// A real ship, `apps`, initialized in its own folder under `root` with the
+/// test's own fleet registry, and its home opened with one open task.
+fn approvals_ship(root: &Path) -> (std::path::PathBuf, Store) {
+    let folder = root.join("apps");
+    fs::create_dir_all(&folder).unwrap();
+    let init = support::isolated(root)
+        .current_dir(&folder)
+        .env("GIT_CONFIG_GLOBAL", root.join("gitconfig"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .args(["init", "--ship", "apps", "--harness", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let mut store = Store::open(&folder.join(".privateer")).unwrap();
+    dispatch(
+        &mut store,
+        "charter.put",
+        json!({"id":"release","objective":"Release","repo":repo,"min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "task.create",
+        json!({"id":"ship-it","charter_id":"release","owner":"apps","title":"Ship it"}),
+    )
+    .unwrap();
+    (root.join("fleet.sqlite"), store)
+}
+
+/// Plant an approval created an hour ago that expires at `expires_ms`.
+fn plant_approval(
+    store: &Store,
+    id: &str,
+    action: &str,
+    prefix: Option<&str>,
+    expires_ms: i64,
+    revoked_ms: Option<i64>,
+) {
+    let now = Store::now_ms();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+               command_prefix,created_ms,expires_ms,revoked_ms,source)
+             VALUES(?1,'apps','ship-it',?1,'r-'||?1,?2,?3,?4,?5,?6,'reply')",
+            rusqlite::params![id, action, prefix, now - 3_600_000, expires_ms, revoked_ms],
+        )
+        .unwrap();
+}
+
+fn apps_detail(fleet: &Path) -> (App, String) {
+    let snapshot = privateer::dashboard::fleet::read(fleet, None).unwrap();
+    let mut app = App {
+        snapshot,
+        ..App::default()
+    };
+    app.select_ship(Some("apps".into()));
+    let screen = render(&mut app, 160, 60);
+    (app, screen)
+}
+
+/// The database file's size and modification time.
+fn stamp(store: &Store) -> (u64, std::time::SystemTime) {
+    store
+        .connection()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let meta = fs::metadata(store.home().join("privateer.sqlite")).unwrap();
+    (meta.len(), meta.modified().unwrap())
+}
+
+#[test]
+fn a_ships_detail_lists_only_its_live_captain_approvals_and_reads_older_homes_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let (fleet, store) = approvals_ship(&root);
+    let now = Store::now_ms();
+    // 3 h 30 min and half a minute on, so the render reads 3 h 30 min left.
+    let left = now + (3 * 60 + 30) * 60_000 + 30_000;
+    plant_approval(
+        &store,
+        "a-live",
+        "Run make release",
+        Some("make release"),
+        left,
+        None,
+    );
+    plant_approval(
+        &store,
+        "a-expired",
+        "Ship the expired build",
+        None,
+        now - 60_000,
+        None,
+    );
+    plant_approval(
+        &store,
+        "a-revoked",
+        "Ship the revoked build",
+        None,
+        left,
+        Some(now - 60_000),
+    );
+    let before = stamp(&store);
+    let (app, screen) = apps_detail(&fleet);
+    let approvals = &app.snapshot.ships[0].live.as_ref().unwrap().approvals;
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert!(screen.contains("Captain approvals: 1 live"), "{screen}");
+    assert!(
+        screen.contains("1. Run make release · 3 h 30 min left · only make release · reply"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("expired build") && !screen.contains("revoked build"),
+        "{screen}"
+    );
+    assert!(screen.contains("x revoke approval"), "{screen}");
+    assert_eq!(stamp(&store), before, "the snapshot wrote to the home");
+
+    // A table from before `applies_at` still reads, with no migration.
+    store
+        .connection()
+        .execute_batch("ALTER TABLE captain_approvals DROP COLUMN applies_at;")
+        .unwrap();
+    let before = stamp(&store);
+    let (app, screen) = apps_detail(&fleet);
+    assert!(app.snapshot.ships[0].live.as_ref().unwrap().error.is_none());
+    assert!(screen.contains("Captain approvals: 1 live"), "{screen}");
+    store
+        .connection()
+        .execute("UPDATE captain_approvals SET revoked_ms=?1", [now])
+        .unwrap();
+    let (_, screen) = apps_detail(&fleet);
+    assert!(!screen.contains("Captain approvals"), "{screen}");
+    assert!(!screen.contains("Unavailable"), "{screen}");
+    let columns: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('captain_approvals') WHERE name='applies_at'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 0, "the snapshot migrated the table");
+    assert_ne!(stamp(&store), before, "the update above is a write");
+
+    // A home with no approvals table at all reads as none.
+    store
+        .connection()
+        .execute_batch("DROP TABLE captain_approvals;")
+        .unwrap();
+    let before = stamp(&store);
+    let (app, screen) = apps_detail(&fleet);
+    let live = app.snapshot.ships[0].live.as_ref().unwrap();
+    assert!(
+        live.error.is_none() && live.approvals.is_empty(),
+        "{live:?}"
+    );
+    assert!(!screen.contains("Captain approvals"), "{screen}");
+    assert!(!screen.contains("x revoke approval"), "{screen}");
+    assert_eq!(stamp(&store), before, "the snapshot wrote to the home");
+}
+
+/// A stand-in for `privateer` that records its argv and runs the real one
+/// with none of the test runner's Privateer settings.
+fn recording_privateer(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let (path, log) = (root.join("privateer-recording"), root.join("argv.log"));
+    fs::write(
+        &path,
+        format!(
+            "#!{}\nimport json, os, sys\nwith open({:?}, 'a') as log:\n    log.write(json.dumps(sys.argv[1:]) + '\\n')\n\
+             env = {{k: v for k, v in os.environ.items() if not k.startswith('PRIVATEER_')}}\n\
+             env.update(PRIVATEER_FLEET={:?}, PRIVATEER_SERVICE='none', HOME={:?})\n\
+             os.execve({:?}, [{:?}] + sys.argv[1:], env)\n",
+            support::python().display(),
+            log.display().to_string(),
+            root.join("fleet.sqlite").display().to_string(),
+            root.join("user").display().to_string(),
+            env!("CARGO_BIN_EXE_privateer"),
+            env!("CARGO_BIN_EXE_privateer"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    (path, log)
+}
+
+fn recorded(log: &Path) -> Vec<Value> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn x_then_enter_revokes_the_chosen_approval_and_esc_or_a_stale_row_runs_nothing() {
+    use crossterm::event::KeyCode;
+    use privateer::dashboard::approvals;
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let (fleet, mut store) = approvals_ship(&root);
+    let (binary, log) = recording_privateer(&root);
+    let hour_on = Store::now_ms() + 3_600_000;
+    plant_approval(
+        &store,
+        "a-first",
+        "Run make release",
+        Some("make release"),
+        hour_on,
+        None,
+    );
+    plant_approval(&store, "a-second", "Tag v1.2", None, hour_on, None);
+
+    // Esc closes the chooser and runs nothing.
+    let (mut app, _) = apps_detail(&fleet);
+    app.bridge_key(KeyCode::Char('x'));
+    assert!(app.revoke.is_some());
+    let chooser = render(&mut app, 160, 60);
+    assert!(
+        chooser.contains("Revoke a captain approval of apps"),
+        "{chooser}"
+    );
+    assert!(chooser.contains("> 1. Run make release"), "{chooser}");
+    assert!(
+        chooser.contains("↑↓ pick approval · Enter revoke · Esc cancel"),
+        "{chooser}"
+    );
+    app.bridge_key(KeyCode::Esc);
+    assert!(app.revoke.is_none() && app.revoke_action.is_none());
+
+    // Down, Enter: the second is chosen and the worker's call revokes it.
+    app.bridge_key(KeyCode::Char('x'));
+    app.bridge_key(KeyCode::Down);
+    app.bridge_key(KeyCode::Enter);
+    let chosen = app.revoke_action.take().unwrap();
+    assert_eq!(chosen.id, "a-second");
+    assert!(recorded(&log).is_empty(), "nothing ran before the worker");
+    let latest = privateer::dashboard::fleet::read(&fleet, None).unwrap();
+    let outcome = approvals::execute(&latest, &chosen, &binary).unwrap();
+    assert_eq!(
+        outcome,
+        "Revoked approval a-second; next wake no longer carries it"
+    );
+    let home = store.home().display().to_string();
+    assert_eq!(
+        recorded(&log),
+        [json!([
+            "--home",
+            home,
+            "captain_approval.revoke",
+            "--json",
+            r#"{"id":"a-second"}"#
+        ])]
+    );
+    let (mut app, screen) = apps_detail(&fleet);
+    assert!(screen.contains("Captain approvals: 1 live"), "{screen}");
+    assert!(!screen.contains("Tag v1.2"), "{screen}");
+
+    // A row revoked elsewhere before Enter is refused without a command.
+    app.bridge_key(KeyCode::Char('x'));
+    app.bridge_key(KeyCode::Enter);
+    let stale = app.revoke_action.take().unwrap();
+    dispatch(
+        &mut store,
+        "captain_approval.revoke",
+        json!({"id":"a-first"}),
+    )
+    .unwrap();
+    let latest = privateer::dashboard::fleet::read(&fleet, None).unwrap();
+    let refused = approvals::execute(&latest, &stale, &binary).unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "Approval changed; refresh before revoking."
+    );
+    assert_eq!(recorded(&log).len(), 1);
+    let (_, screen) = apps_detail(&fleet);
+    assert!(!screen.contains("Captain approvals"), "{screen}");
+    assert!(!screen.contains("x revoke approval"), "{screen}");
+}
