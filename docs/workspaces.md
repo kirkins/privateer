@@ -102,8 +102,11 @@ deadline, so a hung broker holds up no other release and a release waits at
 most 35 s however many instances there are. If a running instance cannot close
 its window, or does not answer in time, the release is refused, the error names
 the instance (`could not close the NAME window for this workspace: ...`), and
-the lease is kept. A recorded but stopped instance cannot close anything: the
-release goes ahead and the window left open is audited as
+the lease is kept; `privateer mcp-broker stop --name NAME` is the way out of a
+release that keeps failing (see
+[A release that keeps failing](mcp-broker.md#closing-on-release)). A recorded
+but stopped instance cannot close anything, nor can a running one with no close
+helper: the release goes ahead and the window left open is audited as
 `workspace.mcp_window_unclosed`, with the `instance` (this was
 `workspace.xcode_window_unclosed` before brokers were named). The dispatcher's
 sweep closes the windows the same way before it releases a workspace, and a

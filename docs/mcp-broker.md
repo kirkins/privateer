@@ -211,7 +211,10 @@ verified). A killed broker is not taken as proof that its upstream stopped.
 A profile is one JSON object. Unknown keys are refused at every level, since a
 typo must not silently turn routing off. Every key but `routing` applies to any
 instance; without `routing`, the instance is a plain shared broker: no tool is
-window-bound, nothing is recorded, and it is never asked to close anything.
+window-bound and nothing is recorded. If an earlier install of the same name
+recorded windows, a release still asks it about them, and it answers that it
+cannot close them (see [Closing on release](#closing-on-release)), so a plain
+instance never holds a release.
 
 ```json
 {"label": "Fake",
@@ -547,7 +550,10 @@ for each recorded window under that root, drops those windows from the record
 and the root's target from the cache, and answers one line:
 `{"closed": [PROJECT...]}` or `{"error": "..."}`. An open still running for a
 root under it is marked to close its window when the helper ends, and is listed
-as `"opening": [PROJECT...]` beside `closed`. Windows the broker did not open
+as `"opening": [PROJECT...]` beside `closed`. An instance with no
+`routing.close` (one reinstalled without the profile whose routing recorded
+its windows) drops those windows from its record and lists them as
+`"unclosable": [PROJECT...]` beside `closed`, rather than failing. Windows the broker did not open
 are never closed. Any same-uid peer may send the line. A spurious close is only
 an inconvenience: the window reopens on the next call.
 
@@ -572,9 +578,26 @@ an inconvenience: the window reopens on the next call.
   broker's error rather than as silence. Each wait for the answer is at most a
   second against the deadline, because a long socket timeout fires late (about
   38.6 s for 35 s on this Linux host).
+- A running instance's `unclosable` windows are audited the same way, with the
+  reason `the MCP broker has no close helper`, and the release proceeds.
 - Any running instance that answers with an error, or not in time, refuses the
   release, and the lease is kept. The error names each such instance:
   `could not close the NAME window for this workspace: ...`.
+
+**A release that keeps failing.** A window stays in `NAME.windows.json` until
+its close succeeds. The record survives a broker stop and restart, and the next
+task in the same reused workspace slot is asked to close it again. So a close
+helper that fails every time refuses every release of that slot. The way out:
+
+- `privateer mcp-broker stop --name NAME`. A stopped instance is never asked:
+  the release proceeds and audits the window as `workspace.mcp_window_unclosed`
+  (the window itself stays open, and the record stays until a later close
+  succeeds or it is removed).
+- Or, once the window is closed by hand, remove `run/NAME.windows.json` (with
+  the instance stopped, since a running broker rewrites it from memory), which
+  forgets every window that instance recorded.
+
+See `privateer mcp-broker status --name NAME` for the recorded `windows`.
 
 Release calls the hook once the workspace's jobs are idle and before the
 uncommitted-work and process checks: an upstream's window can write into the
@@ -592,6 +615,15 @@ same checkout, since that window is the new holder's now. See
 an absolute, normalized path, at most 32 arguments, no control characters, and
 never a shell. The project's absolute path is appended as the last argument. It
 is never part of a script.
+
+A helper reports success by exiting 0, and failure by exiting non-zero with the
+reason on its first stderr line. **A close helper must exit 0 when there is
+nothing to close**: the window already closed by hand, the application not
+running, or no window showing that project. A failed close keeps the window in
+the record and refuses the release, and the next release of the same slot asks
+again, so a helper that fails on an already-closed window refuses releases
+until it is stopped (see [A release that keeps failing](#closing-on-release)).
+A close helper should also never start the application just to close it.
 
 Helpers run with the broker's minimal environment (as the upstream's), in `/`,
 with stdin `/dev/null`, at most 64 KiB of stderr read, in their own process
