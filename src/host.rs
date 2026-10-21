@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod approvals;
 pub mod bridge;
 pub(crate) mod restored;
 pub(crate) mod sleep;

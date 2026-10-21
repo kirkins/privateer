@@ -286,6 +286,12 @@ fn a_plain_free_text_yes_records_the_requests_action_for_its_ttl() {
     let approval = &answered["payload"]["approval"];
     assert_eq!(approval["recorded"], true, "{answered}");
     assert_eq!(approval["action"], "Submit build 55 to TestFlight");
+    // No session runs: the reply wakes the ship, and that launch carries it.
+    assert_eq!(approval["applies"], "wake", "{answered}");
+    assert_eq!(
+        approval["note"],
+        "applied from this wake; retry Submit build 55 to TestFlight once."
+    );
     assert_eq!(
         approval["expires_ms"].as_i64().unwrap(),
         answered["created_ms"].as_i64().unwrap() + DAY_MS

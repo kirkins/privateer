@@ -4089,3 +4089,336 @@ fn a_failed_tab_rename_does_not_fail_a_hosted_launch() {
     assert_eq!(herdr.calls("tab.rename")[0]["params"]["label"], "infra");
     place.stop_native("infra");
 }
+
+/// Where Claude keeps the transcripts of the fixture's ship folder.
+fn claude_transcripts(place: &Place) -> PathBuf {
+    let folder: String = place
+        .folder
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    place.root.join(".claude/projects").join(folder)
+}
+
+/// A hosted Claude first mate "infra" that never sleeps, with an interactive
+/// conversation in its folder for `--continue` to resume, and its open task
+/// "ship-it" for approvals to ride.
+fn hosted_claude_refresher() -> (Place, Herdr) {
+    let place = Place::new();
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["manifest"] = json!("bundled:claude");
+    first_mate["options"] = json!({"model":"claude-opus-5-5","permission_mode":"auto"});
+    first_mate["sleep_after_secs"] = json!(0);
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    let trust = json!({"projects": {
+        place.root.to_str().unwrap(): {"hasTrustDialogAccepted": true},
+        place.folder.to_str().unwrap(): {"hasTrustDialogAccepted": true},
+    }});
+    fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
+    let transcripts = claude_transcripts(&place);
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::write(
+        transcripts.join("session.jsonl"),
+        "{\"entrypoint\":\"cli\"}\n",
+    )
+    .unwrap();
+    let (place, herdr) = hosted(place);
+    place.json(
+        "task.create",
+        json!({"id":"ship-it","charter_id":"infra","owner":"infra","title":"Ship it"}),
+    );
+    (place, herdr)
+}
+
+/// The ship asks the captain to approve `action` on "ship-it" and the captain
+/// says yes; the reply's `payload.approval`.
+fn approval_granted(place: &Place, request: &str, action: &str) -> Value {
+    place.agent(
+        "mail.send",
+        json!({"id":request,"from":"infra","to":"captain","kind":"request","task_id":"ship-it",
+            "body":"Build 7 passed CI.","payload":{"approves":{"action":action}}}),
+    );
+    let reply = place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"reply","correlation":request,"body":"yes"}),
+    );
+    let approval = reply["payload"]["approval"].clone();
+    assert_eq!(approval["recorded"], true, "{reply}");
+    approval
+}
+
+/// The session's adapter reports it idle, and its idle spell is backdated by
+/// `secs`, so no test waits out the threshold.
+fn approval_idle(place: &Place, secs: i64) {
+    let holder = holder_of(place);
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":true}),
+    );
+    place
+        .database()
+        .execute(
+            "UPDATE work_sessions SET idle_since_ms=idle_since_ms-?1 WHERE ship='infra'",
+            [secs * 1000],
+        )
+        .unwrap();
+}
+
+/// Past one of the supervisor's five-second checks, the harness still runs.
+fn approval_stays_put(place: &Place, native: i32, why: &str) {
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(unsafe { libc::kill(native, 0) }, 0, "refreshed while {why}");
+    assert_eq!(place.native_pid(), native, "refreshed while {why}");
+}
+
+/// Wait for the pane to restart its harness under a new holder, and return
+/// the new harness's pid. The old one has exited by then.
+fn approval_refreshed(place: &Place, native: i32, holder: &str) -> i32 {
+    until_secs("the pane to refresh its session", 30, || {
+        let pid = fs::read_to_string(place.root.join("pi-pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        let env = fs::read_to_string(place.root.join("pi-env")).unwrap_or_default();
+        pid.is_some_and(|pid| pid != native)
+            && env.trim().split_once(' ').is_some_and(|(_, h)| h != holder)
+    });
+    assert_eq!(unsafe { libc::kill(native, 0) }, -1, "the old harness runs on");
+    place.native_pid()
+}
+
+fn approval_wrapper(place: &Place) -> i64 {
+    place
+        .database()
+        .query_row("SELECT pid FROM hosted_panes WHERE ship='infra'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+fn approval_refreshes(place: &Place) -> Vec<Value> {
+    place.json("audit.list", json!({"limit":1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "host.approvals_refresh")
+        .map(|event| event["payload"].clone())
+        .collect()
+}
+
+fn approval_notices(place: &Place, request: &str) -> Vec<(String, String)> {
+    let db = place.database();
+    let mut statement = db
+        .prepare(
+            "SELECT id, body FROM mail WHERE id LIKE 'approval-applied-%' AND recipient='infra'
+             AND correlation=?1",
+        )
+        .unwrap();
+    statement
+        .query_map([request], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// A captain approval granted while a hosted Claude session runs reaches its
+/// auto-mode classifier by a restart in the same pane, on the same
+/// conversation, at the first safe point: never while busy, idle under 15 s,
+/// held on a permission question, within 5 minutes of the last refresh, or
+/// without a conversation to continue. A revoke refreshes it the same way.
+#[test]
+fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
+    let (place, herdr) = hosted_claude_refresher();
+    let action = "Deploy build 7 to staging";
+    let wrapper = approval_wrapper(&place);
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+    let launched = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(!launched.contains(action), "{launched}");
+
+    let approval = approval_granted(&place, "q-7", action);
+    assert_eq!(approval["applies"], "relaunch", "{approval}");
+    assert!(
+        approval["note"]
+            .as_str()
+            .unwrap()
+            .contains("End this turn without retrying"),
+        "{approval}"
+    );
+
+    // A turn in progress, or an idle spell under 15 s, is no safe point.
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    approval_stays_put(&place, native, "busy");
+    approval_idle(&place, 0);
+    approval_stays_put(&place, native, "idle under 15 s");
+
+    // An open tool-permission question holds the ship.
+    let ask = json!({"type":"tool_permission","block":{"ship":"infra",
+        "denials":[{"tool":"Bash","rule":"Bash(make deploy)"}]}});
+    place
+        .database()
+        .execute(
+            "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+             VALUES('perm-1','infra','captain','request','ship-it','May I run make deploy?',?1,'normal',0,'open')",
+            [ask.to_string()],
+        )
+        .unwrap();
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "paused");
+    place
+        .database()
+        .execute("UPDATE mail SET state='withdrawn' WHERE id='perm-1'", [])
+        .unwrap();
+
+    // Within 5 minutes of the last refresh.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let refreshed_at = |at: i64| {
+        place
+            .database()
+            .execute(
+                "UPDATE hosted_panes SET approvals_refreshed_ms=?1 WHERE ship='infra'",
+                [at],
+            )
+            .unwrap();
+    };
+    refreshed_at(now);
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "inside the 5-minute gap");
+
+    // Without a conversation to continue, context is never traded for it.
+    let transcript = claude_transcripts(&place).join("session.jsonl");
+    let aside = claude_transcripts(&place).join("session.aside");
+    fs::rename(&transcript, &aside).unwrap();
+    refreshed_at(now - 301_000);
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "no conversation continues");
+    assert!(approval_refreshes(&place).is_empty());
+
+    // Once every condition holds, the pane restarts its session in place.
+    fs::rename(&aside, &transcript).unwrap();
+    approval_idle(&place, 20);
+    let second = approval_refreshed(&place, native, &holder);
+    assert_eq!(approval_wrapper(&place), wrapper, "the pane itself restarted");
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert!(argv.contains(action), "{argv}");
+    let sessions = fs::read_to_string(place.root.join("pi-sessions")).unwrap();
+    let ids: Vec<&str> = sessions.lines().collect();
+    assert_eq!(ids.len(), 2, "{sessions}");
+    assert_eq!(ids[0], ids[1], "{sessions}");
+    let id = approval["id"].as_str().unwrap();
+    assert_eq!(
+        approval_refreshes(&place),
+        vec![json!({"ship":"infra","added":[id],"removed":[]})]
+    );
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["approvals_changed"], false, "{bearings}");
+    assert!(
+        bearings["hosted_pane"]["approvals_refreshed_ms"].is_i64(),
+        "{bearings}"
+    );
+    until("the applied notice", || {
+        !approval_notices(&place, "q-7").is_empty()
+    });
+    let notices = approval_notices(&place, "q-7");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].0, format!("approval-applied-{id}"));
+    assert_eq!(
+        notices[0].1,
+        format!("Captain approval applied in your restarted session: retry {action} once.")
+    );
+
+    // A revoke narrows the running classifier's list the same way.
+    place.json("captain_approval.revoke", json!({"id":id}));
+    refreshed_at(now - 301_000);
+    let holder = holder_of(&place);
+    approval_idle(&place, 20);
+    approval_refreshed(&place, second, &holder);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert!(!argv.contains(action), "{argv}");
+    assert_eq!(approval_wrapper(&place), wrapper);
+    assert_eq!(approval_notices(&place, "q-7").len(), 1);
+
+    // A pane whose refresh flag names another process cannot refresh.
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_panes SET approvals_refresh_pid=1 WHERE ship='infra'",
+            [],
+        )
+        .unwrap();
+    let stale = approval_granted(&place, "q-8", "Deploy build 8 to staging");
+    assert_eq!(stale["applies"], "next_launch", "{stale}");
+    place.stop_native("infra");
+}
+
+/// A hosted Pi session cannot take approvals in place: it is never restarted
+/// for one, and the reply says it applies at the next launch.
+#[test]
+fn a_hosted_pi_pane_never_refreshes_for_an_approval() {
+    let (place, _herdr) = hosted_fixture();
+    place.json(
+        "task.create",
+        json!({"id":"ship-it","charter_id":"infra","owner":"infra","title":"Ship it"}),
+    );
+    let native = place.native_pid();
+    let approval = approval_granted(&place, "q-7", "Deploy build 7 to staging");
+    assert_eq!(approval["applies"], "next_launch", "{approval}");
+    assert_eq!(
+        approval["note"],
+        "recorded; applies at your next launch.",
+        "{approval}"
+    );
+    let flag: Option<i64> = place
+        .database()
+        .query_row(
+            "SELECT approvals_refresh_pid FROM hosted_panes WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(flag, None);
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "a Pi session");
+    assert!(approval_refreshes(&place).is_empty());
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(bearings["hosted_pane"]["approvals_changed"], true, "{bearings}");
+    place.stop_native("infra");
+}
+
+/// An approval granted while the hosted first mate sleeps is applied by the
+/// wake the captain's reply starts, so the ship retries at once and no
+/// restart notice follows.
+#[test]
+fn an_approval_granted_to_a_sleeping_pane_applies_from_its_wake() {
+    let (place, herdr) = hosted_claude_sleeper("claude-opus-5-5", "auto");
+    place.json(
+        "task.create",
+        json!({"id":"ship-it","charter_id":"infra","owner":"infra","title":"Ship it"}),
+    );
+    sleep_hosted(&place, &herdr);
+    let action = "Deploy build 7 to staging";
+    let approval = approval_granted(&place, "q-7", action);
+    assert_eq!(approval["applies"], "wake", "{approval}");
+    assert_eq!(
+        approval["note"],
+        format!("applied from this wake; retry {action} once."),
+        "{approval}"
+    );
+    until("the woken harness", || place.root.join("pi-env").exists());
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.contains(action), "{argv}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(approval_notices(&place, "q-7").is_empty());
+    place.stop_native("infra");
+}

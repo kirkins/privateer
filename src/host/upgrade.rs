@@ -139,17 +139,121 @@ pub(crate) fn record_settings(store: &Store, ship: &str) -> Result<()> {
 }
 
 /// Record the captain approvals this pane's session launches with, as told to
-/// its auto-mode classifier. Auto mode reads them only at launch.
-pub(crate) fn record_approvals(store: &Store, ship: &str, sentences: &[String]) -> Result<()> {
-    store.connection().execute(
-        "UPDATE hosted_panes SET approvals_digest=?3 WHERE ship=?1 AND pid=?2",
+/// its auto-mode classifier, and whether this pane process may refresh its
+/// session in place when they change. Auto mode reads them only at launch.
+/// Returns the ids this launch carries for the first time.
+///
+/// The refresh flag is keyed by this process's pid, so a pane an older binary
+/// started, whose `record` rewrites the pid but not this column, never passes
+/// for one that can refresh.
+pub(crate) fn record_approvals(
+    store: &Store,
+    ship: &str,
+    set: &[(String, String)],
+    refreshable: bool,
+) -> Result<Vec<String>> {
+    let pid = std::process::id();
+    let tx = store.write_transaction()?;
+    let Some(before) = tx
+        .query_row(
+            "SELECT approvals_ids FROM hosted_panes WHERE ship=?1 AND pid=?2",
+            params![ship, pid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(vec![]);
+    };
+    let before: Vec<String> = before
+        .and_then(|ids| serde_json::from_str(&ids).ok())
+        .unwrap_or_default();
+    let ids: Vec<String> = set.iter().map(|(id, _)| id.clone()).collect();
+    tx.execute(
+        "UPDATE hosted_panes SET approvals_digest=?3, approvals_ids=?4, approvals_refresh_pid=?5
+         WHERE ship=?1 AND pid=?2",
         params![
             ship,
-            std::process::id(),
-            crate::captain_approvals::digest(sentences)
+            pid,
+            crate::captain_approvals::set_digest(set),
+            serde_json::to_string(&ids)?,
+            refreshable.then_some(pid)
         ],
     )?;
+    tx.commit()?;
+    Ok(ids.into_iter().filter(|id| !before.contains(id)).collect())
+}
+
+/// Tell the ship, once each, that an approval it was told would apply at a
+/// restart now has: `first` are the ids a launch carried for the first time,
+/// and only those recorded as applying at a relaunch are announced. Call
+/// after the harness has spawned. A refresh, a wake or an upgrade relaunch
+/// may each be the launch that applies one.
+pub(crate) fn announce_applied(store: &Store, ship: &str, first: &[String]) -> Result<()> {
+    if first.is_empty() {
+        return Ok(());
+    }
+    let tx = store.write_transaction()?;
+    for id in first {
+        let row: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT task_id, request_id, action FROM captain_approvals
+                 WHERE id=?1 AND ship=?2 AND applies_at='relaunch'",
+                params![id, ship],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((task, request, action)) = row else {
+            continue;
+        };
+        crate::mail::record_crew(
+            &tx,
+            &json!({
+                "id": format!("approval-applied-{id}"),
+                "to": ship,
+                "kind": "notice",
+                "task_id": task,
+                "correlation": request,
+                "urgency": "normal",
+                "body": format!("Captain approval applied in your restarted session: retry {action} once."),
+                "payload": {"approval_applied": id},
+            }),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
+}
+
+/// Where a captain approval recorded now reaches the ship's session:
+/// `relaunch` when a live, awake hosted pane will refresh its session in
+/// place at its next idle point; `wake` when nothing runs (a reply wakes the
+/// ship, and that launch reads approvals) or the hosted pane sleeps; and
+/// `next_launch` for a session that reads them only when it next starts.
+pub(crate) fn approval_applies(store: &Store, ship: &str) -> Result<&'static str> {
+    let lease = presence::presence(store, ship)?;
+    if lease["attended"] != true {
+        return Ok("wake");
+    }
+    let holder = lease["lease"]["holder"].as_str().unwrap_or_default();
+    if !holder.starts_with(presence::HOSTED) {
+        return Ok("next_launch");
+    }
+    let asleep: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM presence WHERE ship=?1 AND asleep_holder=holder)",
+        [ship],
+        |r| r.get(0),
+    )?;
+    if asleep {
+        return Ok("wake");
+    }
+    let Some((pid, _, _)) = live_pane(store, ship)? else {
+        return Ok("next_launch");
+    };
+    let refreshes: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM hosted_panes WHERE ship=?1 AND approvals_refresh_pid=?2)",
+        params![ship, pid],
+        |r| r.get(0),
+    )?;
+    Ok(if refreshes { "relaunch" } else { "next_launch" })
 }
 
 /// Record the native harness this pane spawned, so its exit can be checked.
@@ -190,19 +294,21 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
     let current = current_for(&image)?;
     // A pane recorded before settings or approvals were tracked has no digest
     // to judge.
-    let (launched, approvals): (Option<String>, Option<String>) = store
+    let (launched, approvals, refreshed): (Option<String>, Option<String>, Option<i64>) = store
         .connection()
         .query_row(
-            "SELECT settings_digest, approvals_digest FROM hosted_panes WHERE ship=?1",
+            "SELECT settings_digest, approvals_digest, approvals_refreshed_ms FROM hosted_panes
+             WHERE ship=?1",
             [ship],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
         .unwrap_or_default();
     let settings_changed =
         launched.is_some_and(|launched| launched != settings_digest(&settings_paths(store)));
     // An approval recorded, revoked, expired or ended with its task since
-    // launch. Reported only; the pane is not relaunched for it.
+    // launch. A pane that can refresh applies it at its next safe point
+    // (host::refresh); any other pane applies it at its next launch.
     let approvals_changed = match approvals {
         Some(approvals) => {
             approvals != crate::captain_approvals::current_digest(store, ship, Store::now_ms())?
@@ -217,6 +323,7 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
         "drift": behind(&image, current.as_deref()),
         "settings_changed": settings_changed,
         "approvals_changed": approvals_changed,
+        "approvals_refreshed_ms": refreshed,
     })))
 }
 

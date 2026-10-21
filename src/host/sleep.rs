@@ -192,6 +192,10 @@ pub(crate) enum Ended {
     /// Stopped at a safe point to move onto the current release, under the
     /// holder its fence moved the lease to, and the mail sequence it had seen.
     Relaunch(&'static str, String, i64),
+    /// Stopped at a safe point to apply changed captain approvals, under the
+    /// new holder its fence moved the lease to. The pane starts the harness
+    /// again in place, on the same conversation.
+    Refresh(String),
     /// Another session took the ship's lease, so its mail is no longer this
     /// pane's. The harness was stopped and must not run beside the new holder.
     Superseded,
@@ -243,6 +247,12 @@ pub(crate) fn supervise(
             {
                 stop(child)?;
                 return Ok(Ended::Relaunch(reason, fenced, through));
+            }
+            // After the fence: an upgrade or requested relaunch due now wins,
+            // since the new pane reads approvals at its launch too.
+            if let Ok(Some(fresh)) = super::approvals::fence(store, ship, holder) {
+                stop(child)?;
+                return Ok(Ended::Refresh(fresh));
             }
             if after_secs > 0
                 && let Ok(Some(asleep)) = sleep(store, ship, holder, after_secs)

@@ -224,6 +224,9 @@ impl Store {
             // The ships a task is shared with, as JSON: empty (NULL) unless the
             // owner sets it, so nothing becomes visible on upgrade.
             ("tasks", "shared_with", "TEXT"),
+            // Where a captain approval was told it applies: relaunch, wake or
+            // next_launch.
+            ("captain_approvals", "applies_at", "TEXT"),
         ] {
             let present: bool = migrate.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
