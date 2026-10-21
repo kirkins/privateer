@@ -798,7 +798,7 @@ fn proposed_on_laptop(laptop: &Machine, mac: &Machine, ssh: &Path) -> (String, S
     press(laptop, "liaison", "upkeep", Some(ssh));
     refresh(laptop, ssh);
     let proposed = propose_ok(
-        &laptop,
+        laptop,
         json!({"name": "scout", "to": "mac", "why": "the build caches filled the disk"}),
         ssh,
     );
