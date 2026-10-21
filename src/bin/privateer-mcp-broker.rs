@@ -36,7 +36,7 @@ use std::time::Duration;
 
 /// Bump on any behaviour change: `privateer mcp-broker install` replaces the
 /// installed copy only when this differs.
-pub const BROKER_VERSION: &str = "0.1.0";
+pub const BROKER_VERSION: &str = "0.2.0";
 /// The longest JSON-RPC line either side may send.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
 

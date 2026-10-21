@@ -559,7 +559,7 @@ impl Broker {
         };
         // A tool the list does not show yet is bound when it names a window.
         let bound =
-            tools.get(&name).map_or(false, route::window_bound) || arguments.get(TAB).is_some();
+            tools.get(&name).is_some_and(route::window_bound) || arguments.get(TAB).is_some();
         if !bound {
             return self.forward(client, id, method, message, None);
         }
