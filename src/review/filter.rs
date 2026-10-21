@@ -19,7 +19,11 @@
 //! in a word (`HOME=/x`, `{/x}`, `//x`). Only the worktree and the review
 //! folder's own `diff.patch`, `files.txt` and `pr.md` may be named, and a
 //! kept finding names them relative, so the record never carries the
-//! captain's folder layout. A relative path in the text, `../x` included,
+//! captain's folder layout. Past those, the text may not carry the runtime's
+//! `$HOME` value, `/home/`, `/root/` or `/etc/` anywhere, so a path glued to
+//! other text (`x:/home/…`, `@/home/…`) is refused too. Zero-width and other
+//! invisible format characters are taken out of the reply before any of
+//! this, so one cannot hide a word's start. A relative path in the text, `../x` included,
 //! is the reviewer quoting code (`include_str!("../x")`) and passes; only a
 //! finding's own path must stay inside the worktree, so a finding whose
 //! path climbs out with `..` is refused.
@@ -64,11 +68,12 @@ pub struct Finding {
 }
 
 /// What a reply may name: the worktree, and the review folder it sits in for
-/// that folder's own files.
+/// that folder's own files; and the runtime's home folder, which it may not.
 #[derive(Clone, Copy, Debug)]
 pub struct Allowed<'a> {
     pub tree: &'a Path,
     pub folder: &'a Path,
+    pub home: Option<&'a Path>,
 }
 
 impl Allowed<'_> {
@@ -102,6 +107,7 @@ pub fn findings(
     allowed: Allowed,
     secrets: &[Vec<u8>],
 ) -> Result<Vec<Finding>, String> {
+    let reply = &visible(reply);
     if let Some(why) = secret(reply, secrets) {
         return Err(why);
     }
@@ -109,6 +115,11 @@ pub fn findings(
         return Err(format!(
             "the reply names a path outside the worktree: {}",
             clip(&path, 120)
+        ));
+    }
+    if let Some(folder) = private_folder(reply, allowed) {
+        return Err(format!(
+            "the reply names a path outside the worktree: it carries {folder}"
         ));
     }
     let mut kept = vec![];
@@ -401,6 +412,42 @@ fn outside_path(text: &str, allowed: Allowed) -> Option<String> {
     })
 }
 
+/// Whether a character is invisible formatting: zero-width spaces and
+/// joiners, direction marks and overrides, word joiners and invisible
+/// operators, variation selectors, the byte order mark, soft hyphens, tag
+/// characters and the other format (`Cf`) characters, and blank fillers.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}'
+        | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}'
+        | '\u{FFF0}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// The reply with its invisible formatting taken out.
+fn visible(reply: &str) -> String {
+    reply.chars().filter(|c| !invisible(*c)).collect()
+}
+
+/// A home or system folder the text carries anywhere, glued to other text
+/// or not, once the worktree's and the review folder's own paths are
+/// written relative: the runtime's `$HOME`, `/home/`, `/root/` or `/etc/`.
+fn private_folder(text: &str, allowed: Allowed) -> Option<&'static str> {
+    let rest = allowed.relative(text);
+    let home = allowed
+        .home
+        .map(|h| h.to_string_lossy().trim_end_matches('/').to_owned())
+        .filter(|h| h.len() > 1);
+    if home.is_some_and(|h| rest.contains(&h)) {
+        return Some("the runtime's $HOME");
+    }
+    ["/home/", "/root/", "/etc/"]
+        .into_iter()
+        .find(|folder| rest.contains(folder))
+}
+
 /// At most `limit` characters of `text`.
 pub fn clip(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
@@ -415,11 +462,13 @@ mod tests {
 
     const TREE: &str = "/srv/reviews/r1/tree";
     const FOLDER: &str = "/srv/reviews/r1";
+    const HOME: &str = "/srv/captain";
 
     fn allowed() -> Allowed<'static> {
         Allowed {
             tree: Path::new(TREE),
             folder: Path::new(FOLDER),
+            home: Some(Path::new(HOME)),
         }
     }
 
@@ -504,6 +553,48 @@ mod tests {
         ] {
             assert!(findings(reply, allowed(), &[]).is_ok(), "{reply}");
         }
+    }
+
+    #[test]
+    fn a_home_or_system_folder_glued_to_other_text_or_hidden_is_refused() {
+        for reply in [
+            "x:/home/kirkins/.ssh/id_rsa",
+            "@/home/kirkins/.ssh/id_rsa",
+            "see \u{200B}/home/kirkins/.ssh/id_rsa",
+            "see /\u{200D}home/kirkins/.ssh",
+            "cat\u{2060}/etc/shadow",
+            "key=/root/.aws/credentials",
+            "prefix/etc/passwd",
+            "../../home/kirkins/notes",
+            "it reads srv:/srv/captain/notes",
+            "it reads X/srv/captain",
+            "\u{FEFF}FINDING nit src/a.rs:1 see q/etc/x",
+        ] {
+            let refused = findings(reply, allowed(), &[]).unwrap_err();
+            assert!(
+                refused.contains("outside the worktree"),
+                "{reply:?}: {refused}"
+            );
+        }
+        // The worktree and review folder's own paths are written relative
+        // first, so a worktree under a home folder is not refused, and an
+        // invisible character is gone from the kept text.
+        let under = Allowed {
+            tree: Path::new("/home/captain/ships/a/reviews/r1/tree"),
+            folder: Path::new("/home/captain/ships/a/reviews/r1"),
+            home: Some(Path::new("/home/captain")),
+        };
+        let kept = findings(
+            "FINDING nit /home/captain/ships/a/reviews/r1/tree/src/a.rs:2 a typo\u{200B} here, \
+             see /home/captain/ships/a/reviews/r1/diff.patch\nVERDICT: APPROVE",
+            under,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(kept[0].file, "src/a.rs");
+        assert_eq!(kept[0].text, "a typo here, see diff.patch");
+        assert!(findings("the /home/captain/ships/a folder", under, &[]).is_err());
+        assert!(findings("an etc/ folder, a home/ page", allowed(), &[]).is_ok());
     }
 
     #[test]

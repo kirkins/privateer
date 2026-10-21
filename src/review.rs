@@ -555,6 +555,7 @@ pub(crate) fn settle(
     let folder = PathBuf::from(folder);
     if verdict == "running" {
         let tree = folder.join("tree");
+        let home = std::env::var_os("HOME");
         let (verdict, findings, refusal) = match (outcome, reply) {
             ("succeeded", Some(reply)) => match crate::credentials::stored_values() {
                 Err(error) => (
@@ -564,7 +565,11 @@ pub(crate) fn settle(
                         "refused: the stored credentials could not be read to filter the reply ({error:#})"
                     )),
                 ),
-                Ok(secrets) => match filter::findings(reply, filter::Allowed { tree: &tree, folder: &folder }, &secrets) {
+                Ok(secrets) => match filter::findings(reply, filter::Allowed {
+                    tree: &tree,
+                    folder: &folder,
+                    home: home.as_deref().map(Path::new),
+                }, &secrets) {
                     Err(why) => ("failed", vec![], Some(format!("refused by the filter: {why}"))),
                     Ok(found) => match filter::verdict(reply) {
                         "approve" if found.iter().any(|f| f.severity == "must-fix") => (
