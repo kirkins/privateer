@@ -104,6 +104,19 @@ refresh and explicitly reselect. Truncated fleet scope also refuses focus, answe
 and history read intent. Refresh never focuses anything. Herdr snapshot
 and focus are separate server operations, **not** an atomic occupant lock.
 
+A selected local ship's details list its live [captain
+approvals](tool-permissions.md#captain-approvals) after its open work:
+`Captain approvals: N live`, then one line each with the action, the time
+left, the command prefix (`only make release`) when there is one, and how it
+was given. They are read read-only through the runtime's own liveness rule; a
+home from before captain approvals shows none, and a remote ship shows
+nothing. When the ship has one, `x` opens a chooser: Up/Down picks, Enter
+revokes it through the operator-action worker as `captain_approval.revoke`,
+Esc cancels. An approval the latest snapshot no longer lists is refused with
+"Approval changed; refresh before revoking." The outcome names when it stops
+applying (the ship's next idle point, wake or launch). The dashboard never
+creates or extends an approval.
+
 Optional `<home>/dashboard.yaml`, `.yml` or `.json` presentation retains the
 existing strict input/duplicate/alias limits and cross-home conflict checks.
 Keep only one file. [Example](../examples/dashboard.yaml). No presentation entry

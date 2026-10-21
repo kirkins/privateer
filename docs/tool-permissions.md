@@ -100,6 +100,141 @@ profile/settings choices; it does not revoke custom rules or a profile that
 already requests permissive access. No native settings files, hooks, credentials,
 provider routes, model choices, or charter actions are rewritten.
 
+## Captain approvals
+
+A captain approval is one step the captain said yes to, for one ship and one
+of its open tasks. It reaches `autoMode.allow` as one sentence and nothing
+else: it never overrides a hard deny rule, `permissions.deny` or a managed
+restriction. A production deployment still needs `production_approval` and
+`approval.grant`, and a privileged command still needs `privileged.stage`;
+neither can ride an approval.
+
+### How a ship asks
+
+A first mate asks once, on a `request` or a `decision` to the captain, with
+`payload.approves` and its own open `task_id`:
+
+```json
+{"action":"Submit build 55 to TestFlight","command_prefix":"make release","ttl_secs":86400}
+```
+
+- `action` is one line of at most 300 characters: exactly what the ship will do.
+- `command_prefix` is optional, at most 120 characters: the plain words the
+  command starts with (see the prefix rules below).
+- `ttl_secs` is optional: 1 second to 7 days, 24 h by default.
+- A ship holds at most 8 live approvals.
+- The send is refused when the action or prefix names another ship, mentions
+  policy or settings words (`permission`, `.claude`, `charter`, `automode`),
+  credentials (`.ssh`, `token`, `password`), reads as broad (`anything`,
+  `always`, `from now on`), or restates the approval's own framing
+  (`authorized`, `captain`, `expire`).
+- On a decision, the approving options carry `"approves":true`. A request
+  that carries approves cannot also carry buttons.
+
+The stored body gains a line saying what a yes grants, such as "Approving
+lets apps do this for 24 h: Submit build 55 to TestFlight".
+
+### What counts as the captain's yes
+
+Only the captain's own reply, in the home that holds the request, records an
+approval:
+
+- On a decision, choosing an option marked `"approves":true`. Text beside it
+  may hold only plain words or the option's own label words.
+- On a request, a plain free-text yes: "yes", "ok", "go ahead", or the
+  action's own words.
+
+A hedge ("yes but", "wait", "only staging"), a question mark, an emoji or
+symbol, or a reply that narrows the action ("deploy to staging" for "Deploy
+to staging and prod") approves nothing. The reply's `payload.approval` says
+why, and the ship is told to ask again with a decision. A relay, a bridge
+copy, another ship, a crew and an errand never create one. A request whose
+task closed before the reply approves nothing.
+
+### How it reaches auto mode
+
+Each launch of the ship's first mate adds one sentence per live approval to
+`autoMode.allow`:
+
+> The captain approved this in reply R to request Q, for ship S only, on task
+> T, until 2026-10-22 14:00 UTC: Submit build 55 to TestFlight Only commands
+> that begin exactly with: make release
+
+Crew and errands never carry approvals. A headless wake carries it from its
+next launch. A hosted Claude pane refreshes its session at a safe point: idle
+for 15 s with an empty prompt, not paused on a permission question, at least
+5 minutes since its last refresh, and with a conversation to continue, which
+the restart keeps. A pane sitting at auto mode's stop prompt counts as safe.
+The ship's thread then gets "Captain approval applied in your restarted
+session: retry <action> once."
+
+### Block cards
+
+When auto mode's classifier refuses a first mate's Bash command in a hosted
+pane or a wake, its card may offer two kinds of option.
+
+**Approve for 24 h: Run `<command>`** appears only when the card shows each
+refused command whole and each is one simple command whose words pass as a
+prefix. Compound commands (`;`, `&&`, pipes), heredocs, clipped, masked or
+flattened commands, quoted or globbed words, wrapper-led commands and
+interpreter inline code never offer it. The tap records the step for 24 h,
+with the command's words as its prefix when there is one command.
+
+**As approved: <action>** offers up to two approvals created in the last 24 h
+that the refused session does not already carry. One is recommended when its
+prefix covers the refused command. A live one is applied at the session's
+next safe point; one that expired is renewed for its own length. Anything
+older than 24 h is never one tap away: ask again.
+
+Crew and errand cards, and cards naming any other denial, offer neither.
+
+### Prefix rules
+
+A prefix is plain words of one simple command, split on spaces and tabs:
+
+- None of `; & | < > ( ) $ ` \ ' " * ? [ ] { } ~ #`, and printable ASCII
+  only.
+- No assignment first (`FOO=1 make`).
+- No wrapper first: `env`, `sudo`, `xargs`, `eval`, `doas`, `su`, `exec`,
+  `command`, `builtin`, `nohup`, `timeout`, `nice`, `time`, `watch`, `ssh`,
+  `coproc`, `!`.
+- An interpreter (`bash`, `sh`, `zsh`, `dash`, `ksh`, `fish`, `node`,
+  `perl`, `ruby`, or any `python*`) names its script first, with no option
+  before it and no inline-code flag after it (`-c`, `-e`, `-lc`, `--eval`,
+  `node -p`, `python -m`): `python3 scripts/release.py`, never
+  `python3 -c`.
+
+Matching is by whole words, with no basename or case folding: `make release`
+covers `make release --dry-run`, never `make releasex` or `sudo make
+release`.
+
+### Seeing and revoking
+
+```sh
+privateer permissions approvals              # every ship's, newest first
+privateer permissions approvals list apps
+privateer permissions approvals show approval-0123
+privateer permissions approvals revoke approval-0123
+```
+
+The JSON commands are `captain_approval.list {"ship"?, "live_only"?}`,
+`captain_approval.show {"id"}` and `captain_approval.revoke {"id"}`. Each row
+has a `state`: `live`, `expired`, `revoked`, or `closed` once its task is
+done, cancelled or handed to another owner, or its charter is inactive. A
+live row also has the `sentence` a launch carries. `show` adds `applies_at`
+and `carried_by`, the hosted panes whose launch carried it. Launches, list,
+show and the dashboard all read one rule for this. The operator may list
+any ship; an agent lists and shows only its own ship's.
+
+Revoking is the captain's alone, from the CLI, the JSON command or the
+dashboard's `x` key. It never stops a session mid-turn. The reply's `note`
+says when it stops applying: at the ship's next idle point (`relaunch`), at
+its next wake, or at its next launch. A second revoke answers
+`"already":true`.
+
+Every ship runs as the same OS user, so this is a workflow control that keeps
+a confused agent from approving itself, not isolation.
+
 ## When a tool is denied
 
 A headless Claude run that is denied a tool fails, and its last line,
