@@ -10,9 +10,13 @@
 //! stdin, JSON reply on stdout), with the token's file path, never its value,
 //! in `PRIVATEER_FORGE_TOKEN_FILE` on that child alone. A debug build (the
 //! test suites) may name a fake adapter in `PRIVATEER_FORGE_ADAPTER`; a
-//! release build ignores the variable, so a ship cannot swap the adapter by
-//! its environment. A credential ref named here is never given to a launch:
-//! `bundle.configure` and `bundles.py` refuse it.
+//! release build ignores that variable. That does not pin the adapter on
+//! its own: outside a release image, `PRIVATEER_PLUGINS` still chooses the
+//! folder `forge.py` is read from and `PATH` the `python3` that runs it, so
+//! whoever sets the runtime's environment can still swap the adapter. Only
+//! a release image, which fixes both, closes that. A credential ref named
+//! here is never given to a launch: `bundle.configure` and `bundles.py`
+//! refuse it.
 use crate::store::Store;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
