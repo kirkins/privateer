@@ -15,11 +15,14 @@
 //! base64 or hex, or a token of a common shape the runtime never stored
 //! (`ghp_`, `gho_`, `github_pat_`, `sk-ant-`, `AKIA`, a PEM header), such
 //! as the forge login of the ship user's own `gh`. A path is any absolute,
-//! `file:`, home-relative (`~`, `~user`, `$HOME`) or escaping (`..`) path
-//! wherever it stands in a word (`HOME=/x`, `{/x}`, `//x`). Only the
-//! worktree and the review folder's own `diff.patch`, `files.txt` and
-//! `pr.md` may be named, and a kept finding names them relative, so the
-//! record never carries the captain's folder layout.
+//! `file:` or home-relative (`~`, `~user`, `$HOME`) path wherever it stands
+//! in a word (`HOME=/x`, `{/x}`, `//x`). Only the worktree and the review
+//! folder's own `diff.patch`, `files.txt` and `pr.md` may be named, and a
+//! kept finding names them relative, so the record never carries the
+//! captain's folder layout. A relative path in the text, `../x` included,
+//! is the reviewer quoting code (`include_str!("../x")`) and passes; only a
+//! finding's own path must stay inside the worktree, so a finding whose
+//! path climbs out with `..` is refused.
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
@@ -319,26 +322,12 @@ fn normalize(path: &Path) -> PathBuf {
     normal
 }
 
-/// Whether a relative path climbs above where it starts.
-fn escapes(path: &str) -> bool {
-    let mut depth = 0i64;
-    for part in path.split('/') {
-        match part {
-            ".." => depth -= 1,
-            "" | "." => {}
-            _ => depth += 1,
-        }
-        if depth < 0 {
-            return true;
-        }
-    }
-    false
-}
-
 /// The first path the text names outside what it may name. Words are split
 /// on whitespace and on the quotes, brackets, braces and operators that
 /// wrap a path in prose or code, so a path inside `HOME=/x` or `{/x}` is a
-/// word of its own. A URL is not a path, except a `file:` one.
+/// word of its own. A URL is not a path, except a `file:` one, and a
+/// relative path is not one either: `findings` holds a finding's own path
+/// to the worktree.
 fn outside_path(text: &str, allowed: Allowed) -> Option<String> {
     let wrapping = |c: char| {
         c.is_whitespace()
@@ -405,14 +394,10 @@ fn outside_path(text: &str, allowed: Allowed) -> Option<String> {
                 && (rest[name.len()..].starts_with('/')
                     || matches!(name.as_str(), "HOME" | "USERPROFILE")
                     || name.starts_with("XDG_"))
-        } else if word.starts_with('/') {
-            word.len() > 1 && outside(word)
         } else {
-            (word.contains('/') || word == "..") && escapes(word)
+            word.starts_with('/') && word.len() > 1 && outside(word)
         };
-        (named
-            || (raw.contains('/') && !raw.contains("://") && !raw.starts_with('/') && escapes(raw)))
-        .then(|| word.to_owned())
+        named.then(|| word.to_owned())
     })
 }
 
@@ -498,9 +483,8 @@ mod tests {
             "${HOME}/.ssh",
             "it reads $HOME",
             "$XDG_STATE_HOME",
-            "the text says ../../.. somewhere",
-            "src/../../escape.rs",
-            "a/../..",
+            "FINDING must-fix src/../../escape.rs:3 climbs out",
+            "FINDING nit ..:1 the folder above",
             "/srv/reviews/r1/other.txt",
             "/srv/reviews/r1/treehouse/x",
         ] {
@@ -519,6 +503,31 @@ mod tests {
             "the cost is $PATH-free",
         ] {
             assert!(findings(reply, allowed(), &[]).is_ok(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_relative_path_quoted_in_text_passes_and_only_a_findings_path_must_stay_inside() {
+        // Quoted code climbs with `..` relative to its own file: the reply
+        // and its finding are kept.
+        let reply = "src/transcript.rs reads include_str!(\"../tests/fixtures/x.jsonl\").\n\
+            the text says ../../.. and a/../.. and src/../../escape.rs somewhere\n\
+            FINDING nit src/bundled.rs:8 `include_str!(\"../plugins/x.py\")` is fine\n\
+            VERDICT: APPROVE";
+        let kept = findings(reply, allowed(), &[]).unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].file, "src/bundled.rs");
+        assert!(kept[0].text.contains("../plugins/x.py"), "{kept:?}");
+        // The same climb in a finding's own path is refused.
+        for reply in [
+            "FINDING nit ../x:1 outside",
+            "FINDING nit src/../../x.rs:1 outside",
+        ] {
+            let refused = findings(reply, allowed(), &[]).unwrap_err();
+            assert!(
+                refused.contains("a finding names a path outside the worktree"),
+                "{reply}: {refused}"
+            );
         }
     }
 
