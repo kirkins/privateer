@@ -199,6 +199,18 @@ fn run() -> Result<()> {
         println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
+    // A privileged run is the captain's at a terminal, never an RPC, gateway
+    // or door command: it reads the confirmation from /dev/tty.
+    if command == "privileged" && !json_given && !file_given {
+        return privateer::privileged::cli(home, &positional, None, caller);
+    }
+    if command == "privileged.run" {
+        ensure!(
+            positional.is_empty(),
+            "privileged.run takes --json {{\"id\":...}}"
+        );
+        return privateer::privileged::cli(home, &[], Some(&args), caller);
+    }
     if !json_given && !file_given && privateer::cli::VERBS.contains(&command.as_str()) {
         return privateer::cli::run(home, &command, &positional, caller);
     }

@@ -77,9 +77,23 @@ pub(crate) fn approval_request(
     ensure!(
         request["to"] == "captain"
             && request["kind"] == "request"
-            && request["request_kind"] == "production_approval",
+            && crate::mail::is_approval_kind(request["request_kind"].as_str()),
         "not a typed captain approval request"
     );
+    // Each kind keeps to its own artifacts: a production approval never
+    // writes a privileged one, and a privileged one is checked by its hash.
+    let privileged = request["request_kind"] == crate::privileged::REQUEST_KIND;
+    if privileged {
+        crate::privileged::check_answerable(store, &request)?;
+    } else {
+        ensure!(
+            !crate::privileged::reserved(
+                request["payload"]["artifact"].as_str().unwrap_or(""),
+                request["payload"]["environment"].as_str().unwrap_or("")
+            ),
+            "a production approval cannot name a privileged artifact or host environment"
+        );
+    }
     ensure!(
         request["task_id"] == args["task_id"]
             && request["payload"]["artifact"] == args["artifact"]
@@ -289,9 +303,22 @@ fn observe(
         match source.as_str() {
             "mail" => {
                 let message = crate::mail::find(store, &id)?.context("request vanished")?;
-                let approval = message["request_kind"] == "production_approval";
+                let approval = crate::mail::is_approval_kind(message["request_kind"].as_str());
+                let privileged = message["request_kind"] == crate::privileged::REQUEST_KIND;
                 let payload = &message["payload"];
-                if approval {
+                if privileged && !crate::privileged::local(store, &message)? {
+                    // A copy carried from the machine that staged it: shown,
+                    // but its program, sudo and terminal are there.
+                    if crate::privileged::verify(&message).is_err() {
+                        continue;
+                    }
+                    item["artifact"] = payload["artifact"].clone();
+                    item["environment"] = payload["environment"].clone();
+                    item["version"] = json!(crate::core::hash(&json!([id, "elsewhere"])));
+                    item["actions"] = json!([]);
+                    item["privileged"] = crate::privileged::summary(&message);
+                    item["privileged"]["held_elsewhere"] = json!(true);
+                } else if approval {
                     let Some(task) = message["task_id"].as_str() else {
                         continue;
                     };
@@ -317,6 +344,18 @@ fn observe(
                         continue;
                     };
                     if payload["charter_hash"] != crate::core::hash(&charter) {
+                        continue;
+                    }
+                    if privileged {
+                        // Its binding, machine and expiry, as a grant checks them.
+                        if crate::privileged::check_answerable(store, &message).is_err() {
+                            continue;
+                        }
+                        item["privileged"] = crate::privileged::summary(&message);
+                    } else if crate::privileged::reserved(
+                        payload["artifact"].as_str().unwrap_or(""),
+                        payload["environment"].as_str().unwrap_or(""),
+                    ) {
                         continue;
                     }
                     item["artifact"] = payload["artifact"].clone();

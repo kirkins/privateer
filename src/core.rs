@@ -453,6 +453,13 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     let task = required(&args, "task_id")?;
     let artifact = required(&args, "artifact")?;
     let environment = required(&args, "environment")?;
+    // A privileged approval is written only by a correlated grant of a
+    // privileged request, and used up only by `privileged.run`.
+    ensure!(
+        (request_id.is_some() && command != "approval.consume")
+            || !crate::privileged::reserved(artifact, environment),
+        "artifacts starting privileged: and environments starting host: are privileged approvals: only a correlated grant writes one and only privileged.run uses it"
+    );
     // Serialize the authority read with the grant or consumption: a charter
     // revoked while this command waits for the write lock must not authorize it.
     let tx = store.write_transaction()?;
@@ -762,6 +769,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let mut result = json!({"allowed":true,"task_id":task,"head":head,"evidence":"caller-supplied; forge adapter must verify live checks"});
             if args.get("deploys_production") == Some(&json!(true)) {
                 let env = required(&args, "environment")?;
+                ensure!(
+                    !crate::privileged::reserved(head, env),
+                    "a privileged approval is used only by privileged.run"
+                );
                 // The approval authorises one deployment: allowing it uses the
                 // approval up in the same transaction.
                 let approval: Option<String> = tx.query_row("SELECT id FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3 AND charter_hash=?4 AND consumed=0 ORDER BY id LIMIT 1",params![task,head,env,hash(&charter)],|r|r.get(0)).optional()?;

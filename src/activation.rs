@@ -1228,6 +1228,11 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
         eprintln!("privateer: could not sweep tool-permission asks: {error:#}");
         vec![]
     });
+    // Before the wakes, so a ship hears its expired privileged command now.
+    let privileged_expired = crate::privileged::sweep(store).unwrap_or_else(|error| {
+        eprintln!("privateer: could not sweep privileged requests: {error:#}");
+        vec![]
+    });
     crate::crew::resume_pending(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
@@ -1261,7 +1266,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
     )
 }
 

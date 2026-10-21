@@ -164,8 +164,8 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
             continue;
         };
         ensure!(
-            request_kind.as_deref() != Some("production_approval"),
-            "production approvals require the operator's exact artifact/environment grant or denial; they cannot be relayed"
+            !crate::mail::is_approval_kind(request_kind.as_deref()),
+            "production approvals and privileged commands require the operator's exact grant or denial; they cannot be relayed"
         );
         ensure!(
             matches!(kind.as_str(), "request" | "decision"),
@@ -361,8 +361,8 @@ fn answer(args: &Value) -> Result<Value> {
     let mut target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("ask vanished")?;
     ensure!(
-        ask["request_kind"] != "production_approval",
-        "{} is a production approval; answer it with approval.grant or approval.deny",
+        !crate::mail::is_approval_kind(ask["request_kind"].as_str()),
+        "{} is a production approval or privileged command; answer it with approval.grant or approval.deny",
         item.id
     );
     let kind = if ask["kind"] == "notice" {
@@ -473,8 +473,8 @@ fn end(args: &Value) -> Result<Value> {
     let target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("item vanished")?;
     ensure!(
-        ask["request_kind"] != "production_approval",
-        "{} is a production approval; deny it with approval.deny",
+        !crate::mail::is_approval_kind(ask["request_kind"].as_str()),
+        "{} is a production approval or privileged command; deny it with approval.deny",
         item.id
     );
     let mail = crate::mail::dismiss(&target, &item.id, note)?;

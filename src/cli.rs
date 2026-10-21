@@ -40,6 +40,7 @@ pub const VERBS: &[&str] = &[
     "host",
     "stow",
     "backlog",
+    "privileged",
     // Fleet-wide, handled before a home is needed.
     "afk",
     "back",

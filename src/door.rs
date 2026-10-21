@@ -17,7 +17,9 @@
 //!
 //! Door to runtime:
 //! - `{"type":"delivered","ref":REF}`: the captain has it; it is not sent again;
-//! - `{"type":"request","id":ID,"command":"send|ships|status|waiting|file.put","args":{...}}`.
+//! - `{"type":"request","id":ID,"command":"send|ships|status|waiting|file.put|approval","args":{...}}`.
+//!   `approval {id, action: "grant"|"deny"}` answers a privileged command
+//!   held in a home on this machine, as the captain; nothing else.
 //!   `file.put {to, name, content_file}` stores a file the captain sent in the
 //!   receiving ship's own home, on this machine or a linked one, and answers
 //!   with its `file_id` for the mail's `payload.files`.
@@ -780,6 +782,9 @@ impl<'a> Session<'a> {
                 }
                 crate::dispatch(self.store(&home)?, "captain.dismiss", request)
             }
+            // The captain's Approve or Deny button on a privileged command;
+            // every other approval is answered at the bridge.
+            "approval" => crate::privileged::door_answer(args),
             // The captain sent a file: the door puts it in the receiving
             // ship's own home, here or on a linked machine, and mails its id.
             "file.put" => {
