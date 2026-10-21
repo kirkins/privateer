@@ -44,6 +44,7 @@ pub mod permissions;
 pub mod placement;
 pub mod plugins;
 pub mod presence;
+pub mod privileged;
 mod profile;
 pub mod project;
 pub mod releases;
@@ -123,6 +124,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "file.put",
     "usage.summary",
     "activity.list",
+    "privileged.run",
 ];
 
 /// Whether a command is the operator's alone for this caller. The ship the
@@ -193,6 +195,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
         "captain_approval" => captain_approvals::dispatch(store, command, args),
+        "privileged" => privileged::dispatch(store, command, args),
         "session" => session::dispatch(store, command, args),
         "report" => report::dispatch(store, command, args),
         "file" => files::dispatch(store, command, args),

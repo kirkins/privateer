@@ -66,10 +66,13 @@ One column: Fleet table, Needs you, Recently done. Running crew counts jobs\n\
 recorded as launching or running (not live health). ↑↓ selects; Tab switches\n\
 Fleet/Needs; Enter focuses an EXISTING validated mate space or answers a typed\n\
 runtime need. Choices are offered when provided; otherwise type a reply.\n\
-Approvals bind exact artifact/environment/version; no deployment.\n\
+Approvals bind exact artifact/environment/version; no deployment. A granted\n\
+privileged command opens a Herdr tab running `privateer privileged run ID`\n\
+(or names that command line), where the captain confirms it.\n\
 i: separate mail history; v: voyage, an animated sea of the fleet (v or Esc\n\
 returns); q: quit.\n\
-No launch, Board, Watch, tabs, pane creation/reorder, or automatic focus."
+No launch, Board, Watch, pane reorder or automatic focus; the only tab it\n\
+creates is that privileged confirmation."
                 );
                 return Ok(None);
             }
@@ -102,6 +105,8 @@ struct Update {
     mail: Vec<Mail>,
     errors: Vec<String>,
     outcome: Option<Result<String>>,
+    /// A privileged command the bridge just granted: its home and id.
+    privileged: Option<(PathBuf, String)>,
 }
 enum Action {
     Answer(Answer),
@@ -138,15 +143,23 @@ fn state_worker(
                 }
                 observed = Instant::now();
             }
+            let mut privileged = None;
             let outcome = match action {
                 Some(Action::Answer(answer)) => {
                     let result = if failure.is_some() {
                         Err(anyhow::anyhow!("Fleet unavailable; draft retained"))
                     } else {
                         bridge::execute(&snapshot, fallback.as_deref(), &attention, &answer).map(
-                            |_| {
-                                "Recorded answer; only authoritative refresh clears the item."
-                                    .into()
+                            |_| match bridge::privileged_launch(&answer) {
+                                Some((home, id)) => {
+                                    let line = bridge::privileged_command_line(&home, &id);
+                                    privileged = Some((home, id));
+                                    format!("Approved. Confirm and run it at this machine: {line}")
+                                }
+                                None => {
+                                    "Recorded answer; only authoritative refresh clears the item."
+                                        .into()
+                                }
                             },
                         )
                     };
@@ -188,6 +201,7 @@ fn state_worker(
                     mail: mailbox.messages.clone(),
                     errors: mailbox.errors.clone(),
                     outcome,
+                    privileged,
                 })
                 .is_err()
             {
@@ -196,6 +210,14 @@ fn state_worker(
         }
     });
     (updates, actions)
+}
+enum HerdrAction {
+    Focus(Box<Focus>),
+    /// Open a pane running `privileged run ID` for a granted command.
+    Privileged {
+        home: PathBuf,
+        id: String,
+    },
 }
 #[derive(Clone)]
 struct Focus {
@@ -212,9 +234,9 @@ fn herdr_worker(
     path: PathBuf,
     registry: PathBuf,
     fallback: Option<PathBuf>,
-) -> (Receiver<HerdrUpdate>, SyncSender<Focus>) {
+) -> (Receiver<HerdrUpdate>, SyncSender<HerdrAction>) {
     let (send, updates) = mpsc::sync_channel(1);
-    let (actions, commands) = mpsc::sync_channel::<Focus>(1);
+    let (actions, commands) = mpsc::sync_channel::<HerdrAction>(1);
     thread::spawn(move || {
         let mut delay = Duration::ZERO;
         let mut failures = 0_u32;
@@ -227,7 +249,24 @@ fn herdr_worker(
             let mut notice = None;
             let value = (|| -> Result<View> {
                 let mut client = Client::connect(&path)?;
-                if let Some(action) = action {
+                if let Some(HerdrAction::Privileged { home, id }) = &action {
+                    let line = bridge::privileged_command_line(home, id);
+                    let opened =
+                        home.parent()
+                            .context("ship home has no folder")
+                            .and_then(|folder| {
+                                let binary = privateer::dashboard::command::binary()?;
+                                client.privileged_run(folder, &binary, home, id)
+                            });
+                    notice = Some(match opened {
+                        Ok(_) => {
+                            format!("Approved. Confirm it in the new privileged tab ({line}).")
+                        }
+                        Err(e) => format!("Approved. No pane opened ({e}); run: {line}"),
+                    });
+                }
+                if let Some(HerdrAction::Focus(action)) = action {
+                    let action = *action;
                     let result = (|| -> Result<()> {
                         // Re-read current home/custody/presentation; never launch on a missing binding.
                         let current = fleet::read(&registry, fallback.as_deref())?;
@@ -286,18 +325,18 @@ fn herdr_worker(
     });
     (updates, actions)
 }
-fn request_focus(app: &mut App, sender: Option<&SyncSender<Focus>>) {
+fn request_focus(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
     app.notice = match app.focus_target() {
         Err(e) => format!("Focus refused: {e}"),
         Ok((observed, pane)) => match sender {
             Some(sender)
                 if sender
-                    .try_send(Focus {
+                    .try_send(HerdrAction::Focus(Box::new(Focus {
                         observed,
                         pane,
                         app_snapshot: app.snapshot.clone(),
                         ship: app.ship.clone().unwrap_or_default(),
-                    })
+                    })))
                     .is_ok() =>
             {
                 "Revalidating existing mate identity…".into()
@@ -380,6 +419,13 @@ fn run(opts: Options) -> Result<()> {
                 }
                 app.update_attention(update.attention);
                 app.update_mail(update.mail, update.errors);
+                // Without Herdr, or with its queue busy, the outcome notice
+                // names the command line to run in any terminal.
+                if let Some((home, id)) = update.privileged
+                    && let Some((_, sender)) = &herdr
+                {
+                    let _ = sender.try_send(HerdrAction::Privileged { home, id });
+                }
                 if let Some(outcome) = update.outcome {
                     app.mail_pending = false;
                     app.notice = match outcome {
@@ -522,11 +568,15 @@ mod tests {
         let (send, receive) = mpsc::sync_channel(1);
         assert!(app.bridge_key(KeyCode::Enter));
         request_focus(&mut app, Some(&send));
-        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "w1:p1");
+        let focused = |action: HerdrAction| match action {
+            HerdrAction::Focus(focus) => focus.pane.pane_id,
+            HerdrAction::Privileged { .. } => String::new(),
+        };
+        assert_eq!(focused(receive.try_recv().unwrap()), "w1:p1");
         // Display clipping alone does not remove validated existing focus.
         app.snapshot.truncated = true;
         request_focus(&mut app, Some(&send));
-        assert_eq!(receive.try_recv().unwrap().pane.pane_id, "w1:p1");
+        assert_eq!(focused(receive.try_recv().unwrap()), "w1:p1");
         for case in ["stale", "ambiguous", "incomplete", "unknown", "invalid"] {
             app.herdr_age = Some(0);
             app.snapshot.presentation_error = None;

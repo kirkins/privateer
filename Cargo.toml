@@ -9,6 +9,9 @@ default-run = "privateer"
 
 [features]
 dashboard = ["dep:ratatui", "dep:crossterm", "rusqlite/hooks"]
+# Tests only: honour PRIVATEER_SUDO, PRIVATEER_TEST_TTY and
+# PRIVATEER_TEST_TRUST_UID in `privileged run`. Never enable in a release.
+test-sudo = []
 
 [[bin]]
 name = "privateer-dashboard"
@@ -26,6 +29,10 @@ uuid = { version = "1", features = ["v4"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 crossterm = { version = "0.28", optional = true }
 saphyr-parser = "=0.2.1"
+
+[[test]]
+name = "privileged"
+required-features = ["test-sudo"]
 
 [dev-dependencies]
 tempfile = "3"

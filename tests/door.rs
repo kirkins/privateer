@@ -32,6 +32,17 @@ for line in sys.stdin:
     note(message)
     if message["type"] == "mail" and "hold" not in message["mail"]["body"]:
         print(json.dumps({"type": "delivered", "ref": message["ref"]}), flush=True)
+    # The captain taps Approve on anything that asks for an approval.
+    # A tap carries the hash the phone showed; a stale one answers nothing.
+    if message["type"] == "mail" and message["mail"].get("request_kind"):
+        mail = message["mail"]
+        shown = ((mail.get("payload") or {}).get("privileged") or {}).get("hash", "")[:8]
+        if shown:
+            ask("stale-" + mail["id"], "approval",
+                {"id": mail["id"], "action": "grant", "hash": "00000000"})
+            ask("bare-" + mail["id"], "approval", {"id": mail["id"], "action": "grant"})
+        ask("approve-" + mail["id"], "approval",
+            {"id": mail["id"], "action": "grant", "hash": shown or None})
 "#;
 
 struct Fleet {
@@ -489,6 +500,82 @@ fn a_front_door_carries_captain_mail_both_ways_at_least_once() {
     assert!(!alive(restarted));
     let log = fs::read_to_string(fleet.root.join("state/doors/fake/door.log")).unwrap();
     assert!(log.contains("adapter exited"), "{log}");
+}
+
+#[test]
+fn the_door_approves_a_privileged_command_but_never_a_production_approval() {
+    let fleet = Fleet::new();
+    fleet.add();
+    let staged = fleet.call(
+        "ops",
+        "privileged.stage",
+        json!({"from": "ops", "task_id": "ops-duty", "program": "/usr/bin/id", "args": ["-u"],
+            "cwd": "/", "reason": "Check the effective user"}),
+    );
+    let production = fleet.call(
+        "ops",
+        "mail.send",
+        json!({"from": "ops", "to": "captain", "kind": "request",
+            "request_kind": "production_approval", "task_id": "ops-duty", "body": "Ship it?",
+            "payload": {"artifact": "sha256:exact", "environment": "production"}}),
+    );
+    let privileged_id = staged["id"].as_str().unwrap();
+    let production_id = production["id"].as_str().unwrap();
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("both approval responses", |e| {
+        (response(e, &format!("approve-{privileged_id}")).is_some()
+            && response(e, &format!("approve-{production_id}")).is_some())
+        .then(|| e.to_vec())
+    });
+    stop(supervisor);
+    let stale = response(&entries, &format!("stale-{privileged_id}")).unwrap();
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert!(
+        stale["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed since your phone showed it"),
+        "{stale}"
+    );
+    // An answer without the hash the phone showed answers nothing.
+    let bare = response(&entries, &format!("bare-{privileged_id}")).unwrap();
+    assert_eq!(bare["ok"], false, "{bare}");
+    assert!(
+        bare["error"]
+            .as_str()
+            .unwrap()
+            .contains("must carry the hash the phone showed"),
+        "{bare}"
+    );
+    let granted = response(&entries, &format!("approve-{privileged_id}")).unwrap();
+    assert_eq!(granted["ok"], true, "{granted}");
+    assert_eq!(granted["result"]["action"], "approval.grant");
+    assert!(
+        granted["result"]["run"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("privileged run {privileged_id}")),
+        "{granted}"
+    );
+    let request = fleet.call("ops", "mail.show", json!({"id": privileged_id}));
+    assert_eq!(request["state"], "approved");
+    let reply = fleet.call("ops", "mail.show", json!({"id": request["answered_by"]}));
+    assert_eq!(
+        reply["body"],
+        "approved, waiting for the captain at the machine"
+    );
+    // The phone never approves a production deployment.
+    let refused = response(&entries, &format!("approve-{production_id}")).unwrap();
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("only privileged commands"),
+        "{refused}"
+    );
+    let open = fleet.call("ops", "mail.show", json!({"id": production_id}));
+    assert_eq!(open["state"], "open");
 }
 
 #[test]

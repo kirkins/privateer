@@ -256,8 +256,8 @@ pub(crate) fn declare(
         "approves is a ship's ask to the captain"
     );
     ensure!(
-        request_kind != Some("production_approval"),
-        "a production approval is granted with approval.grant, never through approves"
+        !crate::mail::is_approval_kind(request_kind),
+        "a production approval or privileged command is granted with approval.grant, never through approves"
     );
     ensure!(
         payload["type"] != "tool_permission"

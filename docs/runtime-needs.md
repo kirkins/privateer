@@ -100,6 +100,18 @@ Supported typed facts:
   fails. Plain replies/acknowledgements/agent prose NEVER create a grant. Existing
   `approval.consume`/`delivery.check` remain the exact-artifact, exact-environment
   consumption/deployment gate; this query/action does not deploy anything.
+  A request with `request_kind:"privileged_action"` ([design](design/privileged-action.md)),
+  which only `privileged.stage` writes, is an approval too, with
+  `artifact:"privileged:sha256:<hash>"`, `environment:"host:<machine>"` and an
+  `item.privileged` block: `argv` (one display line per argument, odd characters
+  escaped), `cwd` and `reason` (escaped the same way), `warnings` (one line per
+  argument that is a relative path or under a folder not root's all the way
+  up), `hash`, `machine` and `expires_ms` (24 hours after staging). It is listed only while its binding verifies and it has not
+  expired; it is approvable only in a home on the machine that staged it, and a
+  copy carried elsewhere is listed with `privileged.held_elsewhere:true` and no
+  actions. A grant of it is used up only by `privileged.run`, never by
+  `approval.consume` or `delivery.check`, and a production approval may not name
+  a `privileged:` artifact or a `host:` environment.
 * **blocker**: jobs queued for >=60 seconds on nonterminal
   tasks; recorded orphaned jobs (even on terminal tasks, since payloads may remain).
   Includes typed `evidence`, task/ship, version, and job incarnation where relevant.

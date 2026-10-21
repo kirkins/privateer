@@ -69,6 +69,12 @@ the adapter's stderr, `state/telegram.log` from the adapter).
   follow-up request to that ship. Replying to a message the door does not know
   (it remembers the last 2,000) is refused rather than guessed.
 - **Decisions** whose payload lists `options` show buttons; tapping one answers.
+- **Privileged commands** a ship staged show the exact command, one argument
+  per line, with **Approve** and **Deny**. Approve grants it, but nothing runs
+  yet: it waits for you at the machine, where `privateer privileged run ID`
+  shows it again and runs it after you type the first 8 characters of its
+  hash. A text reply to the card is refused, and production approvals are
+  never approved from the phone.
 - **`/to SHIP text`** sends one message to a ship. `/to SHIP` makes that ship the
   default for plain messages, `/to` shows buttons, and `/to default` resets.
 - **`/status`** shows what each ship is doing, **`/waiting`** re-shows what still
@@ -89,7 +95,9 @@ the adapter's stderr, `state/telegram.log` from the adapter).
 ## Trust boundary
 
 Only the configured `chat_id` is heard, and within it only `allowed_user_ids`
-when set; everything else is logged and dropped. Anyone the door hears can mail
+when set; everything else is logged and dropped. Approving a privileged command
+here is only half of it: the command runs only when you confirm it at the
+machine. Anyone the door hears can mail
 your ships as the captain, so in a group chat set `allowed_user_ids`. The bot
 token is never put on a command line: it reaches curl in a private temporary
 file and is redacted from logs.

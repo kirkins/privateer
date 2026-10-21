@@ -801,7 +801,12 @@ impl App {
                 clean(item["ship"].as_str().unwrap_or("?"), 160),
                 clean(item["version"].as_str().unwrap_or("?"), 160)
             )));
-            if item["kind"] == "approval" {
+            if item["privileged"].is_object() {
+                privileged_lines(&mut lines, &item["privileged"]);
+                lines.push(Line::from(
+                    "a: approve, then confirm at this machine by typing the hash prefix · d: deny",
+                ));
+            } else if item["kind"] == "approval" {
                 lines.push(Line::from(format!(
                     "Artifact: {} · Environment: {}",
                     clean(item["artifact"].as_str().unwrap_or(""), 1024),
@@ -937,7 +942,9 @@ impl App {
             } else if n.item["kind"] == "blocker" {
                 lines.push(Line::from(format!("Recorded {} · status {} · incarnation {}. No live process proof; no inline mutation.",n.item["evidence"],n.item["status"],n.item["incarnation"])));
             }
-            if n.item["kind"] == "approval" {
+            if n.item["privileged"].is_object() {
+                privileged_lines(&mut lines, &n.item["privileged"]);
+            } else if n.item["kind"] == "approval" {
                 lines.push(Line::from(format!(
                     "Exact artifact: {} · environment: {}",
                     clean(n.item["artifact"].as_str().unwrap_or(""), 1024),
@@ -1213,6 +1220,47 @@ pub(super) fn ago(then_ms: i64, now_ms: i64) -> String {
         1..=59 => format!("{minutes} min ago"),
         _ => format!("{} h ago", minutes / 60),
     }
+}
+
+/// A privileged command as the captain reads it: the argv one per line, as
+/// the runtime escaped it, after why and any warnings, then where and the
+/// hash they will confirm.
+fn privileged_lines(lines: &mut Vec<Line<'static>>, privileged: &serde_json::Value) {
+    lines.push(Line::from(format!(
+        "Reason: {}",
+        clean(privileged["reason"].as_str().unwrap_or(""), 4200)
+    )));
+    for warning in privileged["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(64)
+    {
+        lines.push(Line::from(clean(warning.as_str().unwrap_or(""), 4400)));
+    }
+    lines.push(Line::from(format!(
+        "Runs as root on {}{}:",
+        clean(privileged["machine"].as_str().unwrap_or("?"), 160),
+        if privileged["held_elsewhere"] == true {
+            " (staged there; approve and run it on that machine)"
+        } else {
+            ""
+        }
+    )));
+    for arg in privileged["argv"].as_array().into_iter().flatten().take(65) {
+        lines.push(Line::from(format!(
+            "    {}",
+            clean(arg.as_str().unwrap_or(""), 4200)
+        )));
+    }
+    lines.push(Line::from(format!(
+        "in {}",
+        clean(privileged["cwd"].as_str().unwrap_or(""), 4200)
+    )));
+    lines.push(Line::from(format!(
+        "Hash {}",
+        clean(privileged["hash"].as_str().unwrap_or(""), 64)
+    )));
 }
 
 #[cfg(test)]

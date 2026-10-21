@@ -669,10 +669,18 @@ pub(crate) fn approval_answer(
     }
     let id = outcome_id(store, "approval-answer")?;
     let now = Store::now_ms();
+    // A privileged grant is half of it: the captain still confirms and runs
+    // the command at the machine, and the ship hears the result then.
+    let body = if request["request_kind"] == crate::privileged::REQUEST_KIND && state == "approved"
+    {
+        "approved, waiting for the captain at the machine"
+    } else {
+        state
+    };
     store.connection().execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms)
          VALUES(?1,'captain',?2,'reply',?3,?4,?5,?6,'normal',?7)",
-        params![id,request["from"].as_str(),request["id"].as_str(),request["task_id"].as_str(),state,payload.to_string(),now])?;
+        params![id,request["from"].as_str(),request["id"].as_str(),request["task_id"].as_str(),body,payload.to_string(),now])?;
     store.connection().execute("UPDATE mail SET state=?2,answered_by=?3,answered_ms=?4,ended_by=?3,ended_ms=?4,end_reason=?2 WHERE id=?1 AND state='open'",
         params![request["id"].as_str(),state,id,now])?;
     store.audit("approval.response", &json!({"request_id":request["id"],"state":state,"answer_id":id,"approval_id":args.get("id")}))?;
@@ -1065,6 +1073,21 @@ pub(crate) enum Mark {
     Relayed,
     /// A runtime copy of another reply, which keeps that reply's marker.
     Keep(bool),
+    /// The runtime's own privileged request, from `privileged.stage`.
+    Privileged,
+}
+
+/// The request kinds the captain answers with `approval.grant` or
+/// `approval.deny` alone, never with a reply, a relay or a dismissal.
+pub(crate) fn is_approval_kind(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some("production_approval") | Some(crate::privileged::REQUEST_KIND)
+    )
+}
+
+fn approval_kind(value: &Value) -> bool {
+    is_approval_kind(value.as_str())
 }
 
 fn send(store: &Store, args: &Value) -> Result<Value> {
@@ -1075,6 +1098,12 @@ fn send(store: &Store, args: &Value) -> Result<Value> {
 /// stored as a reply, but carries no operator marker.
 pub(crate) fn send_relayed(store: &Store, args: &Value) -> Result<Value> {
     send_with(store, args, Mark::Relayed)
+}
+
+/// `mail.send` for the privileged request `privileged.stage` composed: the
+/// only way that kind and `payload.privileged` are written.
+pub(crate) fn send_privileged(store: &Store, args: &Value) -> Result<Value> {
+    send_with(store, args, Mark::Privileged)
 }
 
 /// `mail.send` for a runtime copy of a captain reply (a fan-out to an
@@ -1149,6 +1178,22 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             "payload.{reserved} is reserved for the runtime"
         );
     }
+    // A privileged request is staged only by the runtime, which binds its
+    // command by hash; its result is the runtime's report of the run.
+    let privileged = matches!(mark, Mark::Privileged);
+    ensure!(
+        payload.get("privileged_result").is_none(),
+        "payload.privileged_result is set by the runtime"
+    );
+    let staged = args["request_kind"] == crate::privileged::REQUEST_KIND
+        || payload.get("privileged").is_some();
+    ensure!(
+        staged == privileged
+            && (!privileged
+                || (args["request_kind"] == crate::privileged::REQUEST_KIND
+                    && payload.get("privileged").is_some())),
+        "privileged requests are staged with privileged.stage"
+    );
     // A placement decision and its outcome are composed by the runtime, so
     // no ship can dress a decision up as one the captain's yes would run.
     for reserved in [
@@ -1194,23 +1239,30 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             Mark::Caller => {
                 *store.caller() == Caller::Operator && payload.get("relayed_by").is_none()
             }
-            Mark::Relayed => false,
+            Mark::Relayed | Mark::Privileged => false,
             Mark::Keep(operator) => operator,
         };
     let about = optional_str(args, "about")?;
     if let Some(about) = about {
         identifier(about)?;
     }
-    if args["request_kind"] == "production_approval" {
+    if approval_kind(&args["request_kind"]) {
         ensure!(
             kind == "request" && to == CAPTAIN,
             "production approvals are requests to captain"
         );
         let task = required(args, "task_id")?;
+        let artifact = required(&payload, "artifact")?;
+        let environment = required(&payload, "environment")?;
         ensure!(
-            required(&payload, "artifact")?.len() <= 1024
-                && required(&payload, "environment")?.len() <= 1024,
+            artifact.len() <= 1024 && environment.len() <= 1024,
             "approval artifact and environment are limited to 1024 bytes"
+        );
+        // A privileged approval names its own artifact and environment, which
+        // only privileged.run uses up.
+        ensure!(
+            privileged || !crate::privileged::reserved(artifact, environment),
+            "artifacts starting privileged: and environments starting host: are privileged approvals"
         );
         let charter = store.active_charter(task)?;
         payload["charter_hash"] = json!(crate::core::hash(&charter));
@@ -1333,7 +1385,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             let primary = crate::block_ask::open_primary(store, &topic)?;
             if let Some((ask, ship)) = &primary {
                 if to == CAPTAIN
-                    && request_kind != Some("production_approval")
+                    && !is_approval_kind(request_kind)
                     && payload.get("needs_hands").is_none()
                 {
                     payload["attached_to"] = json!(ask);
@@ -1369,7 +1421,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             !opens || !matches!(linked["status"].as_str(), Some("done" | "cancelled")),
             "task is terminal"
         );
-        if request_kind == Some("production_approval") {
+        if is_approval_kind(request_kind) {
             ensure!(
                 payload["charter_hash"] == crate::core::hash(&store.active_charter(task)?),
                 "approval authority changed"
@@ -1399,6 +1451,11 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
                     ensure!(
                         thread["state"] == "open",
                         "{correlation} was already answered"
+                    );
+                    // A reply would close it without granting anything.
+                    ensure!(
+                        thread["request_kind"] != crate::privileged::REQUEST_KIND,
+                        "{correlation} is a privileged command; answer it with approval.grant or approval.deny"
                     );
                     // Only an answer to a typed decision is checked against its options.
                     if let (Some(answer), Some(decision)) =
@@ -2402,6 +2459,23 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     let body = args.get("body").and_then(Value::as_str).unwrap_or("");
     let mut payload = args.get("payload").cloned().unwrap_or(json!({}));
     ensure!(payload.is_object(), "payload must be an object");
+    // A privileged request crosses a link only as the captain's copy of a
+    // ship's request, carried by the operator; its result never does.
+    ensure!(
+        payload.get("privileged_result").is_none(),
+        "payload.privileged_result stays in its own home"
+    );
+    if request_kind == Some(crate::privileged::REQUEST_KIND) || payload.get("privileged").is_some()
+    {
+        ensure!(
+            request_kind == Some(crate::privileged::REQUEST_KIND)
+                && payload.get("privileged").is_some()
+                && kind == "request"
+                && to == CAPTAIN
+                && from != CAPTAIN,
+            "privileged requests are staged with privileged.stage"
+        );
+    }
     typed_payload(kind, &mut payload)?;
     hands_step(kind, to, &payload)?;
     // Cross-ship wait notices are runtime-to-runtime: applied here, never
@@ -2481,7 +2555,7 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             None => crate::block_ask::fleet_key_primary(store, from, &payload)?,
         };
         if let Some(topic) = topic
-            && request_kind != Some("production_approval")
+            && !is_approval_kind(request_kind)
             && payload.get("needs_hands").is_none()
             && let Some((ask, ship)) = crate::block_ask::open_primary(store, &topic)?
             && ask != id
@@ -2527,6 +2601,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
                 Some("open" | "withdrawn" | "task_done" | "task_cancelled")
             ),
             "{correlation} was already answered"
+        );
+        ensure!(
+            request["request_kind"] != crate::privileged::REQUEST_KIND,
+            "{correlation} is a privileged command; it is answered where it was staged"
         );
         // Only an answer to a typed decision is checked against its options.
         if let (Some(answer), Some(decision)) = (payload.get("answer"), typed_decision(&request)) {

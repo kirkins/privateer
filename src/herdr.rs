@@ -343,6 +343,34 @@ impl Client {
         )
     }
 
+    /// Open a focused tab running `privateer --home HOME privileged run ID`,
+    /// where the captain confirms a privileged command the bridge granted.
+    /// The id is checked as a launch word; the run itself rechecks it all.
+    pub fn privileged_run(
+        &mut self,
+        folder: &Path,
+        binary: &Path,
+        home: &Path,
+        id: &str,
+    ) -> Result<Pane> {
+        let observed = self.snapshot()?;
+        let label = format!("privileged {}", id.chars().take(24).collect::<String>());
+        self.spawn_recorded(
+            &observed,
+            "tab.create",
+            folder,
+            &label,
+            Some("privileged"),
+            true,
+            &[],
+            binary,
+            home,
+            &["privileged", "run", id],
+            true,
+            |_| Ok(()),
+        )
+    }
+
     /// Open a tab following the ship's first mate (`privateer watch`).
     pub fn watch(
         &mut self,

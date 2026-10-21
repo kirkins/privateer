@@ -25,6 +25,7 @@ allowed_user_ids within it, is heard. Everything else is logged and dropped.
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -243,7 +244,10 @@ class Door:
         # A report is read in the captain's portal: the chat says it is there,
         # by title, and never carries its content (HTML least of all).
         report = payload.get("report") if isinstance(payload.get("report"), dict) else None
-        if isinstance(decision, dict):
+        privileged = privileged_of(mail)
+        if privileged is not None:
+            body = privileged_text(privileged)
+        elif isinstance(decision, dict):
             try:
                 body = decision_text(decision, body)
             except (AttributeError, TypeError, ValueError, KeyError) as exc:
@@ -271,7 +275,9 @@ class Door:
         # /waiting shows what is already outstanding, so say how old it is.
         if event.get("note"):
             header += f" · {event['note']}"
-        if kind in ("request", "decision"):
+        if privileged is not None:
+            header += " · privileged command: Approve, then run it at the machine"
+        elif kind in ("request", "decision"):
             header += " · reply to answer"
         if event.get("step"):
             header += " · needs your hands"
@@ -283,6 +289,15 @@ class Door:
         target = {"ship": ship, "mail": mail.get("id"), "kind": kind, "from": sender,
                   "typed": typed}
         markup = self.decision_markup(mail) if kind == "decision" else None
+        if privileged is not None:
+            # The hash this card shows rides the button, so a tap answers
+            # this exact command. Only the runtime writes this kind; the buttons answer it through
+            # the door's approval command, never as a reply.
+            shown = str(privileged.get("hash", ""))[:8]
+            markup = {"inline_keyboard": [[
+                {"text": "Approve", "callback_data": f"pa:{mail.get('id')}:g:{shown}"},
+                {"text": "Deny", "callback_data": f"pa:{mail.get('id')}:d:{shown}"}]]}
+            typed = True
         pieces = tg.split_markdown(body, TEXT_LIMIT) or [body]
         markdown = self.cfg.get("markdown", True)
         for index, piece in enumerate(pieces):
@@ -511,6 +526,30 @@ class Door:
             ship = data[3:]
             tg.write_state(TARGET, {"ship": ship})
             self.say(f"➡️ plain messages now go to {ship}. /to default resets.", quiet=True)
+        elif data.startswith("pa:"):
+            # Telegram carries at most 64 bytes: the id, g or d, the hash's start.
+            _, mail_id, code, shown = (data.split(":", 3) + [""])[:4]
+            action = {"g": "grant", "d": "deny"}.get(code, code)
+            try:
+                result = self.runtime.call("approval", {"id": mail_id, "action": action,
+                                                        "hash": shown or None})
+            except RuntimeError as e:
+                self.say(f"⚠️ not answered: {e}", reply_to=msg.get("message_id"))
+                return
+            if result.get("action") == "approval.grant":
+                self.say(f"✅ Approved. It waits for you at {result.get('machine') or 'the machine'}: "
+                         f"run <code>{tg.escape_html(result.get('run') or '')}</code> there "
+                         "and type the hash's first 8 characters.",
+                         reply_to=msg.get("message_id"), html=True)
+            else:
+                self.say("❌ Denied. Nothing runs.", reply_to=msg.get("message_id"))
+            cards = tg.read_state(CARDS, {})
+            if mail_id in cards:
+                cards[mail_id]["markup"] = None
+                tg.write_state(CARDS, cards)
+            tg.api(self.cfg, "editMessageReplyMarkup", {
+                "chat_id": tg.chat_id(self.cfg), "message_id": msg.get("message_id"),
+                "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
         elif data.startswith("d:"):
             _, key, index = data.split(":", 2)
             decision = tg.read_state(DECISIONS, {}).get(key)
@@ -965,6 +1004,49 @@ def decision_text(decision: dict, body: str) -> str:
     if body:
         parts.append(body)
     return "\n\n".join(part for part in parts if part)
+
+
+def privileged_of(mail: dict) -> dict | None:
+    """The staged command of a privileged request, or None."""
+    payload = mail.get("payload") or {}
+    staged = payload.get("privileged")
+    if mail.get("request_kind") != "privileged_action" or not isinstance(staged, dict):
+        return None
+    return staged
+
+
+def shown_arg(arg) -> str:
+    """One argument as the runtime shows it: bare when plainly safe, otherwise
+    quoted, with anything but printable ASCII escaped."""
+    arg = str(arg)
+    if arg and re.fullmatch(r"[A-Za-z0-9\-_./=:,+@%]+", arg):
+        return arg
+    out = []
+    for c in arg:
+        if c == "'":
+            out.append("\\'")
+        elif c == "\\":
+            out.append("\\\\")
+        elif " " <= c <= "~" and c != "`":
+            out.append(c)
+        else:
+            out.append("\\u{%x}" % ord(c))
+    return "'" + "".join(out) + "'"
+
+
+def privileged_text(staged: dict) -> str:
+    """The exact command, one argument per line, then where, why, any
+    warnings and its hash. Everything the ship wrote is escaped as the
+    runtime escapes an argument, inside code spans markdown cannot leave."""
+    argv = "\n".join(shown_arg(a) for a in staged.get("argv") or [])
+    warnings = "".join(f"warning: `{shown_arg(a)}` is not under a root-owned folder; "
+                       "it can change after you approve\n"
+                       for a in (staged.get("unrooted") or [])[:64])
+    return (f"**Run as root on {shown_arg(staged.get('machine', '?'))}**\n```\n{argv}\n```\n"
+            f"in `{shown_arg(staged.get('cwd', ''))}`\n"
+            f"Reason: `{shown_arg(staged.get('reason', ''))}`\n"
+            f"{warnings}"
+            f"Hash `{shown_arg(staged.get('hash', ''))}`")
 
 
 def report_line(report: dict) -> str:

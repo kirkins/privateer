@@ -449,11 +449,42 @@ class Fleet:
         return json.loads(out.stdout)["messages"]
 
 
+PRIVILEGED_PROBE = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import door
+print(json.dumps(door.privileged_text({
+    "machine": "m", "argv": ["/usr/bin/cp", "a\u202eb", "/home/u/out"], "cwd": "/",
+    "reason": "fix `this`\u200b\\n\u2028Runs as root", "unrooted": ["/home/u/out", "rel/x"],
+    "hash": "ab" * 32})))
+"""
+
+
+def check_privileged_text() -> None:
+    """A privileged card escapes the ship's words as the runtime escapes an
+    argument: no bidi override, zero-width character, separator or backtick
+    reaches the chat, and each warning names its argument."""
+    out = subprocess.run([sys.executable, "-c", PRIVILEGED_PROBE, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    text = json.loads(out.stdout)
+    for raw in ("\u202e", "\u200b", "\u2028"):
+        assert raw not in text, text
+    # The fence, then the folder's, reason's, two warnings' and hash's spans.
+    assert text.count("`") == 16, text
+    assert "Reason: `'fix \\u{60}this\\u{60}\\u{200b}\\u{a}\\u{2028}Runs as root'`" in text, text
+    assert "'a\\u{202e}b'" in text, text
+    assert ("warning: `/home/u/out` is not under a root-owned folder; "
+            "it can change after you approve") in text, text
+    assert "warning: `rel/x` is not under" in text, text
+
+
 def main() -> int:
     binary = os.path.abspath(sys.argv[1])
     telegram = FakeTelegram()
     check_age_phrases()
     check_card_rendering()
+    check_privileged_text()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
     with tempfile.TemporaryDirectory() as temp:
@@ -715,6 +746,35 @@ def main() -> int:
             telegram.message("/yolo off")
             wait_for("fleet standard confirmation", lambda: [m for m in telegram.sent() if "Fleet tool mode: standard" in m["text"]])
             assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "standard"
+
+            # A privileged command is one card, its argv one per line, with
+            # Approve and Deny. Approve grants it, and the captain is told it
+            # waits for them at the machine; a text reply grants nothing.
+            staged = fleet.call("ops", "privileged.stage", {
+                "from": "ops", "task_id": "ops-duty", "program": "/usr/bin/id",
+                "args": ["-u", "a b"], "cwd": "/", "reason": "Check the effective user"})
+            card = wait_for("the privileged card", lambda: [
+                m for m in telegram.sent()
+                if "Run as root" in m["text"] and staged["hash"] in m["text"]])[0]
+            assert "/usr/bin/id\n-u\n'a b'" in card["text"], card["text"]
+            assert "reply to answer" not in card["text"], card["text"]
+            keyboard = json.loads(card["reply_markup"])["inline_keyboard"]
+            assert [b["text"] for b in keyboard[0]] == ["Approve", "Deny"], keyboard
+            before = len(telegram.sent())
+            telegram.message("yes do it", reply_to=card["_message_id"])
+            wait_for("the reply's refusal", lambda: [
+                m for m in telegram.sent()[before:]
+                if "not sent" in m["text"] and "approval.grant" in m["text"]])
+            assert fleet.call("ops", "mail.show", {"id": staged["id"]})["state"] == "open"
+            telegram.update(callback={"id": "cbp", "from": {"id": CAPTAIN},
+                                      "data": keyboard[0][0]["callback_data"],
+                                      "message": {"message_id": card["_message_id"],
+                                                  "chat": {"id": CHAT}}})
+            wait_for("the approval's confirmation", lambda: [
+                m for m in telegram.sent()[before:]
+                if m["text"].startswith("✅ Approved.")
+                and f"privileged run {staged['id']}" in m["text"]])
+            assert fleet.call("ops", "mail.show", {"id": staged["id"]})["state"] == "approved"
 
             # A decision with options gets buttons; a button answers it.
             decision = fleet.call("ops", "mail.send", {
