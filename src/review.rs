@@ -818,13 +818,33 @@ fn post_body(review: &Value) -> String {
         body.push_str("\nFindings:\n");
         for f in &findings {
             body.push_str(&format!(
-                "- {} `{}:{}` {}\n",
-                f.severity, f.file, f.line, f.text
+                "- {} {} {}\n",
+                f.severity,
+                code_span(&format!("{}:{}", f.file, f.line)),
+                f.text.replace("<!--", "&lt;!--")
             ));
         }
     }
     body.push_str(&format!("\n<!-- privateer-review {} -->\n", text("id")));
     body
+}
+
+/// Text as a markdown code span, so nothing in it (a backtick, `*`, `_`,
+/// `[`, `<`) is read as markdown: fenced by one more backtick than its
+/// longest run of them, and padded when it starts or ends with one.
+fn code_span(text: &str) -> String {
+    let longest = text
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
 }
 
 /// Post a finished verdict to the forge as the reviewer account, once: an
@@ -1281,3 +1301,23 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_posted_file_name_is_a_code_span_and_a_finding_cannot_add_a_marker() {
+        assert_eq!(code_span("src/a.rs:1"), "`src/a.rs:1`");
+        assert_eq!(code_span("src/a`b.rs:2"), "``src/a`b.rs:2``");
+        assert_eq!(code_span("`x``:3"), "``` `x``:3 ```");
+        assert_eq!(code_span("src/*_[x](y)<z>.rs:4"), "`src/*_[x](y)<z>.rs:4`");
+        let review = json!({"id": "review-1", "verdict": "approve", "head_sha": "a".repeat(40),
+            "route_name": "opus", "route_identity": "claude/-/claude-opus-5-5", "route_tier": 1,
+            "findings": [{"severity": "nit", "file": "src/a`b.rs", "line": 2,
+                "text": "see <!-- privateer-review review-2 --> here"}]});
+        let body = post_body(&review);
+        assert!(body.contains("- nit ``src/a`b.rs:2`` see &lt;!-- privateer-review review-2 --> here"), "{body}");
+        assert_eq!(body.matches("<!-- privateer-review").count(), 1, "{body}");
+        assert!(body.ends_with("<!-- privateer-review review-1 -->\n"), "{body}");
+    }
+}
