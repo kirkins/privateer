@@ -125,8 +125,14 @@ runtime turns them into one captain **decision** from the task's owner (see
   holds nothing, and its failed verdict is a low notice naming the decision.
 - A policy change ends the decisions it covers (`yolo`, or every rule allowed); an
   unrelated change keeps them open. A decision whose denial names no rule ends on
-  any change for one retry, and its notice says plainly that nothing was granted:
-  the ship retries the step once and, denied again, reports it with
+  any change for one retry, and its notice says plainly that the runtime can't
+  tell whether the new policy covers it and nothing was granted (`granted:
+  false`): the ship retries the step once and, denied again, reports it with
+  `permissions.blocked`. A decision offering a standing authorization ends when
+  its own ship's authorizations change, but the runtime can't tell whether the new
+  wording covers it, so it is never told the policy allows it (`granted:
+  "unknown"`): it asks for `privateer host relaunch <ship>`, since auto mode reads
+  authorizations only at launch, retries once, and if denied again reports it with
   `permissions.blocked`.
 - Mail to the captain about an open decision (citing `about`, correlated to the
   blocked ship's notice, or the same derived rule denied on another ship) is added

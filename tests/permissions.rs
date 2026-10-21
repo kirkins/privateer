@@ -1026,9 +1026,58 @@ fn an_ask_an_unrelated_policy_change_ends_says_nothing_was_granted() {
         body.contains("nothing was granted for this request"),
         "{body}"
     );
+    assert!(
+        body.contains("can't tell whether the new policy covers this"),
+        "{body}"
+    );
     assert!(body.contains("Retry the step once"), "{body}");
     assert!(body.contains("permissions.blocked"), "{body}");
     assert!(!body.contains("now allows"), "{body}");
+}
+
+#[test]
+fn an_unrelated_authorization_never_tells_an_authorize_ask_it_is_allowed() {
+    let f = Fleet::new();
+    let ask = f.json(
+        "liaison",
+        "permissions.blocked",
+        json!({"task_id": "liaison-duty", "tool": "Bash",
+            "input": {"command": "make deploy | tee deploy.log"}}),
+    )["request_id"]
+        .clone();
+    assert!(f.show("liaison", &ask)["payload"]["block"]["authorize"].is_string());
+    // The captain authorizes something else for the same ship.
+    f.ok(
+        None,
+        &[
+            "permissions",
+            "authorize",
+            "liaison",
+            "Running billing scripts.",
+        ],
+    );
+    let ended = f.show("liaison", &ask);
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    let reason = ended["end_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("standing authorizations changed") && reason.contains("cannot be told"),
+        "{reason}"
+    );
+    let told = f.json("liaison", "mail.inbox", json!({"address":"liaison"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["payload"]["block_cleared"] == true)
+        .cloned()
+        .unwrap();
+    assert_eq!(told["payload"]["granted"], "unknown", "{told}");
+    let body = told["body"].as_str().unwrap();
+    assert!(!body.contains("now allows"), "{body}");
+    assert!(!body.contains("Carry on"), "{body}");
+    assert!(body.contains("can't tell"), "{body}");
+    assert!(body.contains("privateer host relaunch liaison"), "{body}");
+    assert!(body.contains("Retry the step once"), "{body}");
+    assert!(body.contains("permissions.blocked"), "{body}");
 }
 
 #[test]

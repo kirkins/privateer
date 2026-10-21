@@ -35,6 +35,10 @@ pub(crate) const POLICY_CHANGED: &str = "policy changed";
 /// named: its denials name no rule, so it ends for one retry.
 pub(crate) const POLICY_CHANGED_UNGRANTED: &str =
     "policy changed, but nothing this ask named was granted; retry once";
+/// The reason a change to its ship's standing authorizations ends an ask
+/// offering one with: whether the new wording covers it cannot be read, and
+/// auto mode reads it only from its next launch.
+pub(crate) const POLICY_CHANGED_AUTHORIZATIONS: &str = "policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; relaunch, then retry once";
 /// An open block ask, in a query's WHERE clause.
 const OPEN_ASK: &str = "recipient='captain' AND kind IN ('request','decision') AND state='open'
     AND json_extract(payload,'$.type')='tool_permission'";
@@ -528,11 +532,64 @@ fn authorizations_hash(policy: &Value, ship: &str) -> String {
 }
 
 /// Whether a policy change ends an ask: when the policy grants it (see
-/// `grants`), or, for an ask with any other denial or from before asks listed
-/// their denials, on any policy change. The second grants nothing; it ends so
-/// the step is retried once, and a retry that is denied again asks anew.
+/// `grants`), when its ship's standing authorizations changed (see
+/// `reauthorized`), or, for an ask with any other denial or from before asks
+/// listed their denials, on any policy change. Only the first grants
+/// anything; the others end so the step is retried once, and a retry that is
+/// denied again asks anew.
 pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
-    grants(policy, ask) || (!known(ask) && ask["policy_hash"].as_str() != Some(policy_hash))
+    grants(policy, ask)
+        || reauthorized(policy, ask)
+        || (!known(ask) && ask["policy_hash"].as_str() != Some(policy_hash))
+}
+
+/// What a policy change that ends an ask did for what it asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The policy lets every denial run.
+    Granted,
+    /// Its ship's standing authorizations changed; whether they cover it
+    /// cannot be told.
+    Reauthorized,
+    /// Nothing it named was granted; whether the change covers it cannot be
+    /// told.
+    Ungranted,
+}
+
+impl Outcome {
+    /// The outcome of a policy change that ends `ask`.
+    fn of(policy: &Value, ask: &Value) -> Self {
+        if grants(policy, ask) {
+            Self::Granted
+        } else if reauthorized(policy, ask) {
+            Self::Reauthorized
+        } else {
+            Self::Ungranted
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Granted => POLICY_CHANGED,
+            Self::Reauthorized => POLICY_CHANGED_AUTHORIZATIONS,
+            Self::Ungranted => POLICY_CHANGED_UNGRANTED,
+        }
+    }
+
+    fn from_reason(reason: &str) -> Option<Self> {
+        [Self::Granted, Self::Reauthorized, Self::Ungranted]
+            .into_iter()
+            .find(|o| o.reason() == reason)
+    }
+
+    /// What a ship's notice payload says was granted.
+    fn granted(self) -> Value {
+        match self {
+            Self::Granted => json!(true),
+            Self::Reauthorized => json!("unknown"),
+            Self::Ungranted => json!(false),
+        }
+    }
 }
 
 /// Whether the coverage of every denial of an ask can be read from a policy:
@@ -549,35 +606,53 @@ fn known(ask: &Value) -> bool {
 }
 
 /// Whether the policy now lets every denial of an ask run: `yolo`, or each
-/// derived rule present exactly or by its tool's name. A denial an ask offers
-/// a standing authorization for is granted once the ship's own
-/// authorizations change, never by another ship's.
+/// denial a derived rule present exactly or by its tool's name. A denial an
+/// ask offers a standing authorization for is never granted this way: see
+/// `reauthorized`.
 pub(crate) fn grants(policy: &Value, ask: &Value) -> bool {
     if policy["mode"] == "yolo" {
         return true;
     }
+    let allowed = allowed(policy);
+    known(ask) && denials(ask).all(|d| d["rule"].is_string() && rule_allowed(&allowed, d))
+}
+
+/// Whether an ask offering a standing authorization ends because its own
+/// ship's authorizations changed, never another ship's, with every derived
+/// rule it also names allowed. Whether the new authorizations cover it
+/// cannot be read from their wording, and auto mode reads them only from
+/// the ship's next launch, so this grants nothing the runtime can confirm.
+fn reauthorized(policy: &Value, ask: &Value) -> bool {
     if !known(ask) {
         return false;
     }
     let block = &ask["block"];
     let seen = block["authorized"].as_str();
-    let denials = block["denials"].as_array();
-    let allowed: Vec<&str> = policy["claude_allow"]
+    let ship = block["ship"].as_str().unwrap_or_default();
+    let changed = seen != Some(&authorizations_hash(policy, ship));
+    let allowed = allowed(policy);
+    changed
+        && denials(ask).any(|d| !d["rule"].is_string())
+        && denials(ask).all(|d| !d["rule"].is_string() || rule_allowed(&allowed, d))
+}
+
+fn denials(ask: &Value) -> impl Iterator<Item = &Value> {
+    ask["block"]["denials"].as_array().into_iter().flatten()
+}
+
+fn allowed(policy: &Value) -> Vec<&str> {
+    policy["claude_allow"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .collect();
-    let ship = block["ship"].as_str().unwrap_or_default();
-    denials
-        .into_iter()
-        .flatten()
-        .all(|d| match d["rule"].as_str() {
-            Some(rule) => {
-                allowed.contains(&rule) || allowed.contains(&d["tool"].as_str().unwrap_or_default())
-            }
-            None => seen != Some(&authorizations_hash(policy, ship)),
-        })
+        .collect()
+}
+
+/// Whether a denial's derived rule is allowed, exactly or by its tool's name.
+fn rule_allowed(allowed: &[&str], denial: &Value) -> bool {
+    let rule = denial["rule"].as_str().unwrap_or_default();
+    allowed.contains(&rule) || allowed.contains(&denial["tool"].as_str().unwrap_or_default())
 }
 
 /// The open block ask a ship raised for a task, if any.
@@ -969,18 +1044,12 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
 }
 
 /// End an open block ask a policy change covers, in the caller's
-/// transaction, and tell an unscheduled task's owner what it means: carry on
-/// when the policy grants what it asked for, else that nothing was granted,
-/// to retry once and ask again if denied again.
+/// transaction, and tell an unscheduled task's owner what it means (see
+/// `ended_text`).
 fn end_by_policy(store: &Store, policy: &Value, ask: &Value) -> Result<()> {
     let id = ask["id"].as_str().unwrap_or_default();
-    let granted = grants(policy, &ask["payload"]);
-    let reason = if granted {
-        POLICY_CHANGED
-    } else {
-        POLICY_CHANGED_UNGRANTED
-    };
-    crate::mail::end_request(store, ask, "withdrawn", reason)?;
+    let outcome = Outcome::of(policy, &ask["payload"]);
+    crate::mail::end_request(store, ask, "withdrawn", outcome.reason())?;
     let task = ask["task_id"].as_str().unwrap_or_default();
     if !task.is_empty() && !crate::scheduling::scheduled(store, task)? {
         let owner = ask["from"].as_str().unwrap_or_default();
@@ -988,39 +1057,47 @@ fn end_by_policy(store: &Store, policy: &Value, ask: &Value) -> Result<()> {
             store.connection(),
             &json!({"id": format!("block-cleared-{}", hex(id)), "to": owner, "kind": "notice",
                 "task_id": task, "urgency": "normal",
-                "body": format!("{} Task {task}.", ended_text(ask, granted)),
-                "payload": {"about": id, "block_cleared": true, "granted": granted}}),
+                "body": format!("{} Task {task}.", ended_text(ask, outcome)),
+                "payload": {"about": id, "block_cleared": true, "granted": outcome.granted()}}),
         )?;
     }
     Ok(())
 }
 
 /// What a block ask that a policy change ended means for the ship that
-/// asked, in plain words.
-fn ended_text(ask: &Value, granted: bool) -> String {
+/// asked, in plain words: carry on only when the policy grants what it
+/// asked for; otherwise the runtime cannot tell, so retry once (after a
+/// relaunch, when its ship's authorizations changed) and ask again if
+/// denied again.
+fn ended_text(ask: &Value, outcome: Outcome) -> String {
     let id = ask["id"].as_str().unwrap_or_default();
-    let rules = rules_text(&ask["payload"]["block"]);
-    if granted {
-        format!(
+    let block = &ask["payload"]["block"];
+    let rules = rules_text(block);
+    match outcome {
+        Outcome::Granted => format!(
             "The fleet policy now allows what {id} asked for ({rules}); the captain's decision is no longer needed. Carry on."
-        )
-    } else {
-        format!(
-            "{id} ended because the fleet policy changed, but the new policy does not cover what it asked for ({rules}): nothing was granted for this request. Retry the step once; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
-        )
+        ),
+        Outcome::Reauthorized => {
+            let ship = block["ship"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("<ship>");
+            format!(
+                "{id} ended because your ship's standing authorizations changed, but the runtime can't tell whether they cover this request ({rules}): nothing is known to be granted. Auto mode reads them only at launch, so first ask for a relaunch (`privateer host relaunch {ship}`). Retry the step once after it; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
+            )
+        }
+        Outcome::Ungranted => format!(
+            "{id} ended because the fleet policy changed, but the runtime can't tell whether the new policy covers this ({rules}): nothing was granted for this request. Retry the step once; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
+        ),
     }
 }
 
 /// Why a task parked on a block ask resumes, when a policy change ended the
 /// ask; None for any other ending.
 pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
-    let granted = match request["end_reason"].as_str() {
-        Some(POLICY_CHANGED) => true,
-        Some(POLICY_CHANGED_UNGRANTED) => false,
-        _ => return None,
-    };
+    let outcome = Outcome::from_reason(request["end_reason"].as_str()?)?;
     (request["state"] == "withdrawn" && request["payload"]["type"] == "tool_permission")
-        .then(|| ended_text(request, granted))
+        .then(|| ended_text(request, outcome))
 }
 
 /// Before a primary that a policy change ended takes its attachments with
@@ -1098,7 +1175,7 @@ fn end_orphans(store: &Store) -> Result<()> {
                 .to_owned();
             // A policy change ended it, maybe in another home between its
             // commit and that home's release: other ships' asks go first.
-            if matches!(reason.as_str(), POLICY_CHANGED | POLICY_CHANGED_UNGRANTED) {
+            if Outcome::from_reason(&reason).is_some() {
                 release_attachments(store, &primary, ask["from"].as_str().unwrap_or_default())?;
             }
             crate::mail::end_attachments(store, &primary, &reason)?;
@@ -1840,14 +1917,31 @@ mod tests {
             "denials": [{"tool": "Bash", "rule": null, "authorize": "Running make commands."}]}});
         let other = json!({"authorized": {"storefront": ["Running deploys.", "More."]}});
         assert!(!covered(&other, "new", &ask));
+        // Its own ship's change ends it, but other wording may not cover
+        // it: the runtime cannot tell, so it grants nothing.
         let own = json!({"authorized": {"storefront": ["Running deploys."],
             "liaison": ["Running make for deploys."]}});
         assert!(covered(&own, "new", &ask));
-        assert!(covered(&json!({"mode": "yolo"}), "new", &ask));
+        assert!(!grants(&own, &ask));
+        assert_eq!(Outcome::of(&own, &ask), Outcome::Reauthorized);
+        let yolo = json!({"mode": "yolo"});
+        assert!(covered(&yolo, "new", &ask));
+        assert_eq!(Outcome::of(&yolo, &ask), Outcome::Granted);
+        // A derived rule it also names must be allowed as well.
+        let mut mixed = ask.clone();
+        mixed["block"]["denials"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tool": "Bash", "rule": "Bash(make *)"}));
+        assert!(!covered(&own, "old", &mixed));
+        let mut allowing = own.clone();
+        allowing["claude_allow"] = json!(["Bash(make *)"]);
+        assert_eq!(Outcome::of(&allowing, &mixed), Outcome::Reauthorized);
         // Without the hash (a crew's ask, or an older one) any change ends it.
         let mut older = ask.clone();
         older["block"].as_object_mut().unwrap().remove("authorized");
         assert!(covered(&other, "new", &older));
+        assert_eq!(Outcome::of(&other, &older), Outcome::Ungranted);
     }
 
     #[test]
@@ -1899,9 +1993,29 @@ mod tests {
         };
         let ungranted = resumed_by_policy(&ended(POLICY_CHANGED_UNGRANTED)).unwrap();
         assert!(ungranted.contains("nothing was granted"), "{ungranted}");
+        assert!(
+            ungranted.contains("can't tell whether the new policy covers this"),
+            "{ungranted}"
+        );
+        assert!(!ungranted.contains("does not cover"), "{ungranted}");
         assert!(ungranted.contains("permissions.blocked"), "{ungranted}");
         let granted = resumed_by_policy(&ended(POLICY_CHANGED)).unwrap();
         assert!(granted.contains("now allows"), "{granted}");
+        // A ship whose authorizations changed resumes too, told to relaunch.
+        let mut reauthorized = ended(POLICY_CHANGED_AUTHORIZATIONS);
+        reauthorized["payload"]["block"]["ship"] = json!("art");
+        let reauthorized = resumed_by_policy(&reauthorized).unwrap();
+        for absent in ["now allows", "Carry on"] {
+            assert!(!reauthorized.contains(absent), "{reauthorized}");
+        }
+        for present in [
+            "can't tell",
+            "privateer host relaunch art",
+            "Retry the step once",
+            "permissions.blocked",
+        ] {
+            assert!(reauthorized.contains(present), "{reauthorized}");
+        }
         assert!(
             resumed_by_policy(&ended("merged ask permissions-2 ended: policy changed")).is_none()
         );
