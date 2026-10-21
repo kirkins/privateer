@@ -1154,9 +1154,21 @@ fn an_approved_head_merges_through_pr_merge() {
     assert!(body.contains("route opus"), "{body}");
     assert!(!body.contains("Read the change."), "{body}");
     assert!(!post["request"].as_object().unwrap().contains_key("token"));
-    // Every read named the required check from forges.json, never every check.
-    for view in ops_of(&f, "pr.view") {
+    // review.start's read named the required check from forges.json, never
+    // every check; posting the approval, last, read the PR's head and state
+    // and judged no checks.
+    let views = ops_of(&f, "pr.view");
+    let (posting, starting) = views.split_last().unwrap();
+    assert!(!starting.is_empty());
+    for view in starting {
         assert_eq!(view["request"]["required_checks"], json!(["ci"]), "{view}");
+    }
+    assert_eq!(
+        posting["request"]["required_checks"],
+        json!([]),
+        "{posting}"
+    );
+    for view in &views {
         assert_eq!(view["token"], "forge-reviewer-github");
     }
     // Red required checks refuse the merge.

@@ -259,7 +259,7 @@ fn random_run(text: &str) -> bool {
         if run.len() < RANDOM_RUN {
             return false;
         }
-        let count = |f: fn(&u8) -> bool| run.bytes().filter(|b| f(b)).count();
+        let count = |f: fn(&u8) -> bool| run.bytes().filter(f).count();
         let digits = count(u8::is_ascii_digit);
         if run.bytes().all(|b| b.is_ascii_hexdigit()) {
             let lower_sha = run.len() == 40 && !run.bytes().any(|b| b.is_ascii_uppercase());
