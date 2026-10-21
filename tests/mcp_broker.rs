@@ -801,6 +801,18 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
         .then_some(())
     });
     assert_eq!(machine.pass(&upkeep), Value::Null);
+    // A config rewritten after install (an agent may write the ledger) is
+    // never started.
+    machine.run(&upkeep, &install);
+    let config = machine.dir().join("xcode.json");
+    let rewritten = json!({"upstream": ["/usr/bin/touch", temp.path().join("pwned")]});
+    fs::write(&config, rewritten.to_string()).unwrap();
+    let refused = machine.pass(&upkeep);
+    assert!(
+        refused["error"].as_str().unwrap().contains("differs"),
+        "{refused}"
+    );
+    assert!(!temp.path().join("pwned").exists());
     // Install lifts the stop; removing the config stops it again.
     machine.run(&upkeep, &install);
     let restarted = machine.pass(&upkeep)["started"].as_i64().unwrap() as i32;

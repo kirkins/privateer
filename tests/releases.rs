@@ -231,6 +231,12 @@ fn release_layout_rejects_refs_and_non_release_executables() {
     );
     assert!(release.binary("../escape").is_err());
     assert_eq!(
+        release.binary("privateer-mcp-broker").unwrap(),
+        root.join("releases")
+            .join(OLD)
+            .join("bin/privateer-mcp-broker")
+    );
+    assert_eq!(
         release.plugins(),
         root.join("releases")
             .join(OLD)

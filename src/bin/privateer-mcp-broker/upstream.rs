@@ -81,12 +81,14 @@ fn spawn(argv: &[String]) -> std::io::Result<Child> {
             command.env(&name, value);
         }
     }
-    #[cfg(target_os = "linux")]
-    // SAFETY: prctl is async-signal-safe. The supervisor thread that spawns
-    // the upstream lives as long as the broker, so a broker killed outright
-    // takes its upstream with it.
+    // SAFETY: signal and prctl are async-signal-safe.
     unsafe {
         command.pre_exec(|| {
+            // The broker ignores SIGHUP; the upstream gets the default back.
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            // The supervisor thread that spawns the upstream lives as long as
+            // the broker, so a broker killed outright takes its upstream too.
+            #[cfg(target_os = "linux")]
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             Ok(())
         });
@@ -296,7 +298,10 @@ fn route(broker: &Broker, pid: u32, text: &[u8], ready_at: &mut Option<Instant>)
                             let _ = queue.try_send(line(&json!({"jsonrpc": "2.0",
                                 "method": "notifications/initialized", "params": {}})));
                         }
-                        state.phase = Phase::Ready;
+                        // A stop that began meanwhile stands.
+                        if state.phase == Phase::Starting {
+                            state.phase = Phase::Ready;
+                        }
                         *ready_at = Some(Instant::now());
                         broker.changed.notify_all();
                         drop(state);

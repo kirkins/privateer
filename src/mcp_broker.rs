@@ -36,6 +36,14 @@ pub fn stable_binary() -> Result<PathBuf> {
         .join(BINARY))
 }
 
+/// The sha256 of the config `install` wrote, kept beside the stable binary
+/// and outside the ledger, which sandboxed agents may write. The dispatcher
+/// runs the config's upstream only while it still matches, so an agent that
+/// rewrites the config cannot have the dispatcher run its own command.
+fn config_pin() -> Result<PathBuf> {
+    Ok(crate::releases::data_dir()?.join(format!("mcp-broker/{NAME}.json.sha256")))
+}
+
 /// The broker's files under `<ledger>/mcp-broker/`.
 struct Files {
     dir: PathBuf,
@@ -76,6 +84,7 @@ pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> 
         Some("stop") if args.len() == 1 => {
             caller.require_operator("mcp-broker stop")?;
             // First, so the dispatcher does not start it again meanwhile.
+            private_dir(&files.dir)?;
             fs::write(&files.stopped, b"")
                 .with_context(|| format!("cannot write {}", files.stopped.display()))?;
             json!({"stopped": stop_running(&files)?, "held_until": "mcp-broker install"})
@@ -224,10 +233,12 @@ fn install(files: &Files, upstream: &[String]) -> Result<Value> {
         }
     };
     private_dir(&files.dir)?;
+    let config = serde_json::to_vec(&json!({"upstream": upstream}))?;
     write_private(
-        &files.config,
-        serde_json::to_vec(&json!({"upstream": upstream}))?.as_slice(),
+        &config_pin()?,
+        format!("{:x}\n", Sha256::digest(&config)).as_bytes(),
     )?;
+    write_private(&files.config, &config)?;
     let _ = fs::remove_file(&files.stopped);
     let sha256 = sha256_file(&target)?;
     Ok(json!({
@@ -422,7 +433,14 @@ fn ensure_now(store: &Store) -> Result<Value> {
             json!({"error": "the broker is configured but not installed: privateer mcp-broker install"}),
         );
     }
-    let config: Value = serde_json::from_slice(&fs::read(&files.config)?)?;
+    let bytes = fs::read(&files.config)?;
+    let pinned = fs::read_to_string(config_pin()?).unwrap_or_default();
+    if pinned.trim() != format!("{:x}", Sha256::digest(&bytes)) {
+        return Ok(
+            json!({"error": "the broker config differs from what mcp-broker install wrote; not starting it"}),
+        );
+    }
+    let config: Value = serde_json::from_slice(&bytes)?;
     let upstream: Vec<String> = serde_json::from_value(config["upstream"].clone())
         .context("mcp-broker config has no upstream argv")?;
     check_upstream(&upstream)?;
