@@ -18,11 +18,7 @@ sys.path.insert(0, str(ROOT / 'plugins'))
 import bundles
 import pi_bundles
 from native import handle
-
-# The interpreter running these tests, pinned as a stdio server would be.
-PYTHON = os.path.realpath(sys.executable)
-with open(PYTHON, 'rb') as _stream:
-    PYTHON_SHA = hashlib.file_digest(_stream, 'sha256').hexdigest()
+import stdio_pins
 
 # Option rows as Pi's --help lists them, keyed by the flag each row declares.
 PI_ROWS = {
@@ -614,11 +610,17 @@ class Bundles(unittest.TestCase):
         probe.assert_not_called()
 
 
-    # Pinned stdio servers. The interpreter running these tests is root-owned
-    # on a normal install; a private directory under the checkout holds the
-    # executables whose names, modes and links the refusals need.
+    # Pinned stdio servers. A private directory under the checkout holds the
+    # executables whose names, modes and links the records and refusals need;
+    # only a test that runs a server pins a real Python (stdio_pins).
+    def stdio_server(self):
+        if not hasattr(self, '_stdio_server'):
+            self._stdio_server = self.executable_copy(self.private_directory(), 'xcrun')
+        return self._stdio_server
+
     def stdio_record(self, **change):
-        record = {'name': 'xcode', 'command': [PYTHON, '-I', '/srv/mcp/server.py'], 'sha256': PYTHON_SHA, 'timeout': 10}
+        server, digest = self.stdio_server()
+        record = {'name': 'xcode', 'command': [server, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10}
         record.update(change)
         return {key: value for key, value in record.items() if value is not None}
 
@@ -627,17 +629,7 @@ class Bundles(unittest.TestCase):
                 'mcp_servers': [self.stdio_record()] if servers is None else servers}
 
     def private_directory(self):
-        """A directory whose every ancestor the executable rule accepts, or a
-        skip: a checkout below a group-writable folder cannot show these."""
-        temp = tempfile.TemporaryDirectory(prefix='.stdio-fixture-', dir=ROOT)
-        self.addCleanup(temp.cleanup)
-        path = Path(temp.name).resolve()
-        path.chmod(0o755)
-        for part in [*reversed(path.parents), path]:
-            info = part.lstat()
-            if info.st_mode & 0o022 or info.st_uid not in (0, os.geteuid()):
-                self.skipTest(f'{part} is writable by others or not ours: the rule refuses every path below it')
-        return path
+        return stdio_pins.private_directory(self)
 
     def executable_copy(self, directory, name, mode=0o755, data=b'\x7fELF fixture\n'):
         path = directory / name
@@ -796,13 +788,16 @@ class Bundles(unittest.TestCase):
         self.assertEqual((run.returncode, run.stdout, run.stderr), (2, '', message + '\n'))
 
     def test_stdio_launcher_execs_only_the_pinned_command_with_a_minimal_environment(self):
+        # The launcher runs under this Python, unpinned; the server under a
+        # pinned one, which may differ (a macOS framework Python is unpinnable).
+        python, digest = stdio_pins.require_pinned_python(self)
         server = ROOT / 'tests/fixtures/pi-mcp/server.py'
         marker = self.base / 'launched.jsonl'
-        record = self.stdio_record(command=[PYTHON, '-I', str(server), str(marker), 'selected', 'disconnected'],
-                                   credential='XCODE_TOKEN')
+        record = self.stdio_record(command=[python, '-I', str(server), str(marker), 'selected', 'disconnected'],
+                                   sha256=digest, credential='XCODE_TOKEN')
         argv = bundles.stdio_argv(record, '/fleet/xcode-token')
         self.assertEqual(argv[:3], [bundles.interpreter(), '-I', str(ROOT / 'plugins/mcp_stdio.py')])
-        self.assertEqual(json.loads(argv[3]), {'command': record['command'], 'sha256': PYTHON_SHA,
+        self.assertEqual(json.loads(argv[3]), {'command': record['command'], 'sha256': digest,
                                                'credential': {'name': 'XCODE_TOKEN', 'file': '/fleet/xcode-token'}})
         # What a harness hands its servers: its own whole environment.
         harness = {'HOME': str(self.base), 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'TMPDIR': str(self.base),

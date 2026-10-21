@@ -20,6 +20,7 @@ import bundles
 import claude_bundles
 import native_launch
 from native import handle
+import stdio_pins
 
 SESSION = '00000000-0000-4000-8000-000000000001'
 ATTENDED = str(ROOT / 'plugins/attended-claude')
@@ -434,11 +435,17 @@ class ClaudeBundles(unittest.TestCase):
         self.assertFalse([a for a in argv if a.startswith('--mcp-config')])
         self.assertNotIn('PRIVATEER_MCP_SERVERS', env)
 
+    def stdio_server(self, data=b'\x7fELF fixture\n'):
+        """A pinnable stand-in for a server's executable, which these tests
+        never run: (path, sha256), in a private directory."""
+        server = stdio_pins.private_directory(self) / 'xcrun'
+        server.write_bytes(data)
+        server.chmod(0o755)
+        return str(server), hashlib.sha256(data).hexdigest()
+
     def test_selected_stdio_server_runs_through_the_launcher_with_its_credential_path_only(self):
-        python = os.path.realpath(sys.executable)
-        with open(python, 'rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        xcode = {'name': 'xcode', 'command': [python, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10,
+        server, digest = self.stdio_server()
+        xcode = {'name': 'xcode', 'command': [server, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10,
                  'credential': 'XCODE_TOKEN'}
         self.registry['bundles'] = [
             {'ref': 'xcode@1', 'roles': ['crew'], 'mcp_servers': [xcode],
@@ -493,10 +500,8 @@ class ClaudeBundles(unittest.TestCase):
     def test_a_first_mate_never_carries_a_stdio_server(self):
         """A hosted first mate's pane is not a job: its plan and its attended
         launch refuse a stdio server, while an HTTP one still loads."""
-        python = os.path.realpath(sys.executable)
-        with open(python, 'rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        xcode = {'name': 'xcode', 'command': [python, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10}
+        server, digest = self.stdio_server()
+        xcode = {'name': 'xcode', 'command': [server, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10}
         docs = {'name': 'docs', 'url': 'https://mcp.example.test/mcp', 'credential': 'DOCS_TOKEN', 'timeout': 5}
         self.registry['bundles'] = [
             {'ref': 'xcode@1', 'roles': ['first_mate', 'crew'], 'mcp_servers': [xcode]},
@@ -527,21 +532,11 @@ class ClaudeBundles(unittest.TestCase):
         self.assertEqual(len([a for a in argv if a.startswith('--mcp-config')]), 1)
 
     def test_stdio_pin_drift_refuses_a_claude_launch_before_its_probe(self):
-        private = Path(tempfile.mkdtemp(prefix='.stdio-fixture-', dir=ROOT)).resolve()
-        self.addCleanup(shutil.rmtree, private)
-        private.chmod(0o755)
-        for part in [*reversed(private.parents), private]:
-            info = part.lstat()
-            if info.st_mode & 0o022 or info.st_uid not in (0, os.geteuid()):
-                self.skipTest(f'{part} is writable by others or not ours: the rule refuses every path below it')
-        server = private / 'server'
-        server.write_bytes(b'\x7fELF fixture\n')
-        server.chmod(0o755)
-        record = {'name': 'xcode', 'command': [str(server)], 'timeout': 10,
-                  'sha256': hashlib.sha256(server.read_bytes()).hexdigest()}
+        server, digest = self.stdio_server()
+        record = {'name': 'xcode', 'command': [server], 'timeout': 10, 'sha256': digest}
         self.registry['bundles'] = [{'ref': 'xcode@1', 'roles': ['crew'], 'mcp_servers': [record]}]
         plan = self.plan(['xcode@1'])
-        server.write_bytes(b'\x7fELF fixture\n# changed\n')
+        Path(server).write_bytes(b'\x7fELF fixture\n# changed\n')
         with patch.object(native_launch.os, 'execvpe') as execute:
             self.refuses(lambda: native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=plan))
         execute.assert_not_called()
