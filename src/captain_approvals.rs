@@ -53,9 +53,24 @@ const BROAD_WORDS: &[&str] = &[
 /// Words of the sentence that wraps an action, which the action cannot restate.
 const FRAMING_WORDS: &[&str] = &["authorized", "authorised", "captain", "approved", "expire"];
 /// Commands that run whatever follows them.
-const WRAPPERS: &[&str] = &["env", "sudo", "xargs", "eval"];
+const WRAPPERS: &[&str] = &[
+    "env", "sudo", "xargs", "eval", "doas", "su", "exec", "command", "builtin", "nohup", "timeout",
+    "nice", "time", "watch", "ssh", "coproc", "!",
+];
+/// Characters that make a shell line more than one simple command.
+const METACHARACTERS: &str = ";&|<>()$`\\";
+/// Characters bash quotes, globs, expands or comments with, so the word it
+/// runs is not the word written.
+const EXPANSIONS: &str = "'\"*?[]{}~#";
+/// The most words and characters of a command a prefix is matched against.
+const MAX_HEAD_WORDS: usize = 16;
+const MAX_HEAD_CHARS: usize = 200;
+/// How recent an approval or a reply must be to act on in one tap.
+const ONE_TAP_MS: i64 = 86_400_000;
 /// Shells and interpreters, refused alone or running inline code.
-const INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "node"];
+const INTERPRETERS: &[&str] = &[
+    "bash", "sh", "zsh", "dash", "ksh", "fish", "node", "perl", "ruby",
+];
 /// Words that make a free-text reply something other than a plain yes.
 const REFUSALS: &[&str] = &[
     "no",
@@ -173,7 +188,7 @@ fn other_ships(store: &Store, ship: &str) -> Result<Vec<String>> {
 }
 
 /// The coarse send-time lint. The captain's reading is the real check.
-fn lint(store: &Store, ship: &str, field: &str, text: &str) -> Result<()> {
+pub(crate) fn lint(store: &Store, ship: &str, field: &str, text: &str) -> Result<()> {
     let lower = text.to_lowercase();
     if let Some(other) = other_ships(store, ship)?
         .into_iter()
@@ -200,9 +215,52 @@ fn lint(store: &Store, ship: &str, field: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_prefix(prefix: &str) -> Result<()> {
-    let mut words = prefix.split_whitespace();
-    let first = words.next().unwrap_or_default();
+/// The words bash runs for a line holding one simple command, split as bash
+/// splits them, on spaces and tabs. None when the line holds a shell
+/// operator, redirection, quoting, glob, expansion or comment, or anything
+/// but printable ASCII, spaces and tabs: blank, invisible and lookalike
+/// characters are too many to list, so no word written is a different
+/// word run or a word the captain did not see.
+fn shell_words(line: &str) -> Option<Vec<&str>> {
+    let plain = line.chars().all(|c| {
+        (c.is_ascii_graphic() || c == ' ' || c == '\t')
+            && !METACHARACTERS.contains(c)
+            && !EXPANSIONS.contains(c)
+    });
+    plain.then(|| line.split([' ', '\t']).filter(|w| !w.is_empty()).collect())
+}
+
+/// Whether an interpreter's argument makes it run code written inline
+/// rather than a script: `-c`, `-e` or `--eval`, alone or in a flag cluster
+/// (`bash -lc`, `python3 -Sc`, `node -pe`), node's `-p` or `--print`, and
+/// python's `-m`.
+fn inline_code(program: &str, word: &str) -> bool {
+    if matches!(word, "--eval" | "--print" | "--command") {
+        return true;
+    }
+    let Some(flags) = word.strip_prefix('-').filter(|f| !f.starts_with('-')) else {
+        return false;
+    };
+    let letters: String = flags
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    letters.contains(['c', 'e'])
+        || (program == "node" && letters.contains('p'))
+        || (program.starts_with("python") && letters.contains('m'))
+}
+
+pub(crate) fn check_prefix(prefix: &str) -> Result<()> {
+    let Some(words) = shell_words(prefix) else {
+        anyhow::bail!(
+            "approves.command_prefix must be plain words of one simple command, separated by spaces, without ; & | < > ( ) $ ` \\ ' \" * ? [ ] {{ }} ~ #"
+        )
+    };
+    let first = words.first().copied().unwrap_or_default();
+    ensure!(
+        !first.is_empty() && !first.contains('='),
+        "approves.command_prefix must start with the program it runs, not an assignment"
+    );
     let program = first.rsplit('/').next().unwrap_or(first);
     ensure!(
         !WRAPPERS.contains(&program),
@@ -210,16 +268,41 @@ fn check_prefix(prefix: &str) -> Result<()> {
     );
     let interpreter = INTERPRETERS.contains(&program) || program.starts_with("python");
     if interpreter {
-        let rest: Vec<&str> = words.collect();
+        // The script comes first: an option before it (`bash -o errexit`,
+        // `perl -E`, `python3 -W ignore`) leaves room for inline code after.
+        let rest = &words[1..];
         ensure!(
-            rest.iter().any(|w| !w.starts_with('-'))
-                && !rest
-                    .iter()
-                    .any(|w| matches!(*w, "-c" | "-e" | "--eval" | "-m")),
-            "approves.command_prefix cannot be just a shell or interpreter; name the script it runs"
+            rest.first().is_some_and(|w| !w.starts_with('-'))
+                && !rest.iter().any(|w| inline_code(program, w)),
+            "approves.command_prefix cannot be just a shell or interpreter, or give it options before its script; name the script it runs first"
         );
     }
     Ok(())
+}
+
+/// The words of a Bash command a prefix is matched against, when it is one
+/// simple command whose words are the words bash runs (see `shell_words`):
+/// a program first rather than an assignment, at most 16 words and 200
+/// characters, and nothing a card would mask or that looks like a key.
+pub(crate) fn command_head(command: &str) -> Option<Vec<String>> {
+    let words = shell_words(command)?;
+    (command.trim_matches([' ', '\t']).chars().count() <= MAX_HEAD_CHARS
+        && crate::block_ask::mask(command) == command
+        && (1..=MAX_HEAD_WORDS).contains(&words.len())
+        && !words[0].contains('=')
+        && !words.iter().any(|w| crate::block_ask::secret_shaped(w)))
+    .then(|| words.into_iter().map(str::to_owned).collect())
+}
+
+/// Whether a command prefix covers a command's head: its words are the
+/// head's first words, each exactly, so `make release` covers `make release
+/// --dry-run` but never `make releasex` or `sudo make release`.
+pub(crate) fn covers(prefix: &str, head: &[String]) -> bool {
+    shell_words(prefix).is_some_and(|words| {
+        !words.is_empty()
+            && words.len() <= head.len()
+            && words.iter().zip(head).all(|(p, h)| p == h)
+    })
 }
 
 fn hours(ttl_secs: u64) -> String {
@@ -324,6 +407,7 @@ pub(crate) fn declare(
         task,
         LONGEST_UTC,
         &action,
+        prefix.as_deref(),
     );
     ensure!(
         worst.chars().count() <= MAX_SENTENCE_CHARS,
@@ -531,6 +615,9 @@ pub(crate) fn record(
     payload: &Value,
     now: i64,
 ) -> Result<Option<Value>> {
+    if request["payload"]["type"] == "tool_permission" {
+        return record_block(store, request, reply_id, body, payload, now);
+    }
     let Some(approves) = request["payload"].get("approves") else {
         return Ok(None);
     };
@@ -538,13 +625,7 @@ pub(crate) fn record(
         return Ok(None);
     }
     let ship = request["from"].as_str().unwrap_or_default();
-    let skip = |why: &str| -> Result<Option<Value>> {
-        store.audit(
-            "permissions.approval_skipped",
-            &json!({"ship": ship, "request": request["id"], "reply": reply_id, "why": why}),
-        )?;
-        Ok(Some(json!({"recorded": false, "why": why})))
-    };
+    let skip = |why: &str| skipped(store, ship, request, reply_id, why);
     if request["state"] != "open" {
         return skip("the request was closed before this reply, so nothing was approved");
     }
@@ -553,12 +634,7 @@ pub(crate) fn record(
             "only the captain's own reply approves; a relay, a bridge or a copy approves nothing",
         );
     }
-    let text = [body, payload["answer"]["text"].as_str().unwrap_or("")]
-        .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = reply_text(body, payload);
     let source = if request["kind"] == "decision" {
         let chosen = payload["answer"]["option_id"].as_str();
         let option = request["payload"]["decision"]["options"]
@@ -571,22 +647,8 @@ pub(crate) fn record(
                 "the captain did not choose an option that approves; free text on a decision approves nothing",
             );
         };
-        // The door may send the chosen label back as the answer's text.
-        if !text.is_empty() && text != option["label"].as_str().unwrap_or_default() {
-            if !worded(&text) {
-                return skip("reply had no words; ask again with a decision");
-            }
-            if pictured(&text) {
-                return skip(PICTURED);
-            }
-            if let Some(word) = hedged(&text) {
-                return skip(&format!(
-                    "the captain's words carry \"{word}\", so nothing was approved; ask again"
-                ));
-            }
-            if !plain_beside(&text, option["label"].as_str().unwrap_or_default()) {
-                return skip(NOT_PLAIN);
-            }
+        if let Some(why) = beside(&text, option["label"].as_str().unwrap_or_default()) {
+            return skip(&why);
         }
         "option"
     } else {
@@ -610,16 +672,8 @@ pub(crate) fn record(
         "reply"
     };
     let task = request["task_id"].as_str().unwrap_or_default();
-    let open = store
-        .task(task)
-        .is_ok_and(|t| t["owner"] == ship && store.active_charter(task).is_ok());
-    if !open {
+    if !open_task(store, ship, task) {
         return skip("the request's task is no longer open, so nothing was approved");
-    }
-    if live(store, ship, now)?.len() >= MAX_LIVE {
-        return skip(&format!(
-            "{ship} already holds {MAX_LIVE} live captain approvals, so nothing was approved"
-        ));
     }
     let action = approves["action"].as_str().unwrap_or_default();
     let ttl = approves["ttl_secs"]
@@ -629,15 +683,115 @@ pub(crate) fn record(
     if action.is_empty() {
         return skip("the request names no action, so nothing was approved");
     }
+    insert(
+        store,
+        &Grant {
+            ship,
+            task,
+            request,
+            reply_id,
+            action,
+            prefix: approves["command_prefix"].as_str(),
+            ttl,
+            source,
+            renews: None,
+        },
+        now,
+    )
+}
+
+/// Audit why a reply approved nothing, and say so in its `payload.approval`.
+fn skipped(
+    store: &Store,
+    ship: &str,
+    request: &Value,
+    reply_id: &str,
+    why: &str,
+) -> Result<Option<Value>> {
+    store.audit(
+        "permissions.approval_skipped",
+        &json!({"ship": ship, "request": request["id"], "reply": reply_id, "why": why}),
+    )?;
+    Ok(Some(json!({"recorded": false, "why": why})))
+}
+
+/// The reply's words: its body and its answer's text, one per line.
+fn reply_text(body: &str, payload: &Value) -> String {
+    [body, payload["answer"]["text"].as_str().unwrap_or("")]
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Why the text sent beside a chosen approving option keeps it from
+/// approving, if it does. The door may send the chosen label back as the
+/// answer's text, which is the tap itself.
+fn beside(text: &str, label: &str) -> Option<String> {
+    if text.is_empty() || text == label {
+        return None;
+    }
+    if !worded(text) {
+        return Some("reply had no words; ask again with a decision".to_owned());
+    }
+    if pictured(text) {
+        return Some(PICTURED.to_owned());
+    }
+    if let Some(word) = hedged(text) {
+        return Some(format!(
+            "the captain's words carry \"{word}\", so nothing was approved; ask again"
+        ));
+    }
+    (!plain_beside(text, label)).then(|| NOT_PLAIN.to_owned())
+}
+
+/// One approval to record from a captain's reply.
+struct Grant<'a> {
+    ship: &'a str,
+    task: &'a str,
+    /// The request or block ask the reply answers.
+    request: &'a Value,
+    reply_id: &'a str,
+    action: &'a str,
+    prefix: Option<&'a str>,
+    ttl: u64,
+    source: &'a str,
+    /// The expired approval a block card's tap renews.
+    renews: Option<&'a str>,
+}
+
+/// Record an approval, unless the ship already holds the most it may or its
+/// sentence would be too long for auto mode.
+fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
+    let Grant {
+        ship,
+        task,
+        request,
+        reply_id,
+        action,
+        prefix,
+        ttl,
+        source,
+        renews,
+    } = *grant;
+    let skip = |why: &str| skipped(store, ship, request, reply_id, why);
+    if live(store, ship, now)?.len() >= MAX_LIVE {
+        return skip(&format!(
+            "{ship} already holds {MAX_LIVE} live captain approvals, so nothing was approved"
+        ));
+    }
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
     let expires_ms = now + ttl as i64 * 1000;
+    let request_id = request["id"].as_str().unwrap_or_default();
     let told = sentence(
         reply_id,
-        request["id"].as_str().unwrap_or_default(),
+        request_id,
         ship,
         task,
         &crate::routes::utc_time(expires_ms),
         action,
+        prefix,
     );
     if told.chars().count() > MAX_SENTENCE_CHARS {
         return skip(
@@ -650,27 +804,388 @@ pub(crate) fn record(
         "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,source,applies_at)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
-            id,
-            ship,
-            task,
-            request["id"].as_str().unwrap_or_default(),
-            reply_id,
-            action,
-            approves["command_prefix"].as_str(),
-            now,
-            expires_ms,
-            source,
-            applies
+            id, ship, task, request_id, reply_id, action, prefix, now, expires_ms, source, applies
         ],
     )?;
-    store.audit(
-        "permissions.approval_recorded",
-        &json!({"id": id, "ship": ship, "task": task, "request": request["id"],
-            "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
-            "applies": applies}),
-    )?;
+    let mut audit = json!({"id": id, "ship": ship, "task": task, "request": request["id"],
+        "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
+        "applies": applies});
+    if source == "block" {
+        audit["ask"] = request["id"].clone();
+        audit["command_prefix"] = json!(prefix);
+    }
+    if let Some(old) = renews {
+        audit["renews"] = json!(old);
+    }
+    store.audit("permissions.approval_recorded", &audit)?;
     Ok(Some(json!({"recorded": true, "id": id, "action": action,
         "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)})))
+}
+
+/// An approval a block card offered: its task, action, command prefix,
+/// creation, expiry and revocation.
+type Offered = (String, String, Option<String>, i64, i64, Option<i64>);
+
+/// What the captain's tap on a block card's approve or as-approved option
+/// records, in the home holding the ask. `approve` records the step the card
+/// named for 24 h. `as_approved_N` uses an approval the card offered again:
+/// one still live records nothing and is applied at the session's next safe
+/// point; one that expired within the last 24 h is renewed for its own
+/// length. Any other answer to a block ask approves nothing here.
+fn record_block(
+    store: &Store,
+    ask: &Value,
+    reply_id: &str,
+    body: &str,
+    payload: &Value,
+    now: i64,
+) -> Result<Option<Value>> {
+    let chosen = payload["answer"]["option_id"].as_str().unwrap_or_default();
+    let reuse = chosen
+        .strip_prefix("as_approved_")
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|n| (1..=2).contains(n));
+    if (chosen != "approve" && reuse.is_none()) || ask["delivery"] == "received" {
+        return Ok(None);
+    }
+    let ship = ask["from"].as_str().unwrap_or_default();
+    let skip = |why: &str| skipped(store, ship, ask, reply_id, why);
+    if ask["state"] != "open" {
+        return skip("the ask was closed before this reply, so nothing was approved");
+    }
+    if payload.get("fanned_from").is_some() || payload["operator"] != true {
+        return skip(
+            "only the captain's own reply approves; a relay, a bridge or a copy approves nothing",
+        );
+    }
+    let label = ask["payload"]["decision"]["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|o| o["id"] == chosen)
+        .and_then(|o| o["label"].as_str())
+        .unwrap_or_default();
+    if let Some(why) = beside(&reply_text(body, payload), label) {
+        return skip(&why);
+    }
+    let block = &ask["payload"]["block"];
+    let Some(n) = reuse else {
+        let task = ask["task_id"].as_str().unwrap_or_default();
+        let action = block["approve"]["action"].as_str().unwrap_or_default();
+        if action.is_empty() {
+            return skip("the ask offers no step to approve, so nothing was approved");
+        }
+        if !open_task(store, ship, task) {
+            return skip("the ask's task is no longer open, so nothing was approved");
+        }
+        return insert(
+            store,
+            &Grant {
+                ship,
+                task,
+                request: ask,
+                reply_id,
+                action,
+                prefix: block["approve"]["command_prefix"].as_str(),
+                ttl: DEFAULT_TTL_SECS,
+                source: "block",
+                renews: None,
+            },
+            now,
+        );
+    };
+    let Some(id) = block["approvals"][n - 1].as_str() else {
+        return skip("the ask offers no such approval, so nothing was approved");
+    };
+    let row: Option<Offered> = store
+        .connection()
+        .query_row(
+            "SELECT task_id,action,command_prefix,created_ms,expires_ms,revoked_ms
+             FROM captain_approvals WHERE id=?1 AND ship=?2",
+            params![id, ship],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((task, action, prefix, created_ms, expires_ms, revoked)) = row else {
+        return skip("the approval the ask offered is gone, so nothing was approved");
+    };
+    if revoked.is_some() {
+        return skip("the approval the ask offered was revoked, so nothing was approved");
+    }
+    if !open_task(store, ship, &task) {
+        return skip("the approval's task is no longer open, so nothing was approved");
+    }
+    // Live or lapsed, an approval given more than 24 h ago is asked again.
+    if now - created_ms >= ONE_TAP_MS {
+        return skip("the approval is older than 24 h, so nothing was approved; ask again");
+    }
+    if expires_ms > now {
+        // Still live: the session that was refused did not carry it, and
+        // its next launch does.
+        let applies = crate::host::upgrade::approval_applies(store, ship)?;
+        store.connection().execute(
+            "UPDATE captain_approvals SET applies_at=?2 WHERE id=?1",
+            params![id, applies],
+        )?;
+        store.audit(
+            "permissions.approval_reused",
+            &json!({"id": id, "ship": ship, "ask": ask["id"], "reply": reply_id,
+                "applies": applies}),
+        )?;
+        return Ok(Some(
+            json!({"recorded": false, "covered_by": id, "applies": applies,
+            "note": note(applies, &action)}),
+        ));
+    }
+    let ttl = u64::try_from((expires_ms - created_ms) / 1000)
+        .unwrap_or(1)
+        .clamp(1, MAX_TTL_SECS);
+    insert(
+        store,
+        &Grant {
+            ship,
+            task: &task,
+            request: ask,
+            reply_id,
+            action: &action,
+            prefix: prefix.as_deref(),
+            ttl,
+            source: "block",
+            renews: Some(id),
+        },
+        now,
+    )
+}
+
+/// What a block card offers from captain approvals: its options, the
+/// approval ids its as-approved options use, the step its approve option
+/// records, and a line for its `why`.
+#[derive(Default)]
+pub(crate) struct Offer {
+    pub(crate) options: Vec<Value>,
+    pub(crate) approvals: Vec<String>,
+    pub(crate) approve: Option<Value>,
+    pub(crate) why: Option<String>,
+}
+
+/// What a first mate's block card offers from captain approvals, when every
+/// denial it lists is a Bash command the auto-mode classifier refused: up to
+/// two recent approvals the refused session did not carry, to use again,
+/// and this exact step, to approve for 24 h. A crew's or an errand's card,
+/// or one naming any other denial, offers neither.
+pub(crate) fn offer(
+    store: &Store,
+    ship: &str,
+    scope: &str,
+    job_id: Option<&str>,
+    records: &[Value],
+    more: usize,
+    now: i64,
+) -> Result<Offer> {
+    let mut offer = Offer::default();
+    let refused = more == 0
+        && !records.is_empty()
+        && records
+            .iter()
+            .all(|d| d["tool"] == "Bash" && d["classifier"] == true);
+    if !matches!(scope, "pane" | "wake") || !refused {
+        return Ok(offer);
+    }
+    let heads: Vec<Option<Vec<String>>> = records
+        .iter()
+        .map(|d| {
+            d["head"].as_array().map(|words| {
+                words
+                    .iter()
+                    .filter_map(|w| w.as_str().map(str::to_owned))
+                    .collect()
+            })
+        })
+        .collect();
+    let covers_all = |prefix: Option<&str>| {
+        prefix.is_some_and(|p| {
+            heads
+                .iter()
+                .all(|h| h.as_ref().is_some_and(|h| covers(p, h)))
+        })
+    };
+    let carried = carried(store, ship, scope, job_id)?;
+    let in_session = |row: &Row| match &carried {
+        Carried::Ids(ids) => ids.contains(&row.id),
+        Carried::Before(at) => row.created_ms < *at && row.expires_ms > *at,
+        Carried::Unknown => true,
+    };
+    let known = !matches!(carried, Carried::Unknown);
+    // Auto mode refused this with a covering approval in its session.
+    let ignored = live(store, ship, now)?
+        .into_iter()
+        .rev()
+        .find(|row| known && in_session(row) && covers_all(row.prefix.as_deref()));
+    let resume = if scope == "pane" {
+        "The session restarts at its next idle point with it; nothing to relaunch."
+    } else {
+        "The ship's next wake carries it; nothing to relaunch."
+    };
+    let mut recommended = ignored.is_some();
+    for row in recent(store, ship, now)?
+        .into_iter()
+        .filter(|row| known && !in_session(row))
+        .take(2)
+    {
+        let until = crate::routes::utc_time(row.expires_ms);
+        let what = if row.expires_ms > now {
+            format!(
+                "Uses captain approval {} as you gave it, \"{}\", until {until}. {resume}",
+                row.id, row.action
+            )
+        } else {
+            let ttl = u64::try_from((row.expires_ms - row.created_ms) / 1000)
+                .unwrap_or(1)
+                .clamp(1, MAX_TTL_SECS);
+            format!(
+                "Renews captain approval {} as you gave it, \"{}\", for {} from your tap; it expired {until}. {resume}",
+                row.id,
+                row.action,
+                hours(ttl)
+            )
+        };
+        let mut option = json!({"id": format!("as_approved_{}", offer.approvals.len() + 1),
+            "label": crate::block_ask::clip(&format!("As approved: {}", row.action), 80),
+            "what_happens": crate::block_ask::clip(&what, 400)});
+        if !recommended && covers_all(row.prefix.as_deref()) {
+            option["recommended"] = json!(true);
+            recommended = true;
+        }
+        offer.options.push(option);
+        offer.approvals.push(row.id);
+    }
+    if let Some((action, prefix)) = step(store, ship, records, &heads) {
+        let only = prefix
+            .as_deref()
+            .map(|p| format!(", only for commands that begin exactly with {p}"))
+            .unwrap_or_default();
+        let applies = if scope == "pane" {
+            "applies at the session's next idle point; nothing to relaunch"
+        } else {
+            "applies from the ship's next wake; nothing to relaunch"
+        };
+        let mut option = json!({"id": "approve",
+            "label": crate::block_ask::clip(&format!("Approve for 24 h: {action}"), 80),
+            "what_happens": crate::block_ask::clip(&format!(
+                "Records your approval for {ship} of \"{action}\"{only}. It holds for 24 h from your tap and {applies}."), 400)});
+        if !recommended || ignored.is_some() {
+            option["recommended"] = json!(true);
+        }
+        offer.options.push(option);
+        offer.approve = Some(json!({"action": action, "command_prefix": prefix}));
+    }
+    if let Some(row) = ignored {
+        offer.why = Some(format!(
+            "Auto mode refused this although captain approval {} ({}) was in its session.",
+            row.id,
+            crate::block_ask::clip(&row.action, 60)
+        ));
+    }
+    Ok(offer)
+}
+
+/// Which approvals the refused session carried.
+enum Carried {
+    /// A hosted pane's: the ids its launch carried.
+    Ids(Vec<String>),
+    /// A wake's: those live when its job was created.
+    Before(i64),
+    /// No session to tell by.
+    Unknown,
+}
+
+fn carried(store: &Store, ship: &str, scope: &str, job_id: Option<&str>) -> Result<Carried> {
+    if scope == "pane" {
+        let Some((pid, _, _)) = crate::host::upgrade::live_pane(store, ship)? else {
+            return Ok(Carried::Ids(vec![]));
+        };
+        let ids: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT approvals_ids FROM hosted_panes WHERE ship=?1 AND pid=?2",
+                params![ship, pid],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        return Ok(Carried::Ids(
+            ids.and_then(|ids| serde_json::from_str(&ids).ok())
+                .unwrap_or_default(),
+        ));
+    }
+    let Some(job) = job_id else {
+        return Ok(Carried::Unknown);
+    };
+    let started: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(record,'$.created_ms') FROM jobs WHERE id=?1",
+            [job],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(started.map_or(Carried::Unknown, Carried::Before))
+}
+
+/// The exact step a block card offers to approve: "Run" and its refused
+/// commands, and, for one command, its words as the prefix. None when the
+/// card shows any command less than whole (clipped, cut at a heredoc,
+/// flattened or masked), so the captain never approves what they did not
+/// see; when any command is more than one simple command or its words would
+/// not pass as a prefix, so a quoted or wrapped program or an interpreter's
+/// inline code is never one tap away; or when the step would not pass as a
+/// ship's own `approves` would.
+fn step(
+    store: &Store,
+    ship: &str,
+    records: &[Value],
+    heads: &[Option<Vec<String>>],
+) -> Option<(String, Option<String>)> {
+    if !records.iter().all(|d| d["whole"] == true) {
+        return None;
+    }
+    let previews: Vec<String> = records
+        .iter()
+        .map(|d| format!("`{}`", d["preview"].as_str().unwrap_or_default()))
+        .collect();
+    let action = format!("Run {}", previews.join("; "));
+    if action.chars().count() > MAX_ACTION_CHARS
+        || action.chars().any(char::is_control)
+        || lint(store, ship, "the step", &action).is_err()
+    {
+        return None;
+    }
+    let mut prefixes = vec![];
+    for head in heads {
+        let prefix = head.as_ref()?.join(" ");
+        if prefix.chars().count() > MAX_PREFIX_CHARS
+            || check_prefix(&prefix).is_err()
+            || lint(store, ship, "the prefix", &prefix).is_err()
+        {
+            return None;
+        }
+        prefixes.push(prefix);
+    }
+    let prefix = match prefixes.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    };
+    Some((action, prefix))
 }
 
 /// What the ship is told about when its session picks up an approval.
@@ -684,44 +1199,72 @@ fn note(applies: &str, action: &str) -> String {
     }
 }
 
-struct Row {
-    id: String,
+pub(crate) struct Row {
+    pub(crate) id: String,
     task: String,
     request: String,
     reply: String,
-    action: String,
-    expires_ms: i64,
+    pub(crate) action: String,
+    pub(crate) prefix: Option<String>,
+    pub(crate) created_ms: i64,
+    pub(crate) expires_ms: i64,
 }
 
-/// A ship's live approvals: not revoked, not expired, and on a task the ship
-/// still owns, open under an active charter.
-fn live(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
-    let mut statement = store.connection().prepare(
-        "SELECT id,task_id,request_id,reply_id,action,expires_ms FROM captain_approvals
-         WHERE ship=?1 AND revoked_ms IS NULL AND expires_ms>?2 ORDER BY created_ms, id",
-    )?;
+/// Whether `ship` owns `task` and it is open under an active charter.
+fn open_task(store: &Store, ship: &str, task: &str) -> bool {
+    store.task(task).is_ok_and(|t| t["owner"] == ship) && store.active_charter(task).is_ok()
+}
+
+/// A ship's unrevoked approvals matching `filter` (a condition on
+/// `created_ms` and `expires_ms` against `?2`), in `order`, on a task the
+/// ship still owns, open under an active charter.
+fn rows(store: &Store, ship: &str, filter: &str, order: &str, at: i64) -> Result<Vec<Row>> {
+    let mut statement = store.connection().prepare(&format!(
+        "SELECT id,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms
+         FROM captain_approvals WHERE ship=?1 AND revoked_ms IS NULL AND {filter} ORDER BY {order}"
+    ))?;
     let rows = statement
-        .query_map(params![ship, now], |r| {
+        .query_map(params![ship, at], |r| {
             Ok(Row {
                 id: r.get(0)?,
                 task: r.get(1)?,
                 request: r.get(2)?,
                 reply: r.get(3)?,
                 action: r.get(4)?,
-                expires_ms: r.get(5)?,
+                prefix: r.get(5)?,
+                created_ms: r.get(6)?,
+                expires_ms: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
-        .filter(|row| {
-            store.task(&row.task).is_ok_and(|t| t["owner"] == ship)
-                && store.active_charter(&row.task).is_ok()
-        })
+        .filter(|row| open_task(store, ship, &row.task))
         .collect())
 }
 
-/// The one sentence the classifier reads for an approval.
+/// A ship's live approvals: not revoked, not expired, and on a task the ship
+/// still owns, open under an active charter.
+pub(crate) fn live(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
+    rows(store, ship, "expires_ms>?2", "created_ms, id", now)
+}
+
+/// The approvals a block card may offer to use again in one tap: created in
+/// the last 24 h, not revoked, on a task the ship still owns and is open,
+/// newest first. An expired one is renewed by the tap.
+pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
+    rows(
+        store,
+        ship,
+        "created_ms>?2",
+        "created_ms DESC, id",
+        now - ONE_TAP_MS,
+    )
+}
+
+/// The one sentence the classifier reads for an approval. A command prefix
+/// is named after the action, unless that would make the sentence longer
+/// than a policy accepts; then the plain sentence stands.
 fn sentence(
     reply: &str,
     request: &str,
@@ -729,11 +1272,23 @@ fn sentence(
     task: &str,
     until: &str,
     action: &str,
+    prefix: Option<&str>,
 ) -> String {
-    format!(
+    let plain = format!(
         "The captain approved this in reply {reply} to request {request}, for ship {ship} only, \
          on task {task}, until {until}: {action}"
-    )
+    );
+    match prefix {
+        Some(prefix) => {
+            let narrowed = format!("{plain} Only commands that begin exactly with: {prefix}");
+            if narrowed.chars().count() <= MAX_SENTENCE_CHARS {
+                narrowed
+            } else {
+                plain
+            }
+        }
+        None => plain,
+    }
 }
 
 /// What the auto-mode classifier is told for a ship's first-mate launch: one
@@ -791,6 +1346,7 @@ fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String,
             &row.task,
             &crate::routes::utc_time(row.expires_ms),
             &row.action,
+            row.prefix.as_deref(),
         );
         if text.chars().count() > MAX_SENTENCE_CHARS {
             if audit {
@@ -1137,6 +1693,203 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_is_one_simple_command_and_no_wrapper() {
+        for bad in [
+            "make release; rm x",
+            "make release && x",
+            "make | tee",
+            "make > out",
+            "make < in",
+            "(make)",
+            "echo $HOME",
+            "echo `id`",
+            "make \\\n x",
+            "FOO=1 make",
+            "doas make",
+            "su -c make",
+            "exec make",
+            "command make",
+            "builtin cd",
+            "nohup make",
+            "timeout 5 make",
+            "nice make",
+            "time make",
+            "watch make",
+            "ssh host make",
+            "/usr/bin/sudo make",
+            " ",
+            // Quoted, globbed, braced, tilded or commented: bash runs
+            // another word than the one written.
+            "'sudo' make release",
+            "su''do make",
+            "\"sudo\" make release",
+            "{sudo,} make",
+            "/usr/bin/sud? make",
+            "/usr/bin/su* make",
+            "[s]udo make",
+            "~/bin/deploy",
+            "make #release",
+            // Whitespace bash does not split on, and invisible characters.
+            "make\u{a0}release",
+            "make\u{2003}release",
+            "make\u{200b} release",
+            "make\u{202e}esaeler",
+            "make\u{b}release",
+            "make\u{3164}release",
+            "make\u{2800}release",
+            "make\u{ad}release",
+            "make\u{61c}release",
+            "make\u{e0041}release",
+            "m\u{430}ke release",
+            // Interpreters running inline code, however the flag is spelled.
+            "bash \"-c\" x",
+            "bash -lc x",
+            "bash -c x",
+            "sh -ec x",
+            "zsh -xc x",
+            "python3 -Sc x",
+            "python3 -c x",
+            "python3 -m http",
+            "python3 -mhttp x",
+            "node -pe x",
+            "node -e1 x",
+            "node -p x",
+            "node --print x",
+            "node --eval x",
+            "perl -e x",
+            "ruby -e x",
+            "bash",
+            "bash -l",
+            // Options before the script leave room for inline code after.
+            "bash -o errexit",
+            "bash -x scripts/release.sh",
+            "perl -E x",
+            "python3 -W ignore",
+            "python3 -u tools/ship.py",
+            "coproc make",
+            "! make",
+        ] {
+            assert!(check_prefix(bad).is_err(), "{bad}");
+        }
+        for good in [
+            "make release",
+            "./scripts/ship.sh --prod",
+            "cargo publish",
+            "make\trelease",
+            "bash scripts/release.sh",
+            "python3 tools/ship.py --dry-run",
+            "make release-2.0 v=1",
+        ] {
+            check_prefix(good).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_command_head_is_the_words_of_one_simple_command() {
+        assert_eq!(
+            command_head("make release --dry-run").unwrap(),
+            ["make", "release", "--dry-run"]
+        );
+        assert_eq!(
+            command_head("  make   release ").unwrap(),
+            ["make", "release"]
+        );
+        for compound in [
+            "make release; rm x",
+            "make  release; rm x",
+            "make release && x",
+            "make release | tee log",
+            "make release > log",
+            "make release < in",
+            "(make release)",
+            "make $TARGET",
+            "make `x`",
+            "make \\\n release",
+            "make release\nrm x",
+            "make release\r",
+            "TARGET=prod make release",
+            "deploy deadbeef0123456789abcdef0123456789abcdef",
+            "deploy API_TOKEN=abc",
+            "curl -u bob https://bob:pw@x.io",
+            "",
+            "   ",
+            "'sudo' make release",
+            "su''do make",
+            "{sudo,} make",
+            "/usr/bin/sud? make",
+            "\"sudo\" make release",
+            "make\u{a0}release",
+            "make\u{85}release",
+            "make release\u{2028}rm x",
+            "make\u{200b} release",
+            "make\u{3164}release",
+            "m\u{430}ke release",
+            "make ~/release",
+            "make release # now",
+        ] {
+            assert_eq!(command_head(compound), None, "{compound}");
+        }
+        assert_eq!(command_head("make\trelease").unwrap(), ["make", "release"]);
+        let long = format!("make {}", "x ".repeat(16));
+        assert_eq!(command_head(&long), None);
+        assert_eq!(command_head(&format!("make {}", "x".repeat(200))), None);
+    }
+
+    #[test]
+    fn a_prefix_covers_only_whole_leading_words() {
+        let head = |command: &str| command_head(command).unwrap();
+        assert!(covers("make release", &head("make release --dry-run")));
+        assert!(covers("make release", &head("make release")));
+        assert!(covers("make  release", &head("make release now")));
+        for other in [
+            "make releasex",
+            "./make release",
+            "sudo make release",
+            "Make release",
+            "make",
+            "make build release",
+        ] {
+            assert!(!covers("make release", &head(other)), "{other}");
+        }
+        assert!(!covers("", &head("make")));
+        // Only spaces and tabs split words, in a prefix as in a head.
+        assert!(!covers("make\u{a0}release", &head("make release")));
+        assert!(!covers("'make' release", &head("make release")));
+        assert_eq!(command_head("make\u{a0}release --dry-run"), None);
+        // A compound command has no head, so no prefix covers it.
+        assert_eq!(command_head("make  release; rm x"), None);
+    }
+
+    #[test]
+    fn a_sentence_names_its_prefix_when_it_fits() {
+        let told = |action: &str, prefix| {
+            sentence(
+                "r1",
+                "q1",
+                "apps",
+                "main",
+                "2026-10-21 12:00 UTC",
+                action,
+                prefix,
+            )
+        };
+        let plain = told("Run `make release`", None);
+        assert!(
+            plain.ends_with("until 2026-10-21 12:00 UTC: Run `make release`"),
+            "{plain}"
+        );
+        assert_eq!(
+            told("Run `make release`", Some("make release")),
+            format!("{plain} Only commands that begin exactly with: make release")
+        );
+        // Too long with the prefix: the plain sentence stands.
+        let action = "x".repeat(MAX_SENTENCE_CHARS - plain.chars().count() + 18);
+        let long = told(&action, Some("make release"));
+        assert_eq!(long, told(&action, None));
+        assert!(long.chars().count() <= MAX_SENTENCE_CHARS);
+    }
+
+    #[test]
     fn a_ship_name_counts_only_as_a_whole_word() {
         assert!(names("Deploy infra's build", "infra"));
         assert!(names("restart INFRA.", "infra"));
@@ -1210,6 +1963,75 @@ mod tests {
         );
     }
 
+    /// A home from before block cards keeps its approvals and takes a
+    /// block card's.
+    #[test]
+    fn an_older_approvals_table_is_rebuilt_to_take_block_approvals() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&home).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"main","charter_id":"project","owner":"apps","title":"Deliver"}),
+        )
+        .unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "DROP TABLE captain_approvals;
+                 CREATE TABLE captain_approvals(id TEXT PRIMARY KEY,ship TEXT NOT NULL,
+                   task_id TEXT NOT NULL REFERENCES tasks(id),request_id TEXT NOT NULL,reply_id TEXT NOT NULL UNIQUE,
+                   action TEXT NOT NULL,command_prefix TEXT,created_ms INTEGER NOT NULL,expires_ms INTEGER NOT NULL,
+                   revoked_ms INTEGER,source TEXT NOT NULL CHECK(source IN ('reply','option')));
+                 INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,created_ms,expires_ms,source)
+                   VALUES('a1','apps','main','q1','r1','Deploy',1,2,'reply');",
+            )
+            .unwrap();
+        drop(store);
+        // The dashboard's open cannot migrate it, so refuses it up front.
+        #[cfg(feature = "dashboard")]
+        {
+            let refused = Store::open_existing_action(&home, crate::store::Caller::Operator);
+            assert!(
+                refused
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("incompatible existing action schema")
+            );
+        }
+        let store = Store::open(&home).unwrap();
+        #[cfg(feature = "dashboard")]
+        Store::open_existing_action(&home, crate::store::Caller::Operator).unwrap();
+        let block = "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+            created_ms,expires_ms,source,applies_at) VALUES('a2','apps','main','q2','r2','Run x',1,2,'block','wake')";
+        store.connection().execute_batch(block).unwrap();
+        let kept: Vec<(String, String)> = store
+            .connection()
+            .prepare("SELECT id, source FROM captain_approvals ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            kept,
+            [("a1".into(), "reply".into()), ("a2".into(), "block".into())]
+        );
+        // Opened again, it is not rebuilt.
+        drop(store);
+        Store::open(&home).unwrap();
+    }
+
     #[test]
     fn a_received_copy_records_nothing() {
         let temp = tempfile::tempdir().unwrap();
@@ -1230,5 +2052,110 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Only the captain's own tap on a block card, in the home holding the
+    /// ask, records or reuses an approval, and only one given within 24 h.
+    #[test]
+    fn a_block_cards_tap_approves_only_from_the_captain_and_within_24_hours() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"main","charter_id":"project","owner":"apps","title":"Deliver"}),
+        )
+        .unwrap();
+        let now = Store::now_ms();
+        for (id, created_ms) in [
+            ("approval-old", now - 25 * 3_600_000),
+            ("approval-new", now - 3_600_000),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+                       command_prefix,created_ms,expires_ms,source)
+                     VALUES(?1,'apps','main','q-'||?1,'r-'||?1,'Run make release','make release',?2,?3,'reply')",
+                    params![id, created_ms, now + 3_600_000],
+                )
+                .unwrap();
+        }
+        let ask = json!({"id": "ask-1", "from": "apps", "kind": "decision", "task_id": "main",
+            "state": "open", "payload": {"type": "tool_permission", "block": {
+                "approve": {"action": "Run `make release`", "command_prefix": "make release"},
+                "approvals": ["approval-old", "approval-new"]},
+            "decision": {"options": [
+                {"id": "as_approved_1", "label": "As approved: Run make release"},
+                {"id": "as_approved_2", "label": "As approved: Run make release"},
+                {"id": "approve", "label": "Approve for 24 h: Run `make release`"}]}}});
+        let tap = |reply: &str, option: &str, extra: Value| {
+            let mut payload = json!({"answer": {"option_id": option}});
+            payload.as_object_mut().unwrap().extend(
+                extra
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            record(&store, &ask, reply, "", &payload, now)
+                .unwrap()
+                .unwrap()
+        };
+        let count = || -> i64 {
+            store
+                .connection()
+                .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
+                .unwrap()
+        };
+        for (reply, option, extra) in [
+            ("reply-1", "approve", json!({})),
+            ("reply-2", "approve", json!({"operator": false})),
+            (
+                "reply-3",
+                "approve",
+                json!({"operator": true, "fanned_from": "reply-0"}),
+            ),
+            (
+                "reply-4",
+                "as_approved_2",
+                json!({"fanned_from": "reply-0"}),
+            ),
+        ] {
+            let outcome = tap(reply, option, extra);
+            assert_eq!(outcome["recorded"], false, "{reply}: {outcome}");
+            assert!(
+                outcome["why"]
+                    .as_str()
+                    .unwrap()
+                    .contains("only the captain's own reply approves"),
+                "{reply}: {outcome}"
+            );
+        }
+        assert_eq!(count(), 2);
+        // Still live, but given 25 h ago: asked again, not reused.
+        let old = tap("reply-5", "as_approved_1", json!({"operator": true}));
+        assert_eq!(old["recorded"], false, "{old}");
+        assert!(old.get("covered_by").is_none(), "{old}");
+        assert!(
+            old["why"].as_str().unwrap().contains("older than 24 h"),
+            "{old}"
+        );
+        // Given an hour ago, it is reused; nothing new is recorded.
+        let new = tap("reply-6", "as_approved_2", json!({"operator": true}));
+        assert_eq!(new["covered_by"], "approval-new", "{new}");
+        assert_eq!(count(), 2);
+        // The captain's own approve records one row bound to the ask.
+        let own = tap("reply-7", "approve", json!({"operator": true}));
+        assert_eq!(own["recorded"], true, "{own}");
+        assert_eq!(count(), 3);
     }
 }

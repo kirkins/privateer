@@ -417,6 +417,8 @@ struct Herdr {
     focus: Arc<Mutex<Option<String>>>,
     /// Herdr answers ok to reports and drops them.
     drop_reports: Arc<AtomicBool>,
+    /// What a pane's screen shows, when not the harness's ready line.
+    screen: Arc<Mutex<Option<String>>>,
 }
 
 impl Herdr {
@@ -439,6 +441,8 @@ impl Herdr {
         let focused = focus.clone();
         let drop_reports = Arc::new(AtomicBool::new(false));
         let dropping = drop_reports.clone();
+        let screen = Arc::new(Mutex::new(None::<String>));
+        let shown = screen.clone();
         // Each pane's process terminal master, and whether that process still runs.
         let terminals: PaneTerminals = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let reject_label = reject_caption.clone();
@@ -689,7 +693,8 @@ impl Herdr {
                         json!({"type":"pane_read","read":{"pane_id":params["pane_id"],
                             "workspace_id":"w2","tab_id":"w2:t1","source":params["source"],
                             "format":params["format"],"revision":7,"truncated":false,
-                            "text":"\u{1b}[1mpi\u{1b}[0m ready"}})
+                            "text":shown.lock().unwrap().clone()
+                                .unwrap_or_else(|| "\u{1b}[1mpi\u{1b}[0m ready".to_owned())}})
                     }
                     "pane.process_info" => {
                         let live = live.lock().unwrap();
@@ -738,6 +743,7 @@ impl Herdr {
             reject_rename,
             focus,
             drop_reports,
+            screen,
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -4691,5 +4697,210 @@ fn an_approval_granted_to_a_sleeping_pane_applies_from_its_wake() {
     assert!(argv.contains(action), "{argv}");
     std::thread::sleep(Duration::from_millis(500));
     assert!(approval_notices(&place, "q-7").is_empty());
+    place.stop_native("infra");
+}
+
+/// The pane's own transcript records auto mode's classifier refusing `command`
+/// now, as Claude writes it (tests/fixtures/claude/pane-denials.jsonl).
+fn classifier_refused(place: &Place, command: &str) {
+    let at = String::from_utf8(
+        Command::new("date")
+            .args(["-u", "+%Y-%m-%dT%H:%M:%S.000Z"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let cwd = fs::canonicalize(&place.folder).unwrap();
+    let base = json!({"cwd": cwd, "entrypoint": "cli", "isSidechain": false,
+        "sessionId": "00000000-0000-4000-8000-000000000001", "timestamp": at.trim()});
+    let mut asked = base.clone();
+    asked["type"] = json!("assistant");
+    asked["message"] = json!({"role": "assistant", "content": [{"type": "tool_use",
+        "id": "toolu_release", "name": "Bash", "input": {"command": command}}]});
+    let refusal = "Permission for this action was denied by the Claude Code auto mode classifier. \
+        Reason: [Production Deploy]. If you have other tasks that don't depend on this action, \
+        continue working on those.";
+    let mut refused = base;
+    refused["type"] = json!("user");
+    refused["message"] = json!({"role": "user", "content": [{"type": "tool_result",
+        "tool_use_id": "toolu_release", "content": refusal, "is_error": true}]});
+    refused["permissionDecision"] =
+        json!({"decision": "reject", "reasonType": "str", "source": "config"});
+    let transcript = claude_transcripts(place).join("session.jsonl");
+    let mut text = fs::read_to_string(&transcript).unwrap();
+    text.push_str(&format!("{asked}\n{refused}\n"));
+    fs::write(&transcript, text).unwrap();
+}
+
+/// A card raised from auto mode's stop line still applies: the captain
+/// approves the refused step on it, the pane then sits idle, and its
+/// session restarts in place carrying the approval.
+#[test]
+fn an_approval_tapped_on_a_lockout_card_applies_once_the_pane_sits_idle() {
+    let (place, herdr) = hosted_claude_refresher();
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+    // The turn that hit the lockout was running.
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    classifier_refused(&place, "make release --dry-run");
+    *herdr.screen.lock().unwrap() = Some(
+        "● Bash(make release --dry-run)\n  ⎿  bash denied by auto mode · [Production Deploy]\n\
+         3 consecutive actions were blocked. Please review the transcript before continuing.\n"
+            .to_owned(),
+    );
+    place.tick();
+    let asks: Vec<Value> = place.json("mail.inbox", json!({"address":"captain"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["type"] == "tool_permission")
+        .cloned()
+        .collect();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = &asks[0];
+    assert_eq!(ask["payload"]["block"]["scope"], "pane", "{ask}");
+    assert_eq!(
+        ask["payload"]["block"]["approve"],
+        json!({"action":"Run `make release --dry-run`","command_prefix":"make release --dry-run"}),
+        "{ask}"
+    );
+    let approve = ask["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "approve")
+        .cloned()
+        .unwrap();
+    assert_eq!(approve["recommended"], true, "{ask}");
+    let reply = place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"reply","correlation":ask["id"],
+            "body":approve["label"],"payload":{"answer":{"option_id":"approve"}}}),
+    );
+    assert_eq!(reply["approval"]["recorded"], true, "{reply}");
+    assert_eq!(reply["approval"]["applies"], "relaunch", "{reply}");
+    // The screen moves on; the session then sits idle past the threshold.
+    *herdr.screen.lock().unwrap() = None;
+    approval_idle(&place, 20);
+    approval_refreshed(&place, native, &holder);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert!(
+        argv.contains("Run `make release --dry-run` Only commands that begin exactly with: make release --dry-run"),
+        "{argv}"
+    );
+    let id = reply["approval"]["id"].as_str().unwrap();
+    assert_eq!(
+        approval_refreshes(&place),
+        vec![json!({"ship":"infra","added":[id],"removed":[]})]
+    );
+    place.stop_native("infra");
+}
+
+/// On a pane's card, an approval its session carried is not offered again:
+/// when it covers the refused command, the card says auto mode refused it
+/// anyway and recommends approving the step. One given within 24 h that the
+/// session lacks is offered; one given 25 h ago, still live, is not.
+#[test]
+fn a_panes_card_names_the_approval_its_session_carried_and_offers_only_recent_others() {
+    let (place, herdr) = hosted_claude_refresher();
+    let holder = holder_of(&place);
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for (id, action, prefix, created_ms) in [
+        (
+            "approval-carried",
+            "Run make release",
+            "make release",
+            now - 3_600_000,
+        ),
+        (
+            "approval-lacked",
+            "Run make check",
+            "make check",
+            now - 1_800_000,
+        ),
+        (
+            "approval-stale",
+            "Run make release now",
+            "make release",
+            now - 25 * 3_600_000,
+        ),
+    ] {
+        place
+            .database()
+            .execute(
+                "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,
+                   created_ms,expires_ms,source)
+                 VALUES(?1,'infra','ship-it','q-'||?1,'r-'||?1,?2,?3,?4,?5,'reply')",
+                rusqlite::params![id, action, prefix, created_ms, now + 3_600_000],
+            )
+            .unwrap();
+    }
+    // The pane's session was launched carrying the first.
+    let carried = place
+        .database()
+        .execute(
+            "UPDATE hosted_panes SET approvals_ids='[\"approval-carried\"]' WHERE ship='infra'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(carried, 1);
+    classifier_refused(&place, "make release --dry-run");
+    *herdr.screen.lock().unwrap() = Some(
+        "● Bash(make release --dry-run)\n  ⎿  bash denied by auto mode · [Production Deploy]\n\
+         3 consecutive actions were blocked. Please review the transcript before continuing.\n"
+            .to_owned(),
+    );
+    place.tick();
+    let asks: Vec<Value> = place.json("mail.inbox", json!({"address":"captain"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["type"] == "tool_permission")
+        .cloned()
+        .collect();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = &asks[0];
+    assert_eq!(ask["payload"]["block"]["scope"], "pane", "{ask}");
+    assert_eq!(
+        ask["payload"]["block"]["approvals"],
+        json!(["approval-lacked"]),
+        "{ask}"
+    );
+    let why = ask["payload"]["decision"]["why"].as_str().unwrap();
+    assert!(
+        why.contains(
+            "Auto mode refused this although captain approval approval-carried (Run make release) was in its session."
+        ),
+        "{why}"
+    );
+    let options: Vec<(String, bool)> = ask["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o["id"].as_str().unwrap().to_owned(),
+                o["recommended"] == true,
+            )
+        })
+        .collect();
+    assert!(
+        options.contains(&("as_approved_1".to_owned(), false))
+            && options.contains(&("approve".to_owned(), true))
+            && !options.iter().any(|(id, _)| id == "as_approved_2"),
+        "{options:?}"
+    );
     place.stop_native("infra");
 }

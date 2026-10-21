@@ -225,8 +225,9 @@ pub(crate) fn announce_applied(store: &Store, ship: &str, first: &[String]) -> R
 
 /// Where a captain approval recorded now reaches the ship's session:
 /// `relaunch` when a live, awake hosted pane will refresh its session in
-/// place at its next idle point; `wake` when nothing runs (a reply wakes the
-/// ship, and that launch reads approvals) or the hosted pane sleeps; and
+/// place at its next idle point, on a conversation it can continue; `wake`
+/// when nothing runs (a reply wakes the ship, and that launch reads
+/// approvals) or the hosted pane sleeps; and
 /// `next_launch` for a session that reads them only when it next starts.
 pub(crate) fn approval_applies(store: &Store, ship: &str) -> Result<&'static str> {
     let lease = presence::presence(store, ship)?;
@@ -253,7 +254,14 @@ pub(crate) fn approval_applies(store: &Store, ship: &str) -> Result<&'static str
         params![ship, pid],
         |r| r.get(0),
     )?;
-    Ok(if refreshes { "relaunch" } else { "next_launch" })
+    // A refresh continues the folder's conversation; without one it waits.
+    let continues = refreshes
+        && store
+            .home()
+            .parent()
+            .and_then(|folder| folder.canonicalize().ok())
+            .is_some_and(|folder| crate::host::claude_conversation(&folder).continues());
+    Ok(if continues { "relaunch" } else { "next_launch" })
 }
 
 /// Record the native harness this pane spawned, so its exit can be checked.
@@ -267,7 +275,7 @@ pub(crate) fn harness(store: &Store, ship: &str, harness: u32) -> Result<()> {
 }
 
 /// The recorded pane for a ship, if its process is still the one recorded.
-fn live_pane(store: &Store, ship: &str) -> Result<Option<(u32, String, String)>> {
+pub(crate) fn live_pane(store: &Store, ship: &str) -> Result<Option<(u32, String, String)>> {
     let row: Option<(u32, String, String)> = store
         .connection()
         .query_row(

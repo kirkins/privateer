@@ -148,7 +148,17 @@ impl Store {
             Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(Duration::from_millis(250))?;
         let schema: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM metadata WHERE key='schema' AND value='1') AND EXISTS(SELECT 1 FROM metadata WHERE key='runtime_origin' AND length(value) BETWEEN 1 AND 160) AND (SELECT COUNT(*) FROM pragma_table_info('mail') WHERE name IN ('ended_by','ended_ms','end_reason'))=3 AND EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='approver')", [], |r| r.get(0))?;
-        if !schema {
+        // A captain's tap may record an approval, whose table this open
+        // cannot migrate: one from before block cards' approvals is refused
+        // here rather than by its check mid-tap.
+        let approvals: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captain_approvals') WHERE name='applies_at')
+               AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approvals'
+                 AND instr(sql, '''block''') > 0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !schema || !approvals {
             bail!("incompatible existing action schema; use normal upgrade workflow");
         }
         let mode: String = connection.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
@@ -206,7 +216,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS captain_approvals(id TEXT PRIMARY KEY,ship TEXT NOT NULL,
               task_id TEXT NOT NULL REFERENCES tasks(id),request_id TEXT NOT NULL,reply_id TEXT NOT NULL UNIQUE,
               action TEXT NOT NULL,command_prefix TEXT,created_ms INTEGER NOT NULL,expires_ms INTEGER NOT NULL,
-              revoked_ms INTEGER,source TEXT NOT NULL CHECK(source IN ('reply','option')));
+              revoked_ms INTEGER,source TEXT NOT NULL CHECK(source IN ('reply','option','block')));
             CREATE INDEX IF NOT EXISTS captain_approvals_ship ON captain_approvals(ship,expires_ms);")?;
         // Columns added after 0.1.0. Check and add them under the write lock
         // so concurrent opens cannot both add one.
@@ -238,6 +248,28 @@ impl Store {
                     "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
                 ))?;
             }
+        }
+        // A block card's tap records an approval with source 'block', which
+        // the table's first check refused. SQLite cannot change a check, so
+        // the table is rebuilt once, rows and all.
+        let approvals: String = migrate.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='captain_approvals'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !approvals.contains("'block'") {
+            migrate.execute_batch(
+                "CREATE TABLE captain_approvals_next(id TEXT PRIMARY KEY,ship TEXT NOT NULL,
+                   task_id TEXT NOT NULL REFERENCES tasks(id),request_id TEXT NOT NULL,reply_id TEXT NOT NULL UNIQUE,
+                   action TEXT NOT NULL,command_prefix TEXT,created_ms INTEGER NOT NULL,expires_ms INTEGER NOT NULL,
+                   revoked_ms INTEGER,source TEXT NOT NULL CHECK(source IN ('reply','option','block')),
+                   applies_at TEXT);
+                 INSERT INTO captain_approvals_next SELECT id,ship,task_id,request_id,reply_id,action,
+                   command_prefix,created_ms,expires_ms,revoked_ms,source,applies_at FROM captain_approvals;
+                 DROP TABLE captain_approvals;
+                 ALTER TABLE captain_approvals_next RENAME TO captain_approvals;
+                 CREATE INDEX captain_approvals_ship ON captain_approvals(ship,expires_ms);",
+            )?;
         }
         // Inbox reads look messages up by recipient instead of scanning events;
         // `fleet.snapshot` finds a ship's open tasks by owner and status.
