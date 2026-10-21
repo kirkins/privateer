@@ -1738,67 +1738,64 @@ fn a_detached_crew_keeps_the_unlanded_task_branch_and_alerts() {
     assert_eq!(alerts, 1, "{inbox}");
 }
 
-// ---- The Xcode window closes on release (MCP broker, step 3) ---------------
+// ---- MCP brokers close a workspace's windows on release --------------------
 
 const BROKER: &str = env!("CARGO_BIN_EXE_privateer-mcp-broker");
 
-/// A real MCP broker in the fixture's run directory, its upstream the fake
-/// mcpbridge and its window helpers the fake ones. Stopped when dropped.
-struct XcodeBroker {
+fn broker_run_dir(f: &Fixture) -> PathBuf {
+    f.data.join("privateer/mcp-broker/run")
+}
+
+/// Record windows instance `name` opened, as a broker that has since stopped
+/// would have left them: (root, project) each.
+fn record_windows(f: &Fixture, name: &str, windows: &[(&Path, &Path)]) {
+    let run = broker_run_dir(f);
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+    let windows: Vec<Value> = windows
+        .iter()
+        .map(|(root, project)| json!({"root": root, "project": project, "target": null, "opened_ms": 1}))
+        .collect();
+    fs::write(
+        run.join(format!("{name}.windows.json")),
+        json!({"windows": windows}).to_string(),
+    )
+    .unwrap();
+}
+
+fn recorded(f: &Fixture, name: &str) -> Vec<Value> {
+    fs::read(broker_run_dir(f).join(format!("{name}.windows.json")))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["windows"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// A real MCP broker instance in the fixture's run directory, routed by
+/// the generic fake profile, its upstream the fake one and its window
+/// helpers the fake ones. Stopped when dropped.
+struct McpBroker {
     child: std::process::Child,
-    run: PathBuf,
+    socket: PathBuf,
     closed: PathBuf,
 }
 
-impl XcodeBroker {
-    fn run_dir(f: &Fixture) -> PathBuf {
-        f.data.join("privateer/mcp-broker/run")
-    }
-
-    /// Record a window the broker opened for `root`, as a broker that has
-    /// since stopped would have left it.
-    fn record(f: &Fixture, root: &Path, project: &Path) {
-        Self::record_all(f, &[(root, project)]);
-    }
-
-    fn record_all(f: &Fixture, windows: &[(&Path, &Path)]) {
-        let run = Self::run_dir(f);
-        fs::create_dir_all(&run).unwrap();
-        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
-        let windows: Vec<Value> = windows
-            .iter()
-            .map(|(root, project)| json!({"root": root, "project": project, "tab": null, "opened_ms": 1}))
-            .collect();
-        fs::write(
-            run.join("xcode.windows.json"),
-            json!({"windows": windows}).to_string(),
-        )
-        .unwrap();
-    }
-
-    fn recorded(f: &Fixture) -> Vec<Value> {
-        fs::read(Self::run_dir(f).join("xcode.windows.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| v["windows"].as_array().cloned())
-            .unwrap_or_default()
-    }
-
-    fn start(f: &Fixture, close: &[&str]) -> XcodeBroker {
-        let run = Self::run_dir(f);
+impl McpBroker {
+    fn start(f: &Fixture, name: &str, close: &[&str]) -> McpBroker {
+        let run = broker_run_dir(f);
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-broker");
         let python = fs::canonicalize(support::python())
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let windows = f.root.join("windows.json");
-        let closed = f.root.join("closed.jsonl");
+        let windows = f.root.join(format!("{name}-windows.json"));
+        let closed = f.root.join(format!("{name}-closed.jsonl"));
         let helper = |action: &str, log: &Path, extra: &[&str]| {
             let mut argv = vec![
                 python.clone(),
                 "-I".into(),
                 fixtures
-                    .join("fake_xcode_window.py")
+                    .join("fake_window.py")
                     .to_string_lossy()
                     .into_owned(),
                 action.into(),
@@ -1808,22 +1805,31 @@ impl XcodeBroker {
                 log.to_string_lossy().into_owned(),
             ];
             argv.extend(extra.iter().map(|s| s.to_string()));
-            serde_json::to_string(&argv).unwrap()
+            argv
         };
+        let profile = fixtures.join("fake_profile.json");
+        let mut routing: Value = serde_json::from_slice(&fs::read(&profile).unwrap()).unwrap();
+        let mut routing = routing["routing"].take();
+        routing["open"] = json!(helper(
+            "open",
+            &f.root.join(format!("{name}-opened.jsonl")),
+            &[]
+        ));
+        routing["close"] = json!(helper("close", &closed, close));
         let pool = fs::canonicalize(f.root.join("ledger/worktrees")).unwrap();
         let child = support::command(BROKER)
             .args(["serve", "--state-dir"])
             .arg(&run)
-            .args(["--name", "xcode", "--workspace-pool"])
+            .args(["--name", name, "--label", "Fake", "--workspace-pool"])
             .arg(&pool)
-            .arg("--window-open")
-            .arg(helper("open", &f.root.join("opened.jsonl"), &[]))
-            .arg("--window-close")
-            .arg(helper("close", &closed, close))
+            .arg("--routing")
+            .arg(routing.to_string())
             .arg("--")
             .arg(&python)
             .arg("-I")
             .arg(fixtures.join("fake_mcpbridge.py"))
+            .arg("--profile")
+            .arg(&profile)
             .arg("--windows")
             .arg(&windows)
             .stdin(std::process::Stdio::null())
@@ -1831,12 +1837,17 @@ impl XcodeBroker {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        let socket = run.join(format!("{name}.sock"));
         let until = Instant::now() + Duration::from_secs(10);
-        while !run.join("xcode.sock").exists() {
+        while !socket.exists() {
             assert!(Instant::now() < until, "the broker did not start");
             thread::sleep(Duration::from_millis(30));
         }
-        XcodeBroker { child, run, closed }
+        McpBroker {
+            child,
+            socket,
+            closed,
+        }
     }
 
     /// The projects the close helper was run for.
@@ -1850,12 +1861,12 @@ impl XcodeBroker {
     }
 }
 
-impl Drop for XcodeBroker {
+impl Drop for McpBroker {
     fn drop(&mut self) {
         // SAFETY: signalling the broker this test started.
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         let _ = self.child.wait();
-        let _ = fs::remove_file(self.run.join("xcode.sock"));
+        let _ = fs::remove_file(&self.socket);
     }
 }
 
@@ -1873,32 +1884,32 @@ fn audits(f: &Fixture, kind: &str) -> Vec<Value> {
 }
 
 #[test]
-fn release_closes_the_xcode_window_before_its_checks() {
+fn release_closes_the_window_before_its_checks() {
     let f = Fixture::new();
     let w = f.acquire("one");
     let root = fs::canonicalize(path(&w)).unwrap();
-    let project = root.join("App.xcodeproj");
-    // What Xcode leaves in the worktree while its window is open: release's
-    // clean check would refuse it, so the close must come first.
-    let left = root.join("xcuserdata.lock");
-    fs::write(&left, "held by Xcode").unwrap();
-    XcodeBroker::record(&f, &root, &project);
-    let broker = XcodeBroker::start(&f, &["--remove", left.to_str().unwrap()]);
+    let project = root.join("App.proj");
+    // What a window leaves in the worktree while it is open: release's clean
+    // check would refuse it, so the close must come first.
+    let left = root.join("window.lock");
+    fs::write(&left, "held by the window").unwrap();
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::start(&f, "fake", &["--remove", left.to_str().unwrap()]);
     let released = f.release(&w, false);
     assert_eq!(released["state"], "released");
     assert_eq!(broker.closes(), [project.to_string_lossy()]);
     assert!(!left.exists());
-    assert!(XcodeBroker::recorded(&f).is_empty());
+    assert!(recorded(&f, "fake").is_empty());
 }
 
 #[test]
-fn a_failed_xcode_close_refuses_the_release_and_keeps_the_lease() {
+fn a_failed_close_refuses_the_release_and_keeps_the_lease() {
     let f = Fixture::new();
     let w = f.acquire("one");
     let root = fs::canonicalize(path(&w)).unwrap();
-    let project = root.join("App.xcodeproj");
-    XcodeBroker::record(&f, &root, &project);
-    let broker = XcodeBroker::start(&f, &["--fail"]);
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::start(&f, "fake", &["--fail"]);
     let refused = f.run(
         "workspace.release",
         json!({"task_id": "one", "lease_id": w["lease_id"]}),
@@ -1906,7 +1917,8 @@ fn a_failed_xcode_close_refuses_the_release_and_keeps_the_lease() {
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("could not close the Xcode window for this workspace")
+        stderr.contains("could not close the fake window for this workspace")
+            && stderr.contains("could not close the Fake window of")
             && stderr.contains("-1708"),
         "{stderr}"
     );
@@ -1914,7 +1926,7 @@ fn a_failed_xcode_close_refuses_the_release_and_keeps_the_lease() {
     let status = f.ok("workspace.status", json!({"task_id": "one"}));
     assert_eq!(status["state"], "ready");
     assert_eq!(status["lease_id"], w["lease_id"]);
-    assert_eq!(XcodeBroker::recorded(&f).len(), 1);
+    assert_eq!(recorded(&f, "fake").len(), 1);
 }
 
 #[test]
@@ -1922,17 +1934,65 @@ fn with_no_broker_release_proceeds_and_audits_the_unclosed_window() {
     let f = Fixture::new();
     let w = f.acquire("one");
     let root = fs::canonicalize(path(&w)).unwrap();
-    let project = root.join("App.xcodeproj");
-    XcodeBroker::record(&f, &root, &project);
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
     assert_eq!(f.release(&w, false)["state"], "released");
-    let audited = audits(&f, "workspace.xcode_window_unclosed");
+    let audited = audits(&f, "workspace.mcp_window_unclosed");
     assert_eq!(audited.len(), 1, "{audited:?}");
+    assert_eq!(audited[0]["instance"], "fake");
     assert_eq!(audited[0]["root"], json!(root));
     assert_eq!(audited[0]["windows"][0]["project"], json!(project));
 }
 
 #[test]
-fn sweep_closes_the_xcode_window_before_it_releases() {
+fn release_asks_every_instance_that_records_a_window_and_names_the_one_that_fails() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    let (first, second) = (root.join("A.proj"), root.join("B.proj"));
+    record_windows(&f, "fake", &[(&root, &first)]);
+    record_windows(&f, "two", &[(&root, &second)]);
+    // An instance that records nothing under the root is never asked.
+    let other = f.acquire("two");
+    let elsewhere = fs::canonicalize(path(&other)).unwrap();
+    record_windows(&f, "spare", &[(&elsewhere, &elsewhere.join("C.proj"))]);
+    {
+        let fake = McpBroker::start(&f, "fake", &[]);
+        let two = McpBroker::start(&f, "two", &["--fail"]);
+        let spare = McpBroker::start(&f, "spare", &[]);
+        let refused = f.run(
+            "workspace.release",
+            json!({"task_id": "one", "lease_id": w["lease_id"]}),
+        );
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("could not close the two window for this workspace")
+                && !stderr.contains("the fake window"),
+            "{stderr}"
+        );
+        // Both were asked; the one that worked closed its window.
+        assert_eq!(fake.closes(), [first.to_string_lossy()]);
+        assert_eq!(two.closes(), [second.to_string_lossy()]);
+        assert!(spare.closes().is_empty());
+        assert!(recorded(&f, "fake").is_empty());
+        assert_eq!(recorded(&f, "two").len(), 1);
+        assert_eq!(recorded(&f, "spare").len(), 1);
+        let status = f.ok("workspace.status", json!({"task_id": "one"}));
+        assert_eq!(status["state"], "ready");
+    }
+    // Both working: the release asks both, and goes ahead.
+    record_windows(&f, "fake", &[(&root, &first)]);
+    let fake = McpBroker::start(&f, "fake", &[]);
+    let two = McpBroker::start(&f, "two", &[]);
+    assert_eq!(f.release(&w, false)["state"], "released");
+    assert_eq!(fake.closes().len(), 2);
+    assert_eq!(two.closes().len(), 2);
+    assert!(recorded(&f, "fake").is_empty() && recorded(&f, "two").is_empty());
+}
+
+#[test]
+fn sweep_closes_the_window_before_it_releases() {
     let f = Fixture::new();
     let w = f.acquire("one");
     let p = path(&w);
@@ -1943,9 +2003,9 @@ fn sweep_closes_the_xcode_window_before_it_releases() {
         json!({"id":"one","actor":"ship","status":"done"}),
     );
     let root = fs::canonicalize(&p).unwrap();
-    let project = root.join("App.xcodeproj");
-    XcodeBroker::record(&f, &root, &project);
-    let broker = XcodeBroker::start(&f, &[]);
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::start(&f, "fake", &[]);
     let report = f.ok("serve", json!({"once": true}));
     let released: Vec<&str> = report["workspaces"]
         .as_array()
@@ -1955,7 +2015,7 @@ fn sweep_closes_the_xcode_window_before_it_releases() {
         .collect();
     assert!(released.contains(&"one"), "{report}");
     assert_eq!(broker.closes(), [project.to_string_lossy()]);
-    assert!(XcodeBroker::recorded(&f).is_empty());
+    assert!(recorded(&f, "fake").is_empty());
 }
 
 #[test]
@@ -1986,13 +2046,14 @@ fn sweep_leaves_the_window_of_a_checkout_another_task_now_holds() {
         }
     }
     fs::write(&state_file, serde_json::to_string(&slots).unwrap()).unwrap();
-    let moved_project = moved_root.join("A.xcodeproj");
-    let freed_project = freed_root.join("B.xcodeproj");
-    XcodeBroker::record_all(
+    let moved_project = moved_root.join("A.proj");
+    let freed_project = freed_root.join("B.proj");
+    record_windows(
         &f,
+        "fake",
         &[(&moved_root, &moved_project), (&freed_root, &freed_project)],
     );
-    let broker = XcodeBroker::start(&f, &[]);
+    let broker = McpBroker::start(&f, "fake", &[]);
     f.ok("serve", json!({"once": true}));
     for task in ["one", "two"] {
         let status = f.ok("workspace.status", json!({"task_id": task}));
@@ -2000,27 +2061,27 @@ fn sweep_leaves_the_window_of_a_checkout_another_task_now_holds() {
     }
     // Only the free checkout's window closed; the new holder keeps its own.
     assert_eq!(broker.closes(), [freed_project.to_string_lossy()]);
-    let left = XcodeBroker::recorded(&f);
+    let left = recorded(&f, "fake");
     assert_eq!(left.len(), 1, "{left:?}");
     assert_eq!(left[0]["root"], json!(moved_root));
 }
 
-/// A broker that holds the lock and the socket, accepts every connection
-/// and never answers. Stopped when dropped.
+/// A broker instance that holds its lock and socket, accepts every
+/// connection and never answers. Stopped when dropped.
 struct HungBroker(std::process::Child);
 
 impl HungBroker {
-    fn start(f: &Fixture) -> HungBroker {
-        let run = XcodeBroker::run_dir(f);
+    fn start(f: &Fixture, name: &str) -> HungBroker {
+        let run = broker_run_dir(f);
         fs::create_dir_all(&run).unwrap();
         fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
         let script = r#"import fcntl, os, socket, sys
-run = sys.argv[1]
-lock = os.open(os.path.join(run, 'xcode.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+run, name = sys.argv[1], sys.argv[2]
+lock = os.open(os.path.join(run, name + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
 fcntl.flock(lock, fcntl.LOCK_EX)
 listener = socket.socket(socket.AF_UNIX)
 os.umask(0o177)
-listener.bind(os.path.join(run, 'xcode.sock'))
+listener.bind(os.path.join(run, name + '.sock'))
 listener.listen(16)
 held = []
 while True:
@@ -2029,11 +2090,13 @@ while True:
         let child = support::command(support::python())
             .args(["-I", "-c", script])
             .arg(&run)
+            .arg(name)
             .stdin(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        let socket = run.join(format!("{name}.sock"));
         let until = Instant::now() + Duration::from_secs(10);
-        while !run.join("xcode.sock").exists() {
+        while !socket.exists() {
             assert!(Instant::now() < until, "the hung broker did not start");
             thread::sleep(Duration::from_millis(30));
         }
@@ -2054,9 +2117,9 @@ fn a_hung_broker_holds_up_only_the_release_of_a_workspace_with_a_window() {
     let quiet = f.acquire("one");
     let windowed = f.acquire("two");
     let root = fs::canonicalize(path(&windowed)).unwrap();
-    let project = root.join("App.xcodeproj");
-    XcodeBroker::record(&f, &root, &project);
-    let _hung = HungBroker::start(&f);
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let _hung = HungBroker::start(&f, "fake");
     // No window recorded under it: the broker is never asked.
     let started = Instant::now();
     assert_eq!(f.release(&quiet, false)["state"], "released");
@@ -2075,7 +2138,7 @@ fn a_hung_broker_holds_up_only_the_release_of_a_workspace_with_a_window() {
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("could not close the Xcode window for this workspace")
+        stderr.contains("could not close the fake window for this workspace")
             && stderr.contains("the MCP broker did not answer within 35 s"),
         "{stderr}"
     );
@@ -2086,5 +2149,42 @@ fn a_hung_broker_holds_up_only_the_release_of_a_workspace_with_a_window() {
     let status = f.ok("workspace.status", json!({"task_id": "two"}));
     assert_eq!(status["state"], "ready");
     assert_eq!(status["lease_id"], windowed["lease_id"]);
-    assert_eq!(XcodeBroker::recorded(&f).len(), 1);
+    assert_eq!(recorded(&f, "fake").len(), 1);
+}
+
+#[test]
+fn two_hung_instances_share_one_deadline() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    record_windows(&f, "fake", &[(&root, &root.join("A.proj"))]);
+    record_windows(&f, "two", &[(&root, &root.join("B.proj"))]);
+    let _fake = HungBroker::start(&f, "fake");
+    let _two = HungBroker::start(&f, "two");
+    // What a release takes with nothing to ask, shown beside the one below.
+    let quiet = f.acquire("two");
+    let started = Instant::now();
+    assert_eq!(f.release(&quiet, false)["state"], "released");
+    let overhead = started.elapsed();
+    let started = Instant::now();
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id": "one", "lease_id": w["lease_id"]}),
+    );
+    let took = started.elapsed();
+    eprintln!("two hung instances: the release took {took:?}; a quiet one {overhead:?}");
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("could not close the fake window for this workspace")
+            && stderr.contains("could not close the two window for this workspace"),
+        "{stderr}"
+    );
+    // Asked in parallel: 35 s plus 3, never 70.
+    assert!(
+        took >= Duration::from_secs(34) && took < Duration::from_secs(38),
+        "{took:?}"
+    );
+    let status = f.ok("workspace.status", json!({"task_id": "one"}));
+    assert_eq!(status["state"], "ready");
 }

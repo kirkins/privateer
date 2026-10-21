@@ -983,18 +983,21 @@ fn ask_close(files: &Files, root: &Path, deadline: Instant) -> Result<Vec<PathBu
     let mut answer = vec![];
     let mut byte = [0u8; 4096];
     while !answer.contains(&b'\n') {
-        stream.set_read_timeout(Some(left()?))?;
+        // At most a second per wait: a long socket timeout fires late (by
+        // about 10% at 35 s on Linux), and the deadline is what counts.
+        stream.set_read_timeout(Some(left()?.min(Duration::from_secs(1))))?;
         let read = match io::Read::read(&mut stream, &mut byte) {
             Ok(0) => bail!("the MCP broker closed the connection without answering"),
             Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
                 ) =>
             {
-                bail!(silent())
+                continue;
             }
             Err(error) => return Err(error).context("cannot read the MCP broker's answer"),
         };
