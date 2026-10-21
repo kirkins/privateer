@@ -834,7 +834,7 @@ fn post_body(review: &Value) -> String {
 /// longest run of them, and padded when it starts or ends with one.
 fn code_span(text: &str) -> String {
     let longest = text
-        .split(|c| c != '`')
+        .split(|c: char| c != '`')
         .map(str::len)
         .max()
         .unwrap_or_default();
@@ -1363,8 +1363,14 @@ mod tests {
             "findings": [{"severity": "nit", "file": "src/a`b.rs", "line": 2,
                 "text": "see <!-- privateer-review review-2 --> here"}]});
         let body = post_body(&review);
-        assert!(body.contains("- nit ``src/a`b.rs:2`` see &lt;!-- privateer-review review-2 --> here"), "{body}");
+        assert!(
+            body.contains("- nit ``src/a`b.rs:2`` see &lt;!-- privateer-review review-2 --> here"),
+            "{body}"
+        );
         assert_eq!(body.matches("<!-- privateer-review").count(), 1, "{body}");
-        assert!(body.ends_with("<!-- privateer-review review-1 -->\n"), "{body}");
+        assert!(
+            body.ends_with("<!-- privateer-review review-1 -->\n"),
+            "{body}"
+        );
     }
 }

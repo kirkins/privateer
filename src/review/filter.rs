@@ -216,7 +216,7 @@ fn secret(reply: &str, secrets: &[Vec<u8>]) -> Option<String> {
             }
             continue;
         }
-        values.push(squeeze(secret));
+        values.push(squeeze(secret.as_slice()));
         values.extend(encodings(secret));
     }
     let pieces: HashSet<&[u8]> = values
@@ -792,9 +792,15 @@ mod tests {
                 "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
                 "JWT",
             ),
-            ("eyJhbGciOiJIUzI1 NiJ9.eyJzdWIiOiIx MjM0NTY3ODkwIn0.sig", "JWT"),
+            (
+                "eyJhbGciOiJIUzI1 NiJ9.eyJzdWIiOiIx MjM0NTY3ODkwIn0.sig",
+                "JWT",
+            ),
             // Random runs no shape names: base64 and hex.
-            ("key: q8Zt3VnX0bK7LmP2rW9yHs4Jd6Fg1Qa5Ce8Tu0Ri", "random key or token"),
+            (
+                "key: q8Zt3VnX0bK7LmP2rW9yHs4Jd6Fg1Qa5Ce8Tu0Ri",
+                "random key or token",
+            ),
             (
                 "secret 9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08",
                 "random key or token",

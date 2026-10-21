@@ -1356,7 +1356,10 @@ fn a_lost_merge_reply_is_settled_by_reading_the_pr_again() {
         "{refused}"
     );
     assert!(
-        refused.contains(&format!("is open at {}, not merged at that head", &head[..7])),
+        refused.contains(&format!(
+            "is open at {}, not merged at that head",
+            &head[..7]
+        )),
         "{refused}"
     );
     assert!(!f.consumed("deploy-42"));
@@ -1372,7 +1375,8 @@ fn a_lost_merge_reply_is_settled_by_reading_the_pr_again() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["check"] == "merge_reply_lost" && c["error"].as_str().unwrap().contains("timeout")),
+            .any(|c| c["check"] == "merge_reply_lost"
+                && c["error"].as_str().unwrap().contains("timeout")),
         "{merged}"
     );
     assert!(f.consumed("deploy-42"));
@@ -1568,7 +1572,11 @@ fn a_hung_forge_stops_at_the_ticks_posting_budget_and_the_rest_waits() {
         .env("PRIVATEER_REVIEW_POST_BUDGET_MS", "1500")
         .output()
         .unwrap();
-    assert!(tick.status.success(), "{}", String::from_utf8_lossy(&tick.stderr));
+    assert!(
+        tick.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tick.stderr)
+    );
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "the tick waited {:?} on a hung forge",
@@ -1578,10 +1586,7 @@ fn a_hung_forge_stops_at_the_ticks_posting_budget_and_the_rest_waits() {
     assert_eq!(row["post_state"], "failed", "{row}");
     assert_eq!(row["post_attempts"], 3);
     assert!(
-        row["post_error"]
-            .as_str()
-            .unwrap()
-            .contains("time budget"),
+        row["post_error"].as_str().unwrap().contains("time budget"),
         "{row}"
     );
     assert_eq!(f.row(&b)["post_attempts"], 1, "the second was tried");
@@ -1596,7 +1601,8 @@ fn a_hung_forge_stops_at_the_ticks_posting_budget_and_the_rest_waits() {
     let mail = f.mail_to("engineering");
     for id in [&a, &b] {
         assert!(
-            mail.iter().any(|(m, body)| m == &format!("{id}-posted") && body.contains("APPROVE, posted")),
+            mail.iter()
+                .any(|(m, body)| m == &format!("{id}-posted") && body.contains("APPROVE, posted")),
             "{mail:?}"
         );
     }

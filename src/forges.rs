@@ -375,9 +375,8 @@ pub fn exchange(
         }
     }
     command.env("PRIVATEER_FORGE_TOKEN_FILE", &token);
-    let output =
-        crate::review::run_bounded(command, Some(request.to_string().as_bytes()), until)
-            .with_context(|| format!("run the forge adapter's {op}"))?;
+    let output = crate::review::run_bounded(command, Some(request.to_string().as_bytes()), until)
+        .with_context(|| format!("run the forge adapter's {op}"))?;
     serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
             "the forge adapter's {op} reply is not JSON: {}",
