@@ -65,7 +65,8 @@ class Launcher(unittest.TestCase):
             time.sleep(0.05)
         spec = json.dumps({'command': [str(pinned), 'proxy', '--socket', socket, '--connect-wait-secs', '10'],
                            'sha256': digest})
-        client = subprocess.Popen([os.path.realpath(sys.executable), '-I', str(LAUNCHER), spec],
+        # Unbuffered: select() sees every line, none hidden in a read buffer.
+        client = subprocess.Popen([os.path.realpath(sys.executable), '-I', str(LAUNCHER), spec], bufsize=0,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   env={'HOME': os.environ.get('HOME', '/'), 'PATH': '/usr/bin:/bin'})
         self.addCleanup(end, client, client.kill)

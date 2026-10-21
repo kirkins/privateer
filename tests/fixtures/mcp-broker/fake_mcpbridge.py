@@ -7,6 +7,10 @@ on stdio, scripted by argv (the broker gives it a minimal environment).
   --crash-after N      exit after receiving the Nth tools/call, once: a marker
                        FILE.crashed beside --record keeps a restart from
                        crashing again
+  --windows FILE       Xcode's windows: a JSON list of {tabIdentifier,
+                       workspacePath}, read at each XcodeListWindows
+  --windows-text       answer XcodeListWindows in the text form only
+                       (otherwise structuredContent, with the same JSON as text)
 
 Tools (tools/call name):
   echo    {"text"}            answer with the text
@@ -16,6 +20,14 @@ Tools (tools/call name):
   ask     {}                  send a server request, answer with the error
                               code the client side gave it
   crash   {}                  exit at once, mid-call
+  XcodeListWindows {}         the windows in --windows
+  XcodeRead {tabIdentifier, filePath}   answer with the tab and path it got
+  BuildProject {tabIdentifier}          answer with the tab it got
+  DocumentationSearch {query}           window-free: answer with the query
+  XcodeGrep {pattern}         window-free until `retool`, then it takes
+                              tabIdentifier too
+  retool  {}                  give XcodeGrep a tabIdentifier and send
+                              notifications/tools/list_changed
 """
 import argparse
 import json
@@ -28,12 +40,46 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--record')
 parser.add_argument('--init-delay', type=float, default=0)
 parser.add_argument('--crash-after', type=int, default=0)
+parser.add_argument('--windows')
+parser.add_argument('--windows-text', action='store_true')
 options = parser.parse_args()
 
 out_lock = threading.Lock()
 cancelled = set()
 asked = {}
 calls = 0
+retooled = False
+TAB = {'tabIdentifier': {'type': 'string'}}
+
+
+def tools():
+    """Each tool's name and inputSchema properties."""
+    listed = {name: {} for name in ('echo', 'slow', 'notify', 'ask', 'crash', 'retool')}
+    listed.update({
+        'XcodeListWindows': {},
+        'XcodeRead': dict(TAB, filePath={'type': 'string'}),
+        'BuildProject': dict(TAB),
+        'DocumentationSearch': {'query': {'type': 'string'}},
+        'XcodeGrep': dict(TAB, pattern={'type': 'string'}) if retooled else {'pattern': {'type': 'string'}},
+    })
+    return [{'name': name, 'inputSchema': {'type': 'object', 'properties': properties}}
+            for name, properties in listed.items()]
+
+
+def list_windows(request_id):
+    windows = []
+    if options.windows and os.path.exists(options.windows):
+        with open(options.windows) as stream:
+            windows = json.load(stream)
+    if options.windows_text:
+        lines = ['Open Xcode windows:'] + [
+            f"* tabIdentifier: {w['tabIdentifier']}, workspacePath: {w['workspacePath']}" for w in windows]
+        result = {'content': [{'type': 'text', 'text': '\n'.join(lines)}], 'isError': False}
+    else:
+        body = {'windows': windows}
+        result = {'content': [{'type': 'text', 'text': json.dumps(body)}],
+                  'structuredContent': body, 'isError': False}
+    send({'jsonrpc': '2.0', 'id': request_id, 'result': result})
 
 
 def record(message):
@@ -79,7 +125,7 @@ def ask(request_id):
 
 
 def call(request_id, params):
-    global calls
+    global calls, retooled
     calls += 1
     name = params.get('name')
     arguments = params.get('arguments') or {}
@@ -100,6 +146,20 @@ def call(request_id, params):
         result(request_id, 'notified')
     elif name == 'ask':
         threading.Thread(target=ask, args=(request_id,), daemon=True).start()
+    elif name == 'XcodeListWindows':
+        list_windows(request_id)
+    elif name == 'XcodeRead':
+        result(request_id, f"read {arguments.get('filePath')} in tab {arguments.get('tabIdentifier')}")
+    elif name == 'BuildProject':
+        result(request_id, f"built in tab {arguments.get('tabIdentifier')}")
+    elif name == 'DocumentationSearch':
+        result(request_id, f"found {arguments.get('query')}")
+    elif name == 'XcodeGrep':
+        result(request_id, f"grep in tab {arguments.get('tabIdentifier')}")
+    elif name == 'retool':
+        retooled = True
+        send({'jsonrpc': '2.0', 'method': 'notifications/tools/list_changed'})
+        result(request_id, 'retooled')
     else:
         send({'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32602, 'message': 'unknown tool'}})
 
@@ -121,9 +181,7 @@ def main():
                 'capabilities': {'tools': {}},
                 'serverInfo': {'name': 'fake-mcpbridge', 'version': '1.0'}}})
         elif method == 'tools/list':
-            send({'jsonrpc': '2.0', 'id': request_id, 'result': {'tools': [
-                {'name': name, 'inputSchema': {'type': 'object'}}
-                for name in ('echo', 'slow', 'notify', 'ask', 'crash')]}})
+            send({'jsonrpc': '2.0', 'id': request_id, 'result': {'tools': tools()}})
         elif method == 'tools/call':
             call(request_id, message.get('params') or {})
         elif method == 'notifications/cancelled':

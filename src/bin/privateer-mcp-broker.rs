@@ -7,8 +7,9 @@
 //! path nor its hash, so whatever the upstream allowed stays allowed.
 //!
 //! ```text
-//! privateer-mcp-broker serve --state-dir DIR --name NAME [--ready-wait-secs 60] -- UPSTREAM...
-//! privateer-mcp-broker proxy --socket ABS [--connect-wait-secs 60]
+//! privateer-mcp-broker serve --state-dir DIR --name NAME [--ready-wait-secs 60]
+//!     [--workspace-pool ABS]... [--window-open JSON_ARGV] [--window-close JSON_ARGV] -- UPSTREAM...
+//! privateer-mcp-broker proxy --socket ABS [--connect-wait-secs 60] [--project REL]
 //! privateer-mcp-broker --version
 //! ```
 //!
@@ -19,23 +20,27 @@ mod busy;
 mod lines;
 #[path = "privateer-mcp-broker/proxy.rs"]
 mod proxy;
+#[path = "privateer-mcp-broker/route.rs"]
+mod route;
 #[path = "privateer-mcp-broker/serve.rs"]
 mod serve;
 #[path = "privateer-mcp-broker/sys.rs"]
 mod sys;
 #[path = "privateer-mcp-broker/upstream.rs"]
 mod upstream;
+#[path = "privateer-mcp-broker/window.rs"]
+mod window;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Bump on any behaviour change: `privateer mcp-broker install` replaces the
 /// installed copy only when this differs.
-pub const BROKER_VERSION: &str = "0.1.0";
+pub const BROKER_VERSION: &str = "0.2.0";
 /// The longest JSON-RPC line either side may send.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
 
-const USAGE: &str = "usage: privateer-mcp-broker serve --state-dir DIR --name NAME [--ready-wait-secs N] -- UPSTREAM...\n       privateer-mcp-broker proxy --socket ABS [--connect-wait-secs N]\n       privateer-mcp-broker --version";
+const USAGE: &str = "usage: privateer-mcp-broker serve --state-dir DIR --name NAME [--ready-wait-secs N] [--workspace-pool ABS]... [--window-open JSON_ARGV] [--window-close JSON_ARGV] -- UPSTREAM...\n       privateer-mcp-broker proxy --socket ABS [--connect-wait-secs N] [--project REL]\n       privateer-mcp-broker --version";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,7 +54,7 @@ fn main() {
             Err(error) => usage(&error),
         },
         Some("proxy") => match proxy_options(&args[1..]) {
-            Ok((socket, wait)) => proxy::run(&socket, wait),
+            Ok((socket, wait, project)) => proxy::run(&socket, wait, project.as_deref()),
             Err(error) => usage(&error),
         },
         _ => usage("expected serve, proxy or --version"),
@@ -67,6 +72,11 @@ pub struct ServeOptions {
     pub name: String,
     pub ready_wait: Duration,
     pub upstream: Vec<String>,
+    /// Directories whose git checkouts are task workspaces.
+    pub pools: Vec<PathBuf>,
+    /// What opens and closes a workspace's window, the project appended.
+    pub window_open: Option<Vec<String>>,
+    pub window_close: Option<Vec<String>>,
 }
 
 fn serve_options(args: &[String]) -> Result<ServeOptions, String> {
@@ -75,11 +85,23 @@ fn serve_options(args: &[String]) -> Result<ServeOptions, String> {
     let mut ready_wait = 60;
     let mut rest = args.iter();
     let mut upstream = vec![];
+    let mut pools = vec![];
+    let mut window_open = None;
+    let mut window_close = None;
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--state-dir" => dir = Some(PathBuf::from(value(&mut rest, arg)?)),
             "--name" => name = Some(value(&mut rest, arg)?.to_string()),
             "--ready-wait-secs" => ready_wait = seconds(value(&mut rest, arg)?)?,
+            "--workspace-pool" => {
+                let pool = PathBuf::from(value(&mut rest, arg)?);
+                if !pool.is_absolute() || pools.len() >= 16 {
+                    return Err("--workspace-pool is absolute, at most 16 of them".into());
+                }
+                pools.push(pool);
+            }
+            "--window-open" => window_open = Some(window::helper_argv(value(&mut rest, arg)?)?),
+            "--window-close" => window_close = Some(window::helper_argv(value(&mut rest, arg)?)?),
             "--" => {
                 upstream = rest.by_ref().cloned().collect();
                 break;
@@ -108,17 +130,30 @@ fn serve_options(args: &[String]) -> Result<ServeOptions, String> {
         name,
         ready_wait: Duration::from_secs(ready_wait),
         upstream,
+        pools,
+        window_open,
+        window_close,
     })
 }
 
-fn proxy_options(args: &[String]) -> Result<(PathBuf, Duration), String> {
+type ProxyOptions = (PathBuf, Duration, Option<String>);
+
+fn proxy_options(args: &[String]) -> Result<ProxyOptions, String> {
     let mut socket = None;
     let mut wait = 60;
+    let mut project = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--socket" => socket = Some(PathBuf::from(value(&mut rest, arg)?)),
             "--connect-wait-secs" => wait = seconds(value(&mut rest, arg)?)?,
+            "--project" => {
+                let rel = value(&mut rest, arg)?;
+                if rel.is_empty() || rel.starts_with('/') || rel.len() > 1024 {
+                    return Err("--project is a relative path inside the workspace".into());
+                }
+                project = Some(rel.to_string());
+            }
             other => return Err(format!("unexpected argument {other}")),
         }
     }
@@ -126,7 +161,7 @@ fn proxy_options(args: &[String]) -> Result<(PathBuf, Duration), String> {
     if !socket.is_absolute() {
         return Err("--socket must be absolute".into());
     }
-    Ok((socket, Duration::from_secs(wait)))
+    Ok((socket, Duration::from_secs(wait), project))
 }
 
 fn value<'a>(rest: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a str, String> {

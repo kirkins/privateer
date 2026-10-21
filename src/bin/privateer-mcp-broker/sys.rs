@@ -43,7 +43,8 @@ pub fn try_lock(path: &Path) -> io::Result<Option<File>> {
 }
 
 /// The uid of the process at the other end of a connected Unix socket, and
-/// its pid where the system reports one (Linux; macOS's getpeereid has none).
+/// its pid where the system reports one (SO_PEERCRED on Linux, LOCAL_PEERPID
+/// on macOS).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn peer(fd: RawFd) -> io::Result<(u32, Option<i64>)> {
     let mut cred = libc::ucred {
@@ -68,7 +69,32 @@ pub fn peer(fd: RawFd) -> io::Result<(u32, Option<i64>)> {
     Ok((cred.uid, (cred.pid > 0).then_some(i64::from(cred.pid))))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// macOS: getpeereid for the uid, LOCAL_PEERPID for the pid.
+#[cfg(target_os = "macos")]
+pub fn peer(fd: RawFd) -> io::Result<(u32, Option<i64>)> {
+    let mut uid = 0;
+    let mut gid = 0;
+    // SAFETY: both out-pointers are valid.
+    if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` and `len` describe a writable pid_t.
+    let done = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    let pid = (done == 0 && pid > 0).then_some(i64::from(pid));
+    Ok((uid, pid))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn peer(fd: RawFd) -> io::Result<(u32, Option<i64>)> {
     let mut uid = 0;
     let mut gid = 0;
@@ -77,6 +103,52 @@ pub fn peer(fd: RawFd) -> io::Result<(u32, Option<i64>)> {
         return Err(io::Error::last_os_error());
     }
     Ok((uid, None))
+}
+
+/// The working directory of process `pid`, resolved, read from the system
+/// (never from anything the process says): /proc on Linux, proc_pidinfo on
+/// macOS. `None` when it cannot be read.
+pub fn cwd_of(pid: i64) -> Option<PathBuf> {
+    if pid <= 1 {
+        return None;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    #[cfg(target_os = "macos")]
+    let cwd = {
+        let pid = libc::pid_t::try_from(pid).ok()?;
+        // SAFETY: proc_pidinfo fills at most the struct's size.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+                size,
+            )
+        };
+        if got != size {
+            return None;
+        }
+        // vip_path is MAXPATHLEN bytes, split in rows for old compilers.
+        let bytes: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .iter()
+            .flatten()
+            .map(|c| *c as u8)
+            .take_while(|b| *b != 0)
+            .collect();
+        PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes))
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    let cwd = PathBuf::new();
+    if !cwd.is_absolute() {
+        return None;
+    }
+    fs::canonicalize(cwd).ok()
 }
 
 pub fn peer_uid(fd: RawFd) -> io::Result<u32> {

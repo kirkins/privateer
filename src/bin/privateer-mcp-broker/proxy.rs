@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-pub fn run(socket: &Path, wait: Duration) -> i32 {
+pub fn run(socket: &Path, wait: Duration, project: Option<&str>) -> i32 {
     let deadline = Instant::now() + wait;
     let stream = loop {
         match UnixStream::connect(socket) {
@@ -37,7 +37,10 @@ pub fn run(socket: &Path, wait: Duration) -> i32 {
         .and_then(std::fs::canonicalize)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let hello = json!({"privateer_proxy": 1, "cwd": cwd, "pid": std::process::id()});
+    let mut hello = json!({"privateer_proxy": 1, "cwd": cwd, "pid": std::process::id()});
+    if let Some(project) = project {
+        hello["project"] = json!(project);
+    }
     let mut upward = stream;
     if writeln!(upward, "{hello}").is_err() {
         eprintln!("privateer-mcp-broker proxy: the broker closed the connection");

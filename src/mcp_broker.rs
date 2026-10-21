@@ -23,10 +23,56 @@ pub const BINARY: &str = "privateer-mcp-broker";
 /// The one broker this step runs.
 pub const NAME: &str = "xcode";
 const DEFAULT_UPSTREAM: [&str; 2] = ["/usr/bin/xcrun", "mcpbridge"];
+/// How a Mac opens a workspace's window: `-g` keeps the captain's focus.
+#[cfg(target_os = "macos")]
+const DEFAULT_WINDOW_OPEN: &[&str] = &["/usr/bin/open", "-g", "-a", "Xcode"];
+/// How a Mac closes it: every workspace document whose path is the recorded
+/// project or lies below it (Xcode can report `X.xcodeproj` as
+/// `X.xcodeproj/project.xcworkspace`), last first so closing one does not
+/// shift the others. The project path is the script's argument, never part
+/// of the script; nothing matching exits 0; and an Xcode that is not running
+/// is never launched.
+#[cfg(any(target_os = "macos", test))]
+const DEFAULT_WINDOW_CLOSE: &[&str] = &[
+    "/usr/bin/osascript",
+    "-e",
+    "on run argv",
+    "-e",
+    "set wantedPath to item 1 of argv",
+    "-e",
+    "set wantedPrefix to wantedPath & \"/\"",
+    "-e",
+    "if application \"Xcode\" is running then",
+    "-e",
+    "tell application \"Xcode\"",
+    "-e",
+    "set docs to every workspace document",
+    "-e",
+    "repeat with i from (count of docs) to 1 by -1",
+    "-e",
+    "set p to path of (item i of docs)",
+    "-e",
+    "if p is not missing value and (p is wantedPath or p starts with wantedPrefix) then close (item i of docs) saving no",
+    "-e",
+    "end repeat",
+    "-e",
+    "end tell",
+    "-e",
+    "end if",
+    "-e",
+    "end run",
+];
+/// Executables a window helper may not be: a shell would run anything.
+const SHELLS: [&str; 12] = [
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "env", "busybox", "xargs",
+];
+/// The longest a release waits for the broker to close a window: longer than
+/// the broker's 30 s helper deadline, so a close helper the broker kills is
+/// reported as the broker's error, not as silence.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(35);
 /// The dispatcher looks at most this often.
 const ENSURE_EVERY: Duration = Duration::from_secs(30);
-const USAGE: &str =
-    "usage: privateer mcp-broker install [--upstream /ABS/COMMAND [ARG...]] | status | stop";
+const USAGE: &str = "usage: privateer mcp-broker install [--workspace-pool ABS]... [--window-open JSON_ARGV] [--window-close JSON_ARGV] [--upstream /ABS/COMMAND [ARG...]] | status | stop";
 
 /// `$XDG_DATA_HOME/privateer/mcp-broker/bin/privateer-mcp-broker`: outside
 /// every release, so upgrades leave it alone.
@@ -62,6 +108,7 @@ struct Files {
     socket: PathBuf,
     state: PathBuf,
     log: PathBuf,
+    windows: PathBuf,
 }
 
 impl Files {
@@ -75,6 +122,7 @@ impl Files {
             socket: at("sock"),
             state: at("state.json"),
             log: at("log"),
+            windows: at("windows.json"),
             dir,
         }
     }
@@ -126,7 +174,7 @@ pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> 
     let out = match args.first().map(String::as_str) {
         Some("install") => {
             caller.require_operator("mcp-broker install")?;
-            install(&files, &upstream_from(&args[1..])?)?
+            install(&files, &install_options(home, &args[1..])?)?
         }
         Some("status") | None if args.len() <= 1 => status(&files)?,
         Some("stop") if args.len() == 1 => {
@@ -143,14 +191,162 @@ pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> 
     Ok(())
 }
 
-fn upstream_from(args: &[String]) -> Result<Vec<String>> {
-    let upstream: Vec<String> = match args.split_first() {
-        None => DEFAULT_UPSTREAM.iter().map(|s| s.to_string()).collect(),
-        Some((flag, rest)) if flag == "--upstream" && !rest.is_empty() => rest.to_vec(),
-        _ => bail!(USAGE),
-    };
+/// What `install` records: the upstream, the workspace pools and the window
+/// helpers.
+struct Config {
+    upstream: Vec<String>,
+    pools: Vec<PathBuf>,
+    window_open: Option<Vec<String>>,
+    window_close: Option<Vec<String>>,
+}
+
+impl Config {
+    fn json(&self) -> Value {
+        let mut config = json!({"upstream": self.upstream, "workspace_pools": self.pools});
+        if let Some(open) = &self.window_open {
+            config["window_open"] = json!(open);
+        }
+        if let Some(close) = &self.window_close {
+            config["window_close"] = json!(close);
+        }
+        config
+    }
+
+    /// A config `install` wrote, checked again before it is run.
+    fn parse(config: &Value) -> Result<Self> {
+        let upstream: Vec<String> = serde_json::from_value(config["upstream"].clone())
+            .context("mcp-broker config has no upstream argv")?;
+        check_upstream(&upstream)?;
+        let pools: Vec<PathBuf> = match config.get("workspace_pools") {
+            Some(pools) => serde_json::from_value(pools.clone())
+                .context("mcp-broker config workspace_pools is not a list of paths")?,
+            None => vec![],
+        };
+        for pool in &pools {
+            ensure!(
+                normalized(pool),
+                "workspace pool {} is not absolute and normalized",
+                pool.display()
+            );
+        }
+        let helper = |key: &str| -> Result<Option<Vec<String>>> {
+            config
+                .get(key)
+                .map(|argv| {
+                    let argv: Vec<String> = serde_json::from_value(argv.clone())
+                        .with_context(|| format!("mcp-broker config {key} is not an argv"))?;
+                    check_helper(&argv)?;
+                    Ok(argv)
+                })
+                .transpose()
+        };
+        Ok(Self {
+            upstream,
+            pools,
+            window_open: helper("window_open")?,
+            window_close: helper("window_close")?,
+        })
+    }
+}
+
+/// `install`'s arguments. The workspace pool Privateer itself uses,
+/// `<ledger>/worktrees`, is always there; `--workspace-pool` adds others,
+/// each absolute, normalized and existing. The helpers default to the Mac's
+/// `open` and `osascript`, and to none elsewhere.
+fn install_options(home: Option<&Path>, args: &[String]) -> Result<Config> {
+    let own = crate::jobs::ledger_dir_at(home)?.join("worktrees");
+    ensure!(own.is_absolute(), "resource_home must be absolute");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&own)
+        .with_context(|| format!("cannot make {}", own.display()))?;
+    let mut pools = vec![fs::canonicalize(&own)?];
+    #[cfg(target_os = "macos")]
+    let defaults = |argv: &[&str]| Some(argv.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    #[cfg(target_os = "macos")]
+    let (mut window_open, mut window_close) = (
+        defaults(DEFAULT_WINDOW_OPEN),
+        defaults(DEFAULT_WINDOW_CLOSE),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (mut window_open, mut window_close) = (None, None);
+    let mut upstream: Vec<String> = DEFAULT_UPSTREAM.iter().map(|s| s.to_string()).collect();
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let mut value = || rest.next().cloned().context(USAGE);
+        match flag.as_str() {
+            "--workspace-pool" => {
+                let pool = PathBuf::from(value()?);
+                ensure!(
+                    normalized(&pool),
+                    "--workspace-pool {} must be an absolute, normalized path",
+                    pool.display()
+                );
+                ensure!(
+                    pool.is_dir(),
+                    "--workspace-pool {} does not exist",
+                    pool.display()
+                );
+                let real = fs::canonicalize(&pool)?;
+                ensure!(pools.len() < 16, "at most 16 workspace pools");
+                if !pools.contains(&real) {
+                    pools.push(real);
+                }
+            }
+            "--window-open" | "--window-close" => {
+                let argv: Vec<String> = serde_json::from_str(&value()?)
+                    .with_context(|| format!("{flag} takes a JSON array of strings"))?;
+                check_helper(&argv)?;
+                if flag == "--window-open" {
+                    window_open = Some(argv);
+                } else {
+                    window_close = Some(argv);
+                }
+            }
+            "--upstream" => {
+                upstream = rest.by_ref().cloned().collect();
+                ensure!(!upstream.is_empty(), USAGE);
+            }
+            _ => bail!(USAGE),
+        }
+    }
     check_upstream(&upstream)?;
-    Ok(upstream)
+    Ok(Config {
+        upstream,
+        pools,
+        window_open,
+        window_close,
+    })
+}
+
+/// Absolute, with no `.`, `..` or trailing slash.
+fn normalized(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    path.is_absolute()
+        && path.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+        && (text == "/" || !text.ends_with('/'))
+        && !text.contains("//")
+        && !text.split('/').any(|part| part == "." || part == "..")
+}
+
+/// A window helper: checked like the upstream, and never a shell.
+fn check_helper(argv: &[String]) -> Result<()> {
+    check_upstream(argv).context("a window helper is checked like the upstream")?;
+    let base = Path::new(&argv[0])
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    ensure!(
+        !SHELLS.contains(&base.as_str()),
+        "a window helper may not be {base}"
+    );
+    Ok(())
 }
 
 /// An argv whose executable is an absolute, normalized path.
@@ -286,7 +482,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Copy the shipped broker to the stable path unless that already holds the
 /// same version (then nothing changes, not even the inode), and record the
 /// upstream the dispatcher starts it with.
-fn install(files: &Files, upstream: &[String]) -> Result<Value> {
+fn install(files: &Files, wanted: &Config) -> Result<Value> {
+    let upstream = &wanted.upstream;
     let source = source_binary()?;
     let version = version_of(&source)?;
     let target = stable_binary()?;
@@ -317,7 +514,7 @@ fn install(files: &Files, upstream: &[String]) -> Result<Value> {
         }
     };
     private_dir(&files.dir)?;
-    let config = serde_json::to_vec(&json!({"upstream": upstream}))?;
+    let config = serde_json::to_vec(&wanted.json())?;
     write_private(
         &config_pin()?,
         format!("{:x}\n", Sha256::digest(&config)).as_bytes(),
@@ -332,6 +529,9 @@ fn install(files: &Files, upstream: &[String]) -> Result<Value> {
         "sha256": sha256,
         "config": files.config,
         "upstream": upstream,
+        "workspace_pools": wanted.pools,
+        "window_open": wanted.window_open,
+        "window_close": wanted.window_close,
         "socket": files.socket,
         // What a crew bundle pins: this command, with `sha256`.
         "bundle_command": [target, "proxy", "--socket", files.socket],
@@ -358,6 +558,9 @@ fn status(files: &Files) -> Result<Value> {
         "run_dir": files.dir,
         "config": files.config,
         "upstream": read(&files.config)["upstream"],
+        "workspace_pools": read(&files.config)["workspace_pools"],
+        // The windows the broker opened and will close on release.
+        "windows": read(&files.windows)["windows"],
         "stopped": files.stopped.exists(),
         "running": running,
         "pid": running.then(|| read_pid(&files.pid)).flatten(),
@@ -541,6 +744,289 @@ fn stop_running(files: &Files) -> Result<Value> {
     }))
 }
 
+/// What asking the broker to close a workspace's windows came to.
+#[derive(Debug)]
+pub enum CloseOutcome {
+    /// The broker closed these projects' windows; none when the record
+    /// lists no window under the root, in which case it was not asked.
+    Closed(Vec<PathBuf>),
+    /// No broker runs; any window it opened stays open (and is audited).
+    NotRunning,
+}
+
+/// The windows `xcode.windows.json` records under `root`, read under the
+/// same link and owner checks as every broker file. Unreadable means none.
+fn recorded_under(files: &Files, root: &Path) -> Vec<Value> {
+    read_checked(&files.windows)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|record| record["windows"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| {
+            w["root"]
+                .as_str()
+                .is_some_and(|r| Path::new(r).starts_with(root))
+        })
+        .collect()
+}
+
+/// Ask the running broker to close every Xcode window it opened under
+/// `root` (`{"privateer_control":1,"close_workspace":ROOT}`), within 35 s.
+/// The broker is asked only when its record lists a window under `root`,
+/// so a broker that hangs holds up only the release of a workspace it
+/// opened a window for. A broker that answers with an error, or does not
+/// answer in time, is an error.
+pub(crate) fn close_workspace(store: &Store, root: &Path) -> Result<CloseOutcome> {
+    // No run directory this home could use means no broker to ask.
+    let Ok(files) = Files::resolve(Some(store.home())) else {
+        return Ok(CloseOutcome::NotRunning);
+    };
+    let left = recorded_under(&files, root);
+    if left.is_empty() {
+        return Ok(CloseOutcome::Closed(vec![]));
+    }
+    if fs::symlink_metadata(&files.socket).is_err() || !lock_held(&files.lock) {
+        store.audit(
+            "workspace.xcode_window_unclosed",
+            &json!({"root": root, "windows": left, "reason": "the MCP broker is not running"}),
+        )?;
+        return Ok(CloseOutcome::NotRunning);
+    }
+    let deadline = Instant::now() + CLOSE_TIMEOUT;
+    let silent = || {
+        format!(
+            "the MCP broker did not answer within {} s",
+            CLOSE_TIMEOUT.as_secs()
+        )
+    };
+    let left = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .with_context(silent)
+    };
+    let mut stream = connect_by(&files.socket, deadline).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            anyhow::anyhow!(
+                "could not connect to the MCP broker at {} within {} s",
+                files.socket.display(),
+                CLOSE_TIMEOUT.as_secs()
+            )
+        } else {
+            anyhow::anyhow!(
+                "cannot reach the MCP broker at {}: {error}",
+                files.socket.display()
+            )
+        }
+    })?;
+    ensure!(
+        peer_uid(stream.as_raw_fd())? == unsafe { libc::geteuid() },
+        "the MCP broker socket is not this user's"
+    );
+    stream.set_write_timeout(Some(left()?))?;
+    let line = json!({"privateer_control": 1, "close_workspace": root});
+    io::Write::write_all(&mut stream, format!("{line}\n").as_bytes())
+        .context("cannot write to the MCP broker")?;
+    let mut answer = vec![];
+    let mut byte = [0u8; 4096];
+    while !answer.contains(&b'\n') {
+        stream.set_read_timeout(Some(left()?))?;
+        let read = match io::Read::read(&mut stream, &mut byte) {
+            Ok(0) => bail!("the MCP broker closed the connection without answering"),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!(silent())
+            }
+            Err(error) => return Err(error).context("cannot read the MCP broker's answer"),
+        };
+        answer.extend_from_slice(&byte[..read]);
+        ensure!(
+            answer.len() <= 1 << 20,
+            "the MCP broker's answer is too long"
+        );
+    }
+    let end = answer
+        .iter()
+        .position(|b| *b == b'\n')
+        .unwrap_or(answer.len());
+    let answer: Value =
+        serde_json::from_slice(&answer[..end]).context("the MCP broker's answer is not JSON")?;
+    if let Some(error) = answer.get("error") {
+        bail!("{}", error.as_str().unwrap_or("the MCP broker refused"));
+    }
+    let closed: Vec<PathBuf> = serde_json::from_value(answer["closed"].clone())
+        .context("the MCP broker's answer names no closed windows")?;
+    Ok(CloseOutcome::Closed(closed))
+}
+
+/// Connect to the Unix socket at `path` by `deadline` without ever
+/// blocking past it: a blocking connect waits as long as the listener's
+/// backlog stays full, which a hung broker never drains. The stream comes
+/// back blocking.
+// sun_path is i8 on some targets and u8 on others; sa_family_t's width
+// differs between Linux and macOS.
+#[allow(clippy::unnecessary_cast)]
+fn connect_by(path: &Path, deadline: Instant) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: an all-zero sockaddr_un is a valid, empty address.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the socket path is too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        address.sun_len = length as u8;
+    }
+    // SAFETY: socket returns a new descriptor or -1.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a new descriptor nothing else owns.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fcntl on a descriptor this function owns.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    let set = unsafe {
+        libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+            && libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if flags < 0 || !set {
+        return Err(io::Error::last_os_error());
+    }
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
+    loop {
+        // SAFETY: `address` is a valid sockaddr_un of `length` bytes.
+        let done = unsafe {
+            libc::connect(
+                raw,
+                (&address as *const libc::sockaddr_un).cast(),
+                length as libc::socklen_t,
+            )
+        };
+        if done == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            // Linux: the backlog is full. Try again until the deadline.
+            Some(libc::EAGAIN) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(timed_out());
+                }
+                std::thread::sleep(left.min(Duration::from_millis(50)));
+            }
+            // Pending: wait for it to become writable, then read its outcome.
+            Some(libc::EINPROGRESS) => {
+                let mut poll = libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(timed_out());
+                    }
+                    let millis = left.as_millis().clamp(1, 60_000) as libc::c_int;
+                    // SAFETY: one valid pollfd.
+                    match unsafe { libc::poll(&mut poll, 1, millis) } {
+                        0 => {}
+                        n if n > 0 => break,
+                        _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+                        _ => return Err(io::Error::last_os_error()),
+                    }
+                }
+                let mut code: libc::c_int = 0;
+                let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: `code` and `size` describe a writable int.
+                let got = unsafe {
+                    libc::getsockopt(
+                        raw,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut code as *mut libc::c_int).cast(),
+                        &mut size,
+                    )
+                };
+                if got != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if code != 0 {
+                    return Err(io::Error::from_raw_os_error(code));
+                }
+                break;
+            }
+            _ => return Err(error),
+        }
+    }
+    // SAFETY: fcntl on a descriptor this function owns.
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std::os::unix::net::UnixStream::from(socket))
+}
+
+/// The uid of a connected Unix socket's peer.
+fn peer_uid(fd: std::os::fd::RawFd) -> Result<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` and `len` describe a writable ucred.
+        let done = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        ensure!(
+            done == 0,
+            "no peer credentials: {}",
+            io::Error::last_os_error()
+        );
+        Ok(cred.uid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let mut uid = 0;
+        let mut gid = 0;
+        // SAFETY: both out-pointers are valid.
+        let done = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+        ensure!(
+            done == 0,
+            "no peer credentials: {}",
+            io::Error::last_os_error()
+        );
+        Ok(uid)
+    }
+}
+
 /// When this process last looked.
 static LAST_ENSURE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
@@ -590,17 +1076,14 @@ fn ensure_now(store: &Store) -> Result<Value> {
             json!({"error": "the broker config differs from what mcp-broker install wrote; not starting it"}),
         );
     }
-    let config: Value = serde_json::from_slice(&bytes)?;
-    let upstream: Vec<String> = serde_json::from_value(config["upstream"].clone())
-        .context("mcp-broker config has no upstream argv")?;
-    check_upstream(&upstream)?;
+    let config = Config::parse(&serde_json::from_slice(&bytes)?)?;
     private_dir(&files.dir)?;
-    Ok(json!({"started": start(&binary, &files, &upstream)?}))
+    Ok(json!({"started": start(&binary, &files, &config)?}))
 }
 
 /// Start `serve` detached: its own session, stdio on the log, no descriptor
 /// of the dispatcher's, and only the environment its upstream may see.
-fn start(binary: &Path, files: &Files, upstream: &[String]) -> Result<u32> {
+fn start(binary: &Path, files: &Files, config: &Config) -> Result<u32> {
     let log = open_checked(
         &files.log,
         OpenOptions::new().create(true).append(true).mode(0o600),
@@ -612,9 +1095,21 @@ fn start(binary: &Path, files: &Files, upstream: &[String]) -> Result<u32> {
         .arg("--state-dir")
         .arg(&files.dir)
         .arg("--name")
-        .arg(NAME)
+        .arg(NAME);
+    for pool in &config.pools {
+        command.arg("--workspace-pool").arg(pool);
+    }
+    for (flag, helper) in [
+        ("--window-open", &config.window_open),
+        ("--window-close", &config.window_close),
+    ] {
+        if let Some(argv) = helper {
+            command.arg(flag).arg(serde_json::to_string(argv)?);
+        }
+    }
+    command
         .arg("--")
-        .args(upstream)
+        .args(&config.upstream)
         .current_dir(&files.dir)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -692,6 +1187,48 @@ mod tests {
         assert!(read_checked(&link).is_err());
         fs::hard_link(&path, temp.path().join("hard")).unwrap();
         assert!(read_checked(&path).is_err());
+    }
+
+    #[test]
+    fn a_full_backlog_never_blocks_a_connect_past_its_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("full.sock");
+        // A listener that never accepts, with the smallest backlog.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let mut held = vec![];
+        let started = Instant::now();
+        let failed = loop {
+            let attempt = Instant::now();
+            match connect_by(&path, attempt + Duration::from_millis(300)) {
+                Ok(stream) => held.push(stream),
+                Err(error) => break (error, attempt.elapsed()),
+            }
+            assert!(held.len() < 512, "the backlog never filled");
+        };
+        assert!(failed.1 < Duration::from_secs(2), "{failed:?}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        drop(listener);
+        // Nothing listening: refused at once.
+        let gone = connect_by(
+            &temp.path().join("none.sock"),
+            Instant::now() + CLOSE_TIMEOUT,
+        );
+        assert!(gone.is_err());
+    }
+
+    #[test]
+    fn the_mac_close_script_is_a_valid_helper_that_never_interpolates() {
+        let argv: Vec<String> = DEFAULT_WINDOW_CLOSE.iter().map(|s| s.to_string()).collect();
+        check_helper(&argv).unwrap();
+        assert!(
+            argv.iter()
+                .all(|line| !line.contains('{') && !line.contains("do shell"))
+        );
+        assert!(
+            argv.iter()
+                .any(|line| line == "set wantedPath to item 1 of argv")
+        );
     }
 
     #[test]
