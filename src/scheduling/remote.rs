@@ -238,12 +238,15 @@ pub(crate) fn resubscribe(store: &Store, peer: &str) -> Result<usize> {
                 continue;
             };
             // Work whose charter was revoked (its ship retired, say) no
-            // longer runs, and its retirement already unsubscribed it.
-            if !matches!(
-                store.observe_active_charter(&work.task_id, |_| Ok(())),
-                Ok(Some(_))
-            ) {
-                continue;
+            // longer runs, and its retirement already unsubscribed it. One
+            // whose charter cannot be checked is skipped and audited.
+            match store.observe_active_charter(&work.task_id, |_| Ok(())) {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(error) => {
+                    crate::waits::skipped(store, peer, id, &error)?;
+                    continue;
+                }
             }
             if work.subscription.is_none() {
                 work.subscription = Some(Subscription {

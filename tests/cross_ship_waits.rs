@@ -2235,6 +2235,45 @@ fn a_malformed_schedule_is_skipped_and_audited_and_the_rest_resync() {
 }
 
 #[test]
+fn a_wait_whose_charter_cannot_be_checked_is_skipped_and_audited_on_resync() {
+    let mut pair = subscribed();
+    // A second waiting task under its own charter, which then cannot be read.
+    let repo = pair._temp.path().canonicalize().unwrap().join("repo");
+    dispatch(
+        &mut pair.b,
+        "charter.put",
+        json!({"id":"other","objective":"Other","repo":repo,"min_free_bytes":0}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.b,
+        "task.create",
+        json!({"id":"zz-other","charter_id":"other","owner":"infra","title":"Waits too"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.b,
+        "task.enqueue",
+        json!({"id":"zz-other","brief":"Continue once the dependency is done."}),
+    )
+    .unwrap();
+    defer_remote(&mut pair.b, "zz-other", far()).unwrap();
+    exchange(&mut pair);
+    pair.b
+        .connection()
+        .execute("UPDATE charters SET data='not json' WHERE id='other'", [])
+        .unwrap();
+    outage(&mut pair, "ping-0");
+    assert!(audited(&mut pair.b, "wait.resync_failed").is_empty());
+    let skipped = audited(&mut pair.b, "wait.resync_skipped");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["task"], "zz-other");
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(resyncs[0]["resubscribed"], 1);
+}
+
+#[test]
 fn two_processes_hearing_a_link_come_back_resync_it_once() {
     let mut pair = subscribed();
     let (a_home, b_home) = homes(&pair);
