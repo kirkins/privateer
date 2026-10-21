@@ -738,6 +738,7 @@ mod tests {
             requests,
             unread: 0,
             wakes: Vec::new(),
+            approvals: Vec::new(),
             error: None,
         }
     }
