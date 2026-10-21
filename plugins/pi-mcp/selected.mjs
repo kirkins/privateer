@@ -1,8 +1,9 @@
 // Helpers for the run-selected MCP extension. Pure except for the token file
-// read, so Node tests import them directly (like calm.mjs). The launcher sets
-// PRIVATEER_MCP_SERVERS (records only); each token file is read here, never
-// passed through argv, env values, logs or errors.
-import { readFileSync } from "node:fs";
+// read and the stdio executable re-pin, so Node tests import them directly
+// (like calm.mjs). The launcher sets PRIVATEER_MCP_SERVERS (records only); each
+// token file is read here, never passed through argv, env values, logs or errors.
+import { createHash } from "node:crypto";
+import { lstatSync, readFileSync } from "node:fs";
 
 export const EXIT_UNAVAILABLE = 78;
 const READY_SECONDS = 30;
@@ -11,6 +12,12 @@ const NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CREDENTIAL = /^[A-Z][A-Z0-9_]{0,63}$/;
 const TOKEN = /^[A-Za-z0-9._~+\/-]+=*$/;
 const KEYS = ["name", "url", "credential", "timeout", "description"];
+const STDIO_KEYS = ["name", "command", "sha256", "credential", "timeout", "description"];
+const HEX = /^[0-9a-f]{64}$/;
+// The same refusals as plugins/bundles.py: a shell or env would run whatever
+// its arguments say, so the pin would cover nothing.
+const SHELLS = ["sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "csh", "tcsh", "ash", "busybox", "env"];
+const MAX_COMMAND = 32;
 const LOOPBACK = ["127.0.0.1", "[::1]", "localhost"];
 
 // Ban what Pi would expand or run: "$" (env expansion), a leading "!" (shell
@@ -28,13 +35,34 @@ function checkUrl(text) {
   if (url.protocol !== "http:" || !LOOPBACK.includes(url.hostname)) throw new Error("url");
 }
 
+// A stdio argv element: plain, bounded, and no leading "~", which Pi reads as home.
+const argument = (text) => typeof text === "string" && text.length > 0 && text.length <= 4096 && plain(text) && !text.startsWith("~");
+
+// The pinned argv's shape; the bundle loader checked its path, and loadEntries re-pins it.
+function checkCommand(command) {
+  if (!Array.isArray(command) || command.length < 1 || command.length > MAX_COMMAND || !command.every(argument)) throw new Error("command");
+  const [file] = command;
+  const parts = file.split("/");
+  if (!file.startsWith("/") || parts.slice(1).some((part) => part === "" || part === "." || part === "..")) throw new Error("command");
+  if (SHELLS.includes(parts.at(-1))) throw new Error("command");
+}
+
+/** True for a local stdio record, which has a pinned command instead of a url. */
+export const isStdio = (record) => "command" in record;
+
 function checkRecord(record) {
   if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("record");
-  for (const key of Object.keys(record)) if (!KEYS.includes(key)) throw new Error("key");
-  for (const key of ["name", "url", "credential", "timeout"]) if (!(key in record)) throw new Error("key");
+  const stdio = isStdio(record);
+  for (const key of Object.keys(record)) if (!(stdio ? STDIO_KEYS : KEYS).includes(key)) throw new Error("key");
+  for (const key of stdio ? ["name", "command", "sha256", "timeout"] : ["name", "url", "credential", "timeout"]) if (!(key in record)) throw new Error("key");
   if (typeof record.name !== "string" || record.name.length > 32 || !NAME.test(record.name) || !plain(record.name)) throw new Error("name");
-  checkUrl(record.url);
-  if (typeof record.credential !== "string" || !CREDENTIAL.test(record.credential)) throw new Error("credential");
+  if (stdio) {
+    checkCommand(record.command);
+    if (typeof record.sha256 !== "string" || !HEX.test(record.sha256)) throw new Error("sha256");
+  } else {
+    checkUrl(record.url);
+  }
+  if ((!stdio || "credential" in record) && (typeof record.credential !== "string" || !CREDENTIAL.test(record.credential))) throw new Error("credential");
   if (!Number.isInteger(record.timeout) || record.timeout < 1 || record.timeout > 300) throw new Error("timeout");
   if ("description" in record && (typeof record.description !== "string" || record.description.length > 200 || !plain(record.description))) throw new Error("description");
 }
@@ -64,11 +92,30 @@ export const prefixOf = (name) => `mcp__${name.replace(/[^A-Za-z0-9]/g, "_")}__`
 export const foreignTool = (name, records) =>
   name.startsWith("mcp__") && !records.some((record) => name.startsWith(prefixOf(record.name)));
 
-/** The config Pi's createMcpExtension receives for one selected server. */
+/** The config Pi's createMcpExtension receives for one selected HTTP server. */
 export function serverEntry(record, token) {
   const config = { url: record.url, headers: { Authorization: `Bearer ${token}` }, timeout: record.timeout, exposure: "direct" };
   if ("description" in record) config.description = record.description;
   return { name: record.name, config, source: "privateer-selected", scope: "extension" };
+}
+
+/** The config for one selected stdio server: its pinned argv and, in env, only
+ *  its own credential's file path. No cwd, and nothing Pi would expand. */
+export function stdioEntry(record, credentialFile) {
+  const env = {};
+  if ("credential" in record) {
+    if (typeof credentialFile !== "string" || !credentialFile.startsWith("/") || !plain(credentialFile)) throw new Error("credential");
+    env[`PRIVATEER_CREDENTIAL_${record.credential}_FILE`] = credentialFile;
+  }
+  const config = { command: record.command[0], args: record.command.slice(1), env, timeout: record.timeout, exposure: "direct" };
+  if ("description" in record) config.description = record.description;
+  return { name: record.name, config, source: "privateer-selected", scope: "extension" };
+}
+
+/** sha256 of a regular, non-symlink file, read just before Pi spawns it. */
+export function fileDigest(path) {
+  if (!lstatSync(path).isFile()) throw new Error("command");
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 export class UnavailableError extends Error {
@@ -78,12 +125,17 @@ export class UnavailableError extends Error {
   }
 }
 
-/** A loader result for every selected record. Any token problem names only its server. */
-export function loadEntries(env, read) {
+/** A loader result for every selected record. Any token or pin problem names only its server. */
+export function loadEntries(env, read, digest = fileDigest) {
   return parseRecords(env).map((record) => {
     try {
-      const file = env[`PRIVATEER_CREDENTIAL_${record.credential}_FILE`];
-      if (!file) throw new Error("missing");
+      const file = "credential" in record ? env[`PRIVATEER_CREDENTIAL_${record.credential}_FILE`] : undefined;
+      if ("credential" in record && !file) throw new Error("missing");
+      if (isStdio(record)) {
+        // The pin again, as late as this process can check it.
+        if (digest(record.command[0]) !== record.sha256) throw new Error("pin");
+        return stdioEntry(record, file);
+      }
       return serverEntry(record, readToken(file, read));
     } catch {
       throw new UnavailableError(record.name);

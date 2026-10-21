@@ -1,5 +1,5 @@
-"""Claude Code bounded loader: selected skills and HTTP MCP servers only,
-through supported flags.
+"""Claude Code bounded loader: selected skills and HTTP or pinned stdio MCP
+servers only, through supported flags.
 
 Exposure hygiene, not an OS/credential sandbox. Personal hooks, skills,
 plugins and claude.ai connectors are dropped; a few harmless personal settings
@@ -19,8 +19,8 @@ import hashlib
 import stat
 import subprocess
 
-from bundles import (SEMVER, at, credential_directory, file_bytes, present, require, require_flags, safe_path,
-                     validate_plan)
+from bundles import (SEMVER, at, credential_directory, credential_environment, file_bytes, plain, present,
+                     require, require_flags, safe_path, validate_plan)
 
 # Keep the project's .claude settings (Privateer's hooks and permissions) and
 # drop the user source; no MCP servers unless --mcp-config names them.
@@ -99,7 +99,8 @@ def plan(registry, selected, skills):
 
 
 def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=False):
-    """Recheck pins, carried settings and folders before native execution.
+    """Recheck pins (skills and stdio executables), carried settings and
+    folders before native execution.
     Resume is the runtime's exact --resume, checked against the session's
     recorded plan digest before planning; attended starts are always fresh.
     """
@@ -199,7 +200,7 @@ def preflight(value, argv, cwd=None, env=None, runtime_plugins=(), attended=Fals
     carried = ["--settings", json.dumps(merged_settings, separators=(",", ":"))] if merged_settings else []
     plugins = [arg for item in value["skills"] for arg in ("--plugin-dir", item["root"])]
     tail = args[args.index("--"):] if "--" in args else []
-    return [argv[0], *FLAGS, *mcp_config(value.get("mcp_servers", []), env), *carried, *plugins, *kept_flags, *tail]
+    return [argv[0], *FLAGS, *mcp_config(value.get("mcp_servers", []), env, value), *carried, *plugins, *kept_flags, *tail]
 
 
 def config_directory(env):
@@ -207,20 +208,34 @@ def config_directory(env):
     return credential_directory(env).with_suffix(".mcp-configs")
 
 
-def mcp_config(servers, env):
+def mcp_entry(server, helper, paths):
+    """One server's Claude config. HTTP: its header comes from HEADERS reading
+    its credential file. stdio: the pinned argv, and in env only its own
+    credential's file path, never a value."""
+    if "url" in server:
+        return {"type": "http", "url": server["url"], "headersHelper": f"{helper} {server['credential']}"}
+    env = {}
+    if "credential" in server:
+        name = f"PRIVATEER_CREDENTIAL_{server['credential']}_FILE"
+        # Claude expands ${VAR} in a config's env values.
+        at("mcp_servers.credential", lambda: require(name in paths and plain(paths[name])))
+        env[name] = paths[name]
+    return {"type": "stdio", "command": server["command"][0], "args": server["command"][1:], "env": env}
+
+
+def mcp_config(servers, env, plan=None):
     """--mcp-config for the plan's selected servers, beside --strict-mcp-config,
-    which keeps every other server out. Records only: each server's header comes
-    from HEADERS reading its credential file, never from argv or env values.
-    The config is a 0600 file named by its content, not an argument, since a
-    URL may carry a secret in its path or query and argv is world-readable.
-    One `=` argument, since --mcp-config takes several values and would
-    swallow the next one."""
+    which keeps every other server out. Records only: no token in argv, env
+    values or the file. The config is a 0600 file named by its content, not an
+    argument, since a URL may carry a secret in its path or query and argv is
+    world-readable. One `=` argument, since --mcp-config takes several values
+    and would swallow the next one."""
     if not servers:
         return []
     helper = shlex.join([sys.executable, "-I", str(HEADERS)])
-    config = {"mcpServers": {server["name"]: {"type": "http", "url": server["url"],
-                                              "headersHelper": f"{helper} {server['credential']}"}
-                             for server in servers}}
+    # Rechecks each stored credential file; only stdio servers carry a path.
+    paths = credential_environment(plan, env) if any("command" in s and "credential" in s for s in servers) else {}
+    config = {"mcpServers": {server["name"]: mcp_entry(server, helper, paths) for server in servers}}
     body = json.dumps(config, separators=(",", ":"), sort_keys=True).encode()
     directory = config_directory(env)
     directory.parent.mkdir(parents=True, exist_ok=True)
@@ -240,10 +255,10 @@ def mcp_config(servers, env):
 
 
 def check_headers(servers, env):
-    """Run each selected server's header helper once, its output discarded, so
-    a missing or malformed token refuses before launch: Claude itself would
+    """Run each selected HTTP server's header helper once, its output discarded,
+    so a missing or malformed token refuses before launch: Claude itself would
     connect without the header. The token stays in the helper's process."""
-    for server in servers:
+    for server in (server for server in servers if "url" in server):
         done = subprocess.run([sys.executable, "-I", str(HEADERS), server["credential"]], env=env,
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=10)

@@ -256,17 +256,74 @@ def url(value):
     require(parts.scheme == 'https' or parts.hostname in LOOPBACK)
 
 
+# A stdio server's executable may not be a shell or env: either runs whatever
+# its arguments say, so the pin would cover nothing.
+SHELLS = ('sh', 'bash', 'zsh', 'dash', 'fish', 'ksh', 'mksh', 'csh', 'tcsh', 'ash', 'busybox', 'env')
+MAX_COMMAND = 32
+# Bounds the hash read; a native MCP server is far smaller.
+MAX_EXECUTABLE = 512 * 1024 * 1024
+
+
+def argument(text):
+    """One stdio argv element: plain, bounded, and no leading '~', which Pi
+    reads as the home directory and Claude would pass through unchanged."""
+    require(isinstance(text, str) and 0 < len(text) <= 4096 and plain(text) and not text.startswith('~'))
+
+
+def executable(value):
+    """The sha256 of a stdio server's executable: an absolute path, no shell or
+    env, owned by root or this user at every component, none a symlink or group-
+    or world-writable, and a regular file its owner may execute."""
+    argument(value)
+    path = Path(value)
+    require(path.is_absolute() and str(path) == value and '..' not in path.parts and path.name not in SHELLS)
+    for part in [*reversed(path.parents), path]:
+        info = part.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and not info.st_mode & 0o022
+                and info.st_uid in (0, os.geteuid()))
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        # The file hashed is the one checked: same inode as the path's last component.
+        require(stat.S_ISREG(info.st_mode) and info.st_mode & 0o100 and info.st_size <= MAX_EXECUTABLE
+                and (info.st_dev, info.st_ino) == (path.lstat().st_dev, path.lstat().st_ino))
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def command(value):
+    """A stdio server's argv, element 0 its executable: that file's sha256."""
+    require(isinstance(value, list) and 0 < len(value) <= MAX_COMMAND)
+    for item in value:
+        argument(item)
+    try:
+        return executable(value[0])
+    except OSError:
+        # Missing or unreadable: a refusal that carries no path.
+        raise Refused() from None
+
+
 def mcp_server(value, names):
-    """One selected MCP server: a remote streamable-HTTP endpoint whose Bearer
-    token is the named credential. Any other key refuses; no headers or commands."""
-    at('mcp_servers', lambda: require(isinstance(value, dict)
-            and set(value) <= {'name', 'url', 'credential', 'timeout', 'description'}
-            and {'name', 'url', 'credential', 'timeout'} <= set(value)))
+    """One selected MCP server. Either remote streamable HTTP (`url`), whose
+    Bearer token is the named credential, or a local stdio process (`command`),
+    an argv whose executable is pinned by `sha256`, given at most its named
+    credential's file path. Never both; no headers, env, cwd or shell keys."""
+    stdio = isinstance(value, dict) and 'command' in value
+    allowed = {'name', 'command', 'sha256', 'credential', 'timeout', 'description'} if stdio else \
+        {'name', 'url', 'credential', 'timeout', 'description'}
+    needed = {'name', 'command', 'sha256', 'timeout'} if stdio else {'name', 'url', 'credential', 'timeout'}
+    at('mcp_servers', lambda: require(isinstance(value, dict) and set(value) <= allowed and needed <= set(value)))
     at('mcp_servers.name', lambda: require(isinstance(value['name'], str) and len(value['name']) <= 32
             and NAME.fullmatch(value['name']) and plain(value['name'])))
-    at('mcp_servers.url', lambda: url(value['url']))
-    at('mcp_servers.credential', lambda: require(isinstance(value['credential'], str)
-            and value['credential'] in names))
+    if stdio:
+        at('mcp_servers.sha256', lambda: require(isinstance(value['sha256'], str) and HEX.fullmatch(value['sha256'])))
+        digest = at('mcp_servers.command', lambda: command(value['command']))
+        # Checked at selection and again at each launch's preflight.
+        at('mcp_servers.sha256', lambda: require(digest == value['sha256']))
+    else:
+        at('mcp_servers.url', lambda: url(value['url']))
+    if 'credential' in value:
+        at('mcp_servers.credential', lambda: require(isinstance(value['credential'], str)
+                and value['credential'] in names))
     at('mcp_servers.timeout', lambda: require(type(value['timeout']) is int and 1 <= value['timeout'] <= 300))
     if 'description' in value:
         description = value['description']
@@ -330,7 +387,7 @@ def bundle_name(index, bundle):
 
 def bundle(value, refs):
     # Optional executable extensions are not silently discarded: not
-    # supported in this stage. MCP servers are remote HTTP only.
+    # supported in this stage. MCP servers are remote HTTP or pinned stdio.
     at('fields', lambda: keys(value, ('ref', 'roles', *(('skills',) if 'skills' in value else ()),
                                       *(('credentials',) if 'credentials' in value else ()),
                                       *(('mcp_servers',) if 'mcp_servers' in value else ()))))
