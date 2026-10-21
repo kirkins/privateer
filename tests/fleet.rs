@@ -1406,6 +1406,33 @@ fn the_liaison_sees_what_waits_on_the_captain_and_relays_the_captains_answers() 
     );
     let still_open = machine.json(&apps, "mail.show", json!({"id":production["id"]}));
     assert_eq!(still_open["state"], "open");
+    // Nor is a privileged command relayed: only the captain's grant answers it.
+    let staged = machine.as_agent(
+        &apps,
+        "apps",
+        "privileged.stage",
+        json!({"from":"apps","task_id":"release","program":"/usr/bin/id","args":["-u"],"cwd":"/","reason":"Check the user"}),
+    );
+    assert!(staged.status.success(), "{}", stderr(&staged));
+    let staged: Value = serde_json::from_slice(&staged.stdout).unwrap();
+    let refused = machine.as_agent(
+        &liaison,
+        "liaison",
+        "captain.relay",
+        json!({"request":staged["id"],"source":approval_source["id"],"body":"Approved."}),
+    );
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("privileged commands"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        machine.json(&apps, "mail.show", json!({"id":staged["id"]}))["state"],
+        "open"
+    );
+    let withdrawn = machine.as_agent(&apps, "apps", "mail.withdraw", json!({"id":staged["id"]}));
+    assert!(withdrawn.status.success(), "{}", stderr(&withdrawn));
     assert!(still_open["answered_by"].is_null());
     let needs = machine.json(&apps, "runtime.needs", json!({}));
     assert_eq!(needs["items"][0]["kind"], "approval");

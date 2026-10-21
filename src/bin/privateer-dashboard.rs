@@ -212,7 +212,7 @@ fn state_worker(
     (updates, actions)
 }
 enum HerdrAction {
-    Focus(Focus),
+    Focus(Box<Focus>),
     /// Open a pane running `privileged run ID` for a granted command.
     Privileged {
         home: PathBuf,
@@ -266,6 +266,7 @@ fn herdr_worker(
                     });
                 }
                 if let Some(HerdrAction::Focus(action)) = action {
+                    let action = *action;
                     let result = (|| -> Result<()> {
                         // Re-read current home/custody/presentation; never launch on a missing binding.
                         let current = fleet::read(&registry, fallback.as_deref())?;
@@ -330,12 +331,12 @@ fn request_focus(app: &mut App, sender: Option<&SyncSender<HerdrAction>>) {
         Ok((observed, pane)) => match sender {
             Some(sender)
                 if sender
-                    .try_send(HerdrAction::Focus(Focus {
+                    .try_send(HerdrAction::Focus(Box::new(Focus {
                         observed,
                         pane,
                         app_snapshot: app.snapshot.clone(),
                         ship: app.ship.clone().unwrap_or_default(),
-                    }))
+                    })))
                     .is_ok() =>
             {
                 "Revalidating existing mate identity…".into()

@@ -534,7 +534,10 @@ fn the_door_approves_a_privileged_command_but_never_a_production_approval() {
     let request = fleet.call("ops", "mail.show", json!({"id": privileged_id}));
     assert_eq!(request["state"], "approved");
     let reply = fleet.call("ops", "mail.show", json!({"id": request["answered_by"]}));
-    assert_eq!(reply["body"], "approved, waiting for the captain at the machine");
+    assert_eq!(
+        reply["body"],
+        "approved, waiting for the captain at the machine"
+    );
     // The phone never approves a production deployment.
     let refused = response(&entries, &format!("approve-{production_id}")).unwrap();
     assert_eq!(refused["ok"], false, "{refused}");
