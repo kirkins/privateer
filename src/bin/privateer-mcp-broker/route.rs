@@ -490,7 +490,7 @@ fn scan(
         };
         if !kind.is_dir()
             || (project.skip_hidden && name.starts_with('.'))
-            || project.skip_dirs.iter().any(|skip| *skip == name)
+            || project.skip_dirs.contains(&name)
         {
             continue;
         }

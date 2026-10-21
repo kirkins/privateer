@@ -1344,7 +1344,7 @@ fn install_refuses_each_bad_input_and_names_its_cause() {
     let here = machine.root.clone();
     let profile = fake_profile();
     let profile = profile.to_str().unwrap();
-    let profile_json: Value = serde_json::from_slice(&fs::read(&profile).unwrap()).unwrap();
+    let profile_json: Value = serde_json::from_slice(&fs::read(profile).unwrap()).unwrap();
     // A copy of the fake profile with one change.
     let changed = |name: &str, change: &dyn Fn(&mut Value)| -> String {
         let mut copy = profile_json.clone();

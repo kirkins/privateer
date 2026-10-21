@@ -111,10 +111,7 @@ impl Profile {
     pub fn parse(value: &Value) -> Result<Profile, String> {
         let map = object(value, "the profile")?;
         known(map, "", &["label", "upstream", "path_arguments", "routing"])?;
-        let label = map
-            .get("label")
-            .map(|label| check_label(label))
-            .transpose()?;
+        let label = map.get("label").map(check_label).transpose()?;
         let upstream = map
             .get("upstream")
             .map(|argv| {
