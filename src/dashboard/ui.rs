@@ -755,10 +755,7 @@ impl App {
         if open.len() > SHOWN {
             lines.push(Line::from(format!("+{} more open", open.len() - SHOWN)));
         }
-        lines.extend(super::approvals::lines(
-            ship,
-            crate::store::Store::now_ms(),
-        ));
+        lines.extend(super::approvals::lines(ship, crate::store::Store::now_ms()));
         if ship.remote.is_some() {
             let pending = self
                 .snapshot

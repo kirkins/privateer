@@ -110,18 +110,19 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
     let unread = conn.query_row("SELECT count(*) FROM mail WHERE recipient=?1 AND COALESCE(delivery,'received')='received' AND seq>COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1),0)", [name], |r| r.get(0))?;
     let wakes = conn.prepare("SELECT substr(mode,1,40),substr(status,1,40) FROM wakes WHERE ship=?1 ORDER BY created_ms DESC LIMIT 3")?.query_map([name], |r| Ok(Wake {mode:r.get(0)?, status:r.get(1)?}))?.collect::<rusqlite::Result<_>>()?;
     // The runtime's own liveness rule, read-only: an older home has none.
-    let approvals = crate::captain_approvals::live_read(&conn, name, crate::store::Store::now_ms())?
-        .into_iter()
-        .take(ROW_LIMIT)
-        .map(|row| Approval {
-            id: row.id,
-            action: row.action,
-            command_prefix: row.prefix,
-            source: row.source,
-            created_ms: row.created_ms,
-            expires_ms: row.expires_ms,
-        })
-        .collect();
+    let approvals =
+        crate::captain_approvals::live_read(&conn, name, crate::store::Store::now_ms())?
+            .into_iter()
+            .take(ROW_LIMIT)
+            .map(|row| Approval {
+                id: row.id,
+                action: row.action,
+                command_prefix: row.prefix,
+                source: row.source,
+                created_ms: row.created_ms,
+                expires_ms: row.expires_ms,
+            })
+            .collect();
     Ok(ShipState {
         home: home.into(),
         identity: Some(super::bridge::Identity::read(home)?),

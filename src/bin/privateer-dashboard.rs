@@ -9,9 +9,8 @@ use privateer::{
     dashboard::{
         approvals::{self, Revoke},
         bridge::{self, Answer, Attention},
-        command,
         captain::Mail,
-        fleet,
+        command, fleet,
         herdr::{Client, Pane, View},
         mailbox::Mailbox,
         model::Snapshot,

@@ -1300,9 +1300,30 @@ fn a_ships_detail_lists_only_its_live_captain_approvals_and_reads_older_homes_un
     let now = Store::now_ms();
     // 3 h 30 min and half a minute on, so the render reads 3 h 30 min left.
     let left = now + (3 * 60 + 30) * 60_000 + 30_000;
-    plant_approval(&store, "a-live", "Run make release", Some("make release"), left, None);
-    plant_approval(&store, "a-expired", "Ship the expired build", None, now - 60_000, None);
-    plant_approval(&store, "a-revoked", "Ship the revoked build", None, left, Some(now - 60_000));
+    plant_approval(
+        &store,
+        "a-live",
+        "Run make release",
+        Some("make release"),
+        left,
+        None,
+    );
+    plant_approval(
+        &store,
+        "a-expired",
+        "Ship the expired build",
+        None,
+        now - 60_000,
+        None,
+    );
+    plant_approval(
+        &store,
+        "a-revoked",
+        "Ship the revoked build",
+        None,
+        left,
+        Some(now - 60_000),
+    );
     let before = stamp(&store);
     let (app, screen) = apps_detail(&fleet);
     let approvals = &app.snapshot.ships[0].live.as_ref().unwrap().approvals;
@@ -1312,7 +1333,10 @@ fn a_ships_detail_lists_only_its_live_captain_approvals_and_reads_older_homes_un
         screen.contains("1. Run make release · 3 h 30 min left · only make release · reply"),
         "{screen}"
     );
-    assert!(!screen.contains("expired build") && !screen.contains("revoked build"), "{screen}");
+    assert!(
+        !screen.contains("expired build") && !screen.contains("revoked build"),
+        "{screen}"
+    );
     assert!(screen.contains("x revoke approval"), "{screen}");
     assert_eq!(stamp(&store), before, "the snapshot wrote to the home");
 
@@ -1351,7 +1375,10 @@ fn a_ships_detail_lists_only_its_live_captain_approvals_and_reads_older_homes_un
     let before = stamp(&store);
     let (app, screen) = apps_detail(&fleet);
     let live = app.snapshot.ships[0].live.as_ref().unwrap();
-    assert!(live.error.is_none() && live.approvals.is_empty(), "{live:?}");
+    assert!(
+        live.error.is_none() && live.approvals.is_empty(),
+        "{live:?}"
+    );
     assert!(!screen.contains("Captain approvals"), "{screen}");
     assert!(!screen.contains("x revoke approval"), "{screen}");
     assert_eq!(stamp(&store), before, "the snapshot wrote to the home");
@@ -1399,7 +1426,14 @@ fn x_then_enter_revokes_the_chosen_approval_and_esc_or_a_stale_row_runs_nothing(
     let (fleet, mut store) = approvals_ship(&root);
     let (binary, log) = recording_privateer(&root);
     let hour_on = Store::now_ms() + 3_600_000;
-    plant_approval(&store, "a-first", "Run make release", Some("make release"), hour_on, None);
+    plant_approval(
+        &store,
+        "a-first",
+        "Run make release",
+        Some("make release"),
+        hour_on,
+        None,
+    );
     plant_approval(&store, "a-second", "Tag v1.2", None, hour_on, None);
 
     // Esc closes the chooser and runs nothing.
@@ -1407,9 +1441,15 @@ fn x_then_enter_revokes_the_chosen_approval_and_esc_or_a_stale_row_runs_nothing(
     app.bridge_key(KeyCode::Char('x'));
     assert!(app.revoke.is_some());
     let chooser = render(&mut app, 160, 60);
-    assert!(chooser.contains("Revoke a captain approval of apps"), "{chooser}");
+    assert!(
+        chooser.contains("Revoke a captain approval of apps"),
+        "{chooser}"
+    );
     assert!(chooser.contains("> 1. Run make release"), "{chooser}");
-    assert!(chooser.contains("↑↓ pick approval · Enter revoke · Esc cancel"), "{chooser}");
+    assert!(
+        chooser.contains("↑↓ pick approval · Enter revoke · Esc cancel"),
+        "{chooser}"
+    );
     app.bridge_key(KeyCode::Esc);
     assert!(app.revoke.is_none() && app.revoke_action.is_none());
 
@@ -1429,7 +1469,13 @@ fn x_then_enter_revokes_the_chosen_approval_and_esc_or_a_stale_row_runs_nothing(
     let home = store.home().display().to_string();
     assert_eq!(
         recorded(&log),
-        [json!(["--home", home, "captain_approval.revoke", "--json", r#"{"id":"a-second"}"#])]
+        [json!([
+            "--home",
+            home,
+            "captain_approval.revoke",
+            "--json",
+            r#"{"id":"a-second"}"#
+        ])]
     );
     let (mut app, screen) = apps_detail(&fleet);
     assert!(screen.contains("Captain approvals: 1 live"), "{screen}");
@@ -1439,10 +1485,18 @@ fn x_then_enter_revokes_the_chosen_approval_and_esc_or_a_stale_row_runs_nothing(
     app.bridge_key(KeyCode::Char('x'));
     app.bridge_key(KeyCode::Enter);
     let stale = app.revoke_action.take().unwrap();
-    dispatch(&mut store, "captain_approval.revoke", json!({"id":"a-first"})).unwrap();
+    dispatch(
+        &mut store,
+        "captain_approval.revoke",
+        json!({"id":"a-first"}),
+    )
+    .unwrap();
     let latest = privateer::dashboard::fleet::read(&fleet, None).unwrap();
     let refused = approvals::execute(&latest, &stale, &binary).unwrap_err();
-    assert_eq!(refused.to_string(), "Approval changed; refresh before revoking.");
+    assert_eq!(
+        refused.to_string(),
+        "Approval changed; refresh before revoking."
+    );
     assert_eq!(recorded(&log).len(), 1);
     let (_, screen) = apps_detail(&fleet);
     assert!(!screen.contains("Captain approvals"), "{screen}");

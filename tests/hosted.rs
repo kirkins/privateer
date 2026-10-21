@@ -4592,7 +4592,10 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
     // A revoke narrows the running classifier's list the same way, and says so.
     let revoked = place.json("captain_approval.revoke", json!({"id":id}));
     assert_eq!(revoked["applies"], "relaunch", "{revoked}");
-    assert_eq!(revoked["note"], "stops at infra's next idle point", "{revoked}");
+    assert_eq!(
+        revoked["note"], "stops at infra's next idle point",
+        "{revoked}"
+    );
     refreshed_at(now - 301_000);
     let holder = holder_of(&place);
     approval_idle(&place, 20);

@@ -898,9 +898,21 @@ fn an_agent_lists_and_shows_only_its_own_ships_approvals() {
     let (_temp, mut store) = home();
     let hour_on = Store::now_ms() + 3_600_000;
     plant(&store, "a-live", "apps", "main", hour_on);
-    plant(&store, "a-expired", "apps", "main", Store::now_ms() - 60_000);
+    plant(
+        &store,
+        "a-expired",
+        "apps",
+        "main",
+        Store::now_ms() - 60_000,
+    );
     plant(&store, "i-live", "infra", "theirs", hour_on);
-    let own = as_agent(&mut store, "apps", "captain_approval.list", json!({"ship":"apps"})).unwrap();
+    let own = as_agent(
+        &mut store,
+        "apps",
+        "captain_approval.list",
+        json!({"ship":"apps"}),
+    )
+    .unwrap();
     let ids: Vec<&str> = own["approvals"]
         .as_array()
         .unwrap()
@@ -908,9 +920,17 @@ fn an_agent_lists_and_shows_only_its_own_ships_approvals() {
         .map(|r| r["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids.len(), 2, "{own}");
-    assert!(ids.contains(&"a-live") && ids.contains(&"a-expired"), "{own}");
+    assert!(
+        ids.contains(&"a-live") && ids.contains(&"a-expired"),
+        "{own}"
+    );
     refused(
-        as_agent(&mut store, "apps", "captain_approval.list", json!({"ship":"infra"})),
+        as_agent(
+            &mut store,
+            "apps",
+            "captain_approval.list",
+            json!({"ship":"infra"}),
+        ),
         "cannot act as",
     );
     refused(
@@ -934,11 +954,20 @@ fn an_agent_lists_and_shows_only_its_own_ships_approvals() {
 
     // Show: one row, its own ship's only, and the panes that carry it.
     refused(
-        dispatch(&mut store, "captain_approval.show", json!({"id":"approval-none"})),
+        dispatch(
+            &mut store,
+            "captain_approval.show",
+            json!({"id":"approval-none"}),
+        ),
         "no captain approval approval-none",
     );
     refused(
-        as_agent(&mut store, "apps", "captain_approval.show", json!({"id":"i-live"})),
+        as_agent(
+            &mut store,
+            "apps",
+            "captain_approval.show",
+            json!({"id":"i-live"}),
+        ),
         "captain approval i-live is not yours",
     );
     store
@@ -949,9 +978,18 @@ fn an_agent_lists_and_shows_only_its_own_ships_approvals() {
             [],
         )
         .unwrap();
-    let shown = as_agent(&mut store, "apps", "captain_approval.show", json!({"id":"a-live"})).unwrap();
+    let shown = as_agent(
+        &mut store,
+        "apps",
+        "captain_approval.show",
+        json!({"id":"a-live"}),
+    )
+    .unwrap();
     assert_eq!(shown["state"], "live", "{shown}");
-    assert_eq!(shown["carried_by"], json!([{"pid":4242,"launched_ms":1234}]));
+    assert_eq!(
+        shown["carried_by"],
+        json!([{"pid":4242,"launched_ms":1234}])
+    );
     assert_eq!(shown["applies_at"], Value::Null);
     let listed = &all["approvals"]
         .as_array()
@@ -1005,7 +1043,10 @@ fn the_captains_verbs_print_the_commands_json_and_only_the_captain_revokes() {
     };
     let command = |verb: &str, args: Value| stdout_json(&run(&[verb, "--json", &args.to_string()]));
     for (verb, json) in [
-        (vec!["permissions", "approvals"], command("captain_approval.list", json!({}))),
+        (
+            vec!["permissions", "approvals"],
+            command("captain_approval.list", json!({})),
+        ),
         (
             vec!["permissions", "approvals", "list"],
             command("captain_approval.list", json!({})),
@@ -1063,7 +1104,10 @@ fn the_captains_verbs_print_the_commands_json_and_only_the_captain_revokes() {
     assert_eq!(again["already"], true, "{again}");
     assert_eq!(again["revoked_ms"], first["revoked_ms"]);
     let by_json = command("captain_approval.revoke", json!({"id":"a-other"}));
-    assert_eq!(by_json["note"], "next wake no longer carries it", "{by_json}");
+    assert_eq!(
+        by_json["note"], "next wake no longer carries it",
+        "{by_json}"
+    );
     let shown = command("captain_approval.show", json!({"id":"a-live"}));
     assert_eq!(shown["state"], "revoked", "{shown}");
 
@@ -1078,7 +1122,10 @@ fn the_captains_verbs_print_the_commands_json_and_only_the_captain_revokes() {
         let failed = binary(&root, &outside, &verb);
         assert!(!failed.status.success(), "{verb:?}");
         let error = String::from_utf8_lossy(&failed.stderr);
-        assert!(error.contains("not inside a ship folder"), "{verb:?}: {error}");
+        assert!(
+            error.contains("not inside a ship folder"),
+            "{verb:?}: {error}"
+        );
     }
     for verb in [
         vec!["permissions", "approvals", "show"],
@@ -1089,7 +1136,9 @@ fn the_captains_verbs_print_the_commands_json_and_only_the_captain_revokes() {
         assert!(!failed.status.success(), "{verb:?}");
         let error = String::from_utf8_lossy(&failed.stderr);
         assert!(
-            error.contains("usage: privateer permissions approvals [list [SHIP] | show ID | revoke ID]"),
+            error.contains(
+                "usage: privateer permissions approvals [list [SHIP] | show ID | revoke ID]"
+            ),
             "{verb:?}: {error}"
         );
     }

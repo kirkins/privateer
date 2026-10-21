@@ -1529,11 +1529,13 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
     for row in rows {
         let state = state(conn, row, now);
         let sentence = if state == "live" {
-            if !told.contains_key(row.ship.as_str()) {
-                told.insert(&row.ship, current_set(store, &row.ship, now)?);
-            }
-            told[row.ship.as_str()]
-                .iter()
+            let set = match told.entry(row.ship.as_str()) {
+                std::collections::btree_map::Entry::Occupied(set) => set.into_mut(),
+                std::collections::btree_map::Entry::Vacant(set) => {
+                    set.insert(current_set(store, &row.ship, now)?)
+                }
+            };
+            set.iter()
                 .find(|(id, _)| *id == row.id)
                 .map(|(_, sentence)| sentence.clone())
         } else {
@@ -1655,8 +1657,10 @@ fn revoke(store: &Store, args: &Value) -> Result<Value> {
     )?;
     store.audit("permissions.approval_revoked", &json!({"id": id}))?;
     let applies = crate::host::upgrade::approval_applies(store, &ship)?;
-    Ok(json!({"id": id, "ship": ship, "revoked_ms": now, "already": false,
-        "applies": applies, "note": revoke_note(applies, &ship)}))
+    Ok(
+        json!({"id": id, "ship": ship, "revoked_ms": now, "already": false,
+        "applies": applies, "note": revoke_note(applies, &ship)}),
+    )
 }
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -2217,10 +2221,31 @@ mod tests {
         let hour = 3_600_000;
         for (id, ship, task, created, expires, revoked) in [
             ("a-live", "apps", "main", now - hour, now + hour, None),
-            ("a-expired", "apps", "main", now - 3 * hour, now - hour, None),
-            ("a-revoked", "apps", "main", now - 2 * hour, now + hour, Some(now - hour)),
+            (
+                "a-expired",
+                "apps",
+                "main",
+                now - 3 * hour,
+                now - hour,
+                None,
+            ),
+            (
+                "a-revoked",
+                "apps",
+                "main",
+                now - 2 * hour,
+                now + hour,
+                Some(now - hour),
+            ),
             ("a-closed", "apps", "over", now - 2 * hour, now + hour, None),
-            ("i-live", "infra", "theirs", now - 2 * hour, now + hour, None),
+            (
+                "i-live",
+                "infra",
+                "theirs",
+                now - 2 * hour,
+                now + hour,
+                None,
+            ),
         ] {
             store
                 .connection()
@@ -2237,7 +2262,11 @@ mod tests {
         let rows = listed["approvals"].as_array().unwrap();
         let state_of = |id: &str| {
             let row = rows.iter().find(|r| r["id"] == id).unwrap();
-            (row["state"].as_str().unwrap(), row["sentence"].clone(), row["live"].clone())
+            (
+                row["state"].as_str().unwrap(),
+                row["sentence"].clone(),
+                row["live"].clone(),
+            )
         };
         assert_eq!(rows.len(), 5, "{listed}");
         assert_eq!(state_of("a-expired").0, "expired");
