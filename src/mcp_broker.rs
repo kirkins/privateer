@@ -470,7 +470,10 @@ fn parent_of(pid: i32) -> Option<i32> {
 fn upstream_group_of(broker: i32, pgid: i32) -> bool {
     // SAFETY: getpgid and getsid only read.
     let (group, session) = unsafe { (libc::getpgid(pgid), libc::getsid(pgid)) };
-    pgid > 1
+    // On macOS a session can belong to launchd (pid 1), so a broker that
+    // is init would match every process in it.
+    broker > 1
+        && pgid > 1
         && pgid != broker
         && group == pgid
         && (session == broker || parent_of(pgid) == Some(broker))
