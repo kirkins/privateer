@@ -132,6 +132,8 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
             let mut request = json!({"id": id, "version": 1, "method": method, "context": context, "options": options});
             request["context"]["role"] = json!(role);
             request["context"]["errand"] = json!(is_errand);
+            // The digest of a bounded crew's plan, for its job to record.
+            let mut crew_digest = None;
             if let Some(selected) = args.get("tool_bundles") {
                 let mut harness = None;
                 for name in ["pi", "claude"] {
@@ -146,13 +148,15 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
                 let plan = crate::tool_bundles::resolve(store, selected, role, harness, wait)?;
                 if harness == "claude" && method == "command" {
                     let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
-                    crate::tool_bundles::record_plan(
+                    let digest = crate::tool_bundles::record_plan(
                         store,
                         id,
                         role,
+                        context["task_id"].as_str().unwrap_or_default(),
                         &plan,
                         options.get("resume"),
                     )?;
+                    crew_digest = (role == "crew").then_some(digest);
                 }
                 request["context"]["tool_bundles"] = plan;
             }
@@ -187,6 +191,9 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
                 .context("plugin omitted result")?;
             if method == "command" {
                 result = command_result(&context, &result)?;
+                if let Some(digest) = crew_digest {
+                    result["plan_digest"] = json!(digest);
+                }
             } else {
                 ensure!(result["valid"] == true, "plugin validation did not pass");
                 // Export only protocol-defined facts. Adapter output is not an evidence/credential channel.

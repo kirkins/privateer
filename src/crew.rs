@@ -1102,16 +1102,22 @@ fn launch_resume(
              Your last actions before the park, from your log:\n{last}"
         ));
     }
-    // This process launches it, so it is the claimer recovery checks.
+    // This process launches it, so it is the claimer recovery checks. The
+    // session it resumes is recorded first: a bounded launch resumes only the
+    // session of a crew of its task whose park is resuming it, under the plan
+    // that crew launched with (see `tool_bundles::record_plan`).
+    let session = session.filter(|_| same_session);
     store.connection().execute(
-        "UPDATE crew_parks SET attempt=?2, updated_ms=?3, retries=retries+?4, claimer=?5
+        "UPDATE crew_parks SET attempt=?2, updated_ms=?3, retries=retries+?4, claimer=?5,
+           session=?6
            WHERE id=?1",
         params![
             park,
             attempt,
             Store::now_ms(),
             i64::from(retry),
-            crate::jobs::own_identity()?
+            crate::jobs::own_identity()?,
+            session
         ],
     )?;
     // A resume is the runtime's own launch: a crew's agent caller would not
@@ -1131,7 +1137,7 @@ fn launch_resume(
                     park,
                     if admitted { "resumed" } else { "resuming" },
                     resumed,
-                    session.filter(|_| same_session),
+                    session,
                     Store::now_ms()
                 ],
             )?;
