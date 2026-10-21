@@ -96,7 +96,10 @@ impl Release {
 
     pub fn binary(&self, name: &str) -> Result<PathBuf> {
         ensure!(
-            matches!(name, "privateer" | "privateer-dashboard"),
+            matches!(
+                name,
+                "privateer" | "privateer-dashboard" | "privateer-mcp-broker"
+            ),
             "unknown release binary"
         );
         Ok(self.root.join("bin").join(name))

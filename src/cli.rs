@@ -37,6 +37,7 @@ pub const VERBS: &[&str] = &[
     "routes",
     "watch",
     "upgrade",
+    "mcp-broker",
     "host",
     "stow",
     "backlog",

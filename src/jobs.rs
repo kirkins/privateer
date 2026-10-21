@@ -523,8 +523,8 @@ pub(crate) fn normalize_usage(raw: &Value) -> Option<Value> {
         "totalTokens": total.unwrap_or(input + output + cache_read + cache_write),
     }))
 }
-fn config(store: &Store) -> Result<Value> {
-    let path = store.home().join("config.json");
+fn home_config(home: &Path) -> Result<Value> {
+    let path = home.join("config.json");
     if path.exists() {
         Ok(serde_json::from_slice(&fs::read(path)?)?)
     } else {
@@ -534,7 +534,14 @@ fn config(store: &Store) -> Result<Value> {
 /// Where the shared resource ledger lives, without creating anything. A
 /// sandboxed first mate must be able to write there to start crew jobs.
 pub(crate) fn ledger_dir(store: &Store) -> Result<PathBuf> {
-    let cfg = config(store)?;
+    ledger_dir_at(Some(store.home()))
+}
+/// The ledger a home configures, or with no home the machine default.
+pub(crate) fn ledger_dir_at(home: Option<&Path>) -> Result<PathBuf> {
+    let cfg = match home {
+        Some(home) => home_config(home)?,
+        None => json!({}),
+    };
     Ok(
         if let Some(p) = cfg.get("resource_home").and_then(Value::as_str) {
             PathBuf::from(p)

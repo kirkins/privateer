@@ -156,6 +156,11 @@ fn run() -> Result<()> {
         println!("{}", upgrade_status(home.as_deref(), &caller)?);
         return Ok(());
     }
+    // The MCP broker belongs to the machine; install and stop are the
+    // operator's, status anyone's.
+    if command == "mcp-broker" && !json_given && !file_given {
+        return privateer::mcp_broker::cli(home.as_deref(), &positional, &caller);
+    }
     // A hosted first mate's pane is relaunched onto the current release by its
     // home's dispatcher or by the operator, never by an ordinary command.
     if command == "host" && !json_given && !file_given {

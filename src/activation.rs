@@ -1271,13 +1271,16 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let machines = crate::machines::tick(store.home(), budget);
     // This machine's own problems, for the ship that looks after it.
     let owner_alerts = crate::machines::alert_owner(store);
+    // The machine's MCP broker, started once and left running across
+    // dispatcher restarts and upgrades.
+    let mcp_broker = crate::mcp_broker::ensure(store);
     // Approved placement moves this machine is the one to run.
     let placement = crate::placement::tick(store);
     // Landed work frees its checkout without waking anyone.
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
+        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "mcp_broker": mcp_broker, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored}),
     )
 }
 
