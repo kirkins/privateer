@@ -286,16 +286,15 @@ fn gone(pid: &str) {
     }
 }
 
-/// Whether a process is still running (a zombie awaiting its reaper is not).
+/// Whether a process is still running (a zombie awaiting its reaper is not),
+/// on Linux and macOS alike: macOS has no `/proc`.
 fn alive(pid: &str) -> bool {
-    fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-        .ok()
-        .and_then(|stat| {
-            stat.rsplit_once(')')
-                .map(|(_, rest)| rest.trim_start().chars().next())
-        })
-        .flatten()
-        .is_some_and(|state| state != 'Z')
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid.trim()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&output.stdout);
+    !stat.trim().is_empty() && !stat.trim().starts_with('Z')
 }
 
 #[test]
