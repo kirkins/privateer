@@ -871,3 +871,226 @@ fn a_ship_holds_at_most_eight_live_approvals() {
         .unwrap();
     assert_eq!(recorded, 8);
 }
+
+/// Plant an approval for `ship` on `task`, created an hour ago.
+fn plant(store: &Store, id: &str, ship: &str, task: &str, expires_ms: i64) {
+    let now = Store::now_ms();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+               command_prefix,created_ms,expires_ms,source)
+             VALUES(?1,?2,?3,?1,'r-'||?1,'Run make release','make release',?4,?5,'reply')",
+            rusqlite::params![id, ship, task, now - 3_600_000, expires_ms],
+        )
+        .unwrap();
+}
+
+fn as_agent(store: &mut Store, ship: &str, command: &str, args: Value) -> anyhow::Result<Value> {
+    store.set_caller(Caller::Agent { actor: ship.into() });
+    let result = dispatch(store, command, args);
+    store.set_caller(Caller::Operator);
+    result
+}
+
+#[test]
+fn an_agent_lists_and_shows_only_its_own_ships_approvals() {
+    let (_temp, mut store) = home();
+    let hour_on = Store::now_ms() + 3_600_000;
+    plant(&store, "a-live", "apps", "main", hour_on);
+    plant(&store, "a-expired", "apps", "main", Store::now_ms() - 60_000);
+    plant(&store, "i-live", "infra", "theirs", hour_on);
+    let own = as_agent(&mut store, "apps", "captain_approval.list", json!({"ship":"apps"})).unwrap();
+    let ids: Vec<&str> = own["approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{own}");
+    assert!(ids.contains(&"a-live") && ids.contains(&"a-expired"), "{own}");
+    refused(
+        as_agent(&mut store, "apps", "captain_approval.list", json!({"ship":"infra"})),
+        "cannot act as",
+    );
+    refused(
+        as_agent(&mut store, "apps", "captain_approval.list", json!({})),
+        "pass ship apps",
+    );
+    let live = as_agent(
+        &mut store,
+        "apps",
+        "captain_approval.list",
+        json!({"ship":"apps","live_only":true}),
+    )
+    .unwrap();
+    assert_eq!(live["approvals"].as_array().unwrap().len(), 1, "{live}");
+    assert_eq!(live["approvals"][0]["id"], "a-live");
+    // The operator sees every ship's, and may narrow to one.
+    let all = dispatch(&mut store, "captain_approval.list", json!({})).unwrap();
+    assert_eq!(all["approvals"].as_array().unwrap().len(), 3, "{all}");
+    let infra = dispatch(&mut store, "captain_approval.list", json!({"ship":"infra"})).unwrap();
+    assert_eq!(infra["approvals"].as_array().unwrap().len(), 1, "{infra}");
+
+    // Show: one row, its own ship's only, and the panes that carry it.
+    refused(
+        dispatch(&mut store, "captain_approval.show", json!({"id":"approval-none"})),
+        "no captain approval approval-none",
+    );
+    refused(
+        as_agent(&mut store, "apps", "captain_approval.show", json!({"id":"i-live"})),
+        "captain approval i-live is not yours",
+    );
+    store
+        .connection()
+        .execute(
+            "INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms,approvals_ids)
+             VALUES('apps',4242,'x','x',1234,'[\"a-live\"]'),('infra',4343,'x','x',99,'[]')",
+            [],
+        )
+        .unwrap();
+    let shown = as_agent(&mut store, "apps", "captain_approval.show", json!({"id":"a-live"})).unwrap();
+    assert_eq!(shown["state"], "live", "{shown}");
+    assert_eq!(shown["carried_by"], json!([{"pid":4242,"launched_ms":1234}]));
+    assert_eq!(shown["applies_at"], Value::Null);
+    let listed = &all["approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "a-live")
+        .unwrap()
+        .clone();
+    for (key, value) in listed.as_object().unwrap() {
+        assert_eq!(&shown[key], value, "{key}");
+    }
+    let other = dispatch(&mut store, "captain_approval.show", json!({"id":"i-live"})).unwrap();
+    assert_eq!(other["carried_by"], json!([]));
+}
+
+mod support;
+
+/// The real binary on this home, with the test's own user state.
+fn binary(root: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+    support::isolated(root)
+        .env("GIT_CONFIG_GLOBAL", root.join("gitconfig"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn stdout_json(output: &std::process::Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn the_captains_verbs_print_the_commands_json_and_only_the_captain_revokes() {
+    let (temp, store) = home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let home = store.home().to_string_lossy().into_owned();
+    let hour_on = Store::now_ms() + 3_600_000;
+    plant(&store, "a-live", "apps", "main", hour_on);
+    plant(&store, "a-other", "apps", "main", hour_on);
+    plant(&store, "i-live", "infra", "theirs", hour_on);
+    let run = |args: &[&str]| {
+        let mut argv = vec!["--home", home.as_str()];
+        argv.extend_from_slice(args);
+        binary(&root, &root, &argv)
+    };
+    let command = |verb: &str, args: Value| stdout_json(&run(&[verb, "--json", &args.to_string()]));
+    for (verb, json) in [
+        (vec!["permissions", "approvals"], command("captain_approval.list", json!({}))),
+        (
+            vec!["permissions", "approvals", "list"],
+            command("captain_approval.list", json!({})),
+        ),
+        (
+            vec!["permissions", "approvals", "list", "infra"],
+            command("captain_approval.list", json!({"ship":"infra"})),
+        ),
+        (
+            vec!["permissions", "approvals", "show", "a-live"],
+            command("captain_approval.show", json!({"id":"a-live"})),
+        ),
+    ] {
+        let printed = run(&verb);
+        assert_eq!(stdout_json(&printed), json, "{verb:?}");
+        // Pretty, as `privileged list` prints.
+        assert!(String::from_utf8_lossy(&printed.stdout).contains("\n  \""));
+    }
+
+    // An agent's revoke is refused by the JSON command and the verb alike,
+    // and the row stays as it was.
+    let agent = |args: &[&str]| {
+        let mut argv = vec!["--role", "agent", "--actor", "apps"];
+        argv.extend_from_slice(args);
+        run(&argv)
+    };
+    for refusal in [
+        agent(&["captain_approval.revoke", "--json", r#"{"id":"a-live"}"#]),
+        agent(&["permissions", "approvals", "revoke", "a-live"]),
+    ] {
+        assert!(!refusal.status.success());
+        let error = String::from_utf8_lossy(&refusal.stderr);
+        assert!(error.contains("operator command"), "{error}");
+    }
+    let revoked: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT revoked_ms FROM captain_approvals WHERE id='a-live'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(revoked, None);
+    // The agent's own list through the verb names its ship.
+    let own = stdout_json(&agent(&["permissions", "approvals", "list", "apps"]));
+    assert_eq!(own["approvals"].as_array().unwrap().len(), 2, "{own}");
+
+    // The captain revokes: with no hosted pane, the next wake stops carrying it.
+    let first = stdout_json(&run(&["permissions", "approvals", "revoke", "a-live"]));
+    assert_eq!(first["ship"], "apps", "{first}");
+    assert_eq!(first["already"], false, "{first}");
+    assert_eq!(first["applies"], "wake", "{first}");
+    assert_eq!(first["note"], "next wake no longer carries it", "{first}");
+    let again = command("captain_approval.revoke", json!({"id":"a-live"}));
+    assert_eq!(again["already"], true, "{again}");
+    assert_eq!(again["revoked_ms"], first["revoked_ms"]);
+    let by_json = command("captain_approval.revoke", json!({"id":"a-other"}));
+    assert_eq!(by_json["note"], "next wake no longer carries it", "{by_json}");
+    let shown = command("captain_approval.show", json!({"id":"a-live"}));
+    assert_eq!(shown["state"], "revoked", "{shown}");
+
+    // Outside a ship folder the verbs say so; a bad shape prints the usage.
+    let outside = root.join("nowhere");
+    fs::create_dir(&outside).unwrap();
+    for verb in [
+        vec!["permissions", "approvals"],
+        vec!["permissions", "approvals", "show", "a-live"],
+        vec!["permissions", "approvals", "revoke", "a-live"],
+    ] {
+        let failed = binary(&root, &outside, &verb);
+        assert!(!failed.status.success(), "{verb:?}");
+        let error = String::from_utf8_lossy(&failed.stderr);
+        assert!(error.contains("not inside a ship folder"), "{verb:?}: {error}");
+    }
+    for verb in [
+        vec!["permissions", "approvals", "show"],
+        vec!["permissions", "approvals", "list", "apps", "infra"],
+        vec!["permissions", "approvals", "grant", "a-live"],
+    ] {
+        let failed = run(&verb);
+        assert!(!failed.status.success(), "{verb:?}");
+        let error = String::from_utf8_lossy(&failed.stderr);
+        assert!(
+            error.contains("usage: privateer permissions approvals [list [SHIP] | show ID | revoke ID]"),
+            "{verb:?}: {error}"
+        );
+    }
+}

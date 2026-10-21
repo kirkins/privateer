@@ -2185,6 +2185,101 @@ mod tests {
         assert_eq!(current_digest(&store, "apps", now + 60_000).unwrap(), none);
     }
 
+    /// List reads every row through `state`, the rule `live` and so every
+    /// launch reads: each kind of row says so, and a live row's sentence is
+    /// the one a launch carries.
+    #[test]
+    fn list_states_agree_with_what_a_launch_carries() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        for (task, owner) in [("main", "apps"), ("over", "apps"), ("theirs", "infra")] {
+            crate::dispatch(
+                &mut store,
+                "task.create",
+                json!({"id":task,"charter_id":"project","owner":owner,"title":"Deliver"}),
+            )
+            .unwrap();
+        }
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='done' WHERE id='over'", [])
+            .unwrap();
+        let now = Store::now_ms();
+        let hour = 3_600_000;
+        for (id, ship, task, created, expires, revoked) in [
+            ("a-live", "apps", "main", now - hour, now + hour, None),
+            ("a-expired", "apps", "main", now - 3 * hour, now - hour, None),
+            ("a-revoked", "apps", "main", now - 2 * hour, now + hour, Some(now - hour)),
+            ("a-closed", "apps", "over", now - 2 * hour, now + hour, None),
+            ("i-live", "infra", "theirs", now - 2 * hour, now + hour, None),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+                       command_prefix,created_ms,expires_ms,revoked_ms,source)
+                     VALUES(?1,?2,?3,?1,'r-'||?1,'Run make release','make release',?4,?5,?6,'reply')",
+                    params![id, ship, task, created, expires, revoked],
+                )
+                .unwrap();
+        }
+        let listed = list(&store, &json!({})).unwrap();
+        assert_eq!(listed["ship"], Value::Null);
+        let rows = listed["approvals"].as_array().unwrap();
+        let state_of = |id: &str| {
+            let row = rows.iter().find(|r| r["id"] == id).unwrap();
+            (row["state"].as_str().unwrap(), row["sentence"].clone(), row["live"].clone())
+        };
+        assert_eq!(rows.len(), 5, "{listed}");
+        assert_eq!(state_of("a-expired").0, "expired");
+        assert_eq!(state_of("a-revoked").0, "revoked");
+        assert_eq!(state_of("a-closed").0, "closed");
+        for (id, ship) in [("a-live", "apps"), ("i-live", "infra")] {
+            let (state, sentence, live_flag) = state_of(id);
+            assert_eq!((state, live_flag), ("live", json!(true)));
+            let carried = launch_set(&store, ship, now).unwrap();
+            assert_eq!(carried.len(), 1);
+            assert_eq!((carried[0].0.as_str(), json!(carried[0].1)), (id, sentence));
+        }
+        for id in ["a-expired", "a-revoked", "a-closed"] {
+            assert_eq!(state_of(id).1, Value::Null, "{id}");
+            assert_eq!(state_of(id).2, json!(false), "{id}");
+        }
+        // `live` keeps exactly the rows `state` calls live, here and later.
+        for at in [now, now - 2 * hour + 1, now + 2 * hour] {
+            let conn = store.connection();
+            let every = select(conn, "1", [], "id").unwrap();
+            let by_state: Vec<String> = every
+                .iter()
+                .filter(|row| state(conn, row, at) == "live")
+                .map(|row| row.id.clone())
+                .collect();
+            let mut by_live: Vec<String> = ["apps", "infra"]
+                .iter()
+                .flat_map(|ship| live(&store, ship, at).unwrap())
+                .map(|row| row.id)
+                .collect();
+            by_live.sort();
+            assert_eq!(by_state, by_live, "at {at}");
+        }
+        let only = list(&store, &json!({"ship":"apps","live_only":true})).unwrap();
+        let ids: Vec<&Value> = only["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| &r["id"])
+            .collect();
+        assert_eq!(ids, [&json!("a-live")]);
+    }
+
     /// Each place an approval applies tells the ship what to do next.
     #[test]
     fn each_approval_applies_note_says_when_to_retry() {
