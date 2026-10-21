@@ -391,7 +391,7 @@ fn a_tampered_request_a_changed_program_or_a_changed_charter_is_refused() {
     let tampered = machine.staged(|_| {});
     let tampered_id = tampered["id"].as_str().unwrap();
     machine.sql(
-        "UPDATE mail SET payload=json_set(payload,'$.privileged.cwd','/') WHERE id=?1",
+        "UPDATE mail SET payload=json_set(payload,'$.privileged.cwd','/usr') WHERE id=?1",
         &[&tampered_id],
     );
     assert!(machine.need(tampered_id).is_none());

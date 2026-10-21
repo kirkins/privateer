@@ -134,10 +134,9 @@ and a stable explicit grant ID. Plain replies or prose never create a grant.
 This is not deployment: artifact/environment consumption and production
 authorization remain the runtime's existing gates.
 
-A privileged command ([design](design/privileged-action.md)) shows its reason and
-any warnings, then its argv one
-argument per line, its folder and hash. Granting it on the bridge
-opens a focused Herdr tab running `privateer --home HOME privileged run ID`;
+A privileged command ([design](design/privileged-action.md)) shows its reason
+and any warnings, then its argv one argument per line, its folder and hash.
+Granting it on the bridge opens a focused Herdr tab running `privateer --home HOME privileged run ID`;
 without Herdr the notice names that command line. The run shows the command
 again and runs it only after the captain types the hash's first 8 characters.
 
