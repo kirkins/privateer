@@ -959,6 +959,42 @@ fn a_policy_change_for_one_ship_leaves_another_ships_attached_ask_on_its_own() {
 }
 
 #[test]
+fn an_ask_attached_to_a_primary_a_policy_change_ended_elsewhere_is_detached_not_withdrawn() {
+    let f = Fleet::new();
+    f.init("storefront", "claude");
+    f.crew("liaison", "crew-one", json!({}));
+    let ours = f.asks("liaison")[0]["id"].clone();
+    let theirs = f.json(
+        "storefront",
+        "permissions.blocked",
+        json!({"task_id": "storefront-duty", "tool": "Bash",
+            "input": {"command": "make deploy | tee deploy.log"}}),
+    )["request_id"]
+        .clone();
+    rusqlite::Connection::open(f.root.join("storefront/.privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE mail SET payload=json_set(payload,'$.attached_to',?2,'$.attached_ship','liaison')
+             WHERE id=?1",
+            rusqlite::params![theirs.as_str().unwrap(), ours.as_str().unwrap()],
+        )
+        .unwrap();
+    // Liaison's ask ended for a policy change, and storefront's home sweeps
+    // before liaison's home released what was attached to it.
+    rusqlite::Connection::open(f.root.join("liaison/.privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE mail SET state='withdrawn', end_reason='policy changed' WHERE id=?1",
+            [ours.as_str().unwrap()],
+        )
+        .unwrap();
+    f.ok(Some("storefront"), &["serve", "--json", "{\"once\":true}"]);
+    let kept = f.show("storefront", &theirs);
+    assert_eq!(kept["state"], "open", "{kept}");
+    assert!(kept["payload"]["attached_to"].is_null(), "{kept}");
+}
+
+#[test]
 fn an_ask_an_unrelated_policy_change_ends_says_nothing_was_granted() {
     let f = Fleet::new();
     let mut options =

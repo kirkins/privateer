@@ -1096,6 +1096,11 @@ fn end_orphans(store: &Store) -> Result<()> {
                 .or(ask["state"].as_str())
                 .unwrap_or("closed")
                 .to_owned();
+            // A policy change ended it, maybe in another home between its
+            // commit and that home's release: other ships' asks go first.
+            if matches!(reason.as_str(), POLICY_CHANGED | POLICY_CHANGED_UNGRANTED) {
+                release_attachments(store, &primary, ask["from"].as_str().unwrap_or_default())?;
+            }
             crate::mail::end_attachments(store, &primary, &reason)?;
         }
     }
