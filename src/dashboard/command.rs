@@ -69,6 +69,10 @@ pub fn summary(verb: &str, value: &Value) -> String {
             text("to")
         ),
         "service" => text("report"),
+        "captain_approval.revoke" if value["already"] == true => {
+            format!("Approval {} was already revoked.", text("id"))
+        }
+        "captain_approval.revoke" => format!("Revoked approval {}; {}", text("id"), text("note")),
         _ => format!("{verb} completed."),
     }
 }
@@ -249,5 +253,19 @@ mod tests {
             "Retired old; its folder is kept."
         );
         assert_eq!(summary("init", &json!({"ship":"apps"})), "Created apps.");
+        assert_eq!(
+            summary(
+                "captain_approval.revoke",
+                &json!({"id":"approval-1","already":false,"note":"next wake no longer carries it"})
+            ),
+            "Revoked approval approval-1; next wake no longer carries it"
+        );
+        assert_eq!(
+            summary(
+                "captain_approval.revoke",
+                &json!({"id":"approval-1","already":true})
+            ),
+            "Approval approval-1 was already revoked."
+        );
     }
 }

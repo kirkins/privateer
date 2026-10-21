@@ -7,7 +7,9 @@ use crossterm::{
 };
 use privateer::{
     dashboard::{
+        approvals::{self, Revoke},
         bridge::{self, Answer, Attention},
+        command,
         captain::Mail,
         fleet,
         herdr::{Client, Pane, View},
@@ -71,6 +73,8 @@ privileged command opens a Herdr tab running `privateer privileged run ID`\n\
 (or names that command line), where the captain confirms it.\n\
 i: separate mail history; v: voyage, an animated sea of the fleet (v or Esc\n\
 returns); q: quit.\n\
+x: revoke one of the selected ship's live captain approvals (it stops at the\n\
+ship's next idle point, wake or launch); the bridge never grants one.\n\
 No launch, Board, Watch, pane reorder or automatic focus; the only tab it\n\
 creates is that privileged confirmation."
                 );
@@ -105,11 +109,14 @@ struct Update {
     mail: Vec<Mail>,
     errors: Vec<String>,
     outcome: Option<Result<String>>,
+    /// The outcome is a revoke's, whose refusal reads as it is.
+    revoke: bool,
     /// A privileged command the bridge just granted: its home and id.
     privileged: Option<(PathBuf, String)>,
 }
 enum Action {
     Answer(Answer),
+    Revoke(Revoke),
     Read(Mail),
     History,
 }
@@ -144,7 +151,15 @@ fn state_worker(
                 observed = Instant::now();
             }
             let mut privileged = None;
+            let revoke = matches!(action, Some(Action::Revoke(_)));
             let outcome = match action {
+                Some(Action::Revoke(revoke)) => Some(if failure.is_some() {
+                    Err(anyhow::anyhow!("Fleet unavailable; revoke refused"))
+                } else {
+                    Caller::from_env(None, None)
+                        .and_then(|caller| caller.require_operator("dashboard revoke"))
+                        .and_then(|()| approvals::execute(&snapshot, &revoke, &command::binary()?))
+                }),
                 Some(Action::Answer(answer)) => {
                     let result = if failure.is_some() {
                         Err(anyhow::anyhow!("Fleet unavailable; draft retained"))
@@ -201,6 +216,7 @@ fn state_worker(
                     mail: mailbox.messages.clone(),
                     errors: mailbox.errors.clone(),
                     outcome,
+                    revoke,
                     privileged,
                 })
                 .is_err()
@@ -426,7 +442,14 @@ fn run(opts: Options) -> Result<()> {
                 {
                     let _ = sender.try_send(HerdrAction::Privileged { home, id });
                 }
-                if let Some(outcome) = update.outcome {
+                if let Some(outcome) = update.outcome.as_ref().filter(|_| update.revoke) {
+                    app.mail_pending = false;
+                    app.revoke = None;
+                    app.notice = match outcome {
+                        Ok(notice) => notice.clone(),
+                        Err(e) => e.to_string(),
+                    };
+                } else if let Some(outcome) = update.outcome {
                     app.mail_pending = false;
                     app.notice = match outcome {
                         Ok(notice) => {
@@ -490,6 +513,14 @@ fn run(opts: Options) -> Result<()> {
                     }
                     if app.inbox_open && key.code == KeyCode::Char('i') {
                         let _ = actions.try_send(Action::History);
+                    }
+                    if let Some(revoke) = app.revoke_action.take() {
+                        if actions.try_send(Action::Revoke(revoke)).is_ok() {
+                            app.mail_pending = true;
+                            app.notice = "Revoking the approval…".into();
+                        } else {
+                            app.notice = "Action queue busy; choose again.".into();
+                        }
                     }
                     if let Some(answer) = app.answer_action.take() {
                         if actions.try_send(Action::Answer(answer)).is_ok() {

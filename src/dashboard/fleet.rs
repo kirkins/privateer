@@ -26,7 +26,21 @@ pub struct ShipState {
     pub requests: usize,
     pub unread: usize,
     pub wakes: Vec<Wake>,
+    /// Live captain approvals, as the ship's next launch would carry them.
+    #[serde(default)]
+    pub approvals: Vec<Approval>,
     pub error: Option<String>,
+}
+
+/// One live captain approval, read from the ship's own home.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Approval {
+    pub id: String,
+    pub action: String,
+    pub command_prefix: Option<String>,
+    pub source: String,
+    pub created_ms: i64,
+    pub expires_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -95,6 +109,19 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
     )?;
     let unread = conn.query_row("SELECT count(*) FROM mail WHERE recipient=?1 AND COALESCE(delivery,'received')='received' AND seq>COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1),0)", [name], |r| r.get(0))?;
     let wakes = conn.prepare("SELECT substr(mode,1,40),substr(status,1,40) FROM wakes WHERE ship=?1 ORDER BY created_ms DESC LIMIT 3")?.query_map([name], |r| Ok(Wake {mode:r.get(0)?, status:r.get(1)?}))?.collect::<rusqlite::Result<_>>()?;
+    // The runtime's own liveness rule, read-only: an older home has none.
+    let approvals = crate::captain_approvals::live_read(&conn, name, crate::store::Store::now_ms())?
+        .into_iter()
+        .take(ROW_LIMIT)
+        .map(|row| Approval {
+            id: row.id,
+            action: row.action,
+            command_prefix: row.prefix,
+            source: row.source,
+            created_ms: row.created_ms,
+            expires_ms: row.expires_ms,
+        })
+        .collect();
     Ok(ShipState {
         home: home.into(),
         identity: Some(super::bridge::Identity::read(home)?),
@@ -106,6 +133,7 @@ fn state(home: &Path, name: &str) -> Result<ShipState> {
         requests,
         unread,
         wakes,
+        approvals,
         error: None,
     })
 }

@@ -1471,7 +1471,8 @@ fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String,
     Ok(told)
 }
 
-fn left(ms: i64) -> String {
+/// Time left, coarse: "3 h 20 min", "12 min".
+pub(crate) fn left(ms: i64) -> String {
     let minutes = (ms / 60_000).max(1);
     if minutes >= 60 {
         format!("{} h {} min", minutes / 60, minutes % 60)
