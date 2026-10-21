@@ -55,6 +55,8 @@ pub fn init(store: &Store) -> Result<()> {
         ("remote_end_state", "TEXT"),
         // The request a follow-up is raised because of; see ROUTINE_MAIL.
         ("because_of", "TEXT"),
+        // How often a peer refused a wait notice; see `waits::refused`.
+        ("delivery_refusals", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail') WHERE name=?1)",
@@ -1457,7 +1459,7 @@ enum Delivery {
     Delivered,
     Failed,
     Quarantined,
-    /// A refused wait notice, never retried; see `waits::refused`.
+    /// A wait notice refused for the last time; see `waits::refused`.
     Dropped,
 }
 
@@ -1523,9 +1525,12 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         envelope,
         timeout,
     );
-    // A peer that answered and refused the message, as opposed to one that
-    // could not be reached; only a refusal is the captain's to hear about.
-    let refusal = match &response {
+    // A peer that answered with an error, as opposed to one that could not
+    // be reached. An error that says only it could not work just then (its
+    // database busy, a home it could not open) refuses nothing: the message
+    // is retried with the usual backoff. Only a refusal is the captain's to
+    // hear about.
+    let answered_error = match &response {
         Ok(response) if response["ok"] != json!(true) => Some(
             response["error"]
                 .as_str()
@@ -1534,6 +1539,9 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         ),
         _ => None,
     };
+    let refusal = answered_error
+        .clone()
+        .filter(|reason| !crate::waits::temporary(reason));
     let outcome = response.and_then(|response| match response["ok"].as_bool() {
         Some(true) => Ok(applied_end(&message, &response["result"])),
         _ => bail!(
@@ -1589,7 +1597,7 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
     // A peer that answered, even with a refusal, is heard; one that could not
     // be reached marks its link down. A link heard again after being down
     // resyncs the cross-ship waits that ride it.
-    let answered = delivered || refusal.is_some();
+    let answered = delivered || answered_error.is_some();
     if let Err(error) = if answered {
         crate::waits::heard(store, peer).map(|_| ())
     } else {
@@ -1597,14 +1605,21 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
     } {
         eprintln!("privateer: could not record link {peer}: {error:#}");
     }
-    // A refused wait notice is dropped: left pending it would hold back every
-    // later message to that peer, and its subscription is gone either way.
+    // A refused wait notice is retried with the usual backoff, and dropped
+    // on its last refusal: left pending for good it would hold back every
+    // later message to that peer.
     if let Some(reason) = refusal.as_deref().filter(|_| notice.is_some()) {
         let tx = store.write_transaction()?;
-        crate::waits::refused(store, &message, reason)?;
-        tx.execute("DELETE FROM mail_delivery_retry WHERE peer=?1", [peer])?;
+        let dropped = crate::waits::refused(store, &message, reason)?;
+        if dropped {
+            tx.execute("DELETE FROM mail_delivery_retry WHERE peer=?1", [peer])?;
+        }
         tx.commit()?;
-        return Ok(Delivery::Dropped);
+        return Ok(if dropped {
+            Delivery::Dropped
+        } else {
+            Delivery::Failed
+        });
     }
     // A captain's message the peer refused is quarantined: left pending it
     // would hold back every later message to that peer, and retrying a refusal
@@ -1786,7 +1801,8 @@ pub(crate) fn awaiting(
 
 /// Record what another machine collected from `peer`: delivered messages,
 /// with the request-closure state it applied, and messages it refused, which
-/// are quarantined with the reason rather than offered again.
+/// are quarantined with the reason rather than offered again (a wait notice
+/// is offered again until `waits::refused` drops it).
 pub(crate) fn collected(
     store: &Store,
     peer: &str,
@@ -1807,7 +1823,8 @@ pub(crate) fn collected(
         )?;
     }
     for (id, error) in refused {
-        // A refused wait notice is dropped, as on a delivery this home makes.
+        // A refused wait notice stays pending to be collected again, and is
+        // dropped on its last refusal, as on a delivery this home makes.
         if let Some(message) = by_id(store, id)?.filter(|m| {
             m["delivery"] == "pending"
                 && wait_notice(&m["payload"]).is_some()
@@ -1818,7 +1835,14 @@ pub(crate) fn collected(
                     .and_then(remote_peer)
                     == Some(peer)
         }) {
-            changed += usize::from(crate::waits::refused(store, &message, error)?);
+            tx.execute(
+                "UPDATE mail SET delivery_attempts=delivery_attempts+1, delivery_error=?2
+                 WHERE id=?1 AND delivery='pending'",
+                params![id, error.chars().take(4096).collect::<String>()],
+            )?;
+            if !crate::waits::temporary(error) {
+                changed += usize::from(crate::waits::refused(store, &message, error)?);
+            }
             continue;
         }
         changed += tx.execute(
@@ -2817,5 +2841,72 @@ mod hands_tests {
         assert!(hands_step("request", CAPTAIN, &marked(json!(long))).is_err());
         assert!(hands_step("request", CAPTAIN, &json!({"needs_hands": null})).is_err());
         assert!(hands_step("request", CAPTAIN, &json!({"needs_hands": "run it"})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod collected_tests {
+    use super::*;
+
+    #[test]
+    fn a_collected_wait_notice_is_dropped_only_on_its_third_lasting_refusal() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap().join("home");
+        let mut store = Store::open(&home).unwrap();
+        let peer = "machine-studio";
+        crate::dispatch(
+            &mut store,
+            "peer.put",
+            json!({"name":peer,"transport":"collected"}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "ship.put",
+            json!({"name":"storefront","scope":"work","location":{"peer":peer}}),
+        )
+        .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,delivery)
+                 VALUES('sub-1','infra','storefront','notice','',?1,'normal',1,'pending')",
+                [json!({"wait_subscribe":{"task":"icons","subscriber":"infra",
+                    "subscriber_task":"waiting-1"}})
+                .to_string()],
+            )
+            .unwrap();
+        let state = |store: &Store| -> (String, i64, i64) {
+            store
+                .connection()
+                .query_row(
+                    "SELECT delivery, delivery_refusals, delivery_attempts FROM mail WHERE id='sub-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let refuse = |store: &Store, error: &str| {
+            collected(store, peer, &[], &[("sub-1".into(), error.into())]).unwrap()
+        };
+        // A home there that could not take it just then refuses nothing.
+        for _ in 0..4 {
+            assert_eq!(refuse(&store, "database is locked"), 0);
+        }
+        assert_eq!(state(&store), ("pending".into(), 0, 4));
+        assert_eq!(
+            refuse(&store, "no ship named storefront on this machine"),
+            0
+        );
+        assert_eq!(
+            refuse(&store, "no ship named storefront on this machine"),
+            0
+        );
+        assert_eq!(state(&store), ("pending".into(), 2, 6));
+        assert_eq!(
+            refuse(&store, "no ship named storefront on this machine"),
+            1
+        );
+        assert_eq!(state(&store), ("dropped".into(), 3, 7));
     }
 }

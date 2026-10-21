@@ -451,21 +451,60 @@ pub(crate) fn retire(store: &Store, ship: &str) -> Result<Value> {
     Ok(outcome)
 }
 
-/// A peer refused the wait notice `message` this home sent: drop it rather
-/// than leave it pending, where it would hold back every later message to
-/// that peer and be refused again. A refused `task_end` or `wait_closed`
-/// takes the subscription it answered with it. Runs in the caller's
-/// transaction; returns whether the notice was still pending.
+/// How many times a peer may refuse one wait notice before it is dropped.
+pub(crate) const REFUSALS: i64 = 3;
+
+/// Whether a peer's refusal says only that it could not work just then: its
+/// database busy or locked past the busy timeout, a home or the fleet
+/// registry it could not open, a hop beyond it it could not reach. The rpc
+/// loop and a machine gateway answer every error as a refusal, so these are
+/// told apart by their text, and retried as an unreachable peer is.
+pub(crate) fn temporary(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "database is locked",
+        "database table is locked",
+        "busy",
+        "unable to open database",
+        "disk i/o error",
+        // Opening a home or the registry: permissions, space, a missing file.
+        "os error",
+        "privateer home",
+        "existing ship home",
+        "fleet registry",
+        "peer transport",
+        "peer call timed out",
+    ]
+    .iter()
+    .any(|text| reason.contains(text))
+}
+
+/// A peer refused the wait notice `message` this home sent, for a reason
+/// `temporary` does not cover. It is retried with the usual backoff, and on
+/// its `REFUSALS`th refusal dropped rather than left pending, where it would
+/// hold back every later message to that peer and be refused again. A
+/// dropped `task_end` or `wait_closed` takes the subscription it answered
+/// with it; until then the row stays. Runs in the caller's transaction;
+/// returns whether the notice was dropped now.
 pub(crate) fn refused(store: &Store, message: &Value, reason: &str) -> Result<bool> {
     let id = message["id"].as_str().context("message id")?;
     let reason: String = reason.chars().take(4096).collect();
-    let dropped = store.connection().execute(
+    let refusals: Option<i64> = store
+        .connection()
+        .query_row(
+            "UPDATE mail SET delivery_refusals=delivery_refusals+1
+             WHERE id=?1 AND delivery='pending' RETURNING delivery_refusals",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(refusals) = refusals.filter(|n| *n >= REFUSALS) else {
+        return Ok(false);
+    };
+    store.connection().execute(
         "UPDATE mail SET delivery='dropped', delivery_error=?2 WHERE id=?1 AND delivery='pending'",
         params![id, reason],
     )?;
-    if dropped == 0 {
-        return Ok(false);
-    }
     let key = crate::mail::wait_notice(&message["payload"]).context("not a wait notice")?;
     let body = &message["payload"][key];
     let task = body["task"].as_str();
@@ -482,7 +521,7 @@ pub(crate) fn refused(store: &Store, message: &Value, reason: &str) -> Result<bo
     store.audit(
         "wait.notice_dropped",
         &json!({"id": id, "notice": key, "from": message["from"], "to": message["to"],
-            "task": task, "reason": reason, "rows": rows}),
+            "task": task, "reason": reason, "refusals": refusals, "rows": rows}),
     )?;
     Ok(true)
 }
@@ -676,4 +715,35 @@ pub(crate) fn resync(store: &Store, peer: &str) -> Result<Value> {
         store.audit("wait.resync", &outcome)?;
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::temporary;
+
+    #[test]
+    fn only_errors_that_say_the_peer_could_not_work_just_then_are_temporary() {
+        for reason in [
+            "database is locked",
+            "Database is locked: busy",
+            "database table is locked",
+            "unable to open database file: /x/privateer.sqlite",
+            "create Privateer home: Permission denied (os error 13)",
+            "No such file or directory (os error 2)",
+            "agents require an existing ship home",
+            "fleet registry directory",
+            "peer transport exited with exit status: 255: ssh: connect refused",
+            "peer call timed out after 30000 milliseconds",
+        ] {
+            assert!(temporary(reason), "{reason}");
+        }
+        for reason in [
+            "no ship named apps on this machine",
+            "unknown ship apps",
+            "wait notice is malformed",
+            "peer refused delivery",
+        ] {
+            assert!(!temporary(reason), "{reason}");
+        }
+    }
 }

@@ -1897,20 +1897,39 @@ fn an_agents_retire_leaves_the_notices_to_the_retiring_ships_dispatcher() {
     assert!(audited(&mut pair.b, "wait.notice_dropped").is_empty());
 }
 
+/// How often a peer refused one message, and its delivery.
+fn refusals(store: &Store, id_like: &str) -> (i64, String) {
+    store
+        .connection()
+        .query_row(
+            "SELECT delivery_refusals, delivery FROM mail WHERE payload LIKE ?1 ORDER BY seq LIMIT 1",
+            [format!("%{id_like}%")],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
 #[test]
-fn a_refused_wait_notice_is_dropped_and_later_mail_to_that_peer_still_flows() {
+fn a_wait_notice_refused_three_times_is_dropped_and_later_mail_to_that_peer_still_flows() {
     let mut pair = pair();
     share(&mut pair.a, "far-work", json!(["infra"]));
     // The owner's home no longer hosts apps (retired there, say): it refuses
-    // anything addressed to it.
+    // anything addressed to it, every time.
     pair.a
         .connection()
         .execute("DELETE FROM ships WHERE name='apps'", [])
         .unwrap();
     waiter(&mut pair.b, "waiting-1");
     defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
-    // Mail behind the refused subscription still goes, in the same attempt.
+    // Mail behind the refused subscription waits while it is retried.
     ping(&mut pair.b, "after-refusal", "infra", "research");
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (1, "pending".into()));
+    assert_eq!(outbox(&pair.b, "research")[0]["delivery"], "pending");
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (2, "pending".into()));
+    assert!(audited(&mut pair.b, "wait.notice_dropped").is_empty());
+    // The third refusal drops it, and the mail behind it goes in that pass.
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
     let sent = outbox(&pair.b, "apps");
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["delivery"], "dropped");
@@ -1919,7 +1938,8 @@ fn a_refused_wait_notice_is_dropped_and_later_mail_to_that_peer_still_flows() {
     assert_eq!(dropped.len(), 1, "{dropped:?}");
     assert_eq!(dropped[0]["notice"], "wait_subscribe");
     assert_eq!(dropped[0]["to"], "apps");
-    // It is never retried, and the peer is not backed off for it.
+    assert_eq!(dropped[0]["refusals"], 3);
+    // It is never retried again, and the peer is not left backed off.
     for _ in 0..2 {
         dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
     }
@@ -1934,6 +1954,11 @@ fn a_refused_wait_notice_is_dropped_and_later_mail_to_that_peer_still_flows() {
         )
         .unwrap();
     assert_eq!(failures, 0);
+    ping(&mut pair.b, "later", "infra", "research");
+    assert_eq!(
+        outbox(&pair.b, "research").last().unwrap()["delivery"],
+        "delivered"
+    );
     let listed = dispatch(&mut pair.b, "mail.outbox", json!({"delivery":"dropped"})).unwrap();
     assert_eq!(listed["messages"].as_array().unwrap().len(), 1, "{listed}");
     // Nothing quarantined, so nothing for the captain to chase.
@@ -1944,7 +1969,7 @@ fn a_refused_wait_notice_is_dropped_and_later_mail_to_that_peer_still_flows() {
 }
 
 #[test]
-fn a_refused_report_is_dropped_and_the_owner_deletes_its_row() {
+fn a_refused_report_is_dropped_on_its_third_refusal_and_only_then_the_owner_deletes_its_row() {
     let mut pair = subscribed();
     let nonce = nonce_of(&pair.b, "waiting-1").unwrap();
     // The waiting home no longer knows apps, so it refuses apps's mail.
@@ -1959,7 +1984,7 @@ fn a_refused_report_is_dropped_and_the_owner_deletes_its_row() {
     )
     .unwrap();
     // A replay of the same subscription was stored before the answer came
-    // back refused: that generation's row goes with the refused report.
+    // back refused: that generation's row goes with the dropped report.
     pair.a
         .connection()
         .execute(
@@ -1969,6 +1994,11 @@ fn a_refused_report_is_dropped_and_the_owner_deletes_its_row() {
         )
         .unwrap();
     ping(&mut pair.a, "later", "research", "infra");
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    // Refused twice: still owed, and the row stays.
+    assert_eq!(refusals(&pair.a, "task_end"), (2, "pending".into()));
+    assert_eq!(rows(&pair.a, "far-work"), 2);
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
     let ends: Vec<Value> = outbox(&pair.a, "infra")
         .into_iter()
         .filter(|m| m["payload"]["task_end"].is_object())
@@ -1983,6 +2013,97 @@ fn a_refused_report_is_dropped_and_the_owner_deletes_its_row() {
     assert_eq!(dropped[0]["notice"], "task_end");
     assert_eq!(dropped[0]["rows"], 1);
     // Another generation's row is not the refused one's.
+    assert_eq!(rows(&pair.a, "far-work"), 1);
+}
+
+#[test]
+fn a_refusal_that_clears_delivers_the_report_and_the_wait_resumes() {
+    let mut pair = subscribed();
+    let apps: String = pair
+        .b
+        .connection()
+        .query_row("SELECT record FROM ships WHERE name='apps'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    pair.b
+        .connection()
+        .execute("DELETE FROM ships WHERE name='apps'", [])
+        .unwrap();
+    dispatch(
+        &mut pair.a,
+        "task.update",
+        json!({"id":"far-work","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.a, "task_end"), (1, "pending".into()));
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
+    // The waiting home knows apps again: the retry is delivered.
+    pair.b
+        .connection()
+        .execute(
+            "INSERT INTO ships(name, record) VALUES('apps', ?1)",
+            [&apps],
+        )
+        .unwrap();
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.a, "task_end"), (1, "delivered".into()));
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "ready");
+    assert!(audited(&mut pair.a, "wait.notice_dropped").is_empty());
+}
+
+#[test]
+fn a_busy_peer_is_retried_with_backoff_and_never_dropped() {
+    let mut pair = pair();
+    share(&mut pair.a, "far-work", json!(["infra"]));
+    // The owner's home answers every subscription with the error a write
+    // past its busy timeout gives.
+    pair.a
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER busy BEFORE INSERT ON task_subscriptions
+             BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+        )
+        .unwrap();
+    waiter(&mut pair.b, "waiting-1");
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    for _ in 0..4 {
+        dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    }
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (0, "pending".into()));
+    let (attempts, error): (i64, String) = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT delivery_attempts, delivery_error FROM mail WHERE recipient='apps'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempts, 4);
+    assert!(error.contains("database is locked"), "{error}");
+    assert!(audited(&mut pair.b, "wait.notice_dropped").is_empty());
+    // Backed off as an unreachable peer is, though the link is heard.
+    let (failures, down): (i64, Option<i64>) = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT r.failures, l.down_ms FROM mail_delivery_retry r
+             JOIN wait_links l ON l.peer=r.peer WHERE r.peer='home-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(failures, 4);
+    assert_eq!(down, None);
+    // Once the owner's home can write again, the subscription arrives.
+    pair.a
+        .connection()
+        .execute_batch("DROP TRIGGER busy;")
+        .unwrap();
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(refusals(&pair.b, "wait_subscribe"), (0, "delivered".into()));
     assert_eq!(rows(&pair.a, "far-work"), 1);
 }
 
