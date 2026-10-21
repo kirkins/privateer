@@ -1,11 +1,13 @@
-//! The review gate, round B1: `review.start`, settlement, `review.list`,
-//! bearings and the `pr.merge` checks, through the real CLI and real
-//! supervised jobs. A fake harness stands for the reviewer (and for crew and
-//! errands): it records its argv and working folder, and replies with the
-//! test's scripted review. A fake forge adapter (`PRIVATEER_FORGE_ADAPTER`)
-//! answers `pr.view` from per-PR fixtures and logs every operation, so a
-//! test can see that nothing is posted. The PR's commits are real, in a
-//! local origin and its clone under the ship's `projects/` folder.
+//! The review gate: `review.start`, settlement and posting, `review.list`,
+//! bearings, `forges.set`, and `pr.merge` checking and merging, through the
+//! real CLI and real supervised jobs. A fake harness stands for the
+//! reviewer (and for crew and errands): it records its argv and working
+//! folder, and replies with the test's scripted review. A fake forge adapter
+//! (`PRIVATEER_FORGE_ADAPTER`) answers `pr.view` from per-PR fixtures, keeps
+//! the reviews posted to it with their markers as a forge does, merges only
+//! at the fixture's head, and logs every operation with the name of the
+//! token file it was given. The PR's commits are real, in a local origin and
+//! its clone under the ship's `projects/` folder.
 
 mod support;
 
@@ -89,13 +91,54 @@ print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "r
             &root.join("bin/forge"),
             &format!(
                 r#"#!/usr/bin/env python3
-import json, pathlib, sys
+import json, os, pathlib, re, sys
 root = pathlib.Path({root:?})
+op = sys.argv[1]
 request = json.load(sys.stdin)
+token = os.environ.get("PRIVATEER_FORGE_TOKEN_FILE", "")
 with open(root / "adapter.log", "a") as log:
-    log.write(json.dumps({{"argv": sys.argv[1:], "request": request}}) + "\n")
-path = root / "prs" / ("%s.json" % request["pr"])
-print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": "no such pr"}}))
+    log.write(json.dumps({{"argv": sys.argv[1:], "request": request,
+        "token": os.path.basename(token), "token_readable": os.access(token, os.R_OK),
+        "env": sorted(k for k in os.environ if "TOKEN" in k)}}) + "\n")
+def reply(value):
+    print(json.dumps(value))
+    sys.exit(0)
+def fixture():
+    path = root / "prs" / ("%s.json" % request["pr"])
+    if not path.exists():
+        reply({{"ok": False, "error": "no such pr"}})
+    return json.loads(path.read_text())
+if op == "pr.view":
+    reply(fixture())
+if op == "protection.read":
+    reply({{"ok": True, "protected": True, "status_checks": ["ci"], "warnings": ["dismiss stale reviews is not enabled"]}})
+if op == "review.post":
+    marker = re.search(r"<!-- privateer-review [^ ]+ -->", request["body"]).group(0)
+    store = root / "forge-reviews.json"
+    posted = json.loads(store.read_text()) if store.exists() else []
+    for review in posted:
+        if marker in review["body"] and review["commit_id"] == request["commit_id"]:
+            reply({{"ok": True, "posted": False, "already_exists": True, "review_id": review["id"]}})
+    plan = root / "post-plan"
+    steps = plan.read_text().split() if plan.exists() else []
+    step = steps.pop(0) if steps else "ok"
+    plan.write_text(" ".join(steps))
+    if step == "error":
+        reply({{"ok": False, "error": "HTTP 502 bad gateway"}})
+    posted.append({{"id": len(posted) + 1, "commit_id": request["commit_id"],
+        "event": request["event"], "body": request["body"]}})
+    store.write_text(json.dumps(posted))
+    if step == "lost":
+        reply({{"ok": False, "error": "timed out reading the reply"}})
+    reply({{"ok": True, "posted": True, "already_exists": False, "review_id": len(posted)}})
+if op == "pr.merge":
+    pr = fixture()
+    if request["head_sha"] != pr["head_sha"]:
+        reply({{"ok": False, "error": "HTTP 409 Head branch was modified", "status_code": 409}})
+    with open(root / "merges.log", "a") as merges:
+        merges.write(json.dumps(request) + "\n")
+    reply({{"ok": True, "merged": True, "merge_sha": "f" * 40}})
+reply({{"ok": False, "error": "unsupported forge operation: " + op}})
 "#
             ),
         );
@@ -136,7 +179,37 @@ print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": 
                 "refs/remotes/origin/main",
             ],
         );
+        // The captain's reviewer and merger tokens, and forges.json naming
+        // the repository with its required check.
+        fleet.credential("forge-reviewer-github", "reviewer-token-0123456789abcdef");
+        fleet.credential("forge-merger-github", "merger-token-0123456789abcdef");
+        fleet.forges(json!({"repos": {"example.invalid/acme/widget": forge_entry()}}));
         fleet
+    }
+    /// Store a credential as the captain does, the secret on stdin.
+    fn credential(&self, reference: &str, secret: &str) {
+        let mut set = self
+            .command(
+                None,
+                &[
+                    "credential.set",
+                    "--json",
+                    &json!({"ref": reference}).to_string(),
+                ],
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        set.stdin
+            .take()
+            .unwrap()
+            .write_all(secret.as_bytes())
+            .unwrap();
+        assert!(set.wait().unwrap().success());
+    }
+    fn forges(&self, forges: Value) -> Value {
+        self.json(None, "forges.set", forges)
     }
     fn clone_dir(&self) -> PathBuf {
         self.root.join("engineering/projects/widget")
@@ -388,6 +461,30 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+fn forge_entry() -> Value {
+    json!({"forge": "github", "api": "https://api.example.invalid", "branch": "main",
+        "required_checks": ["ci"],
+        "reviewer": {"account": "reviewer-bot", "credential": "forge-reviewer-github"},
+        "merger": {"account": "captain", "credential": "forge-merger-github"}})
+}
+
+/// The adapter log's entries for one operation.
+fn ops_of(f: &Fleet, op: &str) -> Vec<Value> {
+    fs::read_to_string(f.root.join("adapter.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|l| l["argv"][0] == op)
+        .collect()
+}
+
+fn forge_reviews(f: &Fleet) -> Vec<Value> {
+    fs::read_to_string(f.root.join("forge-reviews.json"))
+        .ok()
+        .map(|t| serde_json::from_str(&t).unwrap())
+        .unwrap_or_default()
+}
+
 const APPROVE: &str =
     "Read the change.\nFINDING nit src/lib.rs:1 name the widget\nVERDICT: APPROVE\n";
 
@@ -489,12 +586,11 @@ fn the_prompt_is_the_runtimes_alone_and_the_reviewer_reads_a_read_only_worktree(
             .contains("Fix the widget")
     );
     // Settlement keeps the verdict and the structured finding, removes the
-    // worktree and keeps the diff beside it; nothing reaches the forge but
-    // reads.
+    // worktree, keeps the diff beside it, and posts the approval.
     f.tick();
     let row = f.row(review);
     assert_eq!(row["verdict"], "approve", "{row}");
-    assert_eq!(row["post_state"], "pending");
+    assert_eq!(row["post_state"], "posted", "{row}");
     assert_eq!(row["fresh"], true);
     assert_eq!(
         row["findings"],
@@ -503,16 +599,15 @@ fn the_prompt_is_the_runtimes_alone_and_the_reviewer_reads_a_read_only_worktree(
     assert!(!folder.join("tree").exists());
     assert!(folder.join("diff.patch").exists());
     assert!(
-        f.adapter_ops().iter().all(|op| op == "pr.view"),
+        f.adapter_ops()
+            .iter()
+            .all(|op| op == "pr.view" || op == "protection.read" || op == "review.post"),
         "{:?}",
         f.adapter_ops()
     );
     let notice = f.mail_to("engineering").last().unwrap().1.clone();
     assert!(
-        notice.starts_with(&format!(
-            "Review of #7 at {}: APPROVE, not posted",
-            &head[..7]
-        )),
+        notice.starts_with(&format!("Review of #7 at {}: APPROVE, posted.", &head[..7])),
         "{notice}"
     );
     assert!(
@@ -533,7 +628,7 @@ fn the_prompt_is_the_runtimes_alone_and_the_reviewer_reads_a_read_only_worktree(
     let text = bearings["text"].as_str().unwrap();
     assert!(
         text.contains(&format!(
-            "#7 {} APPROVE by opus (tier 1), not posted yet",
+            "#7 {} APPROVE by opus (tier 1), posted",
             &head[..7]
         )),
         "{text}"
@@ -589,14 +684,7 @@ fn the_reviewer_must_not_be_an_author_route() {
     f.pr(9, &head, "feature");
     let row = f.review(9, APPROVE, json!({}));
     assert_eq!(row["verdict"], "approve", "{row}");
-    let checked = f.json(
-        Some("engineering"),
-        "pr.merge",
-        json!({"task_id": "fix", "pr": 9}),
-    );
-    assert_eq!(checked["allowed"], true, "{checked}");
-    assert_eq!(checked["merged"], false);
-    assert_eq!(checked["expected_head"], head.as_str());
+    assert_eq!(row["post_state"], "posted", "{row}");
     f.crew("crew-late", "writer");
     let refused = f.refused(
         Some("engineering"),
@@ -608,7 +696,7 @@ fn the_reviewer_must_not_be_an_author_route() {
         "{refused}"
     );
     assert!(refused.contains("crew-late"), "{refused}");
-    assert!(f.adapter_ops().iter().all(|op| op == "pr.view"));
+    assert!(ops_of(&f, "pr.merge").is_empty());
 }
 
 #[test]
@@ -686,7 +774,7 @@ fn the_verdict_is_parsed_from_the_last_line_only() {
         json!({}),
     );
     assert_eq!(row["verdict"], "none", "{row}");
-    assert!(f.adapter_ops().iter().all(|op| op == "pr.view"));
+    assert!(ops_of(&f, "review.post").is_empty());
 }
 
 #[test]
@@ -854,11 +942,7 @@ fn the_filter_refuses_credentials_and_outside_paths_and_keeps_structure() {
     let mut set = f
         .command(
             None,
-            &[
-                "credential.set",
-                "--json",
-                r#"{"ref":"forge-reviewer-github"}"#,
-            ],
+            &["credential.set", "--json", r#"{"ref":"search-api-key"}"#],
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -985,10 +1069,428 @@ fn a_declared_route_is_trusted_recorded_and_shown() {
         "{bearings}"
     );
     // pr.merge carries the declaration into its own author check.
-    let checked = f.json(
+    let merged = f.json(
         Some("engineering"),
         "pr.merge",
         json!({"task_id": "fix", "pr": 17}),
     );
-    assert_eq!(checked["allowed"], true, "{checked}");
+    assert_eq!(merged["merged"], true, "{merged}");
+}
+
+#[test]
+fn an_approved_head_merges_through_pr_merge() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 20 }\n")],
+        "Fix",
+    );
+    f.pr(20, &head, "feature");
+    // Before any review: refused, naming review.start.
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 20}),
+    );
+    assert!(refused.contains("start one with review.start"), "{refused}");
+    let row = f.review(20, APPROVE, json!({}));
+    assert_eq!(row["verdict"], "approve", "{row}");
+    assert_eq!(row["post_state"], "posted", "{row}");
+    assert_eq!(row["post_attempts"], 1);
+    // The approval was posted as the reviewer at the reviewed head, from the
+    // stored record: the verdict, the route and the filtered finding, with
+    // the marker, and none of the reply's other text.
+    let posts = ops_of(&f, "review.post");
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    let post = &posts[0];
+    assert_eq!(post["request"]["commit_id"], head.as_str());
+    assert_eq!(post["request"]["event"], "APPROVE");
+    assert_eq!(post["request"]["reviewer"], "reviewer-bot");
+    assert_eq!(post["request"]["forge"], "github");
+    assert_eq!(post["request"]["api"], "https://api.example.invalid");
+    assert_eq!(post["request"]["repo"], "acme/widget");
+    assert_eq!(post["token"], "forge-reviewer-github");
+    assert_eq!(post["token_readable"], true);
+    assert_eq!(post["env"], json!(["PRIVATEER_FORGE_TOKEN_FILE"]));
+    let body = post["request"]["body"].as_str().unwrap();
+    assert!(
+        body.contains(&format!(
+            "<!-- privateer-review {} -->",
+            row["id"].as_str().unwrap()
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains("- nit `src/lib.rs:1` name the widget"),
+        "{body}"
+    );
+    assert!(body.contains("route opus"), "{body}");
+    assert!(!body.contains("Read the change."), "{body}");
+    assert!(!post["request"].as_object().unwrap().contains_key("token"));
+    // Every read named the required check from forges.json, never every check.
+    for view in ops_of(&f, "pr.view") {
+        assert_eq!(view["request"]["required_checks"], json!(["ci"]), "{view}");
+        assert_eq!(view["token"], "forge-reviewer-github");
+    }
+    // Red required checks refuse the merge.
+    let base = f.git(&f.clone_dir(), &["rev-parse", "main"]);
+    let red = json!({"ok": true, "state": "open", "base": "main", "base_sha": base,
+        "head_sha": head, "head_ref": "feature", "title": "Fix the widget", "body": "",
+        "url": "", "required_checks_ok": false, "checks_not_success": ["ci"]});
+    fs::write(f.root.join("prs/20.json"), red.to_string()).unwrap();
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 20}),
+    );
+    assert!(
+        refused.contains("required checks are not green"),
+        "{refused}"
+    );
+    assert!(refused.contains("ci"), "{refused}");
+    // A PR into another branch than forges.json's is refused.
+    f.pr(20, &head, "feature");
+    let mut other =
+        serde_json::from_str::<Value>(&fs::read_to_string(f.root.join("prs/20.json")).unwrap())
+            .unwrap();
+    other["base"] = json!("release");
+    fs::write(f.root.join("prs/20.json"), other.to_string()).unwrap();
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 20}),
+    );
+    assert!(
+        refused.contains("not the protected branch main"),
+        "{refused}"
+    );
+    // Green and on main: it merges as the merger at the head it checked.
+    f.pr(20, &head, "feature");
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 20}),
+    );
+    assert_eq!(merged["merged"], true, "{merged}");
+    assert_eq!(merged["head"], head.as_str());
+    assert_eq!(merged["merge_sha"], "f".repeat(40));
+    let merges = ops_of(&f, "pr.merge");
+    assert_eq!(merges.len(), 1, "{merges:?}");
+    assert_eq!(merges[0]["request"]["head_sha"], head.as_str());
+    assert_eq!(merges[0]["request"]["merge_method"], "merge");
+    assert_eq!(merges[0]["token"], "forge-merger-github");
+    let row = f.row(row["id"].as_str().unwrap());
+    assert!(row["merged_ms"].is_i64(), "{row}");
+    assert_eq!(row["merge_sha"], "f".repeat(40));
+    let bearings = f.json(None, "ship.bearings", json!({"ship": "engineering"}));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("APPROVE by opus (tier 1), posted and merged"),
+        "{bearings}"
+    );
+}
+
+#[test]
+fn a_new_head_needs_a_new_review() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 21 }\n")],
+        "Fix",
+    );
+    f.pr(21, &head, "feature");
+    let started = f.start(21, APPROVE, json!({}));
+    // The head moves while the review runs: settlement finds it moved, so
+    // the approval is stale and nothing is posted.
+    let moved = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 22 }\n")],
+        "Push after the review began",
+    );
+    f.pr(21, &moved, "feature");
+    let row = f.finish(&started);
+    assert_eq!(row["verdict"], "approve", "{row}");
+    assert_eq!(row["post_state"], "stale", "{row}");
+    assert!(
+        row["post_error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("the head moved to {}", &moved[..7])),
+        "{row}"
+    );
+    assert!(ops_of(&f, "review.post").is_empty());
+    let notice = f.mail_to("engineering").last().unwrap().1.clone();
+    assert!(notice.contains("APPROVE, not posted"), "{notice}");
+    assert!(notice.contains("stale"), "{notice}");
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 21}),
+    );
+    assert!(
+        refused.contains(&format!(
+            "head {} has no approved top-tier review",
+            &moved[..7]
+        )),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&format!("was of {}", &head[..7])),
+        "{refused}"
+    );
+    // A stale approval at a head the PR returns to still does not merge.
+    f.pr(21, &head, "feature");
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 21}),
+    );
+    assert!(refused.contains("stale"), "{refused}");
+    assert!(ops_of(&f, "pr.merge").is_empty());
+}
+
+#[test]
+fn posting_is_idempotent_across_a_restart() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 23 }\n")],
+        "Fix",
+    );
+    f.pr(23, &head, "feature");
+    // The first try fails outright; the second reaches the forge, which
+    // records the review, but its reply is lost, as in a crash.
+    fs::write(f.root.join("post-plan"), "error lost").unwrap();
+    let row = f.review(23, APPROVE, json!({}));
+    let id = row["id"].as_str().unwrap().to_owned();
+    assert_eq!(row["post_state"], "failed", "{row}");
+    assert_eq!(row["post_attempts"], 1);
+    assert!(forge_reviews(&f).is_empty());
+    let notice = f.mail_to("engineering").last().unwrap().1.clone();
+    assert!(notice.contains("APPROVE, not posted yet"), "{notice}");
+    assert!(notice.contains("HTTP 502"), "{notice}");
+    // Not posted, so not merged.
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 23}),
+    );
+    assert!(
+        refused.contains("the forge must hold the reviewer's approval"),
+        "{refused}"
+    );
+    f.tick();
+    let row = f.row(&id);
+    assert_eq!(row["post_state"], "failed", "{row}");
+    assert_eq!(row["post_attempts"], 2);
+    assert_eq!(forge_reviews(&f).len(), 1);
+    // The next try finds the review's marker among the reviewer's reviews
+    // and posts nothing more.
+    f.tick();
+    let row = f.row(&id);
+    assert_eq!(row["post_state"], "posted", "{row}");
+    assert_eq!(row["post_attempts"], 3);
+    assert_eq!(forge_reviews(&f).len(), 1, "{:?}", forge_reviews(&f));
+    assert_eq!(ops_of(&f, "review.post").len(), 3);
+    let late = f.mail_to("engineering").last().unwrap().1.clone();
+    assert!(late.contains("APPROVE, posted"), "{late}");
+    // A tick after that posts nothing.
+    f.tick();
+    assert_eq!(ops_of(&f, "review.post").len(), 3);
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 23}),
+    );
+    assert_eq!(merged["merged"], true, "{merged}");
+
+    // A post that keeps failing is given up after four tries, and the ship
+    // hears the token or the forge needs attention.
+    let head = f.commit(
+        "other",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 24 }\n")],
+        "Other",
+    );
+    f.pr(24, &head, "other");
+    fs::write(f.root.join("post-plan"), "error error error error error").unwrap();
+    let row = f.review(
+        24,
+        "FINDING must-fix src/lib.rs:1 wrong\nVERDICT: CHANGES_REQUESTED",
+        json!({}),
+    );
+    let id = row["id"].as_str().unwrap().to_owned();
+    for _ in 0..4 {
+        f.tick();
+    }
+    let row = f.row(&id);
+    assert_eq!(row["post_state"], "failed", "{row}");
+    assert_eq!(row["post_attempts"], 4);
+    assert_eq!(ops_of(&f, "review.post").len(), 3 + 4);
+    let notice = f.mail_to("engineering").last().unwrap().1.clone();
+    assert!(notice.contains("posting gave up after 4 tries"), "{notice}");
+    assert!(
+        ops_of(&f, "review.post")
+            .iter()
+            .skip(3)
+            .all(|p| p["request"]["event"] == "REQUEST_CHANGES")
+    );
+}
+
+#[test]
+fn forges_are_the_captains_and_a_repository_missing_is_not_reviewed() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    // Agents can neither read nor write forges.json.
+    for verb in ["forges.show", "forges.set"] {
+        let refused = f.refused(Some("engineering"), verb, json!({}));
+        assert!(refused.contains("operator command"), "{verb}: {refused}");
+    }
+    let shown = f.json(None, "forges.show", json!({}));
+    assert_eq!(shown["repos"]["example.invalid/acme/widget"], forge_entry());
+    // forges.set reads protection back and warns, and warns of a credential
+    // not stored yet.
+    let mut entry = forge_entry();
+    entry["merger"]["credential"] = json!("forge-merger-unstored");
+    let set = f.forges(json!({"repos": {"example.invalid/acme/widget": entry,
+        "example.invalid/acme/other": forge_entry()}}));
+    let warnings = set["warnings"].to_string();
+    assert!(
+        warnings.contains("forge-merger-unstored is not stored yet"),
+        "{warnings}"
+    );
+    assert!(
+        warnings.contains("dismiss stale reviews is not enabled"),
+        "{warnings}"
+    );
+    let refused = f.refused(
+        None,
+        "forges.set",
+        json!({"repos": {"example.invalid/acme/widget": {"forge": "github"}}}),
+    );
+    assert!(refused.contains("api must be"), "{refused}");
+    // A repository forges.json does not name is not reviewed.
+    f.forges(json!({"repos": {"example.invalid/acme/other": forge_entry()}}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 25 }\n")],
+        "Fix",
+    );
+    f.pr(25, &head, "feature");
+    let refused = f.refused(
+        Some("engineering"),
+        "review.start",
+        json!({"task_id": "fix", "pr": 25}),
+    );
+    assert!(
+        refused.contains("not in the captain's forges.json"),
+        "{refused}"
+    );
+    assert!(ops_of(&f, "pr.view").is_empty());
+}
+
+#[test]
+fn an_approval_with_a_must_fix_blocks_the_same_tree() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 26 }\n")],
+        "Fix",
+    );
+    f.pr(26, &head, "feature");
+    let row = f.review(
+        26,
+        "FINDING must-fix src/lib.rs:1 returns the wrong value\nVERDICT: APPROVE",
+        json!({}),
+    );
+    assert_eq!(row["verdict"], "none", "{row}");
+    let empty = f.commit("feature", &[], "Nothing changed");
+    f.pr(26, &empty, "feature");
+    let refused = f.refused(
+        Some("engineering"),
+        "review.start",
+        json!({"task_id": "fix", "pr": 26}),
+    );
+    assert!(refused.contains("same file tree as"), "{refused}");
+    assert!(refused.contains("a must-fix finding"), "{refused}");
+}
+
+#[test]
+fn another_homes_workspace_branch_is_not_reviewed() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 27 }\n")],
+        "Fix",
+    );
+    f.pr(27, &head, "privateer/0011223344556677/8899aabbccddeeff/1");
+    let refused = f.refused(
+        Some("engineering"),
+        "review.start",
+        json!({"task_id": "fix", "pr": 27}),
+    );
+    assert!(refused.contains("another Privateer home's"), "{refused}");
+    assert!(
+        f.json(None, "review.list", json!({}))["reviews"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_symlink_leaving_the_worktree_is_cut_before_the_reviewer_reads() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let secret = f.root.join("hosts.yml");
+    fs::write(&secret, "oauth_token: gho_notarealtokenbutlongenough0000\n").unwrap();
+    let clone = f.clone_dir();
+    f.git(&clone, &["checkout", "--quiet", "-b", "linked", "main"]);
+    std::os::unix::fs::symlink(&secret, clone.join("config.yml")).unwrap();
+    std::os::unix::fs::symlink("src/lib.rs", clone.join("inward.rs")).unwrap();
+    f.git(&clone, &["checkout", "--quiet", "main"]);
+    let head = f.commit("linked", &[], "Add links");
+    f.pr(28, &head, "linked");
+    let started = f.start(28, APPROVE, json!({}));
+    let tree = f
+        .home()
+        .join("reviews")
+        .join(started["review"].as_str().unwrap())
+        .join("tree");
+    let cut = fs::symlink_metadata(tree.join("config.yml")).unwrap();
+    assert!(cut.file_type().is_file(), "{cut:?}");
+    assert!(
+        fs::read_to_string(tree.join("config.yml"))
+            .unwrap()
+            .contains("cut by the review runtime")
+    );
+    assert!(
+        fs::symlink_metadata(tree.join("inward.rs"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    f.settled(started["errand"].as_str().unwrap());
+    let launch = f.launch(started["errand"].as_str().unwrap());
+    let prompt = launch["argv"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        prompt.contains(
+            "Symlinks that led outside the worktree, replaced by plain files: config.yml"
+        ),
+        "{prompt}"
+    );
+    f.finish(&started);
 }

@@ -1221,12 +1221,13 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     });
     crate::crew::resume_pending(store)?;
     let settled = settle(store)?;
-    let errands = crate::errand::settle(store)?;
-    // A review verdict whose post failed, or never ran, is tried again here.
+    // A review verdict whose post failed, or never ran, is tried again here,
+    // before settlement tries the new ones: each retry is a later tick's.
     let reviews = crate::review::tick(store).unwrap_or_else(|error| {
         eprintln!("privateer: could not post review verdicts: {error:#}");
         vec![]
     });
+    let errands = crate::errand::settle(store)?;
     let routes = crate::routes::scan(store)?;
     // After the scan, so the throttled route is already held and the relaunch
     // takes the next one in its list.

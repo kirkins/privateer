@@ -139,10 +139,7 @@ In GitHub repository settings under **Branches** -> **Branch protection rules** 
 - **Block force pushes** (`allow_force_pushes: false`)
 - **Block deletions** (`allow_deletions: false`)
 
-Verify protection settings via Privateer:
-```sh
-# Checked via plugins/forge.py protection.read once forges.set/show wiring lands
-```
+Verify protection settings via Privateer: `forges.set` (Section C) reads each repository's protection back through `plugins/forge.py protection.read` and lists what is missing under `warnings`.
 
 ---
 
@@ -182,22 +179,24 @@ Before enabling on production repositories, verify on a scratch Forgejo repo:
 
 ---
 
-### Section C: Fleet forge configuration (`forges.json`) and runtime adapter (coming in task 5; not yet available)
-
-> [!NOTE]
-> This section describes fleet configuration and runtime adapter wiring arriving in **task 5** (B2 wiring). Commands `forges.set` and `forges.show`, as well as the `forges.json` fleet path, do not exist in `src/` or `plugins/` yet.
+### Section C: Fleet forge configuration (`forges.json`) and runtime adapter
 
 #### 1. [hands] Fleet forge configuration (`forges.json`)
-The fleet configuration file `forges.json` will reside beside `routes.json` in Privateer's fleet directory (`crate::fleet::registry_path().with_extension("json")`). It is captain-only (`[hands]`) and contains repository mappings and credential references (no secrets).
+The fleet file `forges.json` sits beside the routes file in Privateer's fleet directory (`fleet.forges.json`, `crate::fleet::registry_path().with_extension("forges.json")`). It is captain-only and holds repository entries and credential refs, never secrets. A repository missing from it is not reviewed or merged by `review.start` and `pr.merge`.
 
-Configure via the captain command [hands] once task 5 lands:
+Write it with the captain command [hands]; the reply's `warnings` list credentials not stored yet and branch protection settings that are missing:
 ```sh
 privateer forges.set --file forges.json
 ```
 Inspect with:
 ```sh
-privateer forges.show
+privateer forges.show --json '{}'
 ```
+
+Each entry is keyed `host/owner/name` in lowercase and needs:
+- `forge`: `github` or `forgejo`; `api`: the https API base; `branch`: the protected branch PRs merge into (never taken from a clone's `origin/HEAD`).
+- `required_checks` (optional): the checks a merge needs green. Without it, the checks branch protection requires are used; a repository with neither is refused. Every check is never required, so a check the captain left out (such as `runtime (macos-latest)`) never blocks a merge.
+- `reviewer` and `merger`: `{account, credential}`, two different accounts. The reviewer's token reads the PR and posts reviews. The merger's token merges: on GitHub the ship's own fine-grained token (`forge-ship-github`), on Forgejo the `merger` account's.
 
 Example configuration schema:
 ```json
@@ -207,9 +206,14 @@ Example configuration schema:
       "forge": "github",
       "api": "https://api.github.com",
       "branch": "main",
+      "required_checks": ["runtime (ubuntu-latest)"],
       "reviewer": {
         "account": "<reviewer-account>",
         "credential": "forge-reviewer-github"
+      },
+      "merger": {
+        "account": "kirkins",
+        "credential": "forge-ship-github"
       }
     },
     "git.lobbykit.net/hermes/app": {

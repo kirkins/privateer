@@ -765,3 +765,81 @@ fn configure_accepts_mcp_only_bundle_and_refusals_name_field_not_value() {
     );
     assert!(!format!("{error:#}").contains(sentinel));
 }
+
+#[test]
+fn a_forge_credential_is_never_given_to_a_launch() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let (temp, _store, config) = fixture();
+    let root = temp.path().canonicalize().unwrap();
+    let cli = |command: &str, args: &Value, input: &[u8]| -> (bool, String) {
+        let mut cli = support::command(env!("CARGO_BIN_EXE_privateer"));
+        cli.args(["--home", root.join("home").to_str().unwrap()])
+            .args([command, "--json", &args.to_string()])
+            .env("HOME", root.join("user"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+            .env("PRIVATEER_FORGE_ADAPTER", root.join("no-adapter"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cli.spawn().unwrap();
+        let _ = child.stdin.take().unwrap().write_all(input);
+        let output = child.wait_with_output().unwrap();
+        let text = [output.stdout, output.stderr].concat();
+        (output.status.success(), String::from_utf8(text).unwrap())
+    };
+    let (ok, text) = cli("credential.set", &json!({"ref":"brave-search"}), b"brave-value\n");
+    assert!(ok, "{text}");
+    let forges = json!({"repos": {"github.com/acme/widget": {
+        "forge": "github", "api": "https://api.github.com", "branch": "main",
+        "required_checks": ["ci"],
+        "reviewer": {"account": "reviewer-bot", "credential": "forge-reviewer-github"},
+        "merger": {"account": "captain", "credential": "forge-merger-github"}}}});
+    let (ok, text) = cli("forges.set", &forges, b"");
+    assert!(ok, "{text}");
+    assert!(text.contains("forge-reviewer-github, forge-merger-github is not stored yet"), "{text}");
+    // A bundle registry that names a forges.json ref is refused.
+    for forge_ref in ["forge-reviewer-github", "forge-merger-github"] {
+        let mut named = config.clone();
+        named["bundles"][0]["credentials"] = json!([{"name":"FORGE_TOKEN","ref":forge_ref}]);
+        let (ok, text) = cli("bundle.configure", &json!({"registry": named}), b"");
+        assert!(!ok, "{forge_ref}: {text}");
+        assert!(text.contains("forge credential named in forges.json"), "{text}");
+    }
+    let mut brave = config.clone();
+    brave["bundles"][0]["credentials"] = json!([{"name":"BRAVE_API_KEY","ref":"brave-search"}]);
+    let (ok, text) = cli("bundle.configure", &json!({"registry": brave}), b"");
+    assert!(ok, "{text}");
+    // forges.set cannot later name a ref this home's bundles give to launches.
+    let mut taken = forges.clone();
+    taken["repos"]["github.com/acme/widget"]["merger"]["credential"] = json!("brave-search");
+    let (ok, text) = cli("forges.set", &taken, b"");
+    assert!(!ok && text.contains("given to launches"), "{text}");
+    // A launch plan that names one (as another home's registry could) is
+    // refused where its credential files are given out, in bundles.py; a
+    // forges.json that cannot be read refuses every credential.
+    let launch = |reference: &str| -> String {
+        let script = format!(
+            "import json, sys\nsys.path.insert(0, {plugins:?})\nfrom bundles import credential_environment\n\
+             try:\n    found = credential_environment({{'credentials': [{{'name': 'TOKEN', 'ref': {reference:?}}}]}}, \
+             {{'PRIVATEER_FLEET': {fleet:?}, 'HOME': {home:?}}})\n    print('given ' + ','.join(sorted(found)))\n\
+             except Exception as error:\n    print('refused ' + type(error).__name__)\n",
+            plugins = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins").to_str().unwrap(),
+            fleet = root.join("fleet.sqlite").to_str().unwrap(),
+            home = root.join("user").to_str().unwrap(),
+        );
+        let output = Command::new(support::python())
+            .args(["-I", "-c", &script])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    assert_eq!(launch("brave-search"), "given PRIVATEER_CREDENTIAL_TOKEN_FILE");
+    assert_eq!(launch("forge-reviewer-github"), "refused Refused");
+    assert_eq!(launch("forge-merger-github"), "refused Refused");
+    fs::write(root.join("fleet.forges.json"), "{not json").unwrap();
+    assert_eq!(launch("brave-search"), "refused Refused");
+    let (ok, text) = cli("bundle.configure", &json!({"registry": brave}), b"");
+    assert!(!ok && text.contains("forges"), "{text}");
+}
