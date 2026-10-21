@@ -1614,6 +1614,34 @@ fn a_ships_reply_to_the_placement_decision_is_no_answer() {
 }
 
 #[test]
+fn an_approval_waits_unused_until_its_proposal_is_runnable() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "move_keep", Some(&ssh));
+    // The yes is here before its proposal is runnable, as when a linked
+    // machine's proposal has not yet arrived in an open state.
+    let set = |state: &str| {
+        laptop
+            .conn()
+            .execute(
+                "UPDATE placement_proposals SET state=?2 WHERE id=?1",
+                [&id, state],
+            )
+            .unwrap();
+    };
+    set("checking");
+    let ran = laptop.run_moves("liaison", Some(&ssh));
+    assert!(ran["placement"].is_null(), "{ran}");
+    assert_eq!(approvals(&laptop)[0].1, None, "the approval is not spent");
+    assert!(laptop.moves().is_empty());
+    set("open");
+    let ran = laptop.run_moves("liaison", Some(&ssh));
+    assert!(ran["placement"]["runner"].is_u64(), "{ran}");
+    assert_eq!(proposal(&laptop, &id).0, "moved");
+    assert!(approvals(&laptop)[0].1.is_some());
+}
+
+#[test]
 fn a_changed_lapsed_or_busy_approval_moves_nothing_and_cools_down() {
     let (_temp, laptop, mac, ssh) = fixture();
     let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
