@@ -1,14 +1,16 @@
 //! The MCP broker's machine side: installing its stable binary, reporting
-//! it, stopping it, and the machine owner's dispatcher keeping it running.
+//! its named instances, stopping them, the machine owner's dispatcher keeping
+//! them running, and asking them to close a released workspace's windows.
 //! The broker itself (`src/bin/privateer-mcp-broker.rs`) never links this
-//! library. See docs/mcp-broker.md.
+//! library, and this side names no use case: each instance's profile says
+//! what its upstream is and how its windows route. See docs/mcp-broker.md.
 //!
 //! The binary lives at one unversioned path, so a Privateer upgrade changes
 //! neither its path nor its hash, and a started broker outlives dispatcher
-//! restarts: whatever the upstream allowed (Xcode's Allow) stays allowed.
+//! restarts: whatever the upstream allowed stays allowed.
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -20,59 +22,27 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const BINARY: &str = "privateer-mcp-broker";
-/// The one broker this step runs.
-pub const NAME: &str = "xcode";
-const DEFAULT_UPSTREAM: [&str; 2] = ["/usr/bin/xcrun", "mcpbridge"];
-/// How a Mac opens a workspace's window: `-g` keeps the captain's focus.
-#[cfg(target_os = "macos")]
-const DEFAULT_WINDOW_OPEN: &[&str] = &["/usr/bin/open", "-g", "-a", "Xcode"];
-/// How a Mac closes it: every workspace document whose path is the recorded
-/// project or lies below it (Xcode can report `X.xcodeproj` as
-/// `X.xcodeproj/project.xcworkspace`), last first so closing one does not
-/// shift the others. The project path is the script's argument, never part
-/// of the script; nothing matching exits 0; and an Xcode that is not running
-/// is never launched.
-#[cfg(any(target_os = "macos", test))]
-const DEFAULT_WINDOW_CLOSE: &[&str] = &[
-    "/usr/bin/osascript",
-    "-e",
-    "on run argv",
-    "-e",
-    "set wantedPath to item 1 of argv",
-    "-e",
-    "set wantedPrefix to wantedPath & \"/\"",
-    "-e",
-    "if application \"Xcode\" is running then",
-    "-e",
-    "tell application \"Xcode\"",
-    "-e",
-    "set docs to every workspace document",
-    "-e",
-    "repeat with i from (count of docs) to 1 by -1",
-    "-e",
-    "set p to path of (item i of docs)",
-    "-e",
-    "if p is not missing value and (p is wantedPath or p starts with wantedPrefix) then close (item i of docs) saving no",
-    "-e",
-    "end repeat",
-    "-e",
-    "end tell",
-    "-e",
-    "end if",
-    "-e",
-    "end run",
-];
-/// Executables a window helper may not be: a shell would run anything.
-const SHELLS: [&str; 12] = [
-    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "env", "busybox", "xargs",
-];
-/// The longest a release waits for the broker to close a window: longer than
-/// the broker's 30 s helper deadline, so a close helper the broker kills is
-/// reported as the broker's error, not as silence.
+/// The longest a release waits for the brokers to close a workspace's
+/// windows, however many it asks: longer than the broker's 30 s helper
+/// deadline, so a close helper the broker kills is reported as the broker's
+/// error, not as silence.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(35);
+/// macOS's sun_path: a socket path must be shorter than this.
+const SUN_PATH: usize = 104;
 /// The dispatcher looks at most this often.
 const ENSURE_EVERY: Duration = Duration::from_secs(30);
-const USAGE: &str = "usage: privateer mcp-broker install [--workspace-pool ABS]... [--window-open JSON_ARGV] [--window-close JSON_ARGV] [--upstream /ABS/COMMAND [ARG...]] | status | stop";
+const USAGE: &str = "usage: privateer mcp-broker install --name NAME [--profile FILE] [--workspace-pool ABS]... [--window-open JSON_ARGV] [--window-close JSON_ARGV] [--upstream /ABS/COMMAND [ARG...]] | status [--name NAME] | stop --name NAME";
+
+/// An instance name: `^[a-z][a-z0-9-]{0,15}$`. It names every file of the
+/// instance, so it can never hold a path.
+pub fn valid_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=16).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
 
 /// `$XDG_DATA_HOME/privateer/mcp-broker/bin/privateer-mcp-broker`: outside
 /// every release, so upgrades leave it alone.
@@ -82,24 +52,70 @@ pub fn stable_binary() -> Result<PathBuf> {
         .join(BINARY))
 }
 
-/// The sha256 of the config `install` wrote, kept beside the stable binary
-/// and outside the ledger, which sandboxed agents may write. The dispatcher
-/// runs the config's upstream only while it still matches, so an agent that
-/// rewrites the config cannot have the dispatcher run its own command.
-fn config_pin() -> Result<PathBuf> {
-    Ok(crate::releases::data_dir()?.join(format!("mcp-broker/{NAME}.json.sha256")))
+/// Where the config pins live, beside the stable binary.
+fn pin_dir() -> Result<PathBuf> {
+    Ok(crate::releases::data_dir()?.join("mcp-broker"))
 }
 
-/// `$XDG_DATA_HOME/privateer/mcp-broker/run`: the broker's lock, pid,
-/// state, log, socket and config. Sandboxed agents may write the ledger and
-/// the ship homes, never this; and a crew connects to the socket here
+/// The sha256 of the config `install` wrote for `name`, kept beside the
+/// stable binary and outside the ledger, which sandboxed agents may write.
+/// The dispatcher runs the config's upstream only while it still matches,
+/// so an agent that rewrites the config cannot have the dispatcher run its
+/// own command. A name with a pin is an instance.
+fn config_pin(name: &str) -> Result<PathBuf> {
+    Ok(pin_dir()?.join(format!("{name}.json.sha256")))
+}
+
+/// Every instance: each name with a pin, in order.
+fn instances() -> Result<Vec<String>> {
+    let mut names = suffixed(&pin_dir()?, ".json.sha256");
+    names.sort();
+    Ok(names)
+}
+
+/// The valid instance names of the files in `dir` that end in `suffix`.
+fn suffixed(dir: &Path, suffix: &str) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.strip_suffix(suffix)?.to_owned();
+            valid_name(&name).then_some(name)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// `$XDG_DATA_HOME/privateer/mcp-broker/run`: the brokers' locks, pids,
+/// states, logs, sockets and configs. Sandboxed agents may write the ledger
+/// and the ship homes, never this; and a crew connects to a socket here
 /// without being able to replace it (docs/mcp-broker.md).
 pub fn run_dir() -> Result<PathBuf> {
     Ok(crate::releases::data_dir()?.join("mcp-broker/run"))
 }
 
-/// The broker's files in the run directory.
+/// The run directory, refused when it lies inside a directory agents may
+/// write: the ledger or the ship's home.
+fn checked_run_dir(home: Option<&Path>) -> Result<PathBuf> {
+    let dir = run_dir()?;
+    let ledger = crate::jobs::ledger_dir_at(home)?;
+    for writable in [Some(ledger.as_path()), home].into_iter().flatten() {
+        ensure!(
+            !inside(&dir, writable),
+            "the MCP broker's run directory {} lies inside {}, which agents may write; set XDG_DATA_HOME elsewhere",
+            dir.display(),
+            writable.display()
+        );
+    }
+    Ok(dir)
+}
+
+/// One instance's files in the run directory.
 struct Files {
+    name: String,
     dir: PathBuf,
     config: PathBuf,
     stopped: PathBuf,
@@ -112,9 +128,10 @@ struct Files {
 }
 
 impl Files {
-    fn new(dir: PathBuf) -> Self {
-        let at = |suffix: &str| dir.join(format!("{NAME}.{suffix}"));
+    fn new(dir: PathBuf, name: &str) -> Self {
+        let at = |suffix: &str| dir.join(format!("{name}.{suffix}"));
         Self {
+            name: name.to_owned(),
             config: at("json"),
             stopped: at("stopped"),
             lock: at("lock"),
@@ -125,22 +142,6 @@ impl Files {
             windows: at("windows.json"),
             dir,
         }
-    }
-
-    /// The run directory, refused when it lies inside a directory agents
-    /// may write: the ledger or the ship's home.
-    fn resolve(home: Option<&Path>) -> Result<Self> {
-        let dir = run_dir()?;
-        let ledger = crate::jobs::ledger_dir_at(home)?;
-        for writable in [Some(ledger.as_path()), home].into_iter().flatten() {
-            ensure!(
-                !inside(&dir, writable),
-                "the MCP broker's run directory {} lies inside {}, which agents may write; set XDG_DATA_HOME elsewhere",
-                dir.display(),
-                writable.display()
-            );
-        }
-        Ok(Self::new(dir))
     }
 }
 
@@ -170,20 +171,31 @@ fn inside(path: &Path, parent: &Path) -> bool {
 }
 
 pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> {
-    let files = Files::resolve(home)?;
+    let dir = checked_run_dir(home)?;
+    let named = |args: &[String]| -> Result<Option<String>> {
+        match args {
+            [] => Ok(None),
+            [flag, name] if flag == "--name" => Ok(Some(checked_name(name)?)),
+            _ => bail!(USAGE),
+        }
+    };
     let out = match args.first().map(String::as_str) {
         Some("install") => {
             caller.require_operator("mcp-broker install")?;
-            install(&files, &install_options(home, &args[1..])?)?
+            let (name, config) = install_options(home, &dir, &args[1..])?;
+            install(&Files::new(dir, &name), &config)?
         }
-        Some("status") | None if args.len() <= 1 => status(&files)?,
-        Some("stop") if args.len() == 1 => {
+        Some("status") => status(&dir, named(&args[1..])?.as_deref())?,
+        None => status(&dir, None)?,
+        Some("stop") => {
             caller.require_operator("mcp-broker stop")?;
+            let name = named(&args[1..])?.context("mcp-broker stop needs --name NAME")?;
+            let files = Files::new(dir, &name);
             // First, so the dispatcher does not start it again meanwhile.
             private_dir(&files.dir)?;
             write_private(&files.stopped, b"")
                 .with_context(|| format!("cannot write {}", files.stopped.display()))?;
-            json!({"stopped": stop_running(&files)?, "held_until": "mcp-broker install"})
+            json!({"name": name, "stopped": stop_running(&files)?, "held_until": "mcp-broker install"})
         }
         _ => bail!(USAGE),
     };
@@ -191,32 +203,63 @@ pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> 
     Ok(())
 }
 
-/// What `install` records: the upstream, the workspace pools and the window
-/// helpers.
+fn checked_name(name: &str) -> Result<String> {
+    ensure!(
+        valid_name(name),
+        "--name {name:?} must start with a lowercase letter, then at most 15 lowercase letters, digits or -"
+    );
+    Ok(name.to_owned())
+}
+
+/// What `install` records for an instance: its upstream, the workspace
+/// pools, and the profile's label, path arguments and routing, as
+/// check-profile wrote them. A config of #346's shape (upstream only) is
+/// still a plain instance.
 struct Config {
     upstream: Vec<String>,
     pools: Vec<PathBuf>,
-    window_open: Option<Vec<String>>,
-    window_close: Option<Vec<String>>,
+    label: Option<String>,
+    path_arguments: Option<Value>,
+    routing: Option<Value>,
 }
 
 impl Config {
     fn json(&self) -> Value {
         let mut config = json!({"upstream": self.upstream, "workspace_pools": self.pools});
-        if let Some(open) = &self.window_open {
-            config["window_open"] = json!(open);
-        }
-        if let Some(close) = &self.window_close {
-            config["window_close"] = json!(close);
+        for (key, value) in [
+            ("label", self.label.as_ref().map(|label| json!(label))),
+            ("path_arguments", self.path_arguments.clone()),
+            ("routing", self.routing.clone()),
+        ] {
+            if let Some(value) = value {
+                config[key] = value;
+            }
         }
         config
     }
 
-    /// A config `install` wrote, checked again before it is run.
+    /// A config `install` wrote. The broker validates the profile parts
+    /// again when it starts; here only their shape is read.
     fn parse(config: &Value) -> Result<Self> {
+        let map = config
+            .as_object()
+            .context("mcp-broker config is not a JSON object")?;
+        let keys = [
+            "upstream",
+            "workspace_pools",
+            "label",
+            "path_arguments",
+            "routing",
+        ];
+        if let Some(key) = map.keys().find(|key| !keys.contains(&key.as_str())) {
+            bail!("mcp-broker config has an unknown key {key:?}");
+        }
         let upstream: Vec<String> = serde_json::from_value(config["upstream"].clone())
             .context("mcp-broker config has no upstream argv")?;
-        check_upstream(&upstream)?;
+        ensure!(
+            upstream.first().is_some_and(|program| program.starts_with('/')),
+            "mcp-broker config upstream must start with an absolute path"
+        );
         let pools: Vec<PathBuf> = match config.get("workspace_pools") {
             Some(pools) => serde_json::from_value(pools.clone())
                 .context("mcp-broker config workspace_pools is not a list of paths")?,
@@ -229,95 +272,177 @@ impl Config {
                 pool.display()
             );
         }
-        let helper = |key: &str| -> Result<Option<Vec<String>>> {
-            config
-                .get(key)
-                .map(|argv| {
-                    let argv: Vec<String> = serde_json::from_value(argv.clone())
-                        .with_context(|| format!("mcp-broker config {key} is not an argv"))?;
-                    check_helper(&argv)?;
-                    Ok(argv)
-                })
-                .transpose()
+        let label = match config.get("label") {
+            Some(label) => Some(
+                label
+                    .as_str()
+                    .context("mcp-broker config label is not a string")?
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        let part = |key: &str| -> Result<Option<Value>> {
+            match config.get(key) {
+                Some(value) if value.is_object() => Ok(Some(value.clone())),
+                Some(_) => bail!("mcp-broker config {key} is not an object"),
+                None => Ok(None),
+            }
         };
         Ok(Self {
             upstream,
             pools,
-            window_open: helper("window_open")?,
-            window_close: helper("window_close")?,
+            label,
+            path_arguments: part("path_arguments")?,
+            routing: part("routing")?,
         })
     }
 }
 
-/// `install`'s arguments. The workspace pool Privateer itself uses,
+/// `install`'s arguments: the instance's name, and its config. The profile
+/// file is read and the flags override it (`--upstream` its upstream,
+/// `--window-open` and `--window-close` its routing's helpers); then the
+/// shipped broker's `check-profile`, the one validator, gives the canonical
+/// form that is pinned. The workspace pool Privateer itself uses,
 /// `<ledger>/worktrees`, is always there; `--workspace-pool` adds others,
-/// each absolute, normalized and existing. The helpers default to the Mac's
-/// `open` and `osascript`, and to none elsewhere.
-fn install_options(home: Option<&Path>, args: &[String]) -> Result<Config> {
+/// each absolute, normalized and existing.
+fn install_options(home: Option<&Path>, dir: &Path, args: &[String]) -> Result<(String, Config)> {
+    let mut name = None;
+    let mut profile_file = None;
+    let mut extra_pools = vec![];
+    let mut helpers: Vec<(&str, Value)> = vec![];
+    let mut upstream = None;
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let mut value = || rest.next().cloned().context(USAGE);
+        match flag.as_str() {
+            "--name" => name = Some(checked_name(&value()?)?),
+            "--profile" => profile_file = Some(PathBuf::from(value()?)),
+            "--workspace-pool" => extra_pools.push(PathBuf::from(value()?)),
+            "--window-open" | "--window-close" => {
+                let argv: Vec<String> = serde_json::from_str(&value()?)
+                    .with_context(|| format!("{flag} takes a JSON array of strings"))?;
+                let key = if flag == "--window-open" { "open" } else { "close" };
+                helpers.push((key, json!(argv)));
+            }
+            "--upstream" => {
+                let argv: Vec<String> = rest.by_ref().cloned().collect();
+                ensure!(!argv.is_empty(), USAGE);
+                upstream = Some(argv);
+            }
+            _ => bail!(USAGE),
+        }
+    }
+    let name = name.context("mcp-broker install needs --name NAME")?;
+    let socket = Files::new(dir.to_path_buf(), &name).socket;
+    ensure!(
+        socket.as_os_str().len() < SUN_PATH,
+        "the socket path {} is {} bytes, and macOS allows at most {}; set XDG_DATA_HOME to a shorter directory",
+        socket.display(),
+        socket.as_os_str().len(),
+        SUN_PATH - 1
+    );
+    let mut profile = match &profile_file {
+        Some(path) => {
+            let bytes = fs::read(path)
+                .with_context(|| format!("cannot read the profile {}", path.display()))?;
+            ensure!(bytes.len() <= 1 << 20, "the profile is larger than 1 MiB");
+            let profile: Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("the profile {} is not JSON", path.display()))?;
+            ensure!(
+                profile.is_object(),
+                "the profile {} is not a JSON object",
+                path.display()
+            );
+            profile
+        }
+        None => json!({}),
+    };
+    if let Some(argv) = upstream {
+        profile["upstream"] = json!(argv);
+    }
+    for (key, argv) in helpers {
+        let routing = profile
+            .get_mut("routing")
+            .and_then(Value::as_object_mut)
+            .with_context(|| {
+                format!("--window-{key} needs a profile with routing (--profile FILE)")
+            })?;
+        routing.insert(key.to_owned(), argv);
+    }
+    if profile.get("label").is_none() {
+        profile["label"] = json!(name);
+    }
+    let canonical = check_profile(&source_binary()?, &profile)?;
+    let upstream: Vec<String> = match canonical.get("upstream") {
+        Some(argv) => serde_json::from_value(argv.clone())?,
+        None => bail!(
+            "no upstream for {name}: pass --upstream /ABS/COMMAND [ARG...] or set upstream in the profile"
+        ),
+    };
     let own = crate::jobs::ledger_dir_at(home)?.join("worktrees");
     ensure!(own.is_absolute(), "resource_home must be absolute");
+    let mut pools = vec![];
+    for pool in extra_pools {
+        ensure!(
+            normalized(&pool),
+            "--workspace-pool {} must be an absolute, normalized path",
+            pool.display()
+        );
+        ensure!(
+            pool.is_dir(),
+            "--workspace-pool {} does not exist",
+            pool.display()
+        );
+        let real = fs::canonicalize(&pool)?;
+        ensure!(pools.len() < 15, "at most 16 workspace pools");
+        if !pools.contains(&real) {
+            pools.push(real);
+        }
+    }
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&own)
         .with_context(|| format!("cannot make {}", own.display()))?;
-    let mut pools = vec![fs::canonicalize(&own)?];
-    #[cfg(target_os = "macos")]
-    let defaults = |argv: &[&str]| Some(argv.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-    #[cfg(target_os = "macos")]
-    let (mut window_open, mut window_close) = (
-        defaults(DEFAULT_WINDOW_OPEN),
-        defaults(DEFAULT_WINDOW_CLOSE),
-    );
-    #[cfg(not(target_os = "macos"))]
-    let (mut window_open, mut window_close) = (None, None);
-    let mut upstream: Vec<String> = DEFAULT_UPSTREAM.iter().map(|s| s.to_string()).collect();
-    let mut rest = args.iter();
-    while let Some(flag) = rest.next() {
-        let mut value = || rest.next().cloned().context(USAGE);
-        match flag.as_str() {
-            "--workspace-pool" => {
-                let pool = PathBuf::from(value()?);
-                ensure!(
-                    normalized(&pool),
-                    "--workspace-pool {} must be an absolute, normalized path",
-                    pool.display()
-                );
-                ensure!(
-                    pool.is_dir(),
-                    "--workspace-pool {} does not exist",
-                    pool.display()
-                );
-                let real = fs::canonicalize(&pool)?;
-                ensure!(pools.len() < 16, "at most 16 workspace pools");
-                if !pools.contains(&real) {
-                    pools.push(real);
-                }
-            }
-            "--window-open" | "--window-close" => {
-                let argv: Vec<String> = serde_json::from_str(&value()?)
-                    .with_context(|| format!("{flag} takes a JSON array of strings"))?;
-                check_helper(&argv)?;
-                if flag == "--window-open" {
-                    window_open = Some(argv);
-                } else {
-                    window_close = Some(argv);
-                }
-            }
-            "--upstream" => {
-                upstream = rest.by_ref().cloned().collect();
-                ensure!(!upstream.is_empty(), USAGE);
-            }
-            _ => bail!(USAGE),
-        }
+    let own = fs::canonicalize(&own)?;
+    pools.retain(|pool| *pool != own);
+    pools.insert(0, own);
+    Ok((
+        name,
+        Config {
+            upstream,
+            pools,
+            label: canonical["label"].as_str().map(str::to_owned),
+            path_arguments: canonical.get("path_arguments").cloned(),
+            routing: canonical.get("routing").cloned(),
+        },
+    ))
+}
+
+/// Run the broker's `check-profile` on `profile`: its canonical JSON, or
+/// the one line it refused the profile with.
+fn check_profile(binary: &Path, profile: &Value) -> Result<Value> {
+    let mut child = Command::new(binary)
+        .arg("check-profile")
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("cannot run {} check-profile", binary.display()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        io::Write::write_all(&mut stdin, profile.to_string().as_bytes())?;
     }
-    check_upstream(&upstream)?;
-    Ok(Config {
-        upstream,
-        pools,
-        window_open,
-        window_close,
-    })
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().next().unwrap_or("").trim();
+        bail!(
+            "the profile is refused: {}",
+            first.chars().take(500).collect::<String>()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("check-profile printed no JSON")
 }
 
 /// Absolute, with no `.`, `..` or trailing slash.
@@ -333,45 +458,6 @@ fn normalized(path: &Path) -> bool {
         && (text == "/" || !text.ends_with('/'))
         && !text.contains("//")
         && !text.split('/').any(|part| part == "." || part == "..")
-}
-
-/// A window helper: checked like the upstream, and never a shell.
-fn check_helper(argv: &[String]) -> Result<()> {
-    check_upstream(argv).context("a window helper is checked like the upstream")?;
-    let base = Path::new(&argv[0])
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    ensure!(
-        !SHELLS.contains(&base.as_str()),
-        "a window helper may not be {base}"
-    );
-    Ok(())
-}
-
-/// An argv whose executable is an absolute, normalized path.
-fn check_upstream(upstream: &[String]) -> Result<()> {
-    ensure!(
-        (1..=32).contains(&upstream.len()),
-        "the upstream command has 1 to 32 arguments"
-    );
-    ensure!(
-        upstream
-            .iter()
-            .all(|a| a.len() <= 4096 && !a.chars().any(char::is_control)),
-        "an upstream argument is too long or holds a control character"
-    );
-    let program = Path::new(&upstream[0]);
-    ensure!(
-        program.is_absolute()
-            && program.components().all(|c| matches!(
-                c,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            ))
-            && !upstream[0].ends_with('/'),
-        "the upstream command must start with an absolute, normalized path"
-    );
-    Ok(())
 }
 
 /// The broker this Privateer was shipped with: its release's, or the one
@@ -480,8 +566,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Copy the shipped broker to the stable path unless that already holds the
-/// same version (then nothing changes, not even the inode), and record the
-/// upstream the dispatcher starts it with.
+/// same version (then nothing changes, not even the inode), and record and
+/// pin the instance's config, which the dispatcher starts it with.
 fn install(files: &Files, wanted: &Config) -> Result<Value> {
     let upstream = &wanted.upstream;
     let source = source_binary()?;
@@ -516,13 +602,14 @@ fn install(files: &Files, wanted: &Config) -> Result<Value> {
     private_dir(&files.dir)?;
     let config = serde_json::to_vec(&wanted.json())?;
     write_private(
-        &config_pin()?,
+        &config_pin(&files.name)?,
         format!("{:x}\n", Sha256::digest(&config)).as_bytes(),
     )?;
     write_private(&files.config, &config)?;
     let _ = fs::remove_file(&files.stopped);
     let sha256 = sha256_file(&target)?;
     Ok(json!({
+        "name": files.name,
         "action": action,
         "binary": target,
         "version": version,
@@ -530,8 +617,9 @@ fn install(files: &Files, wanted: &Config) -> Result<Value> {
         "config": files.config,
         "upstream": upstream,
         "workspace_pools": wanted.pools,
-        "window_open": wanted.window_open,
-        "window_close": wanted.window_close,
+        "label": wanted.label,
+        "path_arguments": wanted.path_arguments,
+        "routing": wanted.routing,
         "socket": files.socket,
         // What a crew bundle pins: this command, with `sha256`.
         "bundle_command": [target, "proxy", "--socket", files.socket],
@@ -540,9 +628,37 @@ fn install(files: &Files, wanted: &Config) -> Result<Value> {
     }))
 }
 
-fn status(files: &Files) -> Result<Value> {
+/// The stable binary, and every instance (or only `only`): its config,
+/// files, and the running broker's own report.
+fn status(dir: &Path, only: Option<&str>) -> Result<Value> {
     let binary = stable_binary()?;
     let installed = binary.is_file();
+    let names = match only {
+        Some(name) => {
+            ensure!(
+                config_pin(name)?.exists(),
+                "no MCP broker instance {name}: privateer mcp-broker install --name {name}"
+            );
+            vec![name.to_owned()]
+        }
+        None => instances()?,
+    };
+    let mut reports = Map::new();
+    for name in names {
+        let files = Files::new(dir.to_path_buf(), &name);
+        reports.insert(name, instance_status(&files));
+    }
+    Ok(json!({
+        "binary": binary,
+        "installed": installed,
+        "version": installed.then(|| version_of(&binary).ok()).flatten(),
+        "sha256": installed.then(|| sha256_file(&binary).ok()).flatten(),
+        "run_dir": dir,
+        "instances": reports,
+    }))
+}
+
+fn instance_status(files: &Files) -> Value {
     let running = lock_held(&files.lock);
     let read = |path: &Path| -> Value {
         read_checked(path)
@@ -550,15 +666,14 @@ fn status(files: &Files) -> Result<Value> {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(Value::Null)
     };
-    Ok(json!({
-        "binary": binary,
-        "installed": installed,
-        "version": installed.then(|| version_of(&binary).ok()).flatten(),
-        "sha256": installed.then(|| sha256_file(&binary).ok()).flatten(),
-        "run_dir": files.dir,
+    let config = read(&files.config);
+    json!({
         "config": files.config,
-        "upstream": read(&files.config)["upstream"],
-        "workspace_pools": read(&files.config)["workspace_pools"],
+        "configured": !config.is_null(),
+        "label": config.get("label").cloned().unwrap_or_else(|| json!(files.name)),
+        "upstream": config["upstream"],
+        "workspace_pools": config["workspace_pools"],
+        "routing": config.get("routing").is_some(),
         // The windows the broker opened and will close on release.
         "windows": read(&files.windows)["windows"],
         "stopped": files.stopped.exists(),
@@ -568,7 +683,7 @@ fn status(files: &Files) -> Result<Value> {
         "log": files.log,
         // The broker's own report: upstream state, pid, restarts, clients.
         "broker": if running { read(&files.state) } else { Value::Null },
-    }))
+    })
 }
 
 /// Whether a broker holds the lock. Holding it here, for the instant this
@@ -744,17 +859,7 @@ fn stop_running(files: &Files) -> Result<Value> {
     }))
 }
 
-/// What asking the broker to close a workspace's windows came to.
-#[derive(Debug)]
-pub enum CloseOutcome {
-    /// The broker closed these projects' windows; none when the record
-    /// lists no window under the root, in which case it was not asked.
-    Closed(Vec<PathBuf>),
-    /// No broker runs; any window it opened stays open (and is audited).
-    NotRunning,
-}
-
-/// The windows `xcode.windows.json` records under `root`, read under the
+/// The windows `NAME.windows.json` records under `root`, read under the
 /// same link and owner checks as every broker file. Unreadable means none.
 fn recorded_under(files: &Files, root: &Path) -> Vec<Value> {
     read_checked(&files.windows)
@@ -771,29 +876,65 @@ fn recorded_under(files: &Files, root: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// Ask the running broker to close every Xcode window it opened under
-/// `root` (`{"privateer_control":1,"close_workspace":ROOT}`), within 35 s.
-/// The broker is asked only when its record lists a window under `root`,
-/// so a broker that hangs holds up only the release of a workspace it
-/// opened a window for. A broker that answers with an error, or does not
-/// answer in time, is an error.
-pub(crate) fn close_workspace(store: &Store, root: &Path) -> Result<CloseOutcome> {
+/// Ask every broker that records a window under `root` to close it, before
+/// the workspace is released. Each instance's `NAME.windows.json` is read
+/// first, and an instance that records nothing under `root` is never
+/// asked, so a broker that hangs holds up only the release of a workspace
+/// it opened a window for. A recorded but stopped instance cannot close
+/// anything: its windows are audited (`workspace.mcp_window_unclosed`) and
+/// the release goes on. The running ones are asked in parallel under one
+/// deadline, so the release waits at most 35 s however many there are; an
+/// instance that answers with an error, or not in time, refuses it.
+pub(crate) fn release_workspace(store: &Store, root: &Path) -> Result<()> {
     // No run directory this home could use means no broker to ask.
-    let Ok(files) = Files::resolve(Some(store.home())) else {
-        return Ok(CloseOutcome::NotRunning);
+    let Ok(dir) = checked_run_dir(Some(store.home())) else {
+        return Ok(());
     };
-    let left = recorded_under(&files, root);
-    if left.is_empty() {
-        return Ok(CloseOutcome::Closed(vec![]));
-    }
-    if fs::symlink_metadata(&files.socket).is_err() || !lock_held(&files.lock) {
-        store.audit(
-            "workspace.xcode_window_unclosed",
-            &json!({"root": root, "windows": left, "reason": "the MCP broker is not running"}),
-        )?;
-        return Ok(CloseOutcome::NotRunning);
+    let mut asked = vec![];
+    for name in suffixed(&dir, ".windows.json") {
+        let files = Files::new(dir.clone(), &name);
+        let left = recorded_under(&files, root);
+        if left.is_empty() {
+            continue;
+        }
+        if fs::symlink_metadata(&files.socket).is_err() || !lock_held(&files.lock) {
+            store.audit(
+                "workspace.mcp_window_unclosed",
+                &json!({"instance": name, "root": root, "windows": left,
+                    "reason": "the MCP broker is not running"}),
+            )?;
+            continue;
+        }
+        asked.push(files);
     }
     let deadline = Instant::now() + CLOSE_TIMEOUT;
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let asking: Vec<_> = asked
+            .iter()
+            .map(|files| (&files.name, scope.spawn(move || ask_close(files, root, deadline))))
+            .collect();
+        asking
+            .into_iter()
+            .filter_map(|(name, asking)| {
+                let error = match asking.join() {
+                    Ok(Ok(_)) => return None,
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(_) => "the close panicked".to_owned(),
+                };
+                Some(format!(
+                    "could not close the {name} window for this workspace: {error}"
+                ))
+            })
+            .collect()
+    });
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+
+/// Ask the running instance `files` names to close every window it opened
+/// under `root` (`{"privateer_control":1,"close_workspace":ROOT}`) by
+/// `deadline`: the projects it closed, or why not.
+fn ask_close(files: &Files, root: &Path, deadline: Instant) -> Result<Vec<PathBuf>> {
     let silent = || {
         format!(
             "the MCP broker did not answer within {} s",
@@ -861,9 +1002,8 @@ pub(crate) fn close_workspace(store: &Store, root: &Path) -> Result<CloseOutcome
     if let Some(error) = answer.get("error") {
         bail!("{}", error.as_str().unwrap_or("the MCP broker refused"));
     }
-    let closed: Vec<PathBuf> = serde_json::from_value(answer["closed"].clone())
-        .context("the MCP broker's answer names no closed windows")?;
-    Ok(CloseOutcome::Closed(closed))
+    serde_json::from_value(answer["closed"].clone())
+        .context("the MCP broker's answer names no closed windows")
 }
 
 /// Connect to the Unix socket at `path` by `deadline` without ever
@@ -1030,9 +1170,11 @@ fn peer_uid(fd: std::os::fd::RawFd) -> Result<u32> {
 /// When this process last looked.
 static LAST_ENSURE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
-/// Keep the configured broker running, from the machine owner's dispatcher
-/// only, at most every 30 s. It starts the installed binary when none runs,
-/// never installs or replaces it, and stops a broker whose config is gone.
+/// Keep every configured instance running, from the machine owner's
+/// dispatcher only, at most every 30 s for all of them. It starts the
+/// installed binary for an instance none runs, never installs or replaces
+/// it, and stops an instance whose config is gone. Each instance's outcome
+/// is its own: one's error never skips another. Null when nothing happened.
 pub(crate) fn ensure(store: &Store) -> Value {
     if let Ok(mut last) = LAST_ENSURE.lock() {
         if last.is_some_and(|at| at.elapsed() < ENSURE_EVERY) {
@@ -1040,19 +1182,44 @@ pub(crate) fn ensure(store: &Store) -> Value {
         }
         *last = Some(Instant::now());
     }
-    ensure_now(store).unwrap_or_else(
-        |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
-    )
+    ensure_all(store).unwrap_or_else(|error| json!({"error": clipped(&error)}))
 }
 
-fn ensure_now(store: &Store) -> Result<Value> {
+fn clipped(error: &anyhow::Error) -> String {
+    format!("{error:#}").chars().take(2_000).collect()
+}
+
+fn ensure_all(store: &Store) -> Result<Value> {
     if crate::machines::owner_here(store)?.is_none() {
         return Ok(Value::Null);
     }
-    let files = Files::resolve(Some(store.home()))?;
+    let dir = checked_run_dir(Some(store.home()))?;
+    let mut outcomes = Map::new();
+    for name in instances()? {
+        let files = Files::new(dir.clone(), &name);
+        match ensure_one(&files) {
+            Ok(Value::Null) => {}
+            Ok(outcome) => {
+                outcomes.insert(name, outcome);
+            }
+            Err(error) => {
+                outcomes.insert(name, json!({"error": clipped(&error)}));
+            }
+        }
+    }
+    Ok(if outcomes.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(outcomes)
+    })
+}
+
+/// One instance: stopped if its config is gone, left alone while stopped
+/// or running, and otherwise started from its pinned config.
+fn ensure_one(files: &Files) -> Result<Value> {
     if !files.config.exists() {
         return Ok(if lock_held(&files.lock) {
-            json!({"stopped": stop_running(&files)?})
+            json!({"stopped": stop_running(files)?})
         } else {
             Value::Null
         });
@@ -1062,23 +1229,21 @@ fn ensure_now(store: &Store) -> Result<Value> {
     }
     let binary = stable_binary()?;
     if !binary.is_file() {
-        return Ok(
-            json!({"error": "the broker is configured but not installed: privateer mcp-broker install"}),
-        );
+        bail!("the broker is configured but not installed: privateer mcp-broker install");
     }
     let bytes = read_checked(&files.config)
         .with_context(|| format!("cannot read {}", files.config.display()))?;
-    let pinned = read_checked(&config_pin()?)
+    let pinned = read_checked(&config_pin(&files.name)?)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
-    if pinned.trim() != format!("{:x}", Sha256::digest(&bytes)) {
-        return Ok(
-            json!({"error": "the broker config differs from what mcp-broker install wrote; not starting it"}),
-        );
-    }
+    ensure!(
+        pinned.trim() == format!("{:x}", Sha256::digest(&bytes)),
+        "the {} config differs from what mcp-broker install wrote; not starting it",
+        files.name
+    );
     let config = Config::parse(&serde_json::from_slice(&bytes)?)?;
     private_dir(&files.dir)?;
-    Ok(json!({"started": start(&binary, &files, &config)?}))
+    Ok(json!({"started": start(&binary, files, &config)?}))
 }
 
 /// Start `serve` detached: its own session, stdio on the log, no descriptor
@@ -1095,16 +1260,19 @@ fn start(binary: &Path, files: &Files, config: &Config) -> Result<u32> {
         .arg("--state-dir")
         .arg(&files.dir)
         .arg("--name")
-        .arg(NAME);
+        .arg(&files.name);
+    if let Some(label) = &config.label {
+        command.arg("--label").arg(label);
+    }
     for pool in &config.pools {
         command.arg("--workspace-pool").arg(pool);
     }
-    for (flag, helper) in [
-        ("--window-open", &config.window_open),
-        ("--window-close", &config.window_close),
+    for (flag, part) in [
+        ("--path-arguments", &config.path_arguments),
+        ("--routing", &config.routing),
     ] {
-        if let Some(argv) = helper {
-            command.arg(flag).arg(serde_json::to_string(argv)?);
+        if let Some(part) = part {
+            command.arg(flag).arg(part.to_string());
         }
     }
     command
@@ -1169,11 +1337,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let victim = temp.path().join("victim");
         fs::write(&victim, "untouched").unwrap();
-        let path = temp.path().join("xcode.json");
+        let path = temp.path().join("fake.json");
         // The temp name this process would use, and the target, both links.
         let planted = temp
             .path()
-            .join(format!(".xcode.json.{}.tmp", std::process::id()));
+            .join(format!(".fake.json.{}.tmp", std::process::id()));
         symlink(&victim, &planted).unwrap();
         symlink(&victim, &path).unwrap();
         write_private(&path, b"{}").unwrap();
@@ -1218,17 +1386,22 @@ mod tests {
     }
 
     #[test]
-    fn the_mac_close_script_is_a_valid_helper_that_never_interpolates() {
-        let argv: Vec<String> = DEFAULT_WINDOW_CLOSE.iter().map(|s| s.to_string()).collect();
-        check_helper(&argv).unwrap();
-        assert!(
-            argv.iter()
-                .all(|line| !line.contains('{') && !line.contains("do shell"))
-        );
-        assert!(
-            argv.iter()
-                .any(|line| line == "set wantedPath to item 1 of argv")
-        );
+    fn instance_names_are_short_lowercase_slugs() {
+        for good in ["fake", "two", "a", "x1-y", "abcdefghijklmnop"] {
+            assert!(valid_name(good), "{good}");
+        }
+        for bad in ["", "Fake", "1x", "-x", "../x", "a/b", "abcdefghijklmnopq", "a_b", "a.b"] {
+            assert!(!valid_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_config_of_the_first_shape_parses_and_unknown_keys_do_not() {
+        let plain = Config::parse(&json!({"upstream": ["/opt/x/mcp", "serve"]})).unwrap();
+        assert!(plain.routing.is_none() && plain.label.is_none() && plain.pools.is_empty());
+        assert!(Config::parse(&json!({"upstream": ["/x"], "window_open": ["/y"]})).is_err());
+        assert!(Config::parse(&json!({"upstream": ["x"]})).is_err());
+        assert!(Config::parse(&json!({"upstream": ["/x"], "routing": []})).is_err());
     }
 
     #[test]
