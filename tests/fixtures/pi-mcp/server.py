@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Authless stdio MCP fake. JSONL markers contain no environment/credential values."""
+"""Authless stdio MCP fake. JSONL markers contain no environment/credential
+values: the start marker lists the environment's names only.
+
+Modes: normal, disconnected, hang-init; stubborn starts a grandchild that
+ignores SIGTERM in this process group, escaped one that also leaves it
+(setsid). Each child's pid and start time are recorded, so a test can show
+it is gone."""
 import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
+
+# A grandchild that outlives a polite stop: SIGTERM ignored, closed stdio.
+STUBBORN = 'import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nwhile True: time.sleep(1)\n'
 
 
 def tools():
@@ -41,7 +51,15 @@ def main():
         with marker.open('a') as stream:
             stream.write(json.dumps({'event': event, **fields}) + '\n')
     record('start', pid=os.getpid(), pgid=os.getpgrp(),
-           start=Path('/proc/self/stat').read_text().split()[21])
+           start=Path('/proc/self/stat').read_text().split()[21], env=sorted(os.environ))
+    if mode in ('stubborn', 'escaped'):
+        child = subprocess.Popen([sys.executable, '-I', '-c', STUBBORN], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=mode == 'escaped')
+        # Its start time, once the kernel has it, names this process and no reuse.
+        stat = Path(f'/proc/{child.pid}/stat').read_text()
+        record('child', pid=child.pid, pgid=os.getpgid(child.pid),
+               start=stat[stat.rindex(')') + 2:].split()[19])
     def stop(_sig, _frame):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
@@ -67,6 +85,28 @@ def main():
             print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
     finally:
         record('stop')
+
+
+def alive(event):
+    """True while the recorded process runs: same pid and start time, not a zombie."""
+    try:
+        stat = Path(f"/proc/{event['pid']}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    fields = stat[stat.rindex(')') + 2:].split()
+    return fields[0] != 'Z' and fields[19] == event['start']
+
+
+def outliving(events, grace=3):
+    """The fake's recorded processes still running after `grace` seconds, then
+    killed: a native probe runs outside a job, so nothing else would end them."""
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(alive(e) for e in events if e['event'] in ('start', 'child')):
+        time.sleep(0.1)
+    found = [e for e in events if e['event'] in ('start', 'child') and alive(e)]
+    for event in found:
+        os.kill(event['pid'], 9)
+    return found
 
 
 if __name__ == '__main__':

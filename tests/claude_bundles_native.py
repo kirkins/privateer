@@ -8,6 +8,7 @@ then kills the process. A disposable HOME/CLAUDE_CONFIG_DIR/XDG holds seeded
 personal resources which must not load; real user state is never touched.
 Without an explicit binary the suite skips, and a skip is not evidence.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'plugins'))
 import bundles
 import claude_bundles
+sys.path.insert(0, str(ROOT / 'tests/fixtures/pi-mcp'))
+from server import outliving
+
+STDIO_SERVER = ROOT / 'tests/fixtures/pi-mcp/server.py'
+SENTINEL_TOKEN = 'SENTINEL-' + '0b6f1e3a9c2d4e8f'
 
 NATIVE = Path(sys.argv.pop(1)).absolute() if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else None
 
@@ -39,7 +45,7 @@ class NativeInventory(unittest.TestCase):
             raise unittest.SkipTest('explicit installed native Claude required; skip is not evidence')
         temp = tempfile.TemporaryDirectory(prefix='privateer-claude-native-')
         self.addCleanup(temp.cleanup)
-        base = Path(temp.name).resolve()
+        self.base = base = Path(temp.name).resolve()
         config = base / 'home/.claude'
         self.marker = base / 'ambient-hook-ran'
         # Seeded personal resources: a skill, a hook and an MCP server.
@@ -107,6 +113,65 @@ class NativeInventory(unittest.TestCase):
         self.assertEqual(init.get('model', '').split('-')[1:2], ['sonnet'], 'carried model setting')
         self.assertFalse([e for e in events if 'hook' in str(e.get('subtype', ''))])
         self.assertFalse(self.marker.exists())
+
+
+    def test_selected_stdio_server_env_ambient_and_lifetime(self):
+        """A pinned stdio server through the real launcher and claude_turn: it
+        connects with tools at init, the user's and project's stdio servers never
+        start, and the fake records the environment names Claude passes it.
+        Reports which of its processes outlive the run; the job's teardown ends
+        those (tests/tool_bundles.rs proves it)."""
+        markers = {name: self.base / f'{name}.jsonl' for name in ('ambient-project', 'ambient-user', 'selected')}
+        def server(name, mode='normal'):
+            return {'type': 'stdio', 'command': sys.executable,
+                    'args': [str(STDIO_SERVER), str(markers[name]), name, mode]}
+        (self.repo / '.mcp.json').write_text(json.dumps({'mcpServers': {'ambient-project': server('ambient-project')}}))
+        for config in (self.base / 'home/.claude.json', Path(self.env['CLAUDE_CONFIG_DIR']) / '.claude.json'):
+            config.write_text(json.dumps({'mcpServers': {'ambient-user': server('ambient-user')}}))
+        directory = self.base / 'fleet.credentials'
+        directory.mkdir(mode=0o700)
+        (directory / 'stdio-token').write_text(SENTINEL_TOKEN + '\n')
+        (directory / 'stdio-token').chmod(0o600)
+        python = os.path.realpath(sys.executable)
+        registry = {'schema_version': 1, 'pi_version': '1.2.0', 'claude_version': self.plan['claude_version'],
+                    'integrations': {'reviewed': True, 'extensions': []},
+                    'bundles': [{'ref': 'stdio@1', 'roles': ['crew'],
+                                 'credentials': [{'name': 'STDIO_TOKEN', 'ref': 'stdio-token'}],
+                                 'mcp_servers': [{'name': 'fixture', 'credential': 'STDIO_TOKEN', 'timeout': 10,
+                                                  'command': [python, '-I', str(STDIO_SERVER), str(markers['selected']),
+                                                              'selected', 'stubborn'],
+                                                  'sha256': hashlib.sha256(Path(python).read_bytes()).hexdigest()}]}]}
+        env = dict(self.env, PRIVATEER_PROBE_AMBIENT='1', CLAUDE_CODE_MAX_RETRIES='0')
+        with patch.dict(os.environ, env, clear=True):
+            plan = bundles.plan(registry, ['stdio@1'], 'crew', 'claude')
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(plan),
+                              '--control', '{}', 'claude', 'claude', '--print', '--verbose', '--output-format',
+                              'stream-json', '--no-session-persistence', '--', 'Reply with one word.'],
+                             cwd=self.repo, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=300)
+        events = [json.loads(line) for line in markers['selected'].read_text().splitlines()] \
+            if markers['selected'].exists() else []
+        survivors = outliving(events)
+        lines = [json.loads(line) for line in run.stdout.splitlines() if line.startswith('{')]
+        init = next(e for e in lines if e.get('type') == 'system' and e.get('subtype') == 'init')
+        self.assertEqual([(s['name'], s['status']) for s in init['mcp_servers']], [('fixture', 'connected')])
+        self.assertTrue(any(tool.startswith('mcp__fixture__') for tool in init['tools']))
+        # claude_turn's init check passed: a failure there names mcp-unavailable or mcp-foreign.
+        self.assertFalse([e for e in lines if 'mcp-' in str(e.get('reason', ''))])
+        self.assertFalse(markers['ambient-project'].exists())
+        self.assertFalse(markers['ambient-user'].exists())
+        starts = [e for e in events if e['event'] == 'start']
+        self.assertTrue(starts)
+        names = starts[0]['env']
+        self.assertIn('PRIVATEER_CREDENTIAL_STDIO_TOKEN_FILE', names)
+        self.assertNotIn(SENTINEL_TOKEN, markers['selected'].read_text() + run.stdout + run.stderr)
+        config = next(Path(a.split('=', 1)[1]) for a in claude_bundles.preflight(plan, ['claude', '--print', '--', 'x'],
+                                                                                cwd=self.repo, env=env)
+                      if a.startswith('--mcp-config='))
+        self.assertNotIn(SENTINEL_TOKEN, config.read_text())
+        print(json.dumps({'case': 'selected-stdio', 'native_claude': self.plan['claude_version'],
+                          'exit': run.returncode, 'starts': len(starts), 'env_names': names,
+                          'outliving_claude': [e['event'] for e in survivors]}), file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':
