@@ -126,6 +126,9 @@ pub struct Settings {
     /// How far ahead a falling free-space rate may reach the floor before the
     /// machine's owner is warned. 0 warns only once the floor is crossed.
     pub disk_warn_horizon_secs: u64,
+    /// How long a disk alert must stay raised before the machine's owner may
+    /// propose moving one of its ships elsewhere.
+    pub pressure_after_secs: u64,
     /// Build output (`target` directories) that released worktree slots of a
     /// pool may keep. Beyond it, the least recently released slots are
     /// trimmed. 0 keeps none.
@@ -153,6 +156,7 @@ impl Default for Settings {
             },
             ramp_secs: 60,
             disk_warn_horizon_secs: 24 * 60 * 60,
+            pressure_after_secs: 4 * 60 * 60,
             workspace_cache_budget_bytes: 8 * GIB,
             crew_default_memory_bytes: 2 * GIB,
             crew_memory_bytes: BTreeMap::new(),
@@ -337,6 +341,12 @@ fn effective(raw: &Map<String, Value>) -> Result<Settings> {
                     value.as_u64().filter(|v| *v <= 30 * 86_400).context(
                         "disk_warn_horizon_secs must be 0..2592000 (0 warns only below the floor)",
                     )?;
+            }
+            "pressure_after_secs" => {
+                settings.pressure_after_secs = value
+                    .as_u64()
+                    .filter(|v| *v <= 30 * 86_400)
+                    .context("pressure_after_secs must be 0..2592000")?;
             }
             "workspace_cache_budget_bytes" => {
                 settings.workspace_cache_budget_bytes = bytes(value, key)?;

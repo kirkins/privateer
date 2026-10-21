@@ -103,6 +103,8 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
         ("machines", "offers", "TEXT"),
         ("machine_ships", "requires", "TEXT NOT NULL DEFAULT '[]'"),
         ("machine_ships", "pinned", "TEXT"),
+        ("machines", "placement", "TEXT"),
+        ("machines", "calls_here", "TEXT"),
     ] {
         let present: bool = migrate.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"),
@@ -119,13 +121,14 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     crate::snapshot::init(conn)?;
     crate::usage_carry::init(conn)?;
     crate::capabilities::init(conn)?;
+    crate::placement::init(conn)?;
     Ok(())
 }
 
 /// Whether this registry has ever been linked with another machine, read
 /// without opening it for writing: a dispatcher pass in a fleet with no
 /// links never touches the registry.
-fn ever_linked(path: &std::path::Path) -> bool {
+pub(crate) fn ever_linked(path: &std::path::Path) -> bool {
     Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .and_then(|conn| {
             conn.query_row(
@@ -817,6 +820,34 @@ pub(crate) fn alert_owner(store: &Store) -> Value {
             }
         }
         tx.commit()?;
+        // The machine keeps the disk alerts' clock, so a proposal to move a
+        // ship can wait for pressure that lasts; a lasting one's notice gains
+        // a sentence saying where to look.
+        let keys: Vec<&str> = problems.iter().map(|(key, _)| key.as_str()).collect();
+        crate::placement::note_pressure(&conn, &keys)?;
+        for (key, held) in crate::placement::newly_persistent(&conn)? {
+            let Some((_, body)) = problems.iter().find(|(k, _)| *k == key) else {
+                continue;
+            };
+            if !duty.is_empty() {
+                crate::mail::record_crew(
+                    db,
+                    &json!({"id": format!("machine-{key}-lasting-{}", Store::now_ms()), "to": ship,
+                        "kind": "notice", "task_id": duty, "urgency": "normal",
+                        "body": format!("This machine needs you: {body} {}",
+                            crate::placement::persistent_sentence(held)),
+                        "payload": {"machine_alert": key, "lasting": true}}),
+                )?;
+            }
+            sent.push(json!({"lasting": key}));
+        }
+        match crate::placement::upkeep(&conn, store) {
+            Ok(changed) if changed.as_array().is_some_and(|c| !c.is_empty()) => {
+                sent.push(json!({"placement": changed}));
+            }
+            Ok(_) => {}
+            Err(error) => sent.push(json!({"placement_error": format!("{error:#}")})),
+        }
         Ok(json!(sent))
     };
     work().unwrap_or_else(
@@ -1057,6 +1088,14 @@ fn offers_of(conn: &Connection, machine: &str) -> Result<Value> {
         .unwrap_or(Value::Null))
 }
 
+/// Take in what a linked machine said about placement. Best effort: a frame
+/// that cannot be kept never stops the exchange or the mail.
+fn absorb_placement(conn: &Connection, machine: &str, frame: &Value) {
+    if let Err(error) = crate::placement::absorb(conn, machine, frame) {
+        eprintln!("privateer: placement from {machine} was not kept: {error:#}");
+    }
+}
+
 fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
     let response = crate::peers::call_config(
         &machine.peer,
@@ -1089,6 +1128,9 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     if let Some(offers) = crate::capabilities::offered(conn) {
         body["offers"] = offers;
     }
+    if let Some(frame) = crate::placement::frame(conn, &machine.name) {
+        body["placement"] = frame;
+    }
     let result = call(machine, "fleet.link", with_stows(body, conn), timeout)?;
     let theirs = parse_directory(&result["ships"])?;
     let clashing = clashes(conn, &theirs)?;
@@ -1100,6 +1142,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     record(conn, machine, &theirs)?;
     absorb(conn, &machine.name, &result["stows"])?;
     keep_offers(conn, &machine.name, &result["offers"])?;
+    absorb_placement(conn, &machine.name, &result["placement"]);
     // An older peer sends no flag, so its directory only adds ships.
     install_everywhere(conn, machine, &theirs, is_complete(&result))?;
     Ok(theirs)
@@ -1661,7 +1704,11 @@ fn collect(
     {
         args["usage"] = usage;
     }
+    if let Some(frame) = crate::placement::frame(conn, &machine.name) {
+        args["placement"] = frame;
+    }
     let result = call(machine, "fleet.collect", args, Some(timeout))?;
+    absorb_placement(conn, &machine.name, &result["placement"]);
     // It answers the cursor it stored only when it kept the rows.
     if result["usage"].is_object() {
         let _ = crate::usage_carry::advance(conn, &machine.name, &result["usage"]);
@@ -2295,6 +2342,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             // what it offers; this one answers with its own offers.
             crate::capabilities::absorb(&conn, name, &args["capabilities"])?;
             keep_offers(&conn, name, &args["offers"])?;
+            absorb_placement(&conn, name, &args["placement"]);
             // The machine that reached us carries its stow state in the same
             // exchange, so a request here bound to a stow there resolves now.
             let ended = absorb(&conn, name, args.get("stows").unwrap_or(&Value::Null))?;
@@ -2303,6 +2351,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 json!({"ships": directory(&ours), "complete": complete, "requests_ended": ended});
             if let Some(offers) = crate::capabilities::offered(&conn) {
                 answer["offers"] = offers;
+            }
+            if let Some(frame) = crate::placement::frame(&conn, name) {
+                answer["placement"] = frame;
             }
             Ok(with_stows(answer, &conn))
         }
@@ -2336,6 +2387,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let usage = args
                 .get("usage")
                 .and_then(|carried| crate::usage_carry::absorb(&conn, &machine.name, carried).ok());
+            // Before the mail is gathered: a check answered there writes the
+            // decision here, and it goes out with this collect.
+            absorb_placement(&conn, &machine.name, &args["placement"]);
             // Mail to the captain from before the link stays here.
             let linked_ms: i64 = conn.query_row(
                 "SELECT added_ms FROM machines WHERE name=?1",
@@ -2380,6 +2434,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let mut answer = json!({"messages": messages, "requests_ended": ended});
             if let Some(usage) = usage {
                 answer["usage"] = usage;
+            }
+            if let Some(frame) = crate::placement::frame(&conn, &machine.name) {
+                answer["placement"] = frame;
             }
             Ok(with_stows(answer, &conn))
         }

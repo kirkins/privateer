@@ -119,6 +119,13 @@ fn run() -> Result<()> {
         std::process::exit(code);
     }
     let caller = caller?;
+    // A dispatcher's detached placement runner belongs to the machine, not to
+    // the home it was started from, which the move may take away.
+    if command.as_deref() == Some("_placement-run") {
+        caller.require_operator("_placement-run")?;
+        println!("{}", privateer::placement::runner()?);
+        return Ok(());
+    }
     if command.as_deref() == Some("permissions") && !json_given && !file_given {
         return privateer::permissions::cli(&positional, &caller);
     }

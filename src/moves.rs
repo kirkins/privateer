@@ -252,6 +252,55 @@ fn projects(folder: &Path) -> Result<(Vec<Value>, Vec<String>)> {
     Ok((found, problems))
 }
 
+/// What cloning a ship's projects afresh puts on disk: each project's git
+/// objects and its tracked files, without the build caches and other ignored
+/// files a folder gathers. A project git cannot read counts whole.
+pub(crate) fn clone_bytes(folder: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(folder.join("projects")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| {
+            let path = e.path();
+            cloned_bytes(&path).unwrap_or_else(|| crate::placement::tree_bytes(&path))
+        })
+        .sum()
+}
+
+fn cloned_bytes(project: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let git = |args: &[&str]| -> Option<Vec<u8>> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    // Loose and packed objects, in KiB.
+    let counted = String::from_utf8(git(&["count-objects", "-v"])?).ok()?;
+    let objects: u64 = counted
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| matches!(*key, "size" | "size-pack"))
+        .filter_map(|(_, kib)| kib.trim().parse::<u64>().ok())
+        .sum();
+    let tracked: u64 = git(&["ls-files", "-z"])?
+        .split(|b| *b == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| {
+            fs::symlink_metadata(project.join(std::ffi::OsStr::from_bytes(name))).ok()
+        })
+        .map(|m| m.len())
+        .sum();
+    Some(objects * 1024 + tracked)
+}
+
 /// Runtime files that belong to the machine rather than the ship.
 fn skipped(relative: &Path) -> bool {
     let parts: Vec<String> = relative
@@ -384,17 +433,11 @@ fn export(args: &Value) -> Result<Value> {
             "folder": folder, "files": listed, "projects": projects, "links_left": links,
             "first_mate": profile["first_mate"],
             "requires": profile.get("requires").cloned().unwrap_or_else(|| json!([])),
-            "unpin": unpin && pin.is_some()}),
+            "unpin": unpin && pin.is_some(), "pinned": pin}),
         )
     })();
     match staged {
         Ok(manifest) => {
-            if let Some(pin) = &pin {
-                Store::open(&home)?.audit(
-                    "ship.unpinned",
-                    &json!({"ship": ship, "move": id, "pinned": pin}),
-                )?;
-            }
             put(
                 &conn,
                 id,
@@ -539,7 +582,7 @@ fn hosting_problems(
 }
 
 /// Unmet needs as the captain reads them: `xcode (xcodebuild is not on PATH)`.
-fn unmet_text(unmet: &Value) -> String {
+pub(crate) fn unmet_text(unmet: &Value) -> String {
     unmet
         .as_array()
         .into_iter()
@@ -594,7 +637,8 @@ fn inspect(args: &Value) -> Result<Value> {
         "requires": profile.get("requires").cloned().unwrap_or_else(|| json!([])),
         "pinned": profile.get("pinned").cloned().unwrap_or(Value::Null),
         "first_mate": profile["first_mate"], "projects": projects, "not_idle": not_idle,
-        "folder_bytes": folder_bytes, "project_count": projects.len()}))
+        "folder_bytes": folder_bytes, "project_count": projects.len(),
+        "last_moved_ms": profile.get("last_moved_ms").cloned().unwrap_or(Value::Null)}))
 }
 
 /// Whether this machine can host a ship: each required capability probed
@@ -614,12 +658,12 @@ fn check(args: &Value) -> Result<Value> {
         &args["projects"],
         &path
     )?);
-    let registry = crate::fleet::registry_path()?;
-    answer["free_disk_bytes"] = json!(
-        crate::admission::disk(registry.parent().context("fleet registry directory")?)
-            .map(|(free, _)| free)
-            .ok()
-    );
+    // What a placement proposal also needs: room above this machine's own
+    // floor, and none of its own disk alerts raised.
+    let (free, floor) = crate::placement::room(&conn);
+    answer["free_disk_bytes"] = json!(free);
+    answer["floor_bytes"] = json!(floor);
+    answer["pressure"] = json!(crate::placement::pressure_keys(&conn));
     Ok(answer)
 }
 
@@ -1006,7 +1050,20 @@ fn activate(args: &Value) -> Result<Value> {
             crate::mail::collected_captain(&store, &peer, &carried)?;
         }
     }
+    // Stamped on the ship's own record, which travels with it: a ship that
+    // just moved is not proposed again for a day.
+    store.connection().execute(
+        "UPDATE ships SET record=json_set(record,'$.last_moved_ms',?2) WHERE name=?1",
+        params![ship, Store::now_ms()],
+    )?;
     store.audit("ship.arrived", &json!({"ship": ship, "move": id}))?;
+    // Recorded once the pin is really gone, on arrival, not when it left.
+    if manifest["unpin"] == true {
+        store.audit(
+            "ship.unpinned",
+            &json!({"ship": ship, "move": id, "pinned": manifest["pinned"]}),
+        )?;
+    }
     let dispatcher =
         crate::service::ensure_with_path(&home, &ship, detail["path"].as_str().unwrap_or(""))
             .unwrap_or_else(|error| format!("not started: {error:#}"));
@@ -1103,6 +1160,120 @@ fn release(args: &Value) -> Result<Value> {
     Ok(released)
 }
 
+/// Delete the folder a finished move left behind here, only if its marker
+/// names that move, and say how much was freed. When the ship has since
+/// moved back into that folder, the copy set aside then is the one deleted.
+/// The folder is renamed aside before anything is deleted, so a deletion
+/// that stops partway is finished by the next clean, marker or not. The
+/// machine's pressure clocks start again from now when anything was freed.
+fn clean(args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
+    identifier(id)?;
+    let conn = crate::fleet::registry()?;
+    let (state, mut detail) = exported(&conn, id)?;
+    if !detail["cleaned"].is_null() {
+        return Ok(detail["cleaned"].clone());
+    }
+    ensure!(
+        state == "released",
+        "move {id} is {state} here; only a finished move's folder is cleaned"
+    );
+    let ship = required(&detail["manifest"], "ship")?.to_owned();
+    let home = PathBuf::from(required(&detail, "home")?);
+    ensure!(
+        home.file_name() == Some(std::ffi::OsStr::new(crate::cli::STATE_DIR)),
+        "move {id} names no ship folder"
+    );
+    let folder = home.parent().context("ship folder")?.to_path_buf();
+    let short: String = id.chars().take(8).collect();
+    let doomed = match detail["cleaning"].as_str().map(PathBuf::from) {
+        // Renamed aside by an earlier clean that did not finish.
+        Some(aside) if aside.exists() => Some(aside),
+        _ => match marked(&folder, &ship, id, &short)? {
+            None => None,
+            Some(found) => {
+                // Through a symbolic link, the folder it names is deleted.
+                let real = if fs::symlink_metadata(&found)?.file_type().is_symlink() {
+                    fs::canonicalize(&found)?
+                } else {
+                    found.clone()
+                };
+                for member in crate::fleet::members(&conn)? {
+                    let live = fs::canonicalize(&member.home).unwrap_or(member.home.clone());
+                    ensure!(
+                        !member.home.starts_with(&real) && !live.starts_with(&real),
+                        "{} holds the home of {}, a ship here; it is kept",
+                        real.display(),
+                        member.name
+                    );
+                }
+                let aside = real.with_file_name(format!(
+                    "{}.cleaning-{short}",
+                    real.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                detail["cleaning"] = json!(aside);
+                put(&conn, id, "export", &ship, "released", &detail)?;
+                fs::rename(&real, &aside)?;
+                if found != real {
+                    fs::remove_file(&found)?;
+                }
+                Some(aside)
+            }
+        },
+    };
+    let cleaned = match doomed {
+        Some(doomed) => {
+            let freed = crate::placement::tree_bytes(&doomed);
+            fs::remove_dir_all(&doomed)?;
+            json!({"ship": ship, "folder": folder, "cleaned": true, "freed_bytes": freed})
+        }
+        None => json!({"ship": ship, "folder": folder, "cleaned": false, "freed_bytes": 0,
+            "note": format!("no folder here carries move {id}'s marker; it was already gone")}),
+    };
+    crate::placement::cleaned(&conn, &ship, cleaned["freed_bytes"].as_u64().unwrap_or(0))?;
+    detail["cleaned"] = cleaned.clone();
+    put(&conn, id, "export", &ship, "released", &detail)?;
+    Ok(cleaned)
+}
+
+/// The folder move `id` left behind: the ship's folder when its marker names
+/// the move, else the copy set aside when the ship moved back into it.
+fn marked(folder: &Path, ship: &str, id: &str, short: &str) -> Result<Option<PathBuf>> {
+    let aside = folder.with_file_name(format!(
+        "{}.left-{short}",
+        folder.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    for candidate in [folder.to_path_buf(), aside] {
+        if left_behind(&candidate, ship)?.is_some_and(|note| note["move"] == id) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// `ship.clean_moved {name}`: delete the folder a ship's last finished move
+/// from this machine left behind.
+fn clean_moved(args: &Value) -> Result<Value> {
+    let ship = required(args, "name")?;
+    identifier(ship)?;
+    let conn = crate::fleet::registry()?;
+    let id: String = conn
+        .query_row(
+            "SELECT id FROM moves WHERE role='export' AND ship=?1 AND state='released'
+               AND json_extract(detail,'$.cleaned') IS NULL
+             ORDER BY updated_ms DESC LIMIT 1",
+            [ship],
+            |r| r.get(0),
+        )
+        .optional()?
+        .with_context(|| {
+            format!("no folder {ship} left behind on this machine waits to be cleaned")
+        })?;
+    let mut cleaned = clean(&json!({"id": id}))?;
+    cleaned["move"] = json!(id);
+    Ok(cleaned)
+}
+
 /// Refuse to run a ship from the folder it moved away from.
 pub fn refuse_moved(home: &Path) -> Result<()> {
     let marker = home.join(MARKER);
@@ -1134,6 +1305,8 @@ pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
         "move.status" => status(args),
         "move.discard" => discard(args),
         "move.release" => release(args),
+        "move.clean" => clean(args),
+        "move.eligible" => crate::placement::serve_eligible(args),
         _ => bail!("unknown move command {command}"),
     }
 }
@@ -1233,11 +1406,20 @@ fn preflight(source: &Side, target: &Side, ship: &str, from: &str, to: &str) -> 
         Ok(checked) => checked,
         // A machine too old to check cannot say it offers anything, but
         // still checks the rest when the move begins, as before.
-        Err(error)
-            if format!("{error:#}").contains("unknown move command move.check")
-                && requires.as_array().is_none_or(Vec::is_empty) =>
-        {
-            json!({"met": [], "unmet": [], "problems": [], "free_disk_bytes": null})
+        Err(error) if format!("{error:#}").contains("unknown move command move.check") => {
+            let needs = requires
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            ensure!(
+                needs.is_empty(),
+                "{ship} stays on {from}: {to} runs an older privateer that cannot check what {ship} requires ({}); upgrade privateer on {to}, or clear its requirements with ship.requires",
+                needs.join(", ")
+            );
+            json!({"met": [], "unmet": [], "problems": [], "free_disk_bytes": null,
+                "unchecked": format!("{to} runs an older privateer: its needs are checked when the move begins")})
         }
         Err(error) => return Err(error),
     };
@@ -1246,7 +1428,7 @@ fn preflight(source: &Side, target: &Side, ship: &str, from: &str, to: &str) -> 
         "pinned": inspected["pinned"], "met": checked["met"], "unmet": checked["unmet"],
         "problems": checked["problems"], "not_idle": inspected["not_idle"],
         "folder_bytes": inspected["folder_bytes"], "project_count": inspected["project_count"],
-        "free_disk_bytes": checked["free_disk_bytes"]}),
+        "free_disk_bytes": checked["free_disk_bytes"], "unchecked": checked["unchecked"]}),
     )
 }
 
@@ -1299,7 +1481,9 @@ fn check_only(conn: &Connection, ship: &str, to: &str, unpin: bool) -> Result<Va
     Ok(report)
 }
 
-fn run(args: &Value) -> Result<Value> {
+/// Run a move: the ship, `to` a machine this one reaches or `here`. Called by
+/// `ship.move` after its operator check, and by an approved placement.
+pub(crate) fn run(args: &Value) -> Result<Value> {
     let ship = required(args, "name")?;
     identifier(ship)?;
     let to = required(args, "to")?;
@@ -1323,6 +1507,14 @@ fn run(args: &Value) -> Result<Value> {
             },
         )
         .optional()?;
+    // An approved placement starts its own move, always with the preflight.
+    if args["fresh"].as_bool().unwrap_or(false)
+        && let Some((id, state, _)) = &unfinished
+    {
+        bail!(
+            "an earlier move of {ship} ({id}) is {state} and unfinished; `privateer ship move` finishes it first"
+        );
+    }
     let (id, prior, record) = match unfinished {
         Some((id, state, detail)) => {
             let record: Value = serde_json::from_str(&detail)?;
@@ -1340,6 +1532,12 @@ fn run(args: &Value) -> Result<Value> {
         ),
     };
     let machine = required(&record, "machine")?.to_owned();
+    if let Some(from) = args["from"].as_str() {
+        ensure!(
+            to == "here" && machine == from,
+            "{ship} lives on {machine}, not on {from}; nothing moved"
+        );
+    }
     let peer = required(&record, "peer")?.to_owned();
     let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
@@ -1450,6 +1648,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     store.caller().require_operator(command)?;
     match command {
         "ship.move" => run(&args),
+        "ship.clean_moved" => clean_moved(&args),
         _ => bail!("unknown move command {command}"),
     }
 }

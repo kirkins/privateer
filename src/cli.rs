@@ -101,6 +101,9 @@ fn print_check(name: &str, report: &Value) {
         Some(refusal) => println!("{name} would not move from {from} to {to}: {refusal}"),
         None => println!("{name} can move from {from} to {to}; nothing was stopped or changed."),
     }
+    if let Some(unchecked) = report["unchecked"].as_str() {
+        println!("  unchecked: {unchecked}");
+    }
     let met = names("met");
     println!(
         "  met: {}",
@@ -117,11 +120,16 @@ fn print_check(name: &str, report: &Value) {
             unmet["why"].as_str().unwrap_or("")
         );
     }
-    println!(
-        "  folder: {} MiB besides its projects; {} projects",
-        report["folder_bytes"].as_u64().unwrap_or(0) / (1024 * 1024),
-        report["project_count"].as_u64().unwrap_or(0)
-    );
+    match (
+        report["folder_bytes"].as_u64(),
+        report["project_count"].as_u64(),
+    ) {
+        (Some(bytes), Some(count)) => println!(
+            "  folder: {} MiB besides its projects; {count} projects",
+            bytes / (1024 * 1024)
+        ),
+        _ => println!("  folder: unknown; {from} did not say"),
+    }
     if let Some(free) = report["free_disk_bytes"].as_u64() {
         println!("  free on {to}: {} MiB", free / (1024 * 1024));
     }
@@ -1735,7 +1743,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             args,
             &["scope", "folder", "harness", "objective", "machine", "to"],
         )?;
-        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME | privateer ship move NAME --to MACHINE|--here [--folder PATH] [--check] [--unpin]";
+        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME | privateer ship move NAME --to MACHINE|--here [--folder PATH] [--check] [--unpin] | privateer ship clean-moved NAME";
         let name = flags.positional.get(1).context(usage)?;
         match flags.positional.first().map(String::as_str) {
             Some("new") => {
@@ -1764,6 +1772,22 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     made["dispatcher"].as_str().unwrap_or(""),
                     made["folder"].as_str().unwrap_or("")
                 );
+            }
+            Some("clean-moved") => {
+                let cleaned =
+                    crate::dispatch(&mut store, "ship.clean_moved", json!({"name": name}))?;
+                if cleaned["cleaned"] == true {
+                    println!(
+                        "Aye. The folder {name} left behind at {} is deleted, freeing {} MiB.",
+                        cleaned["folder"].as_str().unwrap_or(""),
+                        cleaned["freed_bytes"].as_u64().unwrap_or(0) / (1024 * 1024)
+                    );
+                } else {
+                    println!(
+                        "The folder {name} left behind at {} was already gone.",
+                        cleaned["folder"].as_str().unwrap_or("")
+                    );
+                }
             }
             Some("move") => {
                 let to = match flags.values.get("to") {
