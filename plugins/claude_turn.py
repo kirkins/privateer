@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -252,6 +253,74 @@ def report_denial(denials):
                      separators=(",", ":")), flush=True)
 
 
+# Claude echoes a Read image twice in one user event: as the tool_result's
+# base64 source and again in tool_use_result.file.base64. A 5 MB image is
+# about 13 MiB of line. The model already has it, so the log keeps a short
+# placeholder instead and never carries image bytes to transcripts or mail.
+# MAX_LINE bounds what is forwarded; EVENT_CEILING bounds what is buffered.
+EVENT_CEILING = 64 * 1024 * 1024
+CONTENT_EVENTS = ("user", "assistant")
+CONTENT_HEAD = re.compile(rb'\A\s*\{\s*"type"\s*:\s*"(user|assistant)"')
+CLIP_CHARS = 8192
+
+
+def omitted(text):
+    return f"[privateer: {len(text)} bytes omitted]"
+
+
+def without_payloads(value):
+    """The value with each base64 payload replaced by a placeholder, and the
+    bytes omitted."""
+    if isinstance(value, dict):
+        out, dropped = {}, 0
+        encoded = value.get("type") == "base64"
+        for key, item in value.items():
+            if isinstance(item, str) and item and (key == "base64" or (encoded and key == "data")):
+                out[key], dropped = omitted(item), dropped + len(item)
+            else:
+                out[key], more = without_payloads(item)
+                dropped += more
+        return out, dropped
+    if isinstance(value, list):
+        out, dropped = [], 0
+        for item in value:
+            item, more = without_payloads(item)
+            out.append(item)
+            dropped += more
+        return out, dropped
+    return value, 0
+
+
+def clip_strings(value):
+    if isinstance(value, dict):
+        return {key: clip_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clip_strings(item) for item in value]
+    if isinstance(value, str) and len(value) > CLIP_CHARS:
+        return value[:CLIP_CHARS] + omitted(value[CLIP_CHARS:])
+    return value
+
+
+def forwarded(line, value):
+    """The bytes to log for one event: the line as read, or a content event
+    with its payloads omitted, clipped, or at last reduced to its identity.
+    None when a non-content event is too large to forward."""
+    content = isinstance(value, dict) and value.get("type") in CONTENT_EVENTS
+    if not content or (b'"base64"' not in line and len(line) <= MAX_LINE):
+        return line if len(line) <= MAX_LINE else None
+    value, dropped = without_payloads(value)
+    if not dropped and len(line) <= MAX_LINE:
+        return line
+    for shape in (lambda: value, lambda: clip_strings(value),
+                  lambda: {**{key: value[key] for key in ("type", "subtype", "session_id", "uuid",
+                                                          "parent_tool_use_id") if key in value},
+                           "privateer_omitted_bytes": len(line)}):
+        text = json.dumps(shape(), separators=(",", ":"))
+        if len(text) <= MAX_LINE:
+            break
+    return text.encode() + b"\n"
+
+
 def selected_servers(env):
     """Names of the run's selected MCP servers, from the launcher's records."""
     records = json.loads(env.get("PRIVATEER_MCP_SERVERS") or "[]")
@@ -278,28 +347,57 @@ def run(argv, control):
 
     def read_stdout():
         try:
-            while line := child.stdout.readline(MAX_LINE + 1):
-                if len(line) > MAX_LINE:
-                    with lock:
-                        state["reason"] = "event-size"
-                    break
-                if not line.endswith(b"\n"):
+            while line := child.stdout.readline(EVENT_CEILING + 1):
+                if len(line) > EVENT_CEILING:
+                    # Past the ceiling only a content event is skipped, unread:
+                    # the model already has it. Any other event may settle the
+                    # run, so it still fails it.
+                    head = CONTENT_HEAD.match(line)
+                    if not head:
+                        with lock:
+                            state["reason"] = "event-size"
+                        break
+                    kind, size = head.group(1).decode(), len(line)
+                    while line and not line.endswith(b"\n"):
+                        line = child.stdout.readline(MAX_LINE)
+                        size += len(line)
+                    if not line:
+                        with lock:
+                            state["reason"] = "truncated-stream"
+                        break
+                    sys.stdout.buffer.write(json.dumps(
+                        {"type": "privateer.event_omitted", "reason": "event-over-ceiling",
+                         "event_type": kind, "bytes": size}, separators=(",", ":")).encode() + b"\n")
+                    sys.stdout.buffer.flush()
+                elif not line.endswith(b"\n"):
                     with lock:
                         state["reason"] = "truncated-stream"
                     break
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
-                if line.strip():
+                elif line.strip():
+                    value = None
                     try:
-                        turn.observe(json.loads(line))
+                        value = json.loads(line)
+                        turn.observe(value)
                     except json.JSONDecodeError:
+                        sys.stdout.buffer.write(line if len(line) <= MAX_LINE else line[:MAX_LINE] + b"\n")
                         with lock:
                             state["reason"] = "invalid-json"
                         break
                     except ValueError as error:
+                        sys.stdout.buffer.write(forwarded(line, value) or b"")
                         with lock:
                             state["reason"] = str(error)
                         break
+                    shown = forwarded(line, value)
+                    if shown is None:
+                        with lock:
+                            state["reason"] = "event-size"
+                        break
+                    sys.stdout.buffer.write(shown)
+                    sys.stdout.buffer.flush()
+                else:
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.buffer.flush()
                 with lock:
                     state["seen_lines"] += 1
                     state["last_event"] = time.monotonic()

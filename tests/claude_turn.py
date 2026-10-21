@@ -12,7 +12,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins"))
-from claude_turn import STOP_GRACE_SECS
+from claude_turn import MAX_LINE, STOP_GRACE_SECS
 
 IDENTITY = "4fa4f4bc-5b2d-4553-8ae1-eb09e501ea63"
 OTHER = "4fa4f4bc-5b2d-4553-8ae1-eb09e501ea64"
@@ -65,6 +65,8 @@ if delay:
         time.sleep(delay)
         return observe(self, value)
     claude_turn.ClaudeTurn.observe = slow
+if os.environ.get('CLAUDE_TEST_EVENT_CEILING'):
+    claude_turn.EVENT_CEILING = int(os.environ['CLAUDE_TEST_EVENT_CEILING'])
 if os.environ.get('CLAUDE_TEST_DARWIN_KILLPG'):
     killpg = os.killpg
     def darwin_killpg(pgid, signum):
@@ -86,6 +88,19 @@ LIMIT = {"type":"rate_limit_event", "session_id":IDENTITY,
 RESULT = {"type":"result", "subtype":"success", "is_error":False, "session_id":IDENTITY, "result":"ok",
           "usage":{"input_tokens":2, "output_tokens":67, "cache_read_input_tokens":14166,
                    "cache_creation_input_tokens":10049, "server_tool_use":{"web_search_requests":0}}}
+
+READ = {"type":"assistant", "session_id":IDENTITY, "message":{"role":"assistant", "content":[
+    {"type":"tool_use", "id":"toolu_01Sheet", "name":"Read", "input":{"file_path":"/x/sheet.png"}}]}}
+SEEN = {"type":"assistant", "session_id":IDENTITY, "message":{"role":"assistant", "content":[
+    {"type":"text", "text":"The contact sheet shows twelve frames."}]}}
+
+
+def image_result(data):
+    """A Read of an image as Claude Code prints it: the base64 twice."""
+    return {"type":"user", "session_id":IDENTITY, "uuid":"u-1", "parent_tool_use_id":None,
+            "message":{"role":"user", "content":[{"tool_use_id":"toolu_01Sheet", "type":"tool_result",
+                "content":[{"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":data}}]}]},
+            "tool_use_result":{"type":"image", "file":{"base64":data, "type":"image/png", "originalSize":len(data)}}}
 
 
 class ClaudeTurn(unittest.TestCase):
@@ -438,6 +453,68 @@ class ClaudeTurn(unittest.TestCase):
                 self.assertEqual((run.returncode, summary["type"]), (2, "native.turn.failed"), run.stderr)
                 self.assertEqual(summary["reason"], "resume-identity")
                 self.assertEqual(summary["native_exit_code"], 0)
+
+    def test_a_large_image_tool_result_mid_turn_completes_and_stays_out_of_the_log(self):
+        data = "iVBORw0KGgo" + "A" * (3 * 1024 * 1024)
+        event = image_result(data)
+        self.assertGreater(len(json.dumps(event)), 6 * 1024 * 1024)
+        run, summary = self.run_stream([HOOK, INIT, READ, event, SEEN, RESULT])
+        self.assertEqual((run.returncode, summary["type"]), (0, "turn.completed"), run.stdout[-2000:])
+        self.assertNotIn("reason", summary)
+        self.assertLess(len(run.stdout), 16 * 1024)
+        self.assertNotIn(b"AAAAAAAA", run.stdout)
+        shown = json.loads(run.stdout.splitlines()[3])
+        omitted = f"[privateer: {len(data)} bytes omitted]"
+        item = shown["message"]["content"][0]
+        self.assertEqual((shown["type"], shown["uuid"], item["tool_use_id"]), ("user", "u-1", "toolu_01Sheet"))
+        self.assertEqual(item["content"][0]["source"], {"type":"base64", "media_type":"image/png", "data":omitted})
+        self.assertEqual(shown["tool_use_result"]["file"]["base64"], omitted)
+        # A small image is also kept out; the events around it are forwarded as read.
+        run, _ = self.run_stream([INIT, image_result("iVBORw0KGgo="), SEEN, RESULT])
+        self.assertEqual(run.returncode, 0, run.stdout)
+        lines = run.stdout.splitlines()
+        self.assertNotIn(b"iVBORw0KGgo=", run.stdout)
+        self.assertEqual(lines[0], json.dumps(INIT).encode())
+        self.assertEqual(lines[2], json.dumps(SEEN).encode())
+
+    def test_a_large_text_tool_result_is_clipped_not_fatal(self):
+        text = {"type":"user", "session_id":IDENTITY, "uuid":"u-2", "message":{"role":"user", "content":[
+            {"tool_use_id":"toolu_01Sheet", "type":"tool_result", "content":"x" * (2 * MAX_LINE)}]}}
+        many = {**text, "message":{"role":"user", "content":[
+            {"tool_use_id":f"t{i}", "type":"tool_result", "content":"y" * 9000} for i in range(200)]}}
+        for event in (text, many):
+            with self.subTest(items=len(event["message"]["content"])):
+                run, summary = self.run_stream([INIT, READ, event, SEEN, RESULT])
+                self.assertEqual((run.returncode, summary["type"]), (0, "turn.completed"), run.stdout[-2000:])
+                shown = json.loads(run.stdout.splitlines()[2])
+                self.assertEqual((shown["type"], shown["uuid"]), ("user", "u-2"))
+                self.assertLessEqual(len(run.stdout.splitlines()[2]), MAX_LINE)
+        # Past every clip the event keeps only its identity and its size.
+        self.assertEqual(json.loads(run.stdout.splitlines()[2])["privateer_omitted_bytes"], len(json.dumps(many)) + 1)
+
+    def test_an_event_past_the_ceiling_is_skipped_only_when_it_is_content(self):
+        ceiling = str(2 * MAX_LINE)
+        event = image_result("A" * (3 * MAX_LINE))
+        run, summary = self.run_stream([INIT, READ, event, SEEN, RESULT], driver=True,
+                                       env_extra={"CLAUDE_TEST_EVENT_CEILING": ceiling})
+        self.assertEqual((run.returncode, summary["type"]), (0, "turn.completed"), run.stderr)
+        skipped = json.loads(run.stdout.splitlines()[2])
+        self.assertEqual(skipped, {"type":"privateer.event_omitted", "reason":"event-over-ceiling",
+                                   "event_type":"user", "bytes":len(json.dumps(event)) + 1})
+        self.assertLess(len(run.stdout), 16 * 1024)
+        # A result, or any event that is not content, may settle the run: too
+        # large to forward, it still fails the turn with a clear reason.
+        huge = {**RESULT, "result":"z" * (3 * MAX_LINE)}
+        large = {**RESULT, "result":"z" * (MAX_LINE + 10)}
+        for events in ([INIT, huge], [INIT, large], [{**INIT, "padding":"p" * (3 * MAX_LINE)}, RESULT]):
+            with self.subTest(size=len(json.dumps(events[-1]))):
+                run, summary = self.run_stream(events, driver=True, env_extra={"CLAUDE_TEST_EVENT_CEILING": ceiling})
+                self.assertEqual((run.returncode, summary["type"]), (2, "native.turn.failed"), run.stderr)
+                self.assertEqual(summary["reason"], "event-size")
+        # A content event past the ceiling that never ends is a truncated stream.
+        raw = b"".join((json.dumps(e)+"\n").encode() for e in [INIT, READ]) + json.dumps(event).encode()
+        run, summary = self.run_stream([], raw=raw, driver=True, env_extra={"CLAUDE_TEST_EVENT_CEILING": ceiling})
+        self.assertEqual((run.returncode, summary["reason"]), (2, "truncated-stream"), run.stderr)
 
 
 if __name__ == "__main__":
