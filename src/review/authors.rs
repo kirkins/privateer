@@ -89,6 +89,11 @@ pub fn compute(
         let Some(id) = job["id"].as_str().map(str::to_owned) else {
             continue;
         };
+        // A review's errand reads the code under the read-only reviewer
+        // role: it writes none of it.
+        if crate::review::is_review_errand(store, &id)? {
+            continue;
+        }
         let route = job["model_route"]
             .as_str()
             .map(str::to_owned)
