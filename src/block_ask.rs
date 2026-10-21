@@ -31,6 +31,10 @@ const REASON_CHARS: usize = 160;
 const MAX_REQUESTERS: usize = 5;
 /// The reason a covering policy change ends an ask with.
 pub(crate) const POLICY_CHANGED: &str = "policy changed";
+/// The reason a policy change ends an ask with when it grants nothing the ask
+/// named: its denials name no rule, so it ends for one retry.
+pub(crate) const POLICY_CHANGED_UNGRANTED: &str =
+    "policy changed, but nothing this ask named was granted; retry once";
 /// An open block ask, in a query's WHERE clause.
 const OPEN_ASK: &str = "recipient='captain' AND kind IN ('request','decision') AND state='open'
     AND json_extract(payload,'$.type')='tool_permission'";
@@ -523,27 +527,41 @@ fn authorizations_hash(policy: &Value, ship: &str) -> String {
     hex(policy["authorized"][ship].to_string())
 }
 
+/// Whether a policy change ends an ask: when the policy grants it (see
+/// `grants`), or, for an ask with any other denial or from before asks listed
+/// their denials, on any policy change. The second grants nothing; it ends so
+/// the step is retried once, and a retry that is denied again asks anew.
+pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
+    grants(policy, ask) || (!known(ask) && ask["policy_hash"].as_str() != Some(policy_hash))
+}
+
+/// Whether the coverage of every denial of an ask can be read from a policy:
+/// each names a derived rule, or a standing authorization the ask recorded
+/// its ship's authorizations for.
+fn known(ask: &Value) -> bool {
+    let block = &ask["block"];
+    let seen = block["authorized"].is_string();
+    block["denials"].as_array().is_some_and(|d| {
+        !d.is_empty()
+            && d.iter()
+                .all(|d| d["rule"].is_string() || (seen && d["authorize"].is_string()))
+    })
+}
+
 /// Whether the policy now lets every denial of an ask run: `yolo`, or each
 /// derived rule present exactly or by its tool's name. A denial an ask offers
-/// a standing authorization for is covered once the ship's own
-/// authorizations change, never by another ship's. An ask with any other
-/// denial, or from before asks listed their denials, ends on any policy
-/// change.
-pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
+/// a standing authorization for is granted once the ship's own
+/// authorizations change, never by another ship's.
+pub(crate) fn grants(policy: &Value, ask: &Value) -> bool {
     if policy["mode"] == "yolo" {
         return true;
+    }
+    if !known(ask) {
+        return false;
     }
     let block = &ask["block"];
     let seen = block["authorized"].as_str();
     let denials = block["denials"].as_array();
-    let known = denials.is_some_and(|d| {
-        !d.is_empty()
-            && d.iter()
-                .all(|d| d["rule"].is_string() || (seen.is_some() && d["authorize"].is_string()))
-    });
-    if !known {
-        return ask["policy_hash"].as_str() != Some(policy_hash);
-    }
     let allowed: Vec<&str> = policy["claude_allow"]
         .as_array()
         .into_iter()
@@ -590,6 +608,24 @@ pub(crate) fn other_homes(here: &Path) -> Vec<(String, PathBuf)> {
         .filter(|m| m.home.is_dir() && m.home != here)
         .map(|m| (m.name, m.home))
         .collect()
+}
+
+/// Whether an ask's denials may join another ship's ask: only when each one,
+/// counted or not, is a derived allow rule. A denial no rule narrows (a
+/// compound command, an unknown or unidentified tool) is named by its tool
+/// alone, which says nothing about what either ship ran, and an
+/// authorization is the asking ship's own.
+fn shared_denials(denials: &[Value], more: u64) -> bool {
+    more == 0 && !denials.is_empty() && denials.iter().all(|d| d["rule"].is_string())
+}
+
+/// Whether a block ask's payload may be attached to another ship's ask. Any
+/// other payload may.
+pub(crate) fn may_join(payload: &Value) -> bool {
+    payload["type"] != "tool_permission"
+        || payload["block"]["denials"].as_array().is_some_and(|d| {
+            shared_denials(d, payload["block"]["more"].as_u64().unwrap_or(0))
+        })
 }
 
 /// An open primary ask for the same denial under the same policy, raised by
@@ -812,7 +848,11 @@ pub(crate) fn raise(
         "decision": {"question": question, "why": why,
             "blocked": [clip(&format!("{task_id}: {title}"), 200)], "free_text_ok": true,
             "group": "tool-permission", "options": options}});
-    let primary = same_denial(store, ship, &fleet_key)?;
+    let primary = if shared_denials(&records, more as u64) {
+        same_denial(store, ship, &fleet_key)?
+    } else {
+        None
+    };
     if let Some((primary, primary_ship)) = &primary {
         payload["about"] = json!(primary);
         payload["attached_to"] = json!(primary);
@@ -910,19 +950,8 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
             continue;
         };
         if covered(&policy, &policy_hash, &ask["payload"]) {
-            crate::mail::end_request(store, &ask, "withdrawn", POLICY_CHANGED)?;
-            let task = ask["task_id"].as_str().unwrap_or_default();
-            if !task.is_empty() && !crate::scheduling::scheduled(store, task)? {
-                let owner = ask["from"].as_str().unwrap_or_default();
-                crate::mail::record_crew(
-                    store.connection(),
-                    &json!({"id": format!("block-cleared-{}", hex(&id)), "to": owner, "kind": "notice",
-                        "task_id": task, "urgency": "normal",
-                        "body": format!("The fleet policy now allows what {id} asked for ({}); the captain's decision is no longer needed. Carry on with task {task}.", rules_text(&ask["payload"]["block"])),
-                        "payload": {"about": id, "block_cleared": true}}),
-                )?;
-            }
-            ended.push(id);
+            end_by_policy(store, &policy, &ask)?;
+            ended.push((id, ask["from"].as_str().unwrap_or_default().to_owned()));
         } else if ask["payload"]["policy_hash"].as_str() != Some(&policy_hash) {
             store.connection().execute(
                 "UPDATE mail SET payload=json_set(payload,'$.policy_hash',?2) WHERE id=?1",
@@ -931,11 +960,114 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
         }
     }
     tx.commit()?;
-    for id in &ended {
+    for (id, ship) in &ended {
+        release_attachments(store, id, ship)?;
         crate::mail::end_attachments(store, id, POLICY_CHANGED)?;
     }
     end_orphans(store)?;
-    Ok(ended)
+    Ok(ended.into_iter().map(|(id, _)| id).collect())
+}
+
+/// End an open block ask a policy change covers, in the caller's
+/// transaction, and tell an unscheduled task's owner what it means: carry on
+/// when the policy grants what it asked for, else that nothing was granted,
+/// to retry once and ask again if denied again.
+fn end_by_policy(store: &Store, policy: &Value, ask: &Value) -> Result<()> {
+    let id = ask["id"].as_str().unwrap_or_default();
+    let granted = grants(policy, &ask["payload"]);
+    let reason = if granted {
+        POLICY_CHANGED
+    } else {
+        POLICY_CHANGED_UNGRANTED
+    };
+    crate::mail::end_request(store, ask, "withdrawn", reason)?;
+    let task = ask["task_id"].as_str().unwrap_or_default();
+    if !task.is_empty() && !crate::scheduling::scheduled(store, task)? {
+        let owner = ask["from"].as_str().unwrap_or_default();
+        crate::mail::record_crew(
+            store.connection(),
+            &json!({"id": format!("block-cleared-{}", hex(id)), "to": owner, "kind": "notice",
+                "task_id": task, "urgency": "normal",
+                "body": format!("{} Task {task}.", ended_text(ask, granted)),
+                "payload": {"about": id, "block_cleared": true, "granted": granted}}),
+        )?;
+    }
+    Ok(())
+}
+
+/// What a block ask that a policy change ended means for the ship that
+/// asked, in plain words.
+fn ended_text(ask: &Value, granted: bool) -> String {
+    let id = ask["id"].as_str().unwrap_or_default();
+    let rules = rules_text(&ask["payload"]["block"]);
+    if granted {
+        format!(
+            "The fleet policy now allows what {id} asked for ({rules}); the captain's decision is no longer needed. Carry on."
+        )
+    } else {
+        format!(
+            "{id} ended because the fleet policy changed, but the new policy does not cover what it asked for ({rules}): nothing was granted for this request. Retry the step once; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
+        )
+    }
+}
+
+/// Why a task parked on a block ask resumes, when a policy change ended the
+/// ask; None for any other ending.
+pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
+    let granted = match request["end_reason"].as_str() {
+        Some(POLICY_CHANGED) => true,
+        Some(POLICY_CHANGED_UNGRANTED) => false,
+        _ => return None,
+    };
+    (request["state"] == "withdrawn" && request["payload"]["type"] == "tool_permission")
+        .then(|| ended_text(request, granted))
+}
+
+/// Before a primary that a policy change ended takes its attachments with
+/// it, settle each other ship's block ask attached to it on its own: one the
+/// policy covers in its own home ends there as that home's sweep would end
+/// it; one it does not cover is detached, so the captain sees it as its own
+/// card instead of losing it to a change made for another ship.
+fn release_attachments(store: &Store, primary: &str, primary_ship: &str) -> Result<()> {
+    let mut homes = vec![store.home().to_path_buf()];
+    homes.extend(other_homes(store.home()).into_iter().map(|(_, h)| h));
+    for home in homes {
+        let Ok(other) = Store::open(&home) else {
+            continue;
+        };
+        let policy = crate::permissions::for_store(&other)?;
+        let policy_hash = crate::permissions::policy_hash(&other)?;
+        let tx = other.write_transaction()?;
+        let rows: Vec<String> = {
+            let mut statement = other.connection().prepare(&format!(
+                "SELECT id FROM mail WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'
+                 AND json_extract(payload,'$.attached_to')=?1 AND sender<>?2"
+            ))?;
+            statement
+                .query_map(params![primary, primary_ship], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for row in rows {
+            let Some(ask) = crate::mail::find(&other, &row)? else {
+                continue;
+            };
+            if covered(&policy, &policy_hash, &ask["payload"]) {
+                end_by_policy(&other, &policy, &ask)?;
+            } else {
+                other.connection().execute(
+                    "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
+                     WHERE id=?1 AND state='open'",
+                    [&row],
+                )?;
+                other.audit(
+                    "permissions.detached",
+                    &json!({"ask": row, "from": primary, "reason": POLICY_CHANGED}),
+                )?;
+            }
+        }
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 /// End the items in this home still attached to an ask that ended without
@@ -1164,7 +1296,9 @@ pub(crate) fn fleet_key_primary(
     from: &str,
     payload: &Value,
 ) -> Result<Option<String>> {
-    if payload["type"] != "tool_permission" {
+    // A copy from before asks with no derived rule stopped joining carries
+    // the same key as before: its denials decide.
+    if payload["type"] != "tool_permission" || !may_join(payload) {
         return Ok(None);
     }
     let Some(key) = payload["block"]["fleet_key"].as_str() else {

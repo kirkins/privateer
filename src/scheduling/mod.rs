@@ -340,11 +340,13 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
             Some("request") => {
                 let request = crate::mail::find(store, required(&wait, "ref")?)?
                     .context("wait request vanished")?;
-                // A block ask that a covering policy change ended is resolved:
-                // the denied tool is now allowed.
-                let covered = request["state"] == "withdrawn"
-                    && request["end_reason"] == crate::block_ask::POLICY_CHANGED
-                    && request["payload"]["type"] == "tool_permission";
+                // A block ask that a policy change ended is resolved for one
+                // retry: the resume says whether the policy granted it.
+                let ended_by_policy = crate::block_ask::resumed_by_policy(&request);
+                let covered = ended_by_policy.is_some();
+                if covered {
+                    work.resumed_by = ended_by_policy;
+                }
                 if !covered
                     && matches!(
                         request["state"].as_str(),
