@@ -126,7 +126,7 @@ fn a_request_freezes_its_action_and_tells_the_captain_what_a_yes_grants() {
     let sent = ask(&mut store, "q-1");
     assert_eq!(
         sent["body"],
-        "Build 55 passed CI.\n\nApproving lets apps do this for 24 h: Submit build 55 to TestFlight"
+        "Approving lets apps do this for 24 h: Submit build 55 to TestFlight\n\nBuild 55 passed CI."
     );
     assert_eq!(
         sent["payload"]["approves"],
@@ -162,6 +162,9 @@ fn each_send_time_lint_and_bound_is_refused() {
         ("Do anything needed", "too broad"),
         ("Run all commands for the release", "too broad"),
         ("Merge from now on", "too broad"),
+        ("Do what the captain authorized", "framing"),
+        ("Submit what is approved", "framing"),
+        ("Deploy it, authorised until it expires", "framing"),
         ("", "1 to 300 characters"),
         ("two\nlines", "1 to 300 characters"),
     ] {
@@ -172,6 +175,14 @@ fn each_send_time_lint_and_bound_is_refused() {
         "1 to 300 characters",
     );
     approves(&mut store, json!({"action":"x".repeat(300)})).unwrap();
+    // The sentence auto mode reads must fit in 600 characters with the
+    // request id this send uses.
+    refused(
+        ask_with(&mut store, &"q".repeat(160), |a| {
+            a["payload"]["approves"]["action"] = json!("x".repeat(300))
+        }),
+        "more than 600 characters",
+    );
     for ttl in [json!(0), json!(604_801), json!(-1), json!("1")] {
         refused(
             ask_with(&mut store, "q-ttl", |a| {
@@ -313,6 +324,9 @@ fn a_hedged_reply_records_nothing_and_says_why() {
         "wait for CI",
         "ok?",
         "Yes, but only on staging",
+        "Denied",
+        "Waiting",
+        "Skip it",
     ]
     .iter()
     .enumerate()
@@ -327,6 +341,17 @@ fn a_hedged_reply_records_nothing_and_says_why() {
                 .as_str()
                 .unwrap()
                 .contains("nothing was approved")
+        );
+    }
+    // A reply with no words, even a thumbs-up, approves nothing.
+    for (i, body) in ["👎", "👍", "❌"].iter().enumerate() {
+        let id = format!("q-wordless-{i}");
+        ask(&mut store, &id);
+        let approval = &reply(&mut store, &id, body)["payload"]["approval"];
+        assert_eq!(
+            *approval,
+            json!({"recorded":false,"why":"reply had no words; ask again with a decision"}),
+            "{body}"
         );
     }
     assert!(rows(&mut store).is_empty());
@@ -380,6 +405,40 @@ fn only_an_approving_option_of_a_decision_records() {
             true,
         ),
         "must be true or false",
+    );
+    // An option that approves cannot read as a refusal.
+    for label in ["Don't submit", "Skip"] {
+        refused(
+            decision(
+                &mut store,
+                "d-0",
+                json!([{"id":"a","label":label,"what_happens":"Build 55 goes to TestFlight","approves":true},
+                    {"id":"b","label":"Hold","what_happens":"Nothing is submitted"}]),
+                true,
+            ),
+            "cannot read as a refusal",
+        );
+    }
+    // The body opens by naming the option that approves, or each of them.
+    let named = decision(&mut store, "d-named", ship_or_hold(), true).unwrap();
+    assert_eq!(
+        named["body"],
+        "Choosing Ship it lets apps do this for 1 h: Submit build 55 to TestFlight"
+    );
+    let two = decision(
+        &mut store,
+        "d-two",
+        json!([{"id":"ship","label":"Ship it","what_happens":"Build 55 goes to TestFlight","approves":true},
+            {"id":"now","label":"Ship now","what_happens":"Build 55 goes to TestFlight","approves":true},
+            {"id":"hold","label":"Hold","what_happens":"Nothing is submitted"}]),
+        true,
+    )
+    .unwrap();
+    assert!(
+        two["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("Choosing Ship it or Ship now lets apps do this for 1 h: ")
     );
     for (id, answer, recorded) in [
         ("d-ship", json!({"option_id":"ship"}), true),
@@ -521,6 +580,17 @@ fn expiry_revocation_and_a_closed_task_end_an_approval() {
         .map(|r| r["id"].clone())
         .collect();
     assert_eq!(left, vec![ids[2].clone()]);
+    // A task handed to another ship takes its approvals out of play.
+    store
+        .connection()
+        .execute("UPDATE tasks SET owner='research' WHERE id='main'", [])
+        .unwrap();
+    assert!(live(&mut store).is_empty());
+    store
+        .connection()
+        .execute("UPDATE tasks SET owner='apps' WHERE id='main'", [])
+        .unwrap();
+    assert_eq!(live(&mut store).len(), 1);
     dispatch(
         &mut store,
         "task.update",

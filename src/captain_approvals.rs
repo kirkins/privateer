@@ -743,6 +743,54 @@ mod tests {
         }
         // A word inside a longer one is not a refusal.
         assert_eq!(hedged("notify the butler"), None);
+        for refusal in [
+            "Denied",
+            "Rejected",
+            "Declined",
+            "Cancelled",
+            "Stopped",
+            "Refused",
+            "Waiting",
+            "Veto",
+            "Skip it",
+            "Postponed",
+            "Paused",
+            "Holding",
+            "Aborted",
+            "Negative",
+            "Nevermind",
+            "never mind",
+        ] {
+            assert!(hedged(refusal).is_some(), "{refusal}");
+        }
+        for yes in ["Submit build 55", "yes", "Go ahead", "ok do it", "Approved"] {
+            assert!(worded(yes) && hedged(yes).is_none(), "{yes}");
+        }
+        for wordless in ["👎", "👍", "❌", "✋", "!!", "55"] {
+            assert!(!worded(wordless), "{wordless}");
+        }
+    }
+
+    #[test]
+    fn an_approving_option_cannot_read_as_a_refusal() {
+        let options = |label: &str, what: &str| {
+            json!({"options": [
+                {"id": "a", "label": label, "what_happens": what, "approves": true},
+                {"id": "b", "label": "Hold", "what_happens": "Nothing is submitted"}
+            ]})
+        };
+        for (label, what) in [
+            ("Don't submit", "Build 55 goes to TestFlight"),
+            ("Skip", "Build 55 goes to TestFlight"),
+            ("Ship it", "Build 55 is not submitted"),
+            ("👍", "Build 55 goes to TestFlight"),
+        ] {
+            assert!(
+                check_options(&options(label, what), true).is_err(),
+                "{label}"
+            );
+        }
+        check_options(&options("Ship it", "Build 55 goes to TestFlight"), true).unwrap();
     }
 
     #[test]

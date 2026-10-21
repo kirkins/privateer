@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Native permission plans; fixtures only, no accounts, providers or settings writes."""
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "plugins"))
 from native import build, handle
-from tool_permissions import attended_argv
+from tool_permissions import attended_argv, policy
 
 
 class Permissions(unittest.TestCase):
@@ -222,7 +224,7 @@ class Permissions(unittest.TestCase):
         self.assertFalse(any(grant in a for a in allow("storefront", "crew")))
 
     APPROVED = ("The captain approved this in reply r-1 to request q-1, for ship storefront only, "
-                "until 2026-10-22 12:00 UTC: Submit build 55 to TestFlight")
+                "on task ship-55, until 2026-10-22 12:00 UTC: Submit build 55 to TestFlight")
 
     def test_the_captains_approvals_reach_only_a_first_mates_allow(self):
         self.policy = {"mode":"standard", "claude_allow":[], "approved":[self.APPROVED]}
@@ -253,11 +255,25 @@ class Permissions(unittest.TestCase):
         argv = attended_argv("claude", ["claude"], {"mode":"standard", "claude_allow":[], "approved":[]})
         self.assertNotIn("--settings", argv)
 
-    def test_malformed_approvals_are_refused(self):
-        for approved in ["one", [1], [""], ["x" * 601], [f"a{i}" for i in range(9)], {"a": "b"}]:
+    def test_approvals_of_the_wrong_type_are_refused(self):
+        for approved in ["one", {"a": "b"}, 1]:
             with self.subTest(approved=approved):
                 with self.assertRaises(ValueError):
                     attended_argv("claude", ["claude"], {"mode":"standard", "claude_allow":[], "approved":approved})
+
+    def test_an_invalid_approval_is_dropped_and_the_launch_still_builds(self):
+        for bad in [1, "", "x" * 601]:
+            with self.subTest(bad=bad):
+                value = {"mode":"standard", "claude_allow":[], "ship":"storefront", "approved":[bad, self.APPROVED]}
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    argv = attended_argv("claude", ["claude"], value)
+                self.assertIn("dropped 1 invalid captain approval", err.getvalue())
+                allow = json.loads(argv[argv.index("--settings") + 1])["autoMode"]["allow"]
+                self.assertIn(self.APPROVED, allow)
+                self.assertFalse(any(a in (bad, "") for a in allow))
+        with contextlib.redirect_stderr(io.StringIO()):
+            kept = policy({"mode":"standard", "claude_allow":[], "approved":[f"a{i}" for i in range(9)]})
+        self.assertEqual(kept["approved"], [f"a{i}" for i in range(8)])
 
     def test_reviewer_role_restricts_supported_harnesses(self):
         req = self.request()
