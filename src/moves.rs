@@ -1018,6 +1018,15 @@ fn activate(args: &Value) -> Result<Value> {
             "{forgotten} ships it knew are not reachable from this machine"
         )));
     }
+    // Its waits on other ships' tasks named them as the old machine reached
+    // them: each one that no longer holds faults, for its first mate to wait
+    // again as this machine reaches them.
+    let rewait = crate::scheduling::arrived(&store, &ship, from)?;
+    if rewait > 0 {
+        notes.push(json!(format!(
+            "{rewait} remote waits faulted: their refs named the route from {from}; wait again from here"
+        )));
+    }
     // Captain mail it carried that the captain already has, taken by a
     // machine link or shown by a front door where it was written, is not
     // offered again from here; the rest still reaches the captain.

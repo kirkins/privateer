@@ -1875,7 +1875,10 @@ pub(crate) fn awaiting(
 /// Record what another machine collected from `peer`: delivered messages,
 /// with the request-closure state it applied, and messages it refused, which
 /// are quarantined with the reason rather than offered again (a wait notice
-/// is offered again until `waits::refused` drops it).
+/// is offered again until `waits::refused` drops it). A refusal that says
+/// only the collecting machine could not work just then (`waits::temporary`)
+/// is no refusal: the message stays pending and is offered again at the next
+/// collection, as a delivery this home makes is retried.
 pub(crate) fn collected(
     store: &Store,
     peer: &str,
@@ -1896,6 +1899,17 @@ pub(crate) fn collected(
         )?;
     }
     for (id, error) in refused {
+        if crate::waits::temporary(error) {
+            // Still pending: nothing changed but the attempt it records.
+            tx.execute(
+                &format!(
+                    "UPDATE mail SET delivery_attempts=delivery_attempts+1, delivery_error=?3
+                     WHERE id=?1 AND delivery='pending' {behind}"
+                ),
+                params![id, peer, error.chars().take(4096).collect::<String>()],
+            )?;
+            continue;
+        }
         // A refused wait notice stays pending to be collected again, and is
         // dropped on its last refusal, as on a delivery this home makes.
         if let Some(message) = by_id(store, id)?.filter(|m| {
@@ -1913,9 +1927,7 @@ pub(crate) fn collected(
                  WHERE id=?1 AND delivery='pending'",
                 params![id, error.chars().take(4096).collect::<String>()],
             )?;
-            if !crate::waits::temporary(error) {
-                changed += usize::from(crate::waits::refused(store, &message, error)?);
-            }
+            changed += usize::from(crate::waits::refused(store, &message, error)?);
             continue;
         }
         changed += tx.execute(

@@ -73,8 +73,9 @@ pub use commands::dispatch;
 pub(crate) use delivery::tick;
 pub(crate) use observation::{fault_item, snapshot};
 pub(crate) use remote::{
-    STALE_SECS as REMOTE_WAIT_STALE_SECS, deliver_notice as remote_notice, resubscribe, settle,
-    stale_item as remote_wait_item, stale_where as remote_wait_stale_where, unsubscribe_all,
+    STALE_SECS as REMOTE_WAIT_STALE_SECS, arrived, deliver_notice as remote_notice, resubscribe,
+    settle, stale_item as remote_wait_item, stale_where as remote_wait_stale_where,
+    unsubscribe_all,
 };
 
 pub(crate) fn init(store: &Store) -> Result<()> {

@@ -1,6 +1,6 @@
 # Design: waits on another ship's task
 
-Status: approved by the captain on 2026-10-20. Step 1 (the owner side, `src/waits.rs`), step 2 (the waiting side, `src/scheduling/remote.rs`), step 3 (resync on reconnect, staleness, subscription nonces) and step 4 (retire, dropped refusals) are implemented; step 5 is not. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
+Status: approved by the captain on 2026-10-20. Step 1 (the owner side, `src/waits.rs`), step 2 (the waiting side, `src/scheduling/remote.rs`), step 3 (resync on reconnect, staleness, subscription nonces), step 4 (retire, dropped refusals) and step 5 (cross-machine tests, `ship.move`) are implemented. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
 
 ## Problem
 
@@ -114,6 +114,19 @@ Fault notices: a schedule that faulted before fault counts were stored (under st
 
 The backlog alarm does not advise re-deferring a stale remote wait. It says the wait is already deferred and resumes on the owner's report, and to check the far ship and the link it rides, or to close or hand off the task.
 
+### As built (step 5)
+
+`tests/cross_machine_waits.rs` runs each case over a real machine link: two machines with their own registries and homes, the laptop reaching the Mac's gateway through a fake `ssh` subprocess, so what the laptop sends is delivered at once and what the Mac sends waits until the laptop collects it. It covers a far `done` resuming and a far `cancelled` faulting in each direction, an unshared and a missing task refused alike, a report lost during an outage answered on the resync (and the same report collected again dropped as `no_wait`), forged reports through the gateway (another ship of the linked machine, a `via` the gateway does not know or none, a status that is not final), retire of either ship, a notice the gateway refuses dropped on its third refusal while later mail flows, a locked home behind the gateway retried and never dropped, and both kinds of `ship.move`.
+
+`ship.move` changes the route a ref names, and a report that comes by another route than the ref's is dropped as `via`, so a moved ship's waits could never end. The runtime does not rewrite refs: the waiting task faults with a clear reason, and its first mate re-waits with the ref as its home now reaches the far ship.
+
+- **The owner ship moves.** Its home moves whole, with its tasks, its subscription rows and its outbox. Homes that learn its new route (the machines on both ends update their ships' directory entries as the move finishes) fault each live wait on it at the next scheduler check: `Remote wait on task T of S on machine M no longer reaches it: S is now on this machine; re-wait without ref.machine` (or `is now on machine N; re-wait with ref.machine N`, or `is now hosted by this home; wait on its task with kind task`). Faulting sends `wait_unsubscribe` by the new route, and the moved owner deletes its row. A home that does not know the new route keeps waiting, and the staleness path shows it; a report that reached it by the new route first was dropped as `via`, and the re-wait is answered at once with the far task's final status.
+- **The waiting ship moves.** Its refs were written as the old machine reached the far ships. On arrival (`moves::activate`), each live remote wait whose far ship is now reached by another route, or is not reachable from the new machine at all, faults (`S moved here from X, and its remote wait on ... no longer reaches it: ...`), audited as `wait.arrived` and noted in the move's reply. Faulting queues `wait_unsubscribe` by the route the far ship has from the new machine. A ref that still holds (a third machine both machines reach under one name) keeps waiting.
+
+A collecting machine that cannot write a message it collected just then (a home's database locked, `waits::temporary`) still reports it, but it is no refusal: the machine it came from keeps it pending, with the attempt and the error, and offers it again at the next collection, as a delivery that machine makes is retried. A captain's message refused that way is not put before the captain. `waits::temporary` matches SQLite's and the runtime's own phrases only, never a bare word a ship's name can hold, so `unknown ship busy-worker` is a refusal.
+
+Not built: an owner retired on a machine that is collected from does not get its `wait_closed` out. Retire drains only what this machine delivers itself, and a retired ship's home leaves the fleet registry, so a collecting machine no longer gathers its outbox: the waiter falls to the staleness path, as for a lost home.
+
 Not built: `mail.deliver` still accepts wait notices from an agent caller. An agent's flush delivers its ship's runtime notices under the agent's identity, and a peer call from inside a job cannot drop to the runtime's role. Refusing agent callers would therefore first need the agent's flush to leave wait notices to the dispatcher, without holding the agent's own mail behind them.
 
 ## Failure cases
@@ -128,6 +141,10 @@ Not built: `mail.deliver` still accepts wait notices from an agent caller. An ag
 | Waiting ship retired | `wait_unsubscribe` for each live remote wait; the owner deletes its rows. Its tasks are not cancelled. |
 | A peer refuses a wait notice | Retried with backoff, dropped (`delivery: dropped`) on the third refusal; later mail to that peer then flows. A dropped report deletes the matching owner row. An error saying the peer could not work just then (a busy database, a home it could not open) is retried like an unreachable peer and never dropped. |
 | Ship renamed or scope moved | The ref names the ship; the subscription fails with a clear refusal and the first mate re-defers with the new name. |
+| Owner ship moved (`ship.move`) | Its rows move with it. A waiting home that knows the new route faults the wait at its next check, naming the route to re-wait by; the fault unsubscribes by the new route. One that does not know it yet keeps waiting, shown as stale. |
+| Waiting ship moved (`ship.move`) | On arrival each live remote wait whose far ship is now reached by another route, or not at all, faults naming the route to re-wait by, and unsubscribes by the far ship's new route. |
+| Owner retired on a machine that is collected from | Its `wait_closed` is not collected once it leaves the fleet; the waiting task falls to the staleness path. |
+| A collecting machine cannot write a message just then | It stays pending where it was sent, with the error, and is collected again; it is not quarantined. |
 | Far task not shared with this ship | `wait_closed` `reason: refused`, and the waiting task faults. Nothing about the task is revealed. |
 | Ship removed from `shared_with` while waiting | `wait_closed` `reason: refused`; the row is deleted and the waiting task faults. |
 | Far task handed to another ship | `wait_closed` `reason: handed_off`, naming the new owner; the waiting task faults, and its first mate re-waits on the new owner. |
