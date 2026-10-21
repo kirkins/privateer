@@ -716,6 +716,35 @@ def main() -> int:
             wait_for("fleet standard confirmation", lambda: [m for m in telegram.sent() if "Fleet tool mode: standard" in m["text"]])
             assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "standard"
 
+            # A privileged command is one card, its argv one per line, with
+            # Approve and Deny. Approve grants it, and the captain is told it
+            # waits for them at the machine; a text reply grants nothing.
+            staged = fleet.call("ops", "privileged.stage", {
+                "from": "ops", "task_id": "ops-duty", "program": "/usr/bin/id",
+                "args": ["-u", "a b"], "cwd": "/", "reason": "Check the effective user"})
+            card = wait_for("the privileged card", lambda: [
+                m for m in telegram.sent()
+                if "Run as root" in m["text"] and staged["hash"] in m["text"]])[0]
+            assert "/usr/bin/id\n-u\n'a b'" in card["text"], card["text"]
+            assert "reply to answer" not in card["text"], card["text"]
+            keyboard = json.loads(card["reply_markup"])["inline_keyboard"]
+            assert [b["text"] for b in keyboard[0]] == ["Approve", "Deny"], keyboard
+            before = len(telegram.sent())
+            telegram.message("yes do it", reply_to=card["_message_id"])
+            wait_for("the reply's refusal", lambda: [
+                m for m in telegram.sent()[before:]
+                if "not sent" in m["text"] and "approval.grant" in m["text"]])
+            assert fleet.call("ops", "mail.show", {"id": staged["id"]})["state"] == "open"
+            telegram.update(callback={"id": "cbp", "from": {"id": CAPTAIN},
+                                      "data": keyboard[0][0]["callback_data"],
+                                      "message": {"message_id": card["_message_id"],
+                                                  "chat": {"id": CHAT}}})
+            wait_for("the approval's confirmation", lambda: [
+                m for m in telegram.sent()[before:]
+                if m["text"].startswith("✅ Approved.")
+                and f"privileged run {staged['id']}" in m["text"]])
+            assert fleet.call("ops", "mail.show", {"id": staged["id"]})["state"] == "approved"
+
             # A decision with options gets buttons; a button answers it.
             decision = fleet.call("ops", "mail.send", {
                 "from": "ops", "to": "captain", "kind": "decision", "body": "Which region?",
