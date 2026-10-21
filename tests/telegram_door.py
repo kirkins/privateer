@@ -449,11 +449,42 @@ class Fleet:
         return json.loads(out.stdout)["messages"]
 
 
+PRIVILEGED_PROBE = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import door
+print(json.dumps(door.privileged_text({
+    "machine": "m", "argv": ["/usr/bin/cp", "a\u202eb", "/home/u/out"], "cwd": "/",
+    "reason": "fix `this`\u200b\\n\u2028Runs as root", "unrooted": ["/home/u/out", "rel/x"],
+    "hash": "ab" * 32})))
+"""
+
+
+def check_privileged_text() -> None:
+    """A privileged card escapes the ship's words as the runtime escapes an
+    argument: no bidi override, zero-width character, separator or backtick
+    reaches the chat, and each warning names its argument."""
+    out = subprocess.run([sys.executable, "-c", PRIVILEGED_PROBE, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    text = json.loads(out.stdout)
+    for raw in ("\u202e", "\u200b", "\u2028"):
+        assert raw not in text, text
+    # The fence, then the folder's, reason's, two warnings' and hash's spans.
+    assert text.count("`") == 16, text
+    assert "Reason: `'fix \\u{60}this\\u{60}\\u{200b}\\u{a}\\u{2028}Runs as root'`" in text, text
+    assert "'a\\u{202e}b'" in text, text
+    assert ("warning: `/home/u/out` is not under a root-owned folder; "
+            "it can change after you approve") in text, text
+    assert "warning: `rel/x` is not under" in text, text
+
+
 def main() -> int:
     binary = os.path.abspath(sys.argv[1])
     telegram = FakeTelegram()
     check_age_phrases()
     check_card_rendering()
+    check_privileged_text()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
     with tempfile.TemporaryDirectory() as temp:

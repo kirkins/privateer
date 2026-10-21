@@ -1035,13 +1035,18 @@ def shown_arg(arg) -> str:
 
 
 def privileged_text(staged: dict) -> str:
-    """The exact command, one argument per line, then where, why and its hash."""
+    """The exact command, one argument per line, then where, why, any
+    warnings and its hash. Everything the ship wrote is escaped as the
+    runtime escapes an argument, inside code spans markdown cannot leave."""
     argv = "\n".join(shown_arg(a) for a in staged.get("argv") or [])
-    reason = str(staged.get("reason", "")).replace("`", "'")
-    return (f"**Run as root on {staged.get('machine', '?')}**\n```\n{argv}\n```\n"
+    warnings = "".join(f"warning: `{shown_arg(a)}` is not under a root-owned folder; "
+                       "it can change after you approve\n"
+                       for a in (staged.get("unrooted") or [])[:64])
+    return (f"**Run as root on {shown_arg(staged.get('machine', '?'))}**\n```\n{argv}\n```\n"
             f"in `{shown_arg(staged.get('cwd', ''))}`\n"
-            f"Reason: {reason}\n"
-            f"Hash `{staged.get('hash', '')}`")
+            f"Reason: `{shown_arg(staged.get('reason', ''))}`\n"
+            f"{warnings}"
+            f"Hash `{shown_arg(staged.get('hash', ''))}`")
 
 
 def report_line(report: dict) -> str:

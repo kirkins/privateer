@@ -40,6 +40,7 @@ for line in sys.stdin:
         if shown:
             ask("stale-" + mail["id"], "approval",
                 {"id": mail["id"], "action": "grant", "hash": "00000000"})
+            ask("bare-" + mail["id"], "approval", {"id": mail["id"], "action": "grant"})
         ask("approve-" + mail["id"], "approval",
             {"id": mail["id"], "action": "grant", "hash": shown or None})
 "#;
@@ -535,6 +536,16 @@ fn the_door_approves_a_privileged_command_but_never_a_production_approval() {
             .unwrap()
             .contains("changed since your phone showed it"),
         "{stale}"
+    );
+    // An answer without the hash the phone showed answers nothing.
+    let bare = response(&entries, &format!("bare-{privileged_id}")).unwrap();
+    assert_eq!(bare["ok"], false, "{bare}");
+    assert!(
+        bare["error"]
+            .as_str()
+            .unwrap()
+            .contains("must carry the hash the phone showed"),
+        "{bare}"
     );
     let granted = response(&entries, &format!("approve-{privileged_id}")).unwrap();
     assert_eq!(granted["ok"], true, "{granted}");

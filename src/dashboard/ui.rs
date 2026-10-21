@@ -1230,7 +1230,12 @@ fn privileged_lines(lines: &mut Vec<Line<'static>>, privileged: &serde_json::Val
         "Reason: {}",
         clean(privileged["reason"].as_str().unwrap_or(""), 4200)
     )));
-    for warning in privileged["warnings"].as_array().into_iter().flatten().take(64) {
+    for warning in privileged["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(64)
+    {
         lines.push(Line::from(clean(warning.as_str().unwrap_or(""), 4400)));
     }
     lines.push(Line::from(format!(

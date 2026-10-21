@@ -16,9 +16,9 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -279,7 +279,11 @@ fn open_folder(path: &Path) -> Result<File> {
     };
     let root = c"/";
     let fd = unsafe { libc::open(root.as_ptr(), flags) };
-    ensure!(fd >= 0, "cannot open /: {}", std::io::Error::last_os_error());
+    ensure!(
+        fd >= 0,
+        "cannot open /: {}",
+        std::io::Error::last_os_error()
+    );
     let mut folder = checked(unsafe { File::from_raw_fd(fd) }, Path::new("/"))?;
     let mut walked = PathBuf::from("/");
     for part in path.components() {
@@ -1416,6 +1420,31 @@ mod tests {
         assert_eq!(display("```"), "'\\u{60}\\u{60}\\u{60}'");
         assert_eq!(display("caf\u{e9}"), "'caf\\u{e9}'");
         assert_eq!(display("\u{202e}rtl"), "'\\u{202e}rtl'");
+    }
+
+    #[test]
+    fn a_reason_is_one_line_of_visible_text_and_is_shown_escaped() {
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "a\u{202a}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+            "a\u{200b}b",
+            "a\u{200f}b",
+            "a\u{2060}b",
+            "a\u{feff}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{ad}b",
+            "a\u{e0041}b",
+        ] {
+            assert!(check_reason(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_reason("Restart nginx after the config change, caf\u{e9}").is_ok());
+        assert_eq!(display("two\nlines"), "'two\\u{a}lines'");
+        assert_eq!(display("a\u{200b}b"), "'a\\u{200b}b'");
     }
 
     #[test]

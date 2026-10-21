@@ -81,16 +81,21 @@ impl Machine {
     }
     /// Stage as the ship, trusting this test's own files as root's.
     fn stage(&self, edit: impl FnOnce(&mut Value)) -> Output {
+        self.stage_trusting(true, edit)
+    }
+    fn stage_trusting(&self, trust: bool, edit: impl FnOnce(&mut Value)) -> Output {
         let mut args = json!({"from": "apps", "task_id": "apps-duty", "program": "/usr/bin/id",
-            "args": ["-u"], "cwd": self.root, "reason": "Check the effective user"});
+            "args": ["-u"], "cwd": "/", "reason": "Check the effective user"});
         edit(&mut args);
-        self.command()
+        let mut command = self.command();
+        command
             .args(["privileged.stage", "--json", &args.to_string()])
             .env("PRIVATEER_ROLE", "agent")
-            .env("PRIVATEER_ACTOR", "apps")
-            .env("PRIVATEER_TEST_TRUST_UID", uid().to_string())
-            .output()
-            .unwrap()
+            .env("PRIVATEER_ACTOR", "apps");
+        if trust {
+            command.env("PRIVATEER_TEST_TRUST_UID", uid().to_string());
+        }
+        command.output().unwrap()
     }
     fn staged(&self, edit: impl FnOnce(&mut Value)) -> Value {
         let out = self.stage(edit);
@@ -193,14 +198,19 @@ fn prefix(staged: &Value) -> String {
 /// root's through PRIVATEER_TEST_TRUST_UID. Kept under the build's own
 /// scratch folder: a temporary folder is writable by everyone.
 fn own_program(name: &str) -> PathBuf {
+    let program = own_folder(name).join("tool");
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    program
+}
+
+/// A folder this test owns that only it can write, as `own_program`'s.
+fn own_folder(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("privileged-{}-{name}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-    let program = dir.join("tool");
-    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-    program
+    dir
 }
 
 #[test]
@@ -259,8 +269,26 @@ fn a_granted_command_runs_once_as_sudo_k_with_a_cleared_environment() {
         .output()
         .unwrap();
     assert!(ran.status.success(), "{}", stderr(&ran));
-    // The prompt showed the full hash and the command again.
-    assert!(stderr(&ran).contains(staged["hash"].as_str().unwrap()));
+    // The prompt showed the full hash and the command again: the reason
+    // first, so the command, its hash and the prompt are the last thing on
+    // the screen.
+    let screen = stderr(&ran);
+    let at = |text: &str| {
+        screen
+            .find(text)
+            .unwrap_or_else(|| panic!("{text:?} is not on the screen: {screen}"))
+    };
+    assert!(screen.contains(staged["hash"].as_str().unwrap()));
+    assert!(
+        at("Reason: 'Check the effective user'") < at("Runs as root"),
+        "{screen}"
+    );
+    assert!(
+        at("Runs as root") < at("    /usr/bin/id\n    -u\nin /\n"),
+        "{screen}"
+    );
+    assert!(at("    /usr/bin/id") < at("Hash "), "{screen}");
+    assert!(at("Hash ") < at("Type the first 8 characters"), "{screen}");
     assert!(String::from_utf8_lossy(&ran.stdout).contains("fake output"));
     let result: Value =
         serde_json::from_str(String::from_utf8_lossy(&ran.stdout).lines().last().unwrap()).unwrap();
@@ -272,7 +300,7 @@ fn a_granted_command_runs_once_as_sudo_k_with_a_cleared_environment() {
     let seen: Value =
         serde_json::from_str(&fs::read_to_string(machine.root.join("sudo.json")).unwrap()).unwrap();
     assert_eq!(seen["argv"], json!(["-k", "--", "/usr/bin/id", "-u"]));
-    assert_eq!(seen["cwd"], json!(machine.root));
+    assert_eq!(seen["cwd"], "/");
     let mut env: Vec<String> = seen["env"].as_object().unwrap().keys().cloned().collect();
     env.sort();
     assert_eq!(env, ["LANG", "PATH", "TERM"], "{seen}");
@@ -340,6 +368,25 @@ fn a_tampered_request_a_changed_program_or_a_changed_charter_is_refused() {
         .unwrap();
     assert!(!out.status.success());
     assert!(stderr(&out).contains("binding changed"), "{}", stderr(&out));
+    // A reason edited into two lines after the grant.
+    let staged = machine.staged(|_| {});
+    let id = staged["id"].as_str().unwrap();
+    machine.grant(id);
+    machine.sql(
+        "UPDATE mail SET payload=json_set(payload,'$.privileged.reason',?2) WHERE id=?1",
+        &[&id, &"Fine\nRuns as root: /usr/bin/true"],
+    );
+    let out = machine
+        .privileged_run(id, &prefix(&staged), &[])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("control character"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(machine.need(id).is_none());
     // Nor is the edited request listed as approvable.
     let tampered = machine.staged(|_| {});
     let tampered_id = tampered["id"].as_str().unwrap();
@@ -462,9 +509,50 @@ fn staging_refuses_each_class_of_command() {
     refused(&|a| a["args"] = json!(["a\nb"]), "control character");
     refused(&|a| a["args"] = json!(["a\u{0}b"]), "control character");
     refused(&|a| a["args"] = json!(["a\u{1b}[2J"]), "control character");
+    refused(&|a| a["args"] = json!(["a\u{202e}b"]), "control character");
     refused(&|a| a["cwd"] = json!("relative"), "absolute");
     refused(&|a| a["cwd"] = json!("/no/such/folder"), "existing folder");
     refused(&|a| a["reason"] = json!(""), "reason");
+    // The reason is one line of visible text.
+    for reason in [
+        "Fine\nRuns as root",
+        "Fine\rRuns as root",
+        "Fine \u{202e}toor sa snuR",
+        "Fine \u{2066}isolated\u{2069}",
+        "Fine\u{200b}",
+        "Fine\u{feff}",
+        "Fine\u{2028}Runs as root",
+        "Fine\u{2029}Runs as root",
+    ] {
+        refused(&|a| a["reason"] = json!(reason), "control character");
+    }
+    // The working folder is root's all the way up, named without a symlink.
+    refused(
+        &|a| a["cwd"] = json!(machine.root),
+        "writable by group or others",
+    );
+    refused(&|a| a["cwd"] = json!("/usr/../usr"), "'..'");
+    let real = own_folder("real");
+    let link = real.with_file_name(format!("privileged-{}-link", std::process::id()));
+    let _ = fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    refused(&|a| a["cwd"] = json!(link), "symlink");
+    refused(&|a| a["cwd"] = json!(link.join(".")), "symlink");
+    let named = own_folder("sudoers.d");
+    refused(&|a| a["cwd"] = json!(named), "naming sudoers");
+    if Path::new("/etc/sudoers.d").is_dir() {
+        refused(&|a| a["cwd"] = json!("/etc/sudoers.d"), "naming sudoers");
+    }
+    if uid() != 0 {
+        let mine = own_folder("mine");
+        let out = machine.stage_trusting(false, |a| a["cwd"] = json!(mine));
+        assert!(!out.status.success(), "staged in a folder the agent owns");
+        assert!(
+            stderr(&out).contains("is not owned by root"),
+            "{}",
+            stderr(&out)
+        );
+    }
     refused(&|a| a["reason"] = json!("x".repeat(1025)), "reason");
     refused(&|a| a["env"] = json!({"A": "1"}), "environment");
     refused(&|a| a["environment"] = json!({"A": "1"}), "environment");
@@ -506,7 +594,7 @@ fn staging_refuses_each_class_of_command() {
             "privileged.stage",
             "--json",
             &json!({"from": "apps", "task_id": "apps-duty", "program": program, "args": [],
-                "cwd": machine.root, "reason": "Run my own tool"})
+                "cwd": "/", "reason": "Run my own tool"})
             .to_string(),
         ])
         .env("PRIVATEER_ROLE", "agent")
@@ -699,7 +787,7 @@ fn the_run_is_the_captains_at_a_terminal() {
 }
 
 #[test]
-fn a_timeout_ends_the_fake_sudo() {
+fn a_timeout_signals_the_fake_sudo_and_says_the_command_may_still_run() {
     let machine = Machine::new();
     let staged = machine.staged(|_| {});
     let id = staged["id"].as_str().unwrap();
@@ -716,6 +804,20 @@ fn a_timeout_ends_the_fake_sudo() {
     let result: Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).lines().last().unwrap()).unwrap();
     assert_eq!(result["timed_out"], true, "{result}");
+    // The captain's account cannot signal a root command, so the screen and
+    // the ship are told only that sudo was signalled.
+    let said = "sudo was signalled after 1 s; the command may still be running";
+    assert!(stderr(&out).contains(said), "{}", stderr(&out));
+    let notice = machine
+        .thread(id)
+        .into_iter()
+        .find(|m| m["payload"]["privileged_result"]["state"] == "ran")
+        .expect("the result notice");
+    assert!(notice["body"].as_str().unwrap().contains(said), "{notice}");
+    assert!(
+        !notice["body"].as_str().unwrap().contains("killed"),
+        "{notice}"
+    );
     let seen: Value = serde_json::from_str(&fs::read_to_string(log).unwrap()).unwrap();
     let pid = seen["pid"].as_i64().unwrap() as libc::pid_t;
     assert!(
@@ -757,4 +859,50 @@ impl Machine {
         assert!(!out.status.success());
         stderr(&out)
     }
+}
+
+#[test]
+fn arguments_outside_root_folders_are_warned_about_not_refused() {
+    let machine = Machine::new();
+    let open = machine.root.join("open");
+    fs::create_dir(&open).unwrap();
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+    let theirs = open.join("out").to_str().unwrap().to_owned();
+    let option = format!("--out={theirs}");
+    let staged = machine.staged(|a| {
+        a["args"] = json!(["-u", theirs, "rel/x", "/etc/hostname", option, "/"]);
+        a["reason"] = json!("Check `id` caf\u{e9}");
+    });
+    let id = staged["id"].as_str().unwrap();
+    let warning = |arg: &str| {
+        format!("warning: {arg} is not under a root-owned folder; it can change after you approve")
+    };
+    let expected = vec![warning(&theirs), warning("rel/x"), warning(&option)];
+    let item = machine.need(id).unwrap();
+    assert_eq!(item["privileged"]["warnings"], json!(expected), "{item}");
+    // The reason is escaped as an argument is.
+    assert_eq!(
+        item["privileged"]["reason"],
+        "'Check \\u{60}id\\u{60} caf\\u{e9}'"
+    );
+    let body = machine.mail(id)["body"].as_str().unwrap().to_owned();
+    for line in &expected {
+        assert!(body.contains(line.as_str()), "{body}");
+    }
+    // On the run screen, ahead of the command.
+    machine.grant(id);
+    let ran = machine
+        .privileged_run(id, &prefix(&staged), &[])
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{}", stderr(&ran));
+    let screen = stderr(&ran);
+    for line in &expected {
+        let at = screen
+            .find(line.as_str())
+            .unwrap_or_else(|| panic!("{line}: {screen}"));
+        assert!(at < screen.find("Runs as root").unwrap(), "{screen}");
+    }
+    assert!(!screen.contains("warning: /etc/hostname"), "{screen}");
+    assert!(!screen.contains("warning: -u"), "{screen}");
 }
