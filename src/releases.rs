@@ -61,6 +61,9 @@ pub struct Release {
     pub commit: String,
 }
 
+/// Every executable a complete release ships in `bin/`.
+pub const BINARIES: [&str; 3] = ["privateer", "privateer-dashboard", "privateer-mcp-broker"];
+
 impl Release {
     pub fn new(data: &Path, commit: &str) -> Result<Self> {
         ensure!(
@@ -95,13 +98,7 @@ impl Release {
     }
 
     pub fn binary(&self, name: &str) -> Result<PathBuf> {
-        ensure!(
-            matches!(
-                name,
-                "privateer" | "privateer-dashboard" | "privateer-mcp-broker"
-            ),
-            "unknown release binary"
-        );
+        ensure!(BINARIES.contains(&name), "unknown release binary");
         Ok(self.root.join("bin").join(name))
     }
 

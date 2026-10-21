@@ -2,7 +2,7 @@ mod support;
 
 use privateer::{
     dispatch,
-    releases::{Release, ShipOutcome, UpgradeRecord},
+    releases::{BINARIES, Release, ShipOutcome, UpgradeRecord},
     store::Store,
 };
 use rusqlite::Connection;
@@ -427,4 +427,53 @@ fn status_reports_broken_current_without_repairing_it() {
         fs::read_link(data.join("current")).unwrap(),
         data.join("releases").join(OLD)
     );
+}
+
+/// The CI release layout copies every binary a release ships, the MCP
+/// broker included: `mcp-broker install` takes it from releases/<commit>/bin.
+#[test]
+fn the_release_layout_ships_every_binary_and_install_takes_the_broker_from_it() {
+    let workflow =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"))
+            .unwrap();
+    let copy = workflow
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .starts_with("cp target/release/privateer ")
+        })
+        .expect("the release layout's binary copy");
+    for name in BINARIES {
+        assert!(
+            copy.split_whitespace()
+                .any(|word| word == format!("target/release/{name}")),
+            "the release layout does not copy {name}: {copy}"
+        );
+    }
+    // A release laid out that way: its privateer installs its own broker.
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let release = Release::new(&data.join("privateer"), NEW).unwrap();
+    fs::create_dir_all(release.root.join("bin")).unwrap();
+    let broker = env!("CARGO_BIN_EXE_privateer-mcp-broker");
+    fs::copy(BIN, release.binary("privateer").unwrap()).unwrap();
+    fs::copy(broker, release.binary("privateer-mcp-broker").unwrap()).unwrap();
+    fs::create_dir_all(temp.path().join("user")).unwrap();
+    let output = support::command(release.binary("privateer").unwrap())
+        .args(["mcp-broker", "install"])
+        .current_dir(temp.path())
+        .env("HOME", temp.path().join("user"))
+        .env("XDG_DATA_HOME", &data)
+        .env("PRIVATEER_RESOURCE_HOME", temp.path().join("ledger"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stable = data.join("privateer/mcp-broker/bin/privateer-mcp-broker");
+    assert_eq!(installed["binary"], stable.to_string_lossy().as_ref());
+    assert_eq!(fs::read(&stable).unwrap(), fs::read(broker).unwrap());
 }
