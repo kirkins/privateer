@@ -1022,6 +1022,60 @@ fn the_moved_ships_own_dispatcher_starts_the_move_without_stopping_it() {
 }
 
 #[test]
+fn a_move_a_crash_interrupted_is_closed_and_the_captain_told_how_to_finish_it() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "move_keep", Some(&ssh));
+    // What a runner leaves when the machine goes down mid-move: the approval
+    // taken, the proposal moving, and nothing holding the placement lock.
+    let conn = laptop.conn();
+    conn.execute("UPDATE placement_approvals SET used_ms=1", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE placement_proposals SET state='moving',
+           record=json_set(record,'$.state','moving','$.moving_ms',1) WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    let held = laptop.agent_ok("upkeep", "ship.placement", json!({}))["holds"].to_string();
+    assert!(held.contains("is moving"), "{held}");
+
+    let ran = laptop.pass("liaison", Some(&ssh));
+    assert_eq!(
+        ran["placement"]["interrupted"][0]["state"],
+        "interrupted",
+        "{ran}"
+    );
+    assert!(ran["placement"]["runner"].is_null(), "{ran}");
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "interrupted", "{record}");
+    assert_eq!(
+        record["outcome"]["finish"], "privateer ship move scout --to mac",
+        "{record}"
+    );
+    // The captain hears it on the decision's thread, with the command.
+    let told = laptop
+        .inbox("upkeep", "captain")
+        .into_iter()
+        .find(|m| m["correlation"] == decision.as_str() && m["kind"] == "notice")
+        .unwrap();
+    let body = told["body"].as_str().unwrap();
+    assert!(body.contains("was interrupted"), "{told}");
+    assert!(
+        body.contains("`privateer ship move scout --to mac` finishes the move"),
+        "{told}"
+    );
+    assert_eq!(told["urgency"], "high", "{told}");
+    // It no longer holds proposals as open; it cools down as a refusal does.
+    let held = laptop.agent_ok("upkeep", "ship.placement", json!({}))["holds"].to_string();
+    assert!(!held.contains("one proposal is open"), "{held}");
+    assert!(held.contains("refused when it ran"), "{held}");
+    // And it is closed once.
+    let again = laptop.pass("liaison", Some(&ssh));
+    assert!(again["placement"].is_null(), "{again}");
+}
+
+#[test]
 fn a_linked_machines_proposal_waits_for_the_linking_machines_check_and_keeps_the_folder() {
     let (_temp, laptop, mac, ssh) = fixture();
     mac.ship("rover");

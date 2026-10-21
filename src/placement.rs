@@ -79,7 +79,7 @@ const PROPOSER_STATES: &[&str] = &[
     "unreachable",
     "unfit",
 ];
-const MOVER_STATES: &[&str] = &["moving", "moved", "refused"];
+const MOVER_STATES: &[&str] = &["moving", "moved", "refused", "interrupted"];
 const MOVE_OPTIONS: &[&str] = &["move_clean", "move_keep"];
 /// A pin "Never this ship" sets.
 const NEVER_REASON: &str = "the captain declined moving it";
@@ -1299,7 +1299,7 @@ fn absorb_proposal(conn: &Connection, from: &str, carried: &Value) -> Result<()>
     match load(conn, id)? {
         // Ours: the machine it targets ran it, or refused it.
         Some(ours) if ours.home.is_none() => {
-            if ours.text("to") == from && matches!(state, "moved" | "refused") {
+            if ours.text("to") == from && matches!(state, "moved" | "refused" | "interrupted") {
                 conclude(conn, id, state, carried["outcome"].clone())?;
             }
         }
@@ -1435,7 +1435,7 @@ fn conclude(conn: &Connection, id: &str, state: &str, outcome: Value) -> Result<
                 proposal.record["cleaned_ms"] = json!(now);
             }
         }
-        "refused" => {
+        "refused" | "interrupted" => {
             tx.execute(
                 "INSERT INTO placement_cooldowns(ship, until_ms) VALUES(?1, ?2)
                  ON CONFLICT(ship) DO UPDATE SET until_ms=excluded.until_ms",
@@ -1521,6 +1521,11 @@ fn outcome_text(proposal: &Proposal) -> String {
         "refused" => format!(
             "{ship} was not moved from {from} to {to}: {why}. It is not proposed again for a day, and {from} proposes nothing for 6 hours."
         ),
+        "interrupted" => format!(
+            "The move of {ship} from {from} to {to} was interrupted: {why}. {ship} may be stopped. On {}, `{}` finishes the move, or says why it cannot.",
+            outcome["runs_on"].as_str().unwrap_or(to),
+            outcome["finish"].as_str().unwrap_or("privateer ship move")
+        ),
         "not_now" => format!(
             "The captain said not now to moving {ship} to {to}; {from} proposes nothing for {}.",
             span(outcome["backoff_ms"].as_i64().unwrap_or(BACKOFF_MS))
@@ -1558,12 +1563,13 @@ fn notify(conn: &Connection, proposal: &Proposal) -> Result<()> {
         )?;
     }
     // The captain hears how a yes ended, on the decision's thread.
-    if matches!(proposal.state.as_str(), "moved" | "refused")
+    if matches!(proposal.state.as_str(), "moved" | "refused" | "interrupted")
         && let Some(decision) = proposal.record["decision"].as_str()
     {
         let mut notice = json!({"id": format!("placement-{}-{}-captain", proposal.id, proposal.state),
             "from": owner, "to": crate::mail::CAPTAIN, "kind": "notice", "correlation": decision,
-            "body": body, "payload": {"placement_outcome": facts}, "urgency": "normal"});
+            "body": body, "payload": {"placement_outcome": facts},
+            "urgency": if proposal.state == "interrupted" { "high" } else { "normal" }});
         if let Some(duty) = duty {
             notice["task_id"] = json!(duty);
         }
@@ -1728,6 +1734,10 @@ pub(crate) fn tick(store: &Store) -> Value {
             crate::capabilities::refresh(&conn);
         }
         let mut report = json!({});
+        let interrupted = interrupted(&conn)?;
+        if !interrupted.is_empty() {
+            report["interrupted"] = json!(interrupted);
+        }
         if !runnable(&conn)?.is_empty() {
             // Let go first: the runner waits for the lock, then holds it.
             drop(lock);
@@ -1789,12 +1799,70 @@ pub fn runner() -> Result<Value> {
     let path = crate::fleet::registry_path()?;
     let conn = crate::fleet::registry()?;
     let _lock = placement_lock(&path, true)?.context("the placement lock")?;
+    let interrupted = interrupted(&conn)?;
     let ran = run_approvals(&conn)?;
     conn.execute(
         "DELETE FROM placement_approvals WHERE expires_ms<?1",
         [Store::now_ms() - CARRY_CLOSED_MS],
     )?;
-    Ok(json!({"ran": ran}))
+    Ok(json!({"interrupted": interrupted, "ran": ran}))
+}
+
+/// Moves a crash or a restart interrupted. A runner holds the placement lock
+/// for the whole of its moves, so a proposal still `moving` here, seen by
+/// whoever holds the lock, has no move running. One whose move finished
+/// since it began closes as moved; any other as interrupted, and the captain
+/// is told the command that finishes it.
+fn interrupted(conn: &Connection) -> Result<Vec<Value>> {
+    let mut closed = vec![];
+    for proposal in proposals(conn, "state='moving'", &[])? {
+        let ship = proposal.text("ship").to_owned();
+        let since = proposal.record["moving_ms"]
+            .as_i64()
+            .unwrap_or(proposal.updated_ms);
+        let run: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, state FROM moves WHERE role='run' AND ship=?1 AND updated_ms>=?2
+                 ORDER BY updated_ms DESC LIMIT 1",
+                params![ship, since],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let cleanup: Option<String> = conn
+            .query_row(
+                "SELECT cleanup FROM placement_approvals WHERE proposal=?1",
+                [&proposal.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let outcome = match &run {
+            Some((id, state)) if state == "done" => json!({"state": "moved", "move": id,
+                "cleanup": cleanup, "cleaned": false,
+                "note": "the move finished, but what ran it stopped before it said so"}),
+            _ => {
+                // The finishing command, on the machine that ran the move.
+                let (finish, on) = match &proposal.home {
+                    None => (
+                        format!("privateer ship move {ship} --to {}", proposal.text("to")),
+                        proposal.text("from"),
+                    ),
+                    Some(_) => (
+                        format!("privateer ship move {ship} --here"),
+                        proposal.text("to"),
+                    ),
+                };
+                json!({"state": "interrupted", "move": run.as_ref().map(|(id, _)| id),
+                    "move_state": run.as_ref().map(|(_, state)| state),
+                    "why": "what ran the move stopped before it finished (a crash or a restart)",
+                    "finish": finish, "runs_on": on})
+            }
+        };
+        let state = outcome["state"].as_str().unwrap_or("interrupted").to_owned();
+        finish(conn, &proposal, &state, outcome.clone())?;
+        closed.push(json!({"proposal": proposal.id, "ship": ship, "state": state,
+            "outcome": outcome}));
+    }
+    Ok(closed)
 }
 
 fn run_approvals(conn: &Connection) -> Result<Vec<Value>> {
@@ -1907,6 +1975,7 @@ fn run_one(conn: &Connection, approval: &Approval, proposal: &Proposal, now: i64
     }
     let ship = proposal.text("ship").to_owned();
     let moving = update(conn, &proposal.id, &["open", "approved"], |p| {
+        p.record["moving_ms"] = json!(Store::now_ms());
         p.state = "moving".into();
     });
     if !matches!(moving, Ok(Some(_))) {
