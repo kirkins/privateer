@@ -217,6 +217,7 @@ window-bound, nothing is recorded, and it is never asked to close anything.
 {"label": "Fake",
  "upstream": ["/ABS/COMMAND", "ARG"],
  "path_arguments": {"names": ["where"], "suffixes": ["Location"]},
+ "env_pass": ["FAKE_HOME_DIR"],
  "routing": {
    "target_argument": "windowId",
    "list": {"tool": "ListWindows", "items": "/structuredContent/windows",
@@ -233,6 +234,7 @@ window-bound, nothing is recorded, and it is never asked to close anything.
 | `label` | How busy answers and refusals name the upstream ("Fake tools busy: ..."). 1 to 32 printable characters. Defaults to the instance's name. |
 | `upstream` | The upstream's argv: 1 to 32 arguments of at most 4096 bytes, no control characters, the first an absolute, normalized path. |
 | `path_arguments.names`, `.suffixes` | Argument names, and endings of argument names, that hold paths, at most 32 of each, each 1 to 64 characters. They only add to the built-in rule (see [Tool calls](#tool-calls)); nothing removes it. |
+| `env_pass` | Environment variables passed through, when set, to the broker, its upstream and its window helpers, beyond the minimal environment (see [Upstream](#how-the-broker-serves)). At most 32 names of `A`-`Z`, `0`-`9` and `_`, not starting with a digit, at most 64 characters each. `PATH` (always `/usr/bin:/bin`), `LD_*` and `DYLD_*` (they load code into every helper) and the variables always passed are refused. |
 | `routing.target_argument` | The argument that names a window. A tool is window-bound when its `inputSchema.properties` has it. |
 | `routing.list.tool` | The tool that lists the upstream's windows. |
 | `routing.list.items` | A JSON pointer to the array of windows. It is applied to the result, and to each text item that parses as JSON; because MCP mirrors `structuredContent` in a text item, a pointer starting with `/structuredContent` is also applied to the text JSON without that first part. |
@@ -254,7 +256,7 @@ pattern language.
 stdin and prints its canonical JSON (every default spelled out, keys in order),
 or exits 2 with one error line naming the key. `install` runs it on the shipped
 binary and pins its output. The dispatcher passes the pinned parts to `serve`
-as `--label`, `--path-arguments JSON` and `--routing JSON`, and `serve`
+as `--label`, `--path-arguments JSON`, `--env-pass JSON` and `--routing JSON`, and `serve`
 validates them again.
 
 ## Lifetime
@@ -271,14 +273,14 @@ upstream allowed.
   `NAME.stopped` exists or a broker holds the lock, it leaves it; if the config
   does not match its pin, that instance is an error; otherwise it starts the
   installed stable binary as
-  `serve --state-dir $XDG_DATA_HOME/privateer/mcp-broker/run --name NAME [--label ...] [--workspace-pool ...]... [--path-arguments ...] [--routing ...] -- UPSTREAM...`.
+  `serve --state-dir $XDG_DATA_HOME/privateer/mcp-broker/run --name NAME [--label ...] [--workspace-pool ...]... [--path-arguments ...] [--env-pass ...] [--routing ...] -- UPSTREAM...`.
 - It reports `{NAME: outcome}` for the instances where something happened
   (`started`, `stopped` or `error`), and null when nothing did. One instance's
   error never skips another.
 - The broker starts detached: in its own session (`setsid`), with stdin
   `/dev/null`, stdout and stderr on `NAME.log`, and no inherited descriptor. Its
   environment is only `PATH=/usr/bin:/bin`, `HOME`, `LANG`, `LC_*`, `TMPDIR` and
-  `DEVELOPER_DIR` if set.
+  the profile's `env_pass`, each if set.
 - The dispatcher never installs or replaces the binary. Configured but not
   installed is reported as that instance's error.
 - The broker outlives dispatcher restarts and upgrades. Service units use
@@ -292,9 +294,9 @@ upstream allowed.
 
 ## How the broker serves
 
-`serve --state-dir DIR --name NAME [--label TEXT] [--ready-wait-secs 60] [--workspace-pool ABS]... [--path-arguments JSON] [--routing JSON] -- UPSTREAM...`
+`serve --state-dir DIR --name NAME [--label TEXT] [--ready-wait-secs 60] [--workspace-pool ABS]... [--path-arguments JSON] [--env-pass JSON] [--routing JSON] -- UPSTREAM...`
 
-The dispatcher passes the label, pools, path arguments and routing from the
+The dispatcher passes the label, pools, path arguments, env_pass and routing from the
 pinned config.
 
 **One per directory and name.** The broker takes `DIR/NAME.lock` with
@@ -308,7 +310,7 @@ from the socket: `SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS.
 **Upstream.**
 
 - The broker spawns the upstream in `/`, with only `PATH=/usr/bin:/bin`, `HOME`,
-  `LANG`, `LC_*`, `TMPDIR` and `DEVELOPER_DIR` if set, in a process group of its
+  `LANG`, `LC_*`, `TMPDIR` and the profile's `env_pass`, each if set, in a process group of its
   own. On Linux it also gets a parent-death SIGKILL, so a broker killed outright
   takes its upstream with it.
 - The broker sends its own `initialize`, with protocol `2025-06-18` and client

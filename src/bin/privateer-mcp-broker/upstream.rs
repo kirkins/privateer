@@ -63,20 +63,22 @@ pub fn supervise(broker: Arc<Broker>) {
     broker.publish();
 }
 
-/// Only `PATH=/usr/bin:/bin`, `HOME`, `LANG`, `LC_*`, `TMPDIR` and
-/// `DEVELOPER_DIR`: what the upstream and the window helpers see.
-pub fn minimal_env(command: &mut Command) {
+/// Only `PATH=/usr/bin:/bin`, `HOME`, `LANG`, `LC_*`, `TMPDIR` and the
+/// profile's `env_pass`: what the upstream and the window helpers see.
+pub fn minimal_env(command: &mut Command, env_pass: &[String]) {
     command.env_clear().env("PATH", "/usr/bin:/bin");
     for (name, value) in std::env::vars_os() {
         let text = name.to_string_lossy();
-        if matches!(&*text, "HOME" | "LANG" | "TMPDIR" | "DEVELOPER_DIR") || text.starts_with("LC_")
+        if matches!(&*text, "HOME" | "LANG" | "TMPDIR")
+            || text.starts_with("LC_")
+            || env_pass.iter().any(|pass| *pass == *text)
         {
             command.env(&name, value);
         }
     }
 }
 
-fn spawn(argv: &[String]) -> std::io::Result<Child> {
+fn spawn(argv: &[String], env_pass: &[String]) -> std::io::Result<Child> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -87,7 +89,7 @@ fn spawn(argv: &[String]) -> std::io::Result<Child> {
         .stderr(Stdio::piped())
         // Its own group, so stopping it reaches whatever it starts.
         .process_group(0);
-    minimal_env(&mut command);
+    minimal_env(&mut command, env_pass);
     // SAFETY: signal and prctl are async-signal-safe.
     unsafe {
         command.pre_exec(|| {
@@ -105,7 +107,7 @@ fn spawn(argv: &[String]) -> std::io::Result<Child> {
 
 /// One upstream lifetime. Returns when it became ready, if it did.
 fn run(broker: &Arc<Broker>, generation: u64, backoff: Duration) -> Option<Instant> {
-    let mut child = match spawn(&broker.upstream_argv) {
+    let mut child = match spawn(&broker.upstream_argv, &broker.env_pass) {
         Ok(child) => child,
         Err(error) => {
             broker

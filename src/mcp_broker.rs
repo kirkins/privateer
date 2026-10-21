@@ -212,7 +212,7 @@ fn checked_name(name: &str) -> Result<String> {
 }
 
 /// What `install` records for an instance: its upstream, the workspace
-/// pools, and the profile's label, path arguments and routing, as
+/// pools, and the profile's label, path arguments, env_pass and routing, as
 /// check-profile wrote them. A config of #346's shape (upstream only) is
 /// still a plain instance.
 struct Config {
@@ -220,6 +220,7 @@ struct Config {
     pools: Vec<PathBuf>,
     label: Option<String>,
     path_arguments: Option<Value>,
+    env_pass: Vec<String>,
     routing: Option<Value>,
 }
 
@@ -229,6 +230,10 @@ impl Config {
         for (key, value) in [
             ("label", self.label.as_ref().map(|label| json!(label))),
             ("path_arguments", self.path_arguments.clone()),
+            (
+                "env_pass",
+                (!self.env_pass.is_empty()).then(|| json!(self.env_pass)),
+            ),
             ("routing", self.routing.clone()),
         ] {
             if let Some(value) = value {
@@ -249,6 +254,7 @@ impl Config {
             "workspace_pools",
             "label",
             "path_arguments",
+            "env_pass",
             "routing",
         ];
         if let Some(key) = map.keys().find(|key| !keys.contains(&key.as_str())) {
@@ -290,11 +296,17 @@ impl Config {
                 None => Ok(None),
             }
         };
+        let env_pass: Vec<String> = match config.get("env_pass") {
+            Some(names) => serde_json::from_value(names.clone())
+                .context("mcp-broker config env_pass is not a list of names")?,
+            None => vec![],
+        };
         Ok(Self {
             upstream,
             pools,
             label,
             path_arguments: part("path_arguments")?,
+            env_pass,
             routing: part("routing")?,
         })
     }
@@ -420,6 +432,10 @@ fn install_options(home: Option<&Path>, dir: &Path, args: &[String]) -> Result<(
             pools,
             label: canonical["label"].as_str().map(str::to_owned),
             path_arguments: canonical.get("path_arguments").cloned(),
+            env_pass: match canonical.get("env_pass") {
+                Some(names) => serde_json::from_value(names.clone())?,
+                None => vec![],
+            },
             routing: canonical.get("routing").cloned(),
         },
     ))
@@ -625,6 +641,7 @@ fn install(files: &Files, wanted: &Config) -> Result<Value> {
         "workspace_pools": wanted.pools,
         "label": wanted.label,
         "path_arguments": wanted.path_arguments,
+        "env_pass": wanted.env_pass,
         "routing": wanted.routing,
         "socket": files.socket,
         // What a crew bundle pins: this command, with `sha256`.
@@ -888,7 +905,8 @@ fn recorded_under(files: &Files, root: &Path) -> Vec<Value> {
 /// asked, so a broker that hangs holds up only the release of a workspace
 /// it opened a window for. A recorded but stopped instance cannot close
 /// anything: its windows are audited (`workspace.mcp_window_unclosed`) and
-/// the release goes on. The running ones are asked in parallel under one
+/// the release goes on, as are those a running instance reports
+/// `unclosable` (it has no close helper). The running ones are asked in parallel under one
 /// deadline, so the release waits at most 35 s however many there are; an
 /// instance that answers with an error, or not in time, refuses it.
 pub(crate) fn release_workspace(store: &Store, root: &Path) -> Result<()> {
@@ -914,6 +932,7 @@ pub(crate) fn release_workspace(store: &Store, root: &Path) -> Result<()> {
         asked.push(files);
     }
     let deadline = Instant::now() + CLOSE_TIMEOUT;
+    let mut unclosed = vec![];
     let failures: Vec<String> = std::thread::scope(|scope| {
         let asking: Vec<_> = asked
             .iter()
@@ -928,7 +947,12 @@ pub(crate) fn release_workspace(store: &Store, root: &Path) -> Result<()> {
             .into_iter()
             .filter_map(|(name, asking)| {
                 let error = match asking.join() {
-                    Ok(Ok(_)) => return None,
+                    Ok(Ok(answer)) => {
+                        if !answer.unclosable.is_empty() {
+                            unclosed.push((name, answer.unclosable));
+                        }
+                        return None;
+                    }
                     Ok(Err(error)) => format!("{error:#}"),
                     Err(_) => "the close panicked".to_owned(),
                 };
@@ -938,14 +962,33 @@ pub(crate) fn release_workspace(store: &Store, root: &Path) -> Result<()> {
             })
             .collect()
     });
+    for (name, windows) in unclosed {
+        store.audit(
+            "workspace.mcp_window_unclosed",
+            &json!({"instance": name, "root": root, "windows": windows,
+                "reason": "the MCP broker has no close helper"}),
+        )?;
+    }
     ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
+/// A running instance's answer to close_workspace.
+#[derive(serde::Deserialize)]
+struct CloseAnswer {
+    /// Required, so an answer without it is refused; the release needs no
+    /// more than that it closed them.
+    #[allow(dead_code)]
+    closed: Vec<PathBuf>,
+    /// Recorded windows it dropped with no close helper to run.
+    #[serde(default)]
+    unclosable: Vec<PathBuf>,
+}
+
 /// Ask the running instance `files` names to close every window it opened
 /// under `root` (`{"privateer_control":1,"close_workspace":ROOT}`) by
-/// `deadline`: the projects it closed, or why not.
-fn ask_close(files: &Files, root: &Path, deadline: Instant) -> Result<Vec<PathBuf>> {
+/// `deadline`: what it closed and could not, or why not.
+fn ask_close(files: &Files, root: &Path, deadline: Instant) -> Result<CloseAnswer> {
     let silent = || {
         format!(
             "the MCP broker did not answer within {} s",
@@ -1016,8 +1059,7 @@ fn ask_close(files: &Files, root: &Path, deadline: Instant) -> Result<Vec<PathBu
     if let Some(error) = answer.get("error") {
         bail!("{}", error.as_str().unwrap_or("the MCP broker refused"));
     }
-    serde_json::from_value(answer["closed"].clone())
-        .context("the MCP broker's answer names no closed windows")
+    serde_json::from_value(answer).context("the MCP broker's answer names no closed windows")
 }
 
 /// Connect to the Unix socket at `path` by `deadline` without ever
@@ -1289,6 +1331,11 @@ fn start(binary: &Path, files: &Files, config: &Config) -> Result<u32> {
             command.arg(flag).arg(part.to_string());
         }
     }
+    if !config.env_pass.is_empty() {
+        command
+            .arg("--env-pass")
+            .arg(json!(config.env_pass).to_string());
+    }
     command
         .arg("--")
         .args(&config.upstream)
@@ -1300,7 +1347,9 @@ fn start(binary: &Path, files: &Files, config: &Config) -> Result<u32> {
         .stderr(log);
     for (name, value) in std::env::vars_os() {
         let text = name.to_string_lossy();
-        if matches!(&*text, "HOME" | "LANG" | "TMPDIR" | "DEVELOPER_DIR") || text.starts_with("LC_")
+        if matches!(&*text, "HOME" | "LANG" | "TMPDIR")
+            || text.starts_with("LC_")
+            || config.env_pass.iter().any(|pass| *pass == *text)
         {
             command.env(&name, value);
         }
@@ -1423,6 +1472,10 @@ mod tests {
     fn a_config_of_the_first_shape_parses_and_unknown_keys_do_not() {
         let plain = Config::parse(&json!({"upstream": ["/opt/x/mcp", "serve"]})).unwrap();
         assert!(plain.routing.is_none() && plain.label.is_none() && plain.pools.is_empty());
+        assert!(plain.env_pass.is_empty() && plain.json().get("env_pass").is_none());
+        let passing = Config::parse(&json!({"upstream": ["/x"], "env_pass": ["A_DIR"]})).unwrap();
+        assert_eq!(passing.env_pass, ["A_DIR"]);
+        assert_eq!(passing.json()["env_pass"], json!(["A_DIR"]));
         assert!(Config::parse(&json!({"upstream": ["/x"], "window_open": ["/y"]})).is_err());
         assert!(Config::parse(&json!({"upstream": ["x"]})).is_err());
         assert!(Config::parse(&json!({"upstream": ["/x"], "routing": []})).is_err());

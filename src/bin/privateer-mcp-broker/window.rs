@@ -35,7 +35,7 @@ impl Opened {
 /// Run `argv` with `project` appended. Its first stderr line, escaped, is
 /// the error when it exits non-zero; past the deadline its group is killed.
 /// Never called with the broker's state locked.
-pub fn run(argv: &[String], project: &Path) -> Result<(), String> {
+pub fn run(argv: &[String], project: &Path, env_pass: &[String]) -> Result<(), String> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -45,7 +45,7 @@ pub fn run(argv: &[String], project: &Path) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .process_group(0);
-    upstream::minimal_env(&mut command);
+    upstream::minimal_env(&mut command, env_pass);
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot run {}: {}", argv[0], error.kind()))?;

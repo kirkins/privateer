@@ -28,7 +28,8 @@ for crews.
 | Key | Value | Why |
 |---|---|---|
 | `label` | `Xcode` | Busy answers and refusals read "Xcode tools busy: ...", "Xcode window tools work only from a Privateer task workspace". |
-| `upstream` | `/usr/bin/xcrun mcpbridge` | Xcode's MCP server, through the `xcrun` shim, which honours `DEVELOPER_DIR` (the one variable the broker passes beyond the minimal environment). |
+| `upstream` | `/usr/bin/xcrun mcpbridge` | Xcode's MCP server, through the `xcrun` shim. |
+| `env_pass` | `DEVELOPER_DIR` | `xcrun` picks the Xcode it runs from `DEVELOPER_DIR` when it is set, and from `xcode-select` otherwise. Passing it keeps the machine owner's choice of Xcode; the broker passes nothing beyond its minimal environment unless a profile names it. |
 | `routing.target_argument` | `tabIdentifier` | The argument Xcode's window-bound tools take. A tool whose schema takes it is routed to its workspace's window. |
 | `routing.list.tool` | `XcodeListWindows` | The tool that lists Xcode's open windows. |
 | `routing.list.items` | `/structuredContent/windows` | Where the window list is expected: `structuredContent.windows`, and the same JSON in a text item (MCP mirrors `structuredContent` there). |

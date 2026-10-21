@@ -1,6 +1,7 @@
 {
   "label": "Xcode",
   "upstream": ["/usr/bin/xcrun", "mcpbridge"],
+  "env_pass": ["DEVELOPER_DIR"],
   "routing": {
     "target_argument": "tabIdentifier",
     "list": {

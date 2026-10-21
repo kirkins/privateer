@@ -3,7 +3,7 @@ file the fake upstream lists (--windows there).
 
   fake_window.py open|close --windows FILE --log FILE [options] PROJECT
 
-Both append their argv to --log, one JSON line each.
+Both append their argv and environment to --log, one JSON line each.
 
 open:   add {"target": "win-N", "path": PROJECT}
   --delay SECS   add it this much later, from a detached child, and exit now
@@ -58,7 +58,8 @@ def add(windows):
 
 
 with open(options.log, 'a') as stream:
-    stream.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pid': os.getpid()}) + '\n')
+    stream.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pid': os.getpid(),
+                             'env': dict(os.environ)}) + '\n')
 
 if options.action == 'open':
     if options.fail:

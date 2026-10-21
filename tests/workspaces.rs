@@ -1782,6 +1782,15 @@ struct McpBroker {
 
 impl McpBroker {
     fn start(f: &Fixture, name: &str, close: &[&str]) -> McpBroker {
+        McpBroker::serve(f, name, Some(close))
+    }
+
+    /// A plain instance: no routing, so no helper to close anything with.
+    fn plain(f: &Fixture, name: &str) -> McpBroker {
+        McpBroker::serve(f, name, None)
+    }
+
+    fn serve(f: &Fixture, name: &str, close: Option<&[&str]>) -> McpBroker {
         let run = broker_run_dir(f);
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-broker");
         let python = fs::canonicalize(support::python())
@@ -1815,15 +1824,18 @@ impl McpBroker {
             &f.root.join(format!("{name}-opened.jsonl")),
             &[]
         ));
-        routing["close"] = json!(helper("close", &closed, close));
         let pool = fs::canonicalize(f.root.join("ledger/worktrees")).unwrap();
-        let child = support::command(BROKER)
+        let mut command = support::command(BROKER);
+        command
             .args(["serve", "--state-dir"])
             .arg(&run)
             .args(["--name", name, "--label", "Fake", "--workspace-pool"])
-            .arg(&pool)
-            .arg("--routing")
-            .arg(routing.to_string())
+            .arg(&pool);
+        if let Some(close) = close {
+            routing["close"] = json!(helper("close", &closed, close));
+            command.arg("--routing").arg(routing.to_string());
+        }
+        let child = command
             .arg("--")
             .arg(&python)
             .arg("-I")
@@ -1942,6 +1954,28 @@ fn with_no_broker_release_proceeds_and_audits_the_unclosed_window() {
     assert_eq!(audited[0]["instance"], "fake");
     assert_eq!(audited[0]["root"], json!(root));
     assert_eq!(audited[0]["windows"][0]["project"], json!(project));
+}
+
+#[test]
+fn a_running_instance_with_no_close_helper_never_holds_a_release() {
+    // Reinstalled without the profile that recorded the window: the plain
+    // instance answers with the window as unclosable, which is audited.
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::plain(&f, "fake");
+    assert_eq!(f.release(&w, false)["state"], "released");
+    assert!(broker.closes().is_empty());
+    let audited = audits(&f, "workspace.mcp_window_unclosed");
+    assert_eq!(audited.len(), 1, "{audited:?}");
+    assert_eq!(audited[0]["instance"], "fake");
+    assert_eq!(audited[0]["root"], json!(root));
+    assert_eq!(audited[0]["windows"], json!([project]));
+    assert_eq!(audited[0]["reason"], "the MCP broker has no close helper");
+    // Dropped from the record: the slot's next release asks nobody.
+    assert!(recorded(&f, "fake").is_empty());
 }
 
 #[test]

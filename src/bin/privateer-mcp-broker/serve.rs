@@ -131,6 +131,15 @@ impl State {
     }
 }
 
+/// What a close_workspace did: the projects closed, those dropped with no
+/// close helper to run, and the first failure, which stopped the rest.
+#[derive(Default)]
+struct Closed {
+    closed: Vec<PathBuf>,
+    unclosable: Vec<PathBuf>,
+    failure: Option<String>,
+}
+
 pub struct Broker {
     pub name: String,
     pub label: String,
@@ -138,6 +147,8 @@ pub struct Broker {
     pub socket: PathBuf,
     pub ready_wait: Duration,
     pub upstream_argv: Vec<String>,
+    /// Variables the upstream and the helpers are passed (`env_pass`).
+    pub env_pass: Vec<String>,
     pub pools: Vec<PathBuf>,
     /// Argument names that hold paths, beyond the built-in ones.
     pub path_arguments: PathArguments,
@@ -1046,7 +1057,7 @@ impl Broker {
     /// The open helper's thread: run it, drop the window from the record if
     /// it failed, and close it again if the workspace was released meanwhile.
     fn run_open(&self, argv: &[String], root: PathBuf, project: PathBuf) {
-        let outcome = window::run(argv, &project).map_err(|why| {
+        let outcome = window::run(argv, &project, &self.env_pass).map_err(|why| {
             format!(
                 "could not open this workspace's {} window: {why}",
                 self.label
@@ -1087,7 +1098,9 @@ impl Broker {
             return;
         }
         if let (true, Some(opened)) = (close_after, opened) {
-            let (closed, failure) = self.close_windows(vec![opened]);
+            let Closed {
+                closed, failure, ..
+            } = self.close_windows(vec![opened]);
             // A client may have listed the window while it was open: its
             // target is gone now, so the slot's next task must look it up again.
             self.lock().targets.remove(&root);
@@ -1155,19 +1168,19 @@ impl Broker {
             .collect()
     }
 
-    /// Run `window_close` for each of `targets`, dropping each one closed
-    /// from the record; stop at the first failure. The record is saved.
-    fn close_windows(&self, targets: Vec<Opened>) -> (Vec<PathBuf>, Option<String>) {
-        let mut closed = vec![];
-        let mut failure = None;
+    /// Run `routing.close` for each of `targets`, dropping each one closed
+    /// from the record; stop at the first failure. Without a close helper
+    /// (a broker reinstalled without the routing that recorded them) each
+    /// is dropped as unclosable instead, for the release to audit: a broker
+    /// that cannot close a window must never hold a release. The record is
+    /// saved.
+    fn close_windows(&self, targets: Vec<Opened>) -> Closed {
+        let mut out = Closed::default();
+        let close = self.routing.as_ref().and_then(|r| r.close.as_ref());
         for target in targets {
-            let close = self.routing.as_ref().and_then(|r| r.close.as_ref());
-            let outcome = match close {
-                Some(argv) => window::run(argv, &target.project),
-                None => Err("no window helper configured".into()),
-            };
+            let outcome = close.map(|argv| window::run(argv, &target.project, &self.env_pass));
             match outcome {
-                Ok(()) => {
+                Some(Ok(())) | None => {
                     let mut state = self.lock();
                     state
                         .windows
@@ -1175,10 +1188,14 @@ impl Broker {
                     if state.opening.get(&target.root).is_some_and(|o| !o.running) {
                         state.opening.remove(&target.root);
                     }
-                    closed.push(target.project);
+                    if outcome.is_some() {
+                        out.closed.push(target.project);
+                    } else {
+                        out.unclosable.push(target.project);
+                    }
                 }
-                Err(why) => {
-                    failure = Some(format!(
+                Some(Err(why)) => {
+                    out.failure = Some(format!(
                         "could not close the {} window of {}: {why}",
                         self.label,
                         target.project.display()
@@ -1187,10 +1204,10 @@ impl Broker {
                 }
             }
         }
-        if !closed.is_empty() {
+        if !out.closed.is_empty() || !out.unclosable.is_empty() {
             self.save_windows();
         }
-        (closed, failure)
+        out
     }
 
     fn close_workspace(&self, client: u64, given: PathBuf, roots: &[PathBuf]) -> Value {
@@ -1214,12 +1231,21 @@ impl Broker {
                 .collect();
             (targets, opening)
         };
-        let (closed, failure) = self.close_windows(targets);
+        let Closed {
+            closed,
+            unclosable,
+            failure,
+        } = self.close_windows(targets);
         self.lock().targets.retain(|root, _| !under(root));
         self.log.line(&format!(
-            "client {client}: close_workspace {}: closed {}{}{}",
+            "client {client}: close_workspace {}: closed {}{}{}{}",
             sys::quoted(&given.to_string_lossy(), 4096),
             closed.len(),
+            if unclosable.is_empty() {
+                String::new()
+            } else {
+                format!("; {} unclosable, no close helper", unclosable.len())
+            },
             if opening.is_empty() {
                 String::new()
             } else {
@@ -1233,14 +1259,18 @@ impl Broker {
                 .map_or(String::new(), |f| format!("; {}", sys::quoted(f, 400)))
         ));
         self.publish();
-        match failure {
-            Some(error) => json!({"error": error}),
-            None if opening.is_empty() => json!({"closed": closed}),
-            None => {
+        let Some(error) = failure else {
+            let mut answer = json!({"closed": closed});
+            if !opening.is_empty() {
                 let opening: Vec<PathBuf> = opening.into_iter().map(|(_, p)| p).collect();
-                json!({"closed": closed, "opening": opening})
+                answer["opening"] = json!(opening);
             }
-        }
+            if !unclosable.is_empty() {
+                answer["unclosable"] = json!(unclosable);
+            }
+            return answer;
+        };
+        json!({"error": error})
     }
 
     /// A client's cancellation, under the id the upstream knows.
@@ -1361,6 +1391,7 @@ pub fn run(options: ServeOptions) -> i32 {
         label,
         ready_wait,
         upstream,
+        env_pass,
         pools,
         path_arguments,
         routing,
@@ -1446,6 +1477,7 @@ pub fn run(options: ServeOptions) -> i32 {
         socket: socket.clone(),
         ready_wait,
         upstream_argv: upstream,
+        env_pass,
         pools,
         path_arguments,
         routing,

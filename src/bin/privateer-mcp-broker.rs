@@ -9,7 +9,8 @@
 //!
 //! ```text
 //! privateer-mcp-broker serve --state-dir DIR --name NAME [--label TEXT] [--ready-wait-secs 60]
-//!     [--workspace-pool ABS]... [--path-arguments JSON] [--routing JSON] -- UPSTREAM...
+//!     [--workspace-pool ABS]... [--path-arguments JSON] [--env-pass JSON] [--routing JSON]
+//!     -- UPSTREAM...
 //! privateer-mcp-broker proxy --socket ABS [--connect-wait-secs 60] [--project REL]
 //! privateer-mcp-broker check-profile < PROFILE.json
 //! privateer-mcp-broker --version
@@ -44,7 +45,7 @@ pub const BROKER_VERSION: &str = "0.3.0";
 /// The longest JSON-RPC line either side may send.
 pub const MAX_LINE: usize = 16 * 1024 * 1024;
 
-const USAGE: &str = "usage: privateer-mcp-broker serve --state-dir DIR --name NAME [--label TEXT] [--ready-wait-secs N] [--workspace-pool ABS]... [--path-arguments JSON] [--routing JSON] -- UPSTREAM...\n       privateer-mcp-broker proxy --socket ABS [--connect-wait-secs N] [--project REL]\n       privateer-mcp-broker check-profile < PROFILE.json\n       privateer-mcp-broker --version";
+const USAGE: &str = "usage: privateer-mcp-broker serve --state-dir DIR --name NAME [--label TEXT] [--ready-wait-secs N] [--workspace-pool ABS]... [--path-arguments JSON] [--env-pass JSON] [--routing JSON] -- UPSTREAM...\n       privateer-mcp-broker proxy --socket ABS [--connect-wait-secs N] [--project REL]\n       privateer-mcp-broker check-profile < PROFILE.json\n       privateer-mcp-broker --version";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -79,6 +80,8 @@ pub struct ServeOptions {
     pub label: String,
     pub ready_wait: Duration,
     pub upstream: Vec<String>,
+    /// Variables passed through to the upstream and the window helpers.
+    pub env_pass: Vec<String>,
     /// Directories whose git checkouts are task workspaces.
     pub pools: Vec<PathBuf>,
     /// Argument names that hold paths, beyond the built-in ones.
@@ -107,6 +110,7 @@ fn serve_options(args: &[String]) -> Result<ServeOptions, String> {
     let mut label = None;
     let mut path_arguments = profile::PathArguments::default();
     let mut routing = None;
+    let mut env_pass = vec![];
     let json = |text: &str, flag: &str| {
         serde_json::from_str::<serde_json::Value>(text)
             .map_err(|_| format!("{flag} takes a JSON object"))
@@ -126,6 +130,12 @@ fn serve_options(args: &[String]) -> Result<ServeOptions, String> {
             }
             "--path-arguments" => {
                 path_arguments = profile::PathArguments::parse(&json(value(&mut rest, arg)?, arg)?)?
+            }
+            "--env-pass" => {
+                let text = value(&mut rest, arg)?;
+                let list = serde_json::from_str::<serde_json::Value>(text)
+                    .map_err(|_| format!("{arg} takes a JSON array"))?;
+                env_pass = profile::env_pass(&list)?;
             }
             "--routing" => {
                 routing = Some(profile::Routing::parse(&json(
@@ -158,6 +168,7 @@ fn serve_options(args: &[String]) -> Result<ServeOptions, String> {
         name,
         ready_wait: Duration::from_secs(ready_wait),
         upstream,
+        env_pass,
         pools,
         path_arguments,
         routing,

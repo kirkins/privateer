@@ -826,6 +826,28 @@ impl Machine {
     fn pass(&self, folder: &Path) -> Value {
         self.run(folder, &["serve", "--json", r#"{"once":true}"#])["mcp_broker"].clone()
     }
+
+    /// A dispatcher pass with `env` set beside the isolated environment.
+    fn pass_with(&self, folder: &Path, env: &[(&str, &str)]) -> Value {
+        let mut command = self.command(folder, &["serve", "--json", r#"{"once":true}"#]);
+        command.envs(env.iter().copied());
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .find_map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .filter(Value::is_object)
+            })
+            .unwrap_or(Value::Null)["mcp_broker"]
+            .clone()
+    }
 }
 
 /// `install --name NAME [EXTRA...] --upstream ARGV...`, as argv.
@@ -2499,8 +2521,16 @@ fn the_xcode_example_profile_routes_builds_and_discovers_its_projects() {
     let installed = machine.run(&upkeep, &install);
     assert_eq!(installed["label"], "Xcode");
     assert_eq!(installed["routing"]["target_argument"], "tabIdentifier");
+    assert_eq!(installed["env_pass"], json!(["DEVELOPER_DIR"]));
     let _detached = Detached(machine.dir().join("xcode.pid"));
-    let started = machine.pass(&upkeep);
+    // Only what env_pass names passes beyond the minimal environment.
+    let started = machine.pass_with(
+        &upkeep,
+        &[
+            ("DEVELOPER_DIR", "/Applications/Fake.app"),
+            ("PRIVATEER_TEST_UNPASSED", "x"),
+        ],
+    );
     assert!(started["xcode"]["started"].is_i64(), "{started}");
     let socket = machine.dir().join("xcode.sock");
     eventually(Duration::from_secs(10), "the socket", || {
@@ -2536,8 +2566,15 @@ fn the_xcode_example_profile_routes_builds_and_discovers_its_projects() {
         text(&second.call(json!(1), "Build", json!({}))),
         "built in window win-2"
     );
-    let opened: Vec<Value> = ws
-        .opens()
+    let opens = ws.opens();
+    let seen = records(&ws.root.join("record.jsonl"));
+    let upstream_env = &seen.iter().find(|r| r.get("started").is_some()).unwrap()["env"];
+    for env in [upstream_env, &opens[0]["env"]] {
+        assert_eq!(env["DEVELOPER_DIR"], "/Applications/Fake.app", "{env}");
+        assert!(env.get("PRIVATEER_TEST_UNPASSED").is_none(), "{env}");
+        assert_eq!(env["PATH"], "/usr/bin:/bin", "{env}");
+    }
+    let opened: Vec<Value> = opens
         .iter()
         .map(|o| o["argv"].as_array().unwrap().last().unwrap().clone())
         .collect();

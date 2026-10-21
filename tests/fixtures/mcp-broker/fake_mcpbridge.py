@@ -4,7 +4,7 @@ tool, target argument and fields come from a routing profile, the same file
 the broker pins, so one fake serves every profile.
 
   --record FILE        append every message received, one JSON line each,
-                       plus {"started": PID} at start
+                       plus {"started": PID, "env": ENVIRONMENT} at start
   --init-delay SECS    answer initialize this late
   --crash-after N      exit after receiving the Nth tools/call, once: a marker
                        FILE.crashed beside --record keeps a restart from
@@ -186,7 +186,7 @@ def call(request_id, params):
 
 
 def main():
-    record({'started': os.getpid()})
+    record({'started': os.getpid(), 'env': dict(os.environ)})
     for raw in sys.stdin:
         message = json.loads(raw)
         record(message)

@@ -1,6 +1,7 @@
 //! The routing profile: the one validator of what an instance declares
-//! about its upstream (its label, extra path arguments, and how its windows
-//! are listed, matched, opened and closed). `check-profile` runs it for
+//! about its upstream (its label, extra path arguments, the environment
+//! variables its upstream and helpers are passed, and how its windows are
+//! listed, matched, opened and closed). `check-profile` runs it for
 //! `privateer mcp-broker install`, and `serve` runs it again on what the
 //! dispatcher passes. Unknown keys are refused at every level: a typo must
 //! never silently turn routing off.
@@ -21,6 +22,9 @@ pub struct Profile {
     pub label: Option<String>,
     pub upstream: Option<Vec<String>>,
     pub path_arguments: PathArguments,
+    /// Variables passed through to the upstream and the window helpers,
+    /// beyond the minimal environment.
+    pub env_pass: Vec<String>,
     pub routing: Option<Routing>,
 }
 
@@ -110,7 +114,11 @@ pub fn check_stdin() -> i32 {
 impl Profile {
     pub fn parse(value: &Value) -> Result<Profile, String> {
         let map = object(value, "the profile")?;
-        known(map, "", &["label", "upstream", "path_arguments", "routing"])?;
+        known(
+            map,
+            "",
+            &["label", "upstream", "path_arguments", "env_pass", "routing"],
+        )?;
         let label = map.get("label").map(check_label).transpose()?;
         let upstream = map
             .get("upstream")
@@ -125,11 +133,17 @@ impl Profile {
             .map(PathArguments::parse)
             .transpose()?
             .unwrap_or_default();
+        let env_pass = map
+            .get("env_pass")
+            .map(env_pass)
+            .transpose()?
+            .unwrap_or_default();
         let routing = map.get("routing").map(Routing::parse).transpose()?;
         Ok(Profile {
             label,
             upstream,
             path_arguments,
+            env_pass,
             routing,
         })
     }
@@ -144,6 +158,9 @@ impl Profile {
             out.insert("upstream".into(), json!(upstream));
         }
         out.insert("path_arguments".into(), self.path_arguments.json());
+        if !self.env_pass.is_empty() {
+            out.insert("env_pass".into(), json!(self.env_pass));
+        }
         if let Some(routing) = &self.routing {
             out.insert("routing".into(), routing.json());
         }
@@ -507,6 +524,36 @@ fn check_label(value: &Value) -> Result<String, String> {
     }
 }
 
+/// `env_pass`: at most 32 variable names (`[A-Z_][A-Z0-9_]*`, at most 64
+/// characters). `PATH` is the broker's own, and `LD_*`/`DYLD_*` would load
+/// code into every helper, so those are refused; the minimal environment's
+/// own variables need no listing.
+pub fn env_pass(value: &Value) -> Result<Vec<String>, String> {
+    let names = strings(value, "env_pass", MAX_ITEMS)?;
+    for name in &names {
+        let bytes = name.as_bytes();
+        let valid = (1..=64).contains(&bytes.len())
+            && !bytes[0].is_ascii_digit()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_');
+        if !valid {
+            return Err(format!(
+                "env_pass: {} is not a variable name of 1 to 64 A-Z, 0-9 or _, not starting with a digit",
+                shown(name)
+            ));
+        }
+        let minimal =
+            matches!(name.as_str(), "HOME" | "LANG" | "TMPDIR") || name.starts_with("LC_");
+        if name == "PATH" || name.starts_with("LD_") || name.starts_with("DYLD_") || minimal {
+            return Err(format!(
+                "env_pass may not name {name}: PATH is fixed, LD_* and DYLD_* load code, and HOME, LANG, LC_* and TMPDIR are always passed"
+            ));
+        }
+    }
+    Ok(names)
+}
+
 /// The label `--label` gives serve, checked as a profile's.
 pub fn label(text: &str) -> Result<String, String> {
     check_label(&json!(text))
@@ -578,6 +625,12 @@ mod tests {
             json!({"names": [], "suffixes": []})
         );
         assert_eq!(Profile::parse(&canonical).unwrap(), profile);
+        assert!(canonical.get("env_pass").is_none());
+        let mut passing = fake();
+        passing["env_pass"] = json!(["FAKE_HOME_DIR"]);
+        let passing = Profile::parse(&passing).unwrap();
+        assert_eq!(passing.env_pass, ["FAKE_HOME_DIR"]);
+        assert_eq!(passing.json()["env_pass"], json!(["FAKE_HOME_DIR"]));
         assert_eq!(
             profile.routing.unwrap().project.unwrap().looked_for(),
             ".proj, Fake.toml"
@@ -634,6 +687,13 @@ mod tests {
         );
         refused(&|p| p["label"] = json!("x".repeat(33)), "label");
         refused(&|p| p["upstream"] = json!(["relative"]), "upstream");
+        refused(
+            &|p| p["env_pass"] = json!(["LD_PRELOAD"]),
+            "may not name LD_PRELOAD",
+        );
+        refused(&|p| p["env_pass"] = json!(["PATH"]), "may not name PATH");
+        refused(&|p| p["env_pass"] = json!(["lower"]), "not a variable name");
+        refused(&|p| p["env_pass"] = json!(vec!["A"; 33]), "env_pass");
         refused(
             &|p| p["path_arguments"] = json!({"names": vec!["a"; 33]}),
             "path_arguments.names",
