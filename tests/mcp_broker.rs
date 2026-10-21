@@ -1450,6 +1450,18 @@ fn path_arguments_stay_inside_the_workspace() {
     let inside = a.join("src/main.swift");
     let ok = client.call(json!(3), "XcodeRead", json!({"filePath": inside}));
     assert_eq!(text(&ok), format!("read {} in tab tab-a", inside.display()));
+    // Plural and URL names, and arrays of paths, are checked too.
+    for (n, arguments) in [
+        json!({"filePaths": [inside, b.join("README")]}),
+        json!({"uri": format!("file://{}", b.join("README").display())}),
+        json!({"file": "src/../../2/repo/README"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = client.call(json!(10 + n), "XcodeRead", arguments);
+        assert!(is_error(&refused), "{refused}");
+    }
     let forwarded = received(&broker, "XcodeRead");
     assert_eq!(forwarded.len(), 1, "{forwarded:?}");
     assert_eq!(forwarded[0]["filePath"], json!(inside));
@@ -1469,7 +1481,7 @@ fn the_first_window_call_opens_the_workspace_window_once() {
             ".hidden/Hidden.xcworkspace",
         ],
     );
-    // The window shows a second after the open.
+    // The window shows a second after the open helper exits.
     let broker = ws.broker("one", &["--delay", "1"], false, None);
     let mut first = Client::connect_from(&broker.socket(), &a, 10);
     let mut second = Client::connect_from(&broker.socket(), &a, 10);
@@ -1529,6 +1541,128 @@ fn the_first_window_call_opens_the_workspace_window_once() {
     assert!(is_error(&refused), "{refused}");
     assert!(text(&refused).contains("--project"), "{refused}");
     assert_eq!(ws.opens().len(), 2);
+}
+
+/// The XcodeListWindows calls the upstream has received.
+fn window_lists(broker: &Broker) -> usize {
+    received(broker, "XcodeListWindows").len()
+}
+
+#[test]
+fn a_slow_open_runs_once_and_every_caller_is_busy_by_its_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    // The open helper runs for 4 s, past the 2 s each call may wait.
+    let broker = ws.broker("one", &["--hold", "4"], false, Some(2));
+    let mut first = Client::connect_from(&broker.socket(), &a, 10);
+    let mut second = Client::connect_from(&broker.socket(), &a, 10);
+    // Ready, with the tool list cached, so the waits below are the window's.
+    for client in [&mut first, &mut second] {
+        assert_eq!(
+            text(&client.call(json!(1), "DocumentationSearch", json!({"query": "q"}))),
+            "found q"
+        );
+    }
+    let busy = "Xcode tools busy: Xcode is opening this workspace's window; retry after 15 s";
+    let first_sent = Instant::now();
+    first.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "BuildProject", "arguments": {}}}));
+    eventually(Duration::from_secs(5), "the open helper", || {
+        (!ws.opens().is_empty()).then_some(())
+    });
+    let second_sent = Instant::now();
+    second.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "BuildProject", "arguments": {}}}));
+    let answer = first.answer(json!(2));
+    let first_took = first_sent.elapsed();
+    assert_eq!(text(&answer), busy, "{answer}");
+    let answer = second.answer(json!(2));
+    let second_took = second_sent.elapsed();
+    assert_eq!(text(&answer), busy, "{answer}");
+    // The opener is not held for the helper, and the waiter waited on the
+    // running open (the grace path would have polled the window list).
+    assert!(first_took < Duration::from_secs(3), "{first_took:?}");
+    assert!(second_took < Duration::from_secs(3), "{second_took:?}");
+    assert_eq!(window_lists(&broker), 2, "one look each before the open");
+    assert_eq!(ws.opens().len(), 1);
+    // The helper ends and its window is recorded; the next call uses it.
+    eventually(Duration::from_secs(10), "the window", || {
+        (!ws.listed().is_empty()).then_some(())
+    });
+    eventually(Duration::from_secs(10), "the record", || {
+        (broker.state()["windows"].as_array()?.len() == 1).then_some(())
+    });
+    assert_eq!(
+        text(&first.call(json!(3), "BuildProject", json!({}))),
+        "built in tab tab-1"
+    );
+    assert_eq!(ws.opens().len(), 1, "{:?}", ws.opens());
+    assert!(received(&broker, "BuildProject").len() == 1);
+}
+
+#[test]
+fn a_workspace_released_while_its_window_opens_closes_it_when_the_open_ends() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    let broker = ws.broker("one", &["--hold", "3"], false, Some(1));
+    let mut client = Client::connect_from(&broker.socket(), &a, 10);
+    assert_eq!(
+        text(&client.call(json!(1), "DocumentationSearch", json!({"query": "q"}))),
+        "found q"
+    );
+    let busy = client.call(json!(2), "BuildProject", json!({}));
+    assert!(text(&busy).contains("is opening"), "{busy}");
+    // Nothing is recorded yet, so nothing closes now; the open is marked.
+    let started = Instant::now();
+    assert_eq!(close_workspace(&broker.socket(), &a), json!({"closed": []}));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let closes = eventually(Duration::from_secs(10), "the close", || {
+        let closes = ws.closes();
+        (!closes.is_empty()).then_some(closes)
+    });
+    assert_eq!(closes.len(), 1);
+    assert_eq!(
+        closes[0]["argv"].as_array().unwrap().last().unwrap(),
+        &json!(a.join("A.xcodeproj"))
+    );
+    eventually(Duration::from_secs(10), "an empty record", || {
+        (broker.state()["windows"] == json!([])).then_some(())
+    });
+    assert!(ws.listed().is_empty(), "{:?}", ws.listed());
+}
+
+#[test]
+fn a_tool_missing_from_the_list_is_listed_again_and_never_given_a_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    ws.seed(json!([{"tabIdentifier": "tab-a", "workspacePath": a.join("A.xcodeproj")}]));
+    let broker = ws.broker("one", &[], false, None);
+    let mut client = Client::connect_from(&broker.socket(), &a, 10);
+    assert_eq!(
+        text(&client.call(json!(1), "DocumentationSearch", json!({"query": "q"}))),
+        "found q"
+    );
+    let lists = || {
+        broker
+            .records()
+            .into_iter()
+            .filter(|r| r["method"] == "tools/list")
+            .count()
+    };
+    let before = lists();
+    let refused = client.call(json!(2), "Mystery", json!({"tabIdentifier": "tab-a"}));
+    assert!(is_error(&refused), "{refused}");
+    assert!(text(&refused).contains("does not list"), "{refused}");
+    assert_eq!(lists(), before + 1, "listed again, once");
+    // Without a tab it goes up as a window-free call.
+    let forwarded = client.call(json!(3), "Mystery", json!({}));
+    assert_eq!(forwarded["error"]["message"], "unknown tool", "{forwarded}");
+    assert_eq!(lists(), before + 2);
+    let sent = received(&broker, "Mystery");
+    assert_eq!(sent, [json!({})]);
 }
 
 #[test]
@@ -1604,12 +1738,25 @@ fn a_released_workspace_closes_only_the_windows_the_broker_opened() {
     assert_eq!(close_workspace(&broker.socket(), &b), json!({"closed": []}));
     assert_eq!(ws.listed().len(), 1, "b's own window is untouched");
     assert_eq!(ws.closes().len(), 1);
-    // A malformed control line gets an error, not a close.
-    let bad = control(
-        &broker.socket(),
-        json!({"privateer_control": 1, "close_workspace": "relative"}),
-    );
-    assert!(bad["error"].is_string(), "{bad}");
+    // A malformed control line, or a root not strictly inside a pool, gets
+    // an error, not a close.
+    let outside = ws.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    for root in [
+        json!("relative"),
+        json!("/"),
+        json!(ws.pool),
+        json!(outside),
+        json!(format!("{}/../2/repo", a.display())),
+        json!(null),
+    ] {
+        let bad = control(
+            &broker.socket(),
+            json!({"privateer_control": 1, "close_workspace": root}),
+        );
+        assert!(bad["error"].is_string(), "{root}: {bad}");
+    }
+    assert_eq!(ws.closes().len(), 1);
     // Opened again, then the broker restarts: the new one still closes it.
     assert_eq!(
         text(&client.call(json!(2), "BuildProject", json!({}))),

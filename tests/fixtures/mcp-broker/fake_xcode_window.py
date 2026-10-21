@@ -7,6 +7,7 @@ Both append their argv to --log, one JSON line each.
 
 open:   add {"tabIdentifier": "tab-N", "workspacePath": PROJECT}
   --delay SECS   add it this much later, from a detached child, and exit now
+  --hold SECS    keep running this long, then add it and exit (a slow open)
   --never        exit 0 and never add it
   --fail         print one line on stderr and exit 3
 close:  remove every window whose workspacePath is PROJECT
@@ -25,6 +26,7 @@ parser.add_argument('action', choices=['open', 'close'])
 parser.add_argument('--windows', required=True)
 parser.add_argument('--log', required=True)
 parser.add_argument('--delay', type=float, default=0)
+parser.add_argument('--hold', type=float, default=0)
 parser.add_argument('--never', action='store_true')
 parser.add_argument('--fail', action='store_true')
 parser.add_argument('--remove')
@@ -64,6 +66,8 @@ if options.action == 'open':
         sys.exit(3)
     if options.never:
         sys.exit(0)
+    if options.hold:
+        time.sleep(options.hold)
     if options.delay:
         if os.fork() == 0:
             os.setsid()
