@@ -789,7 +789,11 @@ fn a_forge_credential_is_never_given_to_a_launch() {
         let text = [output.stdout, output.stderr].concat();
         (output.status.success(), String::from_utf8(text).unwrap())
     };
-    let (ok, text) = cli("credential.set", &json!({"ref":"brave-search"}), b"brave-value\n");
+    let (ok, text) = cli(
+        "credential.set",
+        &json!({"ref":"brave-search"}),
+        b"brave-value\n",
+    );
     assert!(ok, "{text}");
     let forges = json!({"repos": {"github.com/acme/widget": {
         "forge": "github", "api": "https://api.github.com", "branch": "main",
@@ -798,14 +802,20 @@ fn a_forge_credential_is_never_given_to_a_launch() {
         "merger": {"account": "captain", "credential": "forge-merger-github"}}}});
     let (ok, text) = cli("forges.set", &forges, b"");
     assert!(ok, "{text}");
-    assert!(text.contains("forge-reviewer-github, forge-merger-github is not stored yet"), "{text}");
+    assert!(
+        text.contains("forge-reviewer-github, forge-merger-github is not stored yet"),
+        "{text}"
+    );
     // A bundle registry that names a forges.json ref is refused.
     for forge_ref in ["forge-reviewer-github", "forge-merger-github"] {
         let mut named = config.clone();
         named["bundles"][0]["credentials"] = json!([{"name":"FORGE_TOKEN","ref":forge_ref}]);
         let (ok, text) = cli("bundle.configure", &json!({"registry": named}), b"");
         assert!(!ok, "{forge_ref}: {text}");
-        assert!(text.contains("forge credential named in forges.json"), "{text}");
+        assert!(
+            text.contains("forge credential named in forges.json"),
+            "{text}"
+        );
     }
     let mut brave = config.clone();
     brave["bundles"][0]["credentials"] = json!([{"name":"BRAVE_API_KEY","ref":"brave-search"}]);
@@ -825,7 +835,10 @@ fn a_forge_credential_is_never_given_to_a_launch() {
              try:\n    found = credential_environment({{'credentials': [{{'name': 'TOKEN', 'ref': {reference:?}}}]}}, \
              {{'PRIVATEER_FLEET': {fleet:?}, 'HOME': {home:?}}})\n    print('given ' + ','.join(sorted(found)))\n\
              except Exception as error:\n    print('refused ' + type(error).__name__)\n",
-            plugins = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins").to_str().unwrap(),
+            plugins = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins")
+                .to_str()
+                .unwrap(),
             fleet = root.join("fleet.sqlite").to_str().unwrap(),
             home = root.join("user").to_str().unwrap(),
         );
@@ -835,7 +848,10 @@ fn a_forge_credential_is_never_given_to_a_launch() {
             .unwrap();
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
-    assert_eq!(launch("brave-search"), "given PRIVATEER_CREDENTIAL_TOKEN_FILE");
+    assert_eq!(
+        launch("brave-search"),
+        "given PRIVATEER_CREDENTIAL_TOKEN_FILE"
+    );
     assert_eq!(launch("forge-reviewer-github"), "refused Refused");
     assert_eq!(launch("forge-merger-github"), "refused Refused");
     fs::write(root.join("fleet.forges.json"), "{not json").unwrap();
