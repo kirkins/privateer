@@ -1042,8 +1042,7 @@ fn a_move_a_crash_interrupted_is_closed_and_the_captain_told_how_to_finish_it() 
 
     let ran = laptop.pass("liaison", Some(&ssh));
     assert_eq!(
-        ran["placement"]["interrupted"][0]["state"],
-        "interrupted",
+        ran["placement"]["interrupted"][0]["state"], "interrupted",
         "{ran}"
     );
     assert!(ran["placement"]["runner"].is_null(), "{ran}");
@@ -1513,6 +1512,58 @@ fn not_now_backs_off_and_never_pins_the_ship_for_the_captain() {
     );
     assert!(!unpin.status.success());
     assert!(approvals(&laptop).is_empty(), "no answer here was a yes");
+}
+
+#[test]
+fn a_ships_reply_to_the_placement_decision_is_no_answer() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    // A reply from a ship, however it reached the owner's home, marks the
+    // decision answered; only the captain's reply is read as the answer.
+    for (n, option) in ["never", "not_now"].into_iter().enumerate() {
+        let forged = format!("forged-{n}");
+        let home = laptop.home_conn("upkeep");
+        home.execute(
+            "INSERT INTO mail(id, sender, recipient, kind, correlation, body, payload, urgency,
+               created_ms) VALUES(?1, 'scout', 'upkeep', 'reply', ?2, ?3, ?4, 'normal', 1)",
+            rusqlite::params![
+                forged,
+                decision,
+                option,
+                json!({"answer": {"option_id": option}}).to_string()
+            ],
+        )
+        .unwrap();
+        home.execute(
+            "UPDATE mail SET state='answered', answered_by=?2 WHERE id=?1",
+            [&decision, &forged],
+        )
+        .unwrap();
+        laptop.pass("upkeep", Some(&ssh));
+        let (state, record) = proposal(&laptop, &id);
+        assert_eq!(state, "open", "{option}: {record}");
+    }
+    let scout = laptop.ok("scout", "ship.show", json!({"name": "scout"}));
+    assert!(scout["pinned"].is_null(), "{scout}");
+    let streak: i64 = laptop
+        .conn()
+        .query_row(
+            "SELECT COALESCE(MAX(not_now), 0) FROM placement_holds",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(streak, 0);
+    // Unanswered by the captain, it still expires.
+    laptop
+        .conn()
+        .execute(
+            "UPDATE placement_proposals SET created_ms=created_ms-49*3600*1000 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    laptop.pass("upkeep", Some(&ssh));
+    assert_eq!(proposal(&laptop, &id).0, "expired");
 }
 
 #[test]

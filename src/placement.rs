@@ -1602,50 +1602,58 @@ pub(crate) fn upkeep(conn: &Connection, owner_store: &Store) -> Result<Value> {
                         write_decision(owner_store, &proposal)?;
                         None
                     }
-                    Some(mail) if mail["state"] == "open" => {
-                        if now - proposal.created_ms >= OPEN_MS {
-                            let tx = owner_store.write_transaction()?;
-                            crate::mail::end_request(
-                                owner_store,
-                                &mail,
-                                "expired",
-                                "unanswered for 48 hours; it counts as not now",
-                            )?;
-                            tx.commit()?;
-                            Some(("expired", json!({"why": "unanswered for 48 hours"})))
-                        } else {
-                            None
-                        }
-                    }
-                    Some(mail) if mail["state"] == "answered" => {
+                    Some(mail) if matches!(mail["state"].as_str(), Some("open" | "answered")) => {
+                        // Only the captain answers it: a reply from anyone
+                        // else, however it arrived, is no answer.
                         let reply = mail["answered_by"]
                             .as_str()
                             .map(|r| crate::mail::find(owner_store, r))
                             .transpose()?
-                            .flatten();
-                        let choice = reply
-                            .as_ref()
-                            .and_then(|r| r["payload"]["answer"]["option_id"].as_str())
-                            .unwrap_or("");
-                        match choice {
-                            "move_clean" | "move_keep" => {
-                                let choice = choice.to_owned();
-                                update(conn, &id, &["open"], move |p| {
-                                    p.record["answer"] = json!(choice);
-                                    p.record["approved_seen_ms"] = json!(now);
-                                    p.state = "approved".into();
-                                })?;
-                                changed.push(json!({"proposal": id, "state": "approved"}));
-                                None
+                            .flatten()
+                            .filter(|r| r["from"] == crate::mail::CAPTAIN);
+                        match reply {
+                            None if now - proposal.created_ms >= OPEN_MS => {
+                                if mail["state"] == "open" {
+                                    let tx = owner_store.write_transaction()?;
+                                    crate::mail::end_request(
+                                        owner_store,
+                                        &mail,
+                                        "expired",
+                                        "unanswered for 48 hours; it counts as not now",
+                                    )?;
+                                    tx.commit()?;
+                                }
+                                Some(("expired", json!({"why": "unanswered for 48 hours"})))
                             }
-                            "never" => Some(("never", json!({"why": "the captain said never"}))),
-                            "not_now" => {
-                                Some(("not_now", json!({"why": "the captain said not now"})))
+                            None => None,
+                            Some(reply) => {
+                                let choice = reply["payload"]["answer"]["option_id"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                match choice {
+                                    "move_clean" | "move_keep" => {
+                                        let choice = choice.to_owned();
+                                        update(conn, &id, &["open"], move |p| {
+                                            p.record["answer"] = json!(choice);
+                                            p.record["approved_seen_ms"] = json!(now);
+                                            p.state = "approved".into();
+                                        })?;
+                                        changed.push(json!({"proposal": id, "state": "approved"}));
+                                        None
+                                    }
+                                    "never" => {
+                                        Some(("never", json!({"why": "the captain said never"})))
+                                    }
+                                    "not_now" => Some((
+                                        "not_now",
+                                        json!({"why": "the captain said not now"}),
+                                    )),
+                                    _ => Some((
+                                        "not_now",
+                                        json!({"why": "the captain answered without choosing a move"}),
+                                    )),
+                                }
                             }
-                            _ => Some((
-                                "not_now",
-                                json!({"why": "the captain answered without choosing a move"}),
-                            )),
                         }
                     }
                     Some(mail) => Some((
@@ -1857,10 +1865,15 @@ fn interrupted(conn: &Connection) -> Result<Vec<Value>> {
                     "finish": finish, "runs_on": on})
             }
         };
-        let state = outcome["state"].as_str().unwrap_or("interrupted").to_owned();
+        let state = outcome["state"]
+            .as_str()
+            .unwrap_or("interrupted")
+            .to_owned();
         finish(conn, &proposal, &state, outcome.clone())?;
-        closed.push(json!({"proposal": proposal.id, "ship": ship, "state": state,
-            "outcome": outcome}));
+        closed.push(
+            json!({"proposal": proposal.id, "ship": ship, "state": state,
+            "outcome": outcome}),
+        );
     }
     Ok(closed)
 }
