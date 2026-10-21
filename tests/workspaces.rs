@@ -1747,13 +1747,20 @@ impl XcodeBroker {
     /// Record a window the broker opened for `root`, as a broker that has
     /// since stopped would have left it.
     fn record(f: &Fixture, root: &Path, project: &Path) {
+        Self::record_all(f, &[(root, project)]);
+    }
+
+    fn record_all(f: &Fixture, windows: &[(&Path, &Path)]) {
         let run = Self::run_dir(f);
         fs::create_dir_all(&run).unwrap();
         fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+        let windows: Vec<Value> = windows
+            .iter()
+            .map(|(root, project)| json!({"root": root, "project": project, "tab": null, "opened_ms": 1}))
+            .collect();
         fs::write(
             run.join("xcode.windows.json"),
-            json!({"windows": [{"root": root, "project": project, "tab": null, "opened_ms": 1}]})
-                .to_string(),
+            json!({"windows": windows}).to_string(),
         )
         .unwrap();
     }
@@ -1938,4 +1945,135 @@ fn sweep_closes_the_xcode_window_before_it_releases() {
     assert!(released.contains(&"one"), "{report}");
     assert_eq!(broker.closes(), [project.to_string_lossy()]);
     assert!(XcodeBroker::recorded(&f).is_empty());
+}
+
+#[test]
+fn sweep_leaves_the_window_of_a_checkout_another_task_now_holds() {
+    let f = Fixture::new();
+    let moved = f.acquire("one");
+    let freed = f.acquire("two");
+    let moved_root = fs::canonicalize(path(&moved)).unwrap();
+    let freed_root = fs::canonicalize(path(&freed)).unwrap();
+    let pool = path(&moved)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let state_file = pool.join("fixture-state.json");
+    let mut slots: Vec<Value> = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    for slot in slots.iter_mut() {
+        if slot["lease_id"] == moved["lease_id"] {
+            // Another task's live lease on the same checkout.
+            slot["lease_holder"] = json!("privateer:other:gen999");
+            slot["lease_id"] = json!("moved-lease-id");
+        } else if slot["lease_id"] == freed["lease_id"] {
+            // Returned to the pool behind Privateer's back: nobody holds it.
+            slot["status"] = json!("available");
+            slot["lease_holder"] = json!("");
+            slot["lease_id"] = json!("");
+        }
+    }
+    fs::write(&state_file, serde_json::to_string(&slots).unwrap()).unwrap();
+    let moved_project = moved_root.join("A.xcodeproj");
+    let freed_project = freed_root.join("B.xcodeproj");
+    XcodeBroker::record_all(
+        &f,
+        &[(&moved_root, &moved_project), (&freed_root, &freed_project)],
+    );
+    let broker = XcodeBroker::start(&f, &[]);
+    f.ok("serve", json!({"once": true}));
+    for task in ["one", "two"] {
+        let status = f.ok("workspace.status", json!({"task_id": task}));
+        assert_eq!(status["state"], "released", "{task}: {status}");
+    }
+    // Only the free checkout's window closed; the new holder keeps its own.
+    assert_eq!(broker.closes(), [freed_project.to_string_lossy()]);
+    let left = XcodeBroker::recorded(&f);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["root"], json!(moved_root));
+}
+
+/// A broker that holds the lock and the socket, accepts every connection
+/// and never answers. Stopped when dropped.
+struct HungBroker(std::process::Child);
+
+impl HungBroker {
+    fn start(f: &Fixture) -> HungBroker {
+        let run = XcodeBroker::run_dir(f);
+        fs::create_dir_all(&run).unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = r#"import fcntl, os, socket, sys
+run = sys.argv[1]
+lock = os.open(os.path.join(run, 'xcode.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(lock, fcntl.LOCK_EX)
+listener = socket.socket(socket.AF_UNIX)
+os.umask(0o177)
+listener.bind(os.path.join(run, 'xcode.sock'))
+listener.listen(16)
+held = []
+while True:
+    held.append(listener.accept()[0])
+"#;
+        let child = support::command(support::python())
+            .args(["-I", "-c", script])
+            .arg(&run)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !run.join("xcode.sock").exists() {
+            assert!(Instant::now() < until, "the hung broker did not start");
+            thread::sleep(Duration::from_millis(30));
+        }
+        HungBroker(child)
+    }
+}
+
+impl Drop for HungBroker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_hung_broker_holds_up_only_the_release_of_a_workspace_with_a_window() {
+    let f = Fixture::new();
+    let quiet = f.acquire("one");
+    let windowed = f.acquire("two");
+    let root = fs::canonicalize(path(&windowed)).unwrap();
+    let project = root.join("App.xcodeproj");
+    XcodeBroker::record(&f, &root, &project);
+    let _hung = HungBroker::start(&f);
+    // No window recorded under it: the broker is never asked.
+    let started = Instant::now();
+    assert_eq!(f.release(&quiet, false)["state"], "released");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    // A recorded window: refused once the 35 s run out, and the lease kept.
+    let started = Instant::now();
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id": "two", "lease_id": windowed["lease_id"]}),
+    );
+    let took = started.elapsed();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("could not close the Xcode window for this workspace")
+            && stderr.contains("the MCP broker did not answer within 35 s"),
+        "{stderr}"
+    );
+    assert!(
+        took >= Duration::from_secs(34) && took < Duration::from_secs(50),
+        "{took:?}"
+    );
+    let status = f.ok("workspace.status", json!({"task_id": "two"}));
+    assert_eq!(status["state"], "ready");
+    assert_eq!(status["lease_id"], windowed["lease_id"]);
+    assert_eq!(XcodeBroker::recorded(&f).len(), 1);
 }

@@ -372,7 +372,21 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 .filter(|slot| slot["lease_id"].as_str() == Some(&lease))
                 .collect();
             if on_lease.is_empty() {
-                if let Err(error) = close_xcode_window(store, &w) {
+                // Another task's live lease on the same checkout owns its
+                // window now: closing it would close that task's window.
+                let path_text = path.to_str().unwrap_or_default();
+                let reused = all_slots.iter().any(|slot| {
+                    slot["path"].as_str() == Some(path_text)
+                        && slot["lease_id"]
+                            .as_str()
+                            .is_some_and(|other| !other.is_empty() && other != lease)
+                });
+                let closed = if reused {
+                    Ok(())
+                } else {
+                    close_xcode_window(store, &w)
+                };
+                if let Err(error) = closed {
                     let reason = format!("{error:#}");
                     if let Some(kept) = keep(store, &lock, &w, &reason)? {
                         alert_unreleasable(store, &kept, &reason)?;

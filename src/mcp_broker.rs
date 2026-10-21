@@ -26,17 +26,37 @@ const DEFAULT_UPSTREAM: [&str; 2] = ["/usr/bin/xcrun", "mcpbridge"];
 /// How a Mac opens a workspace's window: `-g` keeps the captain's focus.
 #[cfg(target_os = "macos")]
 const DEFAULT_WINDOW_OPEN: &[&str] = &["/usr/bin/open", "-g", "-a", "Xcode"];
-/// How a Mac closes it: the project path is the script's argument, never part
-/// of the script, and an Xcode that is not running is never launched.
-#[cfg(target_os = "macos")]
+/// How a Mac closes it: every workspace document whose path is the recorded
+/// project or lies below it (Xcode can report `X.xcodeproj` as
+/// `X.xcodeproj/project.xcworkspace`), last first so closing one does not
+/// shift the others. The project path is the script's argument, never part
+/// of the script; nothing matching exits 0; and an Xcode that is not running
+/// is never launched.
+#[cfg(any(target_os = "macos", test))]
 const DEFAULT_WINDOW_CLOSE: &[&str] = &[
     "/usr/bin/osascript",
     "-e",
     "on run argv",
     "-e",
+    "set wantedPath to item 1 of argv",
+    "-e",
+    "set wantedPrefix to wantedPath & \"/\"",
+    "-e",
     "if application \"Xcode\" is running then",
     "-e",
-    "tell application \"Xcode\" to close (every workspace document whose path is (item 1 of argv)) saving no",
+    "tell application \"Xcode\"",
+    "-e",
+    "set docs to every workspace document",
+    "-e",
+    "repeat with i from (count of docs) to 1 by -1",
+    "-e",
+    "set p to path of (item i of docs)",
+    "-e",
+    "if p is not missing value and (p is wantedPath or p starts with wantedPrefix) then close (item i of docs) saving no",
+    "-e",
+    "end repeat",
+    "-e",
+    "end tell",
     "-e",
     "end if",
     "-e",
@@ -46,8 +66,10 @@ const DEFAULT_WINDOW_CLOSE: &[&str] = &[
 const SHELLS: [&str; 12] = [
     "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "env", "busybox", "xargs",
 ];
-/// The longest a release waits for the broker to close a window.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a release waits for the broker to close a window: longer than
+/// the broker's 30 s helper deadline, so a close helper the broker kills is
+/// reported as the broker's error, not as silence.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(35);
 /// The dispatcher looks at most this often.
 const ENSURE_EVERY: Duration = Duration::from_secs(30);
 const USAGE: &str = "usage: privateer mcp-broker install [--workspace-pool ABS]... [--window-open JSON_ARGV] [--window-close JSON_ARGV] [--upstream /ABS/COMMAND [ARG...]] | status | stop";
@@ -725,50 +747,79 @@ fn stop_running(files: &Files) -> Result<Value> {
 /// What asking the broker to close a workspace's windows came to.
 #[derive(Debug)]
 pub enum CloseOutcome {
-    /// The broker closed these projects' windows (none, if it opened none).
+    /// The broker closed these projects' windows; none when the record
+    /// lists no window under the root, in which case it was not asked.
     Closed(Vec<PathBuf>),
     /// No broker runs; any window it opened stays open (and is audited).
     NotRunning,
 }
 
+/// The windows `xcode.windows.json` records under `root`, read under the
+/// same link and owner checks as every broker file. Unreadable means none.
+fn recorded_under(files: &Files, root: &Path) -> Vec<Value> {
+    read_checked(&files.windows)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|record| record["windows"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| {
+            w["root"]
+                .as_str()
+                .is_some_and(|r| Path::new(r).starts_with(root))
+        })
+        .collect()
+}
+
 /// Ask the running broker to close every Xcode window it opened under
-/// `root` (`{"privateer_control":1,"close_workspace":ROOT}`), within 30 s.
-/// A broker that answers with an error, or does not answer, is an error.
+/// `root` (`{"privateer_control":1,"close_workspace":ROOT}`), within 35 s.
+/// The broker is asked only when its record lists a window under `root`,
+/// so a broker that hangs holds up only the release of a workspace it
+/// opened a window for. A broker that answers with an error, or does not
+/// answer in time, is an error.
 pub(crate) fn close_workspace(store: &Store, root: &Path) -> Result<CloseOutcome> {
     // No run directory this home could use means no broker to ask.
     let Ok(files) = Files::resolve(Some(store.home())) else {
         return Ok(CloseOutcome::NotRunning);
     };
+    let left = recorded_under(&files, root);
+    if left.is_empty() {
+        return Ok(CloseOutcome::Closed(vec![]));
+    }
     if fs::symlink_metadata(&files.socket).is_err() || !lock_held(&files.lock) {
-        let left: Vec<Value> = read_checked(&files.windows)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|record| record["windows"].as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|w| {
-                w["root"]
-                    .as_str()
-                    .is_some_and(|r| Path::new(r).starts_with(root))
-            })
-            .collect();
-        if !left.is_empty() {
-            store.audit(
-                "workspace.xcode_window_unclosed",
-                &json!({"root": root, "windows": left, "reason": "the MCP broker is not running"}),
-            )?;
-        }
+        store.audit(
+            "workspace.xcode_window_unclosed",
+            &json!({"root": root, "windows": left, "reason": "the MCP broker is not running"}),
+        )?;
         return Ok(CloseOutcome::NotRunning);
     }
     let deadline = Instant::now() + CLOSE_TIMEOUT;
+    let silent = || {
+        format!(
+            "the MCP broker did not answer within {} s",
+            CLOSE_TIMEOUT.as_secs()
+        )
+    };
     let left = || {
         deadline
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
-            .context("the MCP broker did not answer within 30 s")
+            .with_context(silent)
     };
-    let mut stream = std::os::unix::net::UnixStream::connect(&files.socket)
-        .with_context(|| format!("cannot reach the MCP broker at {}", files.socket.display()))?;
+    let mut stream = connect_by(&files.socket, deadline).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            anyhow::anyhow!(
+                "could not connect to the MCP broker at {} within {} s",
+                files.socket.display(),
+                CLOSE_TIMEOUT.as_secs()
+            )
+        } else {
+            anyhow::anyhow!(
+                "cannot reach the MCP broker at {}: {error}",
+                files.socket.display()
+            )
+        }
+    })?;
     ensure!(
         peer_uid(stream.as_raw_fd())? == unsafe { libc::geteuid() },
         "the MCP broker socket is not this user's"
@@ -791,7 +842,7 @@ pub(crate) fn close_workspace(store: &Store, root: &Path) -> Result<CloseOutcome
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                bail!("the MCP broker did not answer within 30 s")
+                bail!(silent())
             }
             Err(error) => return Err(error).context("cannot read the MCP broker's answer"),
         };
@@ -813,6 +864,125 @@ pub(crate) fn close_workspace(store: &Store, root: &Path) -> Result<CloseOutcome
     let closed: Vec<PathBuf> = serde_json::from_value(answer["closed"].clone())
         .context("the MCP broker's answer names no closed windows")?;
     Ok(CloseOutcome::Closed(closed))
+}
+
+/// Connect to the Unix socket at `path` by `deadline` without ever
+/// blocking past it: a blocking connect waits as long as the listener's
+/// backlog stays full, which a hung broker never drains. The stream comes
+/// back blocking.
+// sun_path is i8 on some targets and u8 on others; sa_family_t's width
+// differs between Linux and macOS.
+#[allow(clippy::unnecessary_cast)]
+fn connect_by(path: &Path, deadline: Instant) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: an all-zero sockaddr_un is a valid, empty address.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the socket path is too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        address.sun_len = length as u8;
+    }
+    // SAFETY: socket returns a new descriptor or -1.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a new descriptor nothing else owns.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fcntl on a descriptor this function owns.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    let set = unsafe {
+        libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+            && libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if flags < 0 || !set {
+        return Err(io::Error::last_os_error());
+    }
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
+    loop {
+        // SAFETY: `address` is a valid sockaddr_un of `length` bytes.
+        let done = unsafe {
+            libc::connect(
+                raw,
+                (&address as *const libc::sockaddr_un).cast(),
+                length as libc::socklen_t,
+            )
+        };
+        if done == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            // Linux: the backlog is full. Try again until the deadline.
+            Some(libc::EAGAIN) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(timed_out());
+                }
+                std::thread::sleep(left.min(Duration::from_millis(50)));
+            }
+            // Pending: wait for it to become writable, then read its outcome.
+            Some(libc::EINPROGRESS) => {
+                let mut poll = libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(timed_out());
+                    }
+                    let millis = left.as_millis().clamp(1, 60_000) as libc::c_int;
+                    // SAFETY: one valid pollfd.
+                    match unsafe { libc::poll(&mut poll, 1, millis) } {
+                        0 => {}
+                        n if n > 0 => break,
+                        _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+                        _ => return Err(io::Error::last_os_error()),
+                    }
+                }
+                let mut code: libc::c_int = 0;
+                let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: `code` and `size` describe a writable int.
+                let got = unsafe {
+                    libc::getsockopt(
+                        raw,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut code as *mut libc::c_int).cast(),
+                        &mut size,
+                    )
+                };
+                if got != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if code != 0 {
+                    return Err(io::Error::from_raw_os_error(code));
+                }
+                break;
+            }
+            _ => return Err(error),
+        }
+    }
+    // SAFETY: fcntl on a descriptor this function owns.
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(std::os::unix::net::UnixStream::from(socket))
 }
 
 /// The uid of a connected Unix socket's peer.
@@ -1017,6 +1187,48 @@ mod tests {
         assert!(read_checked(&link).is_err());
         fs::hard_link(&path, temp.path().join("hard")).unwrap();
         assert!(read_checked(&path).is_err());
+    }
+
+    #[test]
+    fn a_full_backlog_never_blocks_a_connect_past_its_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("full.sock");
+        // A listener that never accepts, with the smallest backlog.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let mut held = vec![];
+        let started = Instant::now();
+        let failed = loop {
+            let attempt = Instant::now();
+            match connect_by(&path, attempt + Duration::from_millis(300)) {
+                Ok(stream) => held.push(stream),
+                Err(error) => break (error, attempt.elapsed()),
+            }
+            assert!(held.len() < 512, "the backlog never filled");
+        };
+        assert!(failed.1 < Duration::from_secs(2), "{failed:?}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        drop(listener);
+        // Nothing listening: refused at once.
+        let gone = connect_by(
+            &temp.path().join("none.sock"),
+            Instant::now() + CLOSE_TIMEOUT,
+        );
+        assert!(gone.is_err());
+    }
+
+    #[test]
+    fn the_mac_close_script_is_a_valid_helper_that_never_interpolates() {
+        let argv: Vec<String> = DEFAULT_WINDOW_CLOSE.iter().map(|s| s.to_string()).collect();
+        check_helper(&argv).unwrap();
+        assert!(
+            argv.iter()
+                .all(|line| !line.contains('{') && !line.contains("do shell"))
+        );
+        assert!(
+            argv.iter()
+                .any(|line| line == "set wantedPath to item 1 of argv")
+        );
     }
 
     #[test]
