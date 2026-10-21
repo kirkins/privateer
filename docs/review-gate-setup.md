@@ -1,5 +1,7 @@
 # Review gate setup: captain kit
 
+> **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. `review.start` and `pr.merge` (round B1) remain as optional checks; the setup steps below are not needed.
+
 This kit sets up the top-tier review gate and routes for GitHub and Forgejo repositories, as specified in the [review gate design](design/review-gate-and-route-strength.md).
 
 Every step requiring direct manual operator execution is marked **[hands]**. Non-[hands] steps are performed by the runtime or crew PRs.
