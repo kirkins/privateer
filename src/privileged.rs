@@ -18,7 +18,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::AsRawFd;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -118,12 +119,35 @@ fn refused_class(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Unicode's format characters (category Cf: bidi overrides and isolates,
+/// zero-width characters, the byte order mark, tags) and the line and
+/// paragraph separators: invisible, or able to move text on a screen.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}'
+        | '\u{890}'..='\u{891}' | '\u{8e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
+        | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+        | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}'
+        | '\u{e0001}' | '\u{e0020}'..='\u{e007f}')
+}
+
+/// One line of visible text: no control character (category Cc: NUL, CR,
+/// LF, escapes) and no format or separator character.
 fn no_control(text: &str, what: &str) -> Result<()> {
     ensure!(
-        !text.chars().any(char::is_control),
-        "{what} contains a control character or NUL"
+        !text.chars().any(|c| c.is_control() || invisible(c)),
+        "{what} contains a control character, NUL or invisible formatting character"
     );
     Ok(())
+}
+
+fn check_reason(reason: &str) -> Result<()> {
+    ensure!(
+        !reason.trim().is_empty() && reason.len() <= MAX_REASON_BYTES,
+        "reason must be 1 to {MAX_REASON_BYTES} bytes"
+    );
+    no_control(reason, "reason")
 }
 
 /// A staged command, checked: the canonical program and the existing folder.
@@ -183,6 +207,102 @@ fn check_program_file(program: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
+/// The working folder: a real folder, named without a symlink or `..`, that
+/// is root's all the way up and writable by no one else. The root command
+/// may run files from it (make, cargo, npm and pip do), so nothing but root
+/// may put them there. `/` is the usual folder.
+fn check_folder(cwd: &str) -> Result<PathBuf> {
+    no_control(cwd, "cwd")?;
+    ensure!(
+        cwd.len() <= MAX_PATH_BYTES && Path::new(cwd).is_absolute(),
+        "cwd must be an absolute path"
+    );
+    let mut walked = PathBuf::new();
+    for part in Path::new(cwd).components() {
+        match part {
+            Component::RootDir => walked.push("/"),
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                walked.push(name);
+                let meta = fs::symlink_metadata(&walked)
+                    .map_err(|_| anyhow::anyhow!("cwd must be an existing folder"))?;
+                ensure!(
+                    !meta.file_type().is_symlink(),
+                    "cwd must name no symlink, and {} is one",
+                    walked.display()
+                );
+            }
+            _ => bail!("cwd must not contain '..'"),
+        }
+    }
+    let canonical =
+        fs::canonicalize(cwd).map_err(|_| anyhow::anyhow!("cwd must be an existing folder"))?;
+    ensure!(canonical.is_dir(), "cwd must be an existing folder");
+    ensure!(
+        !canonical
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("sudoers"),
+        "a working folder naming sudoers is refused"
+    );
+    let mut folder = Some(canonical.as_path());
+    while let Some(path) = folder {
+        owned_by_root(path).map_err(|e| {
+            anyhow::anyhow!("cwd must be root's all the way up (\"/\" is the usual folder): {e}")
+        })?;
+        folder = path.parent();
+    }
+    Ok(canonical)
+}
+
+/// The checked working folder, opened again just before sudo starts: one
+/// folder at a time from `/`, never following a symlink, each checked by
+/// its open descriptor. The child enters the last one with `fchdir`, so no
+/// path is looked up between this check and exec.
+fn open_folder(path: &Path) -> Result<File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let checked = |file: File, shown: &Path| -> Result<File> {
+        let meta = file.metadata()?;
+        ensure!(
+            meta.is_dir(),
+            "the working folder {} changed",
+            shown.display()
+        );
+        ensure!(
+            trusted_owner(meta.uid()) && meta.mode() & 0o022 == 0,
+            "the working folder {} is no longer root's alone",
+            shown.display()
+        );
+        Ok(file)
+    };
+    let root = c"/";
+    let fd = unsafe { libc::open(root.as_ptr(), flags) };
+    ensure!(fd >= 0, "cannot open /: {}", std::io::Error::last_os_error());
+    let mut folder = checked(unsafe { File::from_raw_fd(fd) }, Path::new("/"))?;
+    let mut walked = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                walked.push(name);
+                let name = std::ffi::CString::new(name.as_bytes())?;
+                let fd = unsafe { libc::openat(folder.as_raw_fd(), name.as_ptr(), flags) };
+                ensure!(
+                    fd >= 0,
+                    "cannot open the working folder {} without following a symlink: {}",
+                    walked.display(),
+                    std::io::Error::last_os_error()
+                );
+                folder = checked(unsafe { File::from_raw_fd(fd) }, &walked)?;
+            }
+            _ => bail!("the working folder {} is not canonical", path.display()),
+        }
+    }
+    Ok(folder)
+}
+
 /// Every shape and program refusal, at staging and again at run.
 fn check(program: &str, args: &[String], cwd: &str) -> Result<Checked> {
     no_control(program, "program")?;
@@ -211,13 +331,7 @@ fn check(program: &str, args: &[String], cwd: &str) -> Result<Checked> {
         total <= MAX_ARGS_BYTES,
         "the arguments are at most {MAX_ARGS_BYTES} bytes in total"
     );
-    no_control(cwd, "cwd")?;
-    ensure!(
-        cwd.len() <= MAX_PATH_BYTES && Path::new(cwd).is_absolute(),
-        "cwd must be an absolute path"
-    );
-    let cwd = fs::canonicalize(cwd).context("cwd must be an existing folder")?;
-    ensure!(cwd.is_dir(), "cwd must be an existing folder");
+    let cwd = check_folder(cwd)?;
     let given = Path::new(program);
     let canonical = fs::canonicalize(given).with_context(|| format!("no program at {program}"))?;
     let canonical_str = canonical.to_str().context("program path must be UTF-8")?;
@@ -289,6 +403,7 @@ pub(crate) fn verify(request: &Value) -> Result<String> {
             .as_str()
             .with_context(|| format!("privileged request has no {key}"))
     };
+    check_reason(field("reason")?)?;
     let args = strings(&staged["args"], "args")?;
     let expected = binding(
         request["id"].as_str().context("request id")?,
@@ -399,9 +514,67 @@ pub(crate) fn summary(request: &Value) -> Value {
         .flatten()
         .map(|a| display(a.as_str().unwrap_or("")))
         .collect();
+    let unrooted: Vec<String> = staged["unrooted"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|a| a.as_str().unwrap_or("").to_owned())
+        .collect();
     json!({"argv": lines, "cwd": display(staged["cwd"].as_str().unwrap_or("")),
-        "reason": staged["reason"], "hash": staged["hash"], "machine": staged["machine"],
-        "expires_ms": expires_ms(request)})
+        "reason": display(staged["reason"].as_str().unwrap_or("")),
+        "warnings": warnings(&unrooted), "hash": staged["hash"],
+        "machine": staged["machine"], "expires_ms": expires_ms(request)})
+}
+
+/// Whether a folder is root's all the way up: its deepest existing part,
+/// canonical, and every folder above that.
+fn rooted(folder: &Path) -> bool {
+    let Some(existing) = folder.ancestors().find(|f| f.exists()) else {
+        return false;
+    };
+    let Ok(canonical) = fs::canonicalize(existing) else {
+        return false;
+    };
+    canonical.ancestors().all(|f| owned_by_root(f).is_ok())
+}
+
+/// The arguments that name a path the root command reads or writes and that
+/// someone other than root could change after the captain approves: a
+/// relative path, or an absolute one under a folder that is not root's all
+/// the way up. Warned about, not refused; the folder is now. An option's
+/// value (`--file=PATH`) counts too.
+fn unrooted(args: &[String], cwd: &Path) -> Vec<String> {
+    args.iter()
+        .filter(|arg| {
+            let mut paths = vec![arg.as_str()];
+            if let Some((_, value)) = arg.split_once('=').filter(|_| arg.starts_with('-')) {
+                paths.push(value);
+            }
+            paths.into_iter().any(|path| {
+                if let Some(rest) = path.strip_prefix('/') {
+                    !rest.is_empty() && !Path::new(path).parent().is_some_and(rooted)
+                } else {
+                    !path.is_empty()
+                        && !path.starts_with('-')
+                        && !path.contains("://")
+                        && (path.contains('/') || fs::symlink_metadata(cwd.join(path)).is_ok())
+                }
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn warnings(unrooted: &[String]) -> Vec<String> {
+    unrooted
+        .iter()
+        .map(|arg| {
+            format!(
+                "warning: {} is not under a root-owned folder; it can change after you approve",
+                display(arg)
+            )
+        })
+        .collect()
 }
 
 fn stage(store: &Store, args: &Value) -> Result<Value> {
@@ -429,11 +602,7 @@ fn stage(store: &Store, args: &Value) -> Result<Value> {
         "{from} can stage a privileged command only for its own task"
     );
     let reason = required(args, "reason")?;
-    ensure!(
-        !reason.trim().is_empty() && reason.len() <= MAX_REASON_BYTES,
-        "reason must be 1 to {MAX_REASON_BYTES} bytes"
-    );
-    no_control(&reason.replace('\n', " "), "reason")?;
+    check_reason(reason)?;
     let staged_args = match args.get("args").filter(|v| !v.is_null()) {
         Some(value) => strings(value, "args")?,
         None => vec![],
@@ -478,11 +647,12 @@ fn stage(store: &Store, args: &Value) -> Result<Value> {
         &cwd,
     );
     let hash = crate::core::hash(&bound);
+    let unrooted = unrooted(&checked.args, &checked.cwd);
     let payload = json!({
         "privileged": {"v": VERSION, "ship": from, "task_id": task_id, "machine": machine,
             "program": program, "program_sha256": checked.program_sha256,
             "args": checked.args, "argv": bound["argv"], "cwd": cwd, "reason": reason,
-            "hash": hash},
+            "unrooted": unrooted, "hash": hash},
         "artifact": artifact(&hash),
         "environment": environment(&machine),
     });
@@ -492,8 +662,13 @@ fn stage(store: &Store, args: &Value) -> Result<Value> {
         .flatten()
         .map(|a| display(a.as_str().unwrap_or("")))
         .collect();
+    let mut warned = warnings(&unrooted).join("\n");
+    if !warned.is_empty() {
+        warned.push('\n');
+    }
     let body = format!(
-        "Run as root on {machine}:\n{}\nin {}\nReason: {reason}\nHash {hash}",
+        "Reason: {}\n{warned}Run as root on {machine}:\n{}\nin {}\nHash {hash}",
+        display(reason),
         shown.join("\n"),
         display(&cwd)
     );
@@ -690,7 +865,6 @@ fn open_tty() -> Result<Tty> {
         .write(true)
         .open("/dev/tty")
         .context("privileged run needs the captain at a terminal, and /dev/tty cannot be opened")?;
-    use std::os::fd::AsRawFd;
     let fd = tty.as_raw_fd();
     let output = Box::new(tty.try_clone()?);
     Ok(Tty {
@@ -765,7 +939,6 @@ fn execute(plan: &Plan, timeout: Duration, tty: &Tty) -> Result<Outcome> {
         .args(&plan.args)
         .env_clear()
         .env("PATH", SAFE_PATH)
-        .current_dir(&plan.cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -785,7 +958,20 @@ fn execute(plan: &Plan, timeout: Duration, tty: &Tty) -> Result<Outcome> {
             });
         }
     }
+    // Checked once more by descriptor, last thing before the spawn.
+    let folder = open_folder(&plan.cwd)?;
+    let folder_fd = folder.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(folder_fd) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
     let mut child = command.spawn().context("could not start sudo")?;
+    drop(folder);
     let group = child.id() as libc::pid_t;
     let kept = Arc::new(Mutex::new(VecDeque::new()));
     let mut copiers = vec![];
@@ -912,16 +1098,24 @@ fn run(store: &Store, id: &str, timeout: Duration) -> Result<Value> {
     for arg in staged["argv"].as_array().into_iter().flatten() {
         shown.push_str(&format!("    {}\n", display(arg.as_str().unwrap_or(""))));
     }
+    // The ship's words first, then the warnings; the command, its hash and
+    // the prompt are the last thing on the screen.
+    let mut warned = String::new();
+    for line in warnings(&unrooted(&first.args, &first.cwd)) {
+        warned.push_str(&line);
+        warned.push('\n');
+    }
     write!(
         tty.output,
         "Privileged command {id} from {} (task {}), approved by the captain.\n\
-         Runs as root on {} with sudo -k, no shell:\n{shown}in {}\nReason: {}\n\
+         Reason: {}\n{warned}\
+         Runs as root on {} with sudo -k, no shell:\n{shown}in {}\n\
          Hash {}\nType the first {CONFIRM_CHARS} characters of the hash to run it: ",
         first.request["from"].as_str().unwrap_or("?"),
         first.request["task_id"].as_str().unwrap_or("?"),
+        display(staged["reason"].as_str().unwrap_or("")),
         staged["machine"].as_str().unwrap_or("?"),
         display(staged["cwd"].as_str().unwrap_or("")),
-        staged["reason"].as_str().unwrap_or(""),
         first.hash
     )?;
     tty.output.flush()?;
@@ -955,6 +1149,15 @@ fn run(store: &Store, id: &str, timeout: Duration) -> Result<Value> {
     tx.commit()?;
     writeln!(tty.output)?;
     let outcome = execute(&plan, timeout, &tty);
+    if outcome.as_ref().is_ok_and(|o| o.timed_out) {
+        // The captain's own account cannot signal a root process, and under
+        // use_pty sudo runs the command in a session of its own.
+        let _ = writeln!(
+            tty.output,
+            "\nsudo was signalled after {} s; the command may still be running.",
+            timeout.as_secs()
+        );
+    }
     let finished = Store::now_ms();
     let (exit_code, timed_out, output, error) = match &outcome {
         Ok(o) => (Some(o.exit_code), o.timed_out, o.output.clone(), None),
@@ -967,7 +1170,10 @@ fn run(store: &Store, id: &str, timeout: Duration) -> Result<Value> {
     )?;
     let what = match (&error, timed_out, exit_code) {
         (Some(error), _, _) => format!("could not start: {error}"),
-        (None, true, _) => format!("timed out after {} s and was killed", timeout.as_secs()),
+        (None, true, _) => format!(
+            "timed out: sudo was signalled after {} s; the command may still be running",
+            timeout.as_secs()
+        ),
         (None, false, Some(0)) => "exited 0".to_owned(),
         (None, false, code) => format!("exited {}", code.unwrap_or(-1)),
     };
@@ -1094,16 +1300,20 @@ pub(crate) fn door_answer(args: &Value) -> Result<Value> {
                             .is_some_and(|a| a.contains(&json!(verb))),
                     "{id} cannot be answered now (expired, changed or not approvable here)"
                 );
-                // The hash the captain's phone showed, when it names one: a
-                // grant answers that command and no other.
-                if let Some(shown) = args.get("hash").filter(|v| !v.is_null()) {
-                    let shown = shown.as_str().context("hash must be a string")?;
-                    let hash = item["privileged"]["hash"].as_str().unwrap_or("");
-                    ensure!(
-                        shown.len() >= CONFIRM_CHARS && hash.starts_with(shown),
-                        "{id} changed since your phone showed it; nothing was answered"
-                    );
-                }
+                // The hash the captain's phone showed: an answer is to that
+                // command and no other.
+                let shown = args
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .with_context(|| {
+                        format!("an answer to {id} must carry the hash the phone showed; nothing was answered")
+                    })?;
+                let hash = item["privileged"]["hash"].as_str().unwrap_or("");
+                ensure!(
+                    shown.len() >= CONFIRM_CHARS && hash.starts_with(shown),
+                    "{id} changed since your phone showed it; nothing was answered"
+                );
                 let mut answer = json!({"request_id": id, "expected_version": item["version"],
                     "task_id": item["task_id"], "artifact": item["artifact"],
                     "environment": item["environment"], "approver": crate::mail::CAPTAIN});

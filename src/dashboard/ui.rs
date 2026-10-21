@@ -1223,8 +1223,16 @@ pub(super) fn ago(then_ms: i64, now_ms: i64) -> String {
 }
 
 /// A privileged command as the captain reads it: the argv one per line, as
-/// the runtime escaped it, then where, why, and the hash they will confirm.
+/// the runtime escaped it, after why and any warnings, then where and the
+/// hash they will confirm.
 fn privileged_lines(lines: &mut Vec<Line<'static>>, privileged: &serde_json::Value) {
+    lines.push(Line::from(format!(
+        "Reason: {}",
+        clean(privileged["reason"].as_str().unwrap_or(""), 4200)
+    )));
+    for warning in privileged["warnings"].as_array().into_iter().flatten().take(64) {
+        lines.push(Line::from(clean(warning.as_str().unwrap_or(""), 4400)));
+    }
     lines.push(Line::from(format!(
         "Runs as root on {}{}:",
         clean(privileged["machine"].as_str().unwrap_or("?"), 160),
@@ -1241,9 +1249,8 @@ fn privileged_lines(lines: &mut Vec<Line<'static>>, privileged: &serde_json::Val
         )));
     }
     lines.push(Line::from(format!(
-        "in {} · reason: {}",
-        clean(privileged["cwd"].as_str().unwrap_or(""), 4200),
-        clean(privileged["reason"].as_str().unwrap_or(""), 1024)
+        "in {}",
+        clean(privileged["cwd"].as_str().unwrap_or(""), 4200)
     )));
     lines.push(Line::from(format!(
         "Hash {}",
