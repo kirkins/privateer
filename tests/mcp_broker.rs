@@ -657,9 +657,30 @@ fn a_pinned_proxy_runs_through_the_stdio_launcher() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // A skip (a checkout the executable rule refuses) is reported, not hidden.
-    eprintln!("{report}");
     assert!(output.status.success(), "{report}");
+    // unittest -v reports a skip as: test_name (...) ... skipped 'REASON'
+    let skip = report
+        .lines()
+        .find_map(|line| line.split_once(" ... skipped ").map(|(_, why)| why.trim()));
+    match skip {
+        None => {
+            assert!(report.contains(" ... ok"), "{report}");
+            println!("RAN a_pinned_proxy_runs_through_the_stdio_launcher");
+        }
+        Some(reason) => {
+            // Shown with --nocapture and in any failure: never a silent pass.
+            let line = format!("SKIPPED a_pinned_proxy_runs_through_the_stdio_launcher: {reason}");
+            println!("{line}");
+            eprintln!("{line}");
+            // The one documented skip: a checkout below a path the
+            // executable rule refuses. Under CI, anything else fails.
+            let path_rule = reason.contains("rule refuses");
+            assert!(
+                path_rule || std::env::var_os("CI").is_none(),
+                "{line}\n{report}"
+            );
+        }
+    }
 }
 
 /// A machine under `root`: HOME, XDG data, ledger and registry.
