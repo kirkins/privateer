@@ -582,11 +582,36 @@ fn exchange(pair: &mut Pair) {
     dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
 }
 
+/// The wait notices of one kind a home queued for `to`, without the
+/// subscription nonce each carries (`nonces` reads those).
 fn wait_payloads(store: &Store, to: &str, key: &str) -> Vec<Value> {
     outbox(store, to)
         .into_iter()
         .filter_map(|m| m["payload"].get(key).cloned())
+        .map(|mut body| {
+            body.as_object_mut().unwrap().remove("nonce");
+            body
+        })
         .collect()
+}
+
+fn nonces(store: &Store, to: &str, key: &str) -> Vec<Value> {
+    outbox(store, to)
+        .into_iter()
+        .filter_map(|m| m["payload"].get(key).map(|body| body["nonce"].clone()))
+        .collect()
+}
+
+/// The nonce of the subscription a waiting task holds, if any.
+fn nonce_of(store: &Store, task: &str) -> Option<String> {
+    store
+        .connection()
+        .query_row(
+            "SELECT json_extract(record,'$.subscription.nonce') FROM task_schedule WHERE task_id=?1",
+            [task],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 fn audited(store: &mut Store, kind: &str) -> Vec<Value> {
@@ -652,17 +677,23 @@ fn a_remote_defer_subscribes_and_the_owner_stores_the_row() {
         wait_payloads(&pair.b, "apps", "wait_subscribe"),
         vec![json!({"task":"far-work","subscriber":"infra","subscriber_task":"waiting-1"})]
     );
+    // It carries the subscription's nonce, which the schedule records.
+    let nonce = nonce_of(&pair.b, "waiting-1").unwrap();
+    assert_eq!(
+        nonces(&pair.b, "apps", "wait_subscribe"),
+        vec![json!(nonce)]
+    );
     exchange(&mut pair);
     let row = pair
         .a
         .connection()
         .query_row(
-            "SELECT subscriber,subscriber_task FROM task_subscriptions WHERE task_id='far-work'",
+            "SELECT subscriber,subscriber_task,nonce FROM task_subscriptions WHERE task_id='far-work'",
             [],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
         )
         .unwrap();
-    assert_eq!(row, ("infra".to_owned(), "waiting-1".to_owned()));
+    assert_eq!(row, ("infra".to_owned(), "waiting-1".to_owned(), nonce));
     // A dispatcher pass leaves it waiting and sends nothing more.
     pass(&mut pair.b);
     assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
@@ -876,8 +907,16 @@ fn two_local_tasks_waiting_on_one_far_task_both_resume() {
         json!({"id":"far-work","actor":"apps","status":"done"}),
     )
     .unwrap();
-    // One task_end for the ship, naming no waiting task, resumes both.
-    assert_eq!(wait_payloads(&pair.a, "infra", "task_end").len(), 1);
+    // One task_end per subscription, each naming no waiting task but echoing
+    // its own nonce, resumes both.
+    let mut sent: Vec<Value> = nonces(&pair.a, "infra", "task_end");
+    let mut held = vec![
+        json!(nonce_of(&pair.b, "waiting-1").unwrap()),
+        json!(nonce_of(&pair.b, "waiting-2").unwrap()),
+    ];
+    sent.sort_by_key(Value::to_string);
+    held.sort_by_key(Value::to_string);
+    assert_eq!(sent, held);
     dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
     for id in ["waiting-1", "waiting-2"] {
         assert_eq!(work(&mut pair.b, id)["state"], "ready", "{id}");
@@ -1131,4 +1170,564 @@ fn a_home_without_the_shared_with_column_reads_it_as_empty() {
     assert_eq!(task["shared_with"], json!([]));
     assert_eq!(task["owner"], "apps");
     assert!(a.task("no-such-task").is_err());
+}
+
+// Step 3: resync on reconnect, staleness, and the step 2 review follow-ups.
+
+/// Point a home's peer at an executable that cannot start, so every call to
+/// it fails as an unreachable link does, or back at the real one.
+fn link(store: &mut Store, peer: &str, home: &std::path::Path, up: bool) {
+    let executable = if up {
+        env!("CARGO_BIN_EXE_privateer")
+    } else {
+        "/nonexistent/privateer"
+    };
+    dispatch(
+        store,
+        "peer.put",
+        json!({"name":peer,"transport":"local","executable":executable,"home":home}),
+    )
+    .unwrap();
+}
+
+fn homes(pair: &Pair) -> (std::path::PathBuf, std::path::PathBuf) {
+    (pair.a.home().to_path_buf(), pair.b.home().to_path_buf())
+}
+
+/// Ordinary mail from one ship to another behind a peer: recorded, then one
+/// delivery attempt, as mail.send makes.
+fn ping(store: &mut Store, id: &str, from: &str, to: &str) {
+    dispatch(
+        store,
+        "mail.send",
+        json!({"id":id,"from":from,"to":to,"kind":"notice","body":"ping"}),
+    )
+    .unwrap();
+}
+
+/// Take the waiting home's link to the owner down and bring it back: a
+/// message fails to reach the owner, then the next flush reaches it, which
+/// is the link heard again.
+fn outage(pair: &mut Pair, id: &str) {
+    let (a_home, _) = homes(pair);
+    link(&mut pair.b, "home-a", &a_home, false);
+    ping(&mut pair.b, id, "infra", "apps");
+    assert_eq!(
+        outbox(&pair.b, "apps").last().unwrap()["delivery"],
+        "pending"
+    );
+    link(&mut pair.b, "home-a", &a_home, true);
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+}
+
+#[test]
+fn a_link_back_resubscribes_and_the_owner_answers_a_missed_end() {
+    let mut pair = subscribed();
+    let nonce = nonce_of(&pair.b, "waiting-1").unwrap();
+    // While the far task is open, each outage ends with the live subscription
+    // sent again, with the nonce it holds; the owner keeps its one row.
+    for round in 0..2 {
+        outage(&mut pair, &format!("ping-{round}"));
+        assert_eq!(rows(&pair.a, "far-work"), 1);
+        assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
+    }
+    assert_eq!(
+        nonces(&pair.b, "apps", "wait_subscribe"),
+        vec![json!(nonce); 3]
+    );
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 2, "{resyncs:?}");
+    assert!(
+        resyncs
+            .iter()
+            .all(|r| r["peer"] == "home-a" && r["resubscribed"] == 1)
+    );
+    let row_nonce: String = pair
+        .a
+        .connection()
+        .query_row("SELECT nonce FROM task_subscriptions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(row_nonce, nonce);
+    // The far task ends while the owner cannot reach the waiting home, and
+    // its task_end is lost (refused on a machine link, it is quarantined).
+    let (_, b_home) = homes(&pair);
+    link(&mut pair.a, "home-b", &b_home, false);
+    dispatch(
+        &mut pair.a,
+        "task.update",
+        json!({"id":"far-work","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(rows(&pair.a, "far-work"), 0);
+    pair.a
+        .connection()
+        .execute(
+            "UPDATE mail SET delivery='quarantined' WHERE json_extract(payload,'$.task_end') IS NOT NULL",
+            [],
+        )
+        .unwrap();
+    link(&mut pair.a, "home-b", &b_home, true);
+    // The waiting home's link comes back: it subscribes again, and the owner
+    // answers at once with the final status it missed.
+    outage(&mut pair, "ping-2");
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
+    let answered: Vec<Value> = outbox(&pair.a, "infra")
+        .into_iter()
+        .filter(|m| m["payload"]["task_end"].is_object() && m["delivery"] == "pending")
+        .map(|m| m["payload"]["task_end"].clone())
+        .collect();
+    assert_eq!(
+        answered,
+        vec![json!({"task":"far-work","status":"done","reason":"done","nonce":nonce})]
+    );
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    let resumed = work(&mut pair.b, "waiting-1");
+    assert_eq!(resumed["state"], "ready", "{resumed}");
+    assert!(resumed["resumed_by"].as_str().unwrap().contains("done"));
+    // A replay changes nothing: the resolved wait is not sent again, and a
+    // repeated answer finds no wait.
+    let sent = outbox(&pair.b, "apps").len();
+    outage(&mut pair, "ping-3");
+    let after = outbox(&pair.b, "apps");
+    assert_eq!(after.len(), sent + 1, "only the ping: {after:?}");
+    assert_eq!(
+        audited(&mut pair.b, "wait.resync").last().unwrap()["resubscribed"],
+        0
+    );
+    let repeated = report(
+        &mut pair.b,
+        "end-again",
+        "apps",
+        json!({"task_end":{"task":"far-work","status":"done","nonce":nonce}}),
+    );
+    assert_eq!(repeated["wait"]["why"], "no_wait");
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "ready");
+    no_wait_mail(&mut pair.b);
+}
+
+#[test]
+fn an_owner_link_back_reports_a_subscribed_task_that_ended_without_its_report() {
+    let mut pair = subscribed();
+    let nonce = nonce_of(&pair.b, "waiting-1").unwrap();
+    // A row outlived its task: it ended by a path that sent no report.
+    pair.a
+        .connection()
+        .execute(
+            "UPDATE tasks SET status='cancelled' WHERE id='far-work'",
+            [],
+        )
+        .unwrap();
+    let (_, b_home) = homes(&pair);
+    link(&mut pair.a, "home-b", &b_home, false);
+    ping(&mut pair.a, "owner-ping", "apps", "infra");
+    link(&mut pair.a, "home-b", &b_home, true);
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    // Hearing the link again, the owner reports the final status and drops
+    // the row; the waiting task faults on the cancel.
+    assert_eq!(rows(&pair.a, "far-work"), 0);
+    assert_eq!(audited(&mut pair.a, "wait.resync")[0]["answered"], 1);
+    assert_eq!(nonces(&pair.a, "infra", "task_end"), vec![json!(nonce)]);
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    let faulted = work(&mut pair.b, "waiting-1");
+    assert_eq!(faulted["state"], "fault", "{faulted}");
+    assert!(faulted["reason"].as_str().unwrap().contains("cancelled"));
+    // Again: nothing more to report.
+    link(&mut pair.a, "home-b", &b_home, false);
+    ping(&mut pair.a, "owner-ping-2", "apps", "infra");
+    link(&mut pair.a, "home-b", &b_home, true);
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(audited(&mut pair.a, "wait.resync")[1]["answered"], 0);
+    assert_eq!(nonces(&pair.a, "infra", "task_end").len(), 1);
+}
+
+#[test]
+fn a_machine_heard_after_a_silence_resubscribes_and_a_steady_link_does_not() {
+    let Pair { _temp, mut b, .. } = pair();
+    waiter(&mut b, "waiting-1");
+    defer_remote(
+        &mut b,
+        "waiting-1",
+        json!({"ship":"storefront","task":"icons","machine":"studio"}),
+    )
+    .unwrap();
+    let hello = |b: &mut Store, id: &str| {
+        dispatch(
+            b,
+            "mail.deliver",
+            json!({"id":id,"from":"storefront","to":"infra","kind":"notice","body":"hello",
+                "via":"studio"}),
+        )
+        .unwrap();
+    };
+    // The first mail heard over the link only records it; more within the
+    // contact spacing changes nothing.
+    hello(&mut b, "hello-1");
+    hello(&mut b, "hello-2");
+    assert!(audited(&mut b, "wait.resync").is_empty());
+    assert_eq!(wait_payloads(&b, "storefront", "wait_subscribe").len(), 1);
+    // That machine calls this one; after a silence well past its contact
+    // spacing, it has come back.
+    b.connection()
+        .execute(
+            "UPDATE wait_links SET heard_ms=heard_ms-600000 WHERE peer='machine-studio'",
+            [],
+        )
+        .unwrap();
+    hello(&mut b, "hello-3");
+    assert_eq!(audited(&mut b, "wait.resync")[0]["resubscribed"], 1);
+    assert_eq!(
+        nonces(&b, "storefront", "wait_subscribe"),
+        vec![json!(nonce_of(&b, "waiting-1").unwrap()); 2]
+    );
+}
+
+/// The captain's needs, as runtime.needs lists them for the waiting home.
+fn stale_needs(store: &mut Store) -> Vec<Value> {
+    dispatch(store, "runtime.needs", json!({})).unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["evidence"] == "stale_remote_wait")
+        .cloned()
+        .collect()
+}
+
+fn age_wait(store: &Store, task: &str, ms: i64) {
+    store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.subscription.since_ms',
+               json_extract(record,'$.subscription.since_ms')-?2) WHERE task_id=?1",
+            rusqlite::params![task, ms],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_stale_remote_wait_shows_in_needs_and_never_resolves_itself() {
+    let mut pair = subscribed();
+    // Under the threshold (an hour by default) it is not a need.
+    age_wait(&pair.b, "waiting-1", 3_500_000);
+    assert!(stale_needs(&mut pair.b).is_empty());
+    age_wait(&pair.b, "waiting-1", 200_000);
+    let needs = stale_needs(&mut pair.b);
+    assert_eq!(needs.len(), 1, "{needs:?}");
+    let item = &needs[0];
+    assert_eq!(item["kind"], "blocker");
+    assert_eq!(item["ship"], "infra");
+    assert_eq!(item["task_id"], "waiting-1");
+    assert_eq!(item["status"], "waiting");
+    assert_eq!(
+        item["far"],
+        json!({"ship":"apps","task":"far-work","machine":null})
+    );
+    assert_eq!(item["link"]["peer"], "home-a");
+    assert!(item["link"]["heard_ms"].as_i64().unwrap() > 0, "{item}");
+    assert!(item["waited_ms"].as_i64().unwrap() >= 3_700_000);
+    let summary = item["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("far-work")
+            && summary.contains("apps")
+            && summary.contains("home-a")
+            && summary.contains("last heard"),
+        "{summary}"
+    );
+    // It never resumes or faults by itself, and sends nothing.
+    let sent = outbox(&pair.b, "apps").len();
+    for _ in 0..3 {
+        pass(&mut pair.b);
+    }
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
+    assert_eq!(outbox(&pair.b, "apps").len(), sent);
+    assert_eq!(stale_needs(&mut pair.b).len(), 1);
+    // The threshold is the waiting ship's setting; 0 shows none.
+    let manifest = pair
+        ._temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("manifest.json");
+    for (secs, shown) in [(86_400, 0), (60, 1), (0, 0)] {
+        dispatch(
+            &mut pair.b,
+            "ship.put",
+            json!({"name":"infra","scope":"work","location":"here",
+                "first_mate":{"manifest":manifest,"duty_task":"infra-duty",
+                    "remote_wait_stale_secs":secs}}),
+        )
+        .unwrap();
+        assert_eq!(stale_needs(&mut pair.b).len(), shown, "{secs}");
+    }
+    assert!(
+        dispatch(
+            &mut pair.b,
+            "ship.put",
+            json!({"name":"infra","scope":"work","location":"here",
+                "first_mate":{"manifest":manifest,"duty_task":"infra-duty",
+                    "remote_wait_stale_secs":604_801}}),
+        )
+        .is_err()
+    );
+    // The far end's report still ends it as usual.
+    dispatch(
+        &mut pair.a,
+        "task.update",
+        json!({"id":"far-work","actor":"apps","status":"done"}),
+    )
+    .unwrap();
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "ready");
+    assert!(stale_needs(&mut pair.b).is_empty());
+}
+
+/// The scheduling-fault notices the waiting ship has been sent for a task.
+fn fault_notices(store: &Store, task: &str) -> Vec<String> {
+    let mut statement = store
+        .connection()
+        .prepare(
+            "SELECT id FROM mail WHERE recipient='infra' AND task_id=?1
+               AND json_extract(payload,'$.scheduling_fault') IS NOT NULL ORDER BY seq",
+        )
+        .unwrap();
+    statement
+        .query_map([task], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+#[test]
+fn a_second_fault_in_one_revision_wakes_the_first_mate_again() {
+    let mut pair = pair();
+    waiter(&mut pair.b, "waiting-1");
+    // Not shared: the owner refuses, and the wait faults.
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    exchange(&mut pair);
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "fault");
+    assert_eq!(
+        fault_notices(&pair.b, "waiting-1"),
+        ["scheduling-fault-waiting-1-1"]
+    );
+    // The first mate re-defers in the same revision on another far task,
+    // which is refused too: a second fault, with its own notice.
+    defer_remote(
+        &mut pair.b,
+        "waiting-1",
+        json!({"ship":"research","task":"other-work"}),
+    )
+    .unwrap();
+    assert_eq!(work(&mut pair.b, "waiting-1")["revision"], 1);
+    exchange(&mut pair);
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "fault");
+    assert_eq!(
+        fault_notices(&pair.b, "waiting-1"),
+        [
+            "scheduling-fault-waiting-1-1",
+            "scheduling-fault-waiting-1-1-2"
+        ]
+    );
+    // The same fault reported again on the faulted schedule sends nothing.
+    pass(&mut pair.b);
+    report(
+        &mut pair.b,
+        "closed-again",
+        "research",
+        json!({"wait_closed":{"task":"other-work","reason":"refused"}}),
+    );
+    assert_eq!(fault_notices(&pair.b, "waiting-1").len(), 2);
+}
+
+#[test]
+fn a_late_refusal_for_an_older_subscription_does_not_fault_a_newer_wait() {
+    let mut pair = pair();
+    waiter(&mut pair.b, "waiting-1");
+    // The first subscription reaches the owner before the task is shared,
+    // and its refusal is still on its way back.
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    let old = nonce_of(&pair.b, "waiting-1").unwrap();
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(nonces(&pair.a, "infra", "wait_closed"), vec![json!(old)]);
+    // Meanwhile the owner shares it, and the waiting task waits on it anew.
+    share(&mut pair.a, "far-work", json!(["infra"]));
+    dispatch(
+        &mut pair.b,
+        "task.defer",
+        json!({"id":"waiting-1","wait":{"kind":"manual","reason":"pause"}}),
+    )
+    .unwrap();
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    let new = nonce_of(&pair.b, "waiting-1").unwrap();
+    assert_ne!(old, new);
+    dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(rows(&pair.a, "far-work"), 1);
+    // The old refusal arrives: it names the old nonce and is dropped.
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "waiting");
+    let dropped = audited(&mut pair.b, "wait.dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["why"], "nonce");
+    assert_eq!(dropped[0]["nonce"], json!(old));
+    // An answer from an owner that echoes no nonce still applies, as one from
+    // a step 1 owner would.
+    let applied = report(
+        &mut pair.b,
+        "end-without-nonce",
+        "apps",
+        json!({"task_end":{"task":"far-work","status":"done"}}),
+    );
+    assert_eq!(applied["wait"]["state"], "applied");
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "ready");
+}
+
+#[test]
+fn a_rewait_after_a_handoff_subscribes_as_the_owner_to_the_refs_ship() {
+    let mut pair = subscribed();
+    // The far task is handed to research: the wait faults naming it, and the
+    // re-wait goes to the ship its ref names now.
+    dispatch(
+        &mut pair.a,
+        "task.handoff",
+        json!({"id":"far-work","actor":"apps","target":"research"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.a,
+        "task.accept",
+        json!({"id":"far-work","actor":"research"}),
+    )
+    .unwrap();
+    dispatch(&mut pair.a, "mail.flush", json!({})).unwrap();
+    assert_eq!(work(&mut pair.b, "waiting-1")["state"], "fault");
+    defer_remote(
+        &mut pair.b,
+        "waiting-1",
+        json!({"ship":"research","task":"far-work"}),
+    )
+    .unwrap();
+    let sent: Vec<Value> = outbox(&pair.b, "research")
+        .into_iter()
+        .filter(|m| m["payload"]["wait_subscribe"].is_object())
+        .collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["from"], "infra");
+    assert_eq!(sent[0]["payload"]["wait_subscribe"]["subscriber"], "infra");
+    // The waiting task itself is handed to another ship here: its schedule
+    // still names infra, so the new owner cannot defer it as infra.
+    let manifest = pair
+        ._temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("manifest.json");
+    dispatch(
+        &mut pair.b,
+        "task.create",
+        json!({"id":"ops-duty","charter_id":"project","owner":"ops","title":"Duty"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.b,
+        "ship.put",
+        json!({"name":"ops","scope":"work","location":"here",
+            "first_mate":{"manifest":manifest,"duty_task":"ops-duty"}}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.b,
+        "task.handoff",
+        json!({"id":"waiting-1","actor":"infra","target":"ops"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut pair.b,
+        "task.accept",
+        json!({"id":"waiting-1","actor":"ops"}),
+    )
+    .unwrap();
+    let error = defer_remote(
+        &mut pair.b,
+        "waiting-1",
+        json!({"ship":"research","task":"far-work"}),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("enqueue"), "{error:#}");
+    // Once ops enqueues its own assignment, the subscribe is from ops.
+    dispatch(
+        &mut pair.b,
+        "task.enqueue",
+        json!({"id":"waiting-1","brief":"Continue for ops."}),
+    )
+    .unwrap();
+    defer_remote(
+        &mut pair.b,
+        "waiting-1",
+        json!({"ship":"research","task":"far-work"}),
+    )
+    .unwrap();
+    let latest = outbox(&pair.b, "research")
+        .into_iter()
+        .rev()
+        .find(|m| m["payload"]["wait_subscribe"].is_object())
+        .unwrap();
+    assert_eq!(latest["from"], "ops");
+    assert_eq!(latest["payload"]["wait_subscribe"]["subscriber"], "ops");
+}
+
+#[test]
+fn one_end_resolves_every_wait_on_the_far_task_past_a_page() {
+    let mut pair = pair();
+    let ids: Vec<String> = (0..105).map(|n| format!("waiting-{n:03}")).collect();
+    for id in &ids {
+        waiter(&mut pair.b, id);
+        defer_remote(&mut pair.b, id, far()).unwrap();
+    }
+    let applied = report(
+        &mut pair.b,
+        "end-all",
+        "apps",
+        json!({"task_end":{"task":"far-work","status":"done"}}),
+    );
+    assert_eq!(applied["wait"]["tasks"].as_array().unwrap().len(), 105);
+    // work.status lists a bounded page, so read the schedules themselves.
+    let ready: i64 = pair
+        .b
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM task_schedule WHERE task_id LIKE 'waiting-%'
+               AND json_extract(record,'$.state')='ready'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ready, 105);
+}
+
+#[test]
+fn an_agents_own_flush_carries_its_ships_wait_notices() {
+    // Why mail.deliver does not refuse wait notices from an agent caller: an
+    // agent's flush (mail.flush, or the attempt mail.send makes) delivers its
+    // own ship's pending mail, runtime notices included, and the peer call
+    // carries the agent's identity, so the owner's home sees an agent.
+    let mut pair = pair();
+    share(&mut pair.a, "far-work", json!(["infra"]));
+    waiter(&mut pair.b, "waiting-1");
+    defer_remote(&mut pair.b, "waiting-1", far()).unwrap();
+    pair.b.set_caller(privateer::store::Caller::Agent {
+        actor: "infra".into(),
+    });
+    let flushed = dispatch(&mut pair.b, "mail.flush", json!({})).unwrap();
+    assert_eq!(flushed["delivered"], 1, "{flushed}");
+    assert_eq!(rows(&pair.a, "far-work"), 1);
+    // An agent still cannot author one.
+    assert!(
+        dispatch(
+            &mut pair.b,
+            "mail.send",
+            json!({"id":"agent-spoof","from":"infra","to":"apps","kind":"notice","body":"x",
+                "payload":{"wait_subscribe":{"task":"far-work","subscriber":"infra",
+                    "subscriber_task":"other"}}}),
+        )
+        .is_err()
+    );
 }
