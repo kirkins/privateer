@@ -1229,11 +1229,13 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             &folder.canonicalize()?,
         )))
     };
+    // The launch command, and the captain approvals it carries for the first
+    // time, which the pane announces once the harness has spawned.
     let build = |launch: &Launch,
                  profile: &Value,
                  holder: &str,
                  continuation: Option<crate::host::Conversation>|
-     -> Result<std::process::Command> {
+     -> Result<(std::process::Command, Vec<String>)> {
         let mut policy = crate::permissions::load()?;
         if let Ok(charter) = store.charter(&ship) {
             policy["actions"] = charter["actions"].clone();
@@ -1247,12 +1249,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         // The captain's live approvals, read at each launch of the pane. The
         // settings stay inline: Claude reads a --settings file only at launch
         // (tests/fixtures/claude/settings-reload.md), so the pane records what
-        // it carried and reports approvals_changed instead.
-        let approved = crate::captain_approvals::sentences(&store, &ship, Store::now_ms())?;
-        if hosted {
-            let _ = crate::host::upgrade::record_approvals(&store, &ship, &approved);
-        }
-        policy["approved"] = json!(approved);
+        // it carried, and a pane that continues its conversation (exactly
+        // when `continuation` is Some) may refresh in place when they change.
+        let approved = crate::captain_approvals::launch_set(&store, &ship, Store::now_ms())?;
+        let first = if hosted {
+            crate::host::upgrade::record_approvals(&store, &ship, &approved, continuation.is_some())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let sentences: Vec<&str> = approved.iter().map(|(_, s)| s.as_str()).collect();
+        policy["approved"] = json!(sentences);
         let policy = serde_json::to_string(&policy)?;
         let mut command = std::process::Command::new("python3");
         command.arg(plugins.join("native_launch.py"));
@@ -1314,7 +1321,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         if hosted {
             command.env("PRIVATEER_HOSTED", "1");
         }
-        Ok(command)
+        Ok((command, first))
     };
     // Decide before claiming presence, so an error leaves nothing to release.
     let mut continuation = continuation_for(&launch)?;
@@ -1341,6 +1348,34 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         }
     };
     let mut sleep_after = sleep_after_for(&profile);
+    // What a pane starting its harness again reads first, for a wake and an
+    // approvals refresh alike: the profile now, checked again, since what
+    // admitted the first launch may have been revoked since, and the launch
+    // derived from it. A wake is a fresh process: its harness arguments come
+    // from the profile read now, so a changed permission mode, model, effort,
+    // route or harness applies here rather than at the last launch.
+    let replan = |holder: &str| -> Result<(Value, Launch, Option<crate::host::Conversation>, u64)> {
+        let mut check = Store::open(home)?;
+        let profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
+        let planned = crate::host::validate_start(&mut check, &ship, &profile["first_mate"])
+            .and_then(|()| {
+                launch_plan(&check, &profile, ours.first().copied(), passthrough, hosted)
+            })
+            .and_then(|next| -> Result<Launch> {
+                prepare_harness(&next.harness, &plugins, folder, &control)?;
+                Ok(next)
+            });
+        let launch = match planned {
+            Ok(next) => next,
+            Err(error) => {
+                let _ = crate::host::failed(&store, &ship, holder, &format!("{error:#}"));
+                return Err(error);
+            }
+        };
+        let continuation = continuation_for(&launch)?;
+        let sleep_after = sleep_after_for(&profile);
+        Ok((profile, launch, continuation, sleep_after))
+    };
     let terminal = crate::host::sleep::Terminal::save();
     let mut holder = holder;
     // A pane an upgrade relaunched while asleep, or catching up while idle,
@@ -1354,23 +1389,27 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 &store, &ship, &holder,
             )?)
         } else {
-            let mut child =
-                match build(&launch, &profile, &holder, continuation).and_then(|mut command| {
+            let mut first = vec![];
+            let mut child = match build(&launch, &profile, &holder, continuation).and_then(
+                |(mut command, applied)| {
+                    first = applied;
                     command.spawn().with_context(|| {
                         format!("cannot start {}; is it installed?", launch.binary)
                     })
-                }) {
-                    Ok(child) => child,
-                    Err(error) => {
-                        let _ = crate::presence::leave(&store, &ship, &holder);
-                        return Err(error);
-                    }
-                };
+                },
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = crate::presence::leave(&store, &ship, &holder);
+                    return Err(error);
+                }
+            };
             if hosted {
                 // A failure to record readiness leaves the conservative reserved retry
                 // in place; never abandon an already spawned native process over it.
                 let _ = crate::host::started(&store, &ship, &holder);
                 let _ = crate::host::upgrade::harness(&store, &ship, child.id());
+                let _ = crate::host::upgrade::announce_applied(&store, &ship, &first);
             }
             crate::host::sleep::supervise(&store, &ship, &holder, &mut child, sleep_after)?
         };
@@ -1384,6 +1423,19 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 let start = crate::host::upgrade::start_point(reason, sleep_after, through);
                 crate::host::upgrade::retire(&store, &ship, &fenced, reason, start);
                 std::process::exit(0);
+            }
+            crate::host::sleep::Ended::Refresh(fresh) => {
+                // The harness has exited under the old holder; start it again
+                // in this pane, under the new one, on the same conversation.
+                holder = fresh;
+                if let Some(lease) = hosted_lease.as_mut() {
+                    lease.holder.clone_from(&holder);
+                }
+                terminal.restore();
+                println!(
+                    "⚓ Restarting {ship}'s session to apply captain approvals; the conversation continues."
+                );
+                (profile, launch, continuation, sleep_after) = replan(&holder)?;
             }
             crate::host::sleep::Ended::Superseded => {
                 // The lease is another session's: leave it untouched, and end
@@ -1414,33 +1466,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     );
                     std::process::exit(0);
                 }
-                // What admitted the first launch may have been revoked since.
-                let mut check = Store::open(home)?;
-                profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
-                if let Err(error) =
-                    crate::host::validate_start(&mut check, &ship, &profile["first_mate"])
-                {
-                    let _ = crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
-                    return Err(error);
-                }
-                // The wake is a fresh process: its harness arguments come from the
-                // profile read now, so a changed permission mode, model, effort,
-                // route or harness applies here rather than at the last launch.
-                launch =
-                    match launch_plan(&check, &profile, ours.first().copied(), passthrough, hosted)
-                        .and_then(|next| -> Result<Launch> {
-                            prepare_harness(&next.harness, &plugins, folder, &control)?;
-                            Ok(next)
-                        }) {
-                        Ok(next) => next,
-                        Err(error) => {
-                            let _ =
-                                crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
-                            return Err(error);
-                        }
-                    };
-                continuation = continuation_for(&launch)?;
-                sleep_after = sleep_after_for(&profile);
+                (profile, launch, continuation, sleep_after) = replan(&holder)?;
                 // Only a relaunch that is admitted again is a wake.
                 crate::host::sleep::woke(&store, &ship, reason, continuation);
             }

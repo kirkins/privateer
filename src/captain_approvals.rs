@@ -644,9 +644,11 @@ pub(crate) fn record(
             "sentence too long for auto mode with this reply id, so nothing was approved; ask again",
         );
     }
+    // Where the ship's session picks the approval up, as the ship is now.
+    let applies = crate::host::upgrade::approval_applies(store, ship)?;
     store.connection().execute(
-        "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,source)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,source,applies_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
             id,
             ship,
@@ -657,17 +659,29 @@ pub(crate) fn record(
             approves["command_prefix"].as_str(),
             now,
             expires_ms,
-            source
+            source,
+            applies
         ],
     )?;
     store.audit(
         "permissions.approval_recorded",
         &json!({"id": id, "ship": ship, "task": task, "request": request["id"],
-            "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source}),
+            "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
+            "applies": applies}),
     )?;
-    Ok(Some(
-        json!({"recorded": true, "id": id, "action": action, "expires_ms": expires_ms}),
-    ))
+    Ok(Some(json!({"recorded": true, "id": id, "action": action,
+        "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)})))
+}
+
+/// What the ship is told about when its session picks up an approval.
+fn note(applies: &str, action: &str) -> String {
+    match applies {
+        "relaunch" => "recorded; applies when your session restarts at its next idle point. \
+             End this turn without retrying; a notice says when it is applied."
+            .to_owned(),
+        "wake" => format!("applied from this wake; retry {action} once."),
+        _ => "recorded; applies at your next launch.".to_owned(),
+    }
 }
 
 struct Row {
@@ -727,28 +741,47 @@ fn sentence(
 /// launch's policy check is skipped and audited, so one bad row never stops
 /// a launch.
 pub(crate) fn sentences(store: &Store, ship: &str, now: i64) -> Result<Vec<String>> {
+    Ok(launch_set(store, ship, now)?
+        .into_iter()
+        .map(|(_, sentence)| sentence)
+        .collect())
+}
+
+/// The approvals a launch now carries, as (id, sentence), in the order told.
+pub(crate) fn launch_set(store: &Store, ship: &str, now: i64) -> Result<Vec<(String, String)>> {
     told(store, ship, now, true)
+}
+
+/// The approvals a launch now would carry. Read-only: a skipped sentence is
+/// audited by the launch, not by every check.
+pub(crate) fn current_set(store: &Store, ship: &str, now: i64) -> Result<Vec<(String, String)>> {
+    told(store, ship, now, false)
 }
 
 /// A digest of the sentences a launch carried. Claude reads its settings only
 /// at launch (tests/fixtures/claude/settings-reload.md), so a pane whose
 /// digest differs from `current_digest` runs on stale approvals.
-pub(crate) fn digest(sentences: &[String]) -> String {
+pub(crate) fn digest<S: AsRef<str>>(sentences: &[S]) -> String {
     let mut hasher = Sha256::new();
-    for sentence in sentences {
+    for sentence in sentences.iter().map(AsRef::as_ref) {
         hasher.update(sentence.as_bytes());
         hasher.update([0]);
     }
     format!("{:x}", hasher.finalize())
 }
 
-/// The digest a launch now would carry. Read-only: a skipped sentence is
-/// audited by the launch, not by every check.
+/// The digest a launch now would carry, read-only.
 pub(crate) fn current_digest(store: &Store, ship: &str, now: i64) -> Result<String> {
-    Ok(digest(&told(store, ship, now, false)?))
+    Ok(set_digest(&current_set(store, ship, now)?))
 }
 
-fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<String>> {
+/// The digest of a launch set's sentences.
+pub(crate) fn set_digest(set: &[(String, String)]) -> String {
+    let sentences: Vec<&str> = set.iter().map(|(_, sentence)| sentence.as_str()).collect();
+    digest(&sentences)
+}
+
+fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String, String)>> {
     let mut told = vec![];
     for row in live(store, ship, now)? {
         let text = sentence(
@@ -768,7 +801,7 @@ fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<String>>
             }
             continue;
         }
-        told.push(text);
+        told.push((row.id, text));
         if told.len() == MAX_LIVE {
             break;
         }
@@ -1161,6 +1194,20 @@ mod tests {
         assert_ne!(one, both);
         assert_ne!(one, none);
         assert_eq!(current_digest(&store, "apps", now + 60_000).unwrap(), none);
+    }
+
+    /// Each place an approval applies tells the ship what to do next.
+    #[test]
+    fn each_approval_applies_note_says_when_to_retry() {
+        assert!(note("relaunch", "Deploy").contains("End this turn without retrying"));
+        assert_eq!(
+            note("wake", "Deploy build 7"),
+            "applied from this wake; retry Deploy build 7 once."
+        );
+        assert_eq!(
+            note("next_launch", "Deploy"),
+            "recorded; applies at your next launch."
+        );
     }
 
     #[test]
