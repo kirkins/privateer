@@ -219,6 +219,11 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
             record[key] = value;
         }
     }
+    // When it last moved is stamped by the move itself, never by a put.
+    if let Some(moved) = ship(store, name)?.and_then(|existing| existing.get("last_moved_ms").cloned())
+    {
+        record["last_moved_ms"] = moved;
+    }
     if let Some(profile) = args.get("first_mate").filter(|v| !v.is_null()) {
         ensure!(
             location == "here",
@@ -1129,7 +1134,15 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             "payload.{reserved} is reserved for the runtime"
         );
     }
-    for reserved in ["operator", "attached_to", "attached_ship"] {
+    // A placement decision and its outcome are composed by the runtime, so
+    // no ship can dress a decision up as one the captain's yes would run.
+    for reserved in [
+        "operator",
+        "attached_to",
+        "attached_ship",
+        "placement",
+        "placement_outcome",
+    ] {
         ensure!(
             payload.get(reserved).is_none(),
             "payload.{reserved} is set by the runtime"
@@ -1411,6 +1424,11 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     }
     if kind == "reply" && from == CAPTAIN {
         record_reply_at_desk(store, &stored);
+    }
+    // Only the operator's own reply, written here, can approve a placement
+    // move; delivered and relayed replies never reach this.
+    if operator && let Some(correlation) = correlation {
+        crate::placement::answered(store, correlation, &stored);
     }
     let mut result = annotate(stored, Store::now_ms());
     if let Some((ask, ship)) = attached {

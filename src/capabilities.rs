@@ -6,7 +6,12 @@
 //! offers a name when its probe succeeds here or the operator declared it,
 //! unless the operator withheld it (`machine.offers`). The vocabulary is
 //! defined on the linking machine and travels to the machines it reaches in
-//! the directory exchange, where the copy it was sent is kept.
+//! the directory exchange, where the copy it was sent is kept. A machine
+//! linked by two keeps one linker's copy: of those heard within the last
+//! hour, the first by name (so a later linker whose name sorts earlier takes
+//! over); when none was heard lately, the one heard last. A linker that
+//! stopped exchanging, such as one that removed the link only on its side,
+//! goes quiet and stops defining.
 //!
 //! A probe is a binary on the login shell's PATH, a path that must exist, or
 //! an argv. An argv probe runs with a cleared environment holding only `HOME`
@@ -16,7 +21,9 @@
 //! stored vocabulary: what arrives to be checked carries names, never probes.
 //!
 //! Detection is cached for at most ten minutes, for planning and for the
-//! exchange; a move's preflight always probes live.
+//! exchange; a move's preflight always probes live. The exchange probes
+//! only within a short budget, and a probe it cuts short is not cached: a
+//! dispatcher pass refreshes the cache with each probe's full time.
 use crate::store::{Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -46,6 +53,13 @@ const EXCHANGE_BUDGET: Duration = Duration::from_secs(2);
 const PARALLEL: usize = 16;
 /// How long a detected offer is trusted for planning.
 const CACHE_MS: i64 = 600_000;
+/// A linking machine unheard this long no longer defines the vocabulary
+/// while another one is heard; each exchanges every five minutes.
+const QUIET_MS: i64 = 3_600_000;
+/// Why a probe stopped when the check's time, not its own, ran out: not an
+/// answer, so never cached.
+const CUT_SHORT: &str = "probe not finished within the check's time";
+const NOT_RUN: &str = "probe not run: the check's time ran out";
 
 pub(crate) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -188,12 +202,18 @@ pub(crate) fn known(conn: &Connection, name: &str) -> Result<bool> {
     )?)
 }
 
-/// The machine whose vocabulary this one keeps a copy of: one that links it.
+/// The machine whose vocabulary this one keeps a copy of: of the machines
+/// that link this one and were heard within `QUIET_MS`, the first by name;
+/// when none was, the one heard last.
 fn defined_on(conn: &Connection) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT name FROM machines WHERE role='collected' ORDER BY name LIMIT 1",
-            [],
+            "SELECT name FROM machines WHERE role='collected'
+             ORDER BY COALESCE(refreshed_ms, 0) >= ?1 DESC,
+               CASE WHEN COALESCE(refreshed_ms, 0) >= ?1 THEN name END,
+               refreshed_ms DESC, name
+             LIMIT 1",
+            [Store::now_ms() - QUIET_MS],
             |r| r.get(0),
         )
         .optional()?)
@@ -373,11 +393,15 @@ fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Resu
         .spawn()
         .map_err(|error| format!("{shown} could not start: {error}"))?;
     let pid = child.id();
-    let deadline = deadline.min(Instant::now() + PROBE_TIMEOUT);
+    let own = Instant::now() + PROBE_TIMEOUT;
+    let cut = deadline < own;
+    let deadline = deadline.min(own);
     let outcome = loop {
         match crate::jobs::exited_unreaped(pid) {
             Ok(Some(_)) => break None,
-            Ok(None) if Instant::now() >= deadline => break Some("probe timed out".to_owned()),
+            Ok(None) if Instant::now() >= deadline => {
+                break Some(if cut { CUT_SHORT } else { "probe timed out" }.to_owned());
+            }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => break Some(format!("{error:#}")),
         }
@@ -470,10 +494,7 @@ fn evaluate(
                             let path = &path;
                             scope.spawn(move || {
                                 if Instant::now() >= budget {
-                                    return (
-                                        *index,
-                                        Err("probe not run: the check's time ran out".to_owned()),
-                                    );
+                                    return (*index, Err(NOT_RUN.to_owned()));
                                 }
                                 (*index, run(probe, path, budget))
                             })
@@ -491,6 +512,12 @@ fn evaluate(
                 let Some((name, verdict)) = verdicts.get_mut(index) else {
                     continue;
                 };
+                // A probe the budget stopped said nothing about this machine.
+                let unanswered = matches!(&result, Err(why) if why == CUT_SHORT || why == NOT_RUN);
+                if unanswered {
+                    *verdict = Some(result.map(|()| "detected"));
+                    continue;
+                }
                 conn.execute(
                     "INSERT INTO machine_offers(name, met, why, probed_ms) VALUES(?1, ?2, ?3, ?4)
                      ON CONFLICT(name) DO UPDATE SET met=excluded.met, why=excluded.why,
@@ -565,6 +592,16 @@ pub(crate) fn offered(conn: &Connection) -> Option<Value> {
             .map(|(name, _)| name)
             .collect::<Vec<_>>()
     ))
+}
+
+/// Probe what the cache no longer knows, each probe with its full time, so
+/// the exchange's short budget finds fresh answers. Called from a dispatcher
+/// pass at most every few minutes; best effort.
+pub(crate) fn refresh(conn: &Connection) {
+    if let Ok(vocabulary) = vocabulary(conn) {
+        let names: Vec<String> = vocabulary.into_iter().map(|t| t.name).collect();
+        let _ = evaluate(conn, &names, false, CHECK_BUDGET);
+    }
 }
 
 /// A linked machine's reported offers, bounded to names.
@@ -693,8 +730,10 @@ mod tests {
 
     fn registry() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE machines(name TEXT PRIMARY KEY, role TEXT NOT NULL);")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE machines(name TEXT PRIMARY KEY, role TEXT NOT NULL, refreshed_ms INTEGER);",
+        )
+        .unwrap();
         init(&conn).unwrap();
         conn
     }
@@ -788,6 +827,60 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_linker_stops_defining_the_vocabulary() {
+        let conn = registry();
+        let now = Store::now_ms();
+        // desk sorts first but removed the link on its side long ago.
+        conn.execute(
+            "INSERT INTO machines(name, role, refreshed_ms) VALUES('desk', 'collected', ?1),
+               ('studio', 'collected', ?2)",
+            params![now - 2 * QUIET_MS, now],
+        )
+        .unwrap();
+        assert_eq!(defined_on(&conn).unwrap().as_deref(), Some("studio"));
+        let studio = json!([{"name": "docker", "note": "", "probe": {"path": "docker"}}]);
+        absorb(&conn, "studio", &studio).unwrap();
+        assert!(known(&conn, "docker").unwrap());
+        // A later linker heard now whose name sorts earlier takes over.
+        conn.execute(
+            "INSERT INTO machines(name, role, refreshed_ms) VALUES('alpha', 'collected', ?1)",
+            [now],
+        )
+        .unwrap();
+        assert_eq!(defined_on(&conn).unwrap().as_deref(), Some("alpha"));
+        // With every linker quiet, the one heard last.
+        conn.execute("UPDATE machines SET refreshed_ms=refreshed_ms-?1", [3 * QUIET_MS])
+            .unwrap();
+        conn.execute(
+            "UPDATE machines SET refreshed_ms=?1 WHERE name='studio'",
+            [now - 2 * QUIET_MS],
+        )
+        .unwrap();
+        assert_eq!(defined_on(&conn).unwrap().as_deref(), Some("studio"));
+    }
+
+    #[test]
+    fn a_probe_the_exchange_cut_short_is_not_cached() {
+        let conn = registry();
+        put(&conn, &json!({"name": "slow", "probe": {"argv": ["sleep", "2"]}})).unwrap();
+        let names = vec!["slow".to_owned()];
+        let verdicts = evaluate(&conn, &names, false, Duration::from_millis(200)).unwrap();
+        assert_eq!(verdicts[0].1, Err(CUT_SHORT.to_owned()));
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM machine_offers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cached, 0, "a cut-short probe is no answer");
+        // With its full time, it answers, and the answer is cached.
+        refresh(&conn);
+        let met: bool = conn
+            .query_row("SELECT met FROM machine_offers WHERE name='slow'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(met);
+    }
+
+    #[test]
     fn offers_are_detected_declared_and_withheld() {
         let conn = registry();
         put(&conn, &json!({"name": "shell", "probe": {"file": "/"}})).unwrap();
@@ -842,7 +935,7 @@ mod tests {
         let soon = Instant::now() + Duration::from_millis(300);
         assert_eq!(
             run_argv(&["sleep".into(), "30".into()], path, soon).unwrap_err(),
-            "probe timed out"
+            CUT_SHORT
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(

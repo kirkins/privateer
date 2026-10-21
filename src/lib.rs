@@ -39,6 +39,7 @@ pub mod moves;
 pub mod needs;
 pub mod opencode_mail;
 pub mod peers;
+mod placement;
 pub mod permissions;
 pub mod plugins;
 pub mod presence;
@@ -98,6 +99,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "history.prune",
     "ship.put",
     "ship.move",
+    "ship.clean_moved",
     "permissions.set",
     "bundle.configure",
     "credential.set",
@@ -192,7 +194,12 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "report" => report::dispatch(store, command, args),
         "file" => files::dispatch(store, command, args),
         "project" => project::dispatch(store, command, args),
-        "ship" if command == "ship.move" => moves::dispatch(store, command, args),
+        "ship" if matches!(command, "ship.move" | "ship.clean_moved") => {
+            moves::dispatch(store, command, args)
+        }
+        "ship" if matches!(command, "ship.placement" | "ship.propose_move") => {
+            placement::dispatch(store, command, args)
+        }
         "ship" if command == "ship.profile" => {
             store.caller().require_operator(command)?;
             profile::profile(&args)
