@@ -2,7 +2,7 @@
 //! deliberately NOT a harness option: first-mate resources never become crew
 //! defaults.
 use crate::store::Store;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -98,26 +98,34 @@ pub(crate) fn session_digest(store: &Store, profile: &Value) -> Option<String> {
 }
 
 /// Record a bounded Claude launch's plan digest with its wake or errand, so
-/// the session it starts carries it. A bounded resume continues only a
-/// recorded first-mate session started under this same digest.
+/// the session it starts carries it, and return it: a crew's launch records
+/// it in its own job (see `agent.start`). A bounded resume continues only a
+/// session started under this same digest, by the same role: a recorded
+/// first-mate session, or the session of a crew of `task` whose park is
+/// resuming it now.
 pub(crate) fn record_plan(
     store: &Store,
     id: &str,
     role: &str,
+    task: &str,
     plan: &Value,
     resume: Option<&Value>,
-) -> Result<()> {
+) -> Result<String> {
     let digest = digest(plan);
     if let Some(session) = resume {
-        let started: bool = store.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1 AND plan_digest=?2)",
-            params![session.as_str(), digest],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            role == "first_mate" && started,
-            "a bounded session resumes only under the plan it started with"
-        );
+        let session = session.as_str();
+        match role {
+            "first_mate" => {
+                let started: bool = store.connection().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=?1 AND plan_digest=?2)",
+                    params![session, digest],
+                    |r| r.get(0),
+                )?;
+                ensure!(started, "{UNRESUMABLE}");
+            }
+            "crew" => crew_resume(store, task, session, &digest)?,
+            _ => bail!("{UNRESUMABLE}"),
+        }
     }
     store.connection().execute(
         "UPDATE wakes SET plan_digest=?2 WHERE job_id=?1 AND status='running'",
@@ -127,7 +135,37 @@ pub(crate) fn record_plan(
         "UPDATE errands SET plan_digest=?2 WHERE id=?1 AND status='running'",
         params![id, digest],
     )?;
-    Ok(())
+    Ok(digest)
+}
+
+const UNRESUMABLE: &str = "a bounded session resumes only under the plan it started with";
+
+/// A crew resumes only its own session: one a park of a crew of `task` is
+/// resuming now (the runtime records it there before it launches), never a
+/// first mate's or an errand's, and only when the plan that crew launched
+/// under is the plan launching now.
+fn crew_resume(store: &Store, task: &str, session: Option<&str>, digest: &str) -> Result<()> {
+    let started: Option<Option<String>> = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(j.record,'$.launch.plan_digest') FROM crew_parks p
+               JOIN jobs j ON j.id=p.crew_job_id
+              WHERE p.session=?1 AND p.task_id=?2 AND p.state='resuming'
+                AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.session_id=?1)
+              ORDER BY p.updated_ms DESC LIMIT 1",
+            params![session, task],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match started {
+        Some(Some(started)) if started == digest => Ok(()),
+        // Kept short: a crew's outcome mail clips its reason.
+        Some(Some(_)) => bail!(
+            "task {task}: crew session not resumed because its bundle plan changed while it \
+             was parked (bundles, registry or carried Claude settings); {UNRESUMABLE}"
+        ),
+        _ => bail!("{UNRESUMABLE}"),
+    }
 }
 
 pub(crate) fn configure(store: &mut Store, args: Value) -> Result<Value> {

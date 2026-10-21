@@ -627,6 +627,10 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     "require": require.as_ref().map(|r| r.to_json()),
                     "timeout_secs": job.get("timeout_secs"),
                 });
+                // A bounded crew's plan: its session resumes only under it.
+                if let Some(digest) = plan.get("plan_digest") {
+                    job["launch"]["plan_digest"] = digest.clone();
+                }
             }
             let mut started = jobs::start_agent(store, job.clone())?;
             if viewed {

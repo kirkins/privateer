@@ -300,9 +300,16 @@ own hooks still load). The loader refuses before launch when:
 **Resume.** The plan digest (selected refs, pins, Claude version and carried
 settings) is recorded with the wake or errand and the session it starts. A
 bounded first mate resumes only a session recorded under the same digest, as
-the runtime's exact `--resume`; any change starts fresh. Crew never resume a
-bounded session. Live and hosted starts are always fresh, since `--continue`
-cannot name the session a digest was recorded for.
+the runtime's exact `--resume`; any change starts fresh. A bounded crew's
+digest is recorded in its job's launch record. When it parks, its resume
+continues its own session only: the runtime records that session on the park
+before launching, and the launch must be a crew of the same task, under the
+digest the crew launched with. If the plan changed while the crew was parked,
+the resume is refused with a message naming the task, and the crew's outcome
+says its session was not resumed because its bundle plan changed. A crew never
+resumes a first mate's or an errand's session, nor they a crew's. Live and
+hosted starts are always fresh, since `--continue` cannot name the session a
+digest was recorded for.
 
 `--bare` and `--safe-mode` are not used: `--bare` accepts only an API key, which
 would change the auth route, and `--safe-mode` drops `--plugin-dir` skills.

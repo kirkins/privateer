@@ -46,6 +46,60 @@ fn selected_plan(value: &Value) -> Value {
     serde_json::from_str(argv[index + 1].as_str().unwrap()).unwrap()
 }
 
+/// A fake `claude` in `bin` for one scripted turn. The loader refuses a #!
+/// wrapper, so it is a compiled exec shim into a Python script. It answers
+/// the adapter's version and help probes, logs each launch's argv to `log`,
+/// and reports the session it was given, or a new one, as Claude's
+/// stream-json does, around `turn`.
+fn fake_claude(root: &Path, bin: &Path, log: &Path, turn: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let python = support::python();
+    let script = root.join("claude.py");
+    fs::write(&script, format!(r#"import json, os, re, subprocess, sys, uuid
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("2.1.300 (Claude Code)")
+    sys.exit(0)
+if args == ["--help"]:
+    print("Options:\n  --setting-sources <sources>  Comma-separated list of setting sources\n  --strict-mcp-config  Only use MCP servers from --mcp-config\n  --settings <file-or-json>  Path to a settings JSON file\n  --plugin-dir <path>  Load a plugin from a directory\n  -p, --print  Print response and exit")
+    sys.exit(0)
+with open({}, "a") as f:
+    f.write(json.dumps(args) + "\n")
+flags = args[:args.index("--")]
+session = flags[flags.index("--resume") + 1] if "--resume" in flags else str(uuid.uuid4())
+print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}), flush=True)
+{turn}
+print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "session_id": session}}), flush=True)
+"#, json!(log))).unwrap();
+    let shim = root.join("claude.c");
+    fs::write(
+        &shim,
+        format!(
+            r#"#include <unistd.h>
+int main(int argc, char **argv) {{
+    char *args[argc + 2];
+    args[0] = {python:?};
+    args[1] = {script:?};
+    for (int i = 1; i <= argc; i++) args[i + 1] = argv[i];
+    execv(args[0], args);
+    return 127;
+}}
+"#,
+            python = python.display().to_string(),
+            script = script.display().to_string()
+        ),
+    )
+    .unwrap();
+    let built = Command::new("cc")
+        .arg("-o")
+        .arg(bin.join("claude"))
+        .arg(&shim)
+        .status()
+        .unwrap();
+    assert!(built.success());
+    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[test]
 fn deterministic_python_bundle_validation() {
     for suite in ["tests/pi_bundles.py", "tests/claude_bundles.py"] {
@@ -427,7 +481,6 @@ fn claude_plan_carries_allowlist_and_resumes_only_under_its_digest() {
 
 #[test]
 fn a_bounded_claude_first_mate_resumes_its_session_until_the_plan_changes() {
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
     let (temp, mut store, mut config) = fixture();
     config["claude_version"] = json!("2.1.300");
@@ -444,60 +497,18 @@ fn a_bounded_claude_first_mate_resumes_its_session_until_the_plan_changes() {
         .unwrap();
     };
     settings("exact");
-    // The loader refuses a #! wrapper, so the fake claude is a compiled exec
-    // shim into a scripted turn: it acknowledges its wake's mail and reports
-    // the session it was given, or a new one, as Claude's stream-json does.
+    // The fake claude acknowledges its wake's mail.
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
     let python = support::python();
     let log = root.join("claude-argv.jsonl");
     let cli = json!([support::BIN, "--home", home]);
-    let script = root.join("claude.py");
-    fs::write(&script, format!(r#"import json, re, subprocess, sys, uuid
-args = sys.argv[1:]
-if args == ["--version"]:
-    print("2.1.300 (Claude Code)")
-    sys.exit(0)
-if args == ["--help"]:
-    print("Options:\n  --setting-sources <sources>  Comma-separated list of setting sources\n  --strict-mcp-config  Only use MCP servers from --mcp-config\n  --settings <file-or-json>  Path to a settings JSON file\n  --plugin-dir <path>  Load a plugin from a directory\n  -p, --print  Print response and exit")
-    sys.exit(0)
-with open({}, "a") as f:
-    f.write(json.dumps(args) + "\n")
-flags = args[:args.index("--")]
-session = flags[flags.index("--resume") + 1] if "--resume" in flags else str(uuid.uuid4())
-print(json.dumps({{"type": "system", "subtype": "init", "session_id": session}}), flush=True)
-through = int(re.search(r"through seq (\d+)", args[-1]).group(1))
-subprocess.run({} + ["mail.ack", "--json", json.dumps({{"address": "ship", "through_seq": through}})],
-               check=True, capture_output=True)
-print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "session_id": session}}), flush=True)
-"#, json!(log), cli)).unwrap();
-    let shim = root.join("claude.c");
-    fs::write(
-        &shim,
-        format!(
-            r#"#include <unistd.h>
-int main(int argc, char **argv) {{
-    char *args[argc + 2];
-    args[0] = {python:?};
-    args[1] = {script:?};
-    for (int i = 1; i <= argc; i++) args[i + 1] = argv[i];
-    execv(args[0], args);
-    return 127;
-}}
-"#,
-            python = python.display().to_string(),
-            script = script.display().to_string()
-        ),
-    )
-    .unwrap();
-    let built = Command::new("cc")
-        .arg("-o")
-        .arg(bin.join("claude"))
-        .arg(&shim)
-        .status()
-        .unwrap();
-    assert!(built.success());
-    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o700)).unwrap();
+    let turn = format!(
+        r#"through = int(re.search(r"through seq (\d+)", args[-1]).group(1))
+subprocess.run({cli} + ["mail.ack", "--json", json.dumps({{"address": "ship", "through_seq": through}})],
+               check=True, capture_output=True)"#
+    );
+    fake_claude(&root, &bin, &log, &turn);
     let path = format!(
         "{}:{}:/usr/bin:/bin",
         bin.display(),
@@ -764,4 +775,355 @@ fn configure_accepts_mcp_only_bundle_and_refusals_name_field_not_value() {
         "bundle docs@1 refused: mcp_servers.credential"
     );
     assert!(!format!("{error:#}").contains(sentinel));
+}
+
+/// A crew resumes only its own session: the one its park is resuming, for
+/// its task, under the plan the crew launched with. It never resumes a first
+/// mate's or an errand's session, and neither of those resumes a crew's.
+#[test]
+fn a_bounded_crew_resumes_only_its_own_parked_session_under_its_plan() {
+    let (temp, mut store, mut config) = fixture();
+    config["claude_version"] = json!("2.1.300");
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    store.connection().execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('other','charter','ship','other task','open',0)", []).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let claude = root.join("claude-config");
+    fs::create_dir(&claude).unwrap();
+    let settings = |model: &str| {
+        fs::write(
+            claude.join("settings.json"),
+            json!({"model":model}).to_string(),
+        )
+        .unwrap();
+    };
+    settings("exact");
+    let home = store.home().to_owned();
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        support::python().parent().unwrap().display()
+    );
+    let launch = |id: &str, task: &str, resume: Option<&str>| -> Result<Value, String> {
+        let mut args = json!({"id":id,"task_id":task,"manifest":"bundled:claude",
+            "tool_bundles":["fixture@1"],"options":{"model":"exact"}});
+        if let Some(session) = resume {
+            args["options"]["resume"] = json!(session);
+        }
+        let output = support::command(support::BIN)
+            .args(["--home", home.to_str().unwrap(), "plugin.command", "--json"])
+            .arg(args.to_string())
+            .env("HOME", &root)
+            .env("PATH", &path)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"))
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(serde_json::from_slice(&output.stdout).unwrap())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    };
+    let refused = |result: Result<Value, String>| {
+        let error = result.expect_err("resumed");
+        assert!(
+            error.contains("a bounded session resumes only under the plan it started with"),
+            "{error}"
+        );
+        error
+    };
+    // A crew's park, resuming its crew's session, as the runtime records it
+    // before the resume launches.
+    let park =
+        |crew: &str, task: &str, state: &str, session: &str, digest: &str| {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                    rusqlite::params![
+                        crew,
+                        json!({"id":crew,"launch":{"plan_digest":digest}}).to_string()
+                    ],
+                )
+                .unwrap();
+            store.connection().execute(
+            "INSERT INTO crew_parks(id,root,crew_job_id,child_job_id,task_id,ship,state,next,
+               harness,session,attempt,created_ms,updated_ms)
+             VALUES('park-'||?1,?1,?1,'render',?2,'ship',?3,'check the render','claude',?4,1,0,0)",
+            rusqlite::params![crew, task, state, session],
+        )
+        .unwrap();
+        };
+
+    // A crew's launch carries its plan's digest, for its job to record.
+    let digest = launch("crew-1", "task", None).unwrap()["plan_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(digest.len(), 64);
+    let session = "00000000-0000-4000-8000-00000000c1e1";
+    // No park resumes it yet.
+    refused(launch("crew-2", "task", Some(session)));
+    park("crew-1", "task", "resuming", session, &digest);
+    let resumed = launch("crew-resume-park-crew-1-1", "task", Some(session)).unwrap();
+    assert!(
+        resumed["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == session),
+        "{resumed}"
+    );
+    assert_eq!(resumed["plan_digest"], digest.as_str());
+    // A crew of another task cannot take it.
+    refused(launch("crew-3", "other", Some(session)));
+    // Neither a first mate's wake nor an errand resumes a crew's session.
+    store
+        .connection()
+        .execute(
+            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms,session_id)
+             VALUES('wake-1','ship','duty',0,'wake-1','resume','running',0,?1)",
+            [session],
+        )
+        .unwrap();
+    refused(launch("wake-1", "task", Some(session)));
+    store
+        .connection()
+        .execute(
+            "INSERT INTO errands(id,ship,focus,task_id,brief,mode,status,created_ms)
+             VALUES('errand-1','ship','errand','task','look','resume','running',0)",
+            [],
+        )
+        .unwrap();
+    refused(launch("errand-1", "task", Some(session)));
+    // A crew never resumes a first mate's or an errand's session, even one
+    // started under its own digest that a park claims.
+    for (n, focus) in ["duty", "errand:errand-0"].iter().enumerate() {
+        let other = format!("00000000-0000-4000-8000-00000000f00{n}");
+        store.connection().execute(
+            "INSERT INTO sessions(ship,focus,harness,session_id,wakes,started_ms,last_turn_ms,plan_digest)
+             VALUES('ship',?1,'claude',?2,1,0,0,?3)",
+            rusqlite::params![focus, other, digest],
+        )
+        .unwrap();
+        let crew = format!("crew-forged-{n}");
+        park(&crew, "task", "resuming", &other, &digest);
+        refused(launch(&format!("{crew}-resume"), "task", Some(&other)));
+    }
+    // A park that is not resuming resumes nothing.
+    let waiting = "00000000-0000-4000-8000-00000000c1e2";
+    park("crew-4", "task", "parked", waiting, &digest);
+    refused(launch("crew-4-resume", "task", Some(waiting)));
+    // The plan changed while the crew was parked: refused, saying so.
+    settings("other");
+    let error = refused(launch("crew-resume-park-crew-1-2", "task", Some(session)));
+    assert!(
+        error.contains("task task: crew session not resumed because its bundle plan changed"),
+        "{error}"
+    );
+}
+
+/// A bounded Claude crew that parks on a gated heavy job, with what it left.
+struct ParkedCrew {
+    _temp: TempDir,
+    store: Store,
+    /// The crew's job once its park settled: resumed or failed.
+    crew: Value,
+    /// Each claude launch's argv.
+    launches: Vec<Vec<String>>,
+    /// The mail its first mate was sent.
+    mail: Vec<String>,
+}
+
+/// Launch a bounded crew that parks on a heavy job it starts, and release
+/// the job once it is parked, after changing the crew's carried Claude
+/// settings when `change_plan`. The job's supervisor resumes the crew.
+fn park_a_bounded_crew(change_plan: bool) -> ParkedCrew {
+    use std::time::{Duration, Instant};
+    let (temp, mut store, mut config) = fixture();
+    // The crew's budget covers its launch on a loaded runner.
+    store
+        .connection()
+        .execute(
+            "UPDATE charters SET data=json_set(data,'$.job_timeout_secs',300) WHERE id='charter'",
+            [],
+        )
+        .unwrap();
+    config["claude_version"] = json!("2.1.300");
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let home = store.home().to_owned();
+    let claude = root.join("claude-config");
+    fs::create_dir(&claude).unwrap();
+    let settings = |model: &str| {
+        fs::write(
+            claude.join("settings.json"),
+            json!({"model":model}).to_string(),
+        )
+        .unwrap();
+    };
+    settings("exact");
+    // The crew starts a heavy job that runs until released, and parks on it.
+    // Its resume only finishes its turn.
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = root.join("claude-argv.jsonl");
+    let release = root.join("release");
+    let gate = format!(
+        "while [ ! -e '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.1; done; echo rendered",
+        release.display(),
+        root.display()
+    );
+    let cli = json!([support::BIN, "--home", home]);
+    let render = json!({"id":"render","task_id":"task","command":["sh","-c",gate],"heavy":true});
+    let park = json!({"job_id":"render","next":"check the render"});
+    let turn = format!(
+        r#"if not os.environ["PRIVATEER_JOB"].startswith("crew-resume-"):
+    for command, value in (("job.start", {render}), ("crew.park", {park})):
+        subprocess.run({cli} + [command, "--json", value], check=True, capture_output=True)"#,
+        // Each request as JSON text, quoted as a Python string.
+        render = json!(render.to_string()),
+        park = json!(park.to_string()),
+    );
+    fake_claude(&root, &bin, &log, &turn);
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        bin.display(),
+        support::python().parent().unwrap().display()
+    );
+    let run = |agent: bool, command: &str, args: Value| -> Value {
+        let mut cli = support::command(support::BIN);
+        cli.args(["--home", home.to_str().unwrap(), command, "--json"])
+            .arg(args.to_string())
+            .env("HOME", &root)
+            .env("PATH", &path)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", root.join("ledger"))
+            .env("PRIVATEER_SERVICE", "none")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH");
+        if agent {
+            cli.env("PRIVATEER_ROLE", "agent")
+                .env("PRIVATEER_ACTOR", "ship");
+        }
+        let output = cli.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    run(false, "ship.put", json!({"name":"ship","scope":"ship"}));
+    run(
+        false,
+        "resource.configure",
+        json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,
+            "max_load_per_cpu":1024,"ramp_secs":0,
+            "crew_memory_bytes":{"claude":1u64 << 20},
+            "heavy_estimate":{"disk_bytes":1u64 << 20}}),
+    );
+    run(
+        true,
+        "agent.start",
+        json!({"task_id":"task","id":"crew-1","manifest":"bundled:claude",
+            "tool_bundles":["fixture@1"],"options":{"model":"exact"}}),
+    );
+    let wait = |id: &str, accepted: &[&str]| -> Value {
+        let until = Instant::now() + Duration::from_secs(90);
+        loop {
+            let job = run(false, "job.status", json!({"id":id}));
+            if accepted.contains(&job["status"].as_str().unwrap_or_default()) {
+                return job;
+            }
+            assert!(
+                Instant::now() < until,
+                "{id} never reached {accepted:?}: {job}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let parked = wait("crew-1", &["parked"]);
+    assert_eq!(parked["park"], "park-crew-1-1", "{parked}");
+    if change_plan {
+        settings("other");
+    }
+    fs::write(&release, "").unwrap();
+    let crew = wait("crew-1", &["resumed", "failed"]);
+    if crew["status"] == "resumed" {
+        wait("crew-resume-park-crew-1-1-1", &["succeeded"]);
+    }
+    let launches = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mail = run(
+        false,
+        "mail.inbox",
+        json!({"address":"ship","all":true,"limit":1000}),
+    )["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["body"].as_str().map(str::to_owned))
+        .collect();
+    ParkedCrew {
+        _temp: temp,
+        store,
+        crew,
+        launches,
+        mail,
+    }
+}
+
+/// A bounded crew parks, its job ends, and it resumes its own session under
+/// the plan it launched with.
+#[test]
+fn a_parked_bounded_crew_resumes_its_session_under_the_same_plan() {
+    let parked = park_a_bounded_crew(false);
+    assert_eq!(parked.crew["status"], "resumed", "{}", parked.crew);
+    assert_eq!(parked.launches.len(), 2, "{:?}", parked.launches);
+    let (session, started, resumed): (String, String, String) = parked
+        .store
+        .connection()
+        .query_row(
+            "SELECT p.session, json_extract(c.record,'$.launch.plan_digest'),
+                    json_extract(r.record,'$.launch.plan_digest')
+               FROM crew_parks p JOIN jobs c ON c.id=p.crew_job_id
+               JOIN jobs r ON r.id=p.resumed_job_id WHERE p.id='park-crew-1-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(started.len(), 64);
+    assert_eq!(resumed, started, "the resume runs under the crew's plan");
+    let argv = &parked.launches[1];
+    let at = argv.iter().position(|a| a == "--resume").unwrap();
+    assert_eq!(argv[at + 1], session);
+    assert!(!parked.launches[0].contains(&"--resume".to_owned()));
+}
+
+/// The crew's plan changes while it is parked: its session is not resumed,
+/// and its first mate is told why, naming the task.
+#[test]
+fn a_parked_bounded_crew_whose_plan_changed_is_not_resumed() {
+    let parked = park_a_bounded_crew(true);
+    assert_eq!(parked.crew["status"], "failed", "{}", parked.crew);
+    let why = "task task: crew session not resumed because its bundle plan changed";
+    let reason = parked.crew["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains(why), "{reason}");
+    assert_eq!(parked.launches.len(), 1, "{:?}", parked.launches);
+    assert!(
+        parked
+            .mail
+            .iter()
+            .any(|body| body.starts_with("Crew job crew-1 failed") && body.contains(why)),
+        "{:?}",
+        parked.mail
+    );
 }
