@@ -8,7 +8,10 @@
 //! a commit cannot hide its author in a child or sibling task. A branch that
 //! is not one of ours falls back to every agent job the ship ran since the
 //! merge-base commit was made; the merge-base is on the protected branch, so
-//! its time is trustworthy.
+//! its time is trustworthy. That fallback has a known gap, accepted by the
+//! captain (decision Q2): a rebase onto a newer protected branch moves the
+//! merge-base later, so a crew that ran before the new merge-base drops out
+//! of the author set even though its commits are still on the branch.
 //!
 //! Each job in scope lands in one of two classes. Crew jobs, and any author
 //! routes the ship declares (which can only add), are `crew_models`: a
