@@ -4310,13 +4310,69 @@ fn approval_granted(place: &Place, request: &str, action: &str) -> Value {
     approval
 }
 
-/// The session's adapter reports it idle, and its idle spell is backdated by
-/// `secs`, so no test waits out the threshold.
+/// The lease, its followers, the pane and the work rows, for a CI log.
+fn approval_state(place: &Place) -> String {
+    let db = place.database();
+    let mut out = format!(
+        "pi-env: {:?}\n",
+        fs::read_to_string(place.root.join("pi-env")).unwrap_or_default()
+    );
+    for table in [
+        "presence",
+        "host_launches",
+        "hosted_relaunches",
+        "hosted_panes",
+        "work_sessions",
+        "task_schedule",
+        "wakes",
+    ] {
+        let mut statement = db.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let names: Vec<String> = statement
+            .column_names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let rows = statement
+            .query_map([], |r| {
+                (0..names.len())
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        for row in rows {
+            let row = row.unwrap();
+            let fields: Vec<String> = names
+                .iter()
+                .zip(row)
+                .map(|(name, value)| format!("{name}={value:?}"))
+                .collect();
+            out.push_str(&format!("{table}: {}\n", fields.join(" ")));
+        }
+    }
+    out
+}
+
+/// The session's adapter, as the harness running now, reports it idle, and
+/// its idle spell is backdated by `secs`, so no test waits out the threshold.
 fn approval_idle(place: &Place, secs: i64) {
-    let holder = holder_of(place);
-    place.agent(
-        "work.poll",
-        json!({"ship":"infra","holder":holder,"idle":true}),
+    approval_idle_as(place, &holder_of(place), secs);
+}
+
+fn approval_idle_as(place: &Place, holder: &str, secs: i64) {
+    let args = json!({"ship":"infra","holder":holder,"idle":true});
+    let output = retry_fixture_exec(|| {
+        place
+            .command(&["work.poll", "--json", &args.to_string()])
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "infra")
+            .output()
+    })
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "work.poll as {holder}: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        approval_state(place)
     );
     place
         .database()
@@ -4325,6 +4381,24 @@ fn approval_idle(place: &Place, secs: i64) {
             [secs * 1000],
         )
         .unwrap();
+}
+
+/// Return the conversation set `aside` to `transcript` and report the session
+/// idle past the threshold, as the harness running then, completing the safe
+/// point; `pause` stands for a slow poll. The last idle report is still fresh
+/// (sleep::FRESH_MS), so on its own it would let the pane refresh the moment
+/// the conversation is back and move the lease before this poll, which the
+/// lease then refuses as the old session's. A busy report, made while no
+/// refresh can be due, ends that spell: the refresh follows only this report.
+fn approval_resumed(place: &Place, transcript: &Path, aside: &Path, pause: Duration) {
+    let holder = holder_of(place);
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    fs::rename(aside, transcript).unwrap();
+    std::thread::sleep(pause);
+    approval_idle_as(place, &holder, 20);
 }
 
 /// Past one of the supervisor's five-second checks, the harness still runs.
@@ -4421,25 +4495,6 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
     approval_idle(&place, 0);
     approval_stays_put(&place, native, "idle under 15 s");
 
-    // An open tool-permission question holds the ship.
-    let ask = json!({"type":"tool_permission","block":{"ship":"infra",
-        "denials":[{"tool":"Bash","rule":"Bash(make deploy)"}]}});
-    place
-        .database()
-        .execute(
-            "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
-             VALUES('perm-1','infra','captain','request','ship-it','May I run make deploy?',?1,'normal',0,'open')",
-            [ask.to_string()],
-        )
-        .unwrap();
-    approval_idle(&place, 20);
-    approval_stays_put(&place, native, "paused");
-    place
-        .database()
-        .execute("UPDATE mail SET state='withdrawn' WHERE id='perm-1'", [])
-        .unwrap();
-
-    // Within 5 minutes of the last refresh.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -4453,7 +4508,28 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
             )
             .unwrap();
     };
+
+    // An open tool-permission question holds the ship.
+    let ask = json!({"type":"tool_permission","block":{"ship":"infra",
+        "denials":[{"tool":"Bash","rule":"Bash(make deploy)"}]}});
+    place
+        .database()
+        .execute(
+            "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+             VALUES('perm-1','infra','captain','request','ship-it','May I run make deploy?',?1,'normal',0,'open')",
+            [ask.to_string()],
+        )
+        .unwrap();
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "paused");
+
+    // Within 5 minutes of the last refresh. The gap holds the ship before the
+    // question closes, so the still-fresh idle spell finds no safe point.
     refreshed_at(now);
+    place
+        .database()
+        .execute("UPDATE mail SET state='withdrawn' WHERE id='perm-1'", [])
+        .unwrap();
     approval_idle(&place, 20);
     approval_stays_put(&place, native, "inside the 5-minute gap");
 
@@ -4467,8 +4543,7 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
     assert!(approval_refreshes(&place).is_empty());
 
     // Once every condition holds, the pane restarts its session in place.
-    fs::rename(&aside, &transcript).unwrap();
-    approval_idle(&place, 20);
+    approval_resumed(&place, &transcript, &aside, Duration::ZERO);
     let second = approval_refreshed(&place, native, &holder);
     assert_eq!(
         approval_wrapper(&place),
@@ -4530,6 +4605,29 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
         .unwrap();
     let stale = approval_granted(&place, "q-8", "Deploy build 8 to staging");
     assert_eq!(stale["applies"], "next_launch", "{stale}");
+    place.stop_native("infra");
+}
+
+/// The refresh follows the idle report that completes the safe point, so the
+/// harness making it is still the lease's holder however slow it is. Were the
+/// idle spell from before the conversation went missing still counted, the
+/// pane would refresh within one five-second check of the conversation's
+/// return, and a report slower than that be refused as the old session's.
+#[test]
+fn an_approval_refresh_follows_the_idle_report_that_completes_its_safe_point() {
+    let (place, _herdr) = hosted_claude_refresher();
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+    approval_granted(&place, "q-7", "Deploy build 7 to staging");
+    let transcript = claude_transcripts(&place).join("session.jsonl");
+    let aside = claude_transcripts(&place).join("session.aside");
+    fs::rename(&transcript, &aside).unwrap();
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "no conversation continues");
+    approval_resumed(&place, &transcript, &aside, Duration::from_secs(6));
+    approval_refreshed(&place, native, &holder);
+    let presence = place.json("ship.presence", json!({"ship":"infra"}));
+    assert_eq!(presence["lease"]["holder"], holder_of(&place), "{presence}");
     place.stop_native("infra");
 }
 
