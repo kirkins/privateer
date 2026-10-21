@@ -109,6 +109,19 @@ const REFUSAL_STEMS: &[&str] = &[
     "negative",
     "nevermind",
 ];
+/// Words a plain yes may hold besides the words of the action it answers.
+const PLAIN_WORDS: &[&str] = &[
+    "yes", "y", "yep", "yeah", "ok", "okay", "k", "sure", "go", "ahead", "do", "it", "please",
+    "approve", "approved", "proceed", "lgtm", "ship", "thanks", "thank", "you", "the", "that",
+    "this", "fine", "good", "now",
+];
+/// The words of which a free-text reply needs one, unless it is made only of
+/// the action's own words.
+const YES_WORDS: &[&str] = &[
+    "yes", "y", "yep", "yeah", "ok", "okay", "k", "sure", "go", "approve", "approved", "proceed",
+    "lgtm", "ship", "do", "fine", "good",
+];
+const NOT_PLAIN: &str = "reply was not a plain yes; ask again with a decision";
 
 /// One line of text within `max` characters, trimmed, with no control
 /// characters. Errors name the field, never the value.
@@ -250,6 +263,12 @@ pub(crate) fn declare(
                 .all(|k| payload.get(*k).is_none()),
         "approves cannot ride an ask the runtime raises"
     );
+    // A door sends a tapped choice back as plain text, so a ship's own
+    // buttons ("Go", "Pass") would each read as the captain's yes.
+    ensure!(
+        kind != "request" || payload.get("choices").is_none(),
+        "use kind decision with an approving option for buttons"
+    );
     let fields = approves.as_object().context("approves must be an object")?;
     ensure!(
         fields
@@ -373,23 +392,46 @@ fn worded(text: &str) -> bool {
         .any(|w| w.chars().any(char::is_alphabetic))
 }
 
+/// The lowercased words of `text`, split on anything but letters, digits and
+/// an apostrophe inside a word, with every apostrophe form made ASCII.
+fn words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .replace(['‘', '’', '`', 'ʼ'], "'")
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .map(|w| w.trim_matches('\''))
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether a reply that passed `hedged` is a plain yes: every word is a
+/// plain word or one of `own` (the words of what it answers), and one is a
+/// yes word unless `yes_needed` is false or all of them are `own`. Anything
+/// else ("after CI", "for staging", "show me the diff") is not a yes.
+fn plain(text: &str, own: &[String], yes_needed: bool) -> bool {
+    let words = words(text);
+    let own_word = |w: &String| own.contains(w);
+    words
+        .iter()
+        .all(|w| PLAIN_WORDS.contains(&w.as_str()) || own_word(w))
+        && (!yes_needed
+            || words.iter().any(|w| YES_WORDS.contains(&w.as_str()))
+            || words.iter().all(own_word))
+}
+
 /// Whether the reply text holds a word that makes it something other than a
 /// plain yes. A false no costs the captain one more ask; a false yes grants
 /// what they did not, so this errs toward no.
 fn hedged(text: &str) -> Option<String> {
-    let lower = text.to_lowercase().replace('’', "'");
-    if lower.contains('?') {
+    if text.contains('?') {
         return Some("?".into());
     }
-    let words: Vec<&str> = lower
-        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
-        .filter(|w| !w.is_empty())
-        .collect();
+    let words = words(text);
     REFUSALS
         .iter()
         .find(|refusal| {
             let parts: Vec<&str> = refusal.split(' ').collect();
-            words.windows(parts.len()).any(|w| w == parts.as_slice())
+            words.windows(parts.len()).any(|w| w.iter().eq(parts.iter()))
         })
         .map(|w| (*w).to_owned())
         .or_else(|| {
@@ -465,6 +507,11 @@ pub(crate) fn record(
                     "the captain's words carry \"{word}\", so nothing was approved; ask again"
                 ));
             }
+            let mut own = words(approves["action"].as_str().unwrap_or_default());
+            own.extend(words(option["label"].as_str().unwrap_or_default()));
+            if !plain(&text, &own, false) {
+                return skip(NOT_PLAIN);
+            }
         }
         "option"
     } else {
@@ -478,6 +525,9 @@ pub(crate) fn record(
             return skip(&format!(
                 "the captain's reply carries \"{word}\", so it is not a plain yes and nothing was approved; ask again with a decision"
             ));
+        }
+        if !plain(&text, &words(approves["action"].as_str().unwrap_or_default()), true) {
+            return skip(NOT_PLAIN);
         }
         "reply"
     };
