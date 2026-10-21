@@ -981,7 +981,8 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
         .then_some(())
     });
     assert_eq!(machine.pass(&upkeep), Value::Null);
-    // A config rewritten after install (an agent may write the ledger) is
+    // A config rewritten after install (defence in depth: agents cannot
+    // write the run directory) is
     // never started.
     machine.run(&upkeep, &install);
     let config = machine.dir().join("xcode.json");
