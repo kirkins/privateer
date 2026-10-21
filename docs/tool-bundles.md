@@ -8,7 +8,7 @@ search credential stores, or infer which personal extensions are required.
 
 The first stage supports named/versioned **local skills and their supporting
 scripts/files**. Remote streamable-HTTP MCP servers and pinned local stdio MCP
-servers load for Pi and Claude runs that select them, see
+servers (crew jobs only) load for Pi and Claude runs that select them, see
 [Selected MCP servers](#selected-mcp-servers-pi-and-claude). Optional executable
 tool extensions are deferred: definitions containing those fields fail
 validation, rather than silently dropping them. The separate
@@ -343,7 +343,8 @@ A stdio server has `name`, `command`, `sha256` and `timeout`, and optionally
   and holds no `$`, leading `!`, leading `~` or control character: Pi expands `$`
   and a leading `~/`.
 - Element 0 is the executable: an absolute, normalized path. Its file must be a
-  regular file its owner may execute, and its contents must match `sha256`.
+  regular file its owner may execute, not a `#!` script, and its contents must
+  match `sha256`.
   Every component from `/` down must be owned by root or this user, must not be
   a symlink and must not be group- or world-writable. Root-owned
   `/usr/bin/xcrun` qualifies; a temporary directory never does, because `/tmp`
@@ -353,10 +354,28 @@ A stdio server has `name`, `command`, `sha256` and `timeout`, and optionally
   whatever its arguments say.
 - The pin covers the executable only, not what it loads. An interpreter
   (`python3 server.py`) or a trampoline (`xcrun`) runs files the pin does not
-  name.
+  name. A `#!` script refuses (`mcp_servers.command`) on every platform: it
+  runs its interpreter by path, which its pin does not cover, and it cannot be
+  exec'd through the descriptor the launcher hashed. Pin the interpreter and
+  pass the script as an argument instead.
 - There are no `env`, `cwd`, `shell`, `args`, `type` or `headers` keys.
 - `credential` is optional. When given, the server receives that credential's
   file path, never its value.
+
+**Stdio servers are crew-only.** A crew job's teardown ends a stdio server and
+everything it started (see below). A hosted first mate's pane is not a job:
+sleep, approval refresh and upgrade stop it by signalling the harness pid
+alone, so a server that ignores SIGTERM, or one orphaned when the harness is
+killed, would outlive the pane, and every relaunch could leave another. A
+bundle's `roles` may still name `first_mate`, but any plan for a role other
+than `crew` that selects a stdio server refuses with `stdio MCP servers run only
+in crew jobs, whose teardown ends them; first_mate launches are not jobs`. That
+covers a first mate's profile (`ship.put`), its hosted or `privateer start`
+launch, and its wakes, which plan as `first_mate`. The same refusal is
+repeated at each job's adapter preflight (by its role) and by the attended
+launcher, and Pi's gate gets the launcher's interpreter only for a job's
+launch, so it refuses any stdio record otherwise. HTTP servers stay allowed for
+every role that may carry bundles.
 
 The pin is checked when the registry is configured, when a run is planned, at
 each launch's preflight, and again by the launcher just before exec (Pi's gate
@@ -416,8 +435,16 @@ launcher, `plugins/mcp_stdio.py`:
 - Its one argument is a runtime-written spec: the pinned command, its `sha256`,
   and the server's credential name and file path if it has one. It never reads
   the record from its environment.
-- It re-pins the executable, then `execve`s it in place: the same pid and
-  process group, with no fork or `setsid`.
+- It re-pins the executable, opening it with `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`
+  and hashing that descriptor.
+- It closes every inherited descriptor from 3 up to the soft `RLIMIT_NOFILE`,
+  so the server holds only its stdio.
+- It then `execve`s in place: the same pid and process group, with no fork or
+  `setsid`. Where the platform execs a descriptor (`os.execve` in
+  `os.supports_fd`, which includes Linux), it execs the very descriptor it
+  hashed, so the bytes hashed are the bytes run; the descriptor is
+  close-on-exec, so the server never holds it. Elsewhere (macOS) it execs the
+  path, rechecked just before.
 - On any drift or unexpected spec it exits 78 with one fixed line and starts
   nothing.
 
@@ -447,9 +474,9 @@ Nothing else is passed, including `DEVELOPER_DIR` (`xcrun` falls back to
 both harnesses, and `tests/pi_bundles.py` asserts it for the launcher alone. The
 server's working directory is the harness's.
 
-A server's processes end with the run's job. The harness spawns the launcher,
-the launcher execs the server, and the server stays in the process group the
-harness gave it, inside the job's session. A SIGTERM-ignoring grandchild
+A server's processes end with the crew's job, which is why only crew may run
+one. The harness spawns the launcher, the launcher execs the server, and the
+server stays in the process group the harness gave it, inside the job's session. A SIGTERM-ignoring grandchild
 outlives the harness itself:
 
 - Claude exits normally and leaves its group running.
@@ -467,9 +494,10 @@ Limits: the token sits in the Pi process's memory; a same-user agent can still
 read the credential file; URLs are not content-pinned. A token that goes bad
 after launch (the file changed mid-run) makes Claude reconnect without the
 header; a hosted session has no connection check. A stdio pin covers the
-executable, not what it loads. Between the launcher's re-pin and its `execve`,
-the path can still be swapped, but only by root or this user, who own every
-component.
+executable, not what it loads. On Linux the launcher runs the bytes it hashed.
+On macOS, which cannot exec a descriptor, the path can still be swapped between
+the launcher's re-pin and its `execve`, but only by root or this user, who own
+every component.
 
 - The agent can read its own credential file; this is an accepted limit.
 - Redirects are followed, but `Authorization` is dropped on a cross-origin redirect.
@@ -495,8 +523,12 @@ python3 tests/claude_bundles_native.py /absolute/installed/native/claude
 The stdio cases: the deterministic suites cover every refusal (shells and `env`,
 relative or unnormalized paths, symlinks, writable ancestors, non-executable
 files, pin drift at selection, preflight and the launcher, `$`/`!`/`~` and
-control characters, `env`/`cwd`/`shell` keys, `url` beside `command`), the
-Claude and Pi entries, and the launcher's environment and in-place exec. Each
+control characters, `env`/`cwd`/`shell` keys, `url` beside `command`, `#!`
+scripts), the crew-only rule (a first mate's plan, profile, job preflight and
+attended launch refuse a stdio server, while its HTTP servers and a crew's stdio
+server still load), the Claude and Pi entries, and the launcher's environment,
+closed descriptors (the fake records its own, and sees only 0, 1 and 2 though
+the harness passed more) and in-place exec. Each
 native probe's `test_selected_stdio_server_env_ambient_and_lifetime` runs a
 pinned stdio fake (`tests/fixtures/pi-mcp/server.py`) through the real launcher
 and harness. It asserts:
