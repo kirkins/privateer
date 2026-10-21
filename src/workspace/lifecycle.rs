@@ -54,6 +54,23 @@ fn archive_tip(store: &Store, lock: &Lock, w: &Workspace, rev: &str) -> Result<S
     Ok(reference)
 }
 
+/// Close the workspace's Xcode window, if the MCP broker opened one, before
+/// anything checks the checkout: Xcode can write into the worktree and hold
+/// files there. Every way out of `ready` goes through here. A running broker
+/// that cannot close it keeps the workspace; with no broker running, the
+/// window left open is audited and the workspace goes.
+fn close_xcode_window(store: &Store, w: &Workspace) -> Result<()> {
+    let Some(path) = w.path.as_ref() else {
+        return Ok(());
+    };
+    let root = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+    crate::mcp_broker::close_workspace(store, &root)
+        .map(|_| ())
+        .map_err(|error| {
+            anyhow::anyhow!("could not close the Xcode window for this workspace: {error:#}")
+        })
+}
+
 fn release(store: &Store, args: &Value) -> Result<Value> {
     let task = required(args, "task_id")?;
     owner(store, task)?;
@@ -93,6 +110,7 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         matches!(w.state.as_str(), "ready" | "releasing"),
         "finish workspace.acquire recovery before releasing"
     );
+    close_xcode_window(store, &w)?;
     w.state = "ready".into();
     validate(&lock, &w)?;
     sync_branch(&lock, &mut w);
@@ -354,6 +372,13 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 .filter(|slot| slot["lease_id"].as_str() == Some(&lease))
                 .collect();
             if on_lease.is_empty() {
+                if let Err(error) = close_xcode_window(store, &w) {
+                    let reason = format!("{error:#}");
+                    if let Some(kept) = keep(store, &lock, &w, &reason)? {
+                        alert_unreleasable(store, &kept, &reason)?;
+                    }
+                    continue;
+                }
                 w.state = "released".into();
                 w.retained_reason = None;
                 let _ = save(store, &w);
@@ -413,6 +438,15 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 keep(store, &lock, &w, "active task without branch commits")?;
                 continue;
             }
+        }
+        // Closed here too, so a failure reaches the owner whatever the task's
+        // status; release closes again, finding nothing left.
+        if let Err(error) = close_xcode_window(store, &w) {
+            let reason = format!("{error:#}");
+            if let Some(kept) = keep(store, &lock, &w, &reason)? {
+                alert_unreleasable(store, &kept, &reason)?;
+            }
+            continue;
         }
         drop(lock);
 

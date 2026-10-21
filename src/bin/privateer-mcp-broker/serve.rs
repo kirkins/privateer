@@ -674,7 +674,7 @@ impl Broker {
                 line.push(b'\n');
                 let _ = queue.try_send(line);
                 Err(Refusal::Busy(
-                    format!("{method} did not answer in time"),
+                    format!("the upstream did not answer {method} in time"),
                     15,
                 ))
             }
@@ -754,16 +754,23 @@ impl Broker {
             return Ok(tab);
         }
         self.open(client, root, deadline)?;
+        let opening = || {
+            Refusal::Busy(
+                "Xcode is opening this workspace's window".into(),
+                OPEN_RETRY_SECS,
+            )
+        };
         loop {
-            if let Some(tab) = self.list_for(root, deadline)? {
-                return Ok(tab);
+            match self.list_for(root, deadline) {
+                Ok(Some(tab)) => return Ok(tab),
+                Ok(None) => {}
+                // Out of time while asking: the window is what it waits for.
+                Err(Refusal::Busy(..)) => return Err(opening()),
+                Err(refusal) => return Err(refusal),
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(Refusal::Busy(
-                    "Xcode is opening this workspace's window".into(),
-                    OPEN_RETRY_SECS,
-                ));
+                return Err(opening());
             }
             std::thread::sleep(OPEN_POLL.min(deadline - now));
         }

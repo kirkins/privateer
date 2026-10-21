@@ -84,6 +84,16 @@ struct Broker {
 
 impl Broker {
     fn start(root: &Path, extra: &[&str], ready_wait: Option<u64>) -> Broker {
+        Broker::start_with(root, extra, ready_wait, &[])
+    }
+
+    /// With broker options (workspace pools, window helpers) before `--`.
+    fn start_with(
+        root: &Path,
+        extra: &[&str],
+        ready_wait: Option<u64>,
+        options: &[String],
+    ) -> Broker {
         let dir = root.join("state");
         let record = root.join("record.jsonl");
         let mut command = support::command(BROKER);
@@ -92,6 +102,7 @@ impl Broker {
         if let Some(secs) = ready_wait {
             command.args(["--ready-wait-secs", &secs.to_string()]);
         }
+        command.args(options);
         command
             .arg("--")
             .args(upstream(&record, extra))
@@ -157,10 +168,20 @@ impl Client {
     }
 
     fn connect_from(socket: &Path, cwd: &Path, wait: u64) -> Client {
+        Client::spawn(socket, cwd, wait, &[])
+    }
+
+    /// A proxy with extra options (`--project REL`).
+    fn connect_with(socket: &Path, cwd: &Path, options: &[&str]) -> Client {
+        Client::spawn(socket, cwd, 10, options)
+    }
+
+    fn spawn(socket: &Path, cwd: &Path, wait: u64, options: &[&str]) -> Client {
         let mut child = support::command(BROKER)
             .args(["proxy", "--socket"])
             .arg(socket)
             .args(["--connect-wait-secs", &wait.to_string()])
+            .args(options)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -617,8 +638,8 @@ fn the_proxy_says_hello_from_its_real_cwd_and_exits_with_either_side() {
             .and_then(|c| c.iter().find(|c| c["pid"] == pid).cloned())
     });
     assert_eq!(client["cwd"], real.to_string_lossy().as_ref());
-    // The socket's own report of the peer, beside the hello's claim.
-    #[cfg(target_os = "linux")]
+    // The socket's own report of the peer (SO_PEERCRED, LOCAL_PEERPID),
+    // beside the hello's claim.
     assert_eq!(client["peer_pid"], pid);
     // stdin closed: the proxy exits.
     drop(a.stdin.take());
@@ -803,7 +824,21 @@ fn install_copies_only_a_missing_or_different_version() {
     assert_eq!(fs::metadata(&stable).unwrap().mode() & 0o777, 0o755);
     let config: Value =
         serde_json::from_slice(&fs::read(machine.dir().join("xcode.json")).unwrap()).unwrap();
-    assert_eq!(config, json!({"upstream": ["/usr/bin/xcrun", "mcpbridge"]}));
+    assert_eq!(config["upstream"], json!(["/usr/bin/xcrun", "mcpbridge"]));
+    // Privateer's own workspace pool, <ledger>/worktrees, is always there.
+    let own_pool = fs::canonicalize(machine.ledger().join("worktrees")).unwrap();
+    assert_eq!(config["workspace_pools"], json!([own_pool]));
+    // The Mac's open and osascript by default; no helper elsewhere.
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            config["window_open"],
+            json!(["/usr/bin/open", "-g", "-a", "Xcode"])
+        );
+        assert_eq!(config["window_close"][0], "/usr/bin/osascript");
+    } else {
+        assert!(config.get("window_open").is_none(), "{config}");
+        assert!(config.get("window_close").is_none(), "{config}");
+    }
     assert_eq!(fs::metadata(machine.dir()).unwrap().mode() & 0o777, 0o700);
     // Every broker file is in the run directory, outside the ledger that
     // sandboxed agents may write; nothing of the broker's is in the ledger.
@@ -958,6 +993,12 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     assert_eq!(status["running"], true);
     assert_eq!(status["pid"], pid);
     assert_eq!(status["broker"]["upstream"]["state"], "ready");
+    // The dispatcher passed the pinned config's pools to the broker.
+    assert!(!status["workspace_pools"].as_array().unwrap().is_empty());
+    assert_eq!(
+        status["broker"]["workspace_pools"],
+        status["workspace_pools"]
+    );
     let upstream_pid = status["broker"]["upstream"]["pid"].as_i64().unwrap() as i32;
     assert!(alive(upstream_pid));
     // A state file naming another process group as the upstream: stop never
@@ -1040,4 +1081,651 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     let gone = machine.pass(&upkeep);
     assert_eq!(gone["stopped"]["upstream_gone"], true, "{gone}");
     assert!(!alive(upstream_pid));
+}
+
+// ---- Step 3: windows and routing -------------------------------------------
+
+fn window_helper() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-broker/fake_xcode_window.py")
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Real git worktrees under a temporary workspace pool, laid out as
+/// Treehouse leaves them, and the fake Xcode their windows live in.
+struct Workspaces {
+    root: PathBuf,
+    pool: PathBuf,
+    repo: PathBuf,
+    /// Xcode's windows, as the fake mcpbridge lists them.
+    windows: PathBuf,
+    opened: PathBuf,
+    closed: PathBuf,
+}
+
+impl Workspaces {
+    fn new(temp: &Path) -> Workspaces {
+        let root = fs::canonicalize(temp).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        fs::write(repo.join("README"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        let pool = root.join("pool");
+        fs::create_dir_all(&pool).unwrap();
+        Workspaces {
+            windows: root.join("windows.json"),
+            opened: root.join("opened.jsonl"),
+            closed: root.join("closed.jsonl"),
+            root,
+            pool,
+            repo,
+        }
+    }
+
+    /// A new worktree, with these directories in it.
+    fn worktree(&self, slot: &str, dirs: &[&str]) -> PathBuf {
+        let path = self.pool.join("home-hash").join(slot).join("repo");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        git(
+            &self.repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path.to_str().unwrap(),
+            ],
+        );
+        for dir in dirs {
+            fs::create_dir_all(path.join(dir)).unwrap();
+        }
+        path
+    }
+
+    /// Windows already open in Xcode, which the broker did not open.
+    fn seed(&self, windows: Value) {
+        fs::write(&self.windows, windows.to_string()).unwrap();
+    }
+
+    fn listed(&self) -> Vec<Value> {
+        fs::read(&self.windows)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn helper(&self, action: &str, extra: &[&str]) -> String {
+        let log = if action == "open" {
+            &self.opened
+        } else {
+            &self.closed
+        };
+        let mut argv = vec![
+            fs::canonicalize(support::python())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "-I".into(),
+            window_helper().to_string_lossy().into_owned(),
+            action.into(),
+            "--windows".into(),
+            self.windows.to_string_lossy().into_owned(),
+            "--log".into(),
+            log.to_string_lossy().into_owned(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        serde_json::to_string(&argv).unwrap()
+    }
+
+    /// The broker's options: this pool, and the fake helpers.
+    fn options(&self, open: &[&str], close: &[&str]) -> Vec<String> {
+        vec![
+            "--workspace-pool".into(),
+            self.pool.to_string_lossy().into_owned(),
+            "--window-open".into(),
+            self.helper("open", open),
+            "--window-close".into(),
+            self.helper("close", close),
+        ]
+    }
+
+    /// A broker in `name` under the root, its upstream listing this Xcode.
+    fn broker(&self, name: &str, open: &[&str], text: bool, ready_wait: Option<u64>) -> Broker {
+        let dir = self.root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let windows = self.windows.to_string_lossy().into_owned();
+        let mut upstream = vec!["--windows", windows.as_str()];
+        if text {
+            upstream.push("--windows-text");
+        }
+        Broker::start_with(&dir, &upstream, ready_wait, &self.options(open, &[]))
+    }
+
+    fn opens(&self) -> Vec<Value> {
+        records(&self.opened)
+    }
+
+    fn closes(&self) -> Vec<Value> {
+        records(&self.closed)
+    }
+}
+
+/// The upstream's tools/call arguments for `tool`, as it received them.
+fn received(broker: &Broker, tool: &str) -> Vec<Value> {
+    broker
+        .records()
+        .into_iter()
+        .filter(|r| r["method"] == "tools/call" && r["params"]["name"] == tool)
+        .map(|r| r["params"]["arguments"].clone())
+        .collect()
+}
+
+fn is_error(answer: &Value) -> bool {
+    answer["result"]["isError"] == true
+}
+
+/// One control line to the broker, and its one-line answer.
+fn control(socket: &Path, line: Value) -> Value {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(40)))
+        .unwrap();
+    writeln!(stream, "{line}").unwrap();
+    let mut answer = String::new();
+    BufReader::new(stream).read_line(&mut answer).unwrap();
+    serde_json::from_str(&answer).unwrap_or_else(|_| panic!("{answer:?}"))
+}
+
+fn close_workspace(socket: &Path, root: &Path) -> Value {
+    control(
+        socket,
+        json!({"privateer_control": 1, "close_workspace": root}),
+    )
+}
+
+#[test]
+fn each_workspace_builds_in_its_own_window_and_a_foreign_tab_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    let b = ws.worktree("2", &["B.xcodeproj", "src"]);
+    ws.seed(json!([
+        {"tabIdentifier": "tab-a", "workspacePath": a.join("A.xcodeproj")},
+        {"tabIdentifier": "tab-b", "workspacePath": b.join("B.xcodeproj")},
+    ]));
+    let broker = ws.broker("one", &[], false, None);
+    let mut first = Client::connect_from(&broker.socket(), &a, 10);
+    // Below the checkout: the nearest .git ancestor inside the pool.
+    let mut second = Client::connect_from(&broker.socket(), &b.join("src"), 10);
+    first.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "BuildProject", "arguments": {}}}));
+    second.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "BuildProject"}}));
+    assert_eq!(text(&first.answer(json!(1))), "built in tab tab-a");
+    assert_eq!(text(&second.answer(json!(1))), "built in tab tab-b");
+    let mut tabs: Vec<Value> = received(&broker, "BuildProject")
+        .into_iter()
+        .map(|a| a["tabIdentifier"].clone())
+        .collect();
+    tabs.sort_by_key(|t| t.to_string());
+    assert_eq!(tabs, [json!("tab-a"), json!("tab-b")]);
+    // Another workspace's tab is refused and never forwarded; its own passes.
+    let refused = first.call(json!(2), "BuildProject", json!({"tabIdentifier": "tab-b"}));
+    assert!(is_error(&refused), "{refused}");
+    assert_eq!(
+        text(&refused),
+        "tabIdentifier tab-b is not this workspace's Xcode window; call XcodeListWindows"
+    );
+    let own = first.call(json!(3), "BuildProject", json!({"tabIdentifier": "tab-a"}));
+    assert_eq!(text(&own), "built in tab tab-a");
+    let to_b = received(&broker, "BuildProject")
+        .into_iter()
+        .filter(|a| a["tabIdentifier"] == "tab-b")
+        .count();
+    assert_eq!(to_b, 1, "only the second client's own call reached tab-b");
+    // Windows that were already open: nothing was opened, nothing recorded.
+    assert!(ws.opens().is_empty());
+    let state = broker.state();
+    let roots: Vec<&Value> = state["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| &c["root"])
+        .collect();
+    assert!(
+        roots.contains(&&json!(a)) && roots.contains(&&json!(b)),
+        "{state}"
+    );
+    assert_eq!(state["windows"], json!([]));
+}
+
+#[test]
+fn window_lists_are_filtered_to_the_clients_workspace_in_both_forms() {
+    for text_form in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = Workspaces::new(temp.path());
+        let a = ws.worktree("1", &["A.xcodeproj"]);
+        let b = ws.worktree("2", &["B.xcodeproj"]);
+        ws.seed(json!([
+            {"tabIdentifier": "tab-a", "workspacePath": a.join("A.xcodeproj")},
+            {"tabIdentifier": "tab-b", "workspacePath": b.join("B.xcodeproj")},
+            {"tabIdentifier": "tab-x", "workspacePath": ws.root.join("elsewhere/X.xcodeproj")},
+        ]));
+        let broker = ws.broker("one", &[], text_form, None);
+        let outside = ws.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let mut mine = Client::connect_from(&broker.socket(), &a, 10);
+        let mut stranger = Client::connect_from(&broker.socket(), &outside, 10);
+        let listed = mine.call(json!(1), "XcodeListWindows", json!({}));
+        let shown = listed.to_string();
+        assert!(shown.contains("tab-a"), "{shown}");
+        assert!(
+            !shown.contains("tab-b") && !shown.contains("tab-x"),
+            "{shown}"
+        );
+        if !text_form {
+            assert_eq!(
+                listed["result"]["structuredContent"]["windows"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let none = stranger.call(json!(1), "XcodeListWindows", json!({}));
+        let shown = none.to_string();
+        assert!(!is_error(&none), "{shown}");
+        assert!(!shown.contains("tab-"), "{shown}");
+    }
+}
+
+#[test]
+fn the_socket_peer_decides_the_workspace_never_the_hello() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    let b = ws.worktree("2", &["B.xcodeproj"]);
+    ws.seed(json!([
+        {"tabIdentifier": "tab-a", "workspacePath": a.join("A.xcodeproj")},
+        {"tabIdentifier": "tab-b", "workspacePath": b.join("B.xcodeproj")},
+    ]));
+    let broker = ws.broker("one", &[], false, None);
+    // A raw client in workspace a whose hello claims workspace b.
+    let script = r#"import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+f = s.makefile('rw')
+f.write(json.dumps({"privateer_proxy": 1, "cwd": sys.argv[2], "pid": 1}) + "\n")
+f.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "BuildProject", "arguments": {}}}) + "\n")
+f.flush()
+print(f.readline().strip())
+"#;
+    let out = support::command(support::python())
+        .args(["-I", "-c", script])
+        .arg(broker.socket())
+        .arg(&b)
+        .current_dir(&a)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let answer: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(text(&answer), "built in tab tab-a");
+    let log = fs::read_to_string(broker.dir.join("xcode.log")).unwrap();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("claims cwd") && l.contains("but its working directory is")),
+        "{log}"
+    );
+    // Outside every pool: window tools refused, window-free tools pass.
+    let outside = ws.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let mut stranger = Client::connect_from(&broker.socket(), &outside, 10);
+    let refused = stranger.call(json!(1), "BuildProject", json!({}));
+    assert!(is_error(&refused));
+    assert_eq!(
+        text(&refused),
+        "Xcode window tools work only from a Privateer task workspace"
+    );
+    let named = stranger.call(json!(2), "BuildProject", json!({"tabIdentifier": "tab-a"}));
+    assert!(is_error(&named), "{named}");
+    let docs = stranger.call(json!(3), "DocumentationSearch", json!({"query": "SwiftUI"}));
+    assert_eq!(text(&docs), "found SwiftUI");
+    assert_eq!(received(&broker, "BuildProject").len(), 1);
+    // The state file: the proxy's own pid, as the socket reports it.
+    let mut mine = Client::connect_from(&broker.socket(), &a, 10);
+    let pid = mine.child.id();
+    mine.initialize(json!(0));
+    let client = eventually(Duration::from_secs(10), "the client", || {
+        broker.state()["clients"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["pid"] == pid).cloned())
+    });
+    assert_eq!(client["peer_pid"], pid);
+    assert_eq!(client["root"], json!(a));
+    assert_eq!(client["peer_cwd"], json!(a));
+}
+
+#[test]
+fn path_arguments_stay_inside_the_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj", "src"]);
+    let b = ws.worktree("2", &[]);
+    ws.seed(json!([{"tabIdentifier": "tab-a", "workspacePath": a.join("A.xcodeproj")}]));
+    let broker = ws.broker("one", &[], false, None);
+    let mut client = Client::connect_from(&broker.socket(), &a, 10);
+    let outside = client.call(json!(1), "XcodeRead", json!({"filePath": b.join("README")}));
+    assert!(is_error(&outside), "{outside}");
+    assert!(
+        text(&outside).contains("lies outside this workspace"),
+        "{outside}"
+    );
+    let climbing = client.call(json!(2), "XcodeRead", json!({"filePath": "src/../../x"}));
+    assert!(is_error(&climbing), "{climbing}");
+    let inside = a.join("src/main.swift");
+    let ok = client.call(json!(3), "XcodeRead", json!({"filePath": inside}));
+    assert_eq!(text(&ok), format!("read {} in tab tab-a", inside.display()));
+    let forwarded = received(&broker, "XcodeRead");
+    assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+    assert_eq!(forwarded[0]["filePath"], json!(inside));
+}
+
+#[test]
+fn the_first_window_call_opens_the_workspace_window_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree(
+        "1",
+        &[
+            "App.xcodeproj/project.xcworkspace",
+            "App.xcworkspace",
+            "Pods/Pods.xcworkspace",
+            "DerivedData/Build.xcworkspace",
+            ".hidden/Hidden.xcworkspace",
+        ],
+    );
+    // The window shows a second after the open.
+    let broker = ws.broker("one", &["--delay", "1"], false, None);
+    let mut first = Client::connect_from(&broker.socket(), &a, 10);
+    let mut second = Client::connect_from(&broker.socket(), &a, 10);
+    for client in [&mut first, &mut second] {
+        client.send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "BuildProject", "arguments": {}}}));
+    }
+    assert_eq!(text(&first.answer(json!(1))), "built in tab tab-1");
+    assert_eq!(text(&second.answer(json!(1))), "built in tab tab-1");
+    let opens = ws.opens();
+    assert_eq!(opens.len(), 1, "{opens:?}");
+    let project = a.join("App.xcworkspace");
+    assert_eq!(
+        opens[0]["argv"].as_array().unwrap().last().unwrap(),
+        &json!(project)
+    );
+    assert_eq!(opens[0]["cwd"], "/");
+    let record: Value =
+        serde_json::from_slice(&fs::read(broker.dir.join("xcode.windows.json")).unwrap()).unwrap();
+    let windows = record["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1, "{record}");
+    assert_eq!(windows[0]["root"], json!(a));
+    assert_eq!(windows[0]["project"], json!(project));
+    assert_eq!(windows[0]["tab"], "tab-1");
+    assert_eq!(broker.state()["windows"][0]["tab"], "tab-1");
+
+    // Ambiguous: refused with the candidates; --project picks one, and a
+    // --project outside the workspace is refused.
+    let c = ws.worktree("3", &["X.xcodeproj", "Y.xcodeproj"]);
+    let mut unsure = Client::connect_from(&broker.socket(), &c, 10);
+    let refused = unsure.call(json!(1), "BuildProject", json!({}));
+    assert!(is_error(&refused), "{refused}");
+    assert!(
+        text(&refused).contains("X.xcodeproj, Y.xcodeproj"),
+        "{refused}"
+    );
+    let mut sure = Client::connect_with(&broker.socket(), &c, &["--project", "Y.xcodeproj"]);
+    assert_eq!(
+        text(&sure.call(json!(1), "BuildProject", json!({}))),
+        "built in tab tab-2"
+    );
+    assert_eq!(
+        ws.opens().last().unwrap()["argv"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        &json!(c.join("Y.xcodeproj"))
+    );
+    let d = ws.worktree("4", &["Z.xcodeproj"]);
+    let mut escaping = Client::connect_with(
+        &broker.socket(),
+        &d,
+        &["--project", "../../1/repo/App.xcworkspace"],
+    );
+    let refused = escaping.call(json!(1), "BuildProject", json!({}));
+    assert!(is_error(&refused), "{refused}");
+    assert!(text(&refused).contains("--project"), "{refused}");
+    assert_eq!(ws.opens().len(), 2);
+}
+
+#[test]
+fn a_window_that_never_shows_is_busy_and_a_failed_open_is_an_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    let never = ws.broker("never", &["--never"], false, Some(2));
+    let mut client = Client::connect_from(&never.socket(), &a, 10);
+    // Ready first, so the wait below is the window's alone.
+    assert_eq!(
+        text(&client.call(json!(1), "DocumentationSearch", json!({"query": "q"}))),
+        "found q"
+    );
+    let started = Instant::now();
+    let busy = client.call(json!(2), "BuildProject", json!({}));
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert_eq!(
+        text(&busy),
+        "Xcode tools busy: Xcode is opening this workspace's window; retry after 15 s"
+    );
+    assert_eq!(busy["result"]["_meta"]["privateer/retry_after_secs"], 15);
+    assert!(received(&never, "BuildProject").is_empty());
+    drop(never);
+
+    let failing = ws.broker("failing", &["--fail"], false, None);
+    let mut client = Client::connect_from(&failing.socket(), &a, 10);
+    let failed = client.call(json!(1), "BuildProject", json!({}));
+    assert!(is_error(&failed), "{failed}");
+    let shown = text(&failed);
+    assert!(
+        shown.starts_with("could not open this workspace's Xcode window:")
+            && shown.contains("LSOpenURLsWithRole")
+            && !shown.contains("second line"),
+        "{shown}"
+    );
+    assert!(received(&failing, "BuildProject").is_empty());
+}
+
+#[test]
+fn a_released_workspace_closes_only_the_windows_the_broker_opened() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    let b = ws.worktree("2", &["B.xcodeproj"]);
+    // b's window was open already: the broker never closes it.
+    ws.seed(json!([{"tabIdentifier": "tab-b", "workspacePath": b.join("B.xcodeproj")}]));
+    let mut broker = ws.broker("one", &[], false, None);
+    let mut client = Client::connect_from(&broker.socket(), &a, 10);
+    assert_eq!(
+        text(&client.call(json!(1), "BuildProject", json!({}))),
+        "built in tab tab-1"
+    );
+    let project = a.join("A.xcodeproj");
+    assert_eq!(
+        close_workspace(&broker.socket(), &a),
+        json!({"closed": [project]})
+    );
+    let closes = ws.closes();
+    assert_eq!(closes.len(), 1);
+    assert_eq!(
+        closes[0]["argv"].as_array().unwrap().last().unwrap(),
+        &json!(project)
+    );
+    let open: Vec<Value> = ws
+        .listed()
+        .into_iter()
+        .map(|w| w["tabIdentifier"].clone())
+        .collect();
+    assert_eq!(open, [json!("tab-b")]);
+    assert_eq!(broker.state()["windows"], json!([]));
+    assert_eq!(close_workspace(&broker.socket(), &b), json!({"closed": []}));
+    assert_eq!(ws.listed().len(), 1, "b's own window is untouched");
+    assert_eq!(ws.closes().len(), 1);
+    // A malformed control line gets an error, not a close.
+    let bad = control(
+        &broker.socket(),
+        json!({"privateer_control": 1, "close_workspace": "relative"}),
+    );
+    assert!(bad["error"].is_string(), "{bad}");
+    // Opened again, then the broker restarts: the new one still closes it.
+    assert_eq!(
+        text(&client.call(json!(2), "BuildProject", json!({}))),
+        "built in tab tab-1"
+    );
+    drop(client);
+    broker.stop();
+    let restarted = ws.broker("one", &[], false, None);
+    assert_eq!(restarted.state()["windows"][0]["project"], json!(project));
+    assert_eq!(
+        close_workspace(&restarted.socket(), &a),
+        json!({"closed": [project]})
+    );
+    assert_eq!(ws.closes().len(), 2);
+    assert_eq!(ws.listed().len(), 1);
+}
+
+#[test]
+fn a_changed_tool_list_refreshes_which_tools_are_window_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(temp.path());
+    let a = ws.worktree("1", &["A.xcodeproj"]);
+    ws.seed(json!([{"tabIdentifier": "tab-a", "workspacePath": a.join("A.xcodeproj")}]));
+    let broker = ws.broker("one", &[], false, None);
+    let mut client = Client::connect_from(&broker.socket(), &a, 10);
+    assert_eq!(
+        text(&client.call(json!(1), "XcodeGrep", json!({"pattern": "x"}))),
+        "grep in tab None"
+    );
+    assert_eq!(
+        text(&client.call(json!(2), "retool", json!({}))),
+        "retooled"
+    );
+    assert_eq!(
+        text(&client.call(json!(3), "XcodeGrep", json!({"pattern": "x"}))),
+        "grep in tab tab-a"
+    );
+    // The broker's own tools/list went upstream under its own ids, at least
+    // once before and once after; the client was never answered for them.
+    let lists = broker
+        .records()
+        .into_iter()
+        .filter(|r| r["method"] == "tools/list")
+        .count();
+    assert!(lists >= 2, "{lists}");
+    let stray = client.lines.try_iter().collect::<Vec<_>>();
+    assert!(
+        stray
+            .iter()
+            .all(|m| m["method"] == "notifications/tools/list_changed"),
+        "{stray:?}"
+    );
+}
+
+#[test]
+fn install_pins_the_workspace_pools_and_window_helpers() {
+    let temp = tempfile::tempdir().unwrap();
+    let machine = Machine {
+        root: temp.path().to_path_buf(),
+    };
+    let here = temp.path();
+    let extra = fs::canonicalize(temp.path())
+        .unwrap()
+        .join("more-workspaces");
+    fs::create_dir_all(&extra).unwrap();
+    let open = r#"["/usr/bin/true","open"]"#;
+    let close = r#"["/usr/bin/true","close"]"#;
+    let installed = machine.run(
+        here,
+        &[
+            "mcp-broker",
+            "install",
+            "--workspace-pool",
+            extra.to_str().unwrap(),
+            "--window-open",
+            open,
+            "--window-close",
+            close,
+        ],
+    );
+    let bytes = fs::read(machine.dir().join("xcode.json")).unwrap();
+    let config: Value = serde_json::from_slice(&bytes).unwrap();
+    let own_pool = fs::canonicalize(machine.ledger().join("worktrees")).unwrap();
+    assert_eq!(config["workspace_pools"], json!([own_pool, extra]));
+    assert_eq!(config["window_open"], json!(["/usr/bin/true", "open"]));
+    assert_eq!(config["window_close"], json!(["/usr/bin/true", "close"]));
+    assert_eq!(installed["workspace_pools"], config["workspace_pools"]);
+    // The pin covers them: it is the hash of exactly these bytes.
+    let pin = fs::read_to_string(
+        machine
+            .root
+            .join("data/privateer/mcp-broker/xcode.json.sha256"),
+    )
+    .unwrap();
+    assert_eq!(pin.trim(), {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&bytes))
+    });
+    // Refused: relative, non-normalized or shell helpers, and relative,
+    // non-normalized or missing pools. Nothing is rewritten.
+    let not_dir = extra.join("missing");
+    let dotted = format!("{}/./x", extra.display());
+    for args in [
+        vec!["--window-open", r#"["bin/open"]"#],
+        vec!["--window-open", r#"["/usr/bin/../bin/open"]"#],
+        vec!["--window-close", r#"["/bin/sh","-c","true"]"#],
+        vec!["--window-close", r#"["/usr/bin/env","osascript"]"#],
+        vec!["--window-open", "/usr/bin/open"],
+        vec!["--workspace-pool", "workspaces"],
+        vec!["--workspace-pool", dotted.as_str()],
+        vec!["--workspace-pool", not_dir.to_str().unwrap()],
+    ] {
+        let mut all = vec!["mcp-broker", "install"];
+        all.extend(&args);
+        let out = machine.command(here, &all).output().unwrap();
+        assert!(!out.status.success(), "{args:?} was accepted");
+    }
+    assert_eq!(fs::read(machine.dir().join("xcode.json")).unwrap(), bytes);
 }

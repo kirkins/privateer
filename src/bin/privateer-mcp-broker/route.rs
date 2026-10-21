@@ -57,50 +57,44 @@ pub fn workspace_root(cwd: &Path, pools: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// The windows an XcodeListWindows result names, as (tab, workspace path).
-/// It reads `structuredContent.windows[{tabIdentifier, workspacePath}]` and
-/// text lines that carry `tabIdentifier: X` and `workspacePath: Y`. The real
-/// shape is only known on a Mac, so all the parsing is here.
+/// It reads `structuredContent.windows[{tabIdentifier, workspacePath}]`, the
+/// same JSON as a text item, and text lines that carry `tabIdentifier: X`
+/// and `workspacePath: Y`. The real shape is only known on a Mac, so all the
+/// parsing is here and in `filter_windows`, which shares its pieces.
 pub fn windows(result: &Value) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = vec![];
-    let structured = result
-        .pointer("/structuredContent/windows")
-        .and_then(Value::as_array);
-    for window in structured.into_iter().flatten() {
-        if let (Some(tab), Some(path)) = (
-            window.get(TAB).and_then(Value::as_str),
-            window.get("workspacePath").and_then(Value::as_str),
-        ) {
-            found.push((tab.to_owned(), path.to_owned()));
+    let mut add = |window: (String, String)| {
+        if !found.contains(&window) {
+            found.push(window);
         }
+    };
+    if let Some(list) = result.get("structuredContent").and_then(window_list) {
+        list.iter().filter_map(window_entry).for_each(&mut add);
     }
     for text in texts(result) {
-        for line in text.lines() {
-            if let Some(window) = window_line(line) {
-                if !found.contains(&window) {
-                    found.push(window);
-                }
-            }
+        match serde_json::from_str::<Value>(text) {
+            Ok(json) if window_list(&json).is_some() => window_list(&json)
+                .into_iter()
+                .flatten()
+                .filter_map(window_entry)
+                .for_each(&mut add),
+            _ => text.lines().filter_map(window_line).for_each(&mut add),
         }
     }
     found
 }
 
-/// Keep only the windows `keep` accepts, in both forms of the result. Text
+/// Keep only the windows `keep` accepts, in every form of the result. Text
 /// lines that name no window stay.
 pub fn filter_windows(result: &mut Value, keep: impl Fn(&str, &str) -> bool) {
+    let retain = |list: &mut Vec<Value>| {
+        list.retain(|window| window_entry(window).is_some_and(|(tab, path)| keep(&tab, &path)))
+    };
     if let Some(list) = result
-        .pointer_mut("/structuredContent/windows")
-        .and_then(Value::as_array_mut)
+        .get_mut("structuredContent")
+        .and_then(window_list_mut)
     {
-        list.retain(|window| {
-            match (
-                window.get(TAB).and_then(Value::as_str),
-                window.get("workspacePath").and_then(Value::as_str),
-            ) {
-                (Some(tab), Some(path)) => keep(tab, path),
-                _ => false,
-            }
-        });
+        retain(list);
     }
     if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
         for item in content {
@@ -110,13 +104,45 @@ pub fn filter_windows(result: &mut Value, keep: impl Fn(&str, &str) -> bool) {
             let Some(text) = item.get("text").and_then(Value::as_str) else {
                 continue;
             };
-            let kept: Vec<&str> = text
-                .lines()
-                .filter(|line| window_line(line).is_none_or(|(tab, path)| keep(&tab, &path)))
-                .collect();
-            item["text"] = Value::String(kept.join("\n"));
+            let filtered = match serde_json::from_str::<Value>(text) {
+                Ok(mut json) if window_list(&json).is_some() => {
+                    if let Some(list) = window_list_mut(&mut json) {
+                        retain(list);
+                    }
+                    json.to_string()
+                }
+                _ => text
+                    .lines()
+                    .filter(|line| window_line(line).is_none_or(|(tab, path)| keep(&tab, &path)))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            item["text"] = Value::String(filtered);
         }
     }
+}
+
+/// The window list in a JSON value: its `windows` array, or the value itself
+/// when it is an array.
+fn window_list(value: &Value) -> Option<&Vec<Value>> {
+    value
+        .get("windows")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+}
+
+fn window_list_mut(value: &mut Value) -> Option<&mut Vec<Value>> {
+    if value.get("windows").is_some_and(Value::is_array) {
+        return value.get_mut("windows").and_then(Value::as_array_mut);
+    }
+    value.as_array_mut()
+}
+
+fn window_entry(window: &Value) -> Option<(String, String)> {
+    Some((
+        window.get(TAB)?.as_str()?.to_owned(),
+        window.get("workspacePath")?.as_str()?.to_owned(),
+    ))
 }
 
 fn texts(result: &Value) -> impl Iterator<Item = &str> {
@@ -337,9 +363,10 @@ mod tests {
                 {"tabIdentifier": "t1", "workspacePath": "/w/a/A.xcodeproj"},
                 {"tabIdentifier": "t2", "workspacePath": "/w/b/B.xcodeproj"}]},
             "content": [{"type": "text", "text":
-                "Windows:\n* tabIdentifier: t3, workspacePath: /w/a/C.xcworkspace\n* tabIdentifier: t4, workspacePath: /w/b/D.xcodeproj"}]});
+                "Windows:\n* tabIdentifier: t3, workspacePath: /w/a/C.xcworkspace\n* tabIdentifier: t4, workspacePath: /w/b/D.xcodeproj"},
+                {"type": "text", "text": "{\"windows\":[{\"tabIdentifier\":\"t5\",\"workspacePath\":\"/w/b/E\"}]}"}]});
         let all = windows(&result);
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         assert!(all.contains(&("t3".into(), "/w/a/C.xcworkspace".into())));
         filter_windows(&mut result, |_, path| path.starts_with("/w/a/"));
         let kept = windows(&result);
