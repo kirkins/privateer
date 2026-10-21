@@ -202,7 +202,12 @@ impl Store {
               kind TEXT NOT NULL,payload TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS audit_time ON audit(time_ms,seq);
             CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),
-              artifact TEXT NOT NULL,environment TEXT NOT NULL,charter_hash TEXT NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);")?;
+              artifact TEXT NOT NULL,environment TEXT NOT NULL,charter_hash TEXT NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS captain_approvals(id TEXT PRIMARY KEY,ship TEXT NOT NULL,
+              task_id TEXT NOT NULL REFERENCES tasks(id),request_id TEXT NOT NULL,reply_id TEXT NOT NULL UNIQUE,
+              action TEXT NOT NULL,command_prefix TEXT,created_ms INTEGER NOT NULL,expires_ms INTEGER NOT NULL,
+              revoked_ms INTEGER,source TEXT NOT NULL CHECK(source IN ('reply','option')));
+            CREATE INDEX IF NOT EXISTS captain_approvals_ship ON captain_approvals(ship,expires_ms);")?;
         // Columns added after 0.1.0. Check and add them under the write lock
         // so concurrent opens cannot both add one.
         let migrate = rusqlite::Transaction::new_unchecked(

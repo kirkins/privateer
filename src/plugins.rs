@@ -161,6 +161,16 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
                 request["context"]["tool_bundles"] = plan;
             }
             request["context"]["tool_permissions"] = crate::permissions::for_store(store)?;
+            // The captain's live approvals reach a first mate's launch only,
+            // never a crew's, a reviewer's or an errand's.
+            if role == "first_mate"
+                && !is_errand
+                && let Some(owner) = context["owner"].as_str()
+            {
+                request["context"]["tool_permissions"]["approved"] = json!(
+                    crate::captain_approvals::sentences(store, owner, Store::now_ms())?
+                );
+            }
             if let Some(path) = config {
                 request["config_path"] = json!(path);
             }

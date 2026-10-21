@@ -1,5 +1,6 @@
 """Translate the captain's launch policy; never edit native/global settings."""
 import os
+import sys
 
 
 class UnsupportedYolo(ValueError):
@@ -21,6 +22,14 @@ def policy(value=None):
             not isinstance(statements, list) or any(not isinstance(t, str) for t in statements)
             for statements in authorized.values()):
         raise ValueError("invalid fleet authorizations")
+    approved = value.get("approved", [])
+    if not isinstance(approved, list):
+        raise ValueError("invalid captain approvals")
+    # One bad sentence must never stop a launch: drop it and say so.
+    kept = [t for t in approved if isinstance(t, str) and t and len(t) <= 600][:8]
+    if len(kept) != len(approved):
+        print(f"privateer: dropped {len(approved) - len(kept)} invalid captain approval(s)", file=sys.stderr)
+        value = {**value, "approved": kept}
     if "forges" in value:
         forges = value["forges"]
         if not isinstance(forges, dict):
@@ -122,12 +131,14 @@ def charter_rules(actions, forge=None, role=None, errand=False, policy_value=Non
     return list(dict.fromkeys(rules))
 
 
-def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship=None, authorized=()):
+def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship=None, authorized=(),
+                              approved=()):
     """Tell Claude's auto-mode classifier what the captain already authorized.
 
     The classifier trusts settings, not what an agent reads in mail or notes,
-    so a captain's standing grant must reach it here or it is asked again."""
-    if role in ("crew", "reviewer") or errand or not (actions or authorized):
+    so a captain's standing grant must reach it here or it is asked again.
+    The captain's expiring approvals (`approved`) widen allow only."""
+    if role in ("crew", "reviewer") or errand or not (actions or authorized or approved):
         return None
     allow = ["$defaults"]
     if "merge_green" in (actions or []):
@@ -136,6 +147,7 @@ def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship
     if "publish_pr" in (actions or []):
         allow.append("Creating and publishing pull requests is authorized by the ship's charter (publish_pr).")
     allow += [f"The captain has authorized this: {text}" for text in authorized]
+    allow += list(approved)
     env = ["$defaults"]
     if actions:
         env.append(f"Charter actions granted: {', '.join(sorted(actions))}.")
@@ -258,7 +270,8 @@ def attended_argv(harness, argv, value):
         # An attended Claude session is the ship's first mate.
         extra += ["--disallowedTools", *claude_disallowed("first_mate")]
         auto_settings = claude_auto_mode_settings(actions, forge=forge, role="first_mate", ship=ship,
-                                                  authorized=authorized_for(value, ship))
+                                                  authorized=authorized_for(value, ship),
+                                                  approved=value.get("approved", []))
         if auto_settings:
             settings_idx = None
             for idx, arg in enumerate(prefix):

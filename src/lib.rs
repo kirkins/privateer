@@ -8,6 +8,7 @@ mod block_ask;
 mod bundled;
 pub mod capabilities;
 pub mod captain;
+mod captain_approvals;
 mod claude_denials;
 pub mod cli;
 pub mod context;
@@ -111,6 +112,7 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "captain.reply",
     "captain.dismiss",
     "captain.send",
+    "captain_approval.revoke",
     "session.read",
     "session.send",
     "captain.feed",
@@ -190,6 +192,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "grant" => grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
+        "captain_approval" => captain_approvals::dispatch(store, command, args),
         "session" => session::dispatch(store, command, args),
         "report" => report::dispatch(store, command, args),
         "file" => files::dispatch(store, command, args),
