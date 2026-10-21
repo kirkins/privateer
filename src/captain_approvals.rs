@@ -122,6 +122,8 @@ const YES_WORDS: &[&str] = &[
     "lgtm", "ship", "do", "fine", "good",
 ];
 const NOT_PLAIN: &str = "reply was not a plain yes; ask again with a decision";
+const PICTURED: &str =
+    "reply carries a symbol or emoji, so nothing was approved; ask again with a decision";
 
 /// One line of text within `max` characters, trimmed, with no control
 /// characters. Errors name the field, never the value.
@@ -404,27 +406,96 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a reply that passed `hedged` is a plain yes: every word is a
-/// plain word or one of `own` (the words of what it answers), and one is a
-/// yes word unless `yes_needed` is false or all of them are `own`. Anything
-/// else ("after CI", "for staging", "show me the diff") is not a yes.
-fn plain(text: &str, own: &[String], yes_needed: bool) -> bool {
-    let words = words(text);
-    let own_word = |w: &String| own.contains(w);
-    words
+/// Words that narrow or condition what they follow ("to staging", "after
+/// CI"), so a reply may hold one only by retyping the whole action.
+const SCOPE_WORDS: &[&str] = &[
+    "for", "to", "on", "in", "at", "into", "onto", "from", "via", "with", "without", "after",
+    "before", "when", "once", "while", "and", "or", "then", "plus", "also", "of", "by",
+];
+
+/// The words of `text` that are not plain words.
+fn unplain(text: &str) -> Vec<String> {
+    words(text)
+        .into_iter()
+        .filter(|w| !PLAIN_WORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Whether a free-text reply that passed `hedged` is a plain yes to
+/// `action`. Past its plain words, the reply is nothing (and then holds a yes
+/// word), the action's own words retyped in full, or a leading run of them
+/// with no scope word: "Deploy build 55" approves "Deploy build 55 to staging
+/// and prod", while "deploy to staging" and "staging ok" narrow it and
+/// approve nothing.
+fn plain_yes(text: &str, action: &str) -> bool {
+    let rest = unplain(text);
+    let own = unplain(action);
+    if rest.is_empty() {
+        return words(text).iter().any(|w| YES_WORDS.contains(&w.as_str()));
+    }
+    rest == own
+        || (own.starts_with(&rest) && !rest.iter().any(|w| SCOPE_WORDS.contains(&w.as_str())))
+}
+
+/// Whether the text sent with a chosen approving option holds only plain
+/// words and the option's own label words; the tap is the yes, so even the
+/// action's words would only narrow it.
+fn plain_beside(text: &str, label: &str) -> bool {
+    let own = words(label);
+    words(text)
         .iter()
-        .all(|w| PLAIN_WORDS.contains(&w.as_str()) || own_word(w))
-        && (!yes_needed
-            || words.iter().any(|w| YES_WORDS.contains(&w.as_str()))
-            || words.iter().all(own_word))
+        .all(|w| PLAIN_WORDS.contains(&w.as_str()) || own.contains(w))
+}
+
+/// Question marks in any script, each a refusal like "?".
+const QUESTION_MARKS: &[char] = &[
+    '?',
+    '\u{ff1f}',
+    '\u{fe56}',
+    '\u{fe16}',
+    '\u{bf}',
+    '\u{2047}',
+    '\u{2048}',
+    '\u{2049}',
+    '\u{203d}',
+    '\u{2e18}',
+    '\u{2e2e}',
+    '\u{61f}',
+    '\u{37e}',
+    '\u{55e}',
+    '\u{1367}',
+    '\u{1945}',
+    '\u{a60f}',
+    '\u{11143}',
+    '\u{2753}',
+    '\u{2754}',
+];
+
+/// Whether `c` sits in a Unicode symbol or pictograph range, where a thumb,
+/// a cross or a check mark beside a word could reverse it.
+fn pictograph(c: char) -> bool {
+    matches!(u32::from(c),
+        0xa9 | 0xae | 0x200d | 0x203c | 0x20e3 | 0x3030 | 0x303d
+        | 0x2100..=0x214f
+        | 0x2190..=0x2bff
+        | 0x3200..=0x32ff
+        | 0xfe00..=0xfe0f
+        | 0x1f000..=0x1fbff
+        | 0xe0020..=0xe007f)
+}
+
+/// Whether the reply holds a symbol or pictograph, which leaves it no plain
+/// yes whatever words sit beside it.
+fn pictured(text: &str) -> bool {
+    text.chars().any(pictograph)
 }
 
 /// Whether the reply text holds a word that makes it something other than a
 /// plain yes. A false no costs the captain one more ask; a false yes grants
 /// what they did not, so this errs toward no.
 fn hedged(text: &str) -> Option<String> {
-    if text.contains('?') {
-        return Some("?".into());
+    if let Some(mark) = text.chars().find(|c| QUESTION_MARKS.contains(c)) {
+        return Some(mark.to_string());
     }
     let words = words(text);
     REFUSALS
@@ -504,14 +575,15 @@ pub(crate) fn record(
             if !worded(&text) {
                 return skip("reply had no words; ask again with a decision");
             }
+            if pictured(&text) {
+                return skip(PICTURED);
+            }
             if let Some(word) = hedged(&text) {
                 return skip(&format!(
                     "the captain's words carry \"{word}\", so nothing was approved; ask again"
                 ));
             }
-            let mut own = words(approves["action"].as_str().unwrap_or_default());
-            own.extend(words(option["label"].as_str().unwrap_or_default()));
-            if !plain(&text, &own, false) {
+            if !plain_beside(&text, option["label"].as_str().unwrap_or_default()) {
                 return skip(NOT_PLAIN);
             }
         }
@@ -523,16 +595,15 @@ pub(crate) fn record(
         if !worded(&text) {
             return skip("reply had no words; ask again with a decision");
         }
+        if pictured(&text) {
+            return skip(PICTURED);
+        }
         if let Some(word) = hedged(&text) {
             return skip(&format!(
                 "the captain's reply carries \"{word}\", so it is not a plain yes and nothing was approved; ask again with a decision"
             ));
         }
-        if !plain(
-            &text,
-            &words(approves["action"].as_str().unwrap_or_default()),
-            true,
-        ) {
+        if !plain_yes(&text, approves["action"].as_str().unwrap_or_default()) {
             return skip(NOT_PLAIN);
         }
         "reply"
@@ -829,7 +900,7 @@ mod tests {
 
     #[test]
     fn a_reply_is_plain_only_in_yes_words_or_the_actions_own() {
-        let own = words("Submit build 55 to TestFlight");
+        let submit = "Submit build 55 to TestFlight";
         for yes in [
             "Submit build 55",
             "yes",
@@ -839,10 +910,11 @@ mod tests {
             "lgtm",
             "yes please",
             "ok, submit it",
+            "submit it",
             "Y",
             "K",
         ] {
-            assert!(plain(yes, &own, true), "{yes}");
+            assert!(plain_yes(yes, submit), "{yes}");
         }
         for loose in [
             "n",
@@ -864,18 +936,100 @@ mod tests {
             "hang on",
             "thanks",
             "please",
-            "submit it",
+            "TestFlight build 55",
         ] {
-            assert!(!plain(loose, &own, true), "{loose}");
+            assert!(!plain_yes(loose, submit), "{loose}");
         }
-        // Beside a chosen option, the option itself is the yes.
-        assert!(plain("thanks", &own, false));
-        assert!(!plain("after CI", &own, false));
         for dont in ["Don‘t", "Don`t", "Donʼt", "Don’t", "DON'T"] {
             assert_eq!(words(dont), ["don't"], "{dont}");
             assert_eq!(hedged(dont).as_deref(), Some("don't"), "{dont}");
         }
         assert_eq!(words("'ok', ship it!"), ["ok", "ship", "it"]);
+    }
+
+    #[test]
+    fn a_reply_that_narrows_the_action_is_no_yes() {
+        let deploy = "Deploy build 55 to staging and prod";
+        for narrow in [
+            "yes for staging",
+            "yes to staging",
+            "staging ok",
+            "deploy to staging",
+            "deploy build 55 to staging",
+            "build 55",
+            "deploy prod",
+        ] {
+            assert!(!plain_yes(narrow, deploy), "{narrow}");
+        }
+        for yes in [
+            "Deploy build 55",
+            "Deploy build 55 to staging and prod",
+            "deploy build 55 to staging and prod, thanks",
+            "yes",
+            "ok deploy",
+        ] {
+            assert!(plain_yes(yes, deploy), "{yes}");
+        }
+        // Deliberate: naming only the head of a multi-part action approves
+        // all of it, as the captain's own "Submit build 55" did.
+        assert!(plain_yes(
+            "merge PR 340",
+            "Merge PR 340 and deploy to staging"
+        ));
+    }
+
+    #[test]
+    fn beside_a_chosen_option_only_plain_and_label_words_pass() {
+        for ok in ["thanks", "Ship it", "yes, ship it now"] {
+            assert!(plain_beside(ok, "Ship it"), "{ok}");
+        }
+        for loose in ["after CI", "Submit build 55", "for staging", "staging"] {
+            assert!(!plain_beside(loose, "Ship it"), "{loose}");
+        }
+    }
+
+    #[test]
+    fn any_question_mark_or_pictograph_is_no_yes() {
+        for asked in [
+            "ok?",
+            "ok？",
+            "ok¿",
+            "¿ok",
+            "ok⁇",
+            "ok⁈",
+            "ok⁉",
+            "ok؟",
+            "ok‽",
+            "ok﹖",
+            "ok\u{37e}",
+            "ok❓",
+        ] {
+            assert!(hedged(asked).is_some(), "{asked}");
+        }
+        for shown in [
+            "👎 yes",
+            "yes 👍",
+            "ok ❌",
+            "✋ go",
+            "yes ✔",
+            "ok ☹",
+            "go →",
+            "yes ⚠️",
+            "ok 🛑",
+            "yes ™",
+        ] {
+            assert!(worded(shown) && pictured(shown), "{shown}");
+        }
+        for plain in [
+            "yes",
+            "Submit build 55",
+            "ok, go ahead!",
+            "Don't",
+            "déployer",
+            "はい",
+        ] {
+            assert!(!pictured(plain), "{plain}");
+        }
     }
 
     #[test]
