@@ -1220,6 +1220,104 @@ fn an_approved_head_merges_through_pr_merge() {
 }
 
 #[test]
+fn pr_merge_uses_up_a_production_approval_and_refuses_another_ships_or_tasks_review() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 41 }\n")],
+        "Fix",
+    );
+    f.pr(41, &head, "feature");
+    let row = f.review(41, APPROVE, json!({}));
+    assert_eq!(row["post_state"], "posted", "{row}");
+    let id = row["id"].as_str().unwrap().to_owned();
+    // Another task of the same ship may not merge on this review.
+    f.json(
+        None,
+        "task.create",
+        json!({"id":"other","charter_id":"engineering","owner":"engineering","title":"Other"}),
+    );
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "other", "pr": 41}),
+    );
+    assert!(
+        refused.contains(&format!(
+            "its review {id} was asked by engineering for task fix, not by engineering for other"
+        )),
+        "{refused}"
+    );
+    // Nor may a review recorded for another ship count.
+    let db = rusqlite::Connection::open(f.home().join("privateer.sqlite")).unwrap();
+    db.execute("UPDATE reviews SET ship='marketing' WHERE id=?1", [&id])
+        .unwrap();
+    let refused = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 41}),
+    );
+    assert!(
+        refused.contains("was asked by marketing for task fix, not by engineering for fix"),
+        "{refused}"
+    );
+    db.execute("UPDATE reviews SET ship='engineering' WHERE id=?1", [&id])
+        .unwrap();
+    // A merge that deploys needs an approval of this exact head and
+    // environment: none, another head's, or another environment's refuse.
+    let production = json!({"task_id": "fix", "pr": 41, "deploys_production": true,
+        "environment": "production"});
+    let refused = f.refused(Some("engineering"), "pr.merge", production.clone());
+    assert!(
+        refused.contains("production requires approval of this exact artifact and environment"),
+        "{refused}"
+    );
+    for (approval, artifact, environment) in [
+        ("other-head", "0".repeat(40), "production"),
+        ("staging", head.clone(), "staging"),
+        ("deploy-41", head.clone(), "production"),
+    ] {
+        f.json(
+            None,
+            "approval.grant",
+            json!({"id": approval, "task_id": "fix", "artifact": artifact,
+                "environment": environment, "approver": "captain"}),
+        );
+    }
+    assert!(ops_of(&f, "pr.merge").is_empty());
+    let merged = f.json(Some("engineering"), "pr.merge", production.clone());
+    assert_eq!(merged["merged"], true, "{merged}");
+    assert!(
+        merged["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["check"] == "production" && c["approval"] == "deploy-41"),
+        "{merged}"
+    );
+    // The merge used the approval up; the others are untouched.
+    assert!(f.consumed("deploy-41"));
+    assert!(!f.consumed("other-head"));
+    assert!(!f.consumed("staging"));
+    let again = f
+        .command(
+            None,
+            &[
+                "approval.consume",
+                "--json",
+                &json!({"id": "deploy-41", "task_id": "fix", "artifact": head,
+                    "environment": "production"})
+                .to_string(),
+            ],
+        )
+        .output()
+        .unwrap();
+    assert!(!again.status.success());
+    assert_eq!(ops_of(&f, "pr.merge").len(), 1);
+}
+
+#[test]
 fn a_lost_merge_reply_is_settled_by_reading_the_pr_again() {
     let f = Fleet::new();
     f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
