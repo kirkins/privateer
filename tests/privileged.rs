@@ -549,8 +549,10 @@ fn staging_refuses_each_class_of_command() {
     refused(&|a| a["cwd"] = json!(link.join(".")), "symlink");
     let named = own_folder("sudoers.d");
     refused(&|a| a["cwd"] = json!(named), "naming sudoers");
-    if Path::new("/etc/sudoers.d").is_dir() {
-        refused(&|a| a["cwd"] = json!("/etc/sudoers.d"), "naming sudoers");
+    // The canonical path: on macOS /etc is a symlink to /private/etc, which is
+    // refused as a symlink before the name is looked at.
+    if let Ok(sudoers) = fs::canonicalize("/etc/sudoers.d") {
+        refused(&|a| a["cwd"] = json!(sudoers), "naming sudoers");
     }
     if uid() != 0 {
         let mine = own_folder("mine");
