@@ -1149,10 +1149,12 @@ fn carried(store: &Store, ship: &str, scope: &str, job_id: Option<&str>) -> Resu
 }
 
 /// The exact step a block card offers to approve: "Run" and its refused
-/// commands, and, for one command a prefix can match, that command's words
-/// as the prefix. None when the card shows any command less than whole
-/// (clipped, cut at a heredoc, flattened or masked), so the captain never
-/// approves what they did not see, or when the step would not pass as a
+/// commands, and, for one command, its words as the prefix. None when the
+/// card shows any command less than whole (clipped, cut at a heredoc,
+/// flattened or masked), so the captain never approves what they did not
+/// see; when any command is more than one simple command or its words would
+/// not pass as a prefix, so a quoted or wrapped program or an interpreter's
+/// inline code is never one tap away; or when the step would not pass as a
 /// ship's own `approves` would.
 fn step(
     store: &Store,
@@ -1174,17 +1176,19 @@ fn step(
     {
         return None;
     }
-    let prefix = match heads {
-        [Some(head)] => {
-            let prefix = head.join(" ");
-            if prefix.chars().count() > MAX_PREFIX_CHARS
-                || check_prefix(&prefix).is_err()
-                || lint(store, ship, "the prefix", &prefix).is_err()
-            {
-                return None;
-            }
-            Some(prefix)
+    let mut prefixes = vec![];
+    for head in heads {
+        let prefix = head.as_ref()?.join(" ");
+        if prefix.chars().count() > MAX_PREFIX_CHARS
+            || check_prefix(&prefix).is_err()
+            || lint(store, ship, "the prefix", &prefix).is_err()
+        {
+            return None;
         }
+        prefixes.push(prefix);
+    }
+    let prefix = match prefixes.as_slice() {
+        [one] => Some(one.clone()),
         _ => None,
     };
     Some((action, prefix))
@@ -2041,5 +2045,110 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Only the captain's own tap on a block card, in the home holding the
+    /// ask, records or reuses an approval, and only one given within 24 h.
+    #[test]
+    fn a_block_cards_tap_approves_only_from_the_captain_and_within_24_hours() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"main","charter_id":"project","owner":"apps","title":"Deliver"}),
+        )
+        .unwrap();
+        let now = Store::now_ms();
+        for (id, created_ms) in [
+            ("approval-old", now - 25 * 3_600_000),
+            ("approval-new", now - 3_600_000),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+                       command_prefix,created_ms,expires_ms,source)
+                     VALUES(?1,'apps','main','q-'||?1,'r-'||?1,'Run make release','make release',?2,?3,'reply')",
+                    params![id, created_ms, now + 3_600_000],
+                )
+                .unwrap();
+        }
+        let ask = json!({"id": "ask-1", "from": "apps", "kind": "decision", "task_id": "main",
+            "state": "open", "payload": {"type": "tool_permission", "block": {
+                "approve": {"action": "Run `make release`", "command_prefix": "make release"},
+                "approvals": ["approval-old", "approval-new"]},
+            "decision": {"options": [
+                {"id": "as_approved_1", "label": "As approved: Run make release"},
+                {"id": "as_approved_2", "label": "As approved: Run make release"},
+                {"id": "approve", "label": "Approve for 24 h: Run `make release`"}]}}});
+        let tap = |reply: &str, option: &str, extra: Value| {
+            let mut payload = json!({"answer": {"option_id": option}});
+            payload.as_object_mut().unwrap().extend(
+                extra
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            record(&store, &ask, reply, "", &payload, now)
+                .unwrap()
+                .unwrap()
+        };
+        let count = || -> i64 {
+            store
+                .connection()
+                .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
+                .unwrap()
+        };
+        for (reply, option, extra) in [
+            ("reply-1", "approve", json!({})),
+            ("reply-2", "approve", json!({"operator": false})),
+            (
+                "reply-3",
+                "approve",
+                json!({"operator": true, "fanned_from": "reply-0"}),
+            ),
+            (
+                "reply-4",
+                "as_approved_2",
+                json!({"fanned_from": "reply-0"}),
+            ),
+        ] {
+            let outcome = tap(reply, option, extra);
+            assert_eq!(outcome["recorded"], false, "{reply}: {outcome}");
+            assert!(
+                outcome["why"]
+                    .as_str()
+                    .unwrap()
+                    .contains("only the captain's own reply approves"),
+                "{reply}: {outcome}"
+            );
+        }
+        assert_eq!(count(), 2);
+        // Still live, but given 25 h ago: asked again, not reused.
+        let old = tap("reply-5", "as_approved_1", json!({"operator": true}));
+        assert_eq!(old["recorded"], false, "{old}");
+        assert!(old.get("covered_by").is_none(), "{old}");
+        assert!(
+            old["why"].as_str().unwrap().contains("older than 24 h"),
+            "{old}"
+        );
+        // Given an hour ago, it is reused; nothing new is recorded.
+        let new = tap("reply-6", "as_approved_2", json!({"operator": true}));
+        assert_eq!(new["covered_by"], "approval-new", "{new}");
+        assert_eq!(count(), 2);
+        // The captain's own approve records one row bound to the ask.
+        let own = tap("reply-7", "approve", json!({"operator": true}));
+        assert_eq!(own["recorded"], true, "{own}");
+        assert_eq!(count(), 3);
     }
 }

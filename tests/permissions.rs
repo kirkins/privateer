@@ -1905,9 +1905,24 @@ fn a_prefix_is_never_recommended_for_a_command_it_does_not_begin() {
     for (command, approve) in [
         ("sudo make release", None),
         ("make releasex", Some(true)),
-        ("make release; x", Some(true)),
+        // Not one simple command, or not the words bash runs: no prefix
+        // matches it and no tap approves it.
+        ("make release; x", None),
+        ("'sudo' make release", None),
+        ("su''do make", None),
+        ("{sudo,} make", None),
+        ("/usr/bin/sud? make", None),
+        ("\"sudo\" make release", None),
+        ("make\u{a0}release", None),
+        ("bash \"-c\" x", None),
+        ("bash -lc x", None),
     ] {
         let ask = refused_wake(&f, command);
+        let denial = &ask["payload"]["block"]["denials"][0];
+        assert_eq!(denial["whole"], true, "{command}: {ask}");
+        if approve.is_none() && command != "sudo make release" && command != "bash -lc x" {
+            assert!(denial.get("head").is_none(), "{command}: {ask}");
+        }
         let options = offered(&ask);
         assert!(
             options.contains(&("as_approved_1".to_owned(), false)),
@@ -1923,4 +1938,128 @@ fn a_prefix_is_never_recommended_for_a_command_it_does_not_begin() {
         );
         set_aside(&f, &ask);
     }
+}
+
+#[test]
+fn approve_is_offered_only_for_a_step_the_card_shows_whole() {
+    let f = classified();
+    let heredoc = "cat <<'EOF' > ~/.ssh/authorized_keys\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5 ops\nEOF";
+    let compound = format!(
+        "cd /srv/app && {} && make release",
+        "make check-unit-tests-for-the-release "
+            .repeat(7)
+            .trim_end()
+    );
+    assert!(compound.chars().count() > 280, "{compound}");
+    for command in [heredoc, compound.as_str()] {
+        let ask = refused_wake(&f, command);
+        let block = &ask["payload"]["block"];
+        assert!(block["denials"][0].get("whole").is_none(), "{ask}");
+        assert!(block.get("approve").is_none(), "{ask}");
+        assert!(
+            !offered(&ask).iter().any(|(id, _)| id == "approve"),
+            "{ask}"
+        );
+        set_aside(&f, &ask);
+    }
+    // A short command shown whole still offers it.
+    let ask = refused_wake(&f, "make check");
+    assert_eq!(ask["payload"]["block"]["denials"][0]["whole"], true);
+    assert!(
+        offered(&ask).contains(&("approve".to_owned(), true)),
+        "{ask}"
+    );
+}
+
+/// `ask` attached to `primary` in `ship`'s home, as an older runtime
+/// attached it.
+fn attach(f: &Fleet, ship: &str, ask: &Value, primary: &Value, primary_ship: &str) {
+    rusqlite::Connection::open(f.root.join(format!("{ship}/.privateer/privateer.sqlite")))
+        .unwrap()
+        .execute(
+            "UPDATE mail SET payload=json_set(payload,'$.attached_to',?2,'$.attached_ship',?3,'$.about',?2)
+             WHERE id=?1",
+            rusqlite::params![
+                ask.as_str().unwrap(),
+                primary.as_str().unwrap(),
+                primary_ship
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn an_approve_fanned_to_the_same_ships_attached_ask_records_nothing_more() {
+    let f = classified();
+    let ask = refused_wake(&f, "make release --dry-run");
+    // The same card of liaison's, on other work, attached to the first: its
+    // options match, so the captain's answer is passed on to it.
+    f.json(
+        "liaison",
+        "task.create",
+        json!({"id": "liaison-other", "charter_id": "liaison", "owner": "liaison",
+            "title": "Other work"}),
+    );
+    rusqlite::Connection::open(f.root.join("liaison/.privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,
+               urgency,deadline_ms,created_ms,state,delivery)
+             SELECT 'ask-copy',sender,recipient,kind,correlation,'liaison-other',request_kind,body,
+               json_set(payload,'$.attached_to',id,'$.attached_ship',sender,'$.about',id,
+                 '$.block.task_id','liaison-other'),
+               urgency,deadline_ms,created_ms,state,delivery FROM mail WHERE id=?1",
+            [ask["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let other = json!("ask-copy");
+    assert_eq!(f.show("liaison", &other)["state"], "open");
+    let reply = f.json("liaison", "mail.send", tap(&ask, "approve", ""));
+    assert_eq!(reply["approval"]["recorded"], true, "{reply}");
+    let copy = f.show("liaison", &other);
+    assert_eq!(copy["state"], "answered", "{copy}");
+    let fanned = f.show("liaison", &copy["answered_by"]);
+    assert!(fanned["payload"]["fanned_from"].is_string(), "{fanned}");
+    assert_eq!(
+        fanned["payload"]["answer"]["option_id"], "approve",
+        "{fanned}"
+    );
+    assert_eq!(fanned["payload"]["approval"]["recorded"], false, "{fanned}");
+    assert!(
+        fanned["payload"]["approval"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("only the captain's own reply approves"),
+        "{fanned}"
+    );
+    assert_eq!(approvals(&f).len(), 1);
+}
+
+#[test]
+fn an_approve_detaches_another_ships_attached_ask_and_approves_nothing_for_it() {
+    let f = classified();
+    f.init("storefront", "claude");
+    let ask = refused_wake(&f, "make release --dry-run");
+    let theirs = f.json(
+        "storefront",
+        "permissions.blocked",
+        json!({"task_id": "storefront-duty", "tool": "Bash",
+            "input": {"command": "make deploy | tee deploy.log"}}),
+    )["request_id"]
+        .clone();
+    attach(&f, "storefront", &theirs, &ask["id"], "liaison");
+    assert!(!waiting_cards(&f).iter().any(|(id, _)| *id == theirs));
+    let reply = f.json("liaison", "mail.send", tap(&ask, "approve", ""));
+    assert_eq!(reply["approval"]["recorded"], true, "{reply}");
+    let kept = f.show("storefront", &theirs);
+    assert_eq!(kept["state"], "open", "{kept}");
+    assert!(kept["payload"]["attached_to"].is_null(), "{kept}");
+    assert!(kept["payload"]["about"].is_null(), "{kept}");
+    assert!(waiting_cards(&f).iter().any(|(id, _)| *id == theirs));
+    let theirs_approved = f.json(
+        "storefront",
+        "captain_approval.list",
+        json!({"ship":"storefront"}),
+    );
+    assert_eq!(theirs_approved["approvals"], json!([]), "{theirs_approved}");
 }

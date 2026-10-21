@@ -4800,3 +4800,107 @@ fn an_approval_tapped_on_a_lockout_card_applies_once_the_pane_sits_idle() {
     );
     place.stop_native("infra");
 }
+
+/// On a pane's card, an approval its session carried is not offered again:
+/// when it covers the refused command, the card says auto mode refused it
+/// anyway and recommends approving the step. One given within 24 h that the
+/// session lacks is offered; one given 25 h ago, still live, is not.
+#[test]
+fn a_panes_card_names_the_approval_its_session_carried_and_offers_only_recent_others() {
+    let (place, herdr) = hosted_claude_refresher();
+    let holder = holder_of(&place);
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for (id, action, prefix, created_ms) in [
+        (
+            "approval-carried",
+            "Run make release",
+            "make release",
+            now - 3_600_000,
+        ),
+        (
+            "approval-lacked",
+            "Run make check",
+            "make check",
+            now - 1_800_000,
+        ),
+        (
+            "approval-stale",
+            "Run make release now",
+            "make release",
+            now - 25 * 3_600_000,
+        ),
+    ] {
+        place
+            .database()
+            .execute(
+                "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,
+                   created_ms,expires_ms,source)
+                 VALUES(?1,'infra','ship-it','q-'||?1,'r-'||?1,?2,?3,?4,?5,'reply')",
+                rusqlite::params![id, action, prefix, created_ms, now + 3_600_000],
+            )
+            .unwrap();
+    }
+    // The pane's session was launched carrying the first.
+    let carried = place
+        .database()
+        .execute(
+            "UPDATE hosted_panes SET approvals_ids='[\"approval-carried\"]' WHERE ship='infra'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(carried, 1);
+    classifier_refused(&place, "make release --dry-run");
+    *herdr.screen.lock().unwrap() = Some(
+        "● Bash(make release --dry-run)\n  ⎿  bash denied by auto mode · [Production Deploy]\n\
+         3 consecutive actions were blocked. Please review the transcript before continuing.\n"
+            .to_owned(),
+    );
+    place.tick();
+    let asks: Vec<Value> = place.json("mail.inbox", json!({"address":"captain"}))["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["payload"]["type"] == "tool_permission")
+        .cloned()
+        .collect();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    let ask = &asks[0];
+    assert_eq!(ask["payload"]["block"]["scope"], "pane", "{ask}");
+    assert_eq!(
+        ask["payload"]["block"]["approvals"],
+        json!(["approval-lacked"]),
+        "{ask}"
+    );
+    let why = ask["payload"]["decision"]["why"].as_str().unwrap();
+    assert!(
+        why.contains(
+            "Auto mode refused this although captain approval approval-carried (Run make release) was in its session."
+        ),
+        "{why}"
+    );
+    let options: Vec<(String, bool)> = ask["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o["id"].as_str().unwrap().to_owned(),
+                o["recommended"] == true,
+            )
+        })
+        .collect();
+    assert!(
+        options.contains(&("as_approved_1".to_owned(), false))
+            && options.contains(&("approve".to_owned(), true))
+            && !options.iter().any(|(id, _)| id == "as_approved_2"),
+        "{options:?}"
+    );
+    place.stop_native("infra");
+}
