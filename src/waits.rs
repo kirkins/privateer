@@ -622,8 +622,11 @@ fn link(store: &Store, peer: &str, back: bool) -> Result<Option<Value>> {
         .and_then(|(_, _, resynced)| resynced)
         .is_some_and(|at| now - at < RESYNC_EVERY_MS)
     {
-        // Too soon after the last resync: the link stays owed one.
-        if !recent {
+        // Too soon after the last resync: the link stays owed one, even when
+        // it was heard moments ago and was not marked down (a machine link
+        // contacted again after failing).
+        let owed = row.is_some_and(|(_, down, _)| down.is_some());
+        if !recent || !owed {
             tx.execute(
                 "UPDATE wait_links SET heard_ms=?2, down_ms=COALESCE(down_ms, ?2) WHERE peer=?1",
                 params![peer, now],
@@ -638,8 +641,9 @@ fn link(store: &Store, peer: &str, back: bool) -> Result<Option<Value>> {
            resynced_ms=excluded.resynced_ms",
         params![peer, now],
     )?;
-    // A resync that fails leaves nothing half sent, but the link is still
-    // heard: it does not stay down and retry a full resync on every delivery.
+    // A resync that fails leaves nothing half sent. The link is heard, and
+    // still owed its resync, which is tried again after the spacing rather
+    // than on every delivery.
     tx.execute_batch("SAVEPOINT resync")?;
     let outcome = match resync(store, peer) {
         Ok(outcome) => {
@@ -648,6 +652,10 @@ fn link(store: &Store, peer: &str, back: bool) -> Result<Option<Value>> {
         }
         Err(error) => {
             tx.execute_batch("ROLLBACK TO resync; RELEASE resync")?;
+            tx.execute(
+                "UPDATE wait_links SET down_ms=?2 WHERE peer=?1",
+                params![peer, row.and_then(|(_, down, _)| down).unwrap_or(now)],
+            )?;
             let error = format!("{error:#}");
             eprintln!("privateer: resync of link {peer} failed: {error}");
             let failed = json!({"peer": peer, "error": error});
@@ -657,6 +665,18 @@ fn link(store: &Store, peer: &str, back: bool) -> Result<Option<Value>> {
     };
     tx.commit()?;
     Ok(Some(outcome))
+}
+
+/// A row a resync of `peer` could not read is skipped and audited, so one
+/// bad schedule or task does not hold back every other wait on the link.
+pub(crate) fn skipped(store: &Store, peer: &str, task: &str, error: &anyhow::Error) -> Result<()> {
+    let error = format!("{error:#}");
+    eprintln!("privateer: resync of link {peer} skipped {task}: {error}");
+    store.audit(
+        "wait.resync_skipped",
+        &json!({"peer": peer, "task": task, "error": error}),
+    )?;
+    Ok(())
 }
 
 /// Resync the waits that ride `peer`, in the caller's transaction. The
@@ -687,8 +707,19 @@ pub(crate) fn resync(store: &Store, peer: &str) -> Result<Value> {
     drop(statement);
     let mut answered = 0;
     for (task, subscriber, subscriber_task, nonce) in rows {
-        let record = store.task(&task)?;
-        let owner = record["owner"].as_str().context("task owner missing")?;
+        // A task that cannot be read is skipped, not the whole resync.
+        let read = store.task(&task).and_then(|record| {
+            let owner = record["owner"].as_str().context("task owner missing")?;
+            Ok((owner.to_owned(), record))
+        });
+        let (owner, record) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                skipped(store, peer, &task, &error)?;
+                continue;
+            }
+        };
+        let owner = owner.as_str();
         let ended = record["status"]
             .as_str()
             .filter(|s| matches!(*s, "done" | "cancelled"));
@@ -719,7 +750,50 @@ pub(crate) fn resync(store: &Store, peer: &str) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::temporary;
+    use super::*;
+
+    #[test]
+    fn a_link_back_heard_moments_ago_and_inside_the_spacing_stays_owed_its_resync() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(temp.path()).unwrap().join("home");
+        let mut store = Store::open(&home).unwrap();
+        crate::dispatch(
+            &mut store,
+            "peer.put",
+            json!({"name":"machine-studio","transport":"collected"}),
+        )
+        .unwrap();
+        init(&store).unwrap();
+        let down = |store: &Store| -> Option<i64> {
+            store
+                .connection()
+                .query_row(
+                    "SELECT down_ms FROM wait_links WHERE peer='machine-studio'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // The machine is contacted again after failing: a resync runs.
+        assert!(link_back(&store, "machine-studio").unwrap().is_some());
+        assert_eq!(down(&store), None);
+        // Failing and contacted again at once, inside both the hearing window
+        // and the resync spacing: no resync yet, but one is owed.
+        assert!(link_back(&store, "machine-studio").unwrap().is_none());
+        assert!(down(&store).is_some());
+        // Inside the spacing it stays owed, and is paid after it.
+        assert!(heard(&store, "machine-studio").unwrap().is_none());
+        assert!(down(&store).is_some());
+        store
+            .connection()
+            .execute(
+                "UPDATE wait_links SET resynced_ms=resynced_ms-?1",
+                [RESYNC_EVERY_MS + 1],
+            )
+            .unwrap();
+        assert!(heard(&store, "machine-studio").unwrap().is_some());
+        assert_eq!(down(&store), None);
+    }
 
     #[test]
     fn only_errors_that_say_the_peer_could_not_work_just_then_are_temporary() {

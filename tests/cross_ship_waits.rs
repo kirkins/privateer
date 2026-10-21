@@ -2136,19 +2136,31 @@ fn a_link_back_resyncs_at_most_once_a_minute_and_stays_owed_one() {
     assert_eq!(audited(&mut pair.b, "wait.resync").len(), 2);
 }
 
+fn link_state(store: &Store) -> (i64, Option<i64>) {
+    store
+        .connection()
+        .query_row(
+            "SELECT heard_ms, down_ms FROM wait_links WHERE peer='home-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
 #[test]
-fn a_failed_resync_still_records_the_link_heard_and_sends_nothing_half_done() {
+fn a_failed_resync_sends_nothing_half_done_and_stays_owed_until_after_the_spacing() {
     let mut pair = subscribed();
-    // A second waiting task whose schedule cannot be read: the resync fails
+    // A second waiting task whose notice cannot be written: the resync fails
     // on it after it has already resubscribed waiting-1.
-    waiter(&mut pair.b, "zz-broken");
-    defer_remote(&mut pair.b, "zz-broken", far()).unwrap();
+    waiter(&mut pair.b, "zz-late");
+    defer_remote(&mut pair.b, "zz-late", far()).unwrap();
     exchange(&mut pair);
     pair.b
         .connection()
-        .execute(
-            "UPDATE task_schedule SET record=json_set(record,'$.revision','x') WHERE task_id='zz-broken'",
-            [],
+        .execute_batch(
+            "CREATE TRIGGER full BEFORE INSERT ON mail
+             WHEN json_extract(NEW.payload,'$.wait_subscribe.subscriber_task')='zz-late'
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
         )
         .unwrap();
     let subscribes = wait_payloads(&pair.b, "apps", "wait_subscribe").len();
@@ -2161,21 +2173,65 @@ fn a_failed_resync_still_records_the_link_heard_and_sends_nothing_half_done() {
         wait_payloads(&pair.b, "apps", "wait_subscribe").len(),
         subscribes
     );
-    // The link is heard, not left down, so the next delivery does not try
-    // the whole resync again.
-    let (heard, down): (i64, Option<i64>) = pair
-        .b
-        .connection()
-        .query_row(
-            "SELECT heard_ms, down_ms FROM wait_links WHERE peer='home-a'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
+    // The link is heard, and still owed its resync.
+    let (heard, down) = link_state(&pair.b);
     assert!(heard > 0);
-    assert_eq!(down, None);
+    assert!(down.is_some());
+    // Not tried again on every delivery inside the spacing.
     ping(&mut pair.b, "ping-1", "infra", "apps");
     assert_eq!(audited(&mut pair.b, "wait.resync_failed").len(), 1);
+    // After it, the first hearing pays the resync it still owes.
+    pair.b
+        .connection()
+        .execute_batch("DROP TRIGGER full;")
+        .unwrap();
+    later(&pair.b);
+    ping(&mut pair.b, "ping-2", "infra", "apps");
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(resyncs[0]["resubscribed"], 2);
+    assert_eq!(
+        wait_payloads(&pair.b, "apps", "wait_subscribe").len(),
+        subscribes + 2
+    );
+    assert_eq!(link_state(&pair.b).1, None);
+}
+
+#[test]
+fn a_malformed_schedule_is_skipped_and_audited_and_the_rest_resync() {
+    let mut pair = subscribed();
+    waiter(&mut pair.b, "zz-broken");
+    defer_remote(&mut pair.b, "zz-broken", far()).unwrap();
+    exchange(&mut pair);
+    pair.b
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.revision','x') WHERE task_id='zz-broken'",
+            [],
+        )
+        .unwrap();
+    let subscribes = wait_payloads(&pair.b, "apps", "wait_subscribe").len();
+    outage(&mut pair, "ping-0");
+    assert!(audited(&mut pair.b, "wait.resync_failed").is_empty());
+    let skipped = audited(&mut pair.b, "wait.resync_skipped");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["task"], "zz-broken");
+    assert_eq!(skipped[0]["peer"], "home-a");
+    assert!(
+        skipped[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid task schedule"),
+        "{skipped:?}"
+    );
+    let resyncs = audited(&mut pair.b, "wait.resync");
+    assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+    assert_eq!(resyncs[0]["resubscribed"], 1);
+    assert_eq!(
+        wait_payloads(&pair.b, "apps", "wait_subscribe").len(),
+        subscribes + 1
+    );
+    assert_eq!(link_state(&pair.b).1, None);
 }
 
 #[test]

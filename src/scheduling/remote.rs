@@ -225,8 +225,14 @@ pub(crate) fn resubscribe(store: &Store, peer: &str) -> Result<usize> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         for id in &ids {
-            let Some(mut work) = load(store, id)? else {
-                continue;
+            // A schedule that cannot be read is skipped, not the resync.
+            let mut work = match load(store, id) {
+                Ok(Some(work)) => work,
+                Ok(None) => continue,
+                Err(error) => {
+                    crate::waits::skipped(store, peer, id, &error)?;
+                    continue;
+                }
             };
             let Some(far) = live(&work) else {
                 continue;
