@@ -380,6 +380,22 @@ mod tests {
         }
     }
 
+    /// The template tells a first mate how to ask for a captain approval and
+    /// what a block card offers, without reading as a block.
+    #[test]
+    fn the_first_mate_instructions_say_how_to_ask_for_a_captain_approval() {
+        let instructions = instructions_text();
+        for named in [
+            "payload.approves",
+            "ttl_secs",
+            "\"approves\":true",
+            "Approve for 24 h",
+            "As approved",
+        ] {
+            assert!(instructions.contains(named), "{named}");
+        }
+    }
+
     #[test]
     fn the_captain_notice_is_not_a_block() {
         let finding = read(
