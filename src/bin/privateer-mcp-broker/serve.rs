@@ -61,6 +61,7 @@ pub struct Internal {
 struct Opening {
     /// The open helper still runs, on its own thread.
     running: bool,
+    project: PathBuf,
     at: Instant,
     error: Option<String>,
     /// The workspace was released while the helper ran: close what it
@@ -956,12 +957,26 @@ impl Broker {
                     root.to_path_buf(),
                     Opening {
                         running: true,
+                        project: project.clone(),
                         at: Instant::now(),
                         error: None,
                         close_after: false,
                     },
                 );
+                // Recorded before the helper runs, so a release meanwhile
+                // finds it and asks for it to be closed.
+                state
+                    .windows
+                    .retain(|w| !(w.root == root && w.project == project));
+                state.windows.push(Opened {
+                    root: root.to_path_buf(),
+                    project: project.clone(),
+                    tab: None,
+                    opened_ms: sys::now_ms() as u64,
+                });
                 drop(state);
+                self.save_windows();
+                self.publish();
                 self.log.line(&format!(
                     "opening the window of {} with {}",
                     sys::quoted(&root.to_string_lossy(), 4096),
@@ -995,44 +1010,46 @@ impl Broker {
         }
     }
 
-    /// The open helper's thread: run it, record what it opened, and close
-    /// that again if the workspace was released meanwhile.
+    /// The open helper's thread: run it, drop the window from the record if
+    /// it failed, and close it again if the workspace was released meanwhile.
     fn run_open(&self, argv: &[String], root: PathBuf, project: PathBuf) {
         let outcome = window::run(argv, &project)
             .map_err(|why| format!("could not open this workspace's Xcode window: {why}"));
-        let opened = Opened {
-            root: root.clone(),
-            project: project.clone(),
-            tab: None,
-            opened_ms: sys::now_ms() as u64,
-        };
-        let close_after = {
+        let (close_after, opened) = {
             let mut state = self.lock();
-            if outcome.is_ok() {
-                state
-                    .windows
-                    .retain(|w| !(w.root == root && w.project == project));
-                state.windows.push(opened.clone());
+            let mine = |w: &Opened| w.root == root && w.project == project;
+            if outcome.is_err() {
+                state.windows.retain(|w| !mine(w));
+            } else if !state.windows.iter().any(mine) {
+                state.windows.push(Opened {
+                    root: root.clone(),
+                    project: project.clone(),
+                    tab: None,
+                    opened_ms: sys::now_ms() as u64,
+                });
             }
+            let opened = state.windows.iter().find(|w| mine(w)).cloned();
             let close_after = state.opening.get(&root).is_some_and(|o| o.close_after);
             state.opening.insert(
                 root.clone(),
                 Opening {
                     running: false,
+                    project: project.clone(),
                     at: Instant::now(),
                     error: outcome.as_ref().err().cloned(),
                     close_after: false,
                 },
             );
             self.changed.notify_all();
-            close_after
+            (close_after, opened)
         };
+        self.save_windows();
         if let Err(why) = &outcome {
             self.log.line(&sys::quoted(why, 400));
+            self.publish();
             return;
         }
-        self.save_windows();
-        if close_after {
+        if let (true, Some(opened)) = (close_after, opened) {
             let (closed, failure) = self.close_windows(vec![opened]);
             self.log.line(&format!(
                 "closed {} window opened after its workspace {} was released{}",
@@ -1139,17 +1156,18 @@ impl Broker {
         let (targets, opening) = {
             let mut state = self.lock();
             // An open still running finishes by closing what it opened.
-            let mut opening = 0;
+            let mut opening: Vec<(PathBuf, PathBuf)> = vec![];
             for (root, o) in state.opening.iter_mut() {
                 if o.running && under(root) {
                     o.close_after = true;
-                    opening += 1;
+                    opening.push((root.clone(), o.project.clone()));
                 }
             }
             let targets: Vec<Opened> = state
                 .windows
                 .iter()
                 .filter(|w| under(&w.root))
+                .filter(|w| !opening.contains(&(w.root.clone(), w.project.clone())))
                 .cloned()
                 .collect();
             (targets, opening)
@@ -1160,10 +1178,13 @@ impl Broker {
             "client {client}: close_workspace {}: closed {}{}{}",
             sys::quoted(&given.to_string_lossy(), 4096),
             closed.len(),
-            if opening > 0 {
-                format!("; {opening} still opening, closed when the open ends")
-            } else {
+            if opening.is_empty() {
                 String::new()
+            } else {
+                format!(
+                    "; {} still opening, closed when the open ends",
+                    opening.len()
+                )
             },
             failure
                 .as_deref()
@@ -1172,7 +1193,11 @@ impl Broker {
         self.publish();
         match failure {
             Some(error) => json!({"error": error}),
-            None => json!({"closed": closed}),
+            None if opening.is_empty() => json!({"closed": closed}),
+            None => {
+                let opening: Vec<PathBuf> = opening.into_iter().map(|(_, p)| p).collect();
+                json!({"closed": closed, "opening": opening})
+            }
         }
     }
 

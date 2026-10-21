@@ -1614,9 +1614,16 @@ fn a_workspace_released_while_its_window_opens_closes_it_when_the_open_ends() {
     );
     let busy = client.call(json!(2), "BuildProject", json!({}));
     assert!(text(&busy).contains("is opening"), "{busy}");
-    // Nothing is recorded yet, so nothing closes now; the open is marked.
+    // Recorded as it opens, so a release asks; it closes when the open ends.
+    let project = a.join("A.xcodeproj");
+    let recorded: Value =
+        serde_json::from_slice(&fs::read(broker.dir.join("xcode.windows.json")).unwrap()).unwrap();
+    assert_eq!(recorded["windows"][0]["project"], json!(project));
     let started = Instant::now();
-    assert_eq!(close_workspace(&broker.socket(), &a), json!({"closed": []}));
+    assert_eq!(
+        close_workspace(&broker.socket(), &a),
+        json!({"closed": [], "opening": [project]})
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
     let closes = eventually(Duration::from_secs(10), "the close", || {
         let closes = ws.closes();
@@ -1625,7 +1632,7 @@ fn a_workspace_released_while_its_window_opens_closes_it_when_the_open_ends() {
     assert_eq!(closes.len(), 1);
     assert_eq!(
         closes[0]["argv"].as_array().unwrap().last().unwrap(),
-        &json!(a.join("A.xcodeproj"))
+        &json!(project)
     );
     eventually(Duration::from_secs(10), "an empty record", || {
         (broker.state()["windows"] == json!([])).then_some(())
@@ -1701,6 +1708,12 @@ fn a_window_that_never_shows_is_busy_and_a_failed_open_is_an_error() {
         "{shown}"
     );
     assert!(received(&failing, "BuildProject").is_empty());
+    // Recorded while it opened, dropped once the open failed.
+    eventually(Duration::from_secs(10), "an empty record", || {
+        let record: Value =
+            serde_json::from_slice(&fs::read(failing.dir.join("xcode.windows.json")).ok()?).ok()?;
+        (record["windows"] == json!([])).then_some(())
+    });
 }
 
 #[test]
