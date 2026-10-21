@@ -91,7 +91,7 @@ print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "r
             &root.join("bin/forge"),
             &format!(
                 r#"#!/usr/bin/env python3
-import json, os, pathlib, re, sys
+import json, os, pathlib, re, sys, time
 root = pathlib.Path({root:?})
 op = sys.argv[1]
 request = json.load(sys.stdin)
@@ -125,6 +125,8 @@ if op == "review.post":
     plan.write_text(" ".join(steps))
     if step == "error":
         reply({{"ok": False, "error": "HTTP 502 bad gateway"}})
+    if step == "hang":
+        time.sleep(30)
     posted.append({{"id": len(posted) + 1, "commit_id": request["commit_id"],
         "event": request["event"], "body": request["body"]}})
     store.write_text(json.dumps(posted))
@@ -1339,6 +1341,78 @@ fn posting_is_idempotent_across_a_restart() {
             .skip(3)
             .all(|p| p["request"]["event"] == "REQUEST_CHANGES")
     );
+}
+
+#[test]
+fn a_hung_forge_stops_at_the_ticks_posting_budget_and_the_rest_waits() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": {"opus": opus()}, "review": ["opus"]}));
+    let first = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 30 }\n")],
+        "Fix",
+    );
+    f.pr(30, &first, "feature");
+    let second = f.commit(
+        "other",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 31 }\n")],
+        "Other",
+    );
+    f.pr(31, &second, "other");
+    // Both posts fail at first: the first at its settlement and again on
+    // the tick that settles the second, the second at its settlement.
+    fs::write(f.root.join("post-plan"), "error error error").unwrap();
+    let a = f.review(30, APPROVE, json!({}))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b = f.review(31, APPROVE, json!({}))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(f.row(&a)["post_attempts"], 2);
+    assert_eq!(f.row(&b)["post_attempts"], 1);
+    // The forge hangs on the next post. The tick stops it at its budget,
+    // well before the hang ends, and leaves the second for the next tick.
+    fs::write(f.root.join("post-plan"), "hang").unwrap();
+    let began = Instant::now();
+    let tick = f
+        .command(None, &["serve", "--json", "{\"once\":true}"])
+        .env("PRIVATEER_REVIEW_POST_BUDGET_MS", "1500")
+        .output()
+        .unwrap();
+    assert!(tick.status.success(), "{}", String::from_utf8_lossy(&tick.stderr));
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "the tick waited {:?} on a hung forge",
+        began.elapsed()
+    );
+    let row = f.row(&a);
+    assert_eq!(row["post_state"], "failed", "{row}");
+    assert_eq!(row["post_attempts"], 3);
+    assert!(
+        row["post_error"]
+            .as_str()
+            .unwrap()
+            .contains("time budget"),
+        "{row}"
+    );
+    assert_eq!(f.row(&b)["post_attempts"], 1, "the second was tried");
+    // The next tick posts both, and the ship hears each landed.
+    f.tick();
+    for (id, attempts) in [(&a, 4), (&b, 2)] {
+        let row = f.row(id);
+        assert_eq!(row["post_state"], "posted", "{row}");
+        assert_eq!(row["post_attempts"], attempts, "{row}");
+    }
+    assert_eq!(forge_reviews(&f).len(), 2);
+    let mail = f.mail_to("engineering");
+    for id in [&a, &b] {
+        assert!(
+            mail.iter().any(|(m, body)| m == &format!("{id}-posted") && body.contains("APPROVE, posted")),
+            "{mail:?}"
+        );
+    }
 }
 
 #[test]

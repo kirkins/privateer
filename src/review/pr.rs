@@ -43,6 +43,8 @@ pub struct Pr {
     pub checks_ok: bool,
     /// The checks that are not, or why none could be read.
     pub checks_detail: String,
+    /// The merge commit, once merged, when the forge names it.
+    pub merge_sha: Option<String>,
 }
 
 /// The files a review folder holds beside its worktree.
@@ -59,7 +61,17 @@ pub struct Files {
 
 /// Run a command with a bounded wait, its stdin given and its stdout and
 /// stderr read whole.
-pub fn run(mut command: Command, input: Option<&[u8]>) -> Result<std::process::Output> {
+pub fn run(command: Command, input: Option<&[u8]>) -> Result<std::process::Output> {
+    run_until(command, input, None)
+}
+
+/// `run`, stopped at `until` when that comes before the usual bound: a
+/// caller with a time budget (the posting tick) gives its end.
+pub fn run_until(
+    mut command: Command,
+    input: Option<&[u8]>,
+    until: Option<Instant>,
+) -> Result<std::process::Output> {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -88,7 +100,9 @@ pub fn run(mut command: Command, input: Option<&[u8]>) -> Result<std::process::O
         let _ = stderr.read_to_end(&mut bytes);
         bytes
     });
-    let until = Instant::now() + READ_TIMEOUT;
+    let bound = Instant::now() + READ_TIMEOUT;
+    let budget = until.filter(|u| *u < bound);
+    let until = budget.unwrap_or(bound);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -96,6 +110,9 @@ pub fn run(mut command: Command, input: Option<&[u8]>) -> Result<std::process::O
         if Instant::now() > until {
             let _ = child.kill();
             let _ = child.wait();
+            if budget.is_some() {
+                bail!("a forge call ran past this tick's time budget");
+            }
             bail!("a forge or git read took longer than {READ_TIMEOUT:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -223,13 +240,20 @@ fn text(value: &Value) -> String {
 }
 
 /// The PR as the forge reports it now, its `required` checks judged at the
-/// head.
-pub fn view(forge: &crate::forges::Repo, number: u64, required: &[String]) -> Result<Pr> {
-    let reply = crate::forges::call(
+/// head (none judged, and `checks_ok` false, when `required` is empty), the
+/// read stopped at `until` when one is given.
+pub fn view(
+    forge: &crate::forges::Repo,
+    number: u64,
+    required: &[String],
+    until: Option<Instant>,
+) -> Result<Pr> {
+    let reply = crate::forges::call_until(
         forge,
         &forge.reviewer,
         "pr.view",
         json!({"pr": number, "required_checks": required}),
+        until,
     )
     .with_context(|| format!("read #{number} in {}", forge.key))?;
     let failing: Vec<String> = reply["checks_not_success"]
@@ -260,6 +284,10 @@ pub fn view(forge: &crate::forges::Repo, number: u64, required: &[String]) -> Re
         } else {
             format!("not green: {}", failing.join(", "))
         },
+        merge_sha: reply["merge_sha"]
+            .as_str()
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned),
     })
 }
 

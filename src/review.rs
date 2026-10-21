@@ -43,6 +43,8 @@ use filter::Finding;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Characters of the ship's notes a review prompt carries.
 const NOTES_CHARS: usize = 2_000;
@@ -57,9 +59,36 @@ const BEARINGS_REVIEWS: i64 = 5;
 const POST_TRIES: i64 = 4;
 /// Days a settled review's folder (its diff and text) is kept.
 const FOLDER_DAYS: i64 = 7;
+/// How long one dispatcher tick may spend posting verdicts, retries and new
+/// settlements together, so a hung forge cannot stall it: a forge call is
+/// stopped at the budget's end, and what is left waits for the next tick.
+const POST_BUDGET: Duration = Duration::from_secs(30);
+/// The end of the current tick's posting budget, set by `tick` and shared
+/// by the settlements that follow it in the same tick.
+static POSTING_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The posting budget; a debug build (the test suites) may shorten it with
+/// `PRIVATEER_REVIEW_POST_BUDGET_MS`.
+fn post_budget() -> Duration {
+    if cfg!(debug_assertions)
+        && let Some(ms) = std::env::var("PRIVATEER_REVIEW_POST_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    POST_BUDGET
+}
+
+/// When posting must stop: the current tick's budget, or a fresh one for a
+/// settlement no tick began.
+fn posting_until() -> Instant {
+    let until = *POSTING_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    until.unwrap_or_else(|| Instant::now() + post_budget())
+}
 
 pub(crate) use filter::clip;
-pub(crate) use pr::run as run_bounded;
+pub(crate) use pr::run_until as run_bounded;
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -319,7 +348,7 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     let declared = declarations(args)?;
     let (task_id, charter_repo, clone, forge) = task_clone(store, &ship, args)?;
     let required = crate::forges::required_checks(&forge)?;
-    let live = pr::view(&forge, number, &required)?;
+    let live = pr::view(&forge, number, &required, None)?;
     ensure!(
         live.state == "open",
         "#{number} in {} is {}; only an open pull request is reviewed",
@@ -610,7 +639,7 @@ pub(crate) fn settle(
             ],
         )?;
         pr::remove(Some(Path::new(&clone)), &folder);
-        post(store, &id)?;
+        post(store, &id, posting_until())?;
     }
     pr::remove(Some(Path::new(&clone)), &folder);
     store.connection().execute(
@@ -804,11 +833,14 @@ fn post_body(review: &Value) -> String {
 /// now. A failure is recorded as `failed` with its try counted; the forge
 /// adapter finds the review's marker among the reviewer's reviews before it
 /// posts, so a try after a post whose reply was lost posts nothing twice.
-fn post(store: &Store, id: &str) -> Result<()> {
+/// Each forge call stops at `until`; past it, nothing is tried and the
+/// verdict waits, untried, for the next tick.
+fn post(store: &Store, id: &str, until: Instant) -> Result<()> {
     let review = record(store, id)?;
     let verdict = review["verdict"].as_str().unwrap_or_default();
     if !matches!(review["post_state"].as_str(), Some("pending" | "failed"))
         || !matches!(verdict, "approve" | "changes_requested")
+        || Instant::now() >= until
     {
         return Ok(());
     }
@@ -821,8 +853,8 @@ fn post(store: &Store, id: &str) -> Result<()> {
                 .context("the review names no forges.json entry")?,
         )?;
         if verdict == "approve" {
-            let required = crate::forges::required_checks(&forge)?;
-            let live = pr::view(&forge, number, &required)?;
+            // Posting needs the PR's state and head, not its checks.
+            let live = pr::view(&forge, number, &[], Some(until))?;
             if live.state != "open" {
                 return Ok(Err(format!("#{number} is {}", live.state)));
             }
@@ -833,13 +865,14 @@ fn post(store: &Store, id: &str) -> Result<()> {
                 )));
             }
         }
-        let reply = crate::forges::call(
+        let reply = crate::forges::call_until(
             &forge,
             &forge.reviewer,
             "review.post",
             json!({"pr": number, "commit_id": head,
                 "event": if verdict == "approve" { "APPROVE" } else { "REQUEST_CHANGES" },
                 "body": post_body(&review), "reviewer": forge.reviewer.account}),
+            Some(until),
         )?;
         Ok(Ok(match &reply["review_id"] {
             Value::Null => None,
@@ -870,10 +903,13 @@ fn post(store: &Store, id: &str) -> Result<()> {
 }
 
 /// Each tick: try again the verdicts whose post failed or never ran (a
-/// restart between settlement and posting), telling the ship when one lands
-/// late, goes stale or is given up on; and remove the folders of reviews
-/// settled more than a week ago.
+/// restart between settlement and posting, or a tick's budget spent),
+/// telling the ship when one lands late, goes stale or is given up on; and
+/// remove the folders of reviews settled more than a week ago. Posting
+/// stops when the tick's budget is spent, and the rest waits.
 pub(crate) fn tick(store: &Store) -> Result<Vec<Value>> {
+    let until = Instant::now() + post_budget();
+    *POSTING_UNTIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
     let due: Vec<(String, String)> = store
         .connection()
         .prepare(
@@ -885,12 +921,15 @@ pub(crate) fn tick(store: &Store) -> Result<Vec<Value>> {
         .collect::<rusqlite::Result<_>>()?;
     let mut tried = vec![];
     for (id, before) in due {
-        post(store, &id)?;
+        if Instant::now() >= until {
+            break;
+        }
+        post(store, &id, until)?;
         let review = record(store, &id)?;
         let after = review["post_state"].as_str().unwrap_or_default().to_owned();
         let attempts = review["post_attempts"].as_i64().unwrap_or_default();
         let notice = match after.as_str() {
-            "posted" if before == "failed" => Some(("posted", "normal")),
+            "posted" if before != "posted" => Some(("posted", "normal")),
             "stale" => Some(("stale", "normal")),
             "failed" if attempts >= POST_TRIES => Some(("post-failed", "normal")),
             _ => None,
@@ -1010,7 +1049,7 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     // 1. The live PR, read from the forge now, its required checks from
     // forges.json or branch protection, never every check.
     let checks_needed = crate::forges::required_checks(&forge)?;
-    let live = pr::view(&forge, number, &checks_needed)?;
+    let live = pr::view(&forge, number, &checks_needed, None)?;
     let head = live.head_sha.clone();
     ensure!(
         live.state == "open",
@@ -1241,3 +1280,4 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         _ => bail!("unknown review command {command}"),
     }
 }
+

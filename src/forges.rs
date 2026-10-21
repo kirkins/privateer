@@ -22,6 +22,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_REPOS: usize = 64;
@@ -322,6 +323,38 @@ fn adapter() -> Result<Command> {
 /// forge, API and `owner/name` added, and the account's token file named in
 /// the child's environment alone. The reply, or why it failed.
 pub fn call(repo: &Repo, account: &Account, op: &str, request: Value) -> Result<Value> {
+    call_until(repo, account, op, request, None)
+}
+
+/// `call`, stopped at `until` when one is given.
+pub fn call_until(
+    repo: &Repo,
+    account: &Account,
+    op: &str,
+    request: Value,
+    until: Option<Instant>,
+) -> Result<Value> {
+    let reply = exchange(repo, account, op, request, until)?;
+    ensure!(
+        reply["ok"] == true,
+        "the forge refused {op} on {}: {}",
+        repo.key,
+        reply["error"].as_str().unwrap_or("no reason given")
+    );
+    Ok(reply)
+}
+
+/// One forge call's reply as the adapter gave it, `ok` or not; an error
+/// only when no reply came (the adapter could not run, ran out of time, or
+/// wrote no JSON). A caller that must tell a refusal from a lost reply
+/// reads `ok` and `status_code` itself.
+pub fn exchange(
+    repo: &Repo,
+    account: &Account,
+    op: &str,
+    request: Value,
+    until: Option<Instant>,
+) -> Result<Value> {
     let token = crate::credentials::file_of(&account.credential)?;
     let mut request = request;
     let fields = request
@@ -338,21 +371,15 @@ pub fn call(repo: &Repo, account: &Account, op: &str, request: Value) -> Result<
         }
     }
     command.env("PRIVATEER_FORGE_TOKEN_FILE", &token);
-    let output = crate::review::run_bounded(command, Some(request.to_string().as_bytes()))
-        .with_context(|| format!("run the forge adapter's {op}"))?;
-    let reply: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+    let output =
+        crate::review::run_bounded(command, Some(request.to_string().as_bytes()), until)
+            .with_context(|| format!("run the forge adapter's {op}"))?;
+    serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
             "the forge adapter's {op} reply is not JSON: {}",
             crate::review::clip(String::from_utf8_lossy(&output.stderr).trim(), 300)
         )
-    })?;
-    ensure!(
-        reply["ok"] == true,
-        "the forge refused {op} on {}: {}",
-        repo.key,
-        reply["error"].as_str().unwrap_or("no reason given")
-    );
-    Ok(reply)
+    })
 }
 
 /// The checks a merge of the repo needs green: forges.json's list, else the
