@@ -59,6 +59,8 @@ const DEFERRAL_WINDOW_MS: i64 = DAY_MS;
 /// they ended, and how long an answered check is kept for it.
 const CARRY_CLOSED_MS: i64 = 7 * DAY_MS;
 const CHECK_KEPT_MS: i64 = HOUR_MS;
+/// Closed proposals are kept this long, then forgotten.
+const KEPT_CLOSED_MS: i64 = 30 * DAY_MS;
 const MAX_CARRIED: usize = 16;
 /// Target checks run in one pass, for proposals from machines this one reaches.
 const CHECKS_PER_PASS: usize = 2;
@@ -1778,6 +1780,7 @@ pub(crate) fn tick(store: &Store) -> Value {
         if !interrupted.is_empty() {
             report["interrupted"] = json!(interrupted);
         }
+        prune(&conn)?;
         if !runnable(&conn)?.is_empty() {
             // Let go first: the runner waits for the lock, then holds it.
             drop(lock);
@@ -1792,6 +1795,21 @@ pub(crate) fn tick(store: &Store) -> Value {
     work().unwrap_or_else(
         |error| json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}),
     )
+}
+
+/// Forget proposals closed long ago, except a move whose old folder still
+/// waits to be cleaned, which holds proposals here, and cooldowns that ended.
+fn prune(conn: &Connection) -> Result<()> {
+    let now = Store::now_ms();
+    conn.execute(
+        "DELETE FROM placement_proposals WHERE updated_ms<?1
+           AND state NOT IN ('checking','open','approved','moving')
+           AND NOT (home_machine IS NULL AND state='moved'
+             AND json_extract(record,'$.cleaned_ms') IS NULL)",
+        [now - KEPT_CLOSED_MS],
+    )?;
+    conn.execute("DELETE FROM placement_cooldowns WHERE until_ms<?1", [now])?;
+    Ok(())
 }
 
 /// Start `privateer _placement-run` in a session of its own, so stopping the
@@ -2310,5 +2328,57 @@ mod tests {
         assert_eq!(streak, 0);
         // A closed proposal does not close again.
         assert!(!conclude(&conn, "d", "moved", json!({})).unwrap());
+    }
+
+    #[test]
+    fn long_closed_proposals_and_ended_cooldowns_are_pruned() {
+        let conn = registry();
+        let closed = |id: &str, state: &str, record: Value| Proposal {
+            id: id.into(),
+            home: None,
+            state: state.into(),
+            record: json!({"id": id, "ship": "rover", "from": "mac", "to": "laptop"})
+                .as_object()
+                .unwrap()
+                .clone()
+                .into_iter()
+                .chain(record.as_object().unwrap().clone())
+                .collect(),
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        save(&conn, &closed("old", "not_now", json!({}))).unwrap();
+        save(&conn, &closed("uncleaned", "moved", json!({}))).unwrap();
+        save(&conn, &closed("cleaned", "moved", json!({"cleaned_ms": 1}))).unwrap();
+        save(&conn, &closed("open", "open", json!({}))).unwrap();
+        save(&conn, &closed("recent", "never", json!({}))).unwrap();
+        conn.execute(
+            "UPDATE placement_proposals SET updated_ms=1 WHERE id!='recent'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO placement_cooldowns(ship, until_ms) VALUES('rover', 1), ('scout', ?1)",
+            [Store::now_ms() + DAY_MS],
+        )
+        .unwrap();
+        prune(&conn).unwrap();
+        let mut kept: Vec<String> = conn
+            .prepare("SELECT id FROM placement_proposals ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        kept.sort();
+        assert_eq!(kept, ["open", "recent", "uncleaned"]);
+        let cooling: Vec<String> = conn
+            .prepare("SELECT ship FROM placement_cooldowns")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(cooling, ["scout"]);
     }
 }
