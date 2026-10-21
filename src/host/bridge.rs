@@ -248,7 +248,10 @@ impl Coordination {
     }
     fn owner(&self, owner: &Owner) -> Result<()> {
         self.validate()?;
-        owner.validate()?;
+        owner.validate().context("bridge hosting home")?;
+        self.member(owner).context("fleet registry")
+    }
+    fn member(&self, owner: &Owner) -> Result<()> {
         let conn = rusqlite::Connection::open_with_flags(
             &self.registry_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -533,11 +536,43 @@ pub struct Lease {
 
 /// Handshake before rendering. Ordinary explicit dashboards have no token and
 /// remain entirely read-only. A delayed launch cannot adopt a replaced claim.
+///
+/// The dispatcher that launched this dashboard is still finishing its tick, so
+/// the read-only checks below can meet its locks on the hosting home or the
+/// fleet registry. The handshake runs only once, so a lock or a lapsed query
+/// deadline is retried for a bounded time instead of leaving the bridge
+/// unadopted. Each attempt takes the guard and checks the token again; any
+/// other refusal is final.
 pub fn adopt() -> Result<Option<Lease>> {
     Caller::from_env(None, None)?.require_operator("dashboard")?;
     let Ok(token) = std::env::var(TOKEN) else {
         return Ok(None);
     };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match adopt_once(&token) {
+            Err(error) if contended(&error) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            result => return result.map(Some),
+        }
+    }
+}
+
+/// A SQLite lock or an interrupted (deadline-bounded) query: a concurrent
+/// writer, not a refusal.
+fn contended(error: &anyhow::Error) -> bool {
+    use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked, OperationInterrupted};
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(failure.code, DatabaseBusy | DatabaseLocked | OperationInterrupted)
+        )
+    })
+}
+
+fn adopt_once(token: &str) -> Result<Lease> {
     let coord = Coordination::open_with_wait(false, true)?;
     let mut claim = coord.read()?.context("missing bridge launch claim")?;
     ensure!(
@@ -568,7 +603,7 @@ pub fn adopt() -> Result<Option<Lease>> {
     claim.adopted = true;
     claim.failures = 0;
     coord.save(&claim)?;
-    Ok(Some(Lease { _file: lease }))
+    Ok(Lease { _file: lease })
 }
 
 /// Presence of a token requests fleet-only observation. Adoption must still
