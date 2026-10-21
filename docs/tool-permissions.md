@@ -192,7 +192,7 @@ Crew and errand cards, and cards naming any other denial, offer neither.
 
 A prefix is plain words of one simple command, split on spaces and tabs:
 
-- None of `; & | < > ( ) $ ` \ ' " * ? [ ] { } ~ #`, and printable ASCII
+- None of ``; & | < > ( ) $ ` \ ' " * ? [ ] { } ~ #``, and printable ASCII
   only.
 - No assignment first (`FOO=1 make`).
 - No wrapper first: `env`, `sudo`, `xargs`, `eval`, `doas`, `su`, `exec`,

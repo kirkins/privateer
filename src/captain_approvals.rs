@@ -2205,18 +2205,43 @@ mod tests {
             json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
         )
         .unwrap();
-        for (task, owner) in [("main", "apps"), ("over", "apps"), ("theirs", "infra")] {
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"old","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        for (task, owner, charter) in [
+            ("main", "apps", "project"),
+            ("over", "apps", "project"),
+            ("theirs", "infra", "project"),
+            ("gone", "apps", "project"),
+            ("moved", "apps", "project"),
+            ("stale", "apps", "old"),
+        ] {
             crate::dispatch(
                 &mut store,
                 "task.create",
-                json!({"id":task,"charter_id":"project","owner":owner,"title":"Deliver"}),
+                json!({"id":task,"charter_id":charter,"owner":owner,"title":"Deliver"}),
             )
             .unwrap();
         }
-        store
-            .connection()
-            .execute("UPDATE tasks SET status='done' WHERE id='over'", [])
-            .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"child","parent":"gone","charter_id":"project","owner":"apps","title":"Deliver"}),
+        )
+        .unwrap();
+        // Closed four ways: done, a cancelled ancestor, handed to another
+        // ship, and a revoked charter.
+        for update in [
+            "UPDATE tasks SET status='done' WHERE id='over'",
+            "UPDATE tasks SET status='cancelled' WHERE id='gone'",
+            "UPDATE tasks SET owner='infra' WHERE id='moved'",
+        ] {
+            store.connection().execute(update, []).unwrap();
+        }
+        crate::dispatch(&mut store, "charter.revoke", json!({"id":"old"})).unwrap();
         let now = Store::now_ms();
         let hour = 3_600_000;
         for (id, ship, task, created, expires, revoked) in [
@@ -2238,6 +2263,30 @@ mod tests {
                 Some(now - hour),
             ),
             ("a-closed", "apps", "over", now - 2 * hour, now + hour, None),
+            (
+                "a-ancestor",
+                "apps",
+                "child",
+                now - 2 * hour,
+                now + hour,
+                None,
+            ),
+            (
+                "a-handed",
+                "apps",
+                "moved",
+                now - 2 * hour,
+                now + hour,
+                None,
+            ),
+            (
+                "a-charter",
+                "apps",
+                "stale",
+                now - 2 * hour,
+                now + hour,
+                None,
+            ),
             (
                 "i-live",
                 "infra",
@@ -2268,10 +2317,12 @@ mod tests {
                 row["live"].clone(),
             )
         };
-        assert_eq!(rows.len(), 5, "{listed}");
+        assert_eq!(rows.len(), 8, "{listed}");
         assert_eq!(state_of("a-expired").0, "expired");
         assert_eq!(state_of("a-revoked").0, "revoked");
-        assert_eq!(state_of("a-closed").0, "closed");
+        for id in ["a-closed", "a-ancestor", "a-handed", "a-charter"] {
+            assert_eq!(state_of(id).0, "closed", "{id}");
+        }
         for (id, ship) in [("a-live", "apps"), ("i-live", "infra")] {
             let (state, sentence, live_flag) = state_of(id);
             assert_eq!((state, live_flag), ("live", json!(true)));
@@ -2279,7 +2330,14 @@ mod tests {
             assert_eq!(carried.len(), 1);
             assert_eq!((carried[0].0.as_str(), json!(carried[0].1)), (id, sentence));
         }
-        for id in ["a-expired", "a-revoked", "a-closed"] {
+        for id in [
+            "a-expired",
+            "a-revoked",
+            "a-closed",
+            "a-ancestor",
+            "a-handed",
+            "a-charter",
+        ] {
             assert_eq!(state_of(id).1, Value::Null, "{id}");
             assert_eq!(state_of(id).2, json!(false), "{id}");
         }
