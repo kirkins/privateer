@@ -107,6 +107,13 @@ Supported typed facts:
   `evidence:"disk_floor_wait"`; other capacity waits use `capacity_wait` unless
   a stale reservation is blocking them. Workspace allocations waiting for disk
   capacity appear as `evidence:"workspace_disk_wait"` with the task as source.
+  A `remote` wait (a wait on another ship's task) that no report from the far
+  owner has ended within the waiting ship's `first_mate.remote_wait_stale_secs`
+  (default 3600) appears as `evidence:"stale_remote_wait"` with source
+  `remote_wait`, `far` `{ship, task, machine}`, `waited_ms`, and `link`
+  `{peer, heard_ms}`, when the link it rides was last heard (null if never
+  since this home began tracking it). It is shown only: the wait stays
+  `waiting` until the owner reports.
   These are last recorded runtime facts, not a live process observation. No generic
   unblock/cancel/"ok" mutation is offered: use existing guarded runtime commands
   after inspecting current evidence. Resolved facts disappear on refresh.
