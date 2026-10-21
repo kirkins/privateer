@@ -967,7 +967,10 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     );
     assert_eq!(stopped["stopped"]["upstream_pid"], Value::Null, "{stopped}");
     assert_eq!(stopped["stopped"]["running"], false);
-    assert!(alive(bystander_pid), "the forged group was signalled");
+    assert!(
+        bystander.try_wait().unwrap().is_none(),
+        "the forged group was signalled"
+    );
     let _ = bystander.kill();
     let _ = bystander.wait();
     eventually(
