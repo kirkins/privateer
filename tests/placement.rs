@@ -1155,6 +1155,53 @@ fn a_linked_machines_proposal_waits_for_the_linking_machines_check_and_keeps_the
 }
 
 #[test]
+fn clean_moved_finds_the_set_aside_folder_through_a_link_and_finishes_a_partial_delete() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("rover");
+    link(&laptop, &mac, &ssh);
+    refresh(&laptop, &ssh);
+    let moved = move_ship(&laptop, &["rover", "--here"], &ssh);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let id: String = mac
+        .conn()
+        .query_row("SELECT id FROM moves WHERE role='export'", [], |r| r.get(0))
+        .unwrap();
+    let short = &id[..8];
+    // Since then the ship moved back into its folder, which set the left
+    // folder aside; here that copy is a link to where it really is.
+    let real = mac.root.join("elsewhere");
+    fs::rename(mac.folder("rover"), &real).unwrap();
+    let aside = mac.root.join(format!("rover.left-{short}"));
+    std::os::unix::fs::symlink(&real, &aside).unwrap();
+    fs::create_dir_all(mac.folder("rover").join("projects")).unwrap();
+    fs::create_dir_all(real.join("projects")).unwrap();
+    fs::write(real.join("projects/cache.bin"), vec![0u8; 64 * 1024]).unwrap();
+    // A directory the deletion cannot empty stops it partway.
+    let stuck = real.join("projects/stuck");
+    fs::create_dir_all(&stuck).unwrap();
+    fs::write(stuck.join("file"), "x").unwrap();
+    fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
+    let failed = mac.run("fitforge", &["ship", "clean-moved", "rover"], None);
+    assert!(!failed.status.success(), "{}", text(&failed));
+    let renamed = mac.root.join(format!("elsewhere.cleaning-{short}"));
+    assert!(renamed.is_dir() && !real.exists() && !aside.exists());
+    fs::set_permissions(
+        renamed.join("projects/stuck"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    // The next clean finishes it, though its marker may be gone.
+    let cleaned = mac.ok("fitforge", "ship.clean_moved", json!({"name": "rover"}));
+    assert_eq!(cleaned["cleaned"], true, "{cleaned}");
+    assert!(cleaned["freed_bytes"].as_u64().unwrap() > 0, "{cleaned}");
+    assert!(!renamed.exists());
+    // The ship's folder is kept.
+    assert!(mac.folder("rover").join("projects").is_dir());
+    let again = mac.json("fitforge", "ship.clean_moved", json!({"name": "rover"}));
+    assert!(!again.status.success(), "{}", text(&again));
+}
+
+#[test]
 fn pressure_lasts_only_while_raised_and_stays_with_the_machine() {
     let (_temp, laptop, mac, ssh) = fixture();
     link(&laptop, &mac, &ssh);

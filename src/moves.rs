@@ -1112,8 +1112,11 @@ fn release(args: &Value) -> Result<Value> {
 }
 
 /// Delete the folder a finished move left behind here, only if its marker
-/// names that move, and say how much was freed. The machine's pressure
-/// clocks start again from now.
+/// names that move, and say how much was freed. When the ship has since
+/// moved back into that folder, the copy set aside then is the one deleted.
+/// The folder is renamed aside before anything is deleted, so a deletion
+/// that stops partway is finished by the next clean, marker or not. The
+/// machine's pressure clocks start again from now when anything was freed.
 fn clean(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     identifier(id)?;
@@ -1133,24 +1136,70 @@ fn clean(args: &Value) -> Result<Value> {
         "move {id} names no ship folder"
     );
     let folder = home.parent().context("ship folder")?.to_path_buf();
-    let cleaned = if home.is_dir() {
-        let note = left_behind(&folder, &ship)?;
-        ensure!(
-            note.as_ref().is_some_and(|n| n["move"] == id),
-            "{} is not the folder move {id} left behind; it is kept",
-            folder.display()
-        );
-        let freed = crate::placement::tree_bytes(&folder);
-        fs::remove_dir_all(&folder)?;
-        json!({"ship": ship, "folder": folder, "cleaned": true, "freed_bytes": freed})
-    } else {
-        json!({"ship": ship, "folder": folder, "cleaned": false, "freed_bytes": 0,
-            "note": "the folder was already gone"})
+    let short: String = id.chars().take(8).collect();
+    let doomed = match detail["cleaning"].as_str().map(PathBuf::from) {
+        // Renamed aside by an earlier clean that did not finish.
+        Some(aside) if aside.exists() => Some(aside),
+        _ => match marked(&folder, &ship, id, &short)? {
+            None => None,
+            Some(found) => {
+                // Through a symbolic link, the folder it names is deleted.
+                let real = if fs::symlink_metadata(&found)?.file_type().is_symlink() {
+                    fs::canonicalize(&found)?
+                } else {
+                    found.clone()
+                };
+                for member in crate::fleet::members(&conn)? {
+                    let live = fs::canonicalize(&member.home).unwrap_or(member.home.clone());
+                    ensure!(
+                        !member.home.starts_with(&real) && !live.starts_with(&real),
+                        "{} holds the home of {}, a ship here; it is kept",
+                        real.display(),
+                        member.name
+                    );
+                }
+                let aside = real.with_file_name(format!(
+                    "{}.cleaning-{short}",
+                    real.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                detail["cleaning"] = json!(aside);
+                put(&conn, id, "export", &ship, "released", &detail)?;
+                fs::rename(&real, &aside)?;
+                if found != real {
+                    fs::remove_file(&found)?;
+                }
+                Some(aside)
+            }
+        },
     };
-    crate::placement::cleaned(&conn, &ship)?;
+    let cleaned = match doomed {
+        Some(doomed) => {
+            let freed = crate::placement::tree_bytes(&doomed);
+            fs::remove_dir_all(&doomed)?;
+            json!({"ship": ship, "folder": folder, "cleaned": true, "freed_bytes": freed})
+        }
+        None => json!({"ship": ship, "folder": folder, "cleaned": false, "freed_bytes": 0,
+            "note": format!("no folder here carries move {id}'s marker; it was already gone")}),
+    };
+    crate::placement::cleaned(&conn, &ship, cleaned["freed_bytes"].as_u64().unwrap_or(0))?;
     detail["cleaned"] = cleaned.clone();
     put(&conn, id, "export", &ship, "released", &detail)?;
     Ok(cleaned)
+}
+
+/// The folder move `id` left behind: the ship's folder when its marker names
+/// the move, else the copy set aside when the ship moved back into it.
+fn marked(folder: &Path, ship: &str, id: &str, short: &str) -> Result<Option<PathBuf>> {
+    let aside = folder.with_file_name(format!(
+        "{}.left-{short}",
+        folder.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    for candidate in [folder.to_path_buf(), aside] {
+        if left_behind(&candidate, ship)?.is_some_and(|note| note["move"] == id) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// `ship.clean_moved {name}`: delete the folder a ship's last finished move

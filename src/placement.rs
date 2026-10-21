@@ -2057,10 +2057,13 @@ fn run_one(conn: &Connection, approval: &Approval, proposal: &Proposal, now: i64
     result.unwrap_or_else(|error| refused(format!("{error:#}")))
 }
 
-/// A move's old folder was deleted here: the pressure clocks start again,
-/// and this machine's proposals of that ship are no longer held for it.
-pub(crate) fn cleaned(conn: &Connection, ship: &str) -> Result<()> {
-    restart_clocks(conn)?;
+/// A move's old folder was deleted here: the pressure clocks start again
+/// when it freed anything, and this machine's proposals of that ship are no
+/// longer held for it.
+pub(crate) fn cleaned(conn: &Connection, ship: &str, freed: u64) -> Result<()> {
+    if freed > 0 {
+        restart_clocks(conn)?;
+    }
     conn.execute(
         "UPDATE placement_proposals SET record=json_set(record,'$.cleaned_ms',?2)
          WHERE home_machine IS NULL AND ship=?1 AND json_extract(record,'$.cleaned_ms') IS NULL",
@@ -2205,7 +2208,7 @@ mod tests {
         let held = holds(&conn, now).unwrap();
         assert_eq!(held.len(), 1, "{held:?}");
         assert!(held[0].contains("clean-moved rover"), "{held:?}");
-        cleaned(&conn, "rover").unwrap();
+        cleaned(&conn, "rover", 1).unwrap();
         assert!(holds(&conn, now).unwrap().is_empty());
         // A refusal when it ran cools the ship and the machine, without backoff.
         save(&conn, &open("d", "rover")).unwrap();
