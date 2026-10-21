@@ -1185,7 +1185,11 @@ fn a_bounded_crews_stdio_mcp_server_and_its_stubborn_grandchild_end_with_its_job
     let home = store.home().to_owned();
     let claude = root.join("claude-config");
     fs::create_dir(&claude).unwrap();
-    fs::write(claude.join("settings.json"), json!({"model":"exact"}).to_string()).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        json!({"model":"exact"}).to_string(),
+    )
+    .unwrap();
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
     let log = root.join("claude-argv.jsonl");
