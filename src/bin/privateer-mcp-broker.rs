@@ -127,7 +127,12 @@ fn serve_options(args: &[String]) -> Result<ServeOptions, String> {
             "--path-arguments" => {
                 path_arguments = profile::PathArguments::parse(&json(value(&mut rest, arg)?, arg)?)?
             }
-            "--routing" => routing = Some(profile::Routing::parse(&json(value(&mut rest, arg)?, arg)?)?),
+            "--routing" => {
+                routing = Some(profile::Routing::parse(&json(
+                    value(&mut rest, arg)?,
+                    arg,
+                )?)?)
+            }
             "--" => {
                 upstream = rest.by_ref().cloned().collect();
                 break;

@@ -110,11 +110,7 @@ pub fn check_stdin() -> i32 {
 impl Profile {
     pub fn parse(value: &Value) -> Result<Profile, String> {
         let map = object(value, "the profile")?;
-        known(
-            map,
-            "",
-            &["label", "upstream", "path_arguments", "routing"],
-        )?;
+        known(map, "", &["label", "upstream", "path_arguments", "routing"])?;
         let label = map
             .get("label")
             .map(|label| check_label(label))
@@ -373,7 +369,11 @@ impl Kind {
     fn parse(value: &Value) -> Result<Kind, String> {
         let at = "routing.project.kinds";
         let map = object(value, at)?;
-        known(map, "routing.project.kinds[].", &["dir_suffix", "dir_with_file"])?;
+        known(
+            map,
+            "routing.project.kinds[].",
+            &["dir_suffix", "dir_with_file"],
+        )?;
         match (map.get("dir_suffix"), map.get("dir_with_file")) {
             (Some(Value::String(suffix)), None) => {
                 let rest = suffix.strip_prefix('.').unwrap_or("");
@@ -576,7 +576,10 @@ mod tests {
         let canonical = profile.json();
         assert_eq!(canonical["routing"]["project"]["max_depth"], 3);
         assert_eq!(canonical["routing"]["project"]["skip_hidden"], false);
-        assert_eq!(canonical["path_arguments"], json!({"names": [], "suffixes": []}));
+        assert_eq!(
+            canonical["path_arguments"],
+            json!({"names": [], "suffixes": []})
+        );
         assert_eq!(Profile::parse(&canonical).unwrap(), profile);
         assert_eq!(
             profile.routing.unwrap().project.unwrap().looked_for(),
@@ -625,7 +628,10 @@ mod tests {
         );
         refused(
             &|p| {
-                p["routing"]["list"].as_object_mut().unwrap().remove("text_path");
+                p["routing"]["list"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("text_path");
             },
             "pair",
         );

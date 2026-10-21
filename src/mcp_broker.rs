@@ -257,7 +257,9 @@ impl Config {
         let upstream: Vec<String> = serde_json::from_value(config["upstream"].clone())
             .context("mcp-broker config has no upstream argv")?;
         ensure!(
-            upstream.first().is_some_and(|program| program.starts_with('/')),
+            upstream
+                .first()
+                .is_some_and(|program| program.starts_with('/')),
             "mcp-broker config upstream must start with an absolute path"
         );
         let pools: Vec<PathBuf> = match config.get("workspace_pools") {
@@ -321,7 +323,11 @@ fn install_options(home: Option<&Path>, dir: &Path, args: &[String]) -> Result<(
             "--window-open" | "--window-close" => {
                 let argv: Vec<String> = serde_json::from_str(&value()?)
                     .with_context(|| format!("{flag} takes a JSON array of strings"))?;
-                let key = if flag == "--window-open" { "open" } else { "close" };
+                let key = if flag == "--window-open" {
+                    "open"
+                } else {
+                    "close"
+                };
                 helpers.push((key, json!(argv)));
             }
             "--upstream" => {
@@ -911,7 +917,12 @@ pub(crate) fn release_workspace(store: &Store, root: &Path) -> Result<()> {
     let failures: Vec<String> = std::thread::scope(|scope| {
         let asking: Vec<_> = asked
             .iter()
-            .map(|files| (&files.name, scope.spawn(move || ask_close(files, root, deadline))))
+            .map(|files| {
+                (
+                    &files.name,
+                    scope.spawn(move || ask_close(files, root, deadline)),
+                )
+            })
             .collect();
         asking
             .into_iter()
@@ -1390,7 +1401,17 @@ mod tests {
         for good in ["fake", "two", "a", "x1-y", "abcdefghijklmnop"] {
             assert!(valid_name(good), "{good}");
         }
-        for bad in ["", "Fake", "1x", "-x", "../x", "a/b", "abcdefghijklmnopq", "a_b", "a.b"] {
+        for bad in [
+            "",
+            "Fake",
+            "1x",
+            "-x",
+            "../x",
+            "a/b",
+            "abcdefghijklmnopq",
+            "a_b",
+            "a.b",
+        ] {
             assert!(!valid_name(bad), "{bad}");
         }
     }

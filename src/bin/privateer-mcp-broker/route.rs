@@ -255,7 +255,10 @@ fn path_argument(name: &str, extra: &PathArguments) -> bool {
     PATH_NAMES.contains(&name)
         || PATH_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
         || extra.names.iter().any(|n| n == name)
-        || extra.suffixes.iter().any(|suffix| name.ends_with(suffix.as_str()))
+        || extra
+            .suffixes
+            .iter()
+            .any(|suffix| name.ends_with(suffix.as_str()))
 }
 
 /// Whether an argument names a URI: only a `file:` one is a path there.
@@ -494,9 +497,7 @@ fn scan(
         let path = entry.path();
         match matched(&path, project) {
             Some(kind) => found[kind].push(path),
-            None if depth + 1 < project.max_depth => {
-                scan(&path, depth + 1, project, found, budget)
-            }
+            None if depth + 1 < project.max_depth => scan(&path, depth + 1, project, found, budget),
             None => {}
         }
     }
@@ -505,7 +506,11 @@ fn scan(
 /// The project a proxy's `--project REL` names: inside `root`, and of one
 /// of the kinds (a file named by a `dir_with_file` kind stands for its
 /// directory). With no project kinds, any directory inside `root`.
-pub fn chosen_project(rel: &str, root: &Path, project: Option<&Project>) -> Result<PathBuf, String> {
+pub fn chosen_project(
+    rel: &str,
+    root: &Path,
+    project: Option<&Project>,
+) -> Result<PathBuf, String> {
     let shown: String = rel.chars().take(512).collect();
     let refused = || match project {
         Some(project) => format!(
@@ -524,7 +529,11 @@ pub fn chosen_project(rel: &str, root: &Path, project: Option<&Project>) -> Resu
         return Err(refused());
     }
     let Some(project) = project else {
-        return if real.is_dir() { Ok(real) } else { Err(refused()) };
+        return if real.is_dir() {
+            Ok(real)
+        } else {
+            Err(refused())
+        };
     };
     if real.is_dir() && matched(&real, project).is_some() {
         return Ok(real);
@@ -598,7 +607,10 @@ mod tests {
             &json!({"properties": {"windowId": {}, "filePath": {}}}),
             &target
         ));
-        assert!(!window_bound(&json!({"properties": {"query": {}}}), &target));
+        assert!(!window_bound(
+            &json!({"properties": {"query": {}}}),
+            &target
+        ));
         assert!(!window_bound(&Value::Null, &target));
     }
 
