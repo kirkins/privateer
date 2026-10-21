@@ -103,7 +103,10 @@ export function serverEntry(record, token) {
 /** Privateer's stdio launcher (plugins/mcp_stdio.py): the runtime's own copy, never a bundle's path. */
 export const LAUNCHER = fileURLToPath(new URL("../mcp_stdio.py", import.meta.url));
 
-/** The interpreter the launcher set for the launcher: absolute, never a PATH lookup. */
+/** The interpreter the launcher set for the launcher: absolute, never a PATH
+ *  lookup. native_launch.py sets it only for a job's launch, never a first
+ *  mate's attended pane, whose stop could leave a server running: without it
+ *  every stdio record is refused. */
 export function interpreter(env) {
   const path = env.PRIVATEER_MCP_PYTHON;
   if (typeof path !== "string" || !path.startsWith("/") || !plain(path) || !/^python/.test(path.split("/").at(-1))) throw new Error("interpreter");
@@ -125,10 +128,14 @@ export function stdioEntry(record, credentialFile, python) {
   return { name: record.name, config, source: "privateer-selected", scope: "extension" };
 }
 
-/** sha256 of a regular, non-symlink file, read just before Pi spawns it. */
+/** sha256 of a regular, non-symlink file, read just before Pi spawns it. A
+ *  #! script is refused, as plugins/bundles.py refuses it: its pin would not
+ *  cover the interpreter it runs by path. */
 export function fileDigest(path) {
   if (!lstatSync(path).isFile()) throw new Error("command");
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  const bytes = readFileSync(path);
+  if (bytes[0] === 0x23 && bytes[1] === 0x21) throw new Error("command");
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 export class UnavailableError extends Error {

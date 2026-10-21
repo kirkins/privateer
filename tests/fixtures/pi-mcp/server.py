@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Authless stdio MCP fake. JSONL markers contain no environment/credential
-values: the start marker lists the environment's names only, and PATH.
+values: the start marker lists the environment's names only, PATH, and
+its open descriptors.
 
 Modes: normal, disconnected, hang-init; stubborn starts a grandchild that
 ignores SIGTERM in this process group, escaped one that also leaves it
@@ -55,13 +56,29 @@ def started(pid):
     return stat[stat.rindex(')') + 2:].split()[19]
 
 
+def descriptors():
+    """This process's open descriptors, before it opens any: /proc/self/fd on
+    Linux, /dev/fd elsewhere. The listing's own descriptor is closed by the
+    time it returns, so only those still open are kept."""
+    directory = '/proc/self/fd' if Path('/proc/self/fd').is_dir() else '/dev/fd'
+    listed = sorted(int(name) for name in os.listdir(directory))
+    def open_(fd):
+        try:
+            os.fstat(fd)
+            return True
+        except OSError:
+            return False
+    return [fd for fd in listed if open_(fd)]
+
+
 def main():
+    fds = descriptors()
     marker, identity, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
     def record(event, **fields):
         with marker.open('a') as stream:
             stream.write(json.dumps({'event': event, **fields}) + '\n')
     record('start', pid=os.getpid(), pgid=os.getpgrp(), start=started(os.getpid()), env=sorted(os.environ),
-           path=os.environ.get('PATH'))
+           path=os.environ.get('PATH'), fds=fds)
     if mode in ('stubborn', 'escaped'):
         child = subprocess.Popen([sys.executable, '-I', '-c', STUBBORN], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

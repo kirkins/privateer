@@ -39,7 +39,11 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
     env = launch_environment()
     secrets = {}
     if bundles is not None:
-        from bundles import credential_environment
+        from bundles import credential_environment, stdio_role
+        if attended:
+            # An attended launch is a first mate's pane, never a job: its stop
+            # signals the harness pid alone, so a stdio server could outlive it.
+            stdio_role(bundles.get("mcp_servers", []), "first_mate")
         # Check every selected ref's stored file before any native probe.
         # Paths only, never values: the plan and argv carry names and refs.
         secrets = credential_environment(bundles, env)
@@ -49,9 +53,10 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
             # stdio server gets only its file's path, never a value.
             # Pi's gate and the headless Claude check both read them.
             env["PRIVATEER_MCP_SERVERS"] = json.dumps(bundles["mcp_servers"], separators=(",", ":"), sort_keys=True)
-            if harness == "pi" and any("command" in server for server in bundles["mcp_servers"]):
+            if harness == "pi" and not attended and any("command" in server for server in bundles["mcp_servers"]):
                 # Pi's gate runs each stdio server through Privateer's launcher
                 # with this interpreter, by absolute path: never a PATH lookup.
+                # A job's launch only: without it the gate refuses every stdio record.
                 from bundles import interpreter
                 env["PRIVATEER_MCP_PYTHON"] = interpreter()
     if bundles is not None and harness == "claude":
@@ -146,9 +151,13 @@ def main():
                 args = args[2:]
             launch(args[0], args[1:], control, bundles=bundles)
     except Exception as error:
+        from bundles import StdioRole
         from tool_permissions import UnsupportedYolo
         if isinstance(error, UnsupportedYolo):
             print(UnsupportedYolo.public_message, file=sys.stderr)
+            return 2
+        if isinstance(error, StdioRole):
+            print(error.public_message, file=sys.stderr)
             return 2
         print("Native harness launch failed; check the selected CLI installation locally.", file=sys.stderr)
         return 2

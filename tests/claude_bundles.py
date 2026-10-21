@@ -490,6 +490,42 @@ class ClaudeBundles(unittest.TestCase):
         self.assertNotIn('credential', json.loads(json.loads(config.read_text())['mcpServers']['xcode']['args'][2]))
         self.assertFalse([k for k in env if k.startswith('PRIVATEER_CREDENTIAL_')])
 
+    def test_a_first_mate_never_carries_a_stdio_server(self):
+        """A hosted first mate's pane is not a job: its plan and its attended
+        launch refuse a stdio server, while an HTTP one still loads."""
+        python = os.path.realpath(sys.executable)
+        with open(python, 'rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        xcode = {'name': 'xcode', 'command': [python, '-I', '/srv/mcp/server.py'], 'sha256': digest, 'timeout': 10}
+        docs = {'name': 'docs', 'url': 'https://mcp.example.test/mcp', 'credential': 'DOCS_TOKEN', 'timeout': 5}
+        self.registry['bundles'] = [
+            {'ref': 'xcode@1', 'roles': ['first_mate', 'crew'], 'mcp_servers': [xcode]},
+            {'ref': 'docs@1', 'roles': ['first_mate', 'crew'], 'mcp_servers': [docs],
+             'credentials': [{'name': 'DOCS_TOKEN', 'ref': 'docs-search'}]}]
+        message = ('stdio MCP servers run only in crew jobs, whose teardown ends them; '
+                   'first_mate launches are not jobs')
+        with self.assertRaises(bundles.StdioRole) as refused:
+            bundles.plan(self.registry, ['xcode@1'], 'first_mate', 'claude')
+        self.assertEqual(str(refused.exception), message)
+        crew = self.plan(['xcode@1'])
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe() as probe, \
+                self.assertRaises(bundles.StdioRole):
+            native_launch.launch('claude', ['claude'], bundles=crew, attended=True)
+        probe.assert_not_called()
+        execute.assert_not_called()
+        # A wake's job preflight plans as first_mate too.
+        request = {'method': 'command', 'context': {'repo': str(self.repo), 'title': 'brief', 'control': {},
+                                                    'role': 'first_mate', 'tool_bundles': crew}, 'options': {}}
+        with self.assertRaises(bundles.StdioRole):
+            handle('claude', request)
+        # HTTP servers stay for a first mate, attended included.
+        self.store('docs-search', b'SENTINEL-MCP-TOKEN\n')
+        first_mate = bundles.plan(self.registry, ['docs@1'], 'first_mate', 'claude')
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', ['claude'], bundles=first_mate, attended=True)
+        argv = execute.call_args.args[1]
+        self.assertEqual(len([a for a in argv if a.startswith('--mcp-config')]), 1)
+
     def test_stdio_pin_drift_refuses_a_claude_launch_before_its_probe(self):
         private = Path(tempfile.mkdtemp(prefix='.stdio-fixture-', dir=ROOT)).resolve()
         self.addCleanup(shutil.rmtree, private)
@@ -499,13 +535,13 @@ class ClaudeBundles(unittest.TestCase):
             if info.st_mode & 0o022 or info.st_uid not in (0, os.geteuid()):
                 self.skipTest(f'{part} is writable by others or not ours: the rule refuses every path below it')
         server = private / 'server'
-        server.write_bytes(b'#!/bin/false\n')
+        server.write_bytes(b'\x7fELF fixture\n')
         server.chmod(0o755)
         record = {'name': 'xcode', 'command': [str(server)], 'timeout': 10,
                   'sha256': hashlib.sha256(server.read_bytes()).hexdigest()}
         self.registry['bundles'] = [{'ref': 'xcode@1', 'roles': ['crew'], 'mcp_servers': [record]}]
         plan = self.plan(['xcode@1'])
-        server.write_bytes(b'#!/bin/false\n# changed\n')
+        server.write_bytes(b'\x7fELF fixture\n# changed\n')
         with patch.object(native_launch.os, 'execvpe') as execute:
             self.refuses(lambda: native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=plan))
         execute.assert_not_called()

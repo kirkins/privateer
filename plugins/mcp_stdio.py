@@ -11,10 +11,17 @@ LANG, LC_*, TMPDIR and its own credential's file path instead.
 
 exec keeps this process's pid and process group: no setsid or fork, so the
 harness's stop and the job's teardown reach the server itself.
+
+Before exec every inherited descriptor from 3 up is closed, so the server
+holds only its stdio. Where the platform execs a descriptor (Linux), the
+executable is exec'd through the very descriptor its pin was hashed from, so
+the bytes hashed are the bytes run; elsewhere (macOS) by its path, rechecked
+just before.
 """
 import json
 import os
 from pathlib import Path
+import resource
 import sys
 
 # -I leaves this script's directory off sys.path; bundles.py is beside it.
@@ -27,19 +34,32 @@ KEPT = ("HOME", "LANG", "TMPDIR")
 
 
 def spec(text):
-    """The checked SPEC and the server's environment-to-be, or a refusal."""
+    """The checked SPEC and the close-on-exec descriptor its executable was
+    hashed through, or a refusal."""
     value = json.loads(text)
     require(isinstance(value, dict) and {"command", "sha256"} <= set(value) <= {"command", "sha256", "credential"})
     require(isinstance(value["sha256"], str) and HEX.fullmatch(value["sha256"]))
-    # Path, owner, mode and content again, as close to exec as this can be.
-    require(command(value["command"]) == value["sha256"])
     credential = value.get("credential")
     if credential is not None:
         require(isinstance(credential, dict) and set(credential) == {"name", "file"}
                 and isinstance(credential["name"], str) and CREDENTIAL_NAME.fullmatch(credential["name"])
                 and isinstance(credential["file"], str) and credential["file"].startswith("/")
                 and plain(credential["file"]))
-    return value
+    # Path, owner, mode and content again, as close to exec as this can be.
+    digest, descriptor = command(value["command"], keep=True)
+    if digest != value["sha256"]:
+        os.close(descriptor)
+        require(False)
+    return value, descriptor
+
+
+def close_inherited(keep):
+    """Close every descriptor from 3 up, up to the soft open-file limit, but `keep`."""
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        soft = os.sysconf("SC_OPEN_MAX")
+    os.closerange(3, keep)
+    os.closerange(keep + 1, max(soft, keep + 1))
 
 
 def environment(inherited, credential):
@@ -53,14 +73,20 @@ def environment(inherited, credential):
 def main(argv):
     try:
         require(len(argv) == 2)
-        value = spec(argv[1])
+        value, descriptor = spec(argv[1])
     except Exception:
         # One fixed line: no path, digest or argument from the spec.
         print("privateer: stdio MCP server refused: its executable or record no longer matches its approval.",
               file=sys.stderr)
         return EXIT_REFUSED
+    env = environment(os.environ, value.get("credential"))
     try:
-        os.execve(value["command"][0], value["command"], environment(os.environ, value.get("credential")))
+        close_inherited(descriptor)
+        # The descriptor is close-on-exec, so the server never holds it.
+        if os.execve in os.supports_fd:
+            os.execve(descriptor, value["command"], env)
+        os.close(descriptor)
+        os.execve(value["command"][0], value["command"], env)
     except OSError:
         print("privateer: stdio MCP server could not start.", file=sys.stderr)
         return EXIT_REFUSED

@@ -513,8 +513,10 @@ def handle(harness, request):
     if bundles is not None:
         if request["context"].get("role") == "reviewer":
             raise ValueError("reviewer does not support tool bundles")
-        from bundles import validate_plan
+        from bundles import stdio_role, validate_plan
         validate_plan(bundles)
+        # Only a crew job's teardown ends a stdio server; a wake plans as first_mate.
+        stdio_role(bundles.get("mcp_servers", []), request["context"].get("role"))
         if harness not in ("pi", "claude") or ("claude_version" in bundles) != (harness == "claude"):
             raise ValueError("bounded resources support only Pi and Claude")
         # Claude resumes only a session the runtime recorded under this exact plan.

@@ -388,6 +388,40 @@ fn first_mate_selection_is_not_an_inherited_harness_option() {
     assert_eq!(explicit["skills"], json!([]));
 }
 
+/// A hosted first mate's pane is not a job, so its stop could leave a stdio
+/// server running: the runtime refuses one in a first mate's selection, with
+/// the adapter's reason, while HTTP servers and a crew's stdio server stay.
+#[test]
+fn a_first_mate_selection_refuses_stdio_servers_and_keeps_http() {
+    let (_temp, mut store, mut config) = fixture();
+    let python = fs::canonicalize("/usr/bin/python3").unwrap();
+    let digest = format!("{:x}", Sha256::digest(fs::read(&python).unwrap()));
+    let bundles = config["bundles"].as_array_mut().unwrap();
+    bundles.push(json!({"ref":"stdio@1","roles":["crew","first_mate"],
+        "mcp_servers":[{"name":"xcode","timeout":10,"sha256":digest,"command":[python,"-I","/srv/mcp/server.py"]}]}));
+    bundles.push(json!({"ref":"docs@1","roles":["crew","first_mate"],
+        "credentials":[{"name":"DOCS_TOKEN","ref":"docs-search"}],
+        "mcp_servers":[{"name":"docs","url":"https://mcp.example.test/mcp","credential":"DOCS_TOKEN","timeout":5}]}));
+    dispatch(&mut store, "bundle.configure", json!({"registry":config})).unwrap();
+    let profile = |selected: Value| {
+        json!({"manifest":"bundled:pi","duty_task":"task","options":{"provider":"chosen","model":"exact"},
+            "tool_bundles":selected})
+    };
+    for selected in [json!(["stdio@1"]), json!(["docs@1", "stdio@1"])] {
+        let error = privateer::activation::profile(&store, "ship", &profile(selected)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "stdio MCP servers run only in crew jobs, whose teardown ends them; \
+             first_mate launches are not jobs"
+        );
+    }
+    let validated =
+        privateer::activation::profile(&store, "ship", &profile(json!(["docs@1"]))).unwrap();
+    assert_eq!(validated["tool_bundles"], json!(["docs@1"]));
+    let crew = selected_plan(&plan(&mut store, Some(json!(["stdio@1"]))).unwrap());
+    assert_eq!(crew["mcp_servers"][0]["command"][0], json!(python));
+}
+
 #[test]
 fn claude_plan_carries_allowlist_and_resumes_only_under_its_digest() {
     let (temp, mut store, mut config) = fixture();

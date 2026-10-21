@@ -271,10 +271,12 @@ def argument(text):
     require(isinstance(text, str) and 0 < len(text) <= 4096 and plain(text) and not text.startswith('~'))
 
 
-def executable(value):
+def executable(value, keep=False):
     """The sha256 of a stdio server's executable: an absolute path, no shell or
     env, owned by root or this user at every component, none a symlink or group-
-    or world-writable, and a regular file its owner may execute."""
+    or world-writable, and a regular file its owner may execute that is not a
+    #! script. With `keep`, also the open close-on-exec descriptor it was
+    hashed through, for the launcher to exec those same bytes."""
     argument(value)
     path = Path(value)
     require(path.is_absolute() and str(path) == value and '..' not in path.parts and path.name not in SHELLS)
@@ -282,22 +284,35 @@ def executable(value):
         info = part.lstat()
         require(not stat.S_ISLNK(info.st_mode) and not info.st_mode & 0o022
                 and info.st_uid in (0, os.geteuid()))
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, 'rb') as stream:
-        info = os.fstat(stream.fileno())
-        # The file hashed is the one checked: same inode as the path's last component.
-        require(stat.S_ISREG(info.st_mode) and info.st_mode & 0o100 and info.st_size <= MAX_EXECUTABLE
-                and (info.st_dev, info.st_ino) == (path.lstat().st_dev, path.lstat().st_ino))
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+            info = os.fstat(descriptor)
+            # The file hashed is the one checked: same inode as the path's last component.
+            require(stat.S_ISREG(info.st_mode) and info.st_mode & 0o100 and info.st_size <= MAX_EXECUTABLE
+                    and (info.st_dev, info.st_ino) == (path.lstat().st_dev, path.lstat().st_ino))
+            # A #! script runs its interpreter by path, which its pin does not
+            # cover, and cannot be exec'd through a close-on-exec descriptor:
+            # pin the interpreter and pass the script as an argument instead.
+            require(os.pread(descriptor, 2, 0) != b'#!')
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if keep:
+        return digest, descriptor
+    os.close(descriptor)
+    return digest
 
 
-def command(value):
-    """A stdio server's argv, element 0 its executable: that file's sha256."""
+def command(value, keep=False):
+    """A stdio server's argv, element 0 its executable: that file's sha256
+    (and, with `keep`, its open descriptor; see executable())."""
     require(isinstance(value, list) and 0 < len(value) <= MAX_COMMAND)
     for item in value:
         argument(item)
     try:
-        return executable(value[0])
+        return executable(value[0], keep)
     except OSError:
         # Missing or unreadable: a refusal that carries no path.
         raise Refused() from None
@@ -367,6 +382,30 @@ def server_keys(servers):
     at('mcp_servers', lambda: require(len(servers) <= 8))
     keys = [server['name'].lower().replace('-', '_') for server in servers]
     at('mcp_servers.name', lambda: require(len(set(keys)) == len(keys)))
+
+
+class StdioRole(Refused):
+    """A stdio server selected for a launch that is not a crew job. A crew
+    job's teardown ends its whole session, the server included. A hosted
+    first mate's pane is not a job: sleep, approval refresh and upgrade signal
+    its harness pid alone, so a server there could outlive it. A wake plans
+    as first_mate too, and is refused with it. The role named is one of a
+    fixed set, never an input value."""
+
+    def __init__(self, role):
+        super().__init__('mcp_servers.command')
+        self.role = role
+
+    @property
+    def public_message(self):
+        return (f"stdio MCP servers run only in crew jobs, whose teardown ends them; "
+                f"{self.role} launches are not jobs")
+
+
+def stdio_role(servers, role):
+    """Refuse any stdio server unless `role` is crew; HTTP servers pass."""
+    if role != 'crew' and any(isinstance(server, dict) and 'command' in server for server in servers):
+        raise StdioRole(role if role in ('first_mate', 'reviewer') else 'non-crew')
 
 
 def credential_directory(env):
@@ -494,6 +533,8 @@ def plan(registry, selected, role, harness='pi'):
     # One name, one ref: two selected bundles cannot disagree on a variable.
     credentials(secrets)
     server_keys(servers)
+    # Plans are where every launch's servers come from: no non-crew plan carries one.
+    stdio_role(servers, role)
     if harness == 'claude':
         from claude_bundles import plan as claude_plan
         result = claude_plan(registry, selected, skills)

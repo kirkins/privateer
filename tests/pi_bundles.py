@@ -639,7 +639,7 @@ class Bundles(unittest.TestCase):
                 self.skipTest(f'{part} is writable by others or not ours: the rule refuses every path below it')
         return path
 
-    def executable_copy(self, directory, name, mode=0o755, data=b'#!/bin/false\n'):
+    def executable_copy(self, directory, name, mode=0o755, data=b'\x7fELF fixture\n'):
         path = directory / name
         path.write_bytes(data)
         path.chmod(mode)
@@ -674,9 +674,11 @@ class Bundles(unittest.TestCase):
         world, world_sha = self.executable_copy(private, 'world', mode=0o757)
         group, group_sha = self.executable_copy(private, 'group', mode=0o775)
         plain_file, plain_sha = self.executable_copy(private, 'not-executable', mode=0o644)
+        # A #! script: its pin would not cover the interpreter it runs.
+        script, script_sha = self.executable_copy(private, 'script', data=b'#!/usr/bin/python3\n')
         (private / 'directory').mkdir(mode=0o755)
         commands = [
-            ([str(link)], good_sha), ([writable_parent], open_sha), ([world], world_sha), ([group], group_sha),
+            ([script], script_sha), ([str(link)], good_sha), ([writable_parent], open_sha), ([world], world_sha), ([group], group_sha),
             ([plain_file], plain_sha), ([str(private / 'directory')], good_sha), ([str(private / 'missing')], good_sha),
             (['server'], good_sha), ([str(private) + '/./server'], good_sha), ([str(private) + '/../' + private.name + '/server'], good_sha),
             ([str(private) + '//server'], good_sha), ([], good_sha), (good, good_sha), ([good] * 33, good_sha),
@@ -710,7 +712,7 @@ class Bundles(unittest.TestCase):
         plan = bundles.plan(registry, ['xcode@1'], 'crew')
         self.assertEqual(plan['mcp_servers'], registry['bundles'][0]['mcp_servers'])
         bundles.validate_plan(plan)
-        Path(server).write_bytes(b'#!/bin/false\n# changed\n')
+        Path(server).write_bytes(b'\x7fELF fixture\n# changed\n')
         with self.assertRaises(bundles.Refused) as refused:
             bundles.plan(registry, ['xcode@1'], 'crew')
         self.assertEqual(refused.exception.field, 'mcp_servers.sha256')
@@ -752,6 +754,47 @@ class Bundles(unittest.TestCase):
         argv, launched = launch(['selected@1'])
         self.assertNotIn('PRIVATEER_MCP_PYTHON', launched)
 
+    def test_stdio_servers_plan_and_launch_only_for_crew_jobs(self):
+        """Only a crew job's teardown ends a stdio server: a first mate's plan,
+        job preflight and attended pane all refuse one. HTTP stays for every role."""
+        import native_launch
+        message = ('stdio MCP servers run only in crew jobs, whose teardown ends them; '
+                   'first_mate launches are not jobs')
+        registry = self.registry_with(self.stdio_bundle(), self.mcp_bundle())
+        crew = bundles.plan(registry, ['xcode@1'], 'crew')
+        self.assertEqual(crew['mcp_servers'], [self.stdio_record()])
+        for selected in (['xcode@1'], ['xcode@1', 'docs@1']):
+            with self.subTest(selected=selected), self.assertRaises(bundles.StdioRole) as refused:
+                bundles.plan(registry, selected, 'first_mate')
+            self.assertEqual(str(refused.exception), message)
+        # Through the adapter protocol the runtime reads, refusal text and all.
+        request = json.dumps({'id': '1', 'version': 1, 'method': 'validate', 'registry': registry,
+                              'selection': ['xcode@1'], 'role': 'first_mate', 'harness': 'pi'})
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/bundles.py')], input=request + '\n',
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(json.loads(run.stdout)['error'], message)
+        self.assertLessEqual(len(message), 200)
+        self.assertEqual(bundles.plan(registry, ['docs@1'], 'first_mate')['mcp_servers'], [self.mcp_record()])
+        # A job's preflight: a wake plans as first_mate, a reviewer never carries bundles.
+        request = {'method': 'command', 'context': {'repo': str(self.repo), 'title': 'brief', 'control': {},
+                                                    'role': 'first_mate', 'tool_bundles': crew}, 'options': {}}
+        with self.assertRaises(bundles.StdioRole):
+            handle('pi', request)
+        request['context']['role'] = 'crew'
+        self.assertIn('--tool-bundles', handle('pi', request)['argv'])
+        request['context'].update(role='first_mate', tool_bundles=bundles.plan(registry, ['docs@1'], 'first_mate'))
+        self.assertIn('--tool-bundles', handle('pi', request)['argv'])
+        # The attended pane, before any credential, probe or harness.
+        with patch.dict(os.environ, self.env, clear=True), self.probe() as probe, \
+                patch.object(native_launch.os, 'execvpe') as execute, self.assertRaises(bundles.StdioRole):
+            native_launch.launch('pi', ['pi'], bundles=crew, attended=True)
+        probe.assert_not_called()
+        execute.assert_not_called()
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/native_launch.py'), '--tool-bundles', json.dumps(crew),
+                              '--attended-policy', '{"mode":"standard","claude_allow":[]}', 'pi', 'pi'],
+                             env=self.env, cwd=self.repo, capture_output=True, text=True, timeout=30)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (2, '', message + '\n'))
+
     def test_stdio_launcher_execs_only_the_pinned_command_with_a_minimal_environment(self):
         server = ROOT / 'tests/fixtures/pi-mcp/server.py'
         marker = self.base / 'launched.jsonl'
@@ -767,11 +810,16 @@ class Bundles(unittest.TestCase):
                    'CLAUDE_CODE_MESSAGING_TOKEN': 'SENTINEL-MESSAGING', 'PRIVATEER_MCP_SERVERS': '[]',
                    'PRIVATEER_CREDENTIAL_OTHER_FILE': '/fleet/other', 'PYTHONPATH': str(self.base),
                    'DEVELOPER_DIR': '/Applications/Xcode.app'}
-        run = subprocess.run(argv, env=harness, capture_output=True, text=True, timeout=30)
+        # A harness's descriptors beyond stdio: the launcher closes them all.
+        inherited = [os.open(os.devnull, os.O_RDONLY) for _ in range(3)]
+        for fd in inherited:
+            self.addCleanup(os.close, fd)
+        run = subprocess.run(argv, env=harness, capture_output=True, text=True, timeout=30, pass_fds=inherited)
         self.assertEqual(run.returncode, 0, run.stderr)
         start = json.loads(marker.read_text().splitlines()[0])
         self.assertEqual(start['env'], ['HOME', 'LANG', 'LC_ALL', 'PATH', 'PRIVATEER_CREDENTIAL_XCODE_TOKEN_FILE', 'TMPDIR'])
         self.assertEqual(start['path'], '/usr/bin:/bin')
+        self.assertEqual(start['fds'], [0, 1, 2])
         # exec in place: the harness's child is the server, in the harness's group.
         self.assertEqual(start['pgid'], os.getpgrp())
         # Any drift or unexpected record refuses with one fixed line, before the server starts.
