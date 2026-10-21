@@ -319,7 +319,11 @@ fn proposal_row(r: &rusqlite::Row) -> rusqlite::Result<(Proposal, String)> {
     ))
 }
 
-fn proposals(conn: &Connection, condition: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Proposal>> {
+fn proposals(
+    conn: &Connection,
+    condition: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Proposal>> {
     let mut statement = conn.prepare(&format!(
         "SELECT {PROPOSAL_COLUMNS} FROM placement_proposals WHERE {condition}
          ORDER BY updated_ms DESC LIMIT 64"
@@ -398,11 +402,9 @@ fn binding(record: &Value) -> String {
 /// reaches it, `collected` when it reaches this one.
 fn role(conn: &Connection, machine: &str) -> Result<Option<String>> {
     Ok(conn
-        .query_row(
-            "SELECT role FROM machines WHERE name=?1",
-            [machine],
-            |r| r.get(0),
-        )
+        .query_row("SELECT role FROM machines WHERE name=?1", [machine], |r| {
+            r.get(0)
+        })
         .optional()?)
 }
 
@@ -502,7 +504,12 @@ fn ensure_holds(conn: &Connection) -> Result<()> {
 
 // ---- Eligibility and targets ------------------------------------------------
 
-fn count(conn: &Connection, table: &str, condition: &str, args: &[&dyn rusqlite::ToSql]) -> Result<i64> {
+fn count(
+    conn: &Connection,
+    table: &str,
+    condition: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> Result<i64> {
     if !has_table(conn, table)? {
         return Ok(0);
     }
@@ -595,7 +602,7 @@ pub(crate) fn eligibility(conn: &Connection, ship: &str, now: i64) -> Result<Val
     if crate::machines::owner(conn)?.as_deref() == Some(ship) {
         reasons.push("it is this machine's owner".into());
     }
-    if crate::door::is_liaison(&member.home) {
+    if crate::machines::captain_home(conn)?.is_some_and(|(captain, _)| captain == ship) {
         reasons.push("it is the captain's home (the liaison)".into());
     }
     let last_worked: Option<i64> = if has_table(db, "wakes")? {
@@ -609,11 +616,13 @@ pub(crate) fn eligibility(conn: &Connection, ship: &str, now: i64) -> Result<Val
     };
     let folder = member.home.parent().context("ship folder")?;
     let project_bytes = tree_bytes(&folder.join("projects"));
-    Ok(json!({"ship": ship, "eligible": reasons.is_empty(), "reasons": reasons,
+    Ok(
+        json!({"ship": ship, "eligible": reasons.is_empty(), "reasons": reasons,
         "folder_bytes": inspected["folder_bytes"], "project_bytes": project_bytes,
         "project_count": inspected["project_count"], "requires": inspected["requires"],
         "first_mate": inspected["first_mate"], "projects": inspected["projects"],
-        "last_worked_ms": last_worked, "jobs_last_day": jobs_last_day(&store, now)}))
+        "last_worked_ms": last_worked, "jobs_last_day": jobs_last_day(&store, now)}),
+    )
 }
 
 /// A ship's share of the host ledger's last day of jobs.
@@ -821,7 +830,7 @@ fn placement(store: &Store) -> Result<Value> {
         "proposals": recent.iter().map(|p| p.record.clone()).collect::<Vec<_>>()}))
 }
 
-/// `ship.propose_move {ship, to, why}`, for the machine's owner only: check
+/// `ship.propose_move {name, to, why}`, for the machine's owner only: check
 /// the holds, the ship and the target again, get the target's live check,
 /// and write one captain decision; or, when the target reaches this machine
 /// and cannot be asked from here, wait for its next pass to check.
@@ -835,7 +844,8 @@ fn propose(store: &Store, args: &Value) -> Result<Value> {
         crate::machines::owner(&conn)?.as_deref() == Some(owner.as_str()),
         "ship.propose_move is for this machine's owner; {owner} is not it"
     );
-    let ship = required(args, "ship")?;
+    // `name`, as ship.move takes it: an agent's `ship` argument names itself.
+    let ship = required(args, "name")?;
     identifier(ship)?;
     let to = required(args, "to")?;
     identifier(to)?;
@@ -852,7 +862,11 @@ fn propose(store: &Store, args: &Value) -> Result<Value> {
         )
     })?;
     let held = holds(&conn, now)?;
-    ensure!(held.is_empty(), "nothing is proposed now: {}", held.join("; "));
+    ensure!(
+        held.is_empty(),
+        "nothing is proposed now: {}",
+        held.join("; ")
+    );
     let eligible = eligibility(&conn, ship, now)?;
     ensure!(
         eligible["eligible"] == true,
@@ -909,7 +923,11 @@ fn propose(store: &Store, args: &Value) -> Result<Value> {
     // One open proposal per machine, decided under the registry's write lock.
     let tx = immediate(&conn)?;
     let held = holds(&tx, now)?;
-    ensure!(held.is_empty(), "nothing is proposed now: {}", held.join("; "));
+    ensure!(
+        held.is_empty(),
+        "nothing is proposed now: {}",
+        held.join("; ")
+    );
     save(&tx, &proposal)?;
     tx.commit()?;
     if proposal.state == "open"
@@ -919,13 +937,15 @@ fn propose(store: &Store, args: &Value) -> Result<Value> {
         return Err(error);
     }
     store.audit("placement.proposed", &proposal.record)?;
-    Ok(json!({"proposal": id, "state": proposal.state, "ship": ship, "to": to,
+    Ok(
+        json!({"proposal": id, "state": proposal.state, "ship": ship, "to": to,
         "decision": proposal.record["decision"],
         "note": if reaches {
             "The captain has the decision; nothing moves without the captain's yes."
         } else {
             "The target reaches this machine and checks at its next pass; the decision is written once it answers."
-        }}))
+        }}),
+    )
 }
 
 /// The arguments of a target's `move.check` for a proposal.
@@ -939,7 +959,11 @@ fn check_request(record: &Value) -> Value {
 /// proposal has the same shape, written from the owner on its duty task.
 fn write_decision(owner_store: &Store, proposal: &Proposal) -> Result<()> {
     let record = &proposal.record;
-    let (ship, from, to) = (proposal.text("ship"), proposal.text("from"), proposal.text("to"));
+    let (ship, from, to) = (
+        proposal.text("ship"),
+        proposal.text("from"),
+        proposal.text("to"),
+    );
     let owner = proposal.text("owner");
     let carries = &record["carries"];
     let folder = carries["folder_bytes"].as_u64().unwrap_or(0);
@@ -1042,7 +1066,9 @@ pub(crate) fn answered(store: &Store, request: &str, reply: &Value) {
             return Ok(None);
         };
         let facts = &thread["payload"]["placement"];
-        if thread["kind"] != "decision" || thread["to"] != crate::mail::CAPTAIN || !facts.is_object()
+        if thread["kind"] != "decision"
+            || thread["to"] != crate::mail::CAPTAIN
+            || !facts.is_object()
         {
             return Ok(None);
         }
@@ -1065,8 +1091,10 @@ pub(crate) fn answered(store: &Store, request: &str, reply: &Value) {
              ON CONFLICT(proposal) DO NOTHING",
             params![id, ship, from, to, binding, choice, now, now + APPROVAL_MS],
         )?;
-        Ok(Some(json!({"proposal": id, "ship": ship, "from": from, "to": to,
-            "cleanup": choice, "reply": reply["id"]})))
+        Ok(Some(
+            json!({"proposal": id, "ship": ship, "from": from, "to": to,
+            "cleanup": choice, "reply": reply["id"]}),
+        ))
     })();
     match result {
         Ok(Some(approval)) => {
@@ -1350,8 +1378,8 @@ fn accept_check(conn: &Connection, from: &str, id: &str, answer: &Value) -> Resu
     }
     ensure!(answer.is_object(), "a check answer is an object");
     let carries = &proposal.record["carries"];
-    let bytes =
-        carries["folder_bytes"].as_u64().unwrap_or(0) + carries["project_bytes"].as_u64().unwrap_or(0);
+    let bytes = carries["folder_bytes"].as_u64().unwrap_or(0)
+        + carries["project_bytes"].as_u64().unwrap_or(0);
     if let Some(refused) = check_refusal(answer, bytes, from) {
         conclude(conn, id, "unfit", json!({"why": refused}))?;
         return Ok(());
@@ -1441,9 +1469,7 @@ fn conclude(conn: &Connection, id: &str, state: &str, outcome: Value) -> Result<
         );
     }
     if let Err(error) = notify(conn, &proposal) {
-        eprintln!(
-            "privateer: proposal {id} closed as {state}, but its notices failed: {error:#}"
-        );
+        eprintln!("privateer: proposal {id} closed as {state}, but its notices failed: {error:#}");
     }
     Ok(true)
 }
@@ -1464,7 +1490,11 @@ fn pin_by_captain(conn: &Connection, ship: &str) -> Result<()> {
 
 /// The sentence a closed proposal ends with.
 fn outcome_text(proposal: &Proposal) -> String {
-    let (ship, from, to) = (proposal.text("ship"), proposal.text("from"), proposal.text("to"));
+    let (ship, from, to) = (
+        proposal.text("ship"),
+        proposal.text("from"),
+        proposal.text("to"),
+    );
     let outcome = &proposal.record["outcome"];
     let why = outcome["why"].as_str().unwrap_or("no reason given");
     match proposal.state.as_str() {
@@ -1603,7 +1633,9 @@ pub(crate) fn upkeep(conn: &Connection, owner_store: &Store) -> Result<Value> {
                                 None
                             }
                             "never" => Some(("never", json!({"why": "the captain said never"}))),
-                            "not_now" => Some(("not_now", json!({"why": "the captain said not now"}))),
+                            "not_now" => {
+                                Some(("not_now", json!({"why": "the captain said not now"})))
+                            }
                             _ => Some((
                                 "not_now",
                                 json!({"why": "the captain answered without choosing a move"}),
@@ -1617,7 +1649,10 @@ pub(crate) fn upkeep(conn: &Connection, owner_store: &Store) -> Result<Value> {
                 }
             }
             "approved"
-                if now - proposal.record["approved_seen_ms"].as_i64().unwrap_or(proposal.updated_ms)
+                if now
+                    - proposal.record["approved_seen_ms"]
+                        .as_i64()
+                        .unwrap_or(proposal.updated_ms)
                     >= LAPSE_MS =>
             {
                 Some((
@@ -1745,14 +1780,21 @@ fn run_approvals(conn: &Connection) -> Result<Vec<Value>> {
             }
             Some(_) => {
                 let (next, kept) = (state.clone(), outcome.clone());
-                update(conn, &proposal.id, &["open", "approved", "moving"], move |p| {
-                    p.record["outcome"] = kept;
-                    p.state = next;
-                })?;
+                update(
+                    conn,
+                    &proposal.id,
+                    &["open", "approved", "moving"],
+                    move |p| {
+                        p.record["outcome"] = kept;
+                        p.state = next;
+                    },
+                )?;
             }
         }
-        ran.push(json!({"proposal": proposal.id, "ship": approval.ship, "state": state,
-            "outcome": outcome}));
+        ran.push(
+            json!({"proposal": proposal.id, "ship": approval.ship, "state": state,
+            "outcome": outcome}),
+        );
     }
     Ok(ran)
 }
@@ -1764,7 +1806,9 @@ fn run_approvals(conn: &Connection) -> Result<Vec<Value>> {
 fn run_one(conn: &Connection, approval: &Approval, proposal: &Proposal, now: i64) -> Value {
     let refused = |why: String| json!({"state": "refused", "why": why});
     if now > approval.expires_ms {
-        return refused("the captain's yes lapsed: it waited more than 6 hours for this machine".into());
+        return refused(
+            "the captain's yes lapsed: it waited more than 6 hours for this machine".into(),
+        );
     }
     let matches = binding(&proposal.record) == approval.binding
         && proposal.record["binding"] == json!(approval.binding)
@@ -1887,7 +1931,11 @@ mod tests {
     #[test]
     fn only_disk_alerts_count_and_a_cleared_one_starts_over() {
         let conn = registry();
-        note_pressure(&conn, &["disk_floor", "capacity_wait", "route:fast", "load"]).unwrap();
+        note_pressure(
+            &conn,
+            &["disk_floor", "capacity_wait", "route:fast", "load"],
+        )
+        .unwrap();
         let keys = pressure_keys(&conn);
         assert_eq!(keys, vec!["disk_floor"]);
         conn.execute("UPDATE machine_pressure SET raised_ms=1", [])
@@ -1980,7 +2028,10 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert!(until - now >= 2 * DAY_MS - MINUTE_MS, "an expiry counts as not now");
+        assert!(
+            until - now >= 2 * DAY_MS - MINUTE_MS,
+            "an expiry counts as not now"
+        );
         // A move resets the backoff, and holds until the folder is cleaned.
         save(&conn, &open("c", "rover")).unwrap();
         conclude(&conn, "c", "moved", json!({"cleaned": false})).unwrap();

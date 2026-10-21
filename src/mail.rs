@@ -220,7 +220,8 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
         }
     }
     // When it last moved is stamped by the move itself, never by a put.
-    if let Some(moved) = ship(store, name)?.and_then(|existing| existing.get("last_moved_ms").cloned())
+    if let Some(moved) =
+        ship(store, name)?.and_then(|existing| existing.get("last_moved_ms").cloned())
     {
         record["last_moved_ms"] = moved;
     }

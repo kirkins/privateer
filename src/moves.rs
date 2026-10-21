@@ -1168,7 +1168,9 @@ fn clean_moved(args: &Value) -> Result<Value> {
             |r| r.get(0),
         )
         .optional()?
-        .with_context(|| format!("no folder {ship} left behind on this machine waits to be cleaned"))?;
+        .with_context(|| {
+            format!("no folder {ship} left behind on this machine waits to be cleaned")
+        })?;
     let mut cleaned = clean(&json!({"id": id}))?;
     cleaned["move"] = json!(id);
     Ok(cleaned)

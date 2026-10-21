@@ -117,6 +117,58 @@ impl Machine {
             .unwrap()
     }
 
+    /// One dispatcher pass in a ship's home.
+    fn pass(&self, ship: &str, ssh: Option<&Path>) -> Value {
+        let output = self.run(ship, &["serve", "--json", r#"{"once":true}"#], ssh);
+        assert!(output.status.success(), "{}", text(&output));
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .next_back()
+            .unwrap_or(Value::Null)
+    }
+
+    /// A command as the agent `actor`, which may reach the other machine.
+    fn agent_via(&self, actor: &str, command: &str, args: Value, ssh: &Path) -> Output {
+        self.run(
+            actor,
+            &[
+                command,
+                "--json",
+                &args.to_string(),
+                "--role",
+                "agent",
+                "--actor",
+                actor,
+            ],
+            Some(ssh),
+        )
+    }
+
+    /// A command as the agent `actor` that must succeed.
+    fn agent_ok(&self, actor: &str, command: &str, args: Value) -> Value {
+        let output = self.as_agent(actor, command, args);
+        assert!(output.status.success(), "{command}: {}", text(&output));
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn conn(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.registry()).unwrap()
+    }
+
+    /// A ship's own database.
+    fn home_conn(&self, ship: &str) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.folder(ship).join(".privateer/privateer.sqlite")).unwrap()
+    }
+
+    /// Messages in a ship's home addressed to `address`.
+    fn inbox(&self, ship: &str, address: &str) -> Vec<Value> {
+        self.ok(ship, "mail.inbox", json!({"address": address}))["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
     /// A script under this machine's root, for a probe to run.
     fn script(&self, name: &str, body: &str) -> String {
         let path = self.root.join(name);
@@ -692,4 +744,926 @@ fn a_check_reports_and_changes_nothing() {
     assert!(mac.moves().is_empty(), "{:?}", mac.moves());
     assert!(!mac.folder("scout").exists());
     assert!(laptop.run("scout", &["status"], None).status.success());
+}
+
+// ---- Owner-proposed moves ------------------------------------------------
+
+/// Name `owner` this machine's owner and give it a lasting disk alert: a
+/// floor no disk meets, counted as persistent at once.
+fn press(machine: &Machine, folder: &str, owner: &str, ssh: Option<&Path>) {
+    machine.ship(owner);
+    let named = machine.run(folder, &["machine", "owner", owner], None);
+    assert!(named.status.success(), "{}", text(&named));
+    machine.ok(
+        folder,
+        "resource.configure",
+        json!({"min_free_disk_bytes": 1_u64 << 60, "pressure_after_secs": 0}),
+    );
+    machine.pass(owner, ssh);
+}
+
+/// One row of a registry's proposals: (state, record).
+fn proposal(machine: &Machine, id: &str) -> (String, Value) {
+    machine
+        .conn()
+        .query_row(
+            "SELECT state, record FROM placement_proposals WHERE id=?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    serde_json::from_str(&r.get::<_, String>(1)?).unwrap(),
+                ))
+            },
+        )
+        .unwrap()
+}
+
+fn approvals(machine: &Machine) -> Vec<(String, Option<i64>, Option<String>)> {
+    let conn = machine.conn();
+    let mut statement = conn
+        .prepare("SELECT proposal, used_ms, origin FROM placement_approvals ORDER BY proposal")
+        .unwrap();
+    statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The laptop's owner proposes moving scout to the Mac, which the laptop
+/// reaches, and the decision waits for the captain: (proposal, decision).
+fn proposed_on_laptop(laptop: &Machine, mac: &Machine, ssh: &Path) -> (String, String) {
+    link(laptop, mac, ssh);
+    press(laptop, "liaison", "upkeep", Some(ssh));
+    refresh(laptop, ssh);
+    let proposed = propose_ok(
+        &laptop,
+        json!({"name": "scout", "to": "mac", "why": "the build caches filled the disk"}),
+        ssh,
+    );
+    assert_eq!(proposed["state"], "open", "{proposed}");
+    (
+        proposed["proposal"].as_str().unwrap().to_owned(),
+        proposed["decision"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// The laptop owner's proposal, which must be accepted.
+fn propose_ok(laptop: &Machine, args: Value, ssh: &Path) -> Value {
+    let output = laptop.agent_via("upkeep", "ship.propose_move", args, ssh);
+    assert!(output.status.success(), "{}", text(&output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn answer(machine: &Machine, decision: &str, option: &str, ssh: Option<&Path>) {
+    let request = json!({"id": decision, "payload": {"answer": {"option_id": option}}}).to_string();
+    let answered = machine.run("liaison", &["captain.reply", "--json", &request], ssh);
+    assert!(answered.status.success(), "{}", text(&answered));
+}
+
+#[test]
+fn a_lasting_disk_alert_lets_the_owner_propose_and_the_captains_yes_moves_the_ship_once() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    link(&laptop, &mac, &ssh);
+    press(&laptop, "liaison", "upkeep", Some(&ssh));
+    refresh(&laptop, &ssh);
+
+    // The owner sees the pressure, the eligible ships and where they could go.
+    let placement = laptop.agent_ok("upkeep", "ship.placement", json!({}));
+    assert_eq!(placement["persistent"], true, "{placement}");
+    assert_eq!(placement["pressure"][0]["key"], "disk_floor", "{placement}");
+    let ship = |name: &str| {
+        placement["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["ship"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(ship("scout")["eligible"], true, "{placement}");
+    assert_eq!(ship("scout")["targets"][0]["machine"], "mac", "{placement}");
+    assert_eq!(ship("scout")["targets"][0]["eligible"], true, "{placement}");
+    assert!(
+        ship("liaison")["reasons"]
+            .to_string()
+            .contains("the captain's home (the liaison)"),
+        "{placement}"
+    );
+    assert!(
+        ship("upkeep")["reasons"]
+            .to_string()
+            .contains("this machine's owner"),
+        "{placement}"
+    );
+    // Only the owner proposes or reads it.
+    let stranger = laptop.as_agent("scout", "ship.placement", json!({}));
+    assert!(!stranger.status.success());
+
+    let proposed = propose_ok(
+        &laptop,
+        json!({"name": "scout", "to": "mac", "why": "the build caches filled the disk"}),
+        &ssh,
+    );
+    assert_eq!(proposed["state"], "open", "{proposed}");
+    let id = proposed["proposal"].as_str().unwrap().to_owned();
+    let decision = proposed["decision"].as_str().unwrap().to_owned();
+    // One open proposal per machine.
+    let second = laptop.agent_via(
+        "upkeep",
+        "ship.propose_move",
+        json!({"name": "scout", "to": "mac", "why": "again"}),
+        &ssh,
+    );
+    assert!(!second.status.success());
+    assert!(
+        text(&second).contains("one proposal is open at a time"),
+        "{}",
+        text(&second)
+    );
+    // The decision has the runtime's shape.
+    let asked = laptop
+        .inbox("upkeep", "captain")
+        .into_iter()
+        .find(|m| m["id"] == decision.as_str())
+        .unwrap();
+    assert_eq!(asked["kind"], "decision");
+    assert!(
+        asked["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("**Move scout from laptop to mac?** laptop has been below its disk floor"),
+        "{asked}"
+    );
+    let options: Vec<&str> = asked["payload"]["decision"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(options, ["move_clean", "move_keep", "not_now", "never"]);
+    assert_eq!(asked["payload"]["placement"]["id"], id.as_str());
+
+    // Nothing moves before the yes.
+    laptop.pass("liaison", Some(&ssh));
+    assert!(laptop.folder("scout").exists());
+
+    answer(&laptop, &decision, "move_clean", Some(&ssh));
+    assert_eq!(approvals(&laptop).len(), 1);
+    let ran = laptop.pass("liaison", Some(&ssh));
+    assert_eq!(ran["placement"][0]["state"], "moved", "{ran}");
+    let arrived = mac.ok("scout", "ship.show", json!({"name": "scout"}));
+    assert_eq!(arrived["location"], "here", "{arrived}");
+    assert!(arrived["last_moved_ms"].as_i64().is_some(), "{arrived}");
+    // The old folder was deleted, and the pressure clock starts again.
+    assert!(!laptop.folder("scout").exists());
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "moved", "{record}");
+    assert_eq!(record["outcome"]["cleaned"], true, "{record}");
+    let restarted: Option<i64> = laptop
+        .conn()
+        .query_row("SELECT restarted_ms FROM machine_pressure", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(restarted.is_some());
+    // The owner and the captain heard how it ended, on the decision's thread.
+    let told = laptop.inbox("upkeep", "captain");
+    let outcome = told
+        .iter()
+        .find(|m| m["correlation"] == decision.as_str() && m["kind"] == "notice")
+        .unwrap();
+    assert!(
+        outcome["body"]
+            .as_str()
+            .unwrap()
+            .contains("scout moved from laptop to mac"),
+        "{outcome}"
+    );
+    assert!(
+        laptop
+            .inbox("upkeep", "upkeep")
+            .iter()
+            .any(|m| m["body"].as_str().unwrap_or("").contains("scout moved")),
+    );
+
+    // A replayed approval does not move it twice.
+    let moves_before = laptop.moves().len();
+    laptop
+        .conn()
+        .execute("UPDATE placement_approvals SET used_ms=NULL", [])
+        .unwrap();
+    laptop.pass("liaison", Some(&ssh));
+    assert_eq!(laptop.moves().len(), moves_before);
+    assert_eq!(proposal(&laptop, &id).0, "moved");
+}
+
+#[test]
+fn a_linked_machines_proposal_waits_for_the_linking_machines_check_and_keeps_the_folder() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("rover");
+    link(&laptop, &mac, &ssh);
+    press(&mac, "fitforge", "upkeep", None);
+    // The laptop's exchange tells the Mac its room and what it calls the Mac.
+    refresh(&laptop, &ssh);
+    let placement = mac.agent_ok("upkeep", "ship.placement", json!({}));
+    let rover = placement["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["ship"] == "rover")
+        .unwrap()
+        .clone();
+    assert_eq!(rover["targets"][0]["machine"], "laptop", "{placement}");
+    assert_eq!(rover["targets"][0]["runs_move"], "laptop", "{placement}");
+    assert_eq!(rover["targets"][0]["eligible"], true, "{placement}");
+
+    let proposed = mac.agent_ok(
+        "upkeep",
+        "ship.propose_move",
+        json!({"name": "rover", "to": "laptop", "why": "simulator images filled the disk"}),
+    );
+    assert_eq!(proposed["state"], "checking", "{proposed}");
+    let id = proposed["proposal"].as_str().unwrap().to_owned();
+    assert!(proposed["decision"].is_null());
+
+    // The laptop learns of it and checks on its next pass; the answer goes
+    // back on the one after, and only then is the decision written.
+    let collect = || {
+        let collected = laptop.run("liaison", &["machine", "collect"], Some(&ssh));
+        assert!(collected.status.success(), "{}", text(&collected));
+    };
+    collect();
+    assert_eq!(proposal(&mac, &id).0, "checking");
+    collect();
+    let (state, record) = proposal(&mac, &id);
+    assert_eq!(state, "open", "{record}");
+    assert_eq!(record["from"], "mac", "{record}");
+    let decision = record["decision"].as_str().unwrap().to_owned();
+    // It reached the captain's desk on the laptop.
+    assert!(
+        laptop
+            .inbox("liaison", "captain")
+            .iter()
+            .any(|m| m["id"] == decision.as_str())
+    );
+
+    answer(&laptop, &decision, "move_keep", Some(&ssh));
+    let ran = laptop.pass("liaison", Some(&ssh));
+    assert_eq!(ran["placement"][0]["state"], "moved", "{ran}");
+    let arrived = laptop.ok("rover", "ship.show", json!({"name": "rover"}));
+    assert_eq!(arrived["location"], "here", "{arrived}");
+    // The Mac learns how it ended, keeps the folder and holds proposals.
+    collect();
+    let (state, record) = proposal(&mac, &id);
+    assert_eq!(state, "moved", "{record}");
+    assert!(mac.folder("rover").exists());
+    let placement = mac.agent_ok("upkeep", "ship.placement", json!({}));
+    assert!(
+        placement["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h.as_str().unwrap().contains("clean-moved rover")),
+        "{placement}"
+    );
+    let cleaned = mac.run("fitforge", &["ship", "clean-moved", "rover"], None);
+    assert!(cleaned.status.success(), "{}", text(&cleaned));
+    assert!(text(&cleaned).contains("is deleted"), "{}", text(&cleaned));
+    assert!(!mac.folder("rover").exists());
+    let placement = mac.agent_ok("upkeep", "ship.placement", json!({}));
+    assert!(
+        placement["holds"].as_array().unwrap().is_empty(),
+        "{placement}"
+    );
+}
+
+#[test]
+fn pressure_lasts_only_while_raised_and_stays_with_the_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    link(&laptop, &mac, &ssh);
+    laptop.ship("upkeep");
+    laptop.run("liaison", &["machine", "owner", "upkeep"], None);
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes": 1_u64 << 60}),
+    );
+    laptop.pass("upkeep", Some(&ssh));
+    let placement = laptop.agent_ok("upkeep", "ship.placement", json!({}));
+    assert_eq!(placement["pressure"][0]["key"], "disk_floor", "{placement}");
+    assert_eq!(placement["persistent"], false, "{placement}");
+    let refused = laptop.agent_via(
+        "upkeep",
+        "ship.propose_move",
+        json!({"name": "scout", "to": "mac", "why": "full"}),
+        &ssh,
+    );
+    assert!(
+        text(&refused).contains("not under persistent disk pressure"),
+        "{}",
+        text(&refused)
+    );
+
+    // Held four hours (backdated), it is persistent, and the owner is told once.
+    let backdate = |conn: &rusqlite::Connection| {
+        conn.execute(
+            "UPDATE machine_pressure SET raised_ms=raised_ms-5*3600*1000",
+            [],
+        )
+        .unwrap();
+    };
+    backdate(&laptop.conn());
+    laptop.pass("upkeep", Some(&ssh));
+    laptop.pass("upkeep", Some(&ssh));
+    let lasting: Vec<Value> = laptop
+        .inbox("upkeep", "upkeep")
+        .into_iter()
+        .filter(|m| m["payload"]["lasting"] == true)
+        .collect();
+    assert_eq!(lasting.len(), 1, "{lasting:?}");
+    assert!(
+        lasting[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("This has lasted 5 hours; `ship.placement` lists ships"),
+        "{lasting:?}"
+    );
+    assert_eq!(
+        laptop.agent_ok("upkeep", "ship.placement", json!({}))["persistent"],
+        true
+    );
+
+    // The owner going away and coming back leaves the clock as it was.
+    let raised = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row("SELECT raised_ms FROM machine_pressure", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = raised(&laptop.conn());
+    laptop.run("liaison", &["machine", "owner", "--clear"], None);
+    laptop.pass("upkeep", Some(&ssh));
+    laptop.run("liaison", &["machine", "owner", "upkeep"], None);
+    laptop.pass("upkeep", Some(&ssh));
+    assert_eq!(raised(&laptop.conn()), before);
+
+    // Cleared and raised again, it starts over.
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes": 0}),
+    );
+    laptop.pass("upkeep", Some(&ssh));
+    let gone: i64 = laptop
+        .conn()
+        .query_row("SELECT COUNT(*) FROM machine_pressure", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(gone, 0);
+    laptop.ok(
+        "liaison",
+        "resource.configure",
+        json!({"min_free_disk_bytes": 1_u64 << 60}),
+    );
+    laptop.pass("upkeep", Some(&ssh));
+    assert!(raised(&laptop.conn()) > before + 4 * 3600 * 1000);
+    assert_eq!(
+        laptop.agent_ok("upkeep", "ship.placement", json!({}))["persistent"],
+        false
+    );
+}
+
+#[test]
+fn each_eligibility_rule_keeps_a_ship_from_being_proposed() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    link(&laptop, &mac, &ssh);
+    press(&laptop, "liaison", "upkeep", Some(&ssh));
+    let now = || -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let duty = |ship: &str| -> String {
+        laptop.ok(ship, "ship.show", json!({"name": ship}))["first_mate"]["duty_task"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let rules: &[(&str, &str)] = &[
+        ("woke", "its first mate woke within the last hour"),
+        ("working", "of its tasks running"),
+        ("queued", "scheduled work ready or running"),
+        ("deferred", "deferred tasks due within a day"),
+        ("pinned", "pinned by captain"),
+        ("arrived", "moved here"),
+        ("cooling", "refused when it ran"),
+    ];
+    for (ship, _) in rules {
+        laptop.ship(ship);
+    }
+    laptop
+        .home_conn("woke")
+        .execute(
+            "INSERT INTO wakes(id, ship, focus, through_seq, mode, status, created_ms)
+             VALUES('w', 'woke', 'duty', 0, 'headless', 'finished', ?1)",
+            [now()],
+        )
+        .unwrap();
+    laptop
+        .home_conn("working")
+        .execute(
+            "UPDATE tasks SET status='running' WHERE id=?1",
+            [duty("working")],
+        )
+        .unwrap();
+    for (ship, state, not_before) in [
+        ("queued", "ready", 0),
+        ("deferred", "waiting", now() + 3_600_000),
+    ] {
+        let conn = laptop.home_conn(ship);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_schedule(task_id TEXT PRIMARY KEY REFERENCES tasks(id),record TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_schedule(task_id, record) VALUES(?1, ?2)",
+            [
+                duty(ship),
+                json!({"owner": ship, "state": state, "not_before_ms": not_before}).to_string(),
+            ],
+        )
+        .unwrap();
+    }
+    laptop.ok(
+        "liaison",
+        "ship.requires",
+        json!({"name": "pinned", "pinned": "the signing keychain"}),
+    );
+    laptop
+        .home_conn("arrived")
+        .execute(
+            "UPDATE ships SET record=json_set(record,'$.last_moved_ms',?1) WHERE name='arrived'",
+            [now() - 3_600_000],
+        )
+        .unwrap();
+    laptop
+        .conn()
+        .execute(
+            "INSERT INTO placement_cooldowns(ship, until_ms) VALUES('cooling', ?1)",
+            [now() + 3_600_000],
+        )
+        .unwrap();
+
+    let placement = laptop.agent_ok("upkeep", "ship.placement", json!({}));
+    for (ship, reason) in rules {
+        let entry = placement["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["ship"] == *ship)
+            .unwrap();
+        assert_eq!(entry["eligible"], false, "{ship}: {entry}");
+        assert!(
+            entry["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap().contains(reason)),
+            "{ship}: {entry}"
+        );
+        let refused = laptop.agent_via(
+            "upkeep",
+            "ship.propose_move",
+            json!({"name": ship, "to": "mac", "why": "full"}),
+            &ssh,
+        );
+        assert!(!refused.status.success(), "{ship}");
+        assert!(
+            text(&refused).contains("may not be proposed"),
+            "{}",
+            text(&refused)
+        );
+    }
+    // scout, idle and unpinned, still is.
+    let scout = placement["ships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["ship"] == "scout")
+        .unwrap();
+    assert_eq!(scout["eligible"], true, "{scout}");
+}
+
+#[test]
+fn a_target_under_pressure_or_without_room_or_reached_through_a_third_is_never_listed() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    link(&laptop, &mac, &ssh);
+    press(&laptop, "liaison", "upkeep", Some(&ssh));
+    // The Mac under pressure itself.
+    mac.ship("macowner");
+    mac.run("fitforge", &["machine", "owner", "macowner"], None);
+    mac.ok(
+        "fitforge",
+        "resource.configure",
+        json!({"min_free_disk_bytes": 1_u64 << 60}),
+    );
+    mac.pass("macowner", None);
+    refresh(&laptop, &ssh);
+    let targets = |laptop: &Machine| {
+        laptop.agent_ok("upkeep", "ship.placement", json!({}))["ships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["ship"] == "scout")
+            .unwrap()["targets"]
+            .clone()
+    };
+    let listed = targets(&laptop);
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["eligible"], false, "{listed}");
+    let why = listed[0]["why"].to_string();
+    assert!(
+        why.contains("under disk pressure itself (disk_floor)"),
+        "{why}"
+    );
+    assert!(why.contains("has no room"), "{why}");
+    let refused = laptop.agent_via(
+        "upkeep",
+        "ship.propose_move",
+        json!({"name": "scout", "to": "mac", "why": "full"}),
+        &ssh,
+    );
+    assert!(
+        text(&refused).contains("mac cannot host scout"),
+        "{}",
+        text(&refused)
+    );
+    // Only machines at the other end of a link are listed at all.
+    let far = laptop.agent_via(
+        "upkeep",
+        "ship.propose_move",
+        json!({"name": "scout", "to": "studio", "why": "full"}),
+        &ssh,
+    );
+    assert!(
+        text(&far).contains("studio is not linked with this machine"),
+        "{}",
+        text(&far)
+    );
+}
+
+#[test]
+fn not_now_backs_off_and_never_pins_the_ship_for_the_captain() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "not_now", Some(&ssh));
+    // The owner's pass reads the answer.
+    laptop.pass("upkeep", Some(&ssh));
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "not_now", "{record}");
+    let placement = laptop.agent_ok("upkeep", "ship.placement", json!({}));
+    assert!(
+        placement["holds"][0]
+            .as_str()
+            .unwrap()
+            .contains("not now (1 in a row); nothing is proposed for another"),
+        "{placement}"
+    );
+    // A second "not now" doubles it: an expired proposal counts as one.
+    laptop
+        .conn()
+        .execute("UPDATE placement_holds SET backoff_until_ms=0", [])
+        .unwrap();
+    let again = propose_ok(
+        &laptop,
+        json!({"name": "scout", "to": "mac", "why": "still full"}),
+        &ssh,
+    );
+    let second = again["proposal"].as_str().unwrap().to_owned();
+    laptop
+        .conn()
+        .execute(
+            "UPDATE placement_proposals SET created_ms=created_ms-49*3600*1000 WHERE id=?1",
+            [&second],
+        )
+        .unwrap();
+    laptop.pass("upkeep", Some(&ssh));
+    assert_eq!(proposal(&laptop, &second).0, "expired");
+    let streak: (i64, i64) = laptop
+        .conn()
+        .query_row(
+            "SELECT not_now, backoff_until_ms FROM placement_holds",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(streak.0, 2);
+    // The decision itself was closed as expired.
+    let asked = laptop
+        .inbox("upkeep", "captain")
+        .into_iter()
+        .find(|m| m["id"] == again["decision"])
+        .unwrap();
+    assert_eq!(asked["state"], "expired", "{asked}");
+
+    // "Never this ship" pins it for the captain.
+    laptop
+        .conn()
+        .execute("UPDATE placement_holds SET backoff_until_ms=0", [])
+        .unwrap();
+    let third = propose_ok(
+        &laptop,
+        json!({"name": "scout", "to": "mac", "why": "full again"}),
+        &ssh,
+    );
+    answer(
+        &laptop,
+        third["decision"].as_str().unwrap(),
+        "never",
+        Some(&ssh),
+    );
+    laptop.pass("upkeep", Some(&ssh));
+    assert_eq!(
+        proposal(&laptop, third["proposal"].as_str().unwrap()).0,
+        "never"
+    );
+    let scout = laptop.ok("scout", "ship.show", json!({"name": "scout"}));
+    assert_eq!(scout["pinned"]["by"], "captain", "{scout}");
+    assert_eq!(scout["pinned"]["reason"], "the captain declined moving it");
+    let unpin = laptop.as_agent(
+        "scout",
+        "ship.requires",
+        json!({"name": "scout", "pinned": null}),
+    );
+    assert!(!unpin.status.success());
+    assert!(approvals(&laptop).is_empty(), "no answer here was a yes");
+}
+
+#[test]
+fn a_changed_lapsed_or_busy_approval_moves_nothing_and_cools_down() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "move_clean", Some(&ssh));
+    // The proposal changed after the yes: a different check answer in its record.
+    laptop
+        .conn()
+        .execute(
+            "UPDATE placement_proposals SET record=json_set(record,'$.check.met',json('[\"forged\"]'))",
+            [],
+        )
+        .unwrap();
+    let ran = laptop.pass("liaison", Some(&ssh));
+    assert_eq!(ran["placement"][0]["state"], "refused", "{ran}");
+    assert!(laptop.folder("scout").exists());
+    assert!(laptop.moves().is_empty(), "{:?}", laptop.moves());
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "refused");
+    assert!(
+        record["outcome"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("no longer matches what the captain approved"),
+        "{record}"
+    );
+    // The ship cools down a day, the machine six hours, without backoff.
+    let placement = laptop.agent_ok("upkeep", "ship.placement", json!({}));
+    let holds = placement["holds"].to_string();
+    assert!(holds.contains("refused when it ran"), "{holds}");
+    assert!(!holds.contains("not now"), "{holds}");
+    // The captain was told why, on the decision's thread.
+    assert!(
+        laptop
+            .inbox("upkeep", "captain")
+            .iter()
+            .any(|m| m["correlation"] == decision.as_str()
+                && m["body"].as_str().unwrap().contains("scout was not moved"))
+    );
+}
+
+#[test]
+fn a_lapsed_yes_or_a_ship_that_became_busy_is_not_moved() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "move_keep", Some(&ssh));
+    laptop
+        .conn()
+        .execute("UPDATE placement_approvals SET expires_ms=1", [])
+        .unwrap();
+    laptop.pass("liaison", Some(&ssh));
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "refused");
+    assert!(
+        record["outcome"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("lapsed"),
+        "{record}"
+    );
+    assert!(laptop.folder("scout").exists());
+
+    // Another proposal, approved, then the ship's first mate wakes.
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (id, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    answer(&laptop, &decision, "move_keep", Some(&ssh));
+    laptop
+        .home_conn("scout")
+        .execute(
+            "INSERT INTO wakes(id, ship, focus, through_seq, mode, status, created_ms)
+             VALUES('w', 'scout', 'duty', 0, 'headless', 'running', 1)",
+            [],
+        )
+        .unwrap();
+    laptop.pass("liaison", Some(&ssh));
+    let (state, record) = proposal(&laptop, &id);
+    assert_eq!(state, "refused", "{record}");
+    assert!(
+        record["outcome"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("scout is no longer eligible: not idle"),
+        "{record}"
+    );
+    assert!(laptop.moves().is_empty(), "{:?}", laptop.moves());
+}
+
+#[test]
+fn only_the_operators_own_reply_or_the_desks_exchange_approves() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let (_, decision) = proposed_on_laptop(&laptop, &mac, &ssh);
+    // A ship cannot write a decision that looks like a proposal, nor speak
+    // as the captain.
+    let forged = laptop.as_agent(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "decision", "body": "move me",
+            "payload": {"placement": {"id": "x"}, "decision": {"question": "q", "options": [
+                {"id": "move_clean", "label": "a", "what_happens": "b"},
+                {"id": "not_now", "label": "c", "what_happens": "d"}]}}}),
+    );
+    assert!(
+        text(&forged).contains("payload.placement is set by the runtime"),
+        "{}",
+        text(&forged)
+    );
+    let as_captain = laptop.as_agent(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "upkeep", "kind": "reply", "correlation": decision,
+            "payload": {"answer": {"option_id": "move_clean"}}}),
+    );
+    assert!(!as_captain.status.success());
+    assert!(approvals(&laptop).is_empty());
+
+    // An approval the Mac holds is ignored by the laptop: the desk is here.
+    let insert = |conn: &rusqlite::Connection, id: &str| {
+        conn.execute(
+            "INSERT INTO placement_approvals(proposal, ship, from_machine, to_machine, binding,
+               cleanup, approved_ms, expires_ms) VALUES(?1, 'scout', 'laptop', 'mac', ?2,
+               'move_clean', ?3, ?4)",
+            rusqlite::params![id, "a".repeat(64), i64::MAX / 4, i64::MAX / 2],
+        )
+        .unwrap();
+    };
+    insert(&mac.conn(), "from-mac");
+    refresh(&laptop, &ssh);
+    assert!(
+        approvals(&laptop).iter().all(|(id, _, _)| id != "from-mac"),
+        "{:?}",
+        approvals(&laptop)
+    );
+    // The Mac takes the laptop's, which holds its desk.
+    insert(&laptop.conn(), "from-laptop");
+    refresh(&laptop, &ssh);
+    assert!(
+        approvals(&mac)
+            .iter()
+            .any(|(id, _, origin)| id == "from-laptop" && origin.as_deref() == Some("laptop")),
+        "{:?}",
+        approvals(&mac)
+    );
+    // With the desk moved to the Mac, the laptop takes the Mac's.
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    refresh(&laptop, &ssh);
+    assert!(
+        approvals(&laptop)
+            .iter()
+            .any(|(id, _, origin)| id == "from-mac" && origin.as_deref() == Some("mac")),
+        "{:?}",
+        approvals(&laptop)
+    );
+}
+
+/// A fake ssh into the Mac whose gateway answers `refused` commands as an
+/// older privateer would, and passes every other request on.
+fn old_mac_ssh(mac: &Machine, refused: &[&str]) -> PathBuf {
+    let proxy = mac.root.join("old-ssh");
+    fs::write(
+        &proxy,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, subprocess, sys
+remote = sys.argv[-1]
+env = {{"HOME": "{root}", "PATH": "{root}/bin:/usr/bin:/bin",
+       "PRIVATEER_FLEET": "{root}/fleet.sqlite", "PRIVATEER_RESOURCE_HOME": "{root}/ledger"}}
+refused = {refused:?}
+child = subprocess.Popen(["/bin/sh", "-c", remote], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, env=env, text=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("command") in refused:
+        print(json.dumps({{"id": request.get("id"), "ok": False,
+                          "error": "unknown move command " + request["command"]}}), flush=True)
+        continue
+    child.stdin.write(line)
+    child.stdin.flush()
+    print(child.stdout.readline(), end="", flush=True)
+child.stdin.close()
+child.wait()
+"#,
+            root = mac.root.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&proxy, fs::Permissions::from_mode(0o755)).unwrap();
+    proxy
+}
+
+#[test]
+fn an_older_peer_is_named_rather_than_shown_as_an_unknown_command() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    define(&laptop, &["xcode", "--declared-only"]);
+    link(&laptop, &mac, &ssh);
+    let old = old_mac_ssh(&mac, &["move.check", "move.inspect"]);
+
+    // A target too old to check says so, and with no needs the move is only unchecked.
+    let checked = move_ship(&laptop, &["scout", "--to", "mac", "--check"], &old);
+    assert!(checked.status.success(), "{}", text(&checked));
+    assert!(
+        text(&checked).contains("unchecked: mac runs an older privateer"),
+        "{}",
+        text(&checked)
+    );
+    laptop.ok(
+        "liaison",
+        "ship.requires",
+        json!({"name": "scout", "requires": ["xcode"]}),
+    );
+    let refused = move_ship(&laptop, &["scout", "--to", "mac"], &old);
+    assert!(!refused.status.success());
+    let said = text(&refused);
+    assert!(
+        said.contains("mac runs an older privateer that cannot check what scout requires (xcode); upgrade privateer on mac"),
+        "{said}"
+    );
+    assert!(!said.contains("unknown move command"), "{said}");
+    assert!(laptop.moves().is_empty());
+
+    // A ship's machine too old to be asked is reported unchecked, not hidden.
+    mac.ship("rover");
+    refresh(&laptop, &ssh);
+    let back = move_ship(&laptop, &["rover", "--here", "--check"], &old);
+    assert!(back.status.success(), "{}", text(&back));
+    let said = text(&back);
+    assert!(
+        said.contains("unchecked: mac cannot be asked before the move"),
+        "{said}"
+    );
+    assert!(said.contains("folder: unknown"), "{said}");
+}
+
+#[test]
+fn a_creator_cannot_clear_the_captains_pin() {
+    let (_temp, laptop, _mac, _ssh) = fixture();
+    // The liaison made scout, so it manages scout without a grant.
+    laptop
+        .conn()
+        .execute(
+            "UPDATE ships SET created_by='liaison' WHERE name='scout'",
+            [],
+        )
+        .unwrap();
+    laptop.ok(
+        "liaison",
+        "ship.requires",
+        json!({"name": "scout", "pinned": "the signing keychain"}),
+    );
+    let refused = laptop.as_agent(
+        "liaison",
+        "ship.requires",
+        json!({"name": "scout", "pinned": null}),
+    );
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused).contains("the captain pinned this ship; only the captain unpins it"),
+        "{}",
+        text(&refused)
+    );
+    // Its requirements are still the creator's to change.
+    let changed = laptop.as_agent(
+        "liaison",
+        "ship.requires",
+        json!({"name": "scout", "requires": []}),
+    );
+    assert!(changed.status.success(), "{}", text(&changed));
 }

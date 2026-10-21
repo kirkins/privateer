@@ -166,6 +166,10 @@ that point, so one build's writing cannot read as a machine filling up. When the
 would reach the floor within `disk_warn_horizon_secs` (default 24 hours), the
 owner is mailed a notice with the rate and the hours left.
 
+Either disk alert raised continuously for `pressure_after_secs` (default 4
+hours) is lasting pressure: the owner is told once, and may propose moving one
+idle ship to a linked machine (see owner-proposed moves in the architecture).
+
 The warning has hysteresis: once raised it clears only when the time to the floor
 is more than twice the horizon, so a forecast hovering at the horizon does not
 flap. While the floor alarm is up, a raised warning stays raised rather than being

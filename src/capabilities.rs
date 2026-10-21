@@ -849,8 +849,11 @@ mod tests {
         .unwrap();
         assert_eq!(defined_on(&conn).unwrap().as_deref(), Some("alpha"));
         // With every linker quiet, the one heard last.
-        conn.execute("UPDATE machines SET refreshed_ms=refreshed_ms-?1", [3 * QUIET_MS])
-            .unwrap();
+        conn.execute(
+            "UPDATE machines SET refreshed_ms=refreshed_ms-?1",
+            [3 * QUIET_MS],
+        )
+        .unwrap();
         conn.execute(
             "UPDATE machines SET refreshed_ms=?1 WHERE name='studio'",
             [now - 2 * QUIET_MS],
@@ -862,7 +865,11 @@ mod tests {
     #[test]
     fn a_probe_the_exchange_cut_short_is_not_cached() {
         let conn = registry();
-        put(&conn, &json!({"name": "slow", "probe": {"argv": ["sleep", "2"]}})).unwrap();
+        put(
+            &conn,
+            &json!({"name": "slow", "probe": {"argv": ["sleep", "2"]}}),
+        )
+        .unwrap();
         let names = vec!["slow".to_owned()];
         let verdicts = evaluate(&conn, &names, false, Duration::from_millis(200)).unwrap();
         assert_eq!(verdicts[0].1, Err(CUT_SHORT.to_owned()));
@@ -873,9 +880,11 @@ mod tests {
         // With its full time, it answers, and the answer is cached.
         refresh(&conn);
         let met: bool = conn
-            .query_row("SELECT met FROM machine_offers WHERE name='slow'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT met FROM machine_offers WHERE name='slow'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(met);
     }

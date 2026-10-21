@@ -2,8 +2,12 @@
 
 Status: a proposal (captain findings 5 and 6, task `privateer-ship-placement`),
 revised after design review. Declared needs (PR 1) are implemented as described,
-except that `ship.create` does not yet refuse a machine missing a need; owner
-proposals (PR 2) are not. It builds on [ship
+except that `ship.create` does not yet refuse a machine missing a need. Owner
+proposals (PR 2) are implemented as described, with the captain's decisions 2,
+3, 4 and 6 as recommended; the approved move runs inside one dispatcher pass,
+and the captain's answers are read where the proposal's owner is (a forged
+"not now" or "never" can only hold a ship back). `ship.propose_move` takes the
+ship as `name`, since an agent's `ship` argument always names itself. It builds on [ship
 moves and machine owners in the architecture](../architecture.md#linked-machines),
 the [flotillas proposal](flotillas.md) (machine owners, the disk floor) and the
 [cross-machine fleet proposal](cross-machine-fleet.md) (links and gateways).
