@@ -57,7 +57,7 @@ pub fn workspace_root(cwd: &Path, pools: &[PathBuf]) -> Option<PathBuf> {
 /// points at the array of windows in the result; a text item that parses as
 /// JSON is read the same way, and, since MCP mirrors `structuredContent` in
 /// a text item, also with the pointer's leading `/structuredContent`
-/// dropped. With `text_target` and `text_path`, text lines name windows
+/// dropped, or as the list itself when it is a bare array. With `text_target` and `text_path`, text lines name windows
 /// too. All window parsing is here and in `filter_windows`, which shares its
 /// pieces.
 pub fn windows(result: &Value, list: &List) -> Vec<(String, String)> {
@@ -144,8 +144,10 @@ pub fn filter_windows(result: &mut Value, list: &List, keep: impl Fn(&str, &str)
     }
 }
 
-/// The pointers a text item's JSON is read with: `list.items`, and that
-/// pointer below `/structuredContent`, whose mirror a text item is.
+/// The pointers a text item's JSON is read with: `list.items`, that
+/// pointer below `/structuredContent`, whose mirror a text item is, and
+/// the whole JSON, so a bare array of windows is filtered too rather than
+/// passed on whole.
 fn text_pointers(list: &List) -> Vec<&str> {
     let mut pointers = vec![list.items.as_str()];
     if let Some(rest) = list.items.strip_prefix("/structuredContent") {
@@ -153,6 +155,7 @@ fn text_pointers(list: &List) -> Vec<&str> {
             pointers.push(rest);
         }
     }
+    pointers.push("");
     pointers
 }
 
@@ -598,6 +601,13 @@ mod tests {
         bare.items = "/structuredContent/open".into();
         let elsewhere = json!({"structuredContent": {"open": [{"windowId": "t8", "root": "/r"}]}});
         assert_eq!(windows(&elsewhere, &bare), [("t8".into(), "/r".into())]);
+        // A text item that is a bare array of windows is the list itself.
+        let mut array = json!({"content": [{"type": "text", "text":
+            "[{\"windowId\":\"t6\",\"root\":\"/w/a/F\"},{\"windowId\":\"t7\",\"root\":\"/w/b/G\"}]"}]});
+        assert_eq!(windows(&array, &list).len(), 2);
+        filter_windows(&mut array, &list, |_, path| path.starts_with("/w/a/"));
+        assert_eq!(windows(&array, &list), [("t6".into(), "/w/a/F".into())]);
+        assert!(!array.to_string().contains("/w/b/G"), "{array}");
     }
 
     #[test]
