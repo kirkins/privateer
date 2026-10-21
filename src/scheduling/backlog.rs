@@ -198,6 +198,54 @@ fn candidates(store: &Store, ship: &str, duty: &str) -> Result<Vec<Candidate>> {
             label,
         });
     }
+    // Remote waits no report has ended past the ship's staleness threshold:
+    // nothing will start them until the far owner answers or the first mate
+    // decides otherwise.
+    let now = Store::now_ms();
+    let mut statement = store.connection().prepare(&format!(
+        "SELECT t.id, t.title, t.rank FROM task_schedule s JOIN tasks t ON t.id=s.task_id
+           LEFT JOIN ships sh ON sh.name=json_extract(s.record,'$.owner')
+         WHERE t.owner=?1 AND json_extract(s.record,'$.owner')=?1 AND t.handoff_to IS NULL
+           AND {} ORDER BY t.rank IS NULL, t.rank, t.rowid LIMIT ?3",
+        super::remote::stale_where("?2")
+    ))?;
+    let stale = statement
+        .query_map(params![ship, now, CANDIDATES], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (id, title, rank) in stale {
+        if held_above(store, &id)? {
+            continue;
+        }
+        let item = super::remote::stale_item(store, &id, now)?;
+        let far = &item["far"];
+        let heard = match item["link"]["heard_ms"].as_i64() {
+            Some(at) => format!("last heard {} min ago", now.saturating_sub(at) / 60_000),
+            None => "not heard".to_owned(),
+        };
+        let machine = far["machine"]
+            .as_str()
+            .map(|m| format!(" on {m}"))
+            .unwrap_or_default();
+        set.push(Candidate {
+            id,
+            title,
+            rank,
+            revision: item["revision"].as_u64().unwrap_or(0),
+            label: format!(
+                "stale remote wait: {} min on {} of {}{machine}, link {heard}",
+                item["waited_ms"].as_i64().unwrap_or(0) / 60_000,
+                far["task"].as_str().unwrap_or(""),
+                far["ship"].as_str().unwrap_or("")
+            ),
+        });
+    }
     Ok(set)
 }
 
@@ -579,6 +627,48 @@ mod tests {
         ));
         assert!(!high.contains("write assignment"));
         assert!(high.len() < 2_048, "{}", high.len());
+    }
+
+    #[test]
+    fn a_stale_remote_wait_is_a_candidate_naming_the_far_end() {
+        let (_temp, store) = crate::scheduling::fixture::home();
+        crate::scheduling::fixture::schedule(
+            &store,
+            "waiting",
+            Some(json!({"kind":"remote","reason":"needs it",
+                "ref":{"ship":"apps","task":"far-work","machine":"studio"}})),
+        );
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='blocked' WHERE id='work-1'", [])
+            .unwrap();
+        assert!(candidates(&store, "infra", "").unwrap().is_empty());
+        store
+            .connection()
+            .execute(
+                "UPDATE task_schedule SET record=json_set(record,'$.subscription.since_ms',?1)",
+                [Store::now_ms() - 2 * 3_600_000],
+            )
+            .unwrap();
+        let set = candidates(&store, "infra", "").unwrap();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].id, "work-1");
+        assert!(
+            set[0]
+                .label
+                .starts_with("stale remote wait: 120 min on far-work of apps on studio"),
+            "{}",
+            set[0].label
+        );
+        // Resolved, it is no longer one.
+        store
+            .connection()
+            .execute(
+                "UPDATE task_schedule SET record=json_set(record,'$.wait.end',json('{}'))",
+                [],
+            )
+            .unwrap();
+        assert!(candidates(&store, "infra", "").unwrap().is_empty());
     }
 
     #[test]

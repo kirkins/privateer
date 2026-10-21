@@ -2180,6 +2180,11 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
                 _ => Ok(collected),
             });
             schedule(&conn, &machine, outcome.is_ok())?;
+            // Contacted again after failing: the link is back, and every home
+            // here resyncs the cross-ship waits that ride it.
+            if outcome.is_ok() && machine.failures > 0 {
+                link_back(&conn, &machine.name);
+            }
             out.push(outcome.unwrap_or_else(
                 |error| json!({"machine": machine.name, "error": format!("{error:#}")}),
             ));
@@ -2189,6 +2194,23 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
     work().map(Value::from).unwrap_or_else(
         |error| json!([{"error": format!("{error:#}").chars().take(2_000).collect::<String>()}]),
     )
+}
+
+/// Resync the cross-ship waits of every home here that ride the link to
+/// `machine`. Best effort: a home that cannot be opened now resyncs when its
+/// own calls hear the link.
+fn link_back(conn: &Connection, machine: &str) {
+    let peer = peer_name(machine);
+    for member in crate::fleet::members(conn).unwrap_or_default() {
+        if !member.home.is_dir() {
+            continue;
+        }
+        if let Err(error) =
+            Store::open(&member.home).and_then(|store| crate::waits::link_back(&store, &peer))
+        {
+            eprintln!("privateer: could not resync waits over {peer}: {error:#}");
+        }
+    }
 }
 
 /// The home here that hosts a ship.
@@ -2331,6 +2353,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     continue;
                 }
                 let store = Store::open(&member.home)?;
+                // The collecting machine's call is the link heard; after a
+                // silence, the waits that ride it resync.
+                if let Err(error) = crate::waits::heard(&store, &peer) {
+                    eprintln!("privateer: could not record link {peer}: {error:#}");
+                }
                 for captain in [false, true] {
                     if captain && !wants_captain {
                         continue;

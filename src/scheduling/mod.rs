@@ -38,6 +38,27 @@ struct Scheduled {
     /// remote task's final status. Shown in the next offer's prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resumed_by: Option<String>,
+    /// The subscription a live remote wait holds with the far owner: its
+    /// nonce, carried in `wait_subscribe` and echoed in the owner's answers,
+    /// and when it began, for staleness. None for every other wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription: Option<Subscription>,
+    /// Faults recorded in this revision, so each one has its own notice.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    faults: u32,
+}
+
+/// One generation of a remote wait's subscription. A wait that is re-deferred
+/// onto the same far task gets a new nonce, so a late answer to the old one
+/// cannot resolve the new one.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct Subscription {
+    nonce: String,
+    since_ms: i64,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 mod backlog;
@@ -51,7 +72,10 @@ pub(crate) use backlog::{
 pub use commands::dispatch;
 pub(crate) use delivery::tick;
 pub(crate) use observation::{fault_item, snapshot};
-pub(crate) use remote::{deliver_notice as remote_notice, settle};
+pub(crate) use remote::{
+    STALE_SECS as REMOTE_WAIT_STALE_SECS, deliver_notice as remote_notice, resubscribe, settle,
+    stale_item as remote_wait_item, stale_where as remote_wait_stale_where,
+};
 
 pub(crate) fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -92,9 +116,11 @@ fn load(store: &Store, task: &str) -> Result<Option<Scheduled>> {
 }
 
 fn save(store: &Store, work: &Scheduled) -> Result<()> {
-    let raw = serde_json::to_string(work)?;
+    // The stored subscription follows the wait, whatever copy the caller holds.
+    let mut work = work.clone();
+    remote::sync(store, load(store, &work.task_id)?.as_ref(), &mut work)?;
+    let raw = serde_json::to_string(&work)?;
     ensure!(raw.len() <= 65_536, "task schedule exceeds byte bound");
-    remote::sync(store, load(store, &work.task_id)?.as_ref(), work)?;
     store.connection().execute(
         "INSERT INTO task_schedule(task_id,record) VALUES(?1,?2) ON CONFLICT(task_id) DO UPDATE SET record=excluded.record",
         params![work.task_id, raw])?;
@@ -129,18 +155,29 @@ fn finish_wake(store: &Store, work: &Scheduled, status: &str, now: i64) -> Resul
     Ok(())
 }
 
-/// Faults are recorded in the caller's transaction. The owner's notice has a
-/// per-revision id, so a repeated fault of the same schedule sends nothing new.
+/// Faults are recorded in the caller's transaction. Each fault has its own
+/// notice to the owner, even a second one in the same revision; the same
+/// fault recorded again on a schedule already faulted with that reason sends
+/// nothing new. The first fault of a revision keeps the original id.
 fn fault(store: &Store, work: &mut Scheduled, reason: impl Into<String>, now: i64) -> Result<()> {
+    let reason: String = reason.into().chars().take(1000).collect();
+    let repeated = work.state == "fault" && work.reason.as_deref() == Some(reason.as_str());
+    if !repeated || work.faults == 0 {
+        work.faults = work.faults.saturating_add(1);
+    }
     work.state = "fault".into();
-    work.reason = Some(reason.into().chars().take(1000).collect());
+    work.reason = Some(reason);
     finish_wake(store, work, "failed", now)?;
+    let id = match work.faults {
+        1 => format!("scheduling-fault-{}-{}", work.task_id, work.revision),
+        n => format!("scheduling-fault-{}-{}-{n}", work.task_id, work.revision),
+    };
     crate::mail::record_crew(
         store.connection(),
-        &json!({"id": format!("scheduling-fault-{}-{}", work.task_id, work.revision),
+        &json!({"id": id,
             "to": work.owner, "kind": "notice", "task_id": work.task_id, "urgency": "high",
             "body": format!("Scheduled task {} faulted: {}", work.task_id, work.reason.as_deref().unwrap_or("")),
-            "payload": {"scheduling_fault": work.task_id, "revision": work.revision}}),
+            "payload": {"scheduling_fault": work.task_id, "revision": work.revision, "fault": work.faults}}),
     )?;
     Ok(())
 }
@@ -189,6 +226,8 @@ pub(crate) fn park_on_ask(store: &Store, task: &str, ask: &str, reason: &str) ->
     work.state = "waiting".into();
     work.wait = Some(json!({"kind": "request", "ref": ask, "reason": reason}));
     work.reason = Some(reason.chars().take(1000).collect());
+    // An earlier resume's reason must not be shown when this wait ends.
+    work.resumed_by = None;
     work.not_before_ms = 0;
     work.last_checked_ms = now;
     save(store, &work)?;
@@ -214,6 +253,7 @@ pub(crate) fn hold(store: &Store, task: &str, reason: &str) -> Result<bool> {
     work.state = "stopped".into();
     work.wait = Some(json!({"kind": "manual", "reason": reason}));
     work.reason = Some(reason.chars().take(1000).collect());
+    work.resumed_by = None;
     work.last_checked_ms = Store::now_ms();
     save(store, &work)?;
     store.connection().execute(
@@ -567,4 +607,94 @@ fn stopped_ancestor(store: &Store, task: &str) -> Result<Option<String>> {
         next = store.task(&id)?["parent"].as_str().map(str::to_owned);
     }
     bail!("task ancestry exceeds scheduling limit")
+}
+
+#[cfg(test)]
+pub(super) mod fixture {
+    use super::*;
+
+    /// A home with a charter and one task of `infra`, `work-1`.
+    pub(in crate::scheduling) fn home() -> (tempfile::TempDir, Store) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&root.join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"work-1","charter_id":"project","owner":"infra","title":"Work"}),
+        )
+        .unwrap();
+        (temp, store)
+    }
+
+    /// `work-1` scheduled in `state` with `wait`, saved as the runtime would.
+    pub(in crate::scheduling) fn schedule(store: &Store, state: &str, wait: Option<Value>) {
+        let now = Store::now_ms();
+        let work = Scheduled {
+            task_id: "work-1".into(),
+            owner: "infra".into(),
+            revision: 1,
+            brief: "Continue.".into(),
+            state: state.into(),
+            wait,
+            not_before_ms: 0,
+            offer_id: None,
+            holder: None,
+            job_id: None,
+            profile: None,
+            charter_hash: None,
+            attempts: 0,
+            created_ms: now,
+            last_checked_ms: now,
+            lease_until_ms: 0,
+            reason: None,
+            resumed_by: None,
+            subscription: None,
+            faults: 0,
+        };
+        save(store, &work).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `work-1` as a far task's `done` reopened it: ready, with the resume's
+    /// reason for its next offer.
+    fn resumed(store: &Store) {
+        fixture::schedule(store, "ready", None);
+        let mut work = load(store, "work-1").unwrap().unwrap();
+        work.resumed_by = Some("Remote task far-work of apps ended done".into());
+        work.reason.clone_from(&work.resumed_by);
+        save(store, &work).unwrap();
+    }
+
+    #[test]
+    fn parking_on_an_ask_forgets_an_earlier_resume() {
+        let (_temp, store) = fixture::home();
+        resumed(&store);
+        assert!(park_on_ask(&store, "work-1", "ask-1", "tool permission: Bash(x)").unwrap());
+        let work = load(&store, "work-1").unwrap().unwrap();
+        assert_eq!(work.state, "waiting");
+        assert!(work.resumed_by.is_none(), "{:?}", work.resumed_by);
+    }
+
+    #[test]
+    fn the_captains_hold_forgets_an_earlier_resume() {
+        let (_temp, store) = fixture::home();
+        resumed(&store);
+        assert!(hold(&store, "work-1", "the captain stopped it").unwrap());
+        let work = load(&store, "work-1").unwrap().unwrap();
+        assert_eq!(work.state, "stopped");
+        assert!(work.resumed_by.is_none(), "{:?}", work.resumed_by);
+    }
 }

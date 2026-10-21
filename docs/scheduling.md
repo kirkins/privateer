@@ -118,6 +118,12 @@ resets it. A ship first seen after an upgrade fires one interval later, not at
 once. A hosted alarm counts against `max_wakes_per_hour`. `work.status` shows
 the alarm's state under `backlog_alarm`, and bearings name its last fire.
 
+A `remote` wait that no report from the far owner has ended within
+`first_mate.remote_wait_stale_secs` (default 3600, `0` shows none) is listed
+too, as a stale remote wait naming the far task, ship and machine and when the
+link it rides was last heard; it is also among the captain's needs. Being
+listed never resumes or faults it. A deadline is a separate `time` wait.
+
 To leave a draft on purpose, say so in the record: `task.update` it to
 `blocked` with the reason in its task note, or enqueue it and `task.defer` it
 with a wait. A task waiting on a request the ship sent, a task offered to

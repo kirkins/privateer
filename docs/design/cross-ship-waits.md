@@ -1,6 +1,6 @@
 # Design: waits on another ship's task
 
-Status: approved by the captain on 2026-10-20. Step 1 (the owner side, `src/waits.rs`) and step 2 (the waiting side, `src/scheduling/remote.rs`) are implemented; steps 3 to 5 are not. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
+Status: approved by the captain on 2026-10-20. Step 1 (the owner side, `src/waits.rs`), step 2 (the waiting side, `src/scheduling/remote.rs`) and step 3 (resync on reconnect, staleness, subscription nonces) are implemented; steps 4 and 5 are not. Read with [scheduling](../scheduling.md) (the typed waits `task.defer` accepts), [cross-machine fleet](cross-machine-fleet.md) (machine links and peers), and [architecture](../architecture.md).
 
 ## Problem
 
@@ -26,11 +26,13 @@ A new wait kind, `remote`, which names a task in another ship's home:
 
 Push only. There is no next-check timer.
 
-1. **Subscribe.** When the defer is applied, the waiting home sends the owner a runtime notice `payload.wait_subscribe: {task, subscriber, subscriber_task}`. The owner records one subscription row keyed by (subscriber ship, subscriber task, far task). Re-sending the same subscription adds nothing.
+1. **Subscribe.** When the defer is applied, the waiting home sends the owner a runtime notice `payload.wait_subscribe: {task, subscriber, subscriber_task, nonce}`. The owner records one subscription row keyed by (subscriber ship, subscriber task, far task), with the nonce. Re-sending the same subscription adds nothing; a new nonce for the same key replaces the row's.
+
+   The nonce names one generation of the wait: a wait that leaves and later re-enters a remote wait on the same far task gets a new one, recorded on the schedule (`subscription: {nonce, since_ms}`). The owner echoes it in every `task_end` and `wait_closed` it sends about that row, one notice per subscription, and the waiting home applies a notice that names a nonce only to the wait holding it, so a late answer to an old subscription (a refusal that was still in flight when the wait was made again) resolves nothing newer and is dropped as `nonce`. Peers from steps 1 and 2 send and store no nonce: a notice without one applies to every matching wait as before, and a wait without one takes any answer. A `wait_unsubscribe` carries its nonce too, and removes a row only of that generation (or one without a nonce).
 2. **Report.** When the owner's task reaches a final status (`done`, `cancelled`), the owner sends each subscriber a runtime notice `payload.task_end: {task, status, reason}`. If the task had already ended when the subscription arrives, the owner answers at once with its final status, so a late defer does not wait forever. The owner sends `wait_closed` `{task, reason}` instead when it refuses the subscription (`reason: refused`), later removes the subscriber from `shared_with` (`reason: refused`), hands the task to another ship (`reason: handed_off`, with `owner` naming the new owner), or is retired (`reason: retired`). `wait_closed` is not a final status and reports none.
 3. **Resume.** The waiting home verifies the notice (below), records the satisfied wait in its own transaction, and the scheduler resumes the task with the far status in the resume reason. A `cancelled` status, or a `wait_closed` notice, faults the waiting task; it never resumes as if the dependency succeeded.
 
-   A `task_end` names the far task, not the subscriber's task, so it resolves every waiting task of the addressed ship whose wait names that far ship and task. The resolution is recorded on the wait (`wait.end`), and the task is checked at once: a `done` reopens it as `ready`, with `resumed_by` (shown in `work.status`, bearings and the next offer's prompt) naming the far task and its status. Anything else marks the schedule `fault` with the reason, which raises the scheduling-fault notice to the ship and appears among the captain's needs, as every scheduling fault does. A resolved wait no longer matches, so a repeated `task_end` or a later `wait_closed` changes nothing.
+   A `task_end` names the far task, not the subscriber's task, so it resolves every waiting task of the addressed ship whose wait names that far ship and task (all of them, a page at a time), narrowed by its nonce when it carries one. The resolution is recorded on the wait (`wait.end`), and the task is checked at once: a `done` reopens it as `ready`, with `resumed_by` (shown in `work.status`, bearings and the next offer's prompt) naming the far task and its status. Anything else marks the schedule `fault` with the reason, which raises the scheduling-fault notice to the ship and appears among the captain's needs, as every scheduling fault does. Each fault has its own notice, so a second fault in the same revision (a re-wait refused again) wakes the first mate again; the same fault recorded twice on a faulted schedule sends one. Parking on a block ask or the captain's hold clears `resumed_by`, so an old resume never reaches a later offer. A resolved wait no longer matches, so a repeated `task_end` or a later `wait_closed` changes nothing.
 
 `wait_subscribe`, `wait_unsubscribe`, `task_end` and `wait_closed` are runtime-to-runtime. They are handled before any inbox is written, so they never wake the owner's first mate and never appear as mail. They are reserved the way `request_end` is (`src/mail.rs`, the reserved-payload check near line 1091): an agent's `mail.send` that sets any of these keys is refused, so only the runtime can author them. The notices ride the existing outbox and peer link; no new transport.
 
@@ -62,6 +64,7 @@ What crosses the link is the final status and a short reason, and nothing else: 
 ## Unsubscribe and cleanup
 
 - The waiting task is cancelled, or re-deferred with a different ref: the waiting home sends `wait_unsubscribe` for the old subscription before it changes the wait. The owner deletes the row.
+- The waiting task is handed to another ship: its schedule still names the old owner, which every subscription speaks for, so `task.defer` refuses until the new owner enqueues its own assignment; its subscriptions then name the new owner, and always go to the ship the ref names.
 - The waiting task ends by any other path (faulted, or its wait is manually stopped): the same unsubscribe is sent when the task leaves `waiting`. Every schedule write compares the old and new record, so this covers a re-defer of any kind, a fresh `task.enqueue`, a park on a block ask, the captain's hold, a stopped ancestor, a lost charter authority, a check failure, the task finishing or being cancelled, and the task's handoff to a new owner. Cancelling, finishing or handing off the waiting task settles its schedule in the same transaction, so the unsubscribe is queued at once.
 - The owner hands its task to another ship (`task.accept`): the old owner, whom every ref names, will never report the end, so it sends each subscriber `wait_closed` with `reason: handed_off` and `owner` naming the new owner, and deletes its rows. The waiting task faults naming the new owner, so its first mate can re-wait on that ship (which must share the task again). An offer that is not accepted changes nothing.
 - The owner removes a ship from `shared_with`: that ship's subscriptions on the task are deleted and it is sent `wait_closed` with `reason: refused`, as a new subscription would be. Its waiting tasks fault.
@@ -80,6 +83,22 @@ What crosses the link is the final status and a short reason, and nothing else: 
 2. **Staleness surfacing.** A `remote` wait with no `task_end` after a threshold (proposed: one hour, configurable) is shown by the existing needs path and the backlog alarm, naming the far ship and machine and the time the link was last heard. It never resumes or faults by itself. A deadline, if the captain wants one, is a separate `time` wait added on top.
 
 Staleness is the honest answer to "no next check": the runtime reports how long it has been waiting on a silent peer rather than inventing a result.
+
+### As built (step 3)
+
+A home records each peer's link in `wait_links` (`heard_ms`, `down_ms`). A peer is heard when a delivery to it is answered (even refused), when mail from a ship behind it is delivered here, when it acknowledges mail it collected, and, for a machine that collects from this one, on each of its `fleet.collect` calls. A delivery that cannot reach it marks the link down. The link has come back when it is heard while marked down or, for a machine that only ever calls this home and so is never seen to fail, when it is heard after a silence of four contact intervals (two minutes). The machine that does the calling also resyncs every home here when a contact succeeds after failures (`machines::tick`). The first time a peer is heard only records it.
+
+A resync runs in the home's own transaction and is audited as `wait.resync` `{peer, resubscribed, answered}`:
+
+- the waiting side sends `wait_subscribe` again for each live remote wait whose far ship is behind that peer, with the nonce it already holds (a wait from before nonces gains one), paging through all of them;
+- the owner, receiving it, stores nothing new for a live subscription and answers at once with `task_end` for a far task that ended meanwhile: this is how a final status lost during the outage (refused on a machine link and quarantined, say) is sent again;
+- the owning side checks each subscription a ship behind the peer holds: one whose task ended without its `task_end` leaving gets it now, one no longer shared is closed `refused`, and both rows go.
+
+A final status still pending in the owner's outbox is delivered as before when the link returns; the resync's answer then arrives as a repeat and is dropped as `no_wait`.
+
+On one machine there is no network link, but a peer is still a subprocess call into another home, which fails if that home or its executable cannot be reached. The same rule applies: the failure marks the link down, the next answered delivery or mail from that home resyncs, and a single home has no peers and nothing to resync.
+
+Staleness is measured from the subscription's `since_ms` (a wait from before step 3 from its schedule's creation) against the waiting ship's `first_mate.remote_wait_stale_secs` (default 3600, `0` shows none, at most a week). A stale wait is a `runtime.needs` blocker with `evidence: "stale_remote_wait"`, and a backlog alarm candidate labelled `stale remote wait`, each naming the far task, ship and machine and when the link was last heard. Neither changes the wait.
 
 ## Failure cases
 

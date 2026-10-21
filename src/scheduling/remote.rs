@@ -112,46 +112,148 @@ pub(super) fn wait(store: &Store, id: &str, owner: &str, wait: &Value) -> Result
 /// leaves a live remote wait by any path (re-deferred elsewhere, enqueued
 /// again, parked, held, stopped, faulted, ended or handed to a new owner)
 /// queues `wait_unsubscribe` for the old subscription, and a wait that
-/// becomes live queues `wait_subscribe`. A wait resolved by the owner's own
-/// `task_end` or `wait_closed` sends nothing back: the owner has already
-/// deleted its row.
-pub(super) fn sync(store: &Store, old: Option<&Scheduled>, new: &Scheduled) -> Result<()> {
+/// becomes live queues `wait_subscribe` with a fresh nonce, recorded on the
+/// schedule. A wait resolved by the owner's own `task_end` or `wait_closed`
+/// sends nothing back: the owner has already deleted its row.
+pub(super) fn sync(store: &Store, old: Option<&Scheduled>, new: &mut Scheduled) -> Result<()> {
     let before = old.and_then(|old| live(old).map(|far| (old.owner.clone(), far)));
     let after = live(new).map(|far| (new.owner.clone(), far));
     if before == after {
+        // The same live subscription: keep its nonce, whichever copy the
+        // caller saved from.
+        if after.is_none() {
+            new.subscription = None;
+        } else if new.subscription.is_none() {
+            new.subscription = old.and_then(|old| old.subscription.clone());
+        }
         return Ok(());
     }
-    if let Some((subscriber, far)) = &before {
+    if let (Some((subscriber, far)), Some(old)) = (&before, old) {
         let resolved = new.owner == *subscriber
             && new.wait.as_ref().is_some_and(|wait| {
                 Far::of(wait).as_ref() == Some(far) && wait.get("end").is_some_and(Value::is_object)
             });
         if !resolved {
-            notice(store, subscriber, &new.task_id, far, "wait_unsubscribe")?;
+            notice(
+                store,
+                subscriber,
+                &new.task_id,
+                far,
+                "wait_unsubscribe",
+                old.subscription.as_ref(),
+                false,
+            )?;
         }
     }
+    new.subscription = None;
     if let Some((subscriber, far)) = &after {
-        notice(store, subscriber, &new.task_id, far, "wait_subscribe")?;
+        let subscription = Subscription {
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            since_ms: Store::now_ms(),
+        };
+        notice(
+            store,
+            subscriber,
+            &new.task_id,
+            far,
+            "wait_subscribe",
+            Some(&subscription),
+            false,
+        )?;
+        new.subscription = Some(subscription);
     }
     Ok(())
 }
 
-fn notice(store: &Store, subscriber: &str, task: &str, far: &Far, key: &str) -> Result<()> {
-    crate::waits::notify(
-        store,
-        subscriber,
-        &far.ship,
-        &json!({key: {"task": far.task, "subscriber": subscriber, "subscriber_task": task}}),
-    )?;
+fn notice(
+    store: &Store,
+    subscriber: &str,
+    task: &str,
+    far: &Far,
+    key: &str,
+    subscription: Option<&Subscription>,
+    resync: bool,
+) -> Result<()> {
+    let mut body = json!({"task": far.task, "subscriber": subscriber, "subscriber_task": task});
+    if let Some(subscription) = subscription {
+        body["nonce"] = json!(subscription.nonce);
+    }
+    crate::waits::notify(store, subscriber, &far.ship, &json!({key: body}))?;
+    let mut audit =
+        json!({"task": task, "ship": far.ship, "far_task": far.task, "machine": far.machine});
+    if resync {
+        audit["resync"] = json!(true);
+    }
     store.audit(
         if key == "wait_subscribe" {
             "wait.subscribe_sent"
         } else {
             "wait.unsubscribe_sent"
         },
-        &json!({"task": task, "ship": far.ship, "far_task": far.task, "machine": far.machine}),
+        &audit,
     )?;
     Ok(())
+}
+
+/// Matching schedules are read a page at a time; every page is resolved.
+const PAGE: i64 = 100;
+
+/// A link to `peer` came back: send `wait_subscribe` again for every live
+/// remote wait of this home whose far ship is behind it, with the nonce it
+/// already holds, in the caller's transaction. The owner keeps one row per
+/// subscription, so a replay adds nothing, and answers at once for a far
+/// task that ended meanwhile. A wait from before nonces gains one here.
+/// Returns how many were sent.
+pub(crate) fn resubscribe(store: &Store, peer: &str) -> Result<usize> {
+    if !available(store)? {
+        return Ok(0);
+    }
+    let mut sent = 0;
+    let mut after = String::new();
+    loop {
+        let mut statement = store.connection().prepare(
+            "SELECT s.task_id FROM task_schedule s
+             JOIN ships far ON far.name=json_extract(s.record,'$.wait.ref.ship')
+             WHERE json_extract(s.record,'$.state')='waiting'
+               AND json_extract(s.record,'$.wait.kind')='remote'
+               AND json_extract(s.record,'$.wait.end') IS NULL
+               AND json_extract(far.record,'$.location.peer')=?1 AND s.task_id>?2
+             ORDER BY s.task_id LIMIT ?3",
+        )?;
+        let ids = statement
+            .query_map(params![peer, after, PAGE], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for id in &ids {
+            let Some(mut work) = load(store, id)? else {
+                continue;
+            };
+            let Some(far) = live(&work) else {
+                continue;
+            };
+            if work.subscription.is_none() {
+                work.subscription = Some(Subscription {
+                    nonce: uuid::Uuid::new_v4().simple().to_string(),
+                    since_ms: work.created_ms,
+                });
+                save(store, &work)?;
+            }
+            notice(
+                store,
+                &work.owner,
+                &work.task_id,
+                &far,
+                "wait_subscribe",
+                work.subscription.as_ref(),
+                true,
+            )?;
+            sent += 1;
+        }
+        match ids.last() {
+            Some(last) if ids.len() as i64 == PAGE => after.clone_from(last),
+            _ => return Ok(sent),
+        }
+    }
 }
 
 /// Whether a resolved remote wait lets its task resume. A `task_end` with
@@ -242,41 +344,66 @@ pub(crate) fn deliver_notice(
     if let Some(owner) = &new_owner {
         identifier(owner)?;
     }
+    // The subscription the owner answers, when it echoes one. An owner from
+    // before nonces sends none, and its answer covers every matching wait.
+    let nonce = text("nonce")?;
+    if let Some(nonce) = &nonce {
+        identifier(nonce)?;
+    }
     let tx = store.write_transaction()?;
-    let mut statement = store.connection().prepare(
-        "SELECT task_id FROM task_schedule
-         WHERE json_extract(record,'$.owner')=?1 AND json_extract(record,'$.state')='waiting'
-           AND json_extract(record,'$.wait.kind')='remote'
-           AND json_extract(record,'$.wait.ref.ship')=?2 AND json_extract(record,'$.wait.ref.task')=?3
-           AND json_extract(record,'$.wait.end') IS NULL
-         ORDER BY task_id LIMIT 100",
-    )?;
-    let ids = statement
-        .query_map(params![to, from, task], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
     let mut named = Vec::new();
-    for id in &ids {
-        if let Some(work) = load(store, id)?
-            && live(&work).is_some()
-        {
-            named.push(work);
+    let mut after = String::new();
+    loop {
+        let mut statement = store.connection().prepare(
+            "SELECT task_id FROM task_schedule
+             WHERE json_extract(record,'$.owner')=?1 AND json_extract(record,'$.state')='waiting'
+               AND json_extract(record,'$.wait.kind')='remote'
+               AND json_extract(record,'$.wait.ref.ship')=?2 AND json_extract(record,'$.wait.ref.task')=?3
+               AND json_extract(record,'$.wait.end') IS NULL AND task_id>?4
+             ORDER BY task_id LIMIT ?5",
+        )?;
+        let ids = statement
+            .query_map(params![to, from, task, after, PAGE], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for id in &ids {
+            if let Some(work) = load(store, id)?
+                && live(&work).is_some()
+            {
+                named.push(work);
+            }
+        }
+        match ids.last() {
+            Some(last) if ids.len() as i64 == PAGE => after.clone_from(last),
+            _ => break,
         }
     }
-    let carried: Vec<Scheduled> = named
+    let routed: Vec<&Scheduled> = named
         .iter()
         .filter(|work| {
             Far::of(work.wait.as_ref().unwrap()).and_then(|far| far.machine)
                 == via.map(str::to_owned)
         })
-        .cloned()
+        .collect();
+    // A wait holding no nonce predates them and takes any answer.
+    let carried: Vec<Scheduled> = routed
+        .iter()
+        .filter(|work| match (&nonce, &work.subscription) {
+            (Some(nonce), Some(subscription)) => subscription.nonce == *nonce,
+            _ => true,
+        })
+        .map(|work| (*work).clone())
         .collect();
     let dropped = if key == "task_end" && !matches!(status.as_deref(), Some("done" | "cancelled")) {
         Some("status")
     } else if named.is_empty() {
         Some("no_wait")
-    } else if carried.is_empty() {
+    } else if routed.is_empty() {
         Some("via")
+    } else if carried.is_empty() {
+        Some("nonce")
     } else {
         None
     };
@@ -284,7 +411,7 @@ pub(crate) fn deliver_notice(
         store.audit(
             "wait.dropped",
             &json!({"id": id, "notice": key, "from": from, "to": to, "via": via,
-                "task": task, "why": why}),
+                "task": task, "nonce": nonce, "why": why}),
         )?;
         tx.commit()?;
         return Ok(json!({"id": id, "wait": {"task": task, "state": "dropped", "why": why}}));
@@ -331,4 +458,66 @@ pub(crate) fn settle(store: &Store, task: &str) -> Result<()> {
     }
     check(store, &mut work, Store::now_ms())?;
     save(store, &work)
+}
+
+/// How long a remote wait may go without a `task_end` before it is shown as
+/// stale, in seconds, unless the waiting ship's profile says otherwise.
+pub(crate) const STALE_SECS: u64 = 3_600;
+
+/// The SQL condition, over a schedule `s`, its task `t` and its owning ship
+/// `sh`, under which a live remote wait is stale at time `now` (a bound
+/// parameter): it has waited past its ship's `remote_wait_stale_secs`, which
+/// is 0 to show none. A wait from before subscriptions carried their start
+/// counts from its schedule's creation.
+pub(crate) fn stale_where(now: &str) -> String {
+    let secs = format!(
+        "COALESCE(json_extract(sh.record,'$.first_mate.remote_wait_stale_secs'),{STALE_SECS})"
+    );
+    format!(
+        "json_extract(s.record,'$.state')='waiting' AND json_extract(s.record,'$.wait.kind')='remote'
+         AND json_extract(s.record,'$.wait.end') IS NULL AND t.status NOT IN ('done','cancelled')
+         AND {secs}>0 AND COALESCE(json_extract(s.record,'$.subscription.since_ms'),
+           json_extract(s.record,'$.created_ms'))+{secs}*1000<={now}"
+    )
+}
+
+/// What the captain and the first mate are told about a stale remote wait:
+/// the far task, ship and machine, how long it has waited with no
+/// `task_end`, and when the link it rides was last heard. Read-only. It
+/// reports and never resolves: the wait stays `waiting`.
+pub(crate) fn stale_item(store: &Store, id: &str, now: i64) -> Result<Value> {
+    let work = load(store, id)?.context("remote wait schedule missing")?;
+    let far = live(&work).context("schedule holds no live remote wait")?;
+    let since = work
+        .subscription
+        .as_ref()
+        .map_or(work.created_ms, |s| s.since_ms);
+    let peer = crate::mail::ship(store, &far.ship)?
+        .and_then(|ship| ship["location"]["peer"].as_str().map(str::to_owned));
+    let heard = match &peer {
+        Some(peer) => crate::waits::last_heard(store, peer)?,
+        None => None,
+    };
+    let minutes = |ms: i64| now.saturating_sub(ms).max(0) / 60_000;
+    let link = match (&peer, heard) {
+        (Some(peer), Some(at)) => format!("the link {peer} was last heard {} min ago", minutes(at)),
+        (Some(peer), None) => {
+            format!("the link {peer} has not been heard since this home began tracking it")
+        }
+        (None, _) => format!("{} is no longer reached through a peer", far.ship),
+    };
+    let summary = format!(
+        "Waiting {} min on remote {} with no task_end; {link}. The wait stays waiting: it resumes or faults only on the owner's report. Add a time wait for a deadline.",
+        minutes(since),
+        far.name()
+    );
+    Ok(
+        json!({"ship": work.owner, "task_id": work.task_id, "status": "waiting",
+        "summary": summary, "created_ms": since, "waited_ms": now.saturating_sub(since),
+        "far": {"ship": far.ship, "task": far.task, "machine": far.machine},
+        "link": {"peer": peer, "heard_ms": heard},
+        "revision": work.revision,
+        "version": crate::core::hash(&json!([work.revision, since,
+            work.subscription.as_ref().map(|s| &s.nonce)]))}),
+    )
 }
