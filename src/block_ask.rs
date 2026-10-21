@@ -448,6 +448,16 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
         if let Some(authorize) = authorize {
             record["authorize"] = json!(authorize);
         }
+        // What a captain approval's command prefix is matched against.
+        if tool == "Bash" && classifier {
+            record["classifier"] = json!(true);
+            if let Some(head) = input["command"]
+                .as_str()
+                .and_then(crate::captain_approvals::command_head)
+            {
+                record["head"] = json!(head);
+            }
+        }
         records.push(record);
     }
     let more = records.len().saturating_sub(MAX_DENIALS);
@@ -518,7 +528,7 @@ pub(crate) fn rules_text(block: &Value) -> String {
     text
 }
 
-fn clip(text: &str, chars: usize) -> String {
+pub(crate) fn clip(text: &str, chars: usize) -> String {
     if text.chars().count() <= chars {
         text.to_owned()
     } else {
@@ -879,8 +889,22 @@ pub(crate) fn raise(
     } else {
         "The task waits until you answer or the fleet policy covers it (/yolo on also clears it)."
     };
+    let offer = crate::captain_approvals::offer(
+        store,
+        ship,
+        scope,
+        job_id,
+        &records,
+        more,
+        Store::now_ms(),
+    )?;
+    let ignored = offer
+        .why
+        .as_deref()
+        .map(|why| format!(" {why}"))
+        .unwrap_or_default();
     let why = clip(
-        &format!("{who} stopped at this tool, working on {title}. {wait}"),
+        &format!("{who} stopped at this tool, working on {title}. {wait}{ignored}"),
         500,
     );
     let mut options = vec![];
@@ -894,6 +918,7 @@ pub(crate) fn raise(
         options.push(json!({"id": "authorize", "label": clip(&format!("Authorize: {text}"), 80),
             "what_happens": clip(&format!("Records the standing authorization '{text}' for {ship}; its auto-mode check reads it from its next launch (`privateer host relaunch {ship}`). Answer with your own wording to record that instead."), 400)}));
     }
+    options.extend(offer.options);
     options.push(json!({"id": "without", "label": "Continue without it",
         "what_happens": "The task resumes; its first mate is told the tool stays denied."}));
     options.push(json!({"id": "stop", "label": "Stop the task",
@@ -918,6 +943,12 @@ pub(crate) fn raise(
         block["authorize"] = json!(text);
         let policy = crate::permissions::for_store(store)?;
         block["authorized"] = json!(authorizations_hash(&policy, ship));
+    }
+    if !offer.approvals.is_empty() {
+        block["approvals"] = json!(offer.approvals);
+    }
+    if let Some(approve) = offer.approve {
+        block["approve"] = approve;
     }
     let mut payload = json!({"type": "tool_permission", "policy_hash": policy_hash, "block": block,
         "decision": {"question": question, "why": why,
@@ -1453,7 +1484,7 @@ pub(crate) fn check_answer(thread: &Value, payload: &Value) -> Result<()> {
     let widens = matches!(
         payload["answer"]["option_id"].as_str(),
         Some("allow" | "authorize")
-    );
+    ) || approves(payload);
     if !is_ask(thread) || !widens {
         return Ok(());
     }
@@ -1466,6 +1497,11 @@ pub(crate) fn check_answer(thread: &Value, payload: &Value) -> Result<()> {
         return Ok(());
     }
     let rules = rules_text(&thread["payload"]["block"]);
+    if approves(payload) {
+        anyhow::bail!(
+            "An approval must come from the captain directly; ask the captain to tap it on the card ({rules})"
+        )
+    }
     if payload["answer"]["option_id"] == "authorize" {
         anyhow::bail!(
             "Authorize must come from the captain directly; ask the captain to tap Authorize or run `privateer permissions authorize SHIP 'TEXT'` ({rules})"
@@ -1474,6 +1510,14 @@ pub(crate) fn check_answer(thread: &Value, payload: &Value) -> Result<()> {
     anyhow::bail!(
         "Allow must come from the captain directly; ask the captain to tap Allow or run `privateer permissions allow '<rule>'` ({rules})"
     )
+}
+
+/// Whether an answer chooses a captain approval: `approve` or one of the
+/// `as_approved_N` options.
+fn approves(payload: &Value) -> bool {
+    payload["answer"]["option_id"]
+        .as_str()
+        .is_some_and(|id| id == "approve" || id.starts_with("as_approved_"))
 }
 
 /// The authorization an `authorize` answer records: the captain's own
@@ -1608,9 +1652,11 @@ fn fan_out(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
                 .and_then(|o| o["label"].as_str())
         });
     let operator = reply["payload"]["operator"] == true;
+    // An authorization or a captain approval is the asking ship's alone.
     let authorizes = answer
         .as_ref()
-        .is_some_and(|a| a["option_id"] == "authorize");
+        .is_some_and(|a| a["option_id"] == "authorize")
+        || approves(&reply["payload"]);
     let mut homes = vec![store.home().to_path_buf()];
     homes.extend(other_homes(store.home()).into_iter().map(|(_, h)| h));
     for home in homes {
@@ -1630,8 +1676,8 @@ fn fan_out(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
             let Some(attached) = crate::mail::find(&other, &row)? else {
                 continue;
             };
-            // An authorization is the asking ship's alone: another ship's
-            // ask is detached, so the captain sees it on its own.
+            // Another ship's ask is detached, so the captain sees it on its
+            // own.
             if authorizes && is_ask(&attached) && attached["from"] != ask["from"] {
                 other.connection().execute(
                     "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
@@ -1899,7 +1945,13 @@ mod tests {
         let ask = json!({"kind": "decision", "to": CAPTAIN,
             "payload": {"type": "tool_permission",
                 "block": {"denials": [], "authorize": "Running make commands."}}});
-        for option in ["allow", "authorize"] {
+        for option in [
+            "allow",
+            "authorize",
+            "approve",
+            "as_approved_1",
+            "as_approved_2",
+        ] {
             let relayed = json!({"answer": {"option_id": option}, "relayed_by": "liaison"});
             assert!(check_answer(&ask, &relayed).is_err(), "{option}");
             let own = json!({"answer": {"option_id": option}, "operator": true});
