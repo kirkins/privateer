@@ -783,6 +783,10 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)})))
 }
 
+/// An approval a block card offered: its task, action, command prefix,
+/// creation, expiry and revocation.
+type Offered = (String, String, Option<String>, i64, i64, Option<i64>);
+
 /// What the captain's tap on a block card's approve or as-approved option
 /// records, in the home holding the ask. `approve` records the step the card
 /// named for 24 h. `as_approved_N` uses an approval the card offered again:
@@ -854,7 +858,7 @@ fn record_block(
     let Some(id) = block["approvals"][n - 1].as_str() else {
         return skip("the ask offers no such approval, so nothing was approved");
     };
-    let row: Option<(String, String, Option<String>, i64, i64, Option<i64>)> = store
+    let row: Option<Offered> = store
         .connection()
         .query_row(
             "SELECT task_id,action,command_prefix,created_ms,expires_ms,revoked_ms
