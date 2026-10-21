@@ -4,25 +4,28 @@ This kit sets up the top-tier review gate and routes for GitHub and Forgejo repo
 
 Every step requiring direct manual operator execution is marked **[hands]**. Non-[hands] steps are performed by the runtime or crew PRs.
 
-## Pending captain decisions (request `01ff0c50`)
+## Captain decisions
 
-Before or during rollout, four decisions are pending the captain's direction:
+Made (request `01ff0c50`):
 
-1. **Review list order (`["sol", "opus"]` vs `["opus", "sol"]`).**
-   - *Recommendation:* `["sol", "opus"]`. This spares the weekly Opus plan cap that the captain shares. Because of the author overlap rule (§2), the order only matters when both models qualify.
-   - *Status:* Pending decision.
+1. **Review list order: `["opus", "sol"]`.** Opus is tried first. Because of the author overlap rule (§2 of the design), the order only matters when both models qualify.
+2. **macOS is not a required check.** Only `runtime (ubuntu-latest)` is required on GitHub. `runtime (macos-latest)` still runs, but it is advisory: it fails now and then, and a required check that flakes would block merges.
+3. **The admin `gh` login stays for now (§A2's login change is skipped).** The ship user's `gh` keeps the captain's admin login. The consequence, plainly: an agent running as the ship user can bypass the runtime's review gate with that login, by merging through `gh api` or by deleting branch protection. `gh pr merge` is disallowed in agent launches, but that is a workflow control, not a boundary. The real gate is GitHub's branch protection with **Enforce for admins** (`enforce_admins: true`), which refuses even an admin's merge without the reviewer's approval, for as long as the protection is left in place.
 
-2. **Requiring the macOS status check on GitHub (`runtime (macos-latest)`).**
-   - *Context:* The macOS runner is known to fail intermittently. Requiring it in branch protection will block merges when it flakes; omitting it leaves macOS verification advisory.
-   - *Status:* Pending decision.
+Still open:
 
-3. **App repository rollout list.**
-   - *Context:* Which Forgejo and GitHub repositories receive branch protection and review gating first (for example, `kirkins/privateer`, `kirkins/quarterdeck`, and `git.lobbykit.net/hermes/*`).
-   - *Status:* Pending decision.
+4. **App repository rollout list.** Which Forgejo and GitHub repositories get branch protection and review gating first (for example `kirkins/privateer`, `kirkins/quarterdeck` and `git.lobbykit.net/hermes/*`).
+5. **Sol setup on the laptop.** Whether to set up the Pi `chatgpt-home` provider on this laptop, or run reviews of privateer's PRs on the server or the Mac, where Sol is already configured.
 
-4. **Sol setup on the laptop.**
-   - *Context:* Whether to set up the Pi `chatgpt-home` provider on this laptop, or have reviews of privateer's PRs run on the server or Mac where Sol is already configured.
-   - *Status:* Pending decision.
+## Rollout order
+
+1. Make the reviewer account and store `forge-reviewer-github` (§A1), and store a merger credential (§A2).
+2. Write `forges.json` with `forges.set`, listing `required_checks` explicitly for every repository (§C1).
+3. Install the release that carries the gate.
+4. **Relaunch every first mate.** A first mate launched before the install keeps its old launch rules and text until it is relaunched.
+5. Run test 11 on scratch repositories (§D) before gating a real one.
+
+Until steps 1 and 2 are done for a repository, no ship can merge there: `gh pr merge` is disallowed, and `pr.merge` refuses a repository missing from `forges.json`.
 
 ---
 
@@ -31,7 +34,7 @@ Before or during rollout, four decisions are pending the captain's direction:
 Configures a second top-tier review route (`sol`) running GPT-6.1 Sol on the captain's ChatGPT plan through Pi, and establishes the `review` route kind.
 
 ### 1. [hands] Copy the `chatgpt-home` provider configuration to the laptop (if Sol runs here)
-*Pending captain decision 4.* If reviews of privateer's PRs run on this laptop, copy the provider configuration and credentials from the server:
+*Open decision 5.* If reviews of privateer's PRs run on this laptop, copy the provider configuration and credentials from the server:
 - Copy the `chatgpt-home` provider definition from the server's `~/.pi/agent/models.json` to `~/.pi/agent/models.json` on the laptop.
 - Copy the auth credentials from the server's `~/.pi/agent/auth.json` to `~/.pi/agent/auth.json` on the laptop.
 
@@ -45,7 +48,7 @@ Ensure it returns a successful response with no auth or connection errors.
 ### 3. [hands] Update fleet routes with `sol` and the `review` list
 Add `sol` to the fleet route registry at tier 1 with uses `["review", "diagnose", "design", "implement"]`, and set the `review` list.
 
-*Note on list order:* Pending captain decision 1; design recommends `["sol", "opus"]`.
+The list is `["opus", "sol"]` (captain decision 1).
 
 Export, update, and apply the route configuration:
 ```sh
@@ -61,7 +64,7 @@ privateer routes show | jq 'del(.applied)
      "uses": ["review", "diagnose", "design", "implement"],
      "note": "Pi + GPT-6.1 Sol on the captain'"'"'s ChatGPT plan. Second top-tier review route."
    }
- | .review = ["sol", "opus"]' > ~/routes-new.json && privateer routes set ~/routes-new.json
+ | .review = ["opus", "sol"]' > ~/routes-new.json && privateer routes set ~/routes-new.json
 ```
 
 On machines where `sol` already exists (such as the server and the Mac), update only its `tier`, `uses`, and the `review` list instead of replacing the whole entry:
@@ -69,7 +72,7 @@ On machines where `sol` already exists (such as the server and the Mac), update 
 privateer routes show | jq 'del(.applied)
  | .routes.sol.tier = 1
  | .routes.sol.uses = ["review", "diagnose", "design", "implement"]
- | .review = ["sol", "opus"]' > ~/routes-new.json && privateer routes set ~/routes-new.json
+ | .review = ["opus", "sol"]' > ~/routes-new.json && privateer routes set ~/routes-new.json
 ```
 
 > [!NOTE]
@@ -84,7 +87,7 @@ privateer routes show | jq 'del(.applied)
 Configures forge credentials, repository branch protections, and forge adapter settings.
 
 ### Section A: GitHub setup (per repository)
-*Repositories selected per pending captain decision 3 (e.g. `kirkins/privateer`, `kirkins/quarterdeck`).*
+*Repositories per open decision 4 (e.g. `kirkins/privateer`, `kirkins/quarterdeck`).*
 
 #### 1. [hands] Create reviewer machine account and store credential
 1. Create a dedicated machine account on GitHub (for example, `<reviewer-account>`).
@@ -95,7 +98,7 @@ Configures forge credentials, repository branch protections, and forge adapter s
    privateer credential.set --json '{"ref":"forge-reviewer-github"}'
    ```
 
-#### 2. [hands] Create fine-grained ship token and restrict administration
+#### 2. [hands] Create the merger token; keep the admin `gh` login for now
 1. On the captain's account (`kirkins`), generate a fine-grained personal access token:
    - **Repository access:** Selected repositories only.
    - **Repository permissions:**
@@ -106,16 +109,14 @@ Configures forge credentials, repository branch protections, and forge adapter s
      - Checks: Read-only
      - Commit statuses: Read-only
      - **Administration: No access (None)**
-2. Replace the ship user's CLI login with this restricted token via interactive login (never pipe tokens with `--with-token`):
-   ```sh
-   gh auth login
-   ```
-   Follow the interactive prompts (choose `GitHub.com`, preferred protocol, and `Paste an authentication token`, then paste the token at the hidden prompt).
-3. Store the token in Privateer's credential store for ship operations (run in a terminal and paste at the no-echo prompt):
+2. Store it in Privateer's credential store as the merger credential `pr.merge` merges with (run in a terminal and paste at the no-echo prompt):
    ```sh
    privateer credential.set --json '{"ref":"forge-ship-github"}'
    ```
-4. Administrative repository changes (such as adjusting branch protection) now take place in the browser. The ship's SSH key remains for git pushes.
+3. **Skipped for now (captain decision 3):** replacing the ship user's `gh` login with this restricted token. The ship user's `gh` keeps the admin login, so an agent could bypass the review gate with `gh api` or by deleting branch protection. Branch protection with **Enforce for admins** (§A4) is the real gate until the login is replaced. When it is, use the interactive `gh auth login` paste prompt (never `--with-token`), and do admin work in the browser; the ship's SSH push key stays, since it cannot change settings.
+
+> [!IMPORTANT]
+> Never put `forge-reviewer-github` or `forge-ship-github` (or any other credential ref named in `forges.json`) in any tool bundle registry. The runtime refuses a registry or a launch plan that names one; do not try to work around that.
 
 #### 3. Add Code Owners file (crew PR)
 In a repository branch, add `.github/CODEOWNERS`:
@@ -132,8 +133,7 @@ In GitHub repository settings under **Branches** -> **Branch protection rules** 
   - **Dismiss stale pull request approvals when new commits are pushed** (`dismiss_stale_reviews`)
   - **Require approval of the most recent push** (`require_last_push_approval`)
 - **Require status checks to pass before merging:**
-  - `runtime (ubuntu-latest)`
-  - `runtime (macos-latest)` *(Pending captain decision 2: evaluate runner reliability)*
+  - `runtime (ubuntu-latest)` only. `runtime (macos-latest)` is not required (captain decision 2).
 - **Do not allow bypassing the above settings:**
   - **Enforce for admins** (`enforce_admins: true`)
 - **Block force pushes** (`allow_force_pushes: false`)
@@ -144,7 +144,7 @@ Verify protection settings via Privateer: `forges.set` (Section C) reads each re
 ---
 
 ### Section B: Forgejo setup (per repository)
-*Repositories selected per pending captain decision 3 (e.g. `git.lobbykit.net/hermes/*`).*
+*Repositories per open decision 4 (e.g. `git.lobbykit.net/hermes/*`).*
 
 #### 1. [hands] Create service users and store credentials
 1. In Forgejo, create three dedicated accounts:
@@ -173,9 +173,7 @@ In Forgejo repository settings under **Branch Protection** for the default branc
 - **Enable status checks:** Checked (`enable_status_check: true`) with repository CI contexts.
 
 #### 3. [hands] Test merge whitelist on a scratch repository
-Before enabling on production repositories, verify on a scratch Forgejo repo:
-1. Confirm a direct merge attempt using the ship token is refused by the forge whitelist.
-2. Confirm `merge_when_checks_succeed` respects the merge whitelist.
+Before enabling on production repositories, run the Forgejo half of test 11 (§D) on a scratch repository.
 
 ---
 
@@ -195,7 +193,7 @@ privateer forges.show --json '{}'
 
 Each entry is keyed `host/owner/name` in lowercase and needs:
 - `forge`: `github` or `forgejo`; `api`: the https API base; `branch`: the protected branch PRs merge into (never taken from a clone's `origin/HEAD`).
-- `required_checks` (optional): the checks a merge needs green. Without it, the checks branch protection requires are used; a repository with neither is refused. Every check is never required, so a check the captain left out (such as `runtime (macos-latest)`) never blocks a merge.
+- `required_checks`: the checks a merge needs green. **List them explicitly for every repository.** The runtime can fall back to reading branch protection, but that read may need an admin token, which the reviewer account does not hold; when it fails, the repository is refused. Every check is never required, so a check left out (such as `runtime (macos-latest)`) never blocks a merge.
 - `reviewer` and `merger`: `{account, credential}`, two different accounts. The reviewer's token reads the PR and posts reviews. The merger's token merges: on GitHub the ship's own fine-grained token (`forge-ship-github`), on Forgejo the `merger` account's.
 
 Example configuration schema:
@@ -220,6 +218,7 @@ Example configuration schema:
       "forge": "forgejo",
       "api": "https://git.lobbykit.net/api/v1",
       "branch": "main",
+      "required_checks": ["<ci context>"],
       "reviewer": {
         "account": "reviewer",
         "credential": "forge-reviewer-forgejo"
@@ -246,4 +245,26 @@ The adapter implements the external interface:
   - Any credential reference named in `forges.json` is banned from tool bundles (`tool_bundles::configure`) and native launch environments (`plugins/bundles.py`), preventing agent access.
 
 #### 3. Residuals and threat model
-Operating under a single OS user cannot protect against direct filesystem inspection by a rogue local process. The review gate prevents automated workflows from skipping or downgrading reviews. Complete credential and token isolation requires the future separate reviewer OS account.
+Operating under a single OS user cannot protect against direct filesystem inspection by a rogue local process. The review gate prevents automated workflows from skipping or downgrading reviews. While the ship user's `gh` keeps the admin login (captain decision 3), an agent could also merge through `gh api` or delete branch protection; GitHub's branch protection with **Enforce for admins** is what holds then. Complete credential and token isolation requires the future separate reviewer OS account.
+
+---
+
+### Section D: Test 11 (manual, on scratch repositories)
+
+Run after the rollout steps above, and record the result of each step in the PR. Use throwaway repositories, never a real one.
+
+**GitHub** (a scratch repository such as `kirkins/review-gate-scratch`):
+1. **[hands]** Create the repository with a `main` branch and a CI workflow whose job reports `runtime (ubuntu-latest)`. Add the reviewer account as a write collaborator, and merge `.github/CODEOWNERS` with `* @<reviewer-account>`.
+2. **[hands]** Set the branch protection of §A4 on `main`, with **Enforce for admins**.
+3. **[hands]** Add the repository to `forges.json` (§C1) with `"required_checks": ["runtime (ubuntu-latest)"]`, and read `forges.set`'s warnings: any missing protection setting it names must be fixed (a warning that protection could not be read with the reviewer's token is expected).
+4. Open a PR from a branch and wait for the check to go green.
+5. **[hands]** As the ship user, try `gh pr merge <n> --merge`: branch protection must refuse it, the admin login included, because there is no approval from the code owner.
+6. As a first mate, `pr.merge` before any review: refused, naming `review.start`.
+7. `review.start`, then wait for the verdict: the PR shows the reviewer account's approval at the head, with the `<!-- privateer-review … -->` marker in its body.
+8. `pr.merge`: the PR is merged with a merge commit, at the head that was reviewed.
+9. On a second PR, push a commit after the approval: GitHub dismisses the stale approval, and `pr.merge` refuses until a new review of the new head.
+
+**Forgejo** (a scratch repository on `git.lobbykit.net`):
+10. **[hands]** Set the protection of §B2, with `reviewer` on the approvals whitelist and `merger` on the merge whitelist. Using the `ships` token, try a direct merge and `merge_when_checks_succeed`: the forge must refuse both.
+11. Repeat steps 4 and 6–8 there: the approval is posted as `reviewer`, and the merge is made as `merger`.
+
