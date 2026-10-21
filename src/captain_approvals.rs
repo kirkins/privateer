@@ -62,14 +62,6 @@ const METACHARACTERS: &str = ";&|<>()$`\\";
 /// Characters bash quotes, globs, expands or comments with, so the word it
 /// runs is not the word written.
 const EXPANSIONS: &str = "'\"*?[]{}~#";
-/// Characters that change how a line reads without showing: zero-width
-/// spaces and joiners, direction marks and overrides, and the byte-order mark.
-const INVISIBLE: &[std::ops::RangeInclusive<char>] = &[
-    '\u{200B}'..='\u{200F}',
-    '\u{202A}'..='\u{202E}',
-    '\u{2060}'..='\u{2069}',
-    '\u{FEFF}'..='\u{FEFF}',
-];
 /// The most words and characters of a command a prefix is matched against.
 const MAX_HEAD_WORDS: usize = 16;
 const MAX_HEAD_CHARS: usize = 200;
@@ -225,15 +217,15 @@ pub(crate) fn lint(store: &Store, ship: &str, field: &str, text: &str) -> Result
 
 /// The words bash runs for a line holding one simple command, split as bash
 /// splits them, on spaces and tabs. None when the line holds a shell
-/// operator, redirection, quoting, glob, expansion or comment, or any other
-/// whitespace, control or invisible character, so no word written is a
-/// different word run.
+/// operator, redirection, quoting, glob, expansion or comment, or anything
+/// but printable ASCII, spaces and tabs: blank, invisible and lookalike
+/// characters are too many to list, so no word written is a different
+/// word run or a word the captain did not see.
 fn shell_words(line: &str) -> Option<Vec<&str>> {
-    let plain = !line.chars().any(|c| {
-        METACHARACTERS.contains(c)
-            || EXPANSIONS.contains(c)
-            || ((c.is_whitespace() || c.is_control()) && c != ' ' && c != '\t')
-            || INVISIBLE.iter().any(|range| range.contains(&c))
+    let plain = line.chars().all(|c| {
+        (c.is_ascii_graphic() || c == ' ' || c == '\t')
+            && !METACHARACTERS.contains(c)
+            && !EXPANSIONS.contains(c)
     });
     plain.then(|| line.split([' ', '\t']).filter(|w| !w.is_empty()).collect())
 }
@@ -276,11 +268,13 @@ pub(crate) fn check_prefix(prefix: &str) -> Result<()> {
     );
     let interpreter = INTERPRETERS.contains(&program) || program.starts_with("python");
     if interpreter {
+        // The script comes first: an option before it (`bash -o errexit`,
+        // `perl -E`, `python3 -W ignore`) leaves room for inline code after.
         let rest = &words[1..];
         ensure!(
-            rest.iter().any(|w| !w.starts_with('-'))
+            rest.first().is_some_and(|w| !w.starts_with('-'))
                 && !rest.iter().any(|w| inline_code(program, w)),
-            "approves.command_prefix cannot be just a shell or interpreter; name the script it runs"
+            "approves.command_prefix cannot be just a shell or interpreter, or give it options before its script; name the script it runs first"
         );
     }
     Ok(())
@@ -1741,6 +1735,12 @@ mod tests {
             "make\u{200b} release",
             "make\u{202e}esaeler",
             "make\u{b}release",
+            "make\u{3164}release",
+            "make\u{2800}release",
+            "make\u{ad}release",
+            "make\u{61c}release",
+            "make\u{e0041}release",
+            "m\u{430}ke release",
             // Interpreters running inline code, however the flag is spelled.
             "bash \"-c\" x",
             "bash -lc x",
@@ -1760,6 +1760,12 @@ mod tests {
             "ruby -e x",
             "bash",
             "bash -l",
+            // Options before the script leave room for inline code after.
+            "bash -o errexit",
+            "bash -x scripts/release.sh",
+            "perl -E x",
+            "python3 -W ignore",
+            "python3 -u tools/ship.py",
             "coproc make",
             "! make",
         ] {
@@ -1771,8 +1777,7 @@ mod tests {
             "cargo publish",
             "make\trelease",
             "bash scripts/release.sh",
-            "bash -x scripts/release.sh",
-            "python3 -u tools/ship.py",
+            "python3 tools/ship.py --dry-run",
             "make release-2.0 v=1",
         ] {
             check_prefix(good).unwrap();
@@ -1817,6 +1822,8 @@ mod tests {
             "make\u{85}release",
             "make release\u{2028}rm x",
             "make\u{200b} release",
+            "make\u{3164}release",
+            "m\u{430}ke release",
             "make ~/release",
             "make release # now",
         ] {
