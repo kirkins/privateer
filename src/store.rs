@@ -266,6 +266,7 @@ impl Store {
         crate::activation::init(&store)?;
         crate::session::init(&store)?;
         crate::errand::init(&store)?;
+        crate::review::init(&store)?;
         crate::context::init(&store)?;
         crate::attention::init(&store)?;
         crate::presence::init(&store)?;

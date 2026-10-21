@@ -120,8 +120,11 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
             };
             let id_str = args.get("id").and_then(Value::as_str).unwrap_or_default();
             let is_errand = crate::errand::is_errand(store, id_str).unwrap_or(false);
-            // Wakes and errands run as the ship's first mate; anything else is crew.
-            let role = if crate::workspace::is_wake(store, &args)? {
+            // Wakes and errands run as the ship's first mate, and a review's
+            // errand as the read-only reviewer; anything else is crew.
+            let role = if crate::review::is_review_errand(store, id_str)? {
+                "reviewer"
+            } else if crate::workspace::is_wake(store, &args)? {
                 "first_mate"
             } else {
                 "crew"
@@ -416,11 +419,19 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
     // Wake-specific text goes after the stable brief, so the brief's bytes
     // stay identical across wakes and its prefix keeps hitting the cache.
     let mut text = brief(&context);
+    // A review's prompt is the runtime's whole: no brief, task or control
+    // protocol beside it.
+    let review = args
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| crate::review::is_review_errand(store, id))
+        .transpose()?
+        .unwrap_or(false);
     if let Some(wake) = args.get("wake").filter(|v| !v.is_null()) {
         let wake = wake.as_str().context("wake must be text")?;
         ensure!(wake.len() <= 32_768, "wake text exceeds 32 KiB");
         // A resumed native session already holds the brief.
-        if args.get("wake_only") == Some(&json!(true)) {
+        if args.get("wake_only") == Some(&json!(true)) || review {
             text.clear();
         } else {
             text.push_str("\n\n");

@@ -190,6 +190,22 @@ fn list() -> Result<Value> {
     Ok(json!({"refs": refs}))
 }
 
+/// Every stored credential's value, so a review reply that carries one is
+/// refused before anything of it is kept. No directory means none stored;
+/// an unsafe one is an error, and the caller refuses the reply.
+pub(crate) fn stored_values() -> Result<Vec<Vec<u8>>> {
+    let mut values = vec![];
+    if let Some(dir) = checked(false)? {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_name().to_str().is_some_and(valid_ref) && entry.file_type()?.is_file() {
+                values.push(fs::read(entry.path())?);
+            }
+        }
+    }
+    Ok(values)
+}
+
 fn remove(args: &Value) -> Result<Value> {
     let name = reference(args, "credential.remove")?;
     let Some(dir) = checked(false)? else {

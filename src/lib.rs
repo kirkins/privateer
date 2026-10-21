@@ -222,6 +222,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "wake" => activation::dispatch(store, command, args),
         "errand" => errand::dispatch(store, command, args),
+        "review" => review::dispatch(store, command, args),
+        "pr" if command == "pr.merge" => review::dispatch(store, command, args),
         "attention" => attention::dispatch(store, command, args),
         "crew" => crew::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
@@ -448,6 +450,15 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             )?;
             if let Some(lease) = &execution.lease_id {
                 args["_workspace_lease_id"] = serde_json::json!(lease);
+            } else if let Some(tree) = args
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| review::tree_of_errand(store, id))
+                .transpose()?
+                .flatten()
+            {
+                // A review's errand reads its own read-only worktree.
+                args["_workspace_cwd"] = serde_json::json!(tree);
             } else {
                 args["_workspace_cwd"] = serde_json::json!(execution.root);
             }
