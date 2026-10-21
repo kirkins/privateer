@@ -42,7 +42,10 @@ pub struct Pending {
 struct Client {
     queue: SyncSender<Vec<u8>>,
     stream: UnixStream,
+    /// The pid the hello claims, and the one the socket reports (none on
+    /// macOS, whose getpeereid has no pid).
     pid: Option<i64>,
+    peer_pid: Option<i64>,
     cwd: Option<String>,
 }
 
@@ -64,6 +67,8 @@ pub struct State {
     next_id: u64,
     clients: HashMap<u64, Client>,
     next_client: u64,
+    /// Client writer threads still running; shutdown waits for them briefly.
+    writers: usize,
 }
 
 impl State {
@@ -161,7 +166,9 @@ impl Broker {
             let mut clients: Vec<_> = state
                 .clients
                 .iter()
-                .map(|(id, c)| json!({"id": id, "pid": c.pid, "cwd": c.cwd}))
+                .map(
+                    |(id, c)| json!({"id": id, "pid": c.pid, "peer_pid": c.peer_pid, "cwd": c.cwd}),
+                )
                 .collect();
             clients.sort_by_key(|c| c["id"].as_u64());
             clients.truncate(64);
@@ -193,7 +200,7 @@ impl Broker {
         self.deliver(&state, client, &message);
     }
 
-    fn client(self: Arc<Self>, stream: UnixStream) {
+    fn client(self: Arc<Self>, stream: UnixStream, peer_pid: Option<i64>) {
         let (Ok(writer), Ok(handle)) = (stream.try_clone(), stream.try_clone()) else {
             return;
         };
@@ -201,6 +208,7 @@ impl Broker {
         let id = {
             let mut state = self.lock();
             state.next_client += 1;
+            state.writers += 1;
             let id = state.next_client;
             state.clients.insert(
                 id,
@@ -208,20 +216,26 @@ impl Broker {
                     queue,
                     stream: handle,
                     pid: None,
+                    peer_pid,
                     cwd: None,
                 },
             );
             id
         };
-        std::thread::spawn(move || {
-            let mut writer = writer;
-            for line in lines_out {
-                if writer.write_all(&line).is_err() {
-                    let _ = writer.shutdown(std::net::Shutdown::Both);
-                    break;
+        {
+            let broker = self.clone();
+            std::thread::spawn(move || {
+                let mut writer = writer;
+                for line in lines_out {
+                    if writer.write_all(&line).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+                let _ = writer.shutdown(std::net::Shutdown::Both);
+                broker.lock().writers -= 1;
+                broker.changed.notify_all();
+            });
+        }
         self.log.line(&format!("client {id} connected"));
         self.publish();
         let mut reader = BufReader::with_capacity(64 * 1024, stream);
@@ -262,7 +276,8 @@ impl Broker {
     }
 
     /// The proxy's first line: who is calling, from where. Recorded only;
-    /// nothing is routed by it yet.
+    /// nothing is routed by it yet. The claimed pid is kept beside the one
+    /// the socket reports, and a mismatch is logged.
     fn hello(&self, client: u64, hello: &Map<String, Value>) {
         let pid = hello.get("pid").and_then(Value::as_i64);
         let cwd = hello
@@ -270,18 +285,29 @@ impl Broker {
             .and_then(Value::as_str)
             .filter(|cwd| cwd.len() <= 4096)
             .map(str::to_owned);
-        {
+        let peer_pid = {
             let mut state = self.lock();
-            if let Some(c) = state.clients.get_mut(&client) {
+            state.clients.get_mut(&client).and_then(|c| {
                 c.pid = pid;
                 c.cwd = cwd.clone();
+                c.peer_pid
+            })
+        };
+        let shown = |pid: Option<i64>| pid.map_or("none".to_owned(), |p| p.to_string());
+        self.log.line(&format!(
+            "client {client} hello pid {} peer pid {} cwd {}",
+            shown(pid),
+            shown(peer_pid),
+            cwd.as_deref()
+                .map_or("none".to_owned(), |c| sys::quoted(c, 4096))
+        ));
+        if let (Some(claimed), Some(seen)) = (pid, peer_pid) {
+            if claimed != seen {
+                self.log.line(&format!(
+                    "client {client} claims pid {claimed} but the socket reports pid {seen}"
+                ));
             }
         }
-        self.log.line(&format!(
-            "client {client} hello pid {} cwd {}",
-            pid.unwrap_or(-1),
-            cwd.as_deref().unwrap_or("?")
-        ));
         self.publish();
     }
 
@@ -319,7 +345,7 @@ impl Broker {
                 "notifications/cancelled" => self.cancel(client, message),
                 other => self.log.line(&format!(
                     "client {client}: dropped notification {}",
-                    other.chars().take(64).collect::<String>()
+                    sys::quoted(other, 64)
                 )),
             },
             // An answer to a server request: the broker answers those itself.
@@ -572,6 +598,7 @@ pub fn run(options: ServeOptions) -> i32 {
             next_id: 0,
             clients: HashMap::new(),
             next_client: 0,
+            writers: 0,
         }),
         changed: Condvar::new(),
         log,
@@ -596,12 +623,12 @@ pub fn run(options: ServeOptions) -> i32 {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
-                    match sys::peer_uid(stream.as_raw_fd()) {
-                        Ok(uid) if uid == me => {
+                    match sys::peer(stream.as_raw_fd()) {
+                        Ok((uid, peer_pid)) if uid == me => {
                             let broker = broker.clone();
-                            std::thread::spawn(move || broker.client(stream));
+                            std::thread::spawn(move || broker.client(stream, peer_pid));
                         }
-                        Ok(uid) => broker
+                        Ok((uid, _)) => broker
                             .log
                             .line(&format!("refused a connection from uid {uid}")),
                         Err(error) => broker
@@ -619,6 +646,7 @@ pub fn run(options: ServeOptions) -> i32 {
         }
     }
     stop(&broker);
+    flush_clients(&broker, Duration::from_secs(1));
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(&state_file);
     let _ = fs::remove_file(&pid_file);
@@ -644,6 +672,28 @@ fn listen(socket: &std::path::Path) -> std::io::Result<UnixListener> {
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// Give each client what is already queued for it (the "upstream exited"
+/// answers to calls the stop cut short), waiting at most `within`; then
+/// close every connection.
+fn flush_clients(broker: &Broker, within: Duration) {
+    let clients = std::mem::take(&mut broker.lock().clients);
+    // Dropping each queue ends its writer thread once the queue is written.
+    let streams: Vec<UnixStream> = clients.into_values().map(|c| c.stream).collect();
+    let deadline = Instant::now() + within;
+    let mut state = broker.lock();
+    while state.writers > 0 && Instant::now() < deadline {
+        state = broker
+            .changed
+            .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
+    }
+    drop(state);
+    for stream in streams {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// End the upstream (its whole process group) before the broker exits:

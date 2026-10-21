@@ -1,9 +1,10 @@
 //! The few operating-system calls std does not cover: flock, the socket
-//! peer's uid, a signal self-pipe, and a bounded log.
+//! peer's credentials, a signal self-pipe, checked private files and a
+//! bounded log.
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -20,13 +21,15 @@ pub fn euid() -> u32 {
 /// Take `path`'s exclusive flock without waiting; `None` if another process
 /// holds it. The returned file keeps the lock until it is dropped.
 pub fn try_lock(path: &Path) -> io::Result<Option<File>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
+    let file = open_checked(
+        path,
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600),
+    )?;
     // SAFETY: a valid descriptor this function owns.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(Some(file));
@@ -39,9 +42,10 @@ pub fn try_lock(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// The uid of the process at the other end of a connected Unix socket.
+/// The uid of the process at the other end of a connected Unix socket, and
+/// its pid where the system reports one (Linux; macOS's getpeereid has none).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
+pub fn peer(fd: RawFd) -> io::Result<(u32, Option<i64>)> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -61,18 +65,22 @@ pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
     if done != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(cred.uid)
+    Ok((cred.uid, (cred.pid > 0).then_some(i64::from(cred.pid))))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
+pub fn peer(fd: RawFd) -> io::Result<(u32, Option<i64>)> {
     let mut uid = 0;
     let mut gid = 0;
     // SAFETY: both out-pointers are valid.
     if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(uid)
+    Ok((uid, None))
+}
+
+pub fn peer_uid(fd: RawFd) -> io::Result<u32> {
+    peer(fd).map(|(uid, _)| uid)
 }
 
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
@@ -151,22 +159,50 @@ pub fn signal_group(pgid: u32, signal: libc::c_int) -> bool {
     unsafe { libc::kill(-(pgid as libc::pid_t), signal) == 0 }
 }
 
-/// Write `bytes` to `path` through a temporary file beside it, mode 0600.
+/// Open a broker file without following a symlink (and without blocking on
+/// a FIFO), then refuse anything but a regular file this user owns with
+/// one link. The state directory is private; nothing relies on that alone.
+pub fn open_checked(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
+    let file = options
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let info = file.metadata()?;
+    if !info.is_file() || info.uid() != euid() || info.nlink() != 1 {
+        return Err(io::Error::other(format!(
+            "{} is not a private regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// Replace `path` through a new temporary file beside it (O_EXCL, 0600), so
+/// neither a planted temp nor a symlink at `path` is ever written through.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    // Unlinking only removes a leftover name, never what a link points at.
+    let _ = fs::remove_file(&temp);
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&temp)?;
     file.write_all(bytes)?;
+    drop(file);
     fs::rename(&temp, path)
 }
 
 /// Make `dir` (0700, ours, not a symlink), or refuse.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
     let info = fs::symlink_metadata(dir)?;
     if !info.is_dir() || info.uid() != euid() {
         return Err(io::Error::other(format!(
@@ -175,6 +211,14 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
         )));
     }
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+/// `text` quoted, with quotes, backslashes and control characters escaped,
+/// at most `limit` characters of it: for a client- or upstream-supplied
+/// field in a log line.
+pub fn quoted(text: &str, limit: usize) -> String {
+    let short: String = text.chars().take(limit).collect();
+    format!("{short:?}")
 }
 
 pub fn now_ms() -> u128 {
@@ -194,7 +238,14 @@ pub struct Log {
 
 impl Log {
     pub fn open(path: PathBuf) -> Log {
-        let file = append(&path).ok();
+        let file = append(&path)
+            .map_err(|error| {
+                eprintln!(
+                    "privateer-mcp-broker: not logging to {}: {error}",
+                    path.display()
+                )
+            })
+            .ok();
         let owns_stdio = file.as_ref().is_some_and(|file| same_file(file, 2));
         Log {
             path,
@@ -225,18 +276,29 @@ impl Log {
             }
         }
         if let Some(file) = file.as_mut() {
-            let text: String = message.chars().take(1_000).collect();
-            let _ = writeln!(file, "{} {}", now_ms(), text.replace('\n', " "));
+            // One line each, whatever a caller passed: control characters
+            // are escaped.
+            let text: String = message
+                .chars()
+                .take(1_000)
+                .flat_map(|c| {
+                    if c.is_control() {
+                        c.escape_default().collect::<Vec<_>>()
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            let _ = writeln!(file, "{} {}", now_ms(), text);
         }
     }
 }
 
 fn append(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
+    open_checked(
+        path,
+        OpenOptions::new().create(true).append(true).mode(0o600),
+    )
 }
 
 fn same_file(file: &File, fd: RawFd) -> bool {

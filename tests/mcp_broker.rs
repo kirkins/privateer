@@ -387,6 +387,98 @@ fn a_slow_initialize_gives_a_busy_answer_within_the_ready_wait() {
 }
 
 #[test]
+fn symlinked_files_in_the_state_dir_are_refused_and_their_targets_untouched() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("state");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let victim = |name: &str| {
+        let path = temp.path().join(format!("victim-{name}"));
+        fs::write(&path, "untouched").unwrap();
+        path
+    };
+    let untouched = |name: &str| {
+        assert_eq!(
+            fs::read_to_string(temp.path().join(format!("victim-{name}"))).unwrap(),
+            "untouched",
+            "{name}"
+        )
+    };
+    let record = temp.path().join("record.jsonl");
+    let serve = |command: &mut Command| {
+        command
+            .args(["serve", "--state-dir"])
+            .arg(&dir)
+            .args(["--name", "xcode", "--"])
+            .args(upstream(&record, &[]))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+    };
+    // A symlinked lock: the broker refuses to start.
+    symlink(victim("lock"), dir.join("xcode.lock")).unwrap();
+    let mut refused = support::command(BROKER);
+    serve(&mut refused);
+    let refused = refused.output().unwrap();
+    assert!(!refused.status.success());
+    assert!(!dir.join("xcode.sock").exists());
+    untouched("lock");
+    fs::remove_file(dir.join("xcode.lock")).unwrap();
+    // A symlinked log, state, pid, and state temp file (named for the
+    // broker's own pid: the shell execs the broker in its place).
+    symlink(victim("log"), dir.join("xcode.log")).unwrap();
+    symlink(victim("state"), dir.join("xcode.state.json")).unwrap();
+    symlink(victim("pid"), dir.join("xcode.pid")).unwrap();
+    let mut command = support::command("/bin/sh");
+    command
+        .arg("-c")
+        .arg(r#"ln -s "$1" "$2/.xcode.state.json.$$.tmp" && shift 2 && exec "$@""#)
+        .arg("sh")
+        .arg(victim("temp"))
+        .arg(&dir)
+        .arg(BROKER);
+    serve(&mut command);
+    let mut child = command.spawn().unwrap();
+    eventually(Duration::from_secs(10), "the broker's socket", || {
+        assert!(child.try_wait().unwrap().is_none(), "the broker exited");
+        dir.join("xcode.sock").exists().then_some(())
+    });
+    let mut client = Client::connect(&dir.join("xcode.sock"));
+    assert_eq!(
+        text(&client.call(json!(1), "echo", json!({"text": "fine"}))),
+        "fine"
+    );
+    drop(client);
+    // The state and pid were replaced by rename, not written through.
+    eventually(Duration::from_secs(5), "a regular state file", || {
+        fs::symlink_metadata(dir.join("xcode.state.json"))
+            .is_ok_and(|m| m.is_file())
+            .then_some(())
+    });
+    assert!(
+        fs::symlink_metadata(dir.join("xcode.pid"))
+            .unwrap()
+            .is_file()
+    );
+    // SAFETY: signalling the broker this test started.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(stderr.contains("not logging to"), "{stderr}");
+    for name in ["log", "state", "pid", "temp"] {
+        untouched(name);
+    }
+    assert!(
+        fs::symlink_metadata(dir.join("xcode.log"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn one_broker_per_directory_private_modes_and_a_stale_socket_replaced() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path().join("state");
@@ -509,6 +601,9 @@ fn the_proxy_says_hello_from_its_real_cwd_and_exits_with_either_side() {
             .and_then(|c| c.iter().find(|c| c["pid"] == pid).cloned())
     });
     assert_eq!(client["cwd"], real.to_string_lossy().as_ref());
+    // The socket's own report of the peer, beside the hello's claim.
+    #[cfg(target_os = "linux")]
+    assert_eq!(client["peer_pid"], pid);
     // stdin closed: the proxy exits.
     drop(a.stdin.take());
     let status = a
@@ -518,7 +613,15 @@ fn the_proxy_says_hello_from_its_real_cwd_and_exits_with_either_side() {
     // The broker closes: the proxy exits.
     let mut b = Client::connect(&broker.socket());
     assert_eq!(text(&b.call(json!(1), "echo", json!({"text": "hi"}))), "hi");
+    // A call in flight when the broker is stopped is answered before it exits.
+    b.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "slow", "arguments": {"secs": 30}}}));
+    broker.wait_record("the slow call", |r| r["params"]["name"] == "slow");
     broker.stop();
+    assert_eq!(
+        text(&b.answer(json!(2))),
+        "upstream exited; the call may or may not have run"
+    );
     assert!(
         b.exits_within(Duration::from_secs(5)).is_some(),
         "exit on broker close"
@@ -607,8 +710,13 @@ impl Machine {
             .join("data/privateer/mcp-broker/bin/privateer-mcp-broker")
     }
 
+    /// The broker's run directory: under XDG data, never the ledger.
     fn dir(&self) -> PathBuf {
-        self.root.join("ledger/mcp-broker")
+        self.root.join("data/privateer/mcp-broker/run")
+    }
+
+    fn ledger(&self) -> PathBuf {
+        self.root.join("ledger")
     }
 
     fn pass(&self, folder: &Path) -> Value {
@@ -660,6 +768,14 @@ fn install_copies_only_a_missing_or_different_version() {
         serde_json::from_slice(&fs::read(machine.dir().join("xcode.json")).unwrap()).unwrap();
     assert_eq!(config, json!({"upstream": ["/usr/bin/xcrun", "mcpbridge"]}));
     assert_eq!(fs::metadata(machine.dir()).unwrap().mode() & 0o777, 0o700);
+    // Every broker file is in the run directory, outside the ledger that
+    // sandboxed agents may write; nothing of the broker's is in the ledger.
+    for key in ["config", "socket"] {
+        let path = PathBuf::from(first[key].as_str().unwrap());
+        assert_eq!(path.parent(), Some(machine.dir().as_path()), "{key}");
+        assert!(!path.starts_with(machine.ledger()), "{key}");
+    }
+    assert!(!machine.ledger().join("mcp-broker").exists());
     assert_eq!(
         first["bundle_command"],
         json!([
@@ -717,6 +833,19 @@ fn install_copies_only_a_missing_or_different_version() {
     assert_eq!(status["installed"], true);
     assert_eq!(status["sha256"], sha256(&stable));
     assert_eq!(status["running"], false);
+    assert_eq!(status["run_dir"], machine.dir().to_string_lossy().as_ref());
+    // A run directory inside the ledger is refused.
+    let inside = machine
+        .command(here, &["mcp-broker", "install"])
+        .env("XDG_DATA_HOME", machine.ledger().join("data"))
+        .output()
+        .unwrap();
+    assert!(!inside.status.success());
+    assert!(
+        String::from_utf8_lossy(&inside.stderr).contains("lies inside"),
+        "{}",
+        String::from_utf8_lossy(&inside.stderr)
+    );
 }
 
 #[test]
@@ -727,11 +856,18 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     };
     let upkeep = machine.ship("upkeep");
     let other = machine.ship("other");
+    // The owner's home keeps its ledger elsewhere: the broker's files do not
+    // follow the ledger, so an install from outside any ship folder (no
+    // home) is the one its dispatcher finds.
+    let home_config = upkeep.join(".privateer/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&home_config).unwrap()).unwrap();
+    config["resource_home"] = json!(temp.path().join("owner-ledger"));
+    fs::write(&home_config, config.to_string()).unwrap();
     let record = temp.path().join("record.jsonl");
     let mut install = vec!["mcp-broker", "install", "--upstream"];
     let argv = upstream(&record, &[]);
     install.extend(argv.iter().map(String::as_str));
-    machine.run(&upkeep, &install);
+    machine.run(temp.path(), &install);
     let pid_file = machine.dir().join("xcode.pid");
     let _detached = Detached(pid_file.clone());
     // No machine owner: no dispatcher starts it.
@@ -790,11 +926,34 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     assert_eq!(status["broker"]["upstream"]["state"], "ready");
     let upstream_pid = status["broker"]["upstream"]["pid"].as_i64().unwrap() as i32;
     assert!(alive(upstream_pid));
+    // A state file naming another process group as the upstream: stop never
+    // signals it, and the broker still ends its own upstream.
+    let mut bystander = Command::new("sleep");
+    std::os::unix::process::CommandExt::process_group(&mut bystander, 0);
+    let mut bystander = bystander.arg("60").spawn().unwrap();
+    let bystander_pid = bystander.id() as i32;
+    let state_file = machine.dir().join("xcode.state.json");
+    let mut forged: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    forged["upstream"]["pid"] = json!(bystander_pid);
+    let forged_temp = machine.dir().join("forged.tmp");
+    fs::write(&forged_temp, forged.to_string()).unwrap();
+    fs::rename(&forged_temp, &state_file).unwrap();
     // Stop: the broker and its upstream are gone, and it stays stopped.
     let stopped = machine.run(&upkeep, &["mcp-broker", "stop"]);
-    assert_eq!(stopped["stopped"]["upstream_gone"], true, "{stopped}");
+    assert_eq!(
+        stopped["stopped"]["unverified_upstream_pid"], bystander_pid,
+        "{stopped}"
+    );
+    assert_eq!(stopped["stopped"]["upstream_pid"], Value::Null, "{stopped}");
     assert_eq!(stopped["stopped"]["running"], false);
-    assert!(!alive(upstream_pid));
+    assert!(alive(bystander_pid), "the forged group was signalled");
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    eventually(
+        Duration::from_secs(5),
+        "the broker's own upstream to end",
+        || (!alive(upstream_pid)).then_some(()),
+    );
     eventually(Duration::from_secs(5), "the broker to exit", || {
         (!alive(pid)
             || fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| s.contains(") Z ")))
@@ -813,6 +972,21 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
         "{refused}"
     );
     assert!(!temp.path().join("pwned").exists());
+    // A symlinked log in the run directory: the dispatcher refuses to open
+    // it, starts nothing, and the link's target is untouched.
+    machine.run(&upkeep, &install);
+    let victim = temp.path().join("victim");
+    fs::write(&victim, "untouched").unwrap();
+    let _ = fs::remove_file(machine.dir().join("xcode.log"));
+    std::os::unix::fs::symlink(&victim, machine.dir().join("xcode.log")).unwrap();
+    let refused = machine.pass(&upkeep);
+    assert!(
+        refused["error"].as_str().unwrap().contains("xcode.log"),
+        "{refused}"
+    );
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+    assert!(!pid_file.exists());
+    fs::remove_file(machine.dir().join("xcode.log")).unwrap();
     // Install lifts the stop; removing the config stops it again.
     machine.run(&upkeep, &install);
     let restarted = machine.pass(&upkeep)["started"].as_i64().unwrap() as i32;

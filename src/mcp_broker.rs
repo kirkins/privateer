@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -44,7 +44,15 @@ fn config_pin() -> Result<PathBuf> {
     Ok(crate::releases::data_dir()?.join(format!("mcp-broker/{NAME}.json.sha256")))
 }
 
-/// The broker's files under `<ledger>/mcp-broker/`.
+/// `$XDG_DATA_HOME/privateer/mcp-broker/run`: the broker's lock, pid,
+/// state, log, socket and config. Sandboxed agents may write the ledger and
+/// the ship homes, never this; and a crew connects to the socket here
+/// without being able to replace it (docs/mcp-broker.md).
+pub fn run_dir() -> Result<PathBuf> {
+    Ok(crate::releases::data_dir()?.join("mcp-broker/run"))
+}
+
+/// The broker's files in the run directory.
 struct Files {
     dir: PathBuf,
     config: PathBuf,
@@ -57,8 +65,7 @@ struct Files {
 }
 
 impl Files {
-    fn new(ledger: &Path) -> Self {
-        let dir = ledger.join("mcp-broker");
+    fn new(dir: PathBuf) -> Self {
         let at = |suffix: &str| dir.join(format!("{NAME}.{suffix}"));
         Self {
             config: at("json"),
@@ -71,10 +78,51 @@ impl Files {
             dir,
         }
     }
+
+    /// The run directory, refused when it lies inside a directory agents
+    /// may write: the ledger or the ship's home.
+    fn resolve(home: Option<&Path>) -> Result<Self> {
+        let dir = run_dir()?;
+        let ledger = crate::jobs::ledger_dir_at(home)?;
+        for writable in [Some(ledger.as_path()), home].into_iter().flatten() {
+            ensure!(
+                !inside(&dir, writable),
+                "the MCP broker's run directory {} lies inside {}, which agents may write; set XDG_DATA_HOME elsewhere",
+                dir.display(),
+                writable.display()
+            );
+        }
+        Ok(Self::new(dir))
+    }
+}
+
+/// Whether `path` is `parent` or below it, as written or once resolved.
+fn inside(path: &Path, parent: &Path) -> bool {
+    let resolved = |p: &Path| {
+        // The deepest existing ancestor, resolved, with the rest appended.
+        let mut existing = p.to_path_buf();
+        let mut rest = vec![];
+        while !existing.exists() {
+            match (
+                existing.file_name().map(ToOwned::to_owned),
+                existing.parent(),
+            ) {
+                (Some(name), Some(up)) => {
+                    rest.push(name);
+                    existing = up.to_path_buf();
+                }
+                _ => break,
+            }
+        }
+        let mut out = fs::canonicalize(&existing).unwrap_or(existing);
+        out.extend(rest.into_iter().rev());
+        out
+    };
+    path.starts_with(parent) || resolved(path).starts_with(resolved(parent))
 }
 
 pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> {
-    let files = Files::new(&crate::jobs::ledger_dir_at(home)?);
+    let files = Files::resolve(home)?;
     let out = match args.first().map(String::as_str) {
         Some("install") => {
             caller.require_operator("mcp-broker install")?;
@@ -85,7 +133,7 @@ pub fn cli(home: Option<&Path>, args: &[String], caller: &Caller) -> Result<()> 
             caller.require_operator("mcp-broker stop")?;
             // First, so the dispatcher does not start it again meanwhile.
             private_dir(&files.dir)?;
-            fs::write(&files.stopped, b"")
+            write_private(&files.stopped, b"")
                 .with_context(|| format!("cannot write {}", files.stopped.display()))?;
             json!({"stopped": stop_running(&files)?, "held_until": "mcp-broker install"})
         }
@@ -170,27 +218,63 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Make `dir` 0700, ours.
+/// Make the run directory (0700, ours, not a symlink, nor its parent).
 fn private_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    let info = fs::symlink_metadata(dir)?;
-    ensure!(
-        info.is_dir() && std::os::unix::fs::MetadataExt::uid(&info) == unsafe { libc::geteuid() },
-        "{} is not a directory this user owns",
-        dir.display()
-    );
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    for part in [dir.parent().context("run directory parent")?, dir] {
+        let info = fs::symlink_metadata(part)?;
+        ensure!(
+            info.is_dir() && info.uid() == unsafe { libc::geteuid() },
+            "{} is not a directory this user owns",
+            part.display()
+        );
+    }
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
+/// Open a broker file without following a symlink (and without blocking on
+/// a FIFO), then refuse anything but a regular file this user owns with
+/// one link. The run directory is private; nothing here relies on that alone.
+fn open_checked(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
+    let file = options
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let info = file.metadata()?;
+    // SAFETY: geteuid cannot fail.
+    if !info.is_file() || info.uid() != unsafe { libc::geteuid() } || info.nlink() != 1 {
+        return Err(io::Error::other(format!(
+            "{} is not a private regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// A broker file's bytes, through `open_checked`, at most 1 MiB.
+fn read_checked(path: &Path) -> io::Result<Vec<u8>> {
+    let file = open_checked(path, OpenOptions::new().read(true))?;
+    let mut bytes = vec![];
+    io::Read::read_to_end(&mut io::Read::take(file, 1 << 20), &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Replace `path` through a new temporary file beside it (O_EXCL, 0600), so
+/// neither a planted temp nor a symlink at `path` is ever written through.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    let name = path.file_name().context("file name")?.to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    // Unlinking only removes a leftover name, never what a link points at.
     let _ = fs::remove_file(&temp);
     {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&temp)?;
         io::Write::write_all(&mut file, bytes)?;
         file.sync_all()?;
@@ -261,7 +345,7 @@ fn status(files: &Files) -> Result<Value> {
     let installed = binary.is_file();
     let running = lock_held(&files.lock);
     let read = |path: &Path| -> Value {
-        fs::read(path)
+        read_checked(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(Value::Null)
@@ -271,6 +355,7 @@ fn status(files: &Files) -> Result<Value> {
         "installed": installed,
         "version": installed.then(|| version_of(&binary).ok()).flatten(),
         "sha256": installed.then(|| sha256_file(&binary).ok()).flatten(),
+        "run_dir": files.dir,
         "config": files.config,
         "upstream": read(&files.config)["upstream"],
         "stopped": files.stopped.exists(),
@@ -286,7 +371,7 @@ fn status(files: &Files) -> Result<Value> {
 /// Whether a broker holds the lock. Holding it here, for the instant this
 /// takes, never stops a broker start: serve retries for half a second.
 fn lock_held(path: &Path) -> bool {
-    let Ok(file) = File::open(path) else {
+    let Ok(file) = open_checked(path, OpenOptions::new().read(true)) else {
         return false;
     };
     // SAFETY: a descriptor this function owns; closing it drops the lock.
@@ -295,7 +380,7 @@ fn lock_held(path: &Path) -> bool {
 }
 
 fn read_pid(path: &Path) -> Option<i32> {
-    fs::read_to_string(path)
+    String::from_utf8(read_checked(path).ok()?)
         .ok()?
         .trim()
         .parse()
@@ -342,10 +427,60 @@ fn wait_unlocked(lock: &Path, within: Duration) -> bool {
     true
 }
 
+/// The parent of `pid`, if it can be read.
+fn parent_of(pid: i32) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        // The fields after the command's closing parenthesis: state, ppid.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: proc_pidinfo fills at most the struct's size.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (got == size).then_some(info.pbi_ppid as i32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether `pgid` names the upstream of the verified broker `broker`: a
+/// group leader in the broker's session (a dispatcher-started broker leads
+/// its own) or the broker's child. Whatever the state file says, nothing
+/// else is signalled.
+fn upstream_group_of(broker: i32, pgid: i32) -> bool {
+    // SAFETY: getpgid and getsid only read.
+    let (group, session) = unsafe { (libc::getpgid(pgid), libc::getsid(pgid)) };
+    pgid > 1
+        && pgid != broker
+        && group == pgid
+        && (session == broker || parent_of(pgid) == Some(broker))
+}
+
 /// Stop a running broker and prove its upstream went with it: SIGTERM (the
 /// broker ends its upstream's process group), then SIGKILL to both after
 /// 10 s. Killing the broker alone is not proof: the upstream group is
-/// checked by itself.
+/// checked by itself, and signalled only once it is verified as the
+/// broker's (`upstream_group_of`), before the broker goes.
 fn stop_running(files: &Files) -> Result<Value> {
     if !lock_held(&files.lock) {
         return Ok(json!({"was_running": false}));
@@ -356,12 +491,18 @@ fn stop_running(files: &Files) -> Result<Value> {
         "pid {pid} in {} is not the broker; not signalling it",
         files.pid.display()
     );
-    let upstream = fs::read(&files.state)
+    let claimed = read_checked(&files.state)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|state| state["upstream"]["pid"].as_i64())
-        .and_then(|pid| i32::try_from(pid).ok())
-        .filter(|pid| *pid > 1);
+        .and_then(|pid| i32::try_from(pid).ok());
+    // Verified while the broker still runs, so its parenthood can be seen.
+    let upstream = claimed.filter(|pgid| upstream_group_of(pid, *pgid));
+    let refused = claimed.filter(|_| upstream.is_none());
+    // Checked again before SIGKILL. After the broker exits only its session
+    // still ties the group to it: a broker that does not lead its own
+    // session (one started by hand) leaves a surviving group unsignalled.
+    let still_ours = |pgid: i32| upstream_group_of(pid, pgid);
     // SAFETY: kill has no memory effects.
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let mut forced = false;
@@ -371,18 +512,19 @@ fn stop_running(files: &Files) -> Result<Value> {
         wait_unlocked(&files.lock, Duration::from_secs(3));
     }
     let group_alive = |pgid: i32| unsafe { libc::kill(-pgid, 0) } == 0;
-    let mut upstream_gone = true;
+    // Unknown (null) when no upstream group was verified.
+    let mut upstream_gone = None;
     if let Some(pgid) = upstream {
         let deadline = Instant::now() + Duration::from_secs(3);
         while group_alive(pgid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
-        if group_alive(pgid) {
+        if group_alive(pgid) && still_ours(pgid) {
             forced = true;
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
             std::thread::sleep(Duration::from_millis(200));
         }
-        upstream_gone = !group_alive(pgid);
+        upstream_gone = Some(!group_alive(pgid));
     }
     Ok(json!({
         "was_running": true,
@@ -390,6 +532,8 @@ fn stop_running(files: &Files) -> Result<Value> {
         "running": lock_held(&files.lock),
         "upstream_pid": upstream,
         "upstream_gone": upstream_gone,
+        // A state-file pgid that is not the broker's upstream: never signalled.
+        "unverified_upstream_pid": refused,
         "forced": forced,
     }))
 }
@@ -416,7 +560,7 @@ fn ensure_now(store: &Store) -> Result<Value> {
     if crate::machines::owner_here(store)?.is_none() {
         return Ok(Value::Null);
     }
-    let files = Files::new(&crate::jobs::ledger_dir(store)?);
+    let files = Files::resolve(Some(store.home()))?;
     if !files.config.exists() {
         return Ok(if lock_held(&files.lock) {
             json!({"stopped": stop_running(&files)?})
@@ -433,8 +577,11 @@ fn ensure_now(store: &Store) -> Result<Value> {
             json!({"error": "the broker is configured but not installed: privateer mcp-broker install"}),
         );
     }
-    let bytes = fs::read(&files.config)?;
-    let pinned = fs::read_to_string(config_pin()?).unwrap_or_default();
+    let bytes = read_checked(&files.config)
+        .with_context(|| format!("cannot read {}", files.config.display()))?;
+    let pinned = read_checked(&config_pin()?)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
     if pinned.trim() != format!("{:x}", Sha256::digest(&bytes)) {
         return Ok(
             json!({"error": "the broker config differs from what mcp-broker install wrote; not starting it"}),
@@ -451,11 +598,11 @@ fn ensure_now(store: &Store) -> Result<Value> {
 /// Start `serve` detached: its own session, stdio on the log, no descriptor
 /// of the dispatcher's, and only the environment its upstream may see.
 fn start(binary: &Path, files: &Files, upstream: &[String]) -> Result<u32> {
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&files.log)?;
+    let log = open_checked(
+        &files.log,
+        OpenOptions::new().create(true).append(true).mode(0o600),
+    )
+    .with_context(|| format!("cannot open {}", files.log.display()))?;
     let mut command = Command::new(binary);
     command
         .arg("serve")
@@ -512,4 +659,50 @@ fn start(binary: &Path, files: &Files, upstream: &[String]) -> Result<u32> {
         let _ = child.wait();
     });
     Ok(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn writes_never_follow_a_planted_temp_or_target_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        let path = temp.path().join("xcode.json");
+        // The temp name this process would use, and the target, both links.
+        let planted = temp
+            .path()
+            .join(format!(".xcode.json.{}.tmp", std::process::id()));
+        symlink(&victim, &planted).unwrap();
+        symlink(&victim, &path).unwrap();
+        write_private(&path, b"{}").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(read_checked(&path).unwrap(), b"{}");
+        assert!(!planted.exists());
+        // Reads refuse a link and a second hard link.
+        let link = temp.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(read_checked(&link).is_err());
+        fs::hard_link(&path, temp.path().join("hard")).unwrap();
+        assert!(read_checked(&path).is_err());
+    }
+
+    #[test]
+    fn only_the_brokers_own_group_counts_as_its_upstream() {
+        let mut child = Command::new("sleep");
+        child.arg("30").process_group(0);
+        let mut child = child.spawn().unwrap();
+        let pgid = child.id() as i32;
+        let me = std::process::id() as i32;
+        assert!(upstream_group_of(me, pgid), "this process's child");
+        assert!(!upstream_group_of(1, pgid), "not init's");
+        assert!(!upstream_group_of(me, me), "never the broker itself");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!upstream_group_of(me, pgid), "gone");
+    }
 }

@@ -69,6 +69,8 @@ fn spawn(argv: &[String]) -> std::io::Result<Child> {
         .args(&argv[1..])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        // Not the broker's state directory, nor wherever it was started.
+        .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -133,10 +135,9 @@ fn run(broker: &Arc<Broker>, generation: u64, backoff: Duration) -> Option<Insta
             while let Ok(Some(line)) = lines::next(&mut reader, 64 * 1024) {
                 if let Line::Text(text) = line {
                     let text = String::from_utf8_lossy(&text);
-                    broker.log.line(&format!(
-                        "upstream stderr: {}",
-                        text.chars().take(200).collect::<String>()
-                    ));
+                    broker
+                        .log
+                        .line(&format!("upstream stderr: {}", sys::quoted(&text, 200)));
                 }
             }
         });
@@ -261,7 +262,7 @@ fn route(broker: &Broker, pid: u32, text: &[u8], ready_at: &mut Option<Instant>)
         (Some(method), Some(id)) => {
             broker.log.line(&format!(
                 "refused upstream request {}",
-                method.chars().take(64).collect::<String>()
+                sys::quoted(&method, 64)
             ));
             if let Some(queue) = &state.upstream {
                 let _ = queue.try_send(line(&json!({"jsonrpc": "2.0", "id": id,
