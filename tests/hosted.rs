@@ -3829,6 +3829,62 @@ fn mail_that_lands_between_a_catch_up_and_its_replacement_wakes_the_asleep_pane(
     place.stop_native("infra");
 }
 
+/// A hosted pane records the captain approvals it launched with. Claude reads
+/// them only at launch, so recording or revoking one afterwards is reported
+/// as `approvals_changed`; the pane is not relaunched for it.
+#[test]
+fn a_hosted_pane_reports_approvals_recorded_or_revoked_after_its_launch() {
+    let a = commit('a');
+    let mut place = Place::new();
+    place.on_release(&a);
+    let (place, _herdr) = hosted(place);
+    let recorded: Option<String> = place
+        .database()
+        .query_row(
+            "SELECT approvals_digest FROM hosted_panes WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(recorded.is_some(), "the launch records its approvals");
+    let changed = || {
+        let status = place.json("upgrade.status", json!({}));
+        assert_eq!(status["hosted_panes"][0]["ship"], "infra", "{status}");
+        let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+        assert_eq!(
+            bearings["hosted_pane"]["approvals_changed"],
+            status["hosted_panes"][0]["approvals_changed"],
+            "{bearings}"
+        );
+        status["hosted_panes"][0]["approvals_changed"] == true
+    };
+    assert!(!changed());
+
+    place.json(
+        "task.create",
+        json!({"id":"ship-it","charter_id":"infra","owner":"infra","title":"Ship it"}),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    place
+        .database()
+        .execute(
+            "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,created_ms,expires_ms,source)
+             VALUES('approval-1','infra','ship-it','q-1','r-1','Deploy build 7 to staging',?1,?2,'reply')",
+            rusqlite::params![now, now + 3_600_000],
+        )
+        .unwrap();
+    assert!(changed(), "an approval recorded after launch");
+    place.json("captain_approval.revoke", json!({"id":"approval-1"}));
+    assert!(
+        !changed(),
+        "revoked, the pane's launch set is current again"
+    );
+    place.stop_native("infra");
+}
+
 #[test]
 fn a_pane_predating_relaunch_support_fails_at_once_and_says_how_to_restart() {
     let a = commit('a');

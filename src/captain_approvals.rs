@@ -15,6 +15,7 @@ use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub(crate) const DEFAULT_TTL_SECS: u64 = 86_400;
 pub(crate) const MAX_TTL_SECS: u64 = 604_800;
@@ -726,6 +727,28 @@ fn sentence(
 /// launch's policy check is skipped and audited, so one bad row never stops
 /// a launch.
 pub(crate) fn sentences(store: &Store, ship: &str, now: i64) -> Result<Vec<String>> {
+    told(store, ship, now, true)
+}
+
+/// A digest of the sentences a launch carried. Claude reads its settings only
+/// at launch (tests/fixtures/claude/settings-reload.md), so a pane whose
+/// digest differs from `current_digest` runs on stale approvals.
+pub(crate) fn digest(sentences: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for sentence in sentences {
+        hasher.update(sentence.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The digest a launch now would carry. Read-only: a skipped sentence is
+/// audited by the launch, not by every check.
+pub(crate) fn current_digest(store: &Store, ship: &str, now: i64) -> Result<String> {
+    Ok(digest(&told(store, ship, now, false)?))
+}
+
+fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<String>> {
     let mut told = vec![];
     for row in live(store, ship, now)? {
         let text = sentence(
@@ -737,10 +760,12 @@ pub(crate) fn sentences(store: &Store, ship: &str, now: i64) -> Result<Vec<Strin
             &row.action,
         );
         if text.chars().count() > MAX_SENTENCE_CHARS {
-            store.audit(
-                "permissions.approval_skipped",
-                &json!({"id": row.id, "ship": ship, "why": "sentence too long"}),
-            )?;
+            if audit {
+                store.audit(
+                    "permissions.approval_skipped",
+                    &json!({"id": row.id, "ship": ship, "why": "sentence too long"}),
+                )?;
+            }
             continue;
         }
         told.push(text);
@@ -1084,6 +1109,58 @@ mod tests {
         assert!(names("restart INFRA.", "infra"));
         assert!(!names("Deploy infrastructure", "infra"));
         assert!(!names("Deploy my-infra-box", "infra"));
+    }
+
+    /// The digest a launch records matches the read-only check until an
+    /// approval is recorded, revoked or expires.
+    #[test]
+    fn the_approvals_digest_follows_live_approvals() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"main","charter_id":"project","owner":"apps","title":"Deliver"}),
+        )
+        .unwrap();
+        let now = 1_000_000;
+        let launched = |store: &Store, at| digest(&sentences(store, "apps", at).unwrap());
+        let none = launched(&store, now);
+        assert_eq!(none, current_digest(&store, "apps", now).unwrap());
+        for (id, expires) in [("a1", now + 60_000), ("a2", now + 120_000)] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+                       created_ms,expires_ms,source) VALUES(?1,'apps','main',?1,?1,'Deploy',?2,?3,'reply')",
+                    params![id, now, expires],
+                )
+                .unwrap();
+        }
+        let both = launched(&store, now);
+        assert_ne!(both, none);
+        assert_eq!(both, current_digest(&store, "apps", now).unwrap());
+        // Another ship's view is untouched.
+        assert_eq!(current_digest(&store, "infra", now).unwrap(), none);
+        store
+            .connection()
+            .execute(
+                "UPDATE captain_approvals SET revoked_ms=?1 WHERE id='a2'",
+                [now],
+            )
+            .unwrap();
+        let one = current_digest(&store, "apps", now).unwrap();
+        assert_ne!(one, both);
+        assert_ne!(one, none);
+        assert_eq!(current_digest(&store, "apps", now + 60_000).unwrap(), none);
     }
 
     #[test]

@@ -102,6 +102,15 @@ pub fn init(store: &Store) -> Result<()> {
     if !digest_column {
         tx.execute_batch("ALTER TABLE hosted_panes ADD COLUMN settings_digest TEXT;")?;
     }
+    // The captain approvals a hosted pane launched with, for approval drift.
+    let approvals_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hosted_panes') WHERE name='approvals_digest')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !approvals_column {
+        tx.execute_batch("ALTER TABLE hosted_panes ADD COLUMN approvals_digest TEXT;")?;
+    }
     crate::host::restored::init(&tx)?;
     // A pane relaunched by an upgrade, or from sleep, starts asleep.
     let asleep_column: bool = tx.query_row(

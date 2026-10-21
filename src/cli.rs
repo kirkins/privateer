@@ -1243,12 +1243,15 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         }
         policy["ship"] = json!(ship);
         policy["role"] = json!("first_mate");
-        // The captain's live approvals, read at each launch of the pane.
-        policy["approved"] = json!(crate::captain_approvals::sentences(
-            &store,
-            &ship,
-            Store::now_ms()
-        )?);
+        // The captain's live approvals, read at each launch of the pane. The
+        // settings stay inline: Claude reads a --settings file only at launch
+        // (tests/fixtures/claude/settings-reload.md), so the pane records what
+        // it carried and reports approvals_changed instead.
+        let approved = crate::captain_approvals::sentences(&store, &ship, Store::now_ms())?;
+        if hosted {
+            let _ = crate::host::upgrade::record_approvals(&store, &ship, &approved);
+        }
+        policy["approved"] = json!(approved);
         let policy = serde_json::to_string(&policy)?;
         let mut command = std::process::Command::new("python3");
         command.arg(plugins.join("native_launch.py"));

@@ -137,7 +137,11 @@ def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship
 
     The classifier trusts settings, not what an agent reads in mail or notes,
     so a captain's standing grant must reach it here or it is asked again.
-    The captain's expiring approvals (`approved`) widen allow only."""
+    The captain's expiring approvals (`approved`) widen allow only.
+
+    Claude reads these only at launch: a running session never re-reads its
+    --settings file, in place or renamed (tests/fixtures/claude/settings-reload.md),
+    so they stay inline and an approval recorded mid-session needs a relaunch."""
     if role in ("crew", "reviewer") or errand or not (actions or authorized or approved):
         return None
     allow = ["$defaults"]
