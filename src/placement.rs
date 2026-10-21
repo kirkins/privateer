@@ -2222,7 +2222,7 @@ mod tests {
         let all = tree_bytes(&temp.path().join("projects"));
         let clone = crate::moves::clone_bytes(temp.path());
         assert!(all > 4 << 20, "{all}");
-        assert!(clone >= 4096 + 1000 && clone < 1 << 20, "{clone}");
+        assert!((4096 + 1000..1 << 20).contains(&clone), "{clone}");
         let report = json!({"folder_bytes": 10, "project_bytes": all, "clone_bytes": clone});
         assert_eq!(needed(&report), 10 + clone);
         // An older report without it counts the projects whole.
