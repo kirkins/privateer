@@ -22,6 +22,12 @@ pub(crate) const MAX_TTL_SECS: u64 = 604_800;
 pub(crate) const MAX_LIVE: usize = 8;
 const MAX_ACTION_CHARS: usize = 300;
 const MAX_PREFIX_CHARS: usize = 120;
+/// The longest sentence `tool_permissions.policy` accepts.
+const MAX_SENTENCE_CHARS: usize = 600;
+/// The longest `until` a sentence prints, and the length of the reply id a
+/// captain's door mints, for the send-time worst case.
+const LONGEST_UTC: &str = "9999-12-31 23:59 UTC";
+const MINTED_REPLY_CHARS: usize = 36;
 
 const POLICY_WORDS: &[&str] = &[
     "permission",
@@ -43,15 +49,65 @@ const BROAD_WORDS: &[&str] = &[
     "always",
     "from now on",
 ];
+/// Words of the sentence that wraps an action, which the action cannot restate.
+const FRAMING_WORDS: &[&str] = &["authorized", "authorised", "captain", "approved", "expire"];
 /// Commands that run whatever follows them.
 const WRAPPERS: &[&str] = &["env", "sudo", "xargs", "eval"];
 /// Shells and interpreters, refused alone or running inline code.
 const INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "node"];
 /// Words that make a free-text reply something other than a plain yes.
 const REFUSALS: &[&str] = &[
-    "no", "not", "don't", "dont", "do not", "never", "stop", "wait", "hold", "later", "cancel",
-    "deny", "decline", "reject", "instead", "unless", "except", "but", "only", "first", "if",
-    "nope", "nah", "cannot", "can't", "won't", "until", "pause", "abort", "refuse", "maybe",
+    "no",
+    "not",
+    "don't",
+    "dont",
+    "do not",
+    "never",
+    "stop",
+    "wait",
+    "hold",
+    "later",
+    "cancel",
+    "deny",
+    "decline",
+    "reject",
+    "instead",
+    "unless",
+    "except",
+    "but",
+    "only",
+    "first",
+    "if",
+    "nope",
+    "nah",
+    "cannot",
+    "can't",
+    "won't",
+    "until",
+    "pause",
+    "abort",
+    "refuse",
+    "maybe",
+    "never mind",
+];
+/// Refusals matched as the start of a word, so "Denied" and "Waiting" count.
+const REFUSAL_STEMS: &[&str] = &[
+    "deny",
+    "deni",
+    "reject",
+    "declin",
+    "cancel",
+    "stop",
+    "refus",
+    "wait",
+    "hold",
+    "paus",
+    "abort",
+    "postpon",
+    "veto",
+    "skip",
+    "negative",
+    "nevermind",
 ];
 
 /// One line of text within `max` characters, trimmed, with no control
@@ -121,6 +177,10 @@ fn lint(store: &Store, ship: &str, field: &str, text: &str) -> Result<()> {
         !BROAD_WORDS.iter().any(|w| lower.contains(w)),
         "{field} is too broad; name the one step the captain is approving"
     );
+    ensure!(
+        !FRAMING_WORDS.iter().any(|w| lower.contains(w)),
+        "{field} restates the approval's own framing; name the step itself"
+    );
     Ok(())
 }
 
@@ -157,8 +217,10 @@ fn hours(ttl_secs: u64) -> String {
 /// Check and normalize `payload.approves` on a message a ship sends to the
 /// captain. Returns the line the stored body gains, so every surface shows
 /// what a yes grants; None when the message declares nothing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn declare(
     store: &Store,
+    id: &str,
     from: &str,
     to: &str,
     kind: &str,
@@ -233,15 +295,39 @@ pub(crate) fn declare(
         live(store, from, Store::now_ms())?.len() < MAX_LIVE,
         "{from} already holds {MAX_LIVE} live captain approvals; finish or let one expire first"
     );
+    let worst = sentence(
+        &"r".repeat(MINTED_REPLY_CHARS),
+        id,
+        from,
+        task,
+        LONGEST_UTC,
+        &action,
+    );
+    ensure!(
+        worst.chars().count() <= MAX_SENTENCE_CHARS,
+        "approves.action with this request id and task would tell auto mode more than \
+         {MAX_SENTENCE_CHARS} characters; shorten the action or the request id"
+    );
     let mut normalized = json!({"action": action, "ttl_secs": ttl_secs});
     if let Some(prefix) = prefix {
         normalized["command_prefix"] = json!(prefix);
     }
     payload["approves"] = normalized;
-    Ok(Some(format!(
-        "Approving lets {from} do this for {}: {action}",
-        hours(ttl_secs)
-    )))
+    let grants = format!("{from} do this for {}: {action}", hours(ttl_secs));
+    if kind == "decision" {
+        let labels: Vec<&str> = payload["decision"]["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|o| o["approves"] == true)
+            .filter_map(|o| o["label"].as_str())
+            .collect();
+        return Ok(Some(format!(
+            "Choosing {} lets {grants}",
+            labels.join(" or ")
+        )));
+    }
+    Ok(Some(format!("Approving lets {grants}")))
 }
 
 /// Check a decision's `approves` option flags: booleans only, only when the
@@ -254,10 +340,24 @@ pub(crate) fn check_options(decision: &Value, declared: bool) -> Result<()> {
                 declared,
                 "decision.options approves applies only with payload.approves"
             );
-            marked += usize::from(
-                flag.as_bool()
-                    .context("decision.options approves must be true or false")?,
-            );
+            let approving = flag
+                .as_bool()
+                .context("decision.options approves must be true or false")?;
+            if approving {
+                for field in ["label", "what_happens"] {
+                    let text = option[field].as_str().unwrap_or_default();
+                    ensure!(
+                        worded(text),
+                        "an option that approves needs words in its {field}"
+                    );
+                    if let Some(word) = hedged(text) {
+                        bail!(
+                            "an option that approves cannot read as a refusal; its {field} carries \"{word}\""
+                        );
+                    }
+                }
+            }
+            marked += usize::from(approving);
         }
     }
     ensure!(
@@ -267,8 +367,15 @@ pub(crate) fn check_options(decision: &Value, declared: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether the text holds at least one word with a letter in it.
+fn worded(text: &str) -> bool {
+    text.split_whitespace()
+        .any(|w| w.chars().any(char::is_alphabetic))
+}
+
 /// Whether the reply text holds a word that makes it something other than a
-/// plain yes.
+/// plain yes. A false no costs the captain one more ask; a false yes grants
+/// what they did not, so this errs toward no.
 fn hedged(text: &str) -> Option<String> {
     let lower = text.to_lowercase().replace('’', "'");
     if lower.contains('?') {
@@ -285,6 +392,14 @@ fn hedged(text: &str) -> Option<String> {
             words.windows(parts.len()).any(|w| w == parts.as_slice())
         })
         .map(|w| (*w).to_owned())
+        .or_else(|| {
+            words.iter().find_map(|word| {
+                REFUSAL_STEMS
+                    .iter()
+                    .any(|stem| word.starts_with(stem))
+                    .then(|| (*word).to_owned())
+            })
+        })
 }
 
 /// What the captain's reply to `request` approves, recorded in the caller's
@@ -341,17 +456,23 @@ pub(crate) fn record(
             );
         };
         // The door may send the chosen label back as the answer's text.
-        if text != option["label"].as_str().unwrap_or_default()
-            && let Some(word) = hedged(&text)
-        {
-            return skip(&format!(
-                "the captain's words carry \"{word}\", so nothing was approved; ask again"
-            ));
+        if !text.is_empty() && text != option["label"].as_str().unwrap_or_default() {
+            if !worded(&text) {
+                return skip("reply had no words; ask again with a decision");
+            }
+            if let Some(word) = hedged(&text) {
+                return skip(&format!(
+                    "the captain's words carry \"{word}\", so nothing was approved; ask again"
+                ));
+            }
         }
         "option"
     } else {
         if text.is_empty() {
             return skip("the captain's reply is empty, so nothing was approved; ask again");
+        }
+        if !worded(&text) {
+            return skip("reply had no words; ask again with a decision");
         }
         if let Some(word) = hedged(&text) {
             return skip(&format!(
@@ -382,6 +503,19 @@ pub(crate) fn record(
     }
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
     let expires_ms = now + ttl as i64 * 1000;
+    let told = sentence(
+        reply_id,
+        request["id"].as_str().unwrap_or_default(),
+        ship,
+        task,
+        &crate::routes::utc_time(expires_ms),
+        action,
+    );
+    if told.chars().count() > MAX_SENTENCE_CHARS {
+        return skip(
+            "sentence too long for auto mode with this reply id, so nothing was approved; ask again",
+        );
+    }
     store.connection().execute(
         "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,source)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -417,8 +551,8 @@ struct Row {
     expires_ms: i64,
 }
 
-/// A ship's live approvals: not revoked, not expired, and on a task that is
-/// still open under an active charter.
+/// A ship's live approvals: not revoked, not expired, and on a task the ship
+/// still owns, open under an active charter.
 fn live(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
     let mut statement = store.connection().prepare(
         "SELECT id,task_id,request_id,reply_id,action,expires_ms FROM captain_approvals
@@ -438,26 +572,56 @@ fn live(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
-        .filter(|row| store.active_charter(&row.task).is_ok())
+        .filter(|row| {
+            store.task(&row.task).is_ok_and(|t| t["owner"] == ship)
+                && store.active_charter(&row.task).is_ok()
+        })
         .collect())
 }
 
+/// The one sentence the classifier reads for an approval.
+fn sentence(
+    reply: &str,
+    request: &str,
+    ship: &str,
+    task: &str,
+    until: &str,
+    action: &str,
+) -> String {
+    format!(
+        "The captain approved this in reply {reply} to request {request}, for ship {ship} only, \
+         on task {task}, until {until}: {action}"
+    )
+}
+
 /// What the auto-mode classifier is told for a ship's first-mate launch: one
-/// sentence per live approval.
+/// sentence per live approval, at most eight. A sentence too long for the
+/// launch's policy check is skipped and audited, so one bad row never stops
+/// a launch.
 pub(crate) fn sentences(store: &Store, ship: &str, now: i64) -> Result<Vec<String>> {
-    Ok(live(store, ship, now)?
-        .into_iter()
-        .take(MAX_LIVE)
-        .map(|row| {
-            format!(
-                "The captain approved this in reply {} to request {}, for ship {ship} only, until {}: {}",
-                row.reply,
-                row.request,
-                crate::routes::utc_time(row.expires_ms),
-                row.action
-            )
-        })
-        .collect())
+    let mut told = vec![];
+    for row in live(store, ship, now)? {
+        let text = sentence(
+            &row.reply,
+            &row.request,
+            ship,
+            &row.task,
+            &crate::routes::utc_time(row.expires_ms),
+            &row.action,
+        );
+        if text.chars().count() > MAX_SENTENCE_CHARS {
+            store.audit(
+                "permissions.approval_skipped",
+                &json!({"id": row.id, "ship": ship, "why": "sentence too long"}),
+            )?;
+            continue;
+        }
+        told.push(text);
+        if told.len() == MAX_LIVE {
+            break;
+        }
+    }
+    Ok(told)
 }
 
 fn left(ms: i64) -> String {

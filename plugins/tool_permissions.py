@@ -1,5 +1,6 @@
 """Translate the captain's launch policy; never edit native/global settings."""
 import os
+import sys
 
 
 class UnsupportedYolo(ValueError):
@@ -22,9 +23,13 @@ def policy(value=None):
             for statements in authorized.values()):
         raise ValueError("invalid fleet authorizations")
     approved = value.get("approved", [])
-    if not isinstance(approved, list) or len(approved) > 8 or any(
-            not isinstance(t, str) or not t or len(t) > 600 for t in approved):
+    if not isinstance(approved, list):
         raise ValueError("invalid captain approvals")
+    # One bad sentence must never stop a launch: drop it and say so.
+    kept = [t for t in approved if isinstance(t, str) and t and len(t) <= 600][:8]
+    if len(kept) != len(approved):
+        print(f"privateer: dropped {len(approved) - len(kept)} invalid captain approval(s)", file=sys.stderr)
+        value = {**value, "approved": kept}
     if "forges" in value:
         forges = value["forges"]
         if not isinstance(forges, dict):

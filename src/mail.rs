@@ -1265,9 +1265,10 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         ensure!(to == CAPTAIN, "decisions are addressed to the captain");
     }
     // The step a yes approves is frozen here, and the body the captain reads
-    // says what it grants, on every surface that shows it.
+    // opens with what it grants, on every surface that shows it.
     let approving = crate::captain_approvals::declare(
         store,
+        &id,
         from,
         to,
         kind,
@@ -1277,7 +1278,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     )?;
     let body = match &approving {
         Some(line) if body.is_empty() => line.clone(),
-        Some(line) => format!("{body}\n\n{line}"),
+        Some(line) => format!("{line}\n\n{body}"),
         None => body.to_owned(),
     };
     let body = body.as_str();
