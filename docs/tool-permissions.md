@@ -124,11 +124,23 @@ runtime turns them into one captain **decision** from the task's owner (see
   ship's "still blocked?" does not lift that pause. An errand's denial asks but
   holds nothing, and its failed verdict is a low notice naming the decision.
 - A policy change ends the decisions it covers (`yolo`, or every rule allowed); an
-  unrelated change keeps them open.
+  unrelated change keeps them open. A decision whose denial names no rule ends on
+  any change for one retry, and its notice says plainly that the runtime can't
+  tell whether the new policy covers it and nothing was granted (`granted:
+  false`): the ship retries the step once and, denied again, reports it with
+  `permissions.blocked`. A decision offering a standing authorization ends when
+  its own ship's authorizations change, but the runtime can't tell whether the new
+  wording covers it, so it is never told the policy allows it (`granted:
+  "unknown"`): it asks for `privateer host relaunch <ship>`, since auto mode reads
+  authorizations only at launch, retries once, and if denied again reports it with
+  `permissions.blocked`.
 - Mail to the captain about an open decision (citing `about`, correlated to the
-  blocked ship's notice, or the same denial on another ship) is added to it rather
-  than shown again, and gets the captain's answer. If the decision ends without an
-  answer (withdrawn, or its task closed), what was added to it ends with it.
+  blocked ship's notice, or the same derived rule denied on another ship) is added
+  to it rather than shown again, and gets the captain's answer. A denial no rule
+  narrows never joins another ship's decision. If the decision ends without an
+  answer (withdrawn, or its task closed), what was added to it ends with it; when
+  a policy change ends it, another ship's decision the change does not cover is
+  detached and shown on its own instead.
 - A hosted or attended first mate, whose harness result the runtime cannot read,
   reports a denial with `permissions.blocked {"task_id","tool","input"}`.
 

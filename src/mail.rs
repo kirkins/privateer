@@ -2403,7 +2403,14 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             fields.remove("attached_to");
             fields.remove("attached_ship");
         }
+        // A block ask whose denials no rule narrows joins no other ship's ask,
+        // even when an older origin attached it there.
+        let joins = crate::block_ask::may_join(&payload);
+        if !joins && let Some(fields) = payload.as_object_mut() {
+            fields.remove("about");
+        }
         let topic = match payload["about"].as_str() {
+            _ if !joins => None,
             Some(about) => Some(about.to_owned()),
             None => crate::block_ask::fleet_key_primary(store, from, &payload)?,
         };

@@ -121,10 +121,12 @@ A rule is refused (null) if it would fail the policy's own validation or allow e
 - `stop`: a scheduled task's row goes to `stopped` with a manual wait, as `task.defer` gives it. The owner gets the answer as normal mail.
 - Free text: the first mate reads the text; a scheduled task reopens.
 - **Policy change** (change 4). Adding an unrelated rule changes `policy_hash` too, and ending every open ask on any change would reopen tasks into the same denial and send fresh cards. So `permissions::set`, and each dispatcher tick in every home, sweep open block asks:
-  - the ask ends, `withdrawn` with reason `policy changed`, when the new policy **covers** it: `yolo`, or every derived rule present exactly or by tool name in `claude_allow`, or it has no derived rule at all;
+  - the ask ends, `withdrawn` with reason `policy changed`, when the new policy **grants** it: `yolo`, or every derived rule present exactly or by tool name in `claude_allow`;
+  - an ask offering a standing authorization (with any derived rule it also names allowed) ends when its own ship's authorizations change, never another ship's. The runtime cannot tell whether the new wording covers it, and auto mode reads it only from the next launch, so this grants nothing it can confirm. Its reason says so: `policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; relaunch, then retry once`;
+  - an ask with a denial no rule names (and no recorded authorization) ends on any policy change for one retry, since the runtime cannot tell what the change covers. Its reason says so: `policy changed, but nothing this ask named was granted; retry once`;
   - otherwise its `policy_hash` is updated in place and it stays open.
   
-  The request wait treats a block ask withdrawn `policy changed` as ready, not `fault`. An unscheduled task's owner gets a `normal` runtime notice. `paused` uses the same coverage test, so a stale hash between a change and the next sweep cannot unpause a ship by accident.
+  The request wait treats a block ask withdrawn for any of these policy reasons as ready, not `fault`, and the resumed work's prompt says which it was. An unscheduled task's owner gets a `normal` runtime notice whose `granted` is `true`, `"unknown"` or `false`. Only `true` says the policy now allows what it asked for and to carry on. `"unknown"` says its ship's standing authorizations changed and the runtime can't tell whether they cover the request: ask for `privateer host relaunch <ship>`, retry once, and if denied again report it with `permissions.blocked`. `false` says the runtime can't tell whether the new policy covers it and nothing was granted: retry the step once and, denied again, report it with `permissions.blocked`. `paused` uses the same coverage test, so a stale hash between a change and the next sweep cannot unpause a ship by accident.
 - **Task closed.** `close_task` already ends the task's open requests and decisions.
 
 **Hosted and attended ships.** Their harness result is not visible, so they get a structured way to report instead of free text:
@@ -139,7 +141,7 @@ A rule is refused (null) if it would fail the policy's own validation or allow e
 1. **Explicit:** `mail.send` accepts `about: <captain item id>`. The id must name an open ask in this machine's fleet, or a mail this home holds whose `payload.about` or `payload.block` names it.
 2. **Correlation chain:** follow `correlation` through mail in this home, at most 8 hops. If a hop is the ask itself, or carries `payload.about` or `payload.block` naming an ask, that ask is the topic. This links storefront's relay (correlated to the notice browser-mac's home sent it) and liaison's relay of that.
 3. **Task link, notices only** (change 5): a notice whose `task_id`, or that task's parent chain within this home, has an open block ask. Requests and decisions attach only by rule 1, rule 2 or rule 4, so fan-out can never close an unrelated question with "Allow Bash(...)".
-4. **Same denial:** a new block ask whose `fleet_key` matches an open one.
+4. **Same denial:** a new block ask whose `fleet_key` matches an open one from another ship, when every denial of the ask is a derived allow rule. A denial no rule narrows (a compound command, an unknown or unidentified tool) is named by its tool alone, which says nothing about what either ship ran, so it never joins another ship's ask; nor does an ask that counted denials beyond the ones it lists. The desk applies the same test to a delivered copy, ignoring any `about` an older origin set on it.
 
 `about` is stamped on every kind of mail, not only captain mail, so the chain survives hops between ships. Task ids do not cross homes, so across ships only rules 1 and 2 apply. The brief adds one sentence for every role: "When you pass on another ship's message, set correlation to it."
 
@@ -171,7 +173,7 @@ The sender's `mail.send` result gains:
 - plain requests get the answer's text and option label;
 - every fan-out reply carries `payload.fanned_from` and keeps the original's `operator` marker, so an attached block ask on another ship applies its `allow` in its own home.
 
-Ending the primary for a policy change or a closed task ends open attachments with state `withdrawn`, reason `merged ask <id> ended: <reason>`. An attachment answered directly (from `/waiting`) closes alone; the primary stays open.
+Ending the primary for a policy change first settles each other ship's block ask attached to it on its own: one the policy covers in its own home ends as that home's sweep would end it, and one it does not cover is detached (`permissions.detached`), so the captain sees it as its own card. Ending the primary then ends the remaining open attachments (relays, and any ending for a closed task) with state `withdrawn`, reason `merged ask <id> ended: <reason>`. An attachment answered directly (from `/waiting`) closes alone; the primary stays open.
 
 **Across homes and machines.**
 

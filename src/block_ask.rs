@@ -31,6 +31,14 @@ const REASON_CHARS: usize = 160;
 const MAX_REQUESTERS: usize = 5;
 /// The reason a covering policy change ends an ask with.
 pub(crate) const POLICY_CHANGED: &str = "policy changed";
+/// The reason a policy change ends an ask with when it grants nothing the ask
+/// named: its denials name no rule, so it ends for one retry.
+pub(crate) const POLICY_CHANGED_UNGRANTED: &str =
+    "policy changed, but nothing this ask named was granted; retry once";
+/// The reason a change to its ship's standing authorizations ends an ask
+/// offering one with: whether the new wording covers it cannot be read, and
+/// auto mode reads it only from its next launch.
+pub(crate) const POLICY_CHANGED_AUTHORIZATIONS: &str = "policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; relaunch, then retry once";
 /// An open block ask, in a query's WHERE clause.
 const OPEN_ASK: &str = "recipient='captain' AND kind IN ('request','decision') AND state='open'
     AND json_extract(payload,'$.type')='tool_permission'";
@@ -523,43 +531,128 @@ fn authorizations_hash(policy: &Value, ship: &str) -> String {
     hex(policy["authorized"][ship].to_string())
 }
 
-/// Whether the policy now lets every denial of an ask run: `yolo`, or each
-/// derived rule present exactly or by its tool's name. A denial an ask offers
-/// a standing authorization for is covered once the ship's own
-/// authorizations change, never by another ship's. An ask with any other
-/// denial, or from before asks listed their denials, ends on any policy
-/// change.
+/// Whether a policy change ends an ask: when the policy grants it (see
+/// `grants`), when its ship's standing authorizations changed (see
+/// `reauthorized`), or, for an ask with any other denial or from before asks
+/// listed their denials, on any policy change. Only the first grants
+/// anything; the others end so the step is retried once, and a retry that is
+/// denied again asks anew.
 pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
+    grants(policy, ask)
+        || reauthorized(policy, ask)
+        || (!known(ask) && ask["policy_hash"].as_str() != Some(policy_hash))
+}
+
+/// What a policy change that ends an ask did for what it asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The policy lets every denial run.
+    Granted,
+    /// Its ship's standing authorizations changed; whether they cover it
+    /// cannot be told.
+    Reauthorized,
+    /// Nothing it named was granted; whether the change covers it cannot be
+    /// told.
+    Ungranted,
+}
+
+impl Outcome {
+    /// The outcome of a policy change that ends `ask`.
+    fn of(policy: &Value, ask: &Value) -> Self {
+        if grants(policy, ask) {
+            Self::Granted
+        } else if reauthorized(policy, ask) {
+            Self::Reauthorized
+        } else {
+            Self::Ungranted
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Granted => POLICY_CHANGED,
+            Self::Reauthorized => POLICY_CHANGED_AUTHORIZATIONS,
+            Self::Ungranted => POLICY_CHANGED_UNGRANTED,
+        }
+    }
+
+    fn from_reason(reason: &str) -> Option<Self> {
+        [Self::Granted, Self::Reauthorized, Self::Ungranted]
+            .into_iter()
+            .find(|o| o.reason() == reason)
+    }
+
+    /// What a ship's notice payload says was granted.
+    fn granted(self) -> Value {
+        match self {
+            Self::Granted => json!(true),
+            Self::Reauthorized => json!("unknown"),
+            Self::Ungranted => json!(false),
+        }
+    }
+}
+
+/// Whether the coverage of every denial of an ask can be read from a policy:
+/// each names a derived rule, or a standing authorization the ask recorded
+/// its ship's authorizations for.
+fn known(ask: &Value) -> bool {
+    let block = &ask["block"];
+    let seen = block["authorized"].is_string();
+    block["denials"].as_array().is_some_and(|d| {
+        !d.is_empty()
+            && d.iter()
+                .all(|d| d["rule"].is_string() || (seen && d["authorize"].is_string()))
+    })
+}
+
+/// Whether the policy now lets every denial of an ask run: `yolo`, or each
+/// denial a derived rule present exactly or by its tool's name. A denial an
+/// ask offers a standing authorization for is never granted this way: see
+/// `reauthorized`.
+pub(crate) fn grants(policy: &Value, ask: &Value) -> bool {
     if policy["mode"] == "yolo" {
         return true;
     }
+    let allowed = allowed(policy);
+    known(ask) && denials(ask).all(|d| d["rule"].is_string() && rule_allowed(&allowed, d))
+}
+
+/// Whether an ask offering a standing authorization ends because its own
+/// ship's authorizations changed, never another ship's, with every derived
+/// rule it also names allowed. Whether the new authorizations cover it
+/// cannot be read from their wording, and auto mode reads them only from
+/// the ship's next launch, so this grants nothing the runtime can confirm.
+fn reauthorized(policy: &Value, ask: &Value) -> bool {
+    if !known(ask) {
+        return false;
+    }
     let block = &ask["block"];
     let seen = block["authorized"].as_str();
-    let denials = block["denials"].as_array();
-    let known = denials.is_some_and(|d| {
-        !d.is_empty()
-            && d.iter()
-                .all(|d| d["rule"].is_string() || (seen.is_some() && d["authorize"].is_string()))
-    });
-    if !known {
-        return ask["policy_hash"].as_str() != Some(policy_hash);
-    }
-    let allowed: Vec<&str> = policy["claude_allow"]
+    let ship = block["ship"].as_str().unwrap_or_default();
+    let changed = seen != Some(&authorizations_hash(policy, ship));
+    let allowed = allowed(policy);
+    changed
+        && denials(ask).any(|d| !d["rule"].is_string())
+        && denials(ask).all(|d| !d["rule"].is_string() || rule_allowed(&allowed, d))
+}
+
+fn denials(ask: &Value) -> impl Iterator<Item = &Value> {
+    ask["block"]["denials"].as_array().into_iter().flatten()
+}
+
+fn allowed(policy: &Value) -> Vec<&str> {
+    policy["claude_allow"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .collect();
-    let ship = block["ship"].as_str().unwrap_or_default();
-    denials
-        .into_iter()
-        .flatten()
-        .all(|d| match d["rule"].as_str() {
-            Some(rule) => {
-                allowed.contains(&rule) || allowed.contains(&d["tool"].as_str().unwrap_or_default())
-            }
-            None => seen != Some(&authorizations_hash(policy, ship)),
-        })
+        .collect()
+}
+
+/// Whether a denial's derived rule is allowed, exactly or by its tool's name.
+fn rule_allowed(allowed: &[&str], denial: &Value) -> bool {
+    let rule = denial["rule"].as_str().unwrap_or_default();
+    allowed.contains(&rule) || allowed.contains(&denial["tool"].as_str().unwrap_or_default())
 }
 
 /// The open block ask a ship raised for a task, if any.
@@ -590,6 +683,24 @@ pub(crate) fn other_homes(here: &Path) -> Vec<(String, PathBuf)> {
         .filter(|m| m.home.is_dir() && m.home != here)
         .map(|m| (m.name, m.home))
         .collect()
+}
+
+/// Whether an ask's denials may join another ship's ask: only when each one,
+/// counted or not, is a derived allow rule. A denial no rule narrows (a
+/// compound command, an unknown or unidentified tool) is named by its tool
+/// alone, which says nothing about what either ship ran, and an
+/// authorization is the asking ship's own.
+fn shared_denials(denials: &[Value], more: u64) -> bool {
+    more == 0 && !denials.is_empty() && denials.iter().all(|d| d["rule"].is_string())
+}
+
+/// Whether a block ask's payload may be attached to another ship's ask. Any
+/// other payload may.
+pub(crate) fn may_join(payload: &Value) -> bool {
+    payload["type"] != "tool_permission"
+        || payload["block"]["denials"]
+            .as_array()
+            .is_some_and(|d| shared_denials(d, payload["block"]["more"].as_u64().unwrap_or(0)))
 }
 
 /// An open primary ask for the same denial under the same policy, raised by
@@ -812,7 +923,11 @@ pub(crate) fn raise(
         "decision": {"question": question, "why": why,
             "blocked": [clip(&format!("{task_id}: {title}"), 200)], "free_text_ok": true,
             "group": "tool-permission", "options": options}});
-    let primary = same_denial(store, ship, &fleet_key)?;
+    let primary = if shared_denials(&records, more as u64) {
+        same_denial(store, ship, &fleet_key)?
+    } else {
+        None
+    };
     if let Some((primary, primary_ship)) = &primary {
         payload["about"] = json!(primary);
         payload["attached_to"] = json!(primary);
@@ -910,19 +1025,8 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
             continue;
         };
         if covered(&policy, &policy_hash, &ask["payload"]) {
-            crate::mail::end_request(store, &ask, "withdrawn", POLICY_CHANGED)?;
-            let task = ask["task_id"].as_str().unwrap_or_default();
-            if !task.is_empty() && !crate::scheduling::scheduled(store, task)? {
-                let owner = ask["from"].as_str().unwrap_or_default();
-                crate::mail::record_crew(
-                    store.connection(),
-                    &json!({"id": format!("block-cleared-{}", hex(&id)), "to": owner, "kind": "notice",
-                        "task_id": task, "urgency": "normal",
-                        "body": format!("The fleet policy now allows what {id} asked for ({}); the captain's decision is no longer needed. Carry on with task {task}.", rules_text(&ask["payload"]["block"])),
-                        "payload": {"about": id, "block_cleared": true}}),
-                )?;
-            }
-            ended.push(id);
+            end_by_policy(store, &policy, &ask)?;
+            ended.push((id, ask["from"].as_str().unwrap_or_default().to_owned()));
         } else if ask["payload"]["policy_hash"].as_str() != Some(&policy_hash) {
             store.connection().execute(
                 "UPDATE mail SET payload=json_set(payload,'$.policy_hash',?2) WHERE id=?1",
@@ -931,11 +1035,116 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
         }
     }
     tx.commit()?;
-    for id in &ended {
+    for (id, ship) in &ended {
+        release_attachments(store, id, ship)?;
         crate::mail::end_attachments(store, id, POLICY_CHANGED)?;
     }
     end_orphans(store)?;
-    Ok(ended)
+    Ok(ended.into_iter().map(|(id, _)| id).collect())
+}
+
+/// End an open block ask a policy change covers, in the caller's
+/// transaction, and tell an unscheduled task's owner what it means (see
+/// `ended_text`).
+fn end_by_policy(store: &Store, policy: &Value, ask: &Value) -> Result<()> {
+    let id = ask["id"].as_str().unwrap_or_default();
+    let outcome = Outcome::of(policy, &ask["payload"]);
+    crate::mail::end_request(store, ask, "withdrawn", outcome.reason())?;
+    let task = ask["task_id"].as_str().unwrap_or_default();
+    if !task.is_empty() && !crate::scheduling::scheduled(store, task)? {
+        let owner = ask["from"].as_str().unwrap_or_default();
+        crate::mail::record_crew(
+            store.connection(),
+            &json!({"id": format!("block-cleared-{}", hex(id)), "to": owner, "kind": "notice",
+                "task_id": task, "urgency": "normal",
+                "body": format!("{} Task {task}.", ended_text(ask, outcome)),
+                "payload": {"about": id, "block_cleared": true, "granted": outcome.granted()}}),
+        )?;
+    }
+    Ok(())
+}
+
+/// What a block ask that a policy change ended means for the ship that
+/// asked, in plain words: carry on only when the policy grants what it
+/// asked for; otherwise the runtime cannot tell, so retry once (after a
+/// relaunch, when its ship's authorizations changed) and ask again if
+/// denied again.
+fn ended_text(ask: &Value, outcome: Outcome) -> String {
+    let id = ask["id"].as_str().unwrap_or_default();
+    let block = &ask["payload"]["block"];
+    let rules = rules_text(block);
+    match outcome {
+        Outcome::Granted => format!(
+            "The fleet policy now allows what {id} asked for ({rules}); the captain's decision is no longer needed. Carry on."
+        ),
+        Outcome::Reauthorized => {
+            let ship = block["ship"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("<ship>");
+            format!(
+                "{id} ended because your ship's standing authorizations changed, but the runtime can't tell whether they cover this request ({rules}): nothing is known to be granted. Auto mode reads them only at launch, so first ask for a relaunch (`privateer host relaunch {ship}`). Retry the step once after it; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
+            )
+        }
+        Outcome::Ungranted => format!(
+            "{id} ended because the fleet policy changed, but the runtime can't tell whether the new policy covers this ({rules}): nothing was granted for this request. Retry the step once; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
+        ),
+    }
+}
+
+/// Why a task parked on a block ask resumes, when a policy change ended the
+/// ask; None for any other ending.
+pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
+    let outcome = Outcome::from_reason(request["end_reason"].as_str()?)?;
+    (request["state"] == "withdrawn" && request["payload"]["type"] == "tool_permission")
+        .then(|| ended_text(request, outcome))
+}
+
+/// Before a primary that a policy change ended takes its attachments with
+/// it, settle each other ship's block ask attached to it on its own: one the
+/// policy covers in its own home ends there as that home's sweep would end
+/// it; one it does not cover is detached, so the captain sees it as its own
+/// card instead of losing it to a change made for another ship.
+fn release_attachments(store: &Store, primary: &str, primary_ship: &str) -> Result<()> {
+    let mut homes = vec![store.home().to_path_buf()];
+    homes.extend(other_homes(store.home()).into_iter().map(|(_, h)| h));
+    for home in homes {
+        let Ok(other) = Store::open(&home) else {
+            continue;
+        };
+        let policy = crate::permissions::for_store(&other)?;
+        let policy_hash = crate::permissions::policy_hash(&other)?;
+        let tx = other.write_transaction()?;
+        let rows: Vec<String> = {
+            let mut statement = other.connection().prepare(&format!(
+                "SELECT id FROM mail WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'
+                 AND json_extract(payload,'$.attached_to')=?1 AND sender<>?2"
+            ))?;
+            statement
+                .query_map(params![primary, primary_ship], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for row in rows {
+            let Some(ask) = crate::mail::find(&other, &row)? else {
+                continue;
+            };
+            if covered(&policy, &policy_hash, &ask["payload"]) {
+                end_by_policy(&other, &policy, &ask)?;
+            } else {
+                other.connection().execute(
+                    "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
+                     WHERE id=?1 AND state='open'",
+                    [&row],
+                )?;
+                other.audit(
+                    "permissions.detached",
+                    &json!({"ask": row, "from": primary, "reason": POLICY_CHANGED}),
+                )?;
+            }
+        }
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 /// End the items in this home still attached to an ask that ended without
@@ -964,6 +1173,11 @@ fn end_orphans(store: &Store) -> Result<()> {
                 .or(ask["state"].as_str())
                 .unwrap_or("closed")
                 .to_owned();
+            // A policy change ended it, maybe in another home between its
+            // commit and that home's release: other ships' asks go first.
+            if Outcome::from_reason(&reason).is_some() {
+                release_attachments(store, &primary, ask["from"].as_str().unwrap_or_default())?;
+            }
             crate::mail::end_attachments(store, &primary, &reason)?;
         }
     }
@@ -1164,7 +1378,9 @@ pub(crate) fn fleet_key_primary(
     from: &str,
     payload: &Value,
 ) -> Result<Option<String>> {
-    if payload["type"] != "tool_permission" {
+    // A copy from before asks with no derived rule stopped joining carries
+    // the same key as before: its denials decide.
+    if payload["type"] != "tool_permission" || !may_join(payload) {
         return Ok(None);
     }
     let Some(key) = payload["block"]["fleet_key"].as_str() else {
@@ -1701,14 +1917,108 @@ mod tests {
             "denials": [{"tool": "Bash", "rule": null, "authorize": "Running make commands."}]}});
         let other = json!({"authorized": {"storefront": ["Running deploys.", "More."]}});
         assert!(!covered(&other, "new", &ask));
+        // Its own ship's change ends it, but other wording may not cover
+        // it: the runtime cannot tell, so it grants nothing.
         let own = json!({"authorized": {"storefront": ["Running deploys."],
             "liaison": ["Running make for deploys."]}});
         assert!(covered(&own, "new", &ask));
-        assert!(covered(&json!({"mode": "yolo"}), "new", &ask));
+        assert!(!grants(&own, &ask));
+        assert_eq!(Outcome::of(&own, &ask), Outcome::Reauthorized);
+        let yolo = json!({"mode": "yolo"});
+        assert!(covered(&yolo, "new", &ask));
+        assert_eq!(Outcome::of(&yolo, &ask), Outcome::Granted);
+        // A derived rule it also names must be allowed as well.
+        let mut mixed = ask.clone();
+        mixed["block"]["denials"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tool": "Bash", "rule": "Bash(make *)"}));
+        assert!(!covered(&own, "old", &mixed));
+        let mut allowing = own.clone();
+        allowing["claude_allow"] = json!(["Bash(make *)"]);
+        assert_eq!(Outcome::of(&allowing, &mixed), Outcome::Reauthorized);
         // Without the hash (a crew's ask, or an older one) any change ends it.
         let mut older = ask.clone();
         older["block"].as_object_mut().unwrap().remove("authorized");
         assert!(covered(&other, "new", &older));
+        assert_eq!(Outcome::of(&other, &older), Outcome::Ungranted);
+    }
+
+    #[test]
+    fn only_asks_whose_every_denial_is_a_derived_rule_join_another_ships() {
+        let ask = |denials: Value, more: u64| json!({"type": "tool_permission", "block": {"denials": denials, "more": more}});
+        assert!(may_join(&ask(
+            json!([{"tool": "Bash", "rule": "Bash(kubectl apply *)"}]),
+            0
+        )));
+        for refused in [
+            ask(json!([{"tool": "Bash", "rule": null}]), 0),
+            ask(json!([{"tool": "unknown", "rule": null}]), 0),
+            ask(json!([{"tool": "", "rule": null, "unidentified": true}]), 0),
+            ask(
+                json!([{"tool": "Bash", "rule": null, "authorize": "Running make."}]),
+                0,
+            ),
+            ask(
+                json!([{"tool": "Bash", "rule": "Bash(make *)"}, {"tool": "Bash", "rule": null}]),
+                0,
+            ),
+            // What it counted but does not list may name no rule.
+            ask(json!([{"tool": "Bash", "rule": "Bash(make *)"}]), 1),
+            ask(json!([]), 0),
+            json!({"type": "tool_permission", "block": {}}),
+        ] {
+            assert!(!may_join(&refused), "{refused}");
+        }
+        // Other captain mail joins by its topic as before.
+        assert!(may_join(&json!({"about": "permissions-x"})));
+    }
+
+    #[test]
+    fn a_policy_change_ends_a_no_rule_ask_without_granting_it() {
+        let policy = json!({"claude_allow": ["Bash(apify run *)"]});
+        let ask = |denials: Value| json!({"policy_hash": "old", "block": {"denials": denials}});
+        let derived = ask(json!([{"tool": "Bash", "rule": "Bash(apify run *)"}]));
+        assert!(grants(&policy, &derived) && covered(&policy, "new", &derived));
+        let other = ask(json!([{"tool": "Bash", "rule": "Bash(make *)"}]));
+        assert!(!grants(&policy, &other) && !covered(&policy, "new", &other));
+        let none = ask(json!([{"tool": "unknown", "rule": null}]));
+        assert!(!grants(&policy, &none));
+        assert!(covered(&policy, "new", &none));
+        assert!(!covered(&policy, "old", &none));
+        assert!(grants(&json!({"mode": "yolo"}), &none));
+        let ended = |reason: &str| {
+            json!({"id": "permissions-1", "state": "withdrawn", "end_reason": reason,
+                "payload": {"type": "tool_permission", "block": {"denials": [{"tool": "unknown", "rule": null}]}}})
+        };
+        let ungranted = resumed_by_policy(&ended(POLICY_CHANGED_UNGRANTED)).unwrap();
+        assert!(ungranted.contains("nothing was granted"), "{ungranted}");
+        assert!(
+            ungranted.contains("can't tell whether the new policy covers this"),
+            "{ungranted}"
+        );
+        assert!(!ungranted.contains("does not cover"), "{ungranted}");
+        assert!(ungranted.contains("permissions.blocked"), "{ungranted}");
+        let granted = resumed_by_policy(&ended(POLICY_CHANGED)).unwrap();
+        assert!(granted.contains("now allows"), "{granted}");
+        // A ship whose authorizations changed resumes too, told to relaunch.
+        let mut reauthorized = ended(POLICY_CHANGED_AUTHORIZATIONS);
+        reauthorized["payload"]["block"]["ship"] = json!("art");
+        let reauthorized = resumed_by_policy(&reauthorized).unwrap();
+        for absent in ["now allows", "Carry on"] {
+            assert!(!reauthorized.contains(absent), "{reauthorized}");
+        }
+        for present in [
+            "can't tell",
+            "privateer host relaunch art",
+            "Retry the step once",
+            "permissions.blocked",
+        ] {
+            assert!(reauthorized.contains(present), "{reauthorized}");
+        }
+        assert!(
+            resumed_by_policy(&ended("merged ask permissions-2 ended: policy changed")).is_none()
+        );
     }
 
     #[test]
