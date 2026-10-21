@@ -37,14 +37,36 @@ fn retry_fixture_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::i
     }
 }
 
-fn until(what: &str, done: impl FnMut() -> bool) {
-    until_secs(what, 20, done);
+// A wait polls for an event, so its deadline only bounds a failure. Loaded CI
+// runners can be far slower than a workstation: PRIVATEER_TEST_WAIT_SECS
+// raises every deadline.
+fn wait_secs(secs: u64) -> u64 {
+    std::env::var("PRIVATEER_TEST_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(secs, |floor: u64| floor.max(secs))
 }
 
-fn until_secs(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
+fn until(what: &str, done: impl FnMut() -> bool) {
+    until_secs(what, 60, done);
+}
+
+fn until_secs(what: &str, secs: u64, done: impl FnMut() -> bool) {
+    until_observed(what, secs, done, String::new);
+}
+
+/// `observed` describes the state on a timeout, for diagnosis from a CI log.
+fn until_observed(
+    what: &str,
+    secs: u64,
+    mut done: impl FnMut() -> bool,
+    observed: impl FnOnce() -> String,
+) {
+    let deadline = Instant::now() + Duration::from_secs(wait_secs(secs));
     while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {what}\n{}", observed());
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -778,6 +800,29 @@ impl Herdr {
             .map(|(id, _)| id.clone())
             .collect()
     }
+    /// What a dashboard bridge wait observed: each launched dashboard, the
+    /// panes, and the requests Herdr answered.
+    #[cfg(feature = "dashboard")]
+    fn bridge_state(&self) -> String {
+        let dashboards = self
+            .dashboards
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .map(DashboardChild::describe)
+            .collect::<Vec<_>>();
+        let methods = self
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap_or("?").to_owned())
+            .collect::<Vec<_>>();
+        format!(
+            "dashboards: {dashboards:#?}\npanes: {}\nrequests: {methods:?}",
+            Value::from(self.panes.lock().unwrap().clone())
+        )
+    }
 }
 
 fn hosted_fixture() -> (Place, Herdr) {
@@ -971,6 +1016,8 @@ fn age_hosted_block(place: &Place) {
 struct DashboardChild {
     child: std::process::Child,
     master: fs::File,
+    /// The last bytes it wrote, so a failed startup can be diagnosed.
+    output: Arc<Mutex<Vec<u8>>>,
     initial: libc::termios,
     drain: Option<std::thread::JoinHandle<()>>,
     reaped: bool,
@@ -1033,19 +1080,40 @@ impl DashboardChild {
         let child = command.spawn().unwrap();
         // Drop Command's parent-side copies of the slave before waiting/reaping.
         drop(command);
-        let mut output = master.try_clone().unwrap();
+        let mut terminal = master.try_clone().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let tail = output.clone();
         let drain = Some(std::thread::spawn(move || {
             use std::io::Read;
             let mut block = [0; 8192];
-            while matches!(output.read(&mut block), Ok(n) if n > 0) {}
+            while let Ok(n @ 1..) = terminal.read(&mut block) {
+                let mut tail = tail.lock().unwrap();
+                tail.extend_from_slice(&block[..n]);
+                let excess = tail.len().saturating_sub(4096);
+                tail.drain(..excess);
+            }
         }));
         Self {
             child,
             master,
+            output,
             initial,
             drain,
             reaped: false,
         }
+    }
+    /// Its exit status, if it has exited, and the tail of its output.
+    fn describe(&mut self) -> String {
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => status.to_string(),
+            Ok(None) => "running".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        let output = String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned();
+        format!(
+            "dashboard {}: {status}; output tail: {output:?}",
+            self.child.id()
+        )
     }
     fn stop(&mut self) {
         until("real dashboard raw-mode readiness", || {
@@ -1092,6 +1160,30 @@ impl Drop for DashboardChild {
             let _ = self.child.wait();
         }
     }
+}
+
+/// The bridge claim, whether a dashboard holds its live lease, and the Herdr
+/// side, for a timed-out bridge wait. Probing the lease takes it only for an
+/// instant, and only once the wait has already failed.
+#[cfg(feature = "dashboard")]
+fn bridge_observed(coordination: &Path, herdr: &Herdr) -> String {
+    use std::os::fd::AsRawFd;
+    let claim = fs::read_to_string(coordination.join("claim.json"))
+        .unwrap_or_else(|error| format!("unreadable: {error}"));
+    let lease = match fs::File::open(coordination.join("live")) {
+        Ok(live) => {
+            if unsafe { libc::flock(live.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                "free".to_owned()
+            } else {
+                format!("held ({})", std::io::Error::last_os_error())
+            }
+        }
+        Err(error) => format!("unopenable: {error}"),
+    };
+    format!(
+        "claim: {claim}\nlive lease: {lease}\n{}",
+        herdr.bridge_state()
+    )
 }
 
 #[cfg(feature = "dashboard")]
@@ -1236,9 +1328,12 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first["bridge"]["status"], "launched", "{first}");
     herdr.slow_create.store(false, Ordering::SeqCst);
-    until("direct dashboard claim adoption", || {
-        claim()["adopted"] == true
-    });
+    until_observed(
+        "direct dashboard claim adoption",
+        60,
+        || claim()["adopted"] == true,
+        || bridge_observed(&coordination, &herdr),
+    );
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     assert_eq!(herdr.calls("pane.send_input").len(), 1);
     assert_eq!(herdr.panes.lock().unwrap().len(), 2);
@@ -1416,9 +1511,12 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     herdr.suppress_input.store(false, Ordering::SeqCst);
     retry();
     assert_eq!(tick(&infra)["bridge"]["status"], "launched");
-    until("recreated direct dashboard adoption", || {
-        claim()["adopted"] == true
-    });
+    until_observed(
+        "recreated direct dashboard adoption",
+        60,
+        || claim()["adopted"] == true,
+        || bridge_observed(&coordination, &herdr),
+    );
     assert_ne!(claim()["token"], pending["token"]);
     // A delayed old executable cannot take custody after its token is fenced.
     let stale = command(&apps, &["--help"])
