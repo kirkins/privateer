@@ -1900,7 +1900,8 @@ pub(crate) fn collected(
     }
     for (id, error) in refused {
         if crate::waits::temporary(error) {
-            changed += tx.execute(
+            // Still pending: nothing changed but the attempt it records.
+            tx.execute(
                 &format!(
                     "UPDATE mail SET delivery_attempts=delivery_attempts+1, delivery_error=?3
                      WHERE id=?1 AND delivery='pending' {behind}"
