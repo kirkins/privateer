@@ -388,6 +388,7 @@ fn only_a_plain_yes_or_the_actions_own_words_record() {
         "hang on",
         "thanks",
         "TestFlight build 55",
+        "ok, submit it",
     ]
     .iter()
     .enumerate()
@@ -420,7 +421,6 @@ fn only_a_plain_yes_or_the_actions_own_words_record() {
         "Approved",
         "lgtm",
         "yes please",
-        "ok, submit it",
         "Yes, ship it now. Thanks!",
     ]
     .iter()
@@ -468,21 +468,31 @@ fn a_reply_that_narrows_the_action_records_nothing() {
         let approval = answer(&mut store, &format!("q-narrow-{i}"), deploy, body);
         assert_eq!(approval, not_plain, "{body}");
     }
+    // A shorter reply may leave out only a destination: not a joined step,
+    // a second scope word, or the rest of a clause.
+    for (i, (action, body)) in [
+        ("Show me the diff, then merge PR 12", "show me the diff"),
+        ("Merge PR 340 and deploy to staging", "merge PR 340"),
+        (deploy, "Deploy build 55"),
+        (deploy, "ok deploy"),
+        ("Submit build 55 to TestFlight", "ok, submit it"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let approval = answer(&mut store, &format!("q-short-{i}"), action, body);
+        assert_eq!(approval, not_plain, "{body}");
+    }
     assert!(rows(&mut store).is_empty());
     let mut yes = vec![
-        (deploy, "Deploy build 55"),
         (deploy, deploy),
         (deploy, "yes"),
-        (deploy, "ok deploy"),
         ("Submit build 55 to TestFlight", "Submit build 55"),
-        ("Submit build 55 to TestFlight", "ok, submit it"),
+        ("Merge PR 340 into main", "ok, merge PR 340"),
     ];
     for body in ["Go ahead", "Approved", "lgtm", "yes please"] {
         yes.push((deploy, body));
     }
-    // Deliberate: naming only the head of a multi-part action approves all
-    // of it, as the captain's own "Submit build 55" did.
-    yes.push(("Merge PR 340 and deploy to staging", "merge PR 340"));
     for (i, (action, body)) in yes.into_iter().enumerate() {
         let approval = answer(&mut store, &format!("q-whole-{i}"), action, body);
         assert_eq!(approval["recorded"], true, "{body}: {approval}");
@@ -520,9 +530,17 @@ fn a_question_mark_in_any_script_or_an_emoji_beside_words_records_nothing() {
     }
     let pictured = json!({"recorded":false,
         "why":"reply carries a symbol or emoji, so nothing was approved; ask again with a decision"});
-    for (i, body) in ["👎 yes", "yes 👍", "Submit build 55 ❌", "✋ ok", "go ✔️"]
-        .iter()
-        .enumerate()
+    for (i, body) in [
+        "👎 yes",
+        "yes 👍",
+        "Submit build 55 ❌",
+        "✋ ok",
+        "go ✔️",
+        "× Submit build 55",
+        "yes ×",
+    ]
+    .iter()
+    .enumerate()
     {
         let approval = answer(
             &mut store,
@@ -590,7 +608,30 @@ fn a_ships_own_buttons_cannot_ride_an_approving_request() {
             "{id}: {answered}"
         );
     }
-    assert_eq!(rows(&mut store).len(), 2);
+    // Beside a label with scope words, a scope word passes only as the
+    // whole label.
+    let both = json!([
+        {"id":"ship","label":"Ship to staging and prod","what_happens":"Build 55 goes to TestFlight","approves":true},
+        {"id":"hold","label":"Hold","what_happens":"Nothing is submitted"}
+    ]);
+    for (id, body, recorded) in [
+        ("d-narrow", "to staging", false),
+        ("d-narrow-ship", "ship to staging", false),
+        ("d-whole", "yes, ship to staging and prod", true),
+    ] {
+        decision(&mut store, id, both.clone(), true).unwrap();
+        let answered = send(
+            &mut store,
+            json!({"from":"captain","to":"apps","kind":"reply","correlation":id,"body":body,
+                "payload":{"answer":{"option_id":"ship"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            answered["payload"]["approval"]["recorded"], recorded,
+            "{id}: {answered}"
+        );
+    }
+    assert_eq!(rows(&mut store).len(), 3);
 }
 
 fn decision(store: &mut Store, id: &str, options: Value, approves: bool) -> anyhow::Result<Value> {

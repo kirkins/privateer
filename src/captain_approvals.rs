@@ -497,6 +497,11 @@ const SCOPE_WORDS: &[&str] = &[
     "for", "to", "on", "in", "at", "into", "onto", "from", "via", "with", "without", "after",
     "before", "when", "once", "while", "and", "or", "then", "plus", "also", "of", "by",
 ];
+/// Scope words that open a destination ("to TestFlight", "on staging"), the
+/// one kind of tail a reply may leave out of the action: the other scope
+/// words can bring in a step of their own ("then merge PR 12", "before
+/// wiping prod", "with a database reset").
+const TARGET_WORDS: &[&str] = &["for", "to", "on", "in", "at", "into", "onto", "from", "via"];
 
 /// The words of `text` that are not plain words.
 fn unplain(text: &str) -> Vec<String> {
@@ -506,29 +511,64 @@ fn unplain(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `text` breaks between two of its words with punctuation that
+/// can start a clause ("to staging, wipe prod", "staging & prod"). A space,
+/// `#`, `@`, `/` or `_`, or a lone `.`, `-` or `:` inside a token ("v1.2.3",
+/// "feature-x") does not break it.
+fn clauses(text: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || "'‘’`ʼ".contains(c);
+    let inner = text.trim_matches(|c: char| !word(c));
+    inner.split(word).filter(|gap| !gap.is_empty()).any(|gap| {
+        let spaced = gap.chars().all(|c| c.is_whitespace() || "#@/_".contains(c));
+        let joined = gap.chars().all(|c| ".-:#@/_".contains(c));
+        !(spaced || joined)
+    })
+}
+
 /// Whether a free-text reply that passed `hedged` is a plain yes to
 /// `action`. Past its plain words, the reply is nothing (and then holds a yes
 /// word), the action's own words retyped in full, or a leading run of them
-/// with no scope word: "Deploy build 55" approves "Deploy build 55 to staging
-/// and prod", while "deploy to staging" and "staging ok" narrow it and
-/// approve nothing.
+/// with no scope word that leaves out only a destination: "Submit build 55"
+/// approves "Submit build 55 to TestFlight". A run that stops mid-clause
+/// ("ok, submit it"), before a step ("show me the diff" of "Show me the diff,
+/// then merge PR 12") or before a tail holding a second scope word or a
+/// clause break approves nothing, since what it leaves out may be more than
+/// the captain meant; nor do "deploy to staging" and "staging ok", which
+/// narrow it.
 fn plain_yes(text: &str, action: &str) -> bool {
     let rest = unplain(text);
     let own = unplain(action);
     if rest.is_empty() {
         return words(text).iter().any(|w| YES_WORDS.contains(&w.as_str()));
     }
-    rest == own
-        || (own.starts_with(&rest) && !rest.iter().any(|w| SCOPE_WORDS.contains(&w.as_str())))
+    if rest == own {
+        return true;
+    }
+    let scoped = |w: &String| SCOPE_WORDS.contains(&w.as_str());
+    let Some((first, tail)) = own
+        .strip_prefix(rest.as_slice())
+        .and_then(|left| left.split_first())
+    else {
+        return false;
+    };
+    !rest.iter().any(scoped)
+        && TARGET_WORDS.contains(&first.as_str())
+        && !tail.iter().any(scoped)
+        && !clauses(action)
 }
 
 /// Whether the text sent with a chosen approving option holds only plain
 /// words and the option's own label words; the tap is the yes, so even the
-/// action's words would only narrow it.
+/// action's words would only narrow it. Text with a scope word ("to staging"
+/// beside "Deploy to staging and prod") passes only as the label's words in
+/// full and in order.
 fn plain_beside(text: &str, label: &str) -> bool {
+    let said = words(text);
+    if said.iter().any(|w| SCOPE_WORDS.contains(&w.as_str())) {
+        return unplain(text) == unplain(label);
+    }
     let own = words(label);
-    words(text)
-        .iter()
+    said.iter()
         .all(|w| PLAIN_WORDS.contains(&w.as_str()) || own.contains(w))
 }
 
@@ -560,11 +600,12 @@ const QUESTION_MARKS: &[char] = &[
 /// a cross or a check mark beside a word could reverse it.
 fn pictograph(c: char) -> bool {
     matches!(u32::from(c),
-        0xa9 | 0xae | 0x200d | 0x203c | 0x20e3 | 0x3030 | 0x303d
+        0xa9 | 0xac | 0xae | 0xd7 | 0x200d | 0x203c | 0x20e3 | 0x3030 | 0x303d
         | 0x2100..=0x214f
         | 0x2190..=0x2bff
         | 0x3200..=0x32ff
         | 0xfe00..=0xfe0f
+        | 0x10102
         | 0x1f000..=0x1fbff
         | 0xe0020..=0xe007f)
 }
@@ -1764,8 +1805,6 @@ mod tests {
             "Approved",
             "lgtm",
             "yes please",
-            "ok, submit it",
-            "submit it",
             "Y",
             "K",
         ] {
@@ -1792,6 +1831,8 @@ mod tests {
             "thanks",
             "please",
             "TestFlight build 55",
+            "ok, submit it",
+            "submit it",
         ] {
             assert!(!plain_yes(loose, submit), "{loose}");
         }
@@ -1817,20 +1858,68 @@ mod tests {
             assert!(!plain_yes(narrow, deploy), "{narrow}");
         }
         for yes in [
-            "Deploy build 55",
             "Deploy build 55 to staging and prod",
             "deploy build 55 to staging and prod, thanks",
             "yes",
-            "ok deploy",
         ] {
             assert!(plain_yes(yes, deploy), "{yes}");
         }
-        // Deliberate: naming only the head of a multi-part action approves
-        // all of it, as the captain's own "Submit build 55" did.
-        assert!(plain_yes(
-            "merge PR 340",
-            "Merge PR 340 and deploy to staging"
-        ));
+    }
+
+    #[test]
+    fn a_shorter_reply_leaves_out_only_a_destination() {
+        // The opener of a two-step action approves neither step.
+        let diff = "Show me the diff, then merge PR 12";
+        for opener in [
+            "show me the diff",
+            "Show me the diff, thanks",
+            "ok show me the diff",
+            "show me",
+        ] {
+            assert!(!plain_yes(opener, diff), "{opener}");
+        }
+        assert!(plain_yes("show me the diff, then merge PR 12", diff));
+        assert!(plain_yes("yes", diff));
+        // A run that stops mid-clause, before a joined step, or before a tail
+        // that holds a second scope word or a clause break approves nothing:
+        // "and prod" and "and merge PR 12" read alike word by word.
+        for (action, short) in [
+            ("Submit build 55 to TestFlight", "submit it"),
+            ("Submit build 55 to TestFlight", "ok, submit build"),
+            ("Deploy build 55 to staging and prod", "deploy build"),
+            ("Deploy build 55 to staging and prod", "Deploy build 55"),
+            ("Deploy build 55 to staging and prod", "ok deploy"),
+            (
+                "Deploy build 55 to staging and merge PR 12",
+                "Deploy build 55",
+            ),
+            ("Merge PR 340 and deploy to staging", "merge PR 340"),
+            ("Merge PR 340, then deploy to staging", "merge PR 340"),
+            (
+                "Deploy build 55 to staging before wiping prod",
+                "Deploy build 55",
+            ),
+            ("Deploy build 55 with a database reset", "Deploy build 55"),
+            ("Merge PR 12 after deleting main", "Merge PR 12"),
+            ("Deploy build 55 to staging, wipe prod", "Deploy build 55"),
+            ("Deploy build 55 to staging; wipe prod", "Deploy build 55"),
+            ("Deploy build 55 to staging - wipe prod", "Deploy build 55"),
+            ("Deploy build 55 to staging & prod", "Deploy build 55"),
+            ("Deploy build 55 to staging (wipe prod)", "Deploy build 55"),
+        ] {
+            assert!(!plain_yes(short, action), "{short} / {action}");
+            assert!(plain_yes(action, action), "{action}");
+        }
+        for (action, short) in [
+            ("Submit build 55 to TestFlight", "Submit build 55"),
+            ("Submit build 55 to TestFlight.", "ok, submit build 55"),
+            ("Deploy v1.2.3 to staging-eu", "deploy v1.2.3"),
+            ("Merge PR #12 into main", "merge PR #12"),
+            ("Push feature-x to origin/main", "push feature-x"),
+            ("Run the migration on db:primary", "run the migration"),
+        ] {
+            assert!(plain_yes(short, action), "{short} / {action}");
+        }
     }
 
     #[test]
@@ -1840,6 +1929,27 @@ mod tests {
         }
         for loose in ["after CI", "Submit build 55", "for staging", "staging"] {
             assert!(!plain_beside(loose, "Ship it"), "{loose}");
+        }
+        // A scope word passes only as the label in full and in order.
+        let both = "Deploy to staging and prod";
+        for narrow in [
+            "to staging",
+            "deploy to staging",
+            "staging and",
+            "deploy and prod",
+            "prod and staging",
+            "and prod to staging deploy",
+            "yes, deploy to staging",
+        ] {
+            assert!(!plain_beside(narrow, both), "{narrow}");
+        }
+        for whole in [
+            "Deploy to staging and prod",
+            "yes, deploy to staging and prod, thanks",
+            "ok",
+            "deploy",
+        ] {
+            assert!(plain_beside(whole, both), "{whole}");
         }
     }
 
@@ -1872,6 +1982,12 @@ mod tests {
             "yes ⚠️",
             "ok 🛑",
             "yes ™",
+            "× merge",
+            "yes ×",
+            "ok ⨯",
+            "¬ merge",
+            "\u{10102} yes",
+            "yes ✓",
         ] {
             assert!(worded(shown) && pictured(shown), "{shown}");
         }
