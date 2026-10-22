@@ -492,6 +492,266 @@ fn a_hosted_first_mate_on_a_backed_off_route_falls_back_headlessly_without_relau
     assert_eq!(fleet.settle()["status"], "succeeded");
 }
 
+/// The ship's first-mate profile with no model of its own, as `init` leaves
+/// it: the own manifest and the fixture's harness settings.
+fn modelless_profile(fleet: &Fleet) {
+    let mut profile = fleet.ok("ship.show", json!({"name":"infra"}), None)["first_mate"].clone();
+    profile["options"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model")
+        .unwrap();
+    fleet.ok(
+        "ship.put",
+        json!({"name":"infra","first_mate":profile}),
+        None,
+    );
+}
+
+/// The model argument the latest wake's job runs with, and the id of the
+/// manifest it launched, as the wake row records its harness.
+fn wake_job(fleet: &mut Fleet) -> (Option<String>, String) {
+    let wake = fleet.wakes()[0].clone();
+    let job = dispatch(&mut fleet.store, "job.status", json!({"id":wake["job_id"]})).unwrap();
+    let model = job["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|arg| {
+            [
+                "own-model",
+                "spent-model",
+                "fallback-model",
+                "missing-model",
+            ]
+            .contains(arg)
+        })
+        .map(str::to_owned);
+    let harness: String = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT harness FROM wakes WHERE id=?1",
+            [wake["id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    (model, harness)
+}
+
+/// The route the latest wake row and its `wake.started` record name.
+fn recorded_route(fleet: &mut Fleet) -> (Value, Value) {
+    let raw: Option<String> = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT route FROM wakes ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let row = raw.map_or(Value::Null, |raw| serde_json::from_str(&raw).unwrap());
+    let started = wakes_started(fleet).last().unwrap()["route"].clone();
+    (row, started)
+}
+
+/// Captain finding 22: a first mate whose profile names no model, as `init`
+/// leaves one, wakes on the first route of the fleet's first_mate list, with
+/// that route's manifest and options, and the wake records which and why. A
+/// profile model set later wins again, unchanged.
+#[test]
+fn a_first_mate_with_no_model_wakes_on_the_first_listed_route_and_records_it() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    modelless_profile(&fleet);
+    fleet.send(json!({"id":"listed","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["status"], "running", "{report}");
+    assert_eq!(report["route"]["name"], "spent", "{report}");
+    assert_eq!(
+        report["route"]["why"],
+        "first available on infra's first_mate list: spent (the profile names no model)"
+    );
+    assert_eq!(report["route"]["identity"], "fallback/-/spent-model");
+    let (model, harness) = wake_job(&mut fleet);
+    assert_eq!(model.as_deref(), Some("spent-model"));
+    assert_eq!(harness, "fallback");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    let (row, started) = recorded_route(&mut fleet);
+    assert_eq!(row["name"], "spent", "{row}");
+    assert_eq!(started, row);
+    // The profile is never rewritten: the route is chosen at each wake.
+    let profile = fleet.ok("ship.show", json!({"name":"infra"}), None)["first_mate"].clone();
+    assert!(profile["options"].get("model").is_none(), "{profile}");
+    // Bearings say which route the next launch takes.
+    let bearings = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("First mate route: spent (fallback/-/spent-model); first available"),
+        "{bearings}"
+    );
+
+    // An explicit model in the profile is the ship's own route again.
+    let mut profile = profile;
+    profile["options"]["model"] = json!("own-model");
+    fleet.ok(
+        "ship.put",
+        json!({"name":"infra","first_mate":profile}),
+        None,
+    );
+    fleet.send(json!({"id":"explicit","from":"apps","to":"infra","kind":"request","body":"Use your own model."}));
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["status"], "running", "{report}");
+    assert!(report["route"].is_null(), "{report}");
+    assert_eq!(wake_model(&mut fleet), "own-model");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    assert_eq!(recorded_route(&mut fleet), (Value::Null, Value::Null));
+    let bearings = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
+    assert!(
+        !bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("First mate route:"),
+        "{bearings}"
+    );
+}
+
+/// With no first_mate list, a profile with no model runs as it always did:
+/// on its own manifest, with no model chosen for it.
+#[test]
+fn a_first_mate_with_no_model_and_no_first_mate_list_runs_as_before() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    modelless_profile(&fleet);
+    fleet.ok(
+        "routes.set",
+        json!({
+            "routes": {
+                "spent": {"manifest":fleet.root.join("fallback/manifest.json"),
+                    "options":mate_options(&fleet, "spent-model"),"cost":"plan"}
+            },
+            "crew": ["spent"]
+        }),
+        None,
+    );
+    fleet.send(json!({"id":"unlisted","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["status"], "running", "{report}");
+    assert!(report["route"].is_null(), "{report}");
+    let (model, harness) = wake_job(&mut fleet);
+    assert_eq!(model, None);
+    assert_eq!(harness, "own");
+    assert_eq!(fleet.settle()["status"], "succeeded");
+    assert_eq!(recorded_route(&mut fleet), (Value::Null, Value::Null));
+}
+
+/// A listed route backing off, or whose harness the last readiness check
+/// found missing, is passed over for the next one, and the why says so; with
+/// every route unavailable the first mate waits rather than run on its
+/// harness's default.
+#[test]
+fn a_first_mate_with_no_model_passes_over_unavailable_listed_routes() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    modelless_profile(&fleet);
+    let absent = fleet.root.join("absent");
+    fs::create_dir_all(&absent).unwrap();
+    fs::write(
+        absent.join("manifest.json"),
+        json!({"schema_version":1,"id":"absent","requires":["absent-tool"],
+            "executable":[support::python().display().to_string(),fleet.root.join("adapter.py")]})
+        .to_string(),
+    )
+    .unwrap();
+    fleet.ok(
+        "routes.set",
+        json!({
+            "routes": {
+                "missing": {"manifest":absent.join("manifest.json"),
+                    "options":mate_options(&fleet, "missing-model"),"cost":"plan"},
+                "spent": {"manifest":fleet.root.join("fallback/manifest.json"),
+                    "options":mate_options(&fleet, "spent-model"),"cost":"plan"},
+                "fallback": {"manifest":fleet.root.join("fallback/manifest.json"),
+                    "options":mate_options(&fleet, "fallback-model"),"cost":"plan"}
+            },
+            "first_mate": ["missing", "spent", "fallback"]
+        }),
+        None,
+    );
+    fleet
+        .store
+        .connection()
+        .execute(
+            "INSERT OR REPLACE INTO machine_readiness(tool, level, ok, version, path, why,
+               install, needed_by, fingerprint, checked_ms)
+             VALUES('absent-tool', 'warn', 0, NULL, NULL, 'absent-tool is not on the PATH',
+               'install absent-tool', '[]', 'test', ?1)",
+            [privateer::store::Store::now_ms()],
+        )
+        .unwrap();
+    back_off(&fleet, "fallback/-/spent-model");
+    fleet.send(json!({"id":"passed-over","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["status"], "running", "{report}");
+    assert_eq!(report["route"]["name"], "fallback", "{report}");
+    let why = report["route"]["why"].as_str().unwrap();
+    assert!(
+        why.starts_with("first available on infra's first_mate list: fallback"),
+        "{why}"
+    );
+    assert!(
+        why.contains("passed over missing: unavailable: absent-tool not installed"),
+        "{why}"
+    );
+    assert!(
+        why.contains("spent: model route fallback/-/spent-model is backing off"),
+        "{why}"
+    );
+    assert_eq!(wake_job(&mut fleet).0.as_deref(), Some("fallback-model"));
+    assert_eq!(fleet.settle()["status"], "succeeded");
+
+    back_off(&fleet, "fallback/-/fallback-model");
+    fleet.send(
+        json!({"id":"none-clear","from":"apps","to":"infra","kind":"request","body":"Anyone?"}),
+    );
+    let wakes = fleet.wakes().len();
+    let report = Fleet::infra(&fleet.tick());
+    let skipped = report["skipped"].as_str().unwrap_or_default();
+    assert!(
+        skipped.starts_with("every first_mate route for infra is unavailable"),
+        "{report}"
+    );
+    assert_eq!(fleet.wakes().len(), wakes);
+    let bearings = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("First mate route: none; every first_mate route for infra is unavailable"),
+        "{bearings}"
+    );
+}
+
+/// A hosted first mate takes the same listed route: its hosted launch is
+/// tried on it, and the headless wake that follows runs on it too.
+#[test]
+fn a_hosted_first_mate_with_no_model_takes_the_listed_route_too() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, true);
+    modelless_profile(&fleet);
+    fleet.send(json!({"id":"hosted-listed","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
+    let report = Fleet::infra(&fleet.tick());
+    // This fixture's adapter cannot host, so the launch is refused and the
+    // wake runs headless, on the listed route.
+    assert!(report["host_error"].is_string(), "{report}");
+    assert_eq!(report["route"]["name"], "spent", "{report}");
+    assert_eq!(wake_job(&mut fleet).0.as_deref(), Some("spent-model"));
+    assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
 #[test]
 fn mail_wakes_the_first_mate_which_answers_and_its_usage_is_recorded() {
     let mut fleet = Fleet::new(now_settings());

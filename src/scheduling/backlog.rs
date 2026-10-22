@@ -434,7 +434,18 @@ fn consider(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
     if crate::jobs::stowed(&ledger)?.is_some() {
         return Ok(skipped(ship, "stowed"));
     }
-    if crate::activation::own_route_blocked(store, profile)? {
+    // A profile naming no model wakes on the first_mate list's first clear
+    // route, which is not backing off by its choice.
+    let blocked = match crate::crew_routes::listed_first_mate(store, ship, profile)? {
+        crate::crew_routes::Listed::Route(_) => false,
+        crate::crew_routes::Listed::Unlisted => {
+            crate::activation::own_route_blocked(store, profile)?
+        }
+        crate::crew_routes::Listed::Unavailable(_) => {
+            return Ok(skipped(ship, "every first_mate route unavailable"));
+        }
+    };
+    if blocked {
         return Ok(skipped(ship, "model route backing off"));
     }
     if has_ready(store, ship)? {

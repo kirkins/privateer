@@ -654,6 +654,39 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
     }
 }
 
+/// Captain finding 22: init says which route the first mate will take from
+/// the fleet's first_mate list, and writes none into the profile, since each
+/// wake chooses again. With no list it says the harness default runs.
+#[test]
+fn init_names_the_first_mate_route_from_the_fleet_list() {
+    let folder = Folder::new("Routed");
+    fs::write(
+        folder.root.join("fleet.routes.json"),
+        json!({"routes": {"flash": {"manifest": "bundled:codex", "cost": "plan",
+            "options": {"model": "flash-model"}}}, "first_mate": ["flash"]})
+        .to_string(),
+    )
+    .unwrap();
+    let out = folder.ok(&["init", "--harness", "codex"]);
+    assert!(
+        out.contains("first mate route: flash (codex/-/flash-model), the first available on the fleet's first_mate list"),
+        "{out}"
+    );
+    let ship = folder.json("ship.show", json!({"name":"routed"}));
+    assert_eq!(
+        ship["first_mate"]["options"],
+        json!({"sandbox":"workspace-write"}),
+        "{ship}"
+    );
+
+    let plain = Folder::new("Plain");
+    let out = plain.ok(&["init", "--harness", "codex"]);
+    assert!(
+        out.contains("first mate model: codex's default (no first_mate routes listed)"),
+        "{out}"
+    );
+}
+
 #[test]
 fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
     let folder = Folder::new("Infra Ship");

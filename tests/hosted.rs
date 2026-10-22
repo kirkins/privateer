@@ -1836,6 +1836,70 @@ fn hosting_inherits_only_with_the_native_route_and_explicit_overrides_win() {
     place.stop_native("implicit");
 }
 
+/// Captain finding 22: `init --harness pi` leaves the first mate no model of
+/// its own, and the fleet lists first_mate routes. Its first mate runs the
+/// first listed route, headless and hosted alike, never Pi's default.
+#[test]
+fn an_init_made_ship_runs_the_first_mate_route_headless_and_hosted() {
+    let place = Place::new();
+    place.json(
+        "routes.set",
+        json!({"routes": {"flash": {"manifest": "bundled:pi", "cost": "plan",
+            "options": {"provider": "fixture-provider", "model": "flash-model"}}},
+            "first_mate": ["flash"]}),
+    );
+    let mut mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    assert_eq!(mate["options"], json!({}), "{mate}");
+    let routed = |argv: &str| {
+        let argv: Vec<&str> = argv.lines().collect();
+        argv.windows(2)
+            .any(|p| p == ["--provider", "fixture-provider"])
+            && argv.windows(2).any(|p| p == ["--model", "flash-model"])
+    };
+
+    // Headless.
+    mate.as_object_mut().unwrap().remove("host");
+    place.json("ship.put", json!({"name":"infra","first_mate":mate}));
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"headless on the route"}),
+    );
+    let report = place.tick();
+    assert_eq!(report["route"]["name"], "flash", "{report}");
+    place.wait_wake("headless", report["wake"].as_str().unwrap(), true);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(routed(&argv), "{argv}");
+    place.stop_wake("headless", &report);
+
+    // Hosted.
+    mate["host"] = json!("herdr");
+    place.json("ship.put", json!({"name":"infra","first_mate":mate}));
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"hosted on the route"}),
+    );
+    let report = place.tick();
+    assert!(report["hosted"]["pane"].is_string(), "{report}");
+    assert_eq!(report["route"]["name"], "flash", "{report}");
+    until("the hosted harness", || place.root.join("pi-env").exists());
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(routed(&argv), "{argv}");
+    place.stop_native("infra");
+}
+
 #[test]
 fn ordinary_idle_ticks_launch_once_and_back_off_durably_before_recovery() {
     let place = Place::new();

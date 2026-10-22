@@ -110,6 +110,19 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
             return Ok(None);
         }
     };
+    // A profile that names no model is offered on the captain's first_mate
+    // list, as a wake is; with none of its routes clear the work waits.
+    let mut profile = profile;
+    let waiting = match crate::crew_routes::listed_first_mate(store, ship, &profile) {
+        Ok(crate::crew_routes::Listed::Route(choice)) => {
+            crate::crew_routes::onto(&mut profile, &choice);
+            None
+        }
+        Ok(crate::crew_routes::Listed::Unlisted) => None,
+        Ok(crate::crew_routes::Listed::Unavailable(why)) => Some(format!("Waiting for {why}")),
+        // A hand-edited routes file must not stop the dispatcher.
+        Err(error) => Some(format!("Waiting for a readable routes file: {error:#}")),
+    };
     for id in ready_ids(store, ship)? {
         let mut work = load(store, &id)?.context("schedule vanished")?;
         check(store, &mut work, now)?;
@@ -127,7 +140,11 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
             save(store, &work)?;
             continue;
         }
-        if let Some(reason) = blocked(store, ship, &id, &profile, mode == "fresh", now)? {
+        let reason = match &waiting {
+            Some(waiting) => Some(waiting.clone()),
+            None => blocked(store, ship, &id, &profile, mode == "fresh", now)?,
+        };
+        if let Some(reason) = reason {
             work.reason = Some(reason);
             save(store, &work)?;
             continue;

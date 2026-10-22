@@ -866,15 +866,22 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
             ..Setup::default()
         },
     )?;
+    // The ship is made; an unreadable routes file only leaves this unknown.
+    let (route, model) = mate_route(home, &ship, &harness)
+        .unwrap_or_else(|error| (None, format!("first mate route: unknown ({error:#})")));
     if quiet {
+        let on = route
+            .map(|name| format!(" on route {name}"))
+            .unwrap_or_default();
         println!(
-            "Aye. {} is now the ship {ship}, crewed by {harness}.",
+            "Aye. {} is now the ship {ship}, crewed by {harness}{on}.",
             folder.display()
         );
         return Ok(());
     }
     println!("Aye. {} is now the ship {ship}.", folder.display());
     println!("  first mate harness: {harness} (change with: privateer init --harness ID)");
+    println!("  {model}");
     if !ours {
         println!("  AGENTS.md exists and was not written by Privateer, so it was left alone.");
     }
@@ -888,6 +895,39 @@ fn init(home: &Path, args: &[String], quiet: bool) -> Result<()> {
         "  privateer ask {ship} \"...\"           or send it a request from anywhere in this folder"
     );
     Ok(())
+}
+
+/// The route a new ship's first mate will take, and init's line saying so:
+/// the first available on the fleet's first_mate list when its profile names
+/// no model, which each wake chooses again, so nothing is written into the
+/// profile to go stale when the routes file changes.
+fn mate_route(home: &Path, ship: &str, harness: &str) -> Result<(Option<String>, String)> {
+    let mut store = Store::open(home)?;
+    let profile = crate::dispatch(&mut store, "ship.show", json!({"name": ship}))?;
+    let mate = &profile["first_mate"];
+    Ok(
+        match crate::crew_routes::listed_first_mate(&store, ship, mate)? {
+            crate::crew_routes::Listed::Route(choice) => {
+                let line = format!(
+                    "first mate route: {} ({}), the first available on the fleet's first_mate list; each wake chooses again",
+                    choice.name,
+                    choice.identity.as_deref().unwrap_or("unnamed")
+                );
+                (Some(choice.name), line)
+            }
+            crate::crew_routes::Listed::Unavailable(why) => (
+                None,
+                format!("first mate route: none yet ({why}); it waits until one clears"),
+            ),
+            crate::crew_routes::Listed::Unlisted => match mate["options"]["model"].as_str() {
+                Some(model) => (None, format!("first mate model: {model}, the ship's own")),
+                None => (
+                    None,
+                    format!("first mate model: {harness}'s default (no first_mate routes listed)"),
+                ),
+            },
+        },
+    )
 }
 
 fn liaison_instructions(ship: &str) -> String {
@@ -1188,12 +1228,32 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     } else {
         format!("start:{}:{}", std::process::id(), uuid::Uuid::new_v4())
     };
-    if hosted
-        && let Err(error) = crate::host::validate_start(&mut store, &ship, &profile["first_mate"])
-    {
-        let _ = crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
-        crate::presence::leave(&store, &ship, &holder)?;
-        return Err(error);
+    let checked = listed_route(
+        &store,
+        &ship,
+        &mut profile,
+        ours.first().copied(),
+        passthrough,
+    )
+    .and_then(|route| {
+        if hosted {
+            crate::host::validate_start(&mut store, &ship, &profile["first_mate"])?;
+        }
+        Ok(route)
+    });
+    match checked {
+        Ok(Some(route)) => println!(
+            "⚓ {ship}'s first mate runs route {}: {}",
+            route.name, route.why
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            if hosted {
+                let _ = crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
+                crate::presence::leave(&store, &ship, &holder)?;
+            }
+            return Err(error);
+        }
     }
     let mut hosted_lease = hosted.then(|| crate::host::Lease {
         store: &store,
@@ -1358,15 +1418,20 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     // route or harness applies here rather than at the last launch.
     let replan = |holder: &str| -> Result<(Value, Launch, Option<crate::host::Conversation>, u64)> {
         let mut check = Store::open(home)?;
-        let profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
-        let planned = crate::host::validate_start(&mut check, &ship, &profile["first_mate"])
-            .and_then(|()| {
-                launch_plan(&check, &profile, ours.first().copied(), passthrough, hosted)
-            })
-            .and_then(|next| -> Result<Launch> {
-                prepare_harness(&next.harness, &plugins, folder, &control)?;
-                Ok(next)
-            });
+        let mut profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
+        let planned = listed_route(
+            &check,
+            &ship,
+            &mut profile,
+            ours.first().copied(),
+            passthrough,
+        )
+        .and_then(|_| crate::host::validate_start(&mut check, &ship, &profile["first_mate"]))
+        .and_then(|()| launch_plan(&check, &profile, ours.first().copied(), passthrough, hosted))
+        .and_then(|next| -> Result<Launch> {
+            prepare_harness(&next.harness, &plugins, folder, &control)?;
+            Ok(next)
+        });
         let launch = match planned {
             Ok(next) => next,
             Err(error) => {
@@ -1484,6 +1549,31 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     }
     crate::presence::leave(&store, &ship, &holder)?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// A first mate started with no harness or model of its own runs on the
+/// captain's first_mate list, as its headless wakes do, read again at each
+/// launch; with every listed route unavailable it does not start.
+fn listed_route(
+    store: &Store,
+    ship: &str,
+    profile: &mut Value,
+    named: Option<&String>,
+    passthrough: &[String],
+) -> Result<Option<crate::crew_routes::Choice>> {
+    if named.is_some() || passes(passthrough, "--model") || passes(passthrough, "--provider") {
+        return Ok(None);
+    }
+    match crate::crew_routes::listed_first_mate(store, ship, &profile["first_mate"])? {
+        crate::crew_routes::Listed::Unlisted => Ok(None),
+        crate::crew_routes::Listed::Route(choice) => {
+            crate::crew_routes::onto(&mut profile["first_mate"], &choice);
+            Ok(Some(choice))
+        }
+        crate::crew_routes::Listed::Unavailable(why) => bail!(
+            "{why}; wait for one to clear, or give the first mate its own model with ship.put"
+        ),
+    }
 }
 
 /// What one launch of a first mate runs, derived from its profile. Every
