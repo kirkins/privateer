@@ -60,6 +60,7 @@ pub mod scheduling;
 pub mod service;
 pub mod session;
 mod snapshot;
+mod stale_tasks;
 pub mod store;
 pub mod stow;
 mod tool_bundles;

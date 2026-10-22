@@ -563,3 +563,80 @@ fn a_backlog_starts_ranked_tasks_first_and_holds_only_unstarted_work() {
     );
     assert!(dispatch(&mut s, "task.backlog", json!({"ship":"infra"})).is_err());
 }
+
+#[test]
+fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
+    let (_temp, mut s) = fleet();
+    for id in ["stale", "finished", "deferred"] {
+        dispatch(
+            &mut s,
+            "task.create",
+            json!({"id":id,"charter_id":"fleet","owner":"infra","title":format!("Work on {id}")}),
+        )
+        .unwrap();
+    }
+    put(&mut s, "task:stale", "Doing: waiting for a review").unwrap();
+    dispatch(
+        &mut s,
+        "task.update",
+        json!({"id":"finished","actor":"infra","status":"done"}),
+    )
+    .unwrap();
+    // A typed wait is its own update: a deferred task is not stale. The
+    // fixture ship has no first mate to enqueue to, so its schedule is stored
+    // as task.defer leaves it.
+    let later = Store::now_ms() + 30 * 86_400_000;
+    let schedule = json!({"task_id":"deferred","owner":"infra","revision":1,
+        "brief":"Continue after the window.","state":"waiting",
+        "wait":{"kind":"time","until_ms":later,"reason":"after the window"},
+        "not_before_ms":later,"offer_id":null,"holder":null,"job_id":null,"profile":null,
+        "charter_hash":null,"attempts":0,"created_ms":Store::now_ms(),
+        "last_checked_ms":Store::now_ms(),"lease_until_ms":0,"reason":"after the window"});
+    s.connection()
+        .execute(
+            "INSERT INTO task_schedule(task_id,record) VALUES('deferred',?1)",
+            [schedule.to_string()],
+        )
+        .unwrap();
+    // Age everything recorded about them; repair and cleanup stay fresh.
+    let now = Store::now_ms();
+    for (id, days) in [("stale", 4), ("finished", 10), ("deferred", 10)] {
+        let at = now - days * 86_400_000 - 60_000;
+        s.connection()
+            .execute(
+                "UPDATE audit SET time_ms=?2 WHERE json_extract(payload,'$.id')=?1",
+                rusqlite::params![id, at],
+            )
+            .unwrap();
+        s.connection()
+            .execute(
+                "UPDATE notes SET created_ms=?2 WHERE focus='task:' || ?1",
+                rusqlite::params![id, at],
+            )
+            .unwrap();
+    }
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("1 open task has had no update in 3 days or more: stale (4 d)."),
+        "{text}"
+    );
+    for other in ["finished (", "deferred (", "repair (", "cleanup ("] {
+        assert!(!text.contains(other), "{other}: {text}");
+    }
+    assert_eq!(bearings["stale_tasks"], 1);
+    // The threshold is the ship's `first_mate.stale_task_days`.
+    s.connection()
+        .execute(
+            "UPDATE ships SET record=json_set(record,'$.first_mate.stale_task_days',5) WHERE name='infra'",
+            [],
+        )
+        .unwrap();
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    assert!(
+        !bearings["text"].as_str().unwrap().contains("no update in"),
+        "{}",
+        bearings["text"]
+    );
+    assert_eq!(bearings["stale_tasks"], 0);
+}

@@ -63,6 +63,10 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
         0,
         604_800,
     ),
+    // An open task with no update for this many days is named in the ship's
+    // bearings and counted on the bridge deck; nothing changes on its own
+    // (0 shows none).
+    ("stale_task_days", crate::stale_tasks::DEFAULT_DAYS, 0, 365),
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;
