@@ -964,7 +964,18 @@ pub(crate) fn supervise(
     ship: &str,
     cwd: &Path,
 ) -> Result<()> {
-    crew_space(store, job, task, ship, cwd, &[], &["_job-supervise", job])
+    crew_space(
+        store,
+        &Of {
+            job,
+            task,
+            ship,
+            cwd,
+        },
+        &[],
+        &["_job-supervise", job],
+        &Space::Crew,
+    )
 }
 
 /// Follow a headless crew job in its own background space under its task:
@@ -981,13 +992,166 @@ pub(crate) fn view_crew(
     // captain types there, so it runs as the operator, not the ship.
     crew_space(
         store,
-        job,
-        task,
-        ship,
-        cwd,
+        &Of {
+            job,
+            task,
+            ship,
+            cwd,
+        },
         &[("PRIVATEER_ROLE", "operator")],
         &["watch", "--job", job],
+        &Space::Crew,
     )
+}
+
+/// How long a job runs before it earns a space in the terminal host. Shorter
+/// jobs (most gates, checks and erases) never open one, so the sidebar does
+/// not churn with every command a ship runs.
+pub(crate) const JOB_SPACE_AFTER_MS: i64 = 120_000;
+/// Spaces opened per tick, so a burst of long jobs does not flood the sidebar.
+const JOB_SPACES_PER_TICK: usize = 3;
+
+/// What a space opened under a ship holds.
+pub(crate) enum Space {
+    Crew,
+    /// A long command job, under the crew that started it (by job id) when
+    /// there is one, else under the first mate.
+    Job {
+        parent: Option<String>,
+        label: String,
+    },
+}
+
+/// A running command job of a hosted ship here that has run long enough for
+/// a space and has none yet.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LongJob {
+    pub id: String,
+    pub task: String,
+    pub ship: String,
+    pub cwd: PathBuf,
+    pub parent: Option<String>,
+    pub label: String,
+}
+
+/// Command jobs spawned at or before `cutoff_ms` and still running, of ships
+/// hosted in Herdr here, that have no recorded space. Wakes, errands and crew
+/// are not command jobs: they have their own spaces or none.
+pub(crate) fn long_jobs(store: &Store, cutoff_ms: i64) -> Result<Vec<LongJob>> {
+    let conn = store.connection();
+    let mut query = conn.prepare(
+        "SELECT j.id, j.record FROM jobs j
+         WHERE json_extract(j.record,'$.status')='running'
+           AND json_extract(j.record,'$.spawned_ms') <= ?1
+           AND COALESCE(json_extract(j.record,'$.action'),'') != 'spawn'
+           AND json_extract(j.record,'$.model_route') IS NULL
+           AND NOT EXISTS(SELECT 1 FROM wakes w WHERE w.job_id=j.id)
+           AND NOT EXISTS(SELECT 1 FROM errands e WHERE e.id=j.id)
+           AND NOT EXISTS(SELECT 1 FROM crew_panes c WHERE c.job_id=j.id)
+         ORDER BY json_extract(j.record,'$.spawned_ms') LIMIT 50",
+    )?;
+    let rows: Vec<(String, String)> = query
+        .query_map([cutoff_ms], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out = vec![];
+    for (id, raw) in rows {
+        let job: Value = serde_json::from_str(&raw)?;
+        let task = job["task_id"].as_str().unwrap_or_default().to_owned();
+        let ship = match job["agent_actor"].as_str() {
+            Some(ship) => ship.to_owned(),
+            None => conn
+                .query_row("SELECT owner FROM tasks WHERE id=?1", [&task], |r| r.get(0))
+                .optional()?
+                .unwrap_or_default(),
+        };
+        let hosted: bool = conn
+            .query_row(
+                "SELECT json_extract(record,'$.location')='here'
+                    AND json_extract(record,'$.first_mate.host')='herdr' FROM ships WHERE name=?1",
+                [&ship],
+                |r| r.get::<_, Option<bool>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or(false);
+        if !hosted {
+            continue;
+        }
+        out.push(LongJob {
+            label: job_label(&job["command"], &task),
+            parent: job["started_by"].as_str().map(str::to_owned),
+            cwd: job["cwd"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| store.home().to_path_buf()),
+            id,
+            task,
+            ship,
+        });
+    }
+    Ok(out)
+}
+
+/// A short name for a job's space: the script or program it runs, past any
+/// interpreter, else its task.
+fn job_label(command: &Value, task: &str) -> String {
+    const INTERPRETERS: [&str; 8] = [
+        "bash", "sh", "zsh", "env", "python", "python3", "node", "nice",
+    ];
+    let name = command
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|arg| arg.rsplit('/').next().unwrap_or(arg))
+        .find(|arg| !arg.starts_with('-') && !INTERPRETERS.contains(arg));
+    match name {
+        Some(name) => format!("{task} · {}", name.chars().take(40).collect::<String>()),
+        None => task.to_owned(),
+    }
+}
+
+/// Opens a read-only space for each long job of a hosted ship here, under
+/// whoever started it. Presentation only: a refused space never touches the
+/// job, and a job is tried once per dispatcher process.
+pub(crate) fn view_long_jobs(store: &Store) -> Value {
+    static TRIED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let jobs = match long_jobs(store, Store::now_ms() - JOB_SPACE_AFTER_MS) {
+        Ok(jobs) => jobs,
+        Err(error) => return json!({"error": format!("{error:#}")}),
+    };
+    let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh: Vec<LongJob> = jobs
+        .into_iter()
+        .filter(|job| !tried.contains(&job.id))
+        .take(JOB_SPACES_PER_TICK)
+        .collect();
+    if fresh.is_empty() || !answers() {
+        return json!([]);
+    }
+    let mut opened = vec![];
+    for job in fresh {
+        tried.insert(job.id.clone());
+        let result = crew_space(
+            store,
+            &Of {
+                job: &job.id,
+                task: &job.task,
+                ship: &job.ship,
+                cwd: &job.cwd,
+            },
+            &[("PRIVATEER_ROLE", "operator")],
+            &["watch", "--job", &job.id],
+            &Space::Job {
+                parent: job.parent.clone(),
+                label: job.label.clone(),
+            },
+        );
+        opened.push(json!({"job_id": job.id, "ship": job.ship,
+            "error": result.err().map(|e| format!("{e:#}"))}));
+    }
+    json!(opened)
 }
 
 pub(crate) fn crew_tab_title(ship: &str, task: &str) -> String {
@@ -998,29 +1162,41 @@ pub(crate) fn crew_tab_title(ship: &str, task: &str) -> String {
     }
 }
 
+/// The job a crew or job space follows, and where it opens.
+struct Of<'a> {
+    job: &'a str,
+    task: &'a str,
+    ship: &'a str,
+    cwd: &'a Path,
+}
+
 fn crew_space(
     store: &Store,
-    job: &str,
-    task: &str,
-    ship: &str,
-    cwd: &Path,
+    of: &Of,
     env: &[(&str, &str)],
     command: &[&str],
+    kind: &Space,
 ) -> Result<()> {
+    let Of {
+        job,
+        task,
+        ship,
+        cwd,
+    } = *of;
     let socket = socket().context("no Herdr socket configured")?;
     let mut client = crate::herdr::Client::connect(&socket)?;
     let binary = crate::executable::installed()?;
     let tab_title = crew_tab_title(ship, task);
-    let pane = client.space(
-        cwd,
-        &format!("└ {task}"),
-        &tab_title,
-        &binary,
-        store.home(),
-        env,
-        command,
-    )?;
-    restored::record(store, &socket, &pane, "crew", ship, cwd);
+    let (label, role, tokens) = match kind {
+        Space::Crew => (format!("└ {task}"), "crew", json!({"job": job})),
+        Space::Job { parent, label } => (
+            format!("  └ {label}"),
+            "job",
+            json!({"job": job, "parent": parent}),
+        ),
+    };
+    let pane = client.space(cwd, &label, &tab_title, &binary, store.home(), env, command)?;
+    restored::record(store, &socket, &pane, role, ship, cwd);
     let viewer = command[0] == "watch";
     // Where the captain finds this crew's session. Presentation only: a
     // pane that is not recorded still runs the crew.
@@ -1030,9 +1206,13 @@ fn crew_space(
         pane: pane.clone(),
     };
     let recorded = crate::session::record_crew(store, job, ship, &binding, viewer);
-    settle(store, &mut client, &pane.workspace_id, "crew", ship);
+    settle_tagged(store, &mut client, &pane.workspace_id, role, ship, &tokens);
     store.audit(
-        "host.crew",
+        if role == "job" {
+            "host.job"
+        } else {
+            "host.crew"
+        },
         &json!({"job_id": job, "task_id": task, "pane": pane.pane_id,
             "workspace": pane.workspace_id, "viewer": viewer,
             "unrecorded": recorded.err().map(|e| format!("{e:#}"))}),
@@ -1049,9 +1229,27 @@ fn settle(
     role: &str,
     ship: &str,
 ) {
+    settle_tagged(store, client, workspace, role, ship, &json!({}));
+}
+
+/// As `settle`, with tokens that place a crew or job space under its parent.
+fn settle_tagged(
+    store: &Store,
+    client: &mut crate::herdr::Client,
+    workspace: &str,
+    role: &str,
+    ship: &str,
+    extra: &Value,
+) {
     let mates = crate::herdr::sidebar::mates(store.connection()).unwrap_or_default();
+    let mut tokens = json!({"privateer": role, "ship": ship});
+    for (key, value) in extra.as_object().into_iter().flatten() {
+        if let Some(text) = value.as_str() {
+            tokens[key] = json!(text);
+        }
+    }
     let _ = client
-        .tag(workspace, role, ship)
+        .tag_tokens(workspace, tokens)
         .and_then(|()| client.arrange_with_mates(&mates));
     // The new space is tagged now, so a second mate space for this ship shows.
     // Settle only records the sighting: the old space may still be closing.
@@ -1068,6 +1266,65 @@ mod tests {
     fn the_trust_step_folder_survives_spaces_and_quotes() {
         assert_eq!(shell_quote("/home/a b"), "'/home/a b'");
         assert_eq!(shell_quote("/home/it's"), r"'/home/it'\''s'");
+    }
+
+    /// Only a hosted ship's command job that has run past the threshold and
+    /// has no space gets one; crew, wakes, short or recorded jobs never do.
+    #[test]
+    fn only_long_running_command_jobs_of_hosted_ships_earn_a_space() {
+        use crate::store::Store;
+        use serde_json::json;
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(&temp.path().join("home")).unwrap();
+        crate::jobs::init(&store).unwrap();
+        let conn = store.connection();
+        for (name, host) in [("apps", "herdr"), ("web", "none")] {
+            conn.execute(
+                "INSERT INTO ships(name, record) VALUES(?1, ?2)",
+                rusqlite::params![
+                    name,
+                    json!({"name": name, "location": "here", "first_mate": {"host": host}})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let now = 10_000_000;
+        let job = |id: &str, ship: &str, spawned: i64, extra: serde_json::Value| {
+            let mut record = json!({"id": id, "task_id": "fix", "agent_actor": ship, "status": "running",
+                "spawned_ms": spawned, "cwd": "/repo",
+                "command": ["bash", "/repo/target/gates.sh", "/repo"], "started_by": "crew-1"});
+            for (k, v) in extra.as_object().unwrap() {
+                record[k] = v.clone();
+            }
+            conn.execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                rusqlite::params![id, record.to_string()],
+            )
+            .unwrap();
+        };
+        job("long", "apps", now - 5 * 60_000, json!({}));
+        job("short", "apps", now - 30_000, json!({}));
+        job("crew", "apps", now - 5 * 60_000, json!({"action": "spawn"}));
+        job(
+            "done",
+            "apps",
+            now - 5 * 60_000,
+            json!({"status": "succeeded"}),
+        );
+        job("unhosted", "web", now - 5 * 60_000, json!({}));
+        job("shown", "apps", now - 5 * 60_000, json!({}));
+        conn.execute(
+            "INSERT INTO crew_panes(job_id, ship, binding, viewer, recorded_ms) VALUES('shown','apps','{}',1,0)",
+            [],
+        )
+        .unwrap();
+        let found = super::long_jobs(&store, now - super::JOB_SPACE_AFTER_MS).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].id, "long");
+        assert_eq!(found[0].label, "fix · gates.sh");
+        assert_eq!(found[0].parent.as_deref(), Some("crew-1"));
+        assert_eq!(found[0].cwd, std::path::PathBuf::from("/repo"));
     }
 
     #[test]
