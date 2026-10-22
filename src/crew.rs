@@ -889,7 +889,8 @@ fn recover_resuming(store: &mut Store) -> Result<()> {
             // a workspace inside agent.start.
             None if launch_in_flight(store, &park)? => {}
             Some(_) => {
-                set_state(store, &park, "resumed")?;
+                // Its claimer may have died before linking the park to it.
+                link_resume(store, &park, "resumed", &id)?;
                 crate::jobs::finish_resumed(store, &crew, &id)?;
             }
             None if retries == 0 => {
@@ -946,6 +947,16 @@ fn launch_in_flight(store: &Store, park: &str) -> Result<bool> {
     };
     let young = Store::now_ms() - updated_ms < LAUNCH_BOUND_MS;
     Ok(young && crate::jobs::identity_alive(&claimer)?)
+}
+
+/// Record the job a park's resume launched, so `lineage` follows it back to
+/// the crew it continues, and the park's state with it.
+fn link_resume(store: &Store, park: &str, state: &str, resumed: &str) -> Result<()> {
+    store.connection().execute(
+        "UPDATE crew_parks SET state=?2, resumed_job_id=?3, updated_ms=?4 WHERE id=?1",
+        params![park, state, resumed, Store::now_ms()],
+    )?;
+    Ok(())
 }
 
 fn set_state(store: &Store, park: &str, state: &str) -> Result<()> {
@@ -1130,17 +1141,8 @@ fn launch_resume(
         Ok(started) => {
             let resumed = started["id"].as_str().unwrap_or(&id).to_owned();
             let admitted = !matches!(started["status"].as_str(), Some("queued" | "starting"));
-            store.connection().execute(
-                "UPDATE crew_parks SET state=?2, resumed_job_id=?3, session=?4, updated_ms=?5
-                   WHERE id=?1",
-                params![
-                    park,
-                    if admitted { "resumed" } else { "resuming" },
-                    resumed,
-                    session,
-                    Store::now_ms()
-                ],
-            )?;
+            let state = if admitted { "resumed" } else { "resuming" };
+            link_resume(store, park, state, &resumed)?;
             // The crew's record now says where its work went; it reports nothing.
             crate::jobs::finish_resumed(store, crew, &resumed)?;
         }
@@ -1264,5 +1266,107 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "crew.report" => report(store, &args),
         "crew.answer" => answer(store, &args),
         _ => bail!("unknown crew command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod recover_tests {
+    use super::*;
+
+    fn insert_job(store: &Store, id: &str, status: &str) {
+        let record = json!({
+            "id": id, "task_id": "fix", "incarnation": "one",
+            "command": ["claude"], "cwd": "/tmp", "action": "spawn", "heavy": false,
+            "timeout_secs": 60, "ledger": "/tmp/ledger.sqlite",
+            "status": status, "created_ms": Store::now_ms(), "finished_ms": null,
+            "supervisor": null, "payload": null, "cancel_requested": false,
+            "exit_code": null, "reason": null, "retry_of": null,
+            "agent_actor": "engineering",
+        });
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id, record) VALUES(?1, ?2)",
+                params![id, record.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn insert_park(store: &Store, id: &str, crew: &str, state: &str, resumed: Option<&str>) {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO crew_parks(id, root, crew_job_id, child_job_id, task_id, ship,
+                   state, next, resumed_job_id, attempt, created_ms, updated_ms)
+                 VALUES(?1, 'crew-1', ?2, '', 'fix', 'engineering', ?3, 'go on', ?4, 1, ?5, ?5)",
+                params![id, crew, state, resumed, Store::now_ms()],
+            )
+            .unwrap();
+    }
+
+    /// The claimer died after agent.start recorded the resume job but before
+    /// it linked the park to it. Recovery settles the park as resumed, and
+    /// must link it too, or the resumed crew starts a lineage of its own and
+    /// its parks no longer count against the caps.
+    #[test]
+    fn a_recovered_resume_keeps_the_crews_lineage_and_caps() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        // The crew has already parked to its cap: five resumed parks, then
+        // the one whose resume was in flight when its claimer died.
+        insert_job(&store, "crew-1", "resumed");
+        let mut crew = "crew-1".to_owned();
+        for n in 1..MAX_PARKS {
+            let resumed = format!("crew-resume-park-crew-1-{n}-1");
+            insert_park(
+                &store,
+                &format!("park-crew-1-{n}"),
+                &crew,
+                "resumed",
+                Some(&resumed),
+            );
+            insert_job(&store, &resumed, "resumed");
+            crew = resumed;
+        }
+        let last = format!("park-crew-1-{MAX_PARKS}");
+        insert_park(&store, &last, &crew, "resuming", None);
+        store
+            .connection()
+            .execute(
+                "UPDATE jobs SET record=json_set(record,'$.status','parked') WHERE id=?1",
+                [&crew],
+            )
+            .unwrap();
+        let resume = format!("crew-resume-{last}-1");
+        insert_job(&store, &resume, "running");
+
+        recover_resuming(&mut store).unwrap();
+
+        let (state, linked): (String, Option<String>) = store
+            .connection()
+            .query_row(
+                "SELECT state, resumed_job_id FROM crew_parks WHERE id=?1",
+                [&last],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "resumed");
+        assert_eq!(linked.as_deref(), Some(resume.as_str()));
+        assert_eq!(
+            crate::jobs::record(&store, &crew).unwrap()["status"],
+            "resumed"
+        );
+        let chain = lineage(&store, &resume).unwrap();
+        assert_eq!(chain.len() as u64, MAX_PARKS + 1, "{chain:?}");
+        let root = chain.last().unwrap();
+        assert_eq!(root, "crew-1");
+        // The resumed crew is at its park cap: it may not park again.
+        let spent = spent_cap(&store, root, "fix", true).unwrap();
+        assert!(
+            spent
+                .as_deref()
+                .is_some_and(|why| why.contains("the cap is 6")),
+            "{spent:?}"
+        );
     }
 }
