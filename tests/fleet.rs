@@ -1526,6 +1526,56 @@ fn a_standing_grant_lets_a_ship_act_on_another_until_paused_or_revoked() {
 }
 
 #[test]
+fn a_put_never_reactivates_a_paused_or_revoked_grant_and_each_write_is_audited() {
+    let machine = Machine::new();
+    let liaison = machine.ship("liaison");
+    machine.ship("apps");
+    let grant =
+        json!({"id":"over-apps","grantee":"liaison","actions":["ship.scope"],"ships":["apps"]});
+    let put = || machine.run(&liaison, &["grant.put", "--json", &grant.to_string()]);
+    let rescope = || {
+        machine
+            .as_agent(
+                &liaison,
+                "liaison",
+                "ship.scope",
+                json!({"name": "apps", "scope": "Apps"}),
+            )
+            .status
+            .success()
+    };
+    assert!(put().status.success());
+    assert!(rescope());
+    machine.ok(&liaison, &["grant", "pause", "over-apps"]);
+    assert!(!put().status.success());
+    assert!(!rescope());
+    machine.ok(&liaison, &["grant", "resume", "over-apps"]);
+    assert!(put().status.success());
+    machine.ok(&liaison, &["grant", "revoke", "over-apps"]);
+    assert!(!put().status.success());
+    assert!(!rescope());
+    let kinds: Vec<String> = machine.json(&liaison, "audit.list", json!({}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .filter(|k| k.starts_with("grant."))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "grant.put",
+            "grant.used",
+            "grant.pause",
+            "grant.resume",
+            "grant.put",
+            "grant.revoke"
+        ]
+    );
+}
+
+#[test]
 fn a_typed_decision_reaches_the_liaison_with_its_options_whole() {
     let machine = Machine::new();
     let liaison = liaison(&machine);
