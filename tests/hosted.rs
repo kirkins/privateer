@@ -2491,6 +2491,7 @@ fn a_restored_space_running_privateer_at_the_shell_pid_is_not_closed() {
 /// adapter reports it idle, and its native payload exits. Herdr has recorded
 /// the harness as exited by then, which is when it drops a report naming it.
 fn sleep_hosted(place: &Place, herdr: &Herdr) -> String {
+    handled(place);
     let pid = place.native_pid();
     let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
     let holder = env.trim().split_once(' ').unwrap().1.to_owned();
@@ -2507,6 +2508,22 @@ fn sleep_hosted(place: &Place, herdr: &Herdr) -> String {
         fs::remove_file(place.root.join(file)).unwrap();
     }
     holder
+}
+
+/// Acknowledge infra's mail as its first mate does once it has handled it: a
+/// request it has neither answered nor acknowledged keeps it awake.
+fn handled(place: &Place) {
+    let latest: i64 = place
+        .database()
+        .query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if latest > 0 {
+        place.agent("mail.ack", json!({"address":"infra","through_seq":latest}));
+    }
 }
 
 /// The hosted first mate "infra", set to sleep after one second, in its pane.
@@ -4348,6 +4365,7 @@ fn an_idle_pane_behind_the_current_release_catches_up_at_its_sleep_point_and_a_b
     // Once idle past its sleep point, the behind pane ends at a safe point,
     // having stopped its harness, and the next dispatcher pass starts it again
     // on the current release.
+    handled(&place);
     let idle = json!({"ship":"infra","holder":holder,"idle":true});
     let session = pi_session_arg(&place);
     place.agent("work.poll", idle.clone());
@@ -4396,6 +4414,7 @@ fn mail_that_lands_between_a_catch_up_and_its_replacement_wakes_the_asleep_pane(
     let holder = holder_of(&place);
 
     // The catch-up fences the old pane at its sleep point and it leaves.
+    handled(&place);
     let idle = json!({"ship":"infra","holder":holder,"idle":true});
     place.agent("work.poll", idle.clone());
     std::thread::sleep(Duration::from_millis(1100));
