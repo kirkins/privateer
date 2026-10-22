@@ -19,7 +19,7 @@ Before or during rollout, four decisions are pending the captain's direction:
    - *Status:* Pending decision.
 
 3. **App repository rollout list.**
-   - *Context:* Which Forgejo and GitHub repositories receive branch protection and review gating first (for example, `kirkins/privateer`, `kirkins/quarterdeck`, and `git.lobbykit.net/hermes/*`).
+   - *Context:* Which Forgejo and GitHub repositories receive branch protection and review gating first (for example, `kirkins/privateer`, `kirkins/quarterdeck`, and `forge.example.com/hermes/*`).
    - *Status:* Pending decision.
 
 4. **Sol setup on the laptop.**
@@ -149,7 +149,7 @@ Verify protection settings via Privateer:
 ---
 
 ### Section B: Forgejo setup (per repository)
-*Repositories selected per pending captain decision 3 (e.g. `git.lobbykit.net/hermes/*`).*
+*Repositories selected per pending captain decision 3 (e.g. `forge.example.com/hermes/*`).*
 
 #### 1. [hands] Create service users and store credentials
 1. In Forgejo, create three dedicated accounts:
@@ -214,9 +214,9 @@ Example configuration schema:
         "credential": "forge-reviewer-github"
       }
     },
-    "git.lobbykit.net/hermes/app": {
+    "forge.example.com/hermes/app": {
       "forge": "forgejo",
-      "api": "https://git.lobbykit.net/api/v1",
+      "api": "https://forge.example.com/api/v1",
       "branch": "main",
       "reviewer": {
         "account": "reviewer",

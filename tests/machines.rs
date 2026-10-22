@@ -5827,7 +5827,7 @@ fn files_cross_a_link_only_on_the_captains_mail_and_by_its_own_rows() {
         json!({"id": "captain-files", "from": "captain", "to": "fitforge",
             "kind": "notice", "body": "Plan attached.",
             "payload": {"files": [{"file_id": file_id, "name": "plan.md", "bytes": 4,
-                "type": "text/markdown", "path": "/home/kirkins/.ssh/id_ed25519"}]}}),
+                "type": "text/markdown", "path": "/home/someone/.ssh/id_ed25519"}]}}),
     );
     assert_eq!(delivered["ok"], true, "{delivered}");
     let mail = messages(&mac, "fitforge", "notice");
