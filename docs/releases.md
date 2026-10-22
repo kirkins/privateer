@@ -1,6 +1,6 @@
 # Versioned releases and upgrade status
 
-This is the release-identity foundation for [issue #76](https://github.com/kirkins/privateer/issues/76), not the fleet upgrader. `privateer upgrade status` is available; building, installing, switching, draining/restarting, pruning, rollback, and approval-bound upgrade requests are not implemented by this change. Do not use an ad hoc symlink switch as a safe fleet upgrade.
+This is the release-identity foundation for [issue #76](https://github.com/kirkins/privateer/issues/76), not the fleet upgrader. `privateer upgrade status` and `privateer upgrade fetch` (below) are available; switching, draining/restarting, pruning, rollback, and approval-bound upgrade requests are not implemented yet ([the design](design/upgrade-execute.md)). Do not use an ad hoc symlink switch as a safe fleet upgrade.
 
 ## Layout
 
@@ -25,7 +25,22 @@ Agent control argv, generated instructions, and newly persisted peer/service com
 
 Legacy `cargo install` and source/target builds remain supported: outside a recognized release layout, existing plugin lookup (explicit `PRIVATEER_PLUGINS`, `share/privateer/plugins` beside the binary's own `bin`, then the build checkout whose `Cargo.toml` names the `privateer` package and nothing above it) and executable replacement behavior remain unchanged. They are reported as an unversioned running binary, not assigned a guessed Git commit. A source checkout changing after compilation is not evidence of a binary's commit.
 
-CI builds this layout on every push to main as a downloadable artifact: `privateer-macos-arm64-<commit>` (macOS on Apple silicon) and `privateer-linux-x86_64-<commit>` (Linux x86_64, built on Ubuntu 24.04 and checked to need glibc 2.39 or older, so it runs on Ubuntu 24.04 and newer). Each holds one `<commit>/` directory as above. The bundled plugins need `python3` on the machine.
+CI builds this layout with `scripts/release-layout.sh` on every push to main as a downloadable artifact: `privateer-macos-arm64-<commit>` (macOS on Apple silicon), `privateer-linux-x86_64-<commit>` and `privateer-linux-aarch64-<commit>` (Linux, built on Ubuntu 24.04 and checked to need glibc 2.39 or older, so they run on Ubuntu 24.04 and newer). Each holds one tarball of one `<commit>/` directory as above, plus `<commit>/SHA256SUMS` covering every other file in it. A release holds plain files and directories only, no links. The bundled plugins need `python3` on the machine.
+
+## Fetching a release
+
+```sh
+privateer upgrade fetch <commit> [--build] [--source CHECKOUT] [--repo OWNER/NAME]
+```
+
+Operator only. It prepares `releases/<commit>` in the installation the running binary belongs to and switches nothing: `current`, launchers, service units and running processes are untouched. A complete release is staged under `staging/<id>/`, checked, and only then renamed into `releases/`, so `releases/<commit>` is either complete or absent.
+
+- **From CI.** When `uname -sm` names a platform CI builds (and, on Linux, `getconf GNU_LIBC_VERSION` reports glibc 2.39 or newer), `gh api` finds the push run on main in the repository (default `kirkins/privateer`; never a pull request's or a fork's run) whose release job for this platform succeeded, and its unexpired artifact. The download's sha256 must equal the digest GitHub reports. The zip is unpacked with `python3 -I -m zipfile`, its tarball's names are checked to lie under `<commit>/` before `tar` extracts it, and the result must hold every binary, plugin manifests and a `SHA256SUMS` matching every file exactly.
+- **From source.** With `--build`, or when CI has nothing for this platform or commit, and only with `--source CHECKOUT`: the commit must be on the checkout's `origin/main` (fetched first). It is exported with `git archive`, leaving the checkout's working tree, index and branch alone, built with `cargo build --release --locked --features dashboard` into `<data>/build/target`, and laid out by the same script CI runs. Without `--source` such a machine is refused, with the reason. A wrong digest, a bad tarball or a failed check never falls back to a build.
+- **Smoke check.** Before publishing, the staged `bin/privateer` must report itself as `<commit>` in `upgrade status`, initialise and read a throwaway home, and the dashboard and broker binaries must run, so a wrong-platform build fails here.
+- **Releases never change.** An existing `releases/<commit>` is reused only when its `SHA256SUMS` still checks out (the bytecode caches Python writes beside the plugins aside); otherwise the command fails naming the directory and overwrites nothing.
+
+The build runs in the foreground and does not yet take the machine's heavy slot. `PRIVATEER_GH`, `PRIVATEER_CARGO` and `PRIVATEER_GLIBC` replace `gh`, `cargo` and getconf's report in tests.
 
 ## Bundled ship manifests
 

@@ -429,24 +429,22 @@ fn status_reports_broken_current_without_repairing_it() {
     );
 }
 
-/// The CI release layout copies every binary a release ships, the MCP
-/// broker included: `mcp-broker install` takes it from releases/<commit>/bin.
+/// The release layout (CI's and a source build's) copies every binary a
+/// release ships, the MCP broker included: `mcp-broker install` takes it
+/// from releases/<commit>/bin.
 #[test]
 fn the_release_layout_ships_every_binary_and_install_takes_the_broker_from_it() {
-    let workflow =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"))
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/release-layout.sh"))
             .unwrap();
-    let copy = workflow
+    let copy = script
         .lines()
-        .find(|line| {
-            line.trim_start()
-                .starts_with("cp target/release/privateer ")
-        })
+        .find(|line| line.starts_with("cp \"$build/privateer\" "))
         .expect("the release layout's binary copy");
     for name in BINARIES {
         assert!(
             copy.split_whitespace()
-                .any(|word| word == format!("target/release/{name}")),
+                .any(|word| word == format!("\"$build/{name}\"")),
             "the release layout does not copy {name}: {copy}"
         );
     }
