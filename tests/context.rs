@@ -567,7 +567,7 @@ fn a_backlog_starts_ranked_tasks_first_and_holds_only_unstarted_work() {
 #[test]
 fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
     let (_temp, mut s) = fleet();
-    for id in ["stale", "finished", "deferred"] {
+    for id in ["stale", "finished", "deferred", "parent", "ancient"] {
         dispatch(
             &mut s,
             "task.create",
@@ -575,7 +575,15 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
         )
         .unwrap();
     }
+    // An open parent is not stale while its open child is being worked.
+    dispatch(
+        &mut s,
+        "task.create",
+        json!({"id":"child","parent":"parent","owner":"infra","title":"Work on the child"}),
+    )
+    .unwrap();
     put(&mut s, "task:stale", "Doing: waiting for a review").unwrap();
+    put(&mut s, "task:ancient", "Doing: nothing lately").unwrap();
     dispatch(
         &mut s,
         "task.update",
@@ -600,7 +608,14 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
         .unwrap();
     // Age everything recorded about them; repair and cleanup stay fresh.
     let now = Store::now_ms();
-    for (id, days) in [("stale", 4), ("finished", 10), ("deferred", 10)] {
+    for (id, days) in [
+        ("stale", 4),
+        ("finished", 10),
+        ("deferred", 10),
+        ("parent", 10),
+        // Past the horizon the audit is not read and the age is not exact.
+        ("ancient", 40),
+    ] {
         let at = now - days * 86_400_000 - 60_000;
         s.connection()
             .execute(
@@ -618,13 +633,22 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
     let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
     let text = bearings["text"].as_str().unwrap();
     assert!(
-        text.contains("1 open task has had no update in 3 days or more: stale (4 d)."),
+        text.contains(
+            "2 open tasks have had no update in 3 days or more: ancient (30+ d), stale (4 d)."
+        ),
         "{text}"
     );
-    for other in ["finished (", "deferred (", "repair (", "cleanup ("] {
+    for other in [
+        "finished (",
+        "deferred (",
+        "parent (",
+        "child (",
+        "repair (",
+        "cleanup (",
+    ] {
         assert!(!text.contains(other), "{other}: {text}");
     }
-    assert_eq!(bearings["stale_tasks"], 1);
+    assert_eq!(bearings["stale_tasks"], 2);
     // The threshold is the ship's `first_mate.stale_task_days`.
     s.connection()
         .execute(
@@ -634,9 +658,12 @@ fn bearings_name_open_tasks_with_no_update_for_the_ships_days_oldest_first() {
         .unwrap();
     let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"infra"})).unwrap();
     assert!(
-        !bearings["text"].as_str().unwrap().contains("no update in"),
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 open task has had no update in 5 days or more: ancient (30+ d)."),
         "{}",
         bearings["text"]
     );
-    assert_eq!(bearings["stale_tasks"], 0);
+    assert_eq!(bearings["stale_tasks"], 1);
 }

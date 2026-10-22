@@ -133,17 +133,22 @@ listed. The design is in [the backlog alarm note](design/backlog-alarm.md).
 ## Stale open tasks
 
 An open task (open, running or blocked) with no update for the ship's
-`first_mate.stale_task_days` (default 3, `0` shows none) is a warning: the
+`first_mate.stale_task_days` (default 3, `0` shows none, at most 30) is a warning: the
 ship's bearings carry one line naming the oldest five with their age and any
 state besides open (`blocked`, `running`, `waiting` for a pinned wait), then
 how many more, and the bridge deck shows the count beside the ship. A task's
 update is the latest of what the store already records: its `task.*` audit
 rows (create, update, rank, defer, enqueue, handoff, accept), its job starts,
 its `task:<id>` and `assignment:<id>` notes, its pins, and its mail, crew
-reports included. A task with a live typed wait is left out, since the wait
-is its update, and so is the duty task. Nothing changes, blocks or mails on
-its own; a task whose audit history was pruned counts as having no recorded
-update.
+reports included. An open child on the same ship lends its updates to its
+open parent (one level), so a parent is not stale while its crew works. The
+audit and mail are read only for the last 30 days, through their time
+indexes, so the cost follows recent activity rather than all history; a task
+with nothing newer shows as `30+ d`. A task with a live typed wait is left
+out, since the wait is its update, and so is the duty task. Nothing changes,
+blocks or mails on its own. On the bridge deck the count is read last in each
+ship's read, and a failed or over-budget read shows no count rather than
+taking the ship off the deck.
 
 ## Context freshness and observation
 

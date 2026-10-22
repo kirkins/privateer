@@ -372,8 +372,6 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;
-    let stale_tasks = crate::stale_tasks::read(conn, ship, now)?.map(|s| s.total);
-    budget.check()?;
     let jobs_total: i64 = conn.query_row(&format!("SELECT COUNT(*) {}", live_jobs()), [], |r| {
         r.get(0)
     })?;
@@ -495,6 +493,12 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         }));
     }
     budget.check()?;
+    // Last, on what is left of the budget, and never fatal: a failed or
+    // over-budget warning reads null and leaves the ship on the deck.
+    let stale_tasks = crate::stale_tasks::read(conn, ship, now)
+        .ok()
+        .flatten()
+        .map(|s| s.total);
     drop(tx);
     Ok(json!({
         "name": ship, "liaison": crate::door::is_liaison(store.home()),
