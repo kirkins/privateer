@@ -425,7 +425,14 @@ def run(argv, control):
             with lock:
                 seen = state["seen_lines"]
             limit = startup_limit if seen == 0 else idle_limit
-            time.sleep(min(1.0, limit / 4))
+            tick = min(1.0, limit / 4)
+            # Wake as soon as claude exits, and give its reader up to a tick
+            # to drain the closed pipe, rather than sleeping a whole tick.
+            try:
+                child.wait(timeout=tick)
+                reader.join(timeout=tick)
+            except subprocess.TimeoutExpired:
+                pass
             now = time.monotonic()
             with lock:
                 if state["done"] or state["reason"]:
