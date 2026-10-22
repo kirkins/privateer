@@ -100,8 +100,10 @@ two-second clock slack the lookup uses, so a clear seen after the launch does
 not hide it and none falls between the two. Whichever way a refusal is found,
 if a card already held it (open, answered or ended), no new card is filed for
 it: an open card keeps it, and otherwise the footer counts as seen and the
-watch reads on from there with no card. Only a refusal no card ever held is
-filed, named. The card says "denied tool not identified" only
+watch reads on from there with no card. A card holds the refusals it names
+and every refusal that joined it while open: a retry its watch read refused
+again, or a later incident that joined it, though its card does not name
+them. Only a refusal no card ever held is filed, named. The card says "denied tool not identified" only
 when the transcript holds no refusal it can read.
 
 The same footer seen again is the same incident, so the screen raises nothing

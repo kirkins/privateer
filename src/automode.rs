@@ -322,7 +322,9 @@ fn alert_in(
                         .map(|(d, _, _)| d.clone())
                         .collect();
                     let ask = open.then_some(id.as_str());
-                    watch(store, ship, &incident, ask, false, scan.as_ref(), &held)?;
+                    // A new watch on it is held: the ask may hold refusals
+                    // this read does not show.
+                    watch(store, ship, &incident, ask, true, scan.as_ref(), &held)?;
                     outcome["asked"] = json!(id);
                 } else if blocking.is_empty() && !passed.is_empty() {
                     // The session is already past every refusal: nobody waits.
@@ -385,7 +387,8 @@ const PAST_ALREADY: &str = "the session got past every refusal it showed before 
 const ASKED_ALREADY: &str = "an ask already held every refusal the pane shows";
 
 /// The pane's ask that held a refusal, by its tool use, open ones first, and
-/// whether it is still open. None when no ask of the ship's ever held it.
+/// whether it is still open: one its card names, or one that joined it while
+/// open (`block_ask::hold_ids`). None when no ask of the ship's ever held it.
 fn held_by(store: &Store, ship: &str, denial: &Value) -> Result<Option<(String, bool)>> {
     let Some(id) = denial["tool_use_id"].as_str().filter(|id| !id.is_empty()) else {
         return Ok(None);
@@ -395,8 +398,10 @@ fn held_by(store: &Store, ship: &str, denial: &Value) -> Result<Option<(String, 
         .query_row(
             "SELECT id, state='open' FROM mail WHERE sender=?1 AND recipient='captain'
              AND json_extract(payload,'$.type')='tool_permission'
-             AND EXISTS(SELECT 1 FROM json_each(payload,'$.block.denials')
-                        WHERE json_extract(value,'$.tool_use_id')=?2)
+             AND (EXISTS(SELECT 1 FROM json_each(payload,'$.block.denials')
+                         WHERE json_extract(value,'$.tool_use_id')=?2)
+                  OR EXISTS(SELECT 1 FROM json_each(payload,'$.block.held_ids')
+                            WHERE value=?2))
              ORDER BY state='open' DESC, seq DESC LIMIT 1",
             params![ship, id],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -625,6 +630,8 @@ fn live(store: &Store, watch: &Watch) -> Result<bool> {
 struct ReadOn {
     next: u64,
     keys: Vec<Value>,
+    /// The tool use ids of the refusals read, which its open ask holds.
+    refused: Vec<String>,
     ask: Option<String>,
     held: bool,
     /// Whether the watch's incident still shows.
@@ -753,7 +760,13 @@ fn read_on(
             &mut pending,
         );
     }
-    let Some(Retried { found, next, whole }) = read else {
+    let Some(Retried {
+        found,
+        refused,
+        next,
+        whole,
+    }) = read
+    else {
         return Ok(None);
     };
     let entry = |keys: &mut Vec<Value>, key: &str, tool: &str| match keys
@@ -769,7 +782,8 @@ fn read_on(
     // In the order written, so a key's last result decides it. A refusal of
     // any call is kept with the ask's own: the ask cannot name it (its card
     // was raised for the refusals read then, as a joining incident's would
-    // be), but it is withdrawn only once the session is past that one too.
+    // be), but it holds it (`settle`), and is withdrawn only once the
+    // session is past that one too.
     for (key, tool, result) in found {
         let at = entry(&mut keys, &key, &tool);
         let k = &mut keys[at];
@@ -814,6 +828,7 @@ fn read_on(
     Ok(Some(ReadOn {
         next,
         keys,
+        refused,
         held: watch.held && ask.is_some(),
         ask: watch.ask.clone().filter(|_| ask.is_some()),
         live,
@@ -930,6 +945,7 @@ fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<Value>> {
     let ReadOn {
         next,
         keys,
+        refused,
         ask,
         held,
         live,
@@ -937,6 +953,17 @@ fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<Value>> {
     } = read;
     let ship = &watch.ship;
     let unchanged = || -> Result<bool> { Ok(watch_of(store, ship)?.as_ref() == Some(watch)) };
+    // The refusals read join the ask while it is still open: one answered
+    // since may have been answered before them.
+    let ids: Vec<&str> = refused.iter().map(String::as_str).collect();
+    let hold = |ask: Option<&str>| -> Result<()> {
+        match ask {
+            Some(ask) if !ids.is_empty() && open(store, ask)?.is_some() => {
+                block_ask::hold_ids(store, ask, &ids)
+            }
+            _ => Ok(()),
+        }
+    };
     let put = |ask: Option<&str>, held: bool, keys: &[Value]| -> Result<()> {
         store.connection().execute(
             "UPDATE hosted_automode_watches SET ask=?2, held=?3, offset=?4, keys=?5 WHERE ship=?1",
@@ -961,6 +988,7 @@ fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<Value>> {
                 if !unchanged()? || crate::claude_denials::written(transcript) != Some(next) {
                     return Ok(false);
                 }
+                hold(open["id"].as_str())?;
                 if live {
                     put(None, false, &after)?;
                 } else {
@@ -1016,9 +1044,10 @@ fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<Value>> {
         && serde_json::to_string(&keys)? == watch.keys
         && ask == watch.ask
         && held == watch.held;
-    if !same {
+    if !same || (ask.is_some() && !ids.is_empty()) {
         let tx = store.write_transaction()?;
         if unchanged()? {
+            hold(ask.as_deref())?;
             put(ask.as_deref(), held, &keys)?;
         }
         tx.commit()?;
@@ -3067,6 +3096,88 @@ mod tests {
             card["block"]["denials"][0]["preview"],
             block_ask::UNIDENTIFIED
         );
+    }
+
+    #[test]
+    fn a_relaunch_redrawing_a_retry_refused_while_its_card_was_open_raises_no_new_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        // The push is retried and refused again while its card is open,
+        // under the same footer: the watch keeps it with the card's own.
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_again", "2026-10-20T00:31:00.000Z")
+        });
+        still_open(&store, projects.path(), &id);
+        // The captain authorizes, and the woken pane redraws the footer of
+        // that retry, the newest refusal: nothing new.
+        store
+            .connection()
+            .execute("UPDATE mail SET state='answered' WHERE id=?1", [&id])
+            .unwrap();
+        relaunch(&store, 11);
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0]["asked"], id.as_str(), "{raised:?}");
+        assert!(raised[0]["ask"].is_null(), "{raised:?}");
+        assert_eq!(asks(&store), 1);
+        // The card still names only the refusal it was raised for.
+        assert_eq!(ask(&store)["block"]["denials"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_refusal_joined_to_an_open_card_by_another_raise_is_held_by_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let path = pane(&store, projects.path(), |n| n <= 3);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let (id, _) = open_card(&store);
+        // A later refusal joins the open card through a raise of its own,
+        // read by no watch of the card's.
+        store
+            .connection()
+            .execute("DELETE FROM hosted_automode_watches", [])
+            .unwrap();
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_again", "2026-10-20T00:31:00.000Z")
+        });
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let denial = crate::claude_denials::latest(&path, &folder)
+            .unwrap()
+            .denials
+            .remove(0);
+        assert_eq!(denial["tool_use_id"], "toolu_push_again");
+        let (records, more) = block_ask::records(&[denial], Some(&folder));
+        let duty = "privateer-automode-lockout";
+        let task = store.task(duty).unwrap();
+        let joined = block_ask::raise(
+            &store,
+            "privateer",
+            duty,
+            &task,
+            None,
+            "pane",
+            records,
+            more,
+        )
+        .unwrap();
+        assert_eq!(
+            (joined["ask"].as_str(), joined["duplicate"].as_bool()),
+            (Some(id.as_str()), Some(true))
+        );
+        // Answered, then woken: the redraw of that refusal is the card's.
+        store
+            .connection()
+            .execute("UPDATE mail SET state='answered' WHERE id=?1", [&id])
+            .unwrap();
+        relaunch(&store, 11);
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0]["asked"], id.as_str(), "{raised:?}");
+        assert_eq!(asks(&store), 1);
     }
 
     #[test]
