@@ -25,6 +25,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      # The shards, the dashboard smoke and the pilot run Python; pin it so a
+      # runner image change cannot move the interpreter under them.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
