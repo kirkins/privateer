@@ -2773,25 +2773,61 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-fn persist_reply(line: &[u8], path: &Path) -> Result<()> {
-    if let Ok(event) = serde_json::from_slice::<Value>(line)
-        && let Some(reply) = crate::reply::text(&event)
-    {
-        let bounded: String = reply.chars().take(16_000).collect();
-        let temporary = path.with_extension("reply.tmp");
-        let mut saved = OpenOptions::new()
+/// Beside the reply file: present while the saved reply ended its turn and
+/// nothing the model did has followed it, so a run that did not succeed can
+/// still trust it as a verdict. A reply said mid-turn, or one any later work
+/// followed, has none.
+pub(crate) const REPLY_ENDED: &str = "reply.ended";
+
+/// Save a completed reply event's text, and keep its `REPLY_ENDED` marker:
+/// set by a turn-ending reply, cleared by any later reply or work. `ended`
+/// tracks whether the marker is there.
+fn persist_reply(line: &[u8], path: &Path, ended: &mut bool) -> Result<()> {
+    let Ok(event) = serde_json::from_slice::<Value>(line) else {
+        return Ok(());
+    };
+    let Some(reply) = crate::reply::text(&event) else {
+        if !crate::crew_relaunch::bookkeeping(&event) {
+            reply_worked(path, ended)?;
+        }
+        return Ok(());
+    };
+    reply_worked(path, ended)?;
+    let bounded: String = reply.chars().take(16_000).collect();
+    let temporary = path.with_extension("reply.tmp");
+    let mut saved = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    saved.write_all(bounded.as_bytes())?;
+    saved.sync_all()?;
+    fs::rename(&temporary, path)?;
+    if crate::reply::ends_turn(&event) {
+        OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
-            .open(&temporary)?;
-        saved.write_all(bounded.as_bytes())?;
-        saved.sync_all()?;
-        fs::rename(&temporary, path)?;
-        OpenOptions::new()
-            .read(true)
-            .open(path.parent().context("reply has no parent")?)?
+            .open(path.with_file_name(REPLY_ENDED))?
             .sync_all()?;
+        *ended = true;
+    }
+    OpenOptions::new()
+        .read(true)
+        .open(path.parent().context("reply has no parent")?)?
+        .sync_all()?;
+    Ok(())
+}
+
+/// Something followed the saved reply: it no longer ends the run.
+fn reply_worked(path: &Path, ended: &mut bool) -> Result<()> {
+    if *ended {
+        match fs::remove_file(path.with_file_name(REPLY_ENDED)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => *ended = false,
+        }
     }
     Ok(())
 }
@@ -2830,6 +2866,7 @@ fn capture(
         let mut stopping_bytes = 0usize;
         let mut event_line = Vec::new();
         let mut dropping_line = false;
+        let mut reply_ended = false;
         loop {
             if stop.load(Ordering::Relaxed) && stopping_bytes >= 65536 {
                 break;
@@ -2841,7 +2878,7 @@ fn capture(
                         for byte in &buf[..n] {
                             if *byte == b'\n' {
                                 if !dropping_line {
-                                    persist_reply(&event_line, reply_path)?;
+                                    persist_reply(&event_line, reply_path, &mut reply_ended)?;
                                 }
                                 event_line.clear();
                                 dropping_line = false;
@@ -2849,8 +2886,11 @@ fn capture(
                                 if event_line.len() < 1_048_576 {
                                     event_line.push(*byte);
                                 } else {
+                                    // A line too long to read is work, as
+                                    // far as a saved reply can tell.
                                     event_line.clear();
                                     dropping_line = true;
+                                    reply_worked(reply_path, &mut reply_ended)?;
                                 }
                             }
                         }
@@ -2900,7 +2940,7 @@ fn capture(
             && !dropping_line
             && !event_line.is_empty()
         {
-            persist_reply(&event_line, reply_path)?;
+            persist_reply(&event_line, reply_path, &mut reply_ended)?;
         }
         file.sync_all()?;
         Ok(dropped)
@@ -3046,19 +3086,87 @@ mod reply_capture_tests {
         let temp = tempfile::tempdir().unwrap();
         let sidecar = temp.path().join("reply");
         let progress = br#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"progress"}],"stopReason":"toolUse"}}"#;
-        persist_reply(progress, &sidecar).unwrap();
+        let mut ended = false;
+        persist_reply(progress, &sidecar, &mut ended).unwrap();
         assert!(!sidecar.exists());
         let final_reply = br#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"final verdict"}],"stopReason":"stop"}}"#;
-        persist_reply(final_reply, &sidecar).unwrap();
-        assert_eq!(fs::read_to_string(sidecar).unwrap(), "final verdict");
+        persist_reply(final_reply, &sidecar, &mut ended).unwrap();
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), "final verdict");
+        assert!(ended && temp.path().join(REPLY_ENDED).exists());
     }
 
     #[test]
     fn stream_without_a_completed_reply_does_not_create_a_verdict() {
         let temp = tempfile::tempdir().unwrap();
         let sidecar = temp.path().join("reply");
-        persist_reply(br#"{"type":"agent_settled","aborted":false}"#, &sidecar).unwrap();
+        persist_reply(
+            br#"{"type":"agent_settled","aborted":false}"#,
+            &sidecar,
+            &mut false,
+        )
+        .unwrap();
         assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn a_saved_reply_is_marked_ended_only_while_nothing_follows_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("reply");
+        let marker = temp.path().join(REPLY_ENDED);
+        let mut ended = false;
+        let mut feed = |line: &str| persist_reply(line.as_bytes(), &sidecar, &mut ended).unwrap();
+
+        // Codex says something before a tool call: saved, never marked.
+        feed(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Let me run the tests first."}}"#,
+        );
+        assert!(sidecar.exists() && !marker.exists());
+
+        // Claude's first turn ends with a progress result, then works on.
+        feed(
+            r#"{"type":"result","is_error":false,"result":"Started the check in the background."}"#,
+        );
+        assert!(marker.exists());
+        feed(r#"{"type":"rate_limit_event"}"#);
+        assert!(marker.exists(), "bookkeeping is not work");
+        feed(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#);
+        assert!(!marker.exists(), "work followed the first turn's result");
+        assert_eq!(
+            fs::read_to_string(&sidecar).unwrap(),
+            "Started the check in the background."
+        );
+
+        // The last turn's result, then only the wrapper's own lines.
+        feed(r#"{"type":"result","is_error":false,"result":"verdict"}"#);
+        feed(r#"{"type":"native.turn.failed","harness":"claude","native_exit_code":0}"#);
+        feed(r#"{"type":"native.permission_blocked","denials":[],"denied":1}"#);
+        assert!(marker.exists());
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), "verdict");
+    }
+
+    #[test]
+    fn a_line_too_long_to_read_unmarks_the_saved_reply() {
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let reader = capture(
+            reader,
+            temp.path().join("stdout.log"),
+            Some(temp.path().join("reply")),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        writer
+            .write_all(b"{\"type\":\"result\",\"result\":\"Started.\"}\n")
+            .unwrap();
+        writer.write_all(&vec![b'x'; 1_100_000]).unwrap();
+        writer.write_all(b"\n").unwrap();
+        drop(writer);
+        reader.join().unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("reply")).unwrap(),
+            "Started."
+        );
+        assert!(!temp.path().join(REPLY_ENDED).exists());
     }
 
     #[test]

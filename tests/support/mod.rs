@@ -168,6 +168,41 @@ if errand:
             "result": "API Error: 400 invalid_request_error"}), flush=True)
         print(json.dumps({"type": "native.turn.failed", "harness": "claude", "native_exit_code": 1}), flush=True)
         sys.exit(2)
+    if mode == "errand-multiturn":
+        # Claude's first turn ends with a progress result, its second works and
+        # then stalls: the first result is not the verdict.
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result_index": 1,
+            "result": "Started the check in the background, I'll report when it finishes."}), flush=True)
+        print(json.dumps({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}}]}}), flush=True)
+        print(json.dumps({"type": "native.turn.failed", "harness": "claude", "reason": "stalled"}), flush=True)
+        sys.exit(2)
+    if mode == "errand-midturn-cut":
+        # A Codex message said mid-turn, past the log's kept head, then more
+        # output than its tail keeps: only the reply file still has it.
+        work = json.dumps({"type": "item.completed", "item": {"type": "command_execution",
+            "aggregated_output": "x" * 4000}})
+        for _ in range(80):
+            print(work)
+        print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+            "text": "Let me run the tests first."}}), flush=True)
+        for _ in range(320):
+            print(work)
+        print(json.dumps({"type": "turn.failed", "error": {"message": "stream disconnected"}}), flush=True)
+        sys.exit(1)
+    if mode == "errand-blocked-cut":
+        # Claude's whole result is longer than the log's tail keeps, then a
+        # tool denial: only the reply file holds the verdict.
+        work = json.dumps({"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "x" * 4000}]}})
+        for _ in range(80):
+            print(work)
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+            "result": verdict + "\n" + "y" * 900000}), flush=True)
+        print(json.dumps({"type": "native.turn.failed", "harness": "claude", "native_exit_code": 0}), flush=True)
+        print(json.dumps({"type": "native.permission_blocked", "denials": [{"tool_name": "Bash",
+            "tool_input": {"command": "cargo test"}}], "denied": 1}), flush=True)
+        sys.exit(2)
     if mode == "errand-midturn":
         # A Codex message said before a tool call, then the turn failed.
         print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",

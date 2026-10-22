@@ -43,7 +43,7 @@ const CURSOR: &str = "crew_relaunch_scanned_ms";
 /// finished step is output, and so is any shape this reader cannot place:
 /// a run is only ever shown empty by the shapes it knows, never assumed
 /// empty from ones it does not.
-fn bookkeeping(event: &Value) -> bool {
+pub(crate) fn bookkeeping(event: &Value) -> bool {
     if event["event"].is_string() {
         // AGY keeps its kinds under `event`; only its session start is
         // bookkeeping.

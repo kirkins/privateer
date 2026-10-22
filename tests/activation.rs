@@ -1639,6 +1639,35 @@ fn an_errand_whose_turn_failed_after_a_full_reply_delivers_it_as_unconfirmed() {
     assert!(body.contains("failed without a verdict"), "{mail}");
     assert_eq!(mail["urgency"], "high", "{mail}");
 
+    // A Claude run ends more than one turn: the first turn's progress
+    // result, followed by the second's work, is not the verdict.
+    let (_, settled, mail) = errand(&mut fleet, "errand-multiturn", "thread:multiturn");
+    assert_eq!(settled["status"], "failed", "{settled}");
+    let body = mail["body"].as_str().unwrap();
+    assert!(body.contains("failed without a verdict"), "{mail}");
+    assert!(!body.contains("Started the check"), "{mail}");
+    assert_eq!(mail["urgency"], "high", "{mail}");
+
+    // Nor is a mid-turn Codex message the reply file kept once the log's
+    // middle, where it was said, is dropped.
+    let (_, _, mail) = errand(&mut fleet, "errand-midturn-cut", "thread:midturn-cut");
+    let body = mail["body"].as_str().unwrap();
+    assert!(body.contains("failed without a verdict"), "{mail}");
+    assert!(!body.contains("Let me run the tests"), "{mail}");
+    assert_eq!(mail["urgency"], "high", "{mail}");
+
+    // A whole Claude result the log cut is still delivered from the reply file.
+    let (id, settled, mail) = errand(&mut fleet, "errand-blocked-cut", "thread:blocked-cut");
+    assert_eq!(settled["status"], "failed", "{settled}");
+    assert!(
+        mail["body"].as_str().unwrap().starts_with(&format!(
+            "Errand on thread:blocked-cut, verdict (unconfirmed; the run ended: permission blocked):\nReviewed: {id}. Brief seen: True\n"
+        )),
+        "{}",
+        &mail["body"].as_str().unwrap()[..300]
+    );
+    assert_eq!(mail["urgency"], "normal", "{}", mail["urgency"]);
+
     // A run with no reply at all keeps saying so.
     let (_, _, mail) = errand(&mut fleet, "fail", "thread:silent");
     let body = mail["body"].as_str().unwrap();

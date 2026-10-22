@@ -345,12 +345,18 @@ pub(crate) fn start_review(store: &mut Store, launch: &ReviewLaunch) -> Result<(
 
 /// The last assistant reply in a harness's JSON event log: Pi-family
 /// `message_end`, Codex `agent_message` items and Claude's `result`.
-/// Returned with whether it also ended its turn.
+/// Returned with whether it ended its turn and nothing the model did followed
+/// it: a Claude run may end several turns, and an earlier turn's result is not
+/// the run's verdict once later work follows it.
 pub(crate) fn last_reply(log: &str) -> Option<(String, bool)> {
     let mut reply = None;
     for event in crate::reply::events(log) {
         if let Some(text) = crate::reply::text(&event) {
             reply = Some((text, crate::reply::ends_turn(&event)));
+        } else if let Some((_, ended)) = &mut reply
+            && !crate::crew_relaunch::bookkeeping(&event)
+        {
+            *ended = false;
         }
     }
     reply
@@ -460,14 +466,21 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         let saved = std::fs::read_to_string(logs.join("reply"))
             .ok()
             .filter(|reply| !reply.is_empty());
-        let reply = match (status, last_reply(&log)) {
-            ("succeeded", last) => saved.or(last.map(|(text, _)| text)),
-            // A run that did not succeed may have stopped mid-turn: its reply
-            // is a verdict only when the last one its log shows ended a turn,
-            // or the log kept none and the reply file holds one.
-            (_, Some((text, true))) => saved.or(Some(text)),
-            (_, Some((_, false))) => None,
-            (_, None) => saved,
+        let reply = if status == "succeeded" {
+            saved.or_else(|| last_reply(&log).map(|(text, _)| text))
+        } else {
+            // A run that did not succeed may have stopped mid-turn, or gone on
+            // to another turn: its reply is a verdict only when it ended a turn
+            // and nothing the model did followed it. The reply file's marker
+            // says so from the whole stream; the log, whose middle may be
+            // dropped, is read only when there is no marked reply.
+            saved
+                .filter(|_| logs.join(crate::jobs::REPLY_ENDED).exists())
+                .or_else(|| {
+                    last_reply(&log)
+                        .filter(|(_, ended)| *ended)
+                        .map(|(text, _)| text)
+                })
         };
         let outcome = if status == "succeeded" && reply.is_some() {
             "succeeded"
@@ -673,6 +686,35 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_earlier_turns_result_is_not_the_last_reply_once_work_follows_it() {
+        let log = [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"result","is_error":false,"result":"Started the check in the background, I'll report when it finishes."}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
+            r#"{"type":"native.turn.failed","harness":"claude","reason":"stalled"}"#,
+        ]
+        .join("\n");
+        let (text, ended) = last_reply(&log).unwrap();
+        assert!(text.starts_with("Started the check"));
+        assert!(!ended);
+        // Only the wrapper's own lines after the result leave it the verdict.
+        let blocked = [
+            r#"{"type":"result","is_error":false,"result":"verdict"}"#,
+            r#"{"type":"native.turn.failed","harness":"claude","native_exit_code":0}"#,
+            r#"{"type":"native.permission_blocked","denials":[],"denied":1}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_reply(&blocked), Some(("verdict".to_owned(), true)));
+        // A dropped middle may have held work: a reply before it is not final.
+        let cut = format!(
+            "{}\n{}\n{{\"type\":\"native.turn.failed\"}}",
+            r#"{"type":"result","is_error":false,"result":"verdict"}"#,
+            r#"{"type":"privateer.log.truncated","dropped_bytes":900000}"#
+        );
+        assert_eq!(last_reply(&cut), Some(("verdict".to_owned(), false)));
+    }
 
     #[test]
     fn a_run_ending_names_how_its_turn_ended() {
