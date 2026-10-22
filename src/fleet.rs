@@ -408,13 +408,12 @@ pub(crate) fn create_for_machine(conn: &Connection, from: &str, args: &Value) ->
     let creator = (created_by != "captain").then(|| created_by.to_owned());
     // The gateway is reached over SSH, where this process's PATH is bare;
     // the unit records the login shell's, as a move's dispatcher does.
-    create_here(
-        &mut store,
-        &args,
-        None,
-        creator,
-        Some(crate::service::login_path()),
-    )
+    let (path, why) = crate::service::login_path_to_record();
+    let mut made = create_here(&mut store, &args, None, creator, Some(path))?;
+    if let Some(why) = why {
+        made["login_shell"] = json!(why);
+    }
+    Ok(made)
 }
 
 /// Create a ship in this machine's fleet. `template` lends the new ship its

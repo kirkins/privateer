@@ -21,7 +21,7 @@
 //! runtime.needs, the machine owner's alerts and the ship's bearings read.
 //! Readiness reports; it never refuses anything itself.
 use crate::store::Store;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -94,7 +94,8 @@ enum Probe {
     Git,
     /// `--version` at or above the floor, and `get --help` naming the flags.
     Treehouse,
-    /// Runs with this flag, its version kept when it prints one.
+    /// Runs with this flag and exits 0; a version it prints on standard
+    /// output is kept. Standard error is not read, so ssh's is never kept.
     Version(&'static str),
     /// On PATH, nothing run.
     Presence,
@@ -271,7 +272,8 @@ fn needed_from(
         needs.add(Need {
             tool: "ssh".into(),
             binary: ssh.into(),
-            // OpenSSH has no --version.
+            // OpenSSH has no --version; `-V` prints on standard error, so
+            // the probe only sees that it runs.
             probe: Probe::Version("-V"),
             block: false,
             needed_by: links.iter().map(|m| format!("{LINKED}{m}")).collect(),
@@ -289,7 +291,7 @@ fn needed_from(
 }
 
 /// What one probe found.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Outcome {
     ok: bool,
     version: Option<String>,
@@ -634,9 +636,10 @@ impl Checker {
     /// Collect a finished check, start one when due, and report the stored
     /// rows. Null when there is nothing new to say.
     fn tick(&self, store: &Store, path: &str, start: bool) -> Value {
-        let (Ok(mut last), Ok(mut running)) = (self.last.lock(), self.running.lock()) else {
-            return Value::Null;
-        };
+        // A panic while either was held leaves nothing half-written: each
+        // is one value, so a poisoned lock is taken as it stands.
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let checked = match running.take() {
             Some(handle) if handle.is_finished() => Some(
                 handle
@@ -1002,13 +1005,17 @@ fn machine_report_with(
     let mut seen: Vec<&PathBuf> = vec![];
     let mut reports = vec![];
     let mut merged: Vec<Row> = vec![];
-    let mut deadline = None;
+    let mut live = Live {
+        deadline: None,
+        budget,
+        probed: vec![],
+    };
     for home in homes {
         if seen.contains(&home) || !home.join("privateer.sqlite").is_file() {
             continue;
         }
         seen.push(home);
-        match home_rows(home, needs, path, &mut deadline, budget) {
+        match home_rows(home, needs, path, &mut live) {
             Ok((source, rows)) => {
                 let tools: Vec<&str> = rows.iter().map(|row| row.tool.as_str()).collect();
                 reports.push(json!({"home": home, "source": source, "failing": tools}));
@@ -1031,14 +1038,23 @@ fn machine_report_with(
     json!({"machine": crate::machines::this_machine(), "homes": reports, "failing": failing})
 }
 
-/// One home's failing rows, and whether they are its stored ones or were
-/// checked live because they were missing or older than their TTL.
+/// What the live checks of one report share: one deadline, set by the
+/// first, and each probe's outcome, so a tool several homes need on the same
+/// PATH is probed once.
+struct Live {
+    deadline: Option<Instant>,
+    budget: Duration,
+    probed: Vec<((String, PathBuf, Probe), Outcome)>,
+}
+
+/// One home's failing rows, and whether they are its stored ones, were
+/// checked live because they were missing or older than their TTL, or were
+/// left unchecked because the report's time ran out before this home.
 fn home_rows(
     home: &Path,
     needs: NeedsOf,
     path: &dyn Fn() -> String,
-    deadline: &mut Option<Instant>,
-    budget: Duration,
+    live: &mut Live,
 ) -> Result<(&'static str, Vec<Row>)> {
     let store = Store::open_readonly(home, crate::store::Caller::Operator)?;
     let needs = needs(&store)?;
@@ -1059,19 +1075,60 @@ fn home_rows(
     if fresh {
         return Ok(("stored", failing(conn)?));
     }
+    // Past the shared deadline every probe would be cut short at once, which
+    // says nothing about this home's tools.
+    if live
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Ok(("unchecked", vec![]));
+    }
     let path = path();
-    let deadline = *deadline.get_or_insert_with(|| Instant::now() + budget);
+    let budget = live.budget;
+    let deadline = *live.deadline.get_or_insert_with(|| Instant::now() + budget);
     let resolved: Vec<(&Need, Option<PathBuf>)> = needs
         .tools
         .iter()
         .map(|need| (need, resolve(&need.binary, &path)))
         .collect();
+    let known = |need: &Need, found: &Option<PathBuf>| {
+        let found = found.as_ref()?;
+        live.probed
+            .iter()
+            .find(|((tool, program, probe), _)| {
+                *tool == need.tool && program == found && *probe == need.probe
+            })
+            .map(|(_, outcome)| outcome.clone())
+    };
+    let cached: Vec<Option<Outcome>> = resolved
+        .iter()
+        .map(|(need, found)| known(need, found))
+        .collect();
     let probes: Vec<(&Need, Option<&Path>)> = resolved
         .iter()
-        .map(|(need, found)| (*need, found.as_deref()))
+        .zip(&cached)
+        .filter(|(_, cached)| cached.is_none())
+        .map(|((need, found), _)| (*need, found.as_deref()))
         .collect();
     // `path` already holds the login shell's PATH, so it is not asked again.
-    let outcomes = run_all(&probes, &path, None, deadline);
+    let mut fresh = run_all(&probes, &path, None, deadline).into_iter();
+    let mut outcomes = vec![];
+    for ((need, found), cached) in resolved.iter().zip(cached) {
+        let outcome = match cached {
+            Some(outcome) => outcome,
+            None => {
+                let outcome = fresh.next().context("a probe gave no outcome")?;
+                if let Some(found) = found {
+                    live.probed.push((
+                        (need.tool.clone(), found.clone(), need.probe),
+                        outcome.clone(),
+                    ));
+                }
+                outcome
+            }
+        };
+        outcomes.push(outcome);
+    }
     let mut rows: Vec<Row> = needs
         .tools
         .iter()
@@ -1167,9 +1224,16 @@ pub(crate) fn linked_summary(report: &Value) -> Value {
     if unread > 0 {
         parts.push(format!("{unread} of its homes could not be read"));
     }
+    let unchecked = homes
+        .iter()
+        .filter(|home| home["source"] == "unchecked")
+        .count();
+    if unchecked > 0 {
+        parts.push(format!("{unchecked} of its homes were not checked in time"));
+    }
     let status = if !failing.is_empty() {
         "failing"
-    } else if unread > 0 || homes.is_empty() {
+    } else if unread > 0 || unchecked > 0 || homes.is_empty() {
         "unknown"
     } else {
         "ready"
@@ -1184,10 +1248,20 @@ pub(crate) fn linked_summary(report: &Value) -> Value {
 }
 
 /// The same when the linked machine could not say: too old to know
-/// `machine.readiness`, or unreachable for it.
+/// `machine.readiness`, or unreachable for it. `why` may carry the remote's
+/// whole standard error, so only its start is kept.
 pub(crate) fn linked_unknown(why: &str) -> Value {
+    let why = why.trim();
+    let why = if why.chars().count() > UNKNOWN_CHARS {
+        format!("{}…", why.chars().take(UNKNOWN_CHARS).collect::<String>())
+    } else {
+        why.to_owned()
+    };
     json!({"status": "unknown", "failing": [], "summary": format!("readiness: unknown ({why})")})
 }
+
+/// The most of a linked machine's error a summary keeps.
+const UNKNOWN_CHARS: usize = 300;
 
 #[cfg(test)]
 mod tests {
@@ -1918,6 +1992,28 @@ mod tests {
     }
 
     #[test]
+    fn a_poisoned_checker_still_reports_and_checks() {
+        let m = Machine::new();
+        m.tool("git", "echo 'git version 2.20.0'");
+        m.check();
+        let checker = Checker::new(Duration::ZERO, unlinked);
+        // A panic while the lock was held poisons it.
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _held = checker.last.lock().unwrap();
+                    panic!("poison the lock");
+                })
+                .join();
+        });
+        assert!(checker.last.is_poisoned());
+        let report = checker.tick(&m.store, &m.path(), true);
+        assert_eq!(report["started"], true, "{report}");
+        assert_eq!(report["failing"][0]["tool"], "git", "{report}");
+        finished(&checker, &m);
+    }
+
+    #[test]
     fn a_one_pass_dispatcher_reports_stored_rows_without_starting_a_check() {
         let m = Machine::new();
         m.tool("git", "echo 'git version 2.20.0'");
@@ -1950,19 +2046,24 @@ mod tests {
         let shell = shell.to_string_lossy().into_owned();
         let bound = Duration::from_secs(1);
         let begun = Instant::now();
-        let path = crate::service::login_path_from(Some(&shell), Instant::now() + bound);
+        let (path, why) = crate::service::login_path_from(Some(&shell), Instant::now() + bound);
         assert!(
             begun.elapsed() < Duration::from_secs(3),
             "the login shell held the lookup {:?}",
             begun.elapsed()
         );
+        assert_eq!(why.as_deref(), Some("the login shell timed out"));
         // Only this process's PATH is left.
-        assert_eq!(path, crate::service::login_path_from(None, Instant::now()));
-        // The shell and what it started were killed.
+        assert_eq!(
+            path,
+            crate::service::login_path_from(None, Instant::now()).0
+        );
+        // The shell and what it started were killed. An orphan is reaped by
+        // whatever adopted it, which may be slow to: a zombie is dead.
         for pid in std::fs::read_to_string(&pids).unwrap().split_whitespace() {
-            let pid: libc::pid_t = pid.parse().unwrap();
+            let pid: u32 = pid.parse().unwrap();
             let until = Instant::now() + Duration::from_secs(3);
-            while unsafe { libc::kill(pid, 0) } == 0 {
+            while crate::jobs::process_identity(pid).unwrap().is_some() {
                 assert!(Instant::now() < until, "{pid} outlived its deadline");
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -1973,7 +2074,7 @@ mod tests {
         let needs = needed_from(&m.store, None, &[], "ssh").unwrap();
         let begun = Instant::now();
         check_with(&m.store, &m.path(), true, &needs, &|| {
-            crate::service::login_path_from(Some(&shell), Instant::now() + bound)
+            crate::service::login_path_from(Some(&shell), Instant::now() + bound).0
         })
         .unwrap();
         assert!(begun.elapsed() < Duration::from_secs(3));
@@ -2142,6 +2243,50 @@ mod tests {
     }
 
     #[test]
+    fn homes_after_the_reports_deadline_read_unchecked_not_failing() {
+        let m = Machine::new();
+        m.tool("git", "/bin/sleep 2; echo 'git version 2.43.0'");
+        let other = Machine::new();
+        let homes = [m.root.join("home"), other.root.join("home")];
+        let path = m.path();
+        let report = machine_report_with(
+            &homes,
+            &|store: &Store| needed_from(store, None, &[], "ssh"),
+            &|| path.clone(),
+            Duration::from_millis(300),
+        );
+        assert_eq!(report["homes"][0]["source"], "live", "{report}");
+        assert_eq!(report["homes"][1]["source"], "unchecked", "{report}");
+        assert_eq!(report["homes"][1]["failing"], json!([]), "{report}");
+        // Only the first home's probe, cut short, fails.
+        assert_eq!(report["homes"][0]["failing"], json!(["git"]), "{report}");
+        let unread = linked_summary(&json!({"homes": [{"home": "/h", "source": "unchecked",
+            "failing": []}], "failing": []}));
+        assert_eq!(unread["status"], "unknown", "{unread}");
+        assert_eq!(
+            unread["summary"],
+            "readiness: unknown (1 of its homes were not checked in time)"
+        );
+    }
+
+    #[test]
+    fn a_tool_several_homes_need_is_probed_once_per_report() {
+        let m = Machine::new();
+        let other = Machine::new();
+        let homes = [m.root.join("home"), other.root.join("home")];
+        let path = m.path();
+        let report = machine_report_with(
+            &homes,
+            &|store: &Store| needed_from(store, None, &[], "ssh"),
+            &|| path.clone(),
+            Duration::from_secs(10),
+        );
+        assert_eq!(report["homes"][0]["source"], "live", "{report}");
+        assert_eq!(report["homes"][1]["source"], "live", "{report}");
+        assert_eq!(m.calls("git"), 1, "{report}");
+    }
+
+    #[test]
     fn a_linked_machines_report_is_summarized_with_its_install_steps() {
         let m = Machine::new();
         m.git_charter("storefront");
@@ -2170,6 +2315,18 @@ mod tests {
             linked_unknown("remote is older")["summary"],
             "readiness: unknown (remote is older)"
         );
+        // A remote's whole standard error is cut to its start.
+        let long = format!("ssh: connect failed\n{}", "x".repeat(65_536));
+        let summary = linked_unknown(&long)["summary"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            summary.starts_with("readiness: unknown (ssh: connect failed\nxx"),
+            "{summary}"
+        );
+        assert!(summary.ends_with("…)"), "{summary}");
+        assert!(summary.chars().count() < 400, "{}", summary.len());
     }
 
     #[test]

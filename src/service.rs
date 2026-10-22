@@ -337,10 +337,14 @@ fn started(service: &Service, home: &Path) -> Result<String> {
 /// login shell's, since a gateway reached over SSH has a bare PATH that
 /// would not find the harness.
 pub(crate) fn login_path() -> String {
-    login_path_from(
-        std::env::var("SHELL").ok().as_deref(),
-        std::time::Instant::now() + LOGIN_TIMEOUT,
-    )
+    login_path_by(std::time::Instant::now() + LOGIN_TIMEOUT)
+}
+
+/// `login_path`, with the login shell stopped by `deadline` if that is
+/// sooner than its own timeout: a check with a budget passes its deadline.
+pub(crate) fn login_path_by(deadline: std::time::Instant) -> String {
+    let own = std::time::Instant::now() + LOGIN_TIMEOUT;
+    login_path_from(std::env::var("SHELL").ok().as_deref(), deadline.min(own)).0
 }
 
 /// How long a login shell may take to print its PATH, the same as a
@@ -348,28 +352,61 @@ pub(crate) fn login_path() -> String {
 /// a dispatcher pass, a move or an install.
 const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `login_path` for a dispatcher unit that keeps it: a ship made for a
+/// linked machine, or a move's arrival. A PATH missing the login shell's
+/// entries stays with the unit, so the shell gets longer, and when it times
+/// out the second value says so, for the reply to show.
+pub(crate) fn login_path_to_record() -> (String, Option<String>) {
+    let (path, why) = login_path_from(
+        std::env::var("SHELL").ok().as_deref(),
+        std::time::Instant::now() + RECORD_TIMEOUT,
+    );
+    let why = why.map(|why| {
+        format!(
+            "{why} after {} s, so the dispatcher records only this process's PATH, which \
+             may not find the harness; run `privateer service start` from a login shell \
+             once it answers",
+            RECORD_TIMEOUT.as_secs()
+        )
+    });
+    (path, why)
+}
+
+/// How long a login shell may take when its PATH is kept: inside the 30 s a
+/// linked machine waits for a ship to be made there.
+const RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// `login_path` with `shell` as the login shell, which is killed with all it
-/// started at `deadline`; then only this process's PATH is used.
-pub(crate) fn login_path_from(shell: Option<&str>, deadline: std::time::Instant) -> String {
+/// started at `deadline`; then only this process's PATH is used, and the
+/// second value is "the login shell timed out".
+pub(crate) fn login_path_from(
+    shell: Option<&str>,
+    deadline: std::time::Instant,
+) -> (String, Option<String>) {
     let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    let login = shell
-        .filter(|shell| shell.starts_with('/'))
-        .and_then(|shell| {
-            let mut command = Command::new(shell);
-            command.args(["-lc", &format!("printf '%s%s\\n' '{PATH_MARK}' \"$PATH\"")]);
-            crate::capabilities::run_bounded(command, "the login shell", deadline, true).ok()
-        })
+    let ran = shell.filter(|shell| shell.starts_with('/')).map(|shell| {
+        let mut command = Command::new(shell);
+        command.args(["-lc", &format!("printf '%s%s\\n' '{PATH_MARK}' \"$PATH\"")]);
+        crate::capabilities::run_bounded(command, "the login shell", deadline, true)
+    });
+    let timed_out = matches!(&ran, Some(Err(why)) if why == crate::capabilities::TIMED_OUT);
+    let login = ran
+        .and_then(std::result::Result::ok)
         .and_then(|output| marked_path(&output));
     for entry in login.iter().flat_map(std::env::split_paths) {
         if !entries.contains(&entry) {
             entries.push(entry);
         }
     }
-    std::env::join_paths(entries)
+    let path = std::env::join_paths(entries)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (
+        path,
+        timed_out.then(|| "the login shell timed out".to_owned()),
+    )
 }
 
 /// Printed just before the login shell's PATH, so text an rc file prints
@@ -637,28 +674,60 @@ fn capitalized(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
+
+    /// Write an executable script, and wait until it can run: a test on
+    /// another thread that forks while it is open for writing holds it
+    /// busy (ETXTBSY) until that child execs. A spawn that starts proves no
+    /// writer is left; it is killed with what it started.
+    fn script(file: &std::path::Path, body: &str) -> String {
+        std::fs::write(file, body).unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(file)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+            {
+                Ok(mut child) => {
+                    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                    let _ = child.wait();
+                    break;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    assert!(Instant::now() < until, "{} stayed busy", file.display());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{}: {error}", file.display()),
+            }
+        }
+        file.to_string_lossy().into_owned()
+    }
 
     /// A login shell whose rc file prints a banner before running the
     /// command, as many server images do.
     fn shell_printing(dir: &std::path::Path, banner: &str, path: &str) -> String {
-        let shell = dir.join("shell");
-        std::fs::write(
-            &shell,
+        script(
+            &dir.join("shell"),
             // `-c` alone, not `-lc`: a profile that resets PATH must not
             // decide this test.
-            format!("#!/bin/sh\nprintf '%s\\n' '{banner}'\nPATH='{path}' exec /bin/sh -c \"$2\"\n"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{banner}'\nPATH='{path}' exec /bin/sh -c \"$2\"\n"
+            ),
         )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        shell.to_string_lossy().into_owned()
     }
 
     #[test]
     fn a_login_shell_banner_never_becomes_path_entries() {
         let dir = tempfile::tempdir().unwrap();
         let shell = shell_printing(dir.path(), "Welcome to: the server", "/opt/login/bin");
-        let path = super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        assert_eq!(why, None);
         let entries: Vec<_> = std::env::split_paths(&path).collect();
         assert!(
             entries.contains(&std::path::PathBuf::from("/opt/login/bin")),
@@ -671,21 +740,54 @@ mod tests {
     #[test]
     fn text_printed_after_the_command_never_joins_the_last_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let shell = dir.path().join("shell");
-        std::fs::write(
-            &shell,
+        let shell = script(
+            &dir.path().join("shell"),
             "#!/bin/sh\nPATH='/opt/login/bin' exec /bin/sh -c \"trap 'echo bye' EXIT; $2\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let shell = shell.to_string_lossy().into_owned();
-        let path = super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        );
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        assert_eq!(why, None);
         let entries: Vec<_> = std::env::split_paths(&path).collect();
         assert!(
             entries.contains(&std::path::PathBuf::from("/opt/login/bin")),
             "{path}"
         );
         assert!(!path.contains("bye"), "{path}");
+    }
+
+    #[test]
+    fn a_login_shell_slower_than_a_probe_is_waited_for_until_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        // An rc file that takes longer than a capability probe may.
+        let shell = script(
+            &dir.path().join("shell"),
+            "#!/bin/sh\nsleep 6\nPATH='/opt/slow/bin' exec /bin/sh -c \"$2\"\n",
+        );
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(20));
+        assert_eq!(why, None, "{path}");
+        let entries: Vec<_> = std::env::split_paths(&path).collect();
+        assert!(
+            entries.contains(&std::path::PathBuf::from("/opt/slow/bin")),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn a_login_shell_past_its_deadline_says_it_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = script(&dir.path().join("shell"), "#!/bin/sh\nexec sleep 30\n");
+        let begun = Instant::now();
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_millis(300));
+        assert!(begun.elapsed() < Duration::from_secs(3));
+        assert_eq!(why.as_deref(), Some("the login shell timed out"));
+        assert_eq!(path, super::login_path_from(None, Instant::now()).0);
+        // A shell that fails rather than hangs is no timeout.
+        let shell = script(&dir.path().join("failing"), "#!/bin/sh\nexit 1\n");
+        let (_, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        assert_eq!(why, None);
     }
 
     #[test]

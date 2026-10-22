@@ -678,7 +678,8 @@ fn begin(args: &Value) -> Result<Value> {
     if let Some((_, detail)) = row(&conn, id, "import")? {
         return Ok(json!({"folder": detail["folder"]}));
     }
-    let path = crate::service::login_path();
+    // Kept as the arriving dispatcher's PATH, so its login shell gets longer.
+    let (path, login_shell) = crate::service::login_path_to_record();
     let problems = hosting_problems(
         &conn,
         ship,
@@ -732,7 +733,8 @@ fn begin(args: &Value) -> Result<Value> {
         "import",
         ship,
         "receiving",
-        &json!({"manifest": manifest, "folder": folder, "path": path}),
+        &json!({"manifest": manifest, "folder": folder, "path": path,
+            "login_shell": login_shell}),
     )?;
     Ok(json!({"folder": folder}))
 }
@@ -1076,8 +1078,11 @@ fn activate(args: &Value) -> Result<Value> {
     let dispatcher =
         crate::service::ensure_with_path(&home, &ship, detail["path"].as_str().unwrap_or(""))
             .unwrap_or_else(|error| format!("not started: {error:#}"));
-    let result = json!({"ship": ship, "folder": folder, "dispatcher": dispatcher,
+    let mut result = json!({"ship": ship, "folder": folder, "dispatcher": dispatcher,
         "set_aside": detail["set_aside"], "notes": notes});
+    if let Some(why) = detail["login_shell"].as_str() {
+        result["login_shell"] = json!(why);
+    }
     detail["result"] = result.clone();
     put(&conn, id, "import", &ship, "finished", &detail)?;
     discard_staging(id, "import")?;
