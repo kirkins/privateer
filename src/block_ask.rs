@@ -236,8 +236,15 @@ pub(crate) fn mask(text: &str) -> String {
     let mut hide_next = false;
     // A line ended between the keyword and the word it hides.
     let mut after_line = false;
+    // The keyword's line, and this line, begin with a file read's line
+    // number.
+    let mut numbered = false;
+    let mut line_numbered = false;
     let mut at = 0;
     while at < words.len() {
+        if at == 0 || ends_line(words[at - 1]) {
+            line_numbered = numbered_line(&words[at..]);
+        }
         let word = words[at];
         let trimmed = word.trim_end();
         let tail = &word[trimmed.len()..];
@@ -247,10 +254,9 @@ pub(crate) fn mask(text: &str) -> String {
             at += 1;
             continue;
         }
-        if let Some(value) = assigned_at(&words, at) {
+        if let Some(next) = hide_assigned(&words, at, &mut out) {
             hide_next = false;
-            out.extend(words[at..value].iter().copied());
-            at = hide_value(&words, value, 0, &mut out);
+            at = next;
             continue;
         }
         let lowered = trimmed.to_ascii_lowercase();
@@ -263,12 +269,13 @@ pub(crate) fn mask(text: &str) -> String {
         if keyword {
             hide_next = true;
             after_line = ends_line(word);
+            numbered = line_numbered;
             out.push_str(word);
             at += 1;
             continue;
         }
         if std::mem::take(&mut hide_next) {
-            match labelled(word, after_line) {
+            match labelled(word, after_line, after_line && numbered) {
                 Labelled::Skip => {
                     hide_next = true;
                     out.push_str(word);
@@ -322,20 +329,50 @@ pub(crate) fn line_number_len(line: &str) -> usize {
     }
 }
 
+/// Whether the line `words` begin begins with a file read's line number.
+pub(crate) fn numbered_line(words: &[&str]) -> bool {
+    words
+        .iter()
+        .find(|word| !word.trim_end().is_empty() || ends_line(word))
+        .is_some_and(|word| line_number_len(word) > 0)
+}
+
+/// When word `at` is a secret-looking name assigned a value, the words
+/// through that value written to `out` with the value hidden; the index of
+/// the word after them. A typed name's first word after its label is
+/// hidden too, as it may be the value rather than a type
+/// (`token: abc123 ttl = 3600`).
+pub(crate) fn hide_assigned(words: &[&str], at: usize, out: &mut String) -> Option<usize> {
+    let (typed, value) = assigned_at(words, at)?;
+    let mut next = at;
+    if let Some(first) = typed {
+        out.extend(words[next..first].iter().copied());
+        next = hide_value(words, first, 0, out);
+    }
+    // The first word may open a bracket that runs through the value.
+    if next <= value {
+        out.extend(words[next..value].iter().copied());
+        next = hide_value(words, value, 0, out);
+    }
+    Some(next)
+}
+
 /// Where the value of a secret-looking name in word `at` begins, when the
-/// name is assigned one: `password = x`, `secret := x`, `token : x`, or
-/// with a type of at most three words between, `password: str = x`,
-/// `let api_key: &str = x`.
-pub(crate) fn assigned_at(words: &[&str], at: usize) -> Option<usize> {
+/// name is assigned one: `password = x`, `secret := x`, `token : x`, the
+/// `=` maybe on a later line, or with at most three words on its line
+/// between, `password: str = x`, `let api_key: &str = x`; and with them,
+/// the first of those words.
+fn assigned_at(words: &[&str], at: usize) -> Option<(Option<usize>, usize)> {
     let word = words[at].trim_end();
     let typed = word.ends_with(':');
     if word.contains('=') || !sensitive_name(word.trim_matches(|c: char| !c.is_alphanumeric())) {
         return None;
     }
+    let mut first = None;
     let mut types = 0;
     let mut next = at;
     loop {
-        if ends_line(words[next]) {
+        if typed && ends_line(words[next]) {
             return None;
         }
         next += 1;
@@ -349,12 +386,14 @@ pub(crate) fn assigned_at(words: &[&str], at: usize) -> Option<usize> {
                     && !other.contains('=')
                     && !other.starts_with(['"', '\'', '`']) =>
             {
+                first.get_or_insert(next);
                 types += 1
             }
             _ => return None,
         }
     }
-    (next + 1..words.len()).find(|&n| !words[n].trim_end().is_empty())
+    let value = (next + 1..words.len()).find(|&n| !words[n].trim_end().is_empty())?;
+    Some((first, value))
 }
 
 /// How a word reads as the value a label or keyword before it names, once
@@ -369,9 +408,11 @@ pub(crate) enum Labelled {
     Value(usize),
 }
 
-pub(crate) fn labelled(word: &str, after_line: bool) -> Labelled {
+/// `numbered` when a line ended after a label whose line began with a file
+/// read's line number, so this line's number is no value.
+pub(crate) fn labelled(word: &str, after_line: bool, numbered: bool) -> Labelled {
     let trimmed = word.trim_end();
-    let from = if after_line { line_number_len(word) } else { 0 };
+    let from = if numbered { line_number_len(word) } else { 0 };
     let rest = trimmed.get(from..).unwrap_or("");
     if rest.is_empty() {
         Labelled::Skip
@@ -401,19 +442,27 @@ pub(crate) fn hide_value(words: &[&str], at: usize, from: usize, out: &mut Strin
 /// Where the quotes and brackets at the end of `value` that close what it
 /// never opened begin.
 fn unopened_from(value: &str) -> usize {
+    const MARKS: &str = "\"'`([{)]}";
+    // How many of each mark the value holds before the cut, counted once.
+    let mut held = [0usize; 9];
+    for c in value.chars() {
+        if let Some(i) = MARKS.find(c) {
+            held[i] += 1;
+        }
+    }
     let mut cut = value.len();
-    while let Some(c) = value[..cut].chars().last() {
-        let head = &value[..cut];
-        let unopened = match c {
-            '"' | '\'' | '`' => head.matches(c).count() % 2 == 1,
-            ')' => head.matches(')').count() > head.matches('(').count(),
-            ']' => head.matches(']').count() > head.matches('[').count(),
-            '}' => head.matches('}').count() > head.matches('{').count(),
+    while let Some(c) = value[..cut].chars().next_back()
+        && let Some(i) = MARKS.find(c)
+    {
+        let unopened = match i {
+            0..3 => held[i] % 2 == 1,
+            6..9 => held[i] > held[i - 3],
             _ => false,
         };
         if !unopened {
             break;
         }
+        held[i] -= 1;
         cut -= c.len_utf8();
     }
     cut
@@ -461,11 +510,15 @@ pub(crate) fn value_end(words: &[&str], at: usize, value: &str) -> usize {
     }
 }
 
-/// Whether a YAML value is a block scalar's indicator, `|`, `>-` or `|2`.
+/// Whether a YAML value is a block scalar's indicator, `|`, `>-` or `|2`:
+/// at most one indentation digit and one chomping sign, so `|1234` is a
+/// value.
 fn block_scalar(value: &str) -> bool {
-    value
-        .strip_prefix(['|', '>'])
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || "+-".contains(c)))
+    value.strip_prefix(['|', '>']).is_some_and(|rest| {
+        let digits = rest.matches(|c: char| ('1'..='9').contains(&c)).count();
+        let signs = rest.matches(['+', '-']).count();
+        digits <= 1 && signs <= 1 && digits + signs == rest.len()
+    })
 }
 
 /// A YAML mapping entry's key and value, `key: value` or `key:`, the value
@@ -485,18 +538,25 @@ fn yaml_entry(text: &str) -> Option<(&str, &str)> {
 /// leaves its value empty or opens a block scalar, `tokens:` or
 /// `password: |`: every line below indented deeper, and each list item at
 /// its indent, has its value hidden, keeping the indentation, each `-` and
-/// nested keys. Lines may carry a file read's line numbers.
+/// nested keys. Lines may carry a file read's line numbers; those under a
+/// key are read as numbers only when the key's line has one.
 pub(crate) fn mask_yaml_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    // The open block: its key's column, and whether it is a block scalar.
-    let mut block: Option<(usize, bool)> = None;
+    // The open block: its key's column, whether it is a block scalar, and
+    // whether its key's line had a line number, so the lines under it do.
+    let mut block: Option<(usize, bool, bool)> = None;
     for line in text.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
+        // A line's text after `start`, unindented, and its indent.
+        let read = |start: usize| {
+            let content = &body[start..];
+            let rest = content.trim_start_matches(' ');
+            (rest, content.len() - rest.len())
+        };
         let start = line_number_len(body);
-        let content = &body[start..];
-        let rest = content.trim_start_matches(' ');
-        let indent = content.len() - rest.len();
-        if let Some((column, scalar)) = block {
+        if let Some((column, scalar, numbered)) = block {
+            let start = if numbered { start } else { 0 };
+            let (rest, indent) = read(start);
             let item = rest == "-" || rest.starts_with("- ");
             if rest.trim().is_empty() {
                 out.push_str(line);
@@ -510,6 +570,7 @@ pub(crate) fn mask_yaml_blocks(text: &str) -> String {
             }
             block = None;
         }
+        let (rest, indent) = read(start);
         let (dashes, entry) = yaml_items(rest);
         if let Some((key, value)) = yaml_entry(entry)
             && sensitive_name(key)
@@ -520,7 +581,7 @@ pub(crate) fn mask_yaml_blocks(text: &str) -> String {
                 None => value,
             };
             if value.is_empty() || block_scalar(value) {
-                block = Some((indent + dashes.len(), !value.is_empty()));
+                block = Some((indent + dashes.len(), !value.is_empty(), start > 0));
             }
         }
         out.push_str(line);
@@ -2328,10 +2389,10 @@ mod tests {
             "PASSWORD=••• ./run --token=••• -v"
         );
         assert_eq!(mask("token = abc"), "token = •••");
-        assert_eq!(mask("password: str = hunter2"), "password: str = •••");
+        assert_eq!(mask("password: str = hunter2"), "password: ••• = •••");
         assert_eq!(
             mask("let api_key: &str = \"a b\";"),
-            "let api_key: &str = •••"
+            "let api_key: ••• = •••"
         );
         assert_eq!(
             mask("secret := \"a b\"\nname := x"),
