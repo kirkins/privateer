@@ -439,6 +439,10 @@ fn absorb(
         .unwrap_or_default())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted =
+    &[("usage.summary", &["since_ms", "until_ms", "group_by"])];
+
 /// The fleet's usage over the period: this machine's homes, and each machine
 /// this one reaches asked for its own in parallel under the gateway timeout.
 pub fn summary(store: &Store, args: &Value) -> Result<Value> {

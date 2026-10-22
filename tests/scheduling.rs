@@ -1013,7 +1013,7 @@ fn a_taken_up_offer_that_defers_on_a_child_is_never_counted_as_an_attempt() {
         call(
             &mut fleet,
             "task.create",
-            json!({"id":child,"parent":"infra-repair","owner":"infra","title":"child","actor":"infra"}),
+            json!({"id":child,"parent":"infra-repair","owner":"infra","title":"child"}),
         );
         let offer = poll(&mut fleet, true)["offer"].clone();
         assert!(offer.is_object(), "round {round}: {offer}");

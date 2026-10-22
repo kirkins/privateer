@@ -115,6 +115,9 @@ pub(crate) fn approval_request(
     Ok(request)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("runtime.needs", &["address", "limit", "after"])];
+
 pub fn query(store: &Store, args: &Value) -> Result<Value> {
     ensure!(
         *store.caller() == Caller::Operator,

@@ -4559,6 +4559,56 @@ fn list(store: &Store, args: &Value) -> Result<Value> {
     }))
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "job.start",
+        &[
+            "task_id",
+            "command",
+            "id",
+            "action",
+            "cwd",
+            "heavy",
+            "estimate",
+            "wait_for_capacity",
+            "max_wait_secs",
+            "cleanup_descendants",
+            "timeout_secs",
+            "agent_actor",
+            "plugin_binding",
+            "workspace_lease_id",
+            "work_offer",
+            "codex_read_only_crew",
+            "production",
+            "_resume_of",
+            "_relaunch_of",
+        ],
+    ),
+    ("job.status", &["id"]),
+    ("job.list", &["limit", "cursor", "after_id"]),
+    ("job.cancel", &["id"]),
+    ("job.retry", &["id", "new_id"]),
+    (
+        "resource.configure",
+        &[
+            "max_heavy_jobs",
+            "max_load_per_cpu",
+            "min_available_memory_bytes",
+            "min_free_disk_bytes",
+            "heavy_estimate",
+            "ramp_secs",
+            "disk_warn_horizon_secs",
+            "pressure_after_secs",
+            "workspace_cache_budget_bytes",
+            "crew_default_memory_bytes",
+            "crew_memory_bytes",
+        ],
+    ),
+    ("resource.recover", &["key", "force"]),
+    ("resource.status", &[]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "job.start" => start(store, args, None, false),

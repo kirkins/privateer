@@ -2140,6 +2140,12 @@ pub(crate) fn cleaned(conn: &Connection, ship: &str, freed: u64) -> Result<()> {
     Ok(())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("ship.placement", &[]),
+    ("ship.propose_move", &["name", "to", "why"]),
+];
+
 /// `ship.placement` and `ship.propose_move`.
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {

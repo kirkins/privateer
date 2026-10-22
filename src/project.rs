@@ -160,6 +160,10 @@ fn add(store: &mut Store, args: &Value) -> Result<Value> {
     published
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted =
+    &[("project.add", &["url", "name", "target", "forge"])];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "project.add" => add(store, &args),

@@ -416,6 +416,13 @@ fn resume_all(store: &Store) -> Result<Value> {
     Ok(out)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("stow.start", &["machine", "all"]),
+    ("stow.status", &["machine", "all"]),
+    ("stow.resume", &["machine", "all"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     let named = args.get("machine").filter(|v| !v.is_null());
     // `--all` reaches every linked machine this one reaches, so it is the

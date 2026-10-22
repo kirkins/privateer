@@ -1658,6 +1658,15 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
         "folder_kept": released["folder_kept"], "directory": directory}))
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "ship.move",
+        &["name", "to", "unpin", "check", "folder", "fresh", "from"],
+    ),
+    ("ship.clean_moved", &["name"]),
+];
+
 /// `ship.move`, for the operator.
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     store.caller().require_operator(command)?;

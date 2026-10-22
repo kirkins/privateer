@@ -209,6 +209,9 @@ fn plugins(harness: &str) -> Vec<Value> {
     }
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("ship.profile", &["ship"])];
+
 pub fn profile(args: &Value) -> Result<Value> {
     let name = required(args, "ship")?;
     identifier(name)?;

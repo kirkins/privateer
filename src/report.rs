@@ -378,6 +378,15 @@ pub(crate) fn check_annotations(from: &str, kind: &str, payload: &Value) -> Resu
     Ok(())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("report.get", &["id"]),
+    (
+        "report.put",
+        &["from", "title", "format", "content", "content_file"],
+    ),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "report.put" => put(store, &args),

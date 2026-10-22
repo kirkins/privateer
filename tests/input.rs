@@ -188,27 +188,44 @@ fn reused_yaml_anchor_names_keep_the_latest_scalar_sequence_and_mapping() {
     }
     let repo = files.temp.path().join("repo");
     fs::create_dir(&repo).unwrap();
-    for (id, anchors, actions) in [
+    // Keys a charter does not take are refused, anchor holders included.
+    let path = files.file("charter.yaml", format!("id: holders\nrepo: {}\nobjective: correct permissions\none: &a inspect\ntwo: &a implement\nactions: [inspect, *a]\n", json!(repo)));
+    let output = files
+        .command()
+        .args(["charter.put", "--file"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("unknown arguments one, two for charter.put"),
+        "{error}"
+    );
+    // A reused anchor name keeps its latest value in the authority it grants.
+    for (id, document) in [
         (
-            "scalar",
-            "one: &a inspect\ntwo: &a implement\nthree: &b cleanup",
-            "[inspect, *a]",
+            "latest",
+            "actions: [&a inspect, &a implement]\nobjective: *a\n",
         ),
         (
-            "sequence",
-            "one: &a [inspect]\ntwo: &a [inspect, implement]\nthree: &b [inspect, cleanup]",
-            "*a",
+            "before",
+            "objective: &a inspect\nactions: [*a, &a implement]\n",
         ),
     ] {
-        let path = files.file("charter.yaml", format!("id: {id}\nrepo: {}\nobjective: correct permissions\n{anchors}\nactions: {actions}\n", json!(repo)));
+        let path = files.file(
+            "charter.yaml",
+            format!("id: {id}\nrepo: {}\n{document}", json!(repo)),
+        );
         assert_eq!(
             files.read("charter.put", &path)["actions"],
             json!(["inspect", "implement"])
         );
-        assert_eq!(
-            files.json("charter.show", json!({"id":id}))["actions"],
-            json!(["inspect", "implement"])
-        );
+        let shown = files.json("charter.show", json!({"id":id}));
+        assert_eq!(shown["actions"], json!(["inspect", "implement"]));
+        if id == "latest" {
+            assert_eq!(shown["objective"], "implement", "{shown}");
+        }
     }
 }
 

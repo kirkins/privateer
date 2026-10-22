@@ -236,6 +236,9 @@ pub fn current_for(executable: &Path) -> Result<Option<Release>> {
     selected(&installation(running.as_ref())?)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("upgrade.status", &[])];
+
 /// The newest `limit` upgrade outcomes (all of them for -1), read only: a
 /// missing registry or table is an empty history.
 fn read_history(registry: &Path, limit: i64) -> Result<Vec<UpgradeRecord>> {

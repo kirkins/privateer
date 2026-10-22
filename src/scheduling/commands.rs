@@ -252,6 +252,17 @@ pub(super) fn is_id_shape(word: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("task.enqueue", &["id", "brief"]),
+    ("task.defer", &["id", "offer_id", "wait"]),
+    ("work.poll", &["ship", "holder", "idle", "attention"]),
+    ("work.started", &["ship", "holder", "offer_id"]),
+    ("work.release", &["ship", "holder", "offer_id"]),
+    ("work.settled", &["ship", "holder", "offer_id"]),
+    ("work.status", &["ship"]),
+];
+
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "task.enqueue" => enqueue(store, &args),

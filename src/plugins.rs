@@ -72,6 +72,51 @@ fn launch_wait(declared: u64, load_per_cpu: f64) -> u64 {
     (base * load_per_cpu.max(1.0)).min(LAUNCH_CEILING_MS as f64) as u64
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "agent.brief",
+        &[
+            "task_id",
+            "id",
+            "wake",
+            "wake_only",
+            "_workspace_lease_id",
+            "_workspace_cwd",
+        ],
+    ),
+    (
+        "plugin.validate",
+        &[
+            "task_id",
+            "manifest",
+            "config",
+            "options",
+            "tool_bundles",
+            "id",
+            "wake",
+            "wake_only",
+            "_workspace_lease_id",
+            "_workspace_cwd",
+        ],
+    ),
+    (
+        "plugin.command",
+        &[
+            "task_id",
+            "manifest",
+            "config",
+            "options",
+            "tool_bundles",
+            "id",
+            "wake",
+            "wake_only",
+            "_workspace_lease_id",
+            "_workspace_cwd",
+        ],
+    ),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     request(store, command, args, Wait::Declared)
 }

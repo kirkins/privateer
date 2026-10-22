@@ -270,7 +270,7 @@ of jobs.
 
 ### The proposal
 
-`ship.propose_move {ship, to, why}` *(new, the machine owner only)* checks
+`ship.propose_move {name, to, why}` *(new, the machine owner only)* checks
 the holds, eligibility and target again, gets a live `move.check` answer
 from the target (below), and writes one captain `decision`
 (`payload.decision` with options, checked by `validate_decision` in

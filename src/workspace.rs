@@ -5,6 +5,7 @@ mod cache;
 mod lifecycle;
 mod process;
 pub(crate) use cache::make_room_for_job;
+pub(crate) use lifecycle::ACCEPTED;
 pub use lifecycle::dispatch;
 pub(crate) use lifecycle::sweep;
 

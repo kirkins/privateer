@@ -744,6 +744,16 @@ pub(crate) fn machine_offers(args: &Value) -> Result<Value> {
     Ok(json!({"offers": offers}))
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("capability.list", &[]),
+    (
+        "capability.put",
+        &["name", "note", "probe", "declared_only"],
+    ),
+    ("capability.remove", &["name"]),
+];
+
 /// `capability.*`: the vocabulary. Anyone may read it; the operator keeps it.
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     let conn = crate::fleet::registry()?;

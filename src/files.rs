@@ -71,6 +71,9 @@ pub fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("file.put", &["to", "name", "content_file"])];
+
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "file.put" => put(store, &args),

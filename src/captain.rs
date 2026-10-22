@@ -495,6 +495,30 @@ pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
     }
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("captain.dismiss", &["id", "note"]),
+    (
+        "captain.feed",
+        &[
+            "after",
+            "before",
+            "limit",
+            "ship",
+            "include_ship_mail",
+            "states",
+            "open_only",
+        ],
+    ),
+    ("captain.relay", &["request", "source", "body"]),
+    ("captain.reply", &["id", "body", "payload"]),
+    (
+        "captain.send",
+        &["to", "kind", "body", "urgency", "payload"],
+    ),
+    ("captain.waiting", &[]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value> {
     // The captain's mail gathers at the desk; when `machine captain` keeps it
     // on another machine, the captain reads it there. An ask held here is

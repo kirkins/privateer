@@ -709,6 +709,16 @@ pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
     Ok(count)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("focus.digest", &["ship", "focus", "limit"]),
+    ("note.get", &["ship", "focus", "versions"]),
+    ("note.list", &["ship"]),
+    ("note.pin", &["ship", "focus", "key", "value"]),
+    ("note.put", &["ship", "focus", "body"]),
+    ("ship.bearings", &["ship"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "note.put" => note_put(store, &args),

@@ -868,6 +868,9 @@ fn closed_here(conn: &Connection, ids: &[&str], unknown: &mut Vec<String>) -> Ha
     closed
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("fleet.snapshot", &["since"])];
+
 pub fn snapshot(args: &Value) -> Result<Value> {
     let since = match args.get("since") {
         None | Some(Value::Null) => serde_json::Map::new(),

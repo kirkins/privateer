@@ -988,6 +988,31 @@ fn list() -> Result<Value> {
     Ok(json!({"registry": registry_path()?, "ships": ships}))
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("fleet.link", &[]),
+    ("fleet.list", &[]),
+    (
+        "ship.create",
+        &[
+            "name",
+            "machine",
+            "scope",
+            "objective",
+            "harness",
+            "host",
+            "folder",
+            "actions",
+        ],
+    ),
+    ("ship.retire", &["name", "expected_home"]),
+    ("ship.actions", &["name", "actions"]),
+    ("ship.scope", &["name", "scope"]),
+    ("ship.consumes", &["name", "consumes"]),
+    ("ship.requires", &["name", "requires", "pinned"]),
+    ("ship.consumers", &["name"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "fleet.list" => list(),

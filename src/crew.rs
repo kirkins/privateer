@@ -1267,6 +1267,14 @@ pub(crate) fn parked_crews(store: &Store, task: &str) -> Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("crew.park", &["job_id", "next"]),
+    ("crew.report", &["kind", "body", "payload", "id"]),
+    ("crew.answer", &["id", "wait_secs"]),
+    ("crew.resume", &["task_id"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "crew.park" => park(store, &args),

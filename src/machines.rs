@@ -2759,6 +2759,22 @@ pub fn cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "machine.add",
+        &["name", "target", "executable", "as", "fleet", "transport"],
+    ),
+    ("machine.captain", &["machine"]),
+    ("machine.collect", &["name"]),
+    ("machine.list", &[]),
+    ("machine.offers", &["add", "remove", "withhold"]),
+    ("machine.owner", &["ship"]),
+    ("machine.readiness", &[]),
+    ("machine.refresh", &["name"]),
+    ("machine.remove", &["name"]),
+];
+
 /// The `machine.*` JSON commands, for the operator.
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     store.caller().require_operator(command)?;
