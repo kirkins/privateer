@@ -281,9 +281,6 @@ fn note_list(store: &Store, args: &Value) -> Result<Value> {
     Ok(json!({"ship": ship, "notes": foci}))
 }
 
-/// A bounded summary of a ship built from records, with no model call:
-/// open tasks, requests owed and owing, unacknowledged mail and the
-/// long-lived ship note.
 /// The route the first mate's next launch takes when its profile names no
 /// model of its own, from the captain's first_mate list, or why none can.
 fn first_mate_route(store: &Store, ship: &str) -> Result<Option<String>> {
@@ -310,6 +307,9 @@ fn first_mate_route(store: &Store, ship: &str) -> Result<Option<String>> {
     )
 }
 
+/// A bounded summary of a ship built from records, with no model call:
+/// open tasks, requests owed and owing, unacknowledged mail and the
+/// long-lived ship note.
 pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     local_ship(store, ship)?;
     let lines = |sql: &str,

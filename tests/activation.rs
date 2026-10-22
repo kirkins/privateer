@@ -752,6 +752,195 @@ fn a_hosted_first_mate_with_no_model_takes_the_listed_route_too() {
     assert_eq!(fleet.settle()["status"], "succeeded");
 }
 
+/// Two first_mate routes on the fixture's own (resumable) harness, listed in
+/// `order`, for a profile that names no model.
+fn same_harness_routes(fleet: &Fleet, order: &[&str]) {
+    // Routes apply to the home's own ship.
+    fs::write(
+        fleet.home.join("config.json"),
+        json!({"resource_home":fleet.root.join("ledger"),"ship":"infra"}).to_string(),
+    )
+    .unwrap();
+    let manifest = fleet.root.join("manifest.json");
+    fleet.ok(
+        "routes.set",
+        json!({
+            "routes": {
+                "a": {"manifest": manifest, "options": {"model": "model-a"}, "cost": "plan"},
+                "b": {"manifest": manifest, "options": {"model": "model-b"}, "cost": "plan"}
+            },
+            "first_mate": order
+        }),
+        None,
+    );
+}
+
+/// A warm session belongs to the model route it ran on. When the first_mate
+/// list's choice moves to another route on the same harness, the next wake
+/// starts fresh rather than resume the old conversation on the new model, in
+/// both directions; on its own route a session resumes as it always did.
+#[test]
+fn a_warm_session_resumes_only_on_the_route_it_ran_on() {
+    let mut fleet = Fleet::new(now_settings());
+    let wake = |fleet: &mut Fleet, body: &str| {
+        fleet.send(json!({"from":"apps","to":"infra","kind":"notice","task_id":"infra-repair","body":body}));
+        let woke = Fleet::infra(&fleet.tick());
+        assert_eq!(woke["status"], "running", "{woke}");
+        let settled = fleet.settle();
+        assert_eq!(settled["status"], "succeeded", "{settled}");
+        (woke, settled["session_id"].as_str().unwrap().to_owned())
+    };
+    same_harness_routes(&fleet, &["a", "b"]);
+    let (woke, on_a) = wake(&mut fleet, "first on a");
+    assert_eq!(woke["route"]["name"], "a", "{woke}");
+    assert_eq!(woke["mode"], "fresh", "{woke}");
+    let (woke, again) = wake(&mut fleet, "again on a");
+    assert_eq!(woke["mode"], "resume", "{woke}");
+    assert_eq!(again, on_a);
+
+    // Route a gives way to b: a fresh session, not a's on model-b.
+    same_harness_routes(&fleet, &["b", "a"]);
+    let (woke, on_b) = wake(&mut fleet, "first on b");
+    assert_eq!(woke["route"]["name"], "b", "{woke}");
+    assert_eq!(woke["mode"], "fresh", "{woke}");
+    assert_ne!(on_b, on_a);
+    assert_eq!(wake_model_arg(&mut fleet).as_deref(), Some("model-b"));
+    let (woke, again) = wake(&mut fleet, "again on b");
+    assert_eq!(woke["mode"], "resume", "{woke}");
+    assert_eq!(again, on_b);
+
+    // And back: b's session never resumes on model-a.
+    same_harness_routes(&fleet, &["a", "b"]);
+    let (woke, back) = wake(&mut fleet, "back on a");
+    assert_eq!(woke["route"]["name"], "a", "{woke}");
+    assert_eq!(woke["mode"], "fresh", "{woke}");
+    assert_ne!(back, on_b);
+}
+
+/// The route model the latest wake's job ran with.
+fn wake_model_arg(fleet: &mut Fleet) -> Option<String> {
+    let wake = fleet.wakes()[0].clone();
+    let job = dispatch(&mut fleet.store, "job.status", json!({"id":wake["job_id"]})).unwrap();
+    job["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|arg| ["model-a", "model-b"].contains(arg))
+        .map(str::to_owned)
+}
+
+/// An errand's session is bound to its route the same way, and with no
+/// errand list of its own an errand runs on the first mate's listed route.
+#[test]
+fn an_errand_session_resumes_only_on_the_route_it_ran_on() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    let errand = |fleet: &mut Fleet, brief: &str| {
+        let started = fleet.ok(
+            "errand.start",
+            json!({"focus":"task:infra-repair","brief":brief}),
+            Some("infra"),
+        );
+        let id = started["errand"].as_str().unwrap().to_owned();
+        assert_eq!(errand_settled(fleet, &id)["status"], "succeeded");
+        started
+    };
+    same_harness_routes(&fleet, &["a", "b"]);
+    let started = errand(&mut fleet, "Review it on a.");
+    assert_eq!(started["route"]["name"], "a", "{started}");
+    assert_eq!(started["mode"], "fresh", "{started}");
+    assert_eq!(errand(&mut fleet, "Again on a.")["mode"], "resume");
+    same_harness_routes(&fleet, &["b", "a"]);
+    let started = errand(&mut fleet, "Now on b.");
+    assert_eq!(started["route"]["name"], "b", "{started}");
+    assert_eq!(started["mode"], "fresh", "{started}");
+    assert_eq!(errand(&mut fleet, "Again on b.")["mode"], "resume");
+}
+
+/// The open runtime.needs items saying a first mate has no route to take.
+fn no_route_needs(fleet: &Fleet) -> Vec<Value> {
+    fleet.ok("runtime.needs", json!({"limit":100}), None)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["evidence"] == "first_mate_no_route")
+        .cloned()
+        .collect()
+}
+
+/// With every first_mate route unavailable, wake-worthy mail that has waited
+/// past max_delay_secs is the captain's to know of: runtime.needs names the
+/// ship and each route's reason, and the item clears once a route does.
+#[test]
+fn a_first_mate_with_no_route_and_overdue_mail_is_a_captain_need_until_a_route_clears() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    modelless_profile(&fleet);
+    let max_delay = |fleet: &Fleet, secs: u64| {
+        let mut profile =
+            fleet.ok("ship.show", json!({"name":"infra"}), None)["first_mate"].clone();
+        profile["max_delay_secs"] = json!(secs);
+        fleet.ok(
+            "ship.put",
+            json!({"name":"infra","first_mate":profile}),
+            None,
+        );
+    };
+    back_off(&fleet, "fallback/-/spent-model");
+    back_off(&fleet, "fallback/-/fallback-model");
+    max_delay(&fleet, 3600);
+    fleet.send(json!({"id":"stuck","from":"apps","to":"infra","kind":"request","body":"Anyone?"}));
+    let report = Fleet::infra(&fleet.tick());
+    assert!(
+        report["skipped"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("every first_mate route for infra is unavailable"),
+        "{report}"
+    );
+    // Not overdue yet: the first mate waits quietly.
+    assert_eq!(no_route_needs(&fleet), Vec::<Value>::new());
+
+    max_delay(&fleet, 0);
+    fleet.tick();
+    let needs = no_route_needs(&fleet);
+    assert_eq!(needs.len(), 1, "{needs:#?}");
+    let need = &needs[0];
+    assert_eq!(need["ship"], "infra", "{need}");
+    assert_eq!(need["kind"], "blocker", "{need}");
+    let summary = need["summary"].as_str().unwrap();
+    for reason in [
+        "spent: model route fallback/-/spent-model is backing off",
+        "fallback: model route fallback/-/fallback-model is backing off",
+    ] {
+        assert!(summary.contains(reason), "{summary}");
+    }
+    // Another pass with nothing changed keeps the same item.
+    fleet.tick();
+    let again = no_route_needs(&fleet);
+    assert_eq!(again.len(), 1, "{again:#?}");
+    assert_eq!(again[0]["version"], need["version"]);
+
+    // A route clears: the first mate wakes and the need is gone.
+    let ledger = rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
+    ledger
+        .execute(
+            "DELETE FROM model_routes WHERE route='fallback/-/fallback-model'",
+            [],
+        )
+        .unwrap();
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["status"], "running", "{report}");
+    assert_eq!(report["route"]["name"], "fallback", "{report}");
+    assert_eq!(no_route_needs(&fleet), Vec::<Value>::new());
+    assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
 #[test]
 fn mail_wakes_the_first_mate_which_answers_and_its_usage_is_recorded() {
     let mut fleet = Fleet::new(now_settings());

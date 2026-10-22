@@ -3965,6 +3965,79 @@ fn a_hosted_pane_reports_drift_and_host_relaunch_moves_it_onto_the_current_relea
     place.stop_native("infra");
 }
 
+/// A relaunch chooses the first mate's route as every launch does: a first
+/// mate whose profile names no model comes back on the first_mate list's
+/// route, never on Pi's own default, and a relaunch with no route clear
+/// leaves the running pane alone.
+#[test]
+fn host_relaunch_takes_the_first_mate_route() {
+    let (a, b) = (commit('a'), commit('b'));
+    let mut place = Place::new();
+    place.on_release(&a);
+    place.json(
+        "routes.set",
+        json!({"routes": {"flash": {"manifest": "bundled:pi", "cost": "plan",
+            "options": {"provider": "fixture-provider", "model": "flash-model"}}},
+            "first_mate": ["flash"]}),
+    );
+    let mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    assert!(mate["options"].get("model").is_none(), "{mate}");
+    let routed = |argv: &str| {
+        let argv: Vec<&str> = argv.lines().collect();
+        argv.windows(2)
+            .any(|p| p == ["--provider", "fixture-provider"])
+            && argv.windows(2).any(|p| p == ["--model", "flash-model"])
+    };
+    let (place, _herdr) = hosted(place);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(routed(&argv), "{argv}");
+    place.install_release(&b);
+    place.select(&b);
+
+    // Every route held off: the relaunch is refused and the pane keeps running.
+    fs::create_dir_all(place.root.join("ledger")).unwrap();
+    let ledger = place.root.join("ledger/resources.sqlite");
+    let held = rusqlite::Connection::open(&ledger).unwrap();
+    held.execute_batch(
+        "CREATE TABLE IF NOT EXISTS model_routes(route TEXT PRIMARY KEY,failures INTEGER NOT NULL,until_ms INTEGER NOT NULL,last_error TEXT,updated_ms INTEGER NOT NULL)",
+    )
+    .unwrap();
+    held.execute(
+        "INSERT INTO model_routes(route,failures,until_ms,last_error,updated_ms) VALUES('pi/fixture-provider/flash-model',1,?1,'429',0)",
+        [i64::MAX / 2],
+    )
+    .unwrap();
+    let native = place.native_pid();
+    let refused = place.relaunch_cmd(&["--force"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("every first_mate route for infra is unavailable"),
+        "{stderr}"
+    );
+    assert_eq!(unsafe { libc::kill(native, 0) }, 0, "the pane was stopped");
+    held.execute("DELETE FROM model_routes", []).unwrap();
+
+    for file in ["pi-env", "pi-argv"] {
+        fs::remove_file(place.root.join(file)).unwrap();
+    }
+    let relaunch = place.relaunch_cmd(&["--force"]);
+    assert!(
+        relaunch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relaunch.stderr)
+    );
+    let report: Value = serde_json::from_slice(&relaunch.stdout).unwrap();
+    assert_eq!(report["route"]["name"], "flash", "{report}");
+    assert!(report["launch"]["launched"]["pane"].is_string(), "{report}");
+    until("the relaunched harness", || {
+        place.root.join("pi-env").exists()
+    });
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(routed(&argv), "{argv}");
+    place.stop_native("infra");
+}
+
 #[test]
 fn an_idle_pane_behind_the_current_release_catches_up_at_its_sleep_point_and_a_busy_one_waits() {
     let (a, b) = (commit('a'), commit('b'));
