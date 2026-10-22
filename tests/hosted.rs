@@ -1853,7 +1853,9 @@ fn hosting_inherits_only_with_the_native_route_and_explicit_overrides_win() {
             .any(|p| p == ["--provider", "fixture-provider"])
     );
     assert!(argv.windows(2).any(|p| p == ["--model", "fixture-model"]));
-    assert!(argv.contains(&"--continue"));
+    // It names its own session rather than take the folder's newest.
+    assert!(argv.windows(2).any(|p| p[0] == "--session-id"), "{argv:?}");
+    assert!(!argv.contains(&"--continue"));
     assert!(!argv.contains(&"--print"));
     let context = fs::read_to_string(place.root.join("pi-context")).unwrap();
     let context: Vec<_> = context.lines().collect();
@@ -2266,7 +2268,7 @@ fn a_hosted_first_mate_runs_live_in_its_own_herdr_space_and_falls_back_without_i
     // carries on the ship's latest conversation with the mail adapter.
     until("the hosted harness", || place.root.join("pi-env").exists());
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
-    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert!(argv.lines().any(|a| a == "--session-id"), "{argv}");
     assert!(
         argv.lines().any(|a| a.ends_with("attended/mail.ts")),
         "{argv}"
@@ -2603,6 +2605,7 @@ fn the_captain_reads_and_types_into_a_hosted_first_mates_session() {
 #[test]
 fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
     let (place, herdr) = hosted_sleeper();
+    let session = pi_session_arg(&place);
     let holder = sleep_hosted(&place, &herdr);
 
     // Asleep, the pane keeps the ship's hosted lease under a new holder, so
@@ -2642,8 +2645,7 @@ fn an_idle_hosted_first_mate_sleeps_in_its_pane_and_mail_or_focus_wakes_it() {
     until("the woken harness", || place.root.join("pi-env").exists());
     let env = fs::read_to_string(place.root.join("pi-env")).unwrap();
     assert_eq!(env.trim(), format!("1 {asleep}"));
-    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
-    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert_eq!(pi_session_arg(&place), session);
     assert!(!herdr.calls("pane.release_agent").is_empty());
     // Released before the harness started: the pane no longer carries the label.
     let pane = herdr.pane_state("w2:p1");
@@ -2678,6 +2680,7 @@ fn a_sleeping_hosted_first_mate_with_an_unscheduled_task_is_woken_once_for_its_b
         "task.create",
         json!({"id":"infra-draft","parent":"infra-duty","owner":"infra","title":"Draft the plan"}),
     );
+    let session = pi_session_arg(&place);
     sleep_hosted(&place, &herdr);
     let serve = || -> Value {
         serde_json::from_str(&place.ok(&["serve", "--json", r#"{"once":true}"#])).unwrap()
@@ -2709,8 +2712,7 @@ fn a_sleeping_hosted_first_mate_with_an_unscheduled_task_is_woken_once_for_its_b
     until("the harness woken by the backlog notice", || {
         place.root.join("pi-env").exists()
     });
-    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
-    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert_eq!(pi_session_arg(&place), session);
     until("the backlog wake audited", || {
         place.json("audit.list", json!({"limit":1000}))["events"]
             .as_array()
@@ -2781,6 +2783,7 @@ fn type_into_pane(place: &Place, pane: &str, text: &str) {
 #[test]
 fn text_typed_into_a_sleeping_hosted_first_mate_wakes_it_as_mail_from_the_captain() {
     let (place, herdr) = hosted_sleeper();
+    let session = pi_session_arg(&place);
     sleep_hosted(&place, &herdr);
     until("the pane listed as asleep", || {
         herdr.pane_state("w2:p1")["display_agent"] == "infra"
@@ -2790,8 +2793,7 @@ fn text_typed_into_a_sleeping_hosted_first_mate_wakes_it_as_mail_from_the_captai
     until("the harness woken by typing", || {
         place.root.join("pi-env").exists()
     });
-    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
-    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert_eq!(pi_session_arg(&place), session);
     assert_eq!(herdr.calls("workspace.create").len(), 1);
     assert_eq!(place.wakes(), 0);
     // The text reached the mailbox as the captain's own mail, not a shell command.
@@ -4197,6 +4199,7 @@ fn a_hosted_pane_reports_drift_and_host_relaunch_moves_it_onto_the_current_relea
     // Forced, the pane stops its harness, verifies it exited and releases its
     // lease; a fresh pane on the current release continues the conversation.
     let native = place.native_pid();
+    let session = pi_session_arg(&place);
     for file in ["pi-env", "pi-argv"] {
         fs::remove_file(place.root.join(file)).unwrap();
     }
@@ -4219,13 +4222,9 @@ fn a_hosted_pane_reports_drift_and_host_relaunch_moves_it_onto_the_current_relea
     until("the relaunched harness", || {
         place.root.join("pi-env").exists()
     });
-    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
-    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
-    // The first harness and its replacement are one conversation.
-    let sessions = fs::read_to_string(place.root.join("pi-sessions")).unwrap();
-    let ids: Vec<&str> = sessions.lines().collect();
-    assert_eq!(ids.len(), 2, "{sessions}");
-    assert_eq!(ids[0], ids[1], "{sessions}");
+    // The first harness and its replacement are one conversation: the
+    // pane's own session, by its id.
+    assert_eq!(pi_session_arg(&place), session);
     assert_eq!(herdr.calls("workspace.create").len(), 2);
     let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
     assert_eq!(bearings["hosted_pane"]["commit"], b.as_str(), "{bearings}");
@@ -4350,6 +4349,7 @@ fn an_idle_pane_behind_the_current_release_catches_up_at_its_sleep_point_and_a_b
     // having stopped its harness, and the next dispatcher pass starts it again
     // on the current release.
     let idle = json!({"ship":"infra","holder":holder,"idle":true});
+    let session = pi_session_arg(&place);
     place.agent("work.poll", idle.clone());
     std::thread::sleep(Duration::from_millis(1100));
     place.agent("work.poll", idle);
@@ -4377,12 +4377,7 @@ fn an_idle_pane_behind_the_current_release_catches_up_at_its_sleep_point_and_a_b
         json!({"from":"captain","to":"infra","kind":"request","body":"wake up"}),
     );
     until("the woken harness", || place.root.join("pi-env").exists());
-    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
-    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
-    let sessions = fs::read_to_string(place.root.join("pi-sessions")).unwrap();
-    let ids: Vec<&str> = sessions.lines().collect();
-    assert_eq!(ids.len(), 2, "{sessions}");
-    assert_eq!(ids[0], ids[1], "{sessions}");
+    assert_eq!(pi_session_arg(&place), session);
     place.stop_native("infra");
 }
 
@@ -5355,44 +5350,72 @@ fn a_panes_card_names_the_approval_its_session_carried_and_offers_only_recent_ot
 
 /// Herdr for a hosted fixture, serving panes with the fixture's PATH and HOME.
 fn route_herdr(place: &Place) -> Herdr {
+    route_herdr_with(place, &[])
+}
+
+/// Herdr for a hosted fixture, its panes also given `extra`.
+fn route_herdr_with(place: &Place, extra: &[(&str, String)]) -> Herdr {
     let socket = place.root.join("config/herdr/herdr.sock");
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    Herdr::start(
-        &socket,
-        vec![
-            ("PATH".into(), place.path.clone()),
-            ("HOME".into(), place.root.display().to_string()),
-            (
-                "XDG_CONFIG_HOME".into(),
-                place.root.join("config").display().to_string(),
-            ),
-        ],
-    )
+    let mut base = vec![
+        ("PATH".into(), place.path.clone()),
+        ("HOME".into(), place.root.display().to_string()),
+        (
+            "XDG_CONFIG_HOME".into(),
+            place.root.join("config").display().to_string(),
+        ),
+    ];
+    base.extend(extra.iter().map(|(k, v)| ((*k).to_owned(), v.clone())));
+    Herdr::start(&socket, base)
 }
 
 /// One hosted launch of the first mate, run until its harness starts and then
-/// stopped: whether it continued, and the model it was given.
-fn launched_route(place: &Place, what: &str) -> (bool, String) {
+/// stopped: its arguments.
+fn launched_argv(place: &Place, what: &str) -> Vec<String> {
     place.retry_now();
     let report = place.tick();
     assert!(report["hosted"]["pane"].is_string(), "{report}");
     until(what, || place.root.join("pi-env").exists());
     let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
-    let args: Vec<&str> = argv.lines().collect();
-    let continued = args.contains(&"--continue");
-    let model = args
-        .windows(2)
-        .find(|w| w[0] == "--model")
-        .map(|w| w[1].to_owned())
-        .unwrap_or_else(|| panic!("no --model: {argv}"));
     place.stop_native("infra");
-    (continued, model)
+    argv.lines().map(str::to_owned).collect()
 }
 
-/// A hosted Pi pane continues the folder's session only on the route a pane
-/// launched it on. When the first_mate list moves the first mate to another
-/// route the pane starts fresh, in both directions, rather than resume the
-/// old conversation on a new model; on one route it continues as before.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+/// The session id the running hosted Pi harness was given.
+fn pi_session_arg(place: &Place) -> String {
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    let args: Vec<String> = argv.lines().map(str::to_owned).collect();
+    assert!(!args.iter().any(|a| a == "--continue"), "{argv}");
+    flag_value(&args, "--session-id").unwrap_or_else(|| panic!("no --session-id: {argv}"))
+}
+
+/// One hosted launch: whether it continued, and the model it was given.
+fn launched_route(place: &Place, what: &str) -> (bool, String) {
+    let args = launched_argv(place, what);
+    let model = flag_value(&args, "--model").unwrap_or_else(|| panic!("no --model: {args:?}"));
+    (args.iter().any(|a| a == "--continue"), model)
+}
+
+/// One hosted Pi launch: the session id the pane gave Pi and the model. A Pi
+/// pane names its session and never asks Pi for the folder's newest.
+fn launched_pi(place: &Place, what: &str) -> (String, String) {
+    let args = launched_argv(place, what);
+    assert!(!args.iter().any(|a| a == "--continue"), "{args:?}");
+    let id =
+        flag_value(&args, "--session-id").unwrap_or_else(|| panic!("no --session-id: {args:?}"));
+    let model = flag_value(&args, "--model").unwrap_or_else(|| panic!("no --model: {args:?}"));
+    (id, model)
+}
+
+/// A hosted Pi pane continues only its own session, and only on the route a
+/// pane launched it on. When the first_mate list moves the first mate to
+/// another route the pane starts fresh, in both directions, rather than
+/// resume the old conversation on a new model; on one route it continues as
+/// before.
 #[test]
 fn a_hosted_pi_pane_continues_only_on_the_route_it_ran_on() {
     let place = Place::new();
@@ -5411,49 +5434,199 @@ fn a_hosted_pi_pane_continues_only_on_the_route_it_ran_on() {
     assert_eq!(mate["options"], json!({}), "{mate}");
     assert_eq!(mate["host"], "herdr", "{mate}");
     let _herdr = route_herdr(&place);
+    let sessions = pi_default_sessions(&place);
 
-    // No pane has recorded a route yet: it continues as it always has.
+    // No pane has named a session yet: it continues the session Pi's
+    // --continue would have, by its id, as it always has.
+    pi_session_written(&sessions, "legacy", Some(&place.folder));
     list(["flash", "pro"]);
     assert_eq!(
-        launched_route(&place, "the first pane"),
-        (true, "flash-model".to_owned())
+        launched_pi(&place, "the first pane"),
+        ("legacy".to_owned(), "flash-model".to_owned())
     );
     // The list moves the first mate to pro: a fresh session there.
     list(["pro", "flash"]);
+    let (pro, model) = launched_pi(&place, "the pane on pro");
+    assert_eq!(model, "pro-model");
+    assert_ne!(pro, "legacy");
+    // That session never took a turn, so flash's is still the session the
+    // folder's continue resumes: launched again on pro, the pane opens its
+    // own unwritten pro session again.
     assert_eq!(
-        launched_route(&place, "the pane on pro"),
-        (false, "pro-model".to_owned())
+        launched_pi(&place, "the pane again on pro, nothing written"),
+        (pro.clone(), "pro-model".to_owned())
     );
-    // That session never took a turn, so the folder's latest session is still
-    // flash's: launched again on pro, the pane is fresh again.
-    assert_eq!(
-        launched_route(&place, "the pane again on pro, nothing written"),
-        (false, "pro-model".to_owned())
-    );
-    // Once pro's session is written, the next launch continues it.
-    pi_session_written(&place, "pro");
-    assert_eq!(
-        launched_route(&place, "the pane again on pro"),
-        (true, "pro-model".to_owned())
-    );
-    // And back: pro's session never continues on flash.
+    // Once pro's session is written, back on flash the pane starts fresh.
+    pi_session_written(&sessions, &pro, Some(&place.folder));
     list(["flash", "pro"]);
-    assert_eq!(
-        launched_route(&place, "the pane back on flash"),
-        (false, "flash-model".to_owned())
-    );
+    let (flash, model) = launched_pi(&place, "the pane back on flash");
+    assert_eq!(model, "flash-model");
+    assert!(flash != pro && flash != "legacy", "{flash}");
     // Flash wrote nothing, so pro's session is still the latest, and pro
     // continues it.
     list(["pro", "flash"]);
     assert_eq!(
-        launched_route(&place, "the pane on pro once more"),
-        (true, "pro-model".to_owned())
+        launched_pi(&place, "the pane on pro once more"),
+        (pro, "pro-model".to_owned())
     );
 }
 
-/// Write a Pi session in the fixture's ship folder, where Pi keeps it under
-/// the default agent directory, as a session's first turn leaves it.
-fn pi_session_written(place: &Place, name: &str) {
+/// Errands run in the ship folder and Pi saves their sessions there. An
+/// errand's session written after a pane's fresh launch is not that pane's
+/// session: it neither counts as the fresh session written, which would move
+/// the pane's route, nor is it what the pane continues, though it is newest.
+#[test]
+fn a_hosted_pi_pane_never_takes_an_errand_session_for_its_own() {
+    let place = Place::new();
+    let route = |model: &str| {
+        json!({"manifest": "bundled:pi", "cost": "plan",
+            "options": {"provider": "fixture-provider", "model": model}})
+    };
+    let list = |order: [&str; 2]| {
+        place.json(
+            "routes.set",
+            json!({"routes": {"flash": route("flash-model"), "pro": route("pro-model")},
+                "first_mate": order}),
+        );
+    };
+    let _herdr = route_herdr(&place);
+    let sessions = pi_default_sessions(&place);
+    pi_session_written(&sessions, "flash-session", Some(&place.folder));
+    list(["flash", "pro"]);
+    assert_eq!(
+        launched_pi(&place, "the pane on flash"),
+        ("flash-session".to_owned(), "flash-model".to_owned())
+    );
+    list(["pro", "flash"]);
+    let (pro, _) = launched_pi(&place, "the fresh pane on pro");
+    // An errand on another model writes its session in the folder, after the
+    // pane's fresh spawn and newer than any.
+    pi_session_written(&sessions, "errand-session", Some(&place.folder));
+    // Back on flash, pro has written nothing: flash's session continues.
+    list(["flash", "pro"]);
+    assert_eq!(
+        launched_pi(&place, "the pane back on flash"),
+        ("flash-session".to_owned(), "flash-model".to_owned())
+    );
+    // On pro again, the pane opens a session of its own, not the errand's.
+    list(["pro", "flash"]);
+    let (again, model) = launched_pi(&place, "the pane on pro again");
+    assert_eq!(model, "pro-model");
+    assert!(
+        !["errand-session", "flash-session"].contains(&again.as_str()),
+        "{again} after {pro}"
+    );
+}
+
+/// With a session directory several folders share
+/// (`PI_CODING_AGENT_SESSION_DIR`), Pi keeps only the sessions whose header
+/// names the working folder, and so does the pane: another folder's newer
+/// session there is neither continued nor the pane's fresh session written.
+#[test]
+fn a_hosted_pi_pane_keeps_to_its_folder_in_a_shared_session_dir() {
+    let place = Place::new();
+    let route = |model: &str| {
+        json!({"manifest": "bundled:pi", "cost": "plan",
+            "options": {"provider": "fixture-provider", "model": model}})
+    };
+    let list = |order: [&str; 2]| {
+        place.json(
+            "routes.set",
+            json!({"routes": {"flash": route("flash-model"), "pro": route("pro-model")},
+                "first_mate": order}),
+        );
+    };
+    let shared = place.root.join("shared-sessions");
+    let _herdr = route_herdr_with(
+        &place,
+        &[("PI_CODING_AGENT_SESSION_DIR", shared.display().to_string())],
+    );
+    let other = place.root.join("other-ship");
+    fs::create_dir(&other).unwrap();
+    pi_session_written(&shared, "mine", Some(&place.folder));
+    pi_session_written(&shared, "theirs", Some(&other));
+    list(["flash", "pro"]);
+    assert_eq!(
+        launched_pi(&place, "the pane on flash"),
+        ("mine".to_owned(), "flash-model".to_owned())
+    );
+    list(["pro", "flash"]);
+    let (pro, _) = launched_pi(&place, "the fresh pane on pro");
+    assert!(pro != "mine" && pro != "theirs", "{pro}");
+    // Another folder's session is written there after the spawn: it is not
+    // pro's session written, so flash's continues.
+    pi_session_written(&shared, "theirs-later", Some(&other));
+    list(["flash", "pro"]);
+    assert_eq!(
+        launched_pi(&place, "the pane back on flash"),
+        ("mine".to_owned(), "flash-model".to_owned())
+    );
+    // Once the pane's own pro session is written there, it counts: flash
+    // starts fresh and pro continues its own.
+    list(["pro", "flash"]);
+    let (pro, _) = launched_pi(&place, "the fresh pane on pro again");
+    pi_session_written(&shared, &pro, Some(&place.folder));
+    list(["flash", "pro"]);
+    let (flash, _) = launched_pi(&place, "the pane on flash after pro wrote");
+    assert!(flash != "mine" && flash != pro, "{flash}");
+    list(["pro", "flash"]);
+    assert_eq!(
+        launched_pi(&place, "the pane on pro, written"),
+        (pro, "pro-model".to_owned())
+    );
+}
+
+/// A Pi `sessionDir` setting moves where Pi writes sessions. The pane looks
+/// there, so its fresh session counts once written, rather than the pane
+/// staying fresh forever.
+#[test]
+fn a_hosted_pi_pane_finds_its_session_under_the_session_dir_setting() {
+    let place = Place::new();
+    let route = |model: &str| {
+        json!({"manifest": "bundled:pi", "cost": "plan",
+            "options": {"provider": "fixture-provider", "model": model}})
+    };
+    let list = |order: [&str; 2]| {
+        place.json(
+            "routes.set",
+            json!({"routes": {"flash": route("flash-model"), "pro": route("pro-model")},
+                "first_mate": order}),
+        );
+    };
+    let agent = place.root.join(".pi/agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"sessionDir":"~/pi-session-store"}"#,
+    )
+    .unwrap();
+    let sessions = place.root.join("pi-session-store");
+    let _herdr = route_herdr(&place);
+    pi_session_written(&sessions, "flash-session", Some(&place.folder));
+    list(["flash", "pro"]);
+    assert_eq!(
+        launched_pi(&place, "the pane on flash"),
+        ("flash-session".to_owned(), "flash-model".to_owned())
+    );
+    list(["pro", "flash"]);
+    let (pro, _) = launched_pi(&place, "the fresh pane on pro");
+    pi_session_written(&sessions, &pro, Some(&place.folder));
+    // Pro's session is written where the setting puts it: back on flash the
+    // pane starts fresh rather than continue flash's on top of pro's turns,
+    // and pro continues its own.
+    list(["flash", "pro"]);
+    let (flash, _) = launched_pi(&place, "the pane back on flash");
+    assert!(flash != "flash-session" && flash != pro, "{flash}");
+    list(["pro", "flash"]);
+    assert_eq!(
+        launched_pi(&place, "the pane on pro again"),
+        (pro, "pro-model".to_owned())
+    );
+}
+
+/// Where Pi keeps the fixture ship folder's sessions under the default agent
+/// directory.
+fn pi_default_sessions(place: &Place) -> PathBuf {
     let cwd = fs::canonicalize(&place.folder).unwrap();
     let cwd = cwd.to_str().unwrap();
     let safe = format!(
@@ -5462,13 +5635,34 @@ fn pi_session_written(place: &Place, name: &str) {
             .unwrap_or(cwd)
             .replace(['/', '\\', ':'], "-")
     );
-    let sessions = place.root.join(".pi/agent/sessions").join(safe);
-    fs::create_dir_all(&sessions).unwrap();
-    fs::write(
-        sessions.join(format!("{name}.jsonl")),
-        "{\"type\":\"session\"}\n",
-    )
-    .unwrap();
+    place.root.join(".pi/agent/sessions").join(safe)
+}
+
+/// Write a Pi session file, as a session's first turn leaves it: its header
+/// names its id and working folder, and it is the newest in `dir`.
+fn pi_session_written(dir: &Path, id: &str, cwd: Option<&Path>) {
+    fs::create_dir_all(dir).unwrap();
+    let mut header = json!({"type":"session","version":3,"id":id});
+    if let Some(cwd) = cwd {
+        header["cwd"] = json!(fs::canonicalize(cwd).unwrap());
+    }
+    let file = dir.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+    // Newer than any session already there, on a filesystem with coarse times.
+    let newest = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .max();
+    fs::write(&file, format!("{header}\n")).unwrap();
+    if let Some(newest) = newest {
+        let at = newest.max(std::time::SystemTime::now()) + std::time::Duration::from_secs(1);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
 }
 
 /// A hosted Claude pane is bound the same way: its folder's interactive

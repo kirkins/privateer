@@ -10,6 +10,7 @@
 //! exit, release the lease and end. The dispatcher, or the relaunch command,
 //! then starts a fresh pane on the release `current` selects, continuing the
 //! ship's conversation. Nothing here interrupts a turn that is running.
+use crate::host::pi_sessions::PiSessions;
 use crate::host::sleep::FRESH_MS;
 use crate::presence;
 use crate::releases::{self, Release};
@@ -276,77 +277,167 @@ pub(crate) fn harness(store: &Store, ship: &str, harness: u32) -> Result<()> {
 
 /// The model route, `harness/provider/model`, of the ship folder's session a
 /// pane's continue resumes; None before any pane recorded one. A fresh launch
-/// takes that place only once its harness has written a session after its
-/// spawn: one that never took a turn left nothing, so a continue would still
-/// find the session before it, on its own route.
-pub(crate) fn session_route(store: &Store, ship: &str, folder: &Path) -> Result<Option<String>> {
-    let Some((session, fresh, since)) = launched(store, ship)? else {
+/// takes that place only once its harness has written its session: one that
+/// never took a turn left nothing, so a continue would still find the session
+/// before it, on its own route. `pi` is where a Pi pane's sessions are.
+pub(crate) fn session_route(
+    store: &Store,
+    ship: &str,
+    folder: &Path,
+    pi: Option<&PiSessions>,
+) -> Result<Option<String>> {
+    let Some(launched) = launched(store, ship)? else {
         return Ok(None);
     };
-    match (fresh, since) {
-        (Some(fresh), Some(since)) if written(folder, &fresh, since) => {
+    match (&launched.fresh, launched.fresh_ms) {
+        (Some(fresh), Some(since)) if written(folder, fresh, since, &launched, pi) => {
             store.connection().execute(
-                "UPDATE hosted_panes SET session_route=fresh_route, fresh_route=NULL, fresh_ms=NULL
+                "UPDATE hosted_panes SET session_route=fresh_route, session_id=fresh_id,
+                   fresh_route=NULL, fresh_ms=NULL, fresh_id=NULL
                  WHERE ship=?1 AND fresh_ms=?2",
                 params![ship, since],
             )?;
-            Ok(Some(fresh))
+            Ok(Some(fresh.clone()))
         }
-        _ => Ok(session),
+        _ => Ok(launched.session),
     }
 }
 
-/// Whether the pane's fresh session has yet to write anything, so it has no
-/// conversation of its own to continue. Read only.
+/// Whether the pane's fresh Claude session has yet to write anything, so it
+/// has no conversation of its own to continue. Read only.
 pub(crate) fn fresh_unwritten(store: &Store, ship: &str, folder: &Path) -> Result<bool> {
     Ok(
-        launched(store, ship)?.is_some_and(|(_, fresh, since)| match (fresh, since) {
-            (Some(fresh), Some(since)) => !written(folder, &fresh, since),
+        launched(store, ship)?.is_some_and(|launched| match (&launched.fresh, launched.fresh_ms) {
+            (Some(fresh), Some(since)) => !written(folder, fresh, since, &launched, None),
             _ => false,
         }),
     )
 }
 
-/// The recorded session route, and a fresh launch's route and spawn time.
-type Launched = (Option<String>, Option<String>, Option<i64>);
+/// The Pi session a pane launching on `route` gives Pi to open, by id, and
+/// whether that continues a session the pane's route ran: its fresh session
+/// on that route, which may not be written yet; else the route's written
+/// session; else, for a pane that never named one, the session `--continue`
+/// would have resumed, except one an errand or wake of the ship recorded;
+/// else a new one. Never another route's session, and never the folder's
+/// newest just for being newest: an errand writes there too.
+pub(crate) fn pi_session(
+    store: &Store,
+    ship: &str,
+    folder: &Path,
+    route: Option<&str>,
+    pi: &PiSessions,
+) -> Result<(String, bool)> {
+    session_route(store, ship, folder, Some(pi))?;
+    let launched = launched(store, ship)?.unwrap_or_default();
+    let on = |recorded: &Option<String>| recorded.as_deref() == route;
+    if let Some(id) = launched.fresh_id.clone().filter(|_| on(&launched.fresh)) {
+        return Ok((id, false));
+    }
+    if launched.session.is_none() || on(&launched.session) {
+        if let Some(id) = launched.session_id {
+            return Ok((id, true));
+        }
+        if launched.fresh_id.is_none()
+            && let Some(id) = pi.newest(&headless_sessions(store, ship))
+        {
+            return Ok((id, true));
+        }
+    }
+    Ok((super::pi_sessions::new_id(), false))
+}
+
+/// The sessions the ship's errands and wakes ran, which are not a pane's.
+fn headless_sessions(store: &Store, ship: &str) -> Vec<String> {
+    let ids = || -> rusqlite::Result<Vec<String>> {
+        let mut statement = store.connection().prepare(
+            "SELECT session_id FROM sessions WHERE ship=?1
+             UNION SELECT session_id FROM errands WHERE ship=?1 AND session_id IS NOT NULL",
+        )?;
+        statement
+            .query_map([ship], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()
+    };
+    ids().unwrap_or_default()
+}
+
+/// The recorded session route and Pi session id, and a fresh launch's route,
+/// spawn time and Pi session id.
+#[derive(Default)]
+struct Launched {
+    session: Option<String>,
+    session_id: Option<String>,
+    fresh: Option<String>,
+    fresh_ms: Option<i64>,
+    fresh_id: Option<String>,
+}
 
 fn launched(store: &Store, ship: &str) -> Result<Option<Launched>> {
     Ok(store
         .connection()
         .query_row(
-            "SELECT session_route, fresh_route, fresh_ms FROM hosted_panes WHERE ship=?1",
+            "SELECT session_route, session_id, fresh_route, fresh_ms, fresh_id
+             FROM hosted_panes WHERE ship=?1",
             [ship],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok(Launched {
+                    session: r.get(0)?,
+                    session_id: r.get(1)?,
+                    fresh: r.get(2)?,
+                    fresh_ms: r.get(3)?,
+                    fresh_id: r.get(4)?,
+                })
+            },
         )
         .optional()?)
 }
 
-fn written(folder: &Path, route: &str, since_ms: i64) -> bool {
-    let harness = route.split('/').next().unwrap_or_default();
-    crate::host::session_since(folder, harness, since_ms)
+/// Whether the fresh launch on `route` has written its session: Claude's
+/// interactive transcript after the spawn, or the Pi session with the id the
+/// pane gave it (any session after the spawn, for a launch recorded before
+/// panes named theirs).
+fn written(
+    folder: &Path,
+    route: &str,
+    since_ms: i64,
+    launched: &Launched,
+    pi: Option<&PiSessions>,
+) -> bool {
+    match route.split('/').next().unwrap_or_default() {
+        "claude" => crate::host::claude_session_since(folder, since_ms),
+        "pi" | "pi-signed" => pi.is_some_and(|pi| match &launched.fresh_id {
+            Some(id) => pi.has(id),
+            None => pi.written_since(since_ms),
+        }),
+        _ => false,
+    }
 }
 
 /// Record the model route this pane launched its harness on, spawned at
-/// `spawned_ms`: the session's own when it continued it, otherwise a fresh
-/// one, which stays apart until it writes a session (`session_route`).
+/// `spawned_ms`, and the Pi session id it gave: the session's own when it
+/// continued it, otherwise a fresh one, which stays apart until it writes a
+/// session (`session_route`).
 pub(crate) fn record_launch(
     store: &Store,
     ship: &str,
     route: Option<&str>,
     continued: bool,
     spawned_ms: i64,
+    session_id: Option<&str>,
 ) -> Result<()> {
     let pid = std::process::id();
     if continued {
         store.connection().execute(
-            "UPDATE hosted_panes SET session_route=?3, fresh_route=NULL, fresh_ms=NULL
+            "UPDATE hosted_panes SET session_route=?3, session_id=?4,
+               fresh_route=NULL, fresh_ms=NULL, fresh_id=NULL
              WHERE ship=?1 AND pid=?2",
-            params![ship, pid, route],
+            params![ship, pid, route, session_id],
         )?;
     } else {
         store.connection().execute(
-            "UPDATE hosted_panes SET fresh_route=?3, fresh_ms=?4 WHERE ship=?1 AND pid=?2",
-            params![ship, pid, route, spawned_ms],
+            "UPDATE hosted_panes SET fresh_route=?3, fresh_ms=?4, fresh_id=?5
+             WHERE ship=?1 AND pid=?2",
+            params![ship, pid, route, spawned_ms, session_id],
         )?;
     }
     Ok(())
