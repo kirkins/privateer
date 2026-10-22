@@ -431,7 +431,9 @@ pub(crate) fn written(path: &Path) -> Option<u64> {
 /// matched however many reads later it is written; at most `MAX_PENDING`
 /// are kept, the oldest dropped first, and a dropped call's refusal is one
 /// the watch cannot see got past. A line longer than one read is stepped
-/// over, not read. None when the transcript cannot be read.
+/// over, not read. A transcript now shorter than `offset` was cut or
+/// replaced: nothing is read, and the next read starts at 0. None when the
+/// transcript cannot be read.
 pub(crate) fn retried(
     path: &Path,
     folder: &Path,
@@ -444,10 +446,10 @@ pub(crate) fn retried(
     let length = file.metadata().ok()?.len();
     if length <= offset {
         // Shorter than the place it was read to, it was cut or replaced:
-        // what it holds now was never read.
+        // what it holds now was never read, so the next read starts over.
         return Some(Retried {
             found: vec![],
-            next: length,
+            next: if length == offset { offset } else { 0 },
             whole: length == offset,
         });
     }
@@ -939,7 +941,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_transcript_shorter_than_the_place_read_to_is_not_whole() {
+    fn a_transcript_shorter_than_the_place_read_to_is_read_again_from_its_start() {
         let temp = tempfile::tempdir().unwrap();
         let folder = Path::new(FITFORGE);
         let session = "00000000-0000-4000-8000-0000000000f1";
@@ -948,10 +950,13 @@ pub(crate) mod tests {
         let end = std::fs::metadata(&path).unwrap().len();
         let read = retried(&path, folder, session, end + 100, &wanted, &mut vec![]).unwrap();
         assert!(!read.whole, "{read:?}");
-        assert_eq!(read.next, end);
-        // Read on from there, it is whole again.
+        assert!(read.found.is_empty(), "{read:?}");
+        assert_eq!(read.next, 0);
+        // Read again from there, what it holds now is read, whole.
         let read = retried(&path, folder, session, read.next, &wanted, &mut vec![]).unwrap();
         assert!(read.whole, "{read:?}");
+        assert_eq!(read.next, end);
+        assert_eq!(read.found.len(), 1, "{read:?}");
     }
 
     #[test]
