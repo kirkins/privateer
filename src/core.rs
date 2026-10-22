@@ -547,8 +547,9 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
 }
 
 /// Operator-run retention. Removes event facts that no longer back a pending
-/// notification, audit rows and finished, released jobs with their logs, all
-/// older than the cutoff. Pending notifications and live jobs are kept.
+/// notification, audit rows, finished, released jobs with their logs, and
+/// finished wakes, all older than the cutoff. Pending notifications, live
+/// jobs and the wakes they or `unwoken` still need are kept.
 /// Pruned event and job ids can be reused afterwards.
 fn history_prune(store: &Store, args: &Value) -> Result<Value> {
     let cutoff = match (args.get("before_ms"), args.get("older_than_days")) {
@@ -592,8 +593,9 @@ fn history_prune(store: &Store, args: &Value) -> Result<Value> {
     let (jobs, jobs_still_reserved, directories) = crate::jobs::prune(store, cutoff, dry_run)?;
     let mail = crate::mail::prune(store, cutoff, dry_run)?;
     let notes = crate::context::prune(store, cutoff, dry_run)?;
+    let wakes = crate::activation::prune(store, cutoff, dry_run)?;
     let mut result = json!({"before_ms":cutoff,"dry_run":dry_run,"events":events,"audit":audit,
-        "jobs":jobs,"jobs_still_reserved":jobs_still_reserved,"mail":mail,"notes":notes});
+        "jobs":jobs,"jobs_still_reserved":jobs_still_reserved,"mail":mail,"notes":notes,"wakes":wakes});
     if dry_run {
         return Ok(result);
     }

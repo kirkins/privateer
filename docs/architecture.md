@@ -21,7 +21,7 @@ Admission governs work started through `job.start`. A harness started by `agent.
 
 Events are facts. Pending notifications are a projection: repeated facts concerning the same task and issue update one pending item. An acknowledgment names the sequence actually observed, so a later fact cannot be silently discarded. Messages name a recipient and a task rather than broadcasting to the whole fleet.
 
-History is kept until an operator prunes it. `history.prune` (`older_than_days` or `before_ms`, optionally `dry_run`) removes event facts older than the cutoff that no longer back a pending notification, audit rows older than the cutoff, and finished jobs whose reservations are released, together with their log directories. Pending notifications, including unread messages, and live or still-reserved jobs are kept. Pruned event and job ids may be reused afterwards. Nothing is deleted automatically; run it by hand or from cron.
+History is kept until an operator prunes it. `history.prune` (`older_than_days` or `before_ms`, optionally `dry_run`) removes event facts older than the cutoff that no longer back a pending notification, audit rows older than the cutoff, finished jobs whose reservations are released, together with their log directories, and finished wakes. Pending notifications, including unread messages, live or still-reserved jobs, wakes whose job record remains and each ship's newest succeeded wake (the sequence it was woken through) are kept. Pruned event and job ids may be reused afterwards. Nothing is deleted automatically; run it by hand or from cron.
 
 ## Ships and mailboxes
 

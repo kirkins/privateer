@@ -1354,6 +1354,25 @@ fn history_prune_keeps_pending_facts_and_reserved_capacity() {
         )
         .unwrap();
     assert!(home.join("jobs/finished").exists());
+    // Wakes age out with the rest, except the live one, the one whose job
+    // record still exists, and each ship's newest succeeded wake (the
+    // sequence it was woken through).
+    for (id, status, through, job) in [
+        ("wake-old", "succeeded", 1, None),
+        ("wake-failed", "failed", 1, None),
+        ("wake-newest", "succeeded", 2, None),
+        ("wake-live", "running", 2, Some("held")),
+    ] {
+        Store::open(&home)
+            .unwrap()
+            .connection()
+            .execute(
+                "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms,finished_ms)
+                 VALUES(?1,'mate','task:task',?2,?3,'headless',?4,0,0)",
+                params![id, through, job, status],
+            )
+            .unwrap();
+    }
     let now = ok(&home, "status", json!({}));
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1377,6 +1396,17 @@ fn history_prune_keeps_pending_facts_and_reserved_capacity() {
     assert_eq!(pruned["events"], 2);
     assert_eq!(pruned["jobs"], 1);
     assert_eq!(pruned["log_directories_failed"], 0);
+    assert_eq!(pruned["wakes"], 2, "{pruned}");
+    let kept: Vec<String> = Store::open(&home)
+        .unwrap()
+        .connection()
+        .prepare("SELECT id FROM wakes ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(kept, ["wake-live", "wake-newest"]);
     let history = ok(&home, "event.history", json!({"limit":100}));
     let ids: Vec<_> = history["events"]
         .as_array()

@@ -699,6 +699,31 @@ fn wake_text(
 /// Codex and native guards (Pi, Claude, Gemini, Cursor, AGY) report per turn
 /// (`turn.completed` or a failed native turn); an unguarded stream's final
 /// `result` is taken as reported; otherwise use the last object.
+/// Retention for `history.prune`: finished wakes older than the cutoff.
+/// Kept: wakes still offered or running, wakes whose job record still
+/// exists (jobs are pruned first, so a live or recent job keeps its wake),
+/// and each ship's newest succeeded wake, which `unwoken` reads for the
+/// sequence the ship was woken through.
+pub(crate) fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
+    let stale = "COALESCE(finished_ms, created_ms) < ?1
+         AND status NOT IN ('offered', 'running')
+         AND (job_id IS NULL OR NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.id = wakes.job_id))
+         AND id IS NOT (SELECT newest.id FROM wakes newest WHERE newest.ship = wakes.ship
+                        AND newest.status = 'succeeded'
+                        ORDER BY newest.through_seq DESC, newest.created_ms DESC LIMIT 1)";
+    let count: i64 = store.connection().query_row(
+        &format!("SELECT COUNT(*) FROM wakes WHERE {stale}"),
+        [cutoff_ms],
+        |r| r.get(0),
+    )?;
+    if !dry_run {
+        store
+            .connection()
+            .execute(&format!("DELETE FROM wakes WHERE {stale}"), [cutoff_ms])?;
+    }
+    Ok(count)
+}
+
 pub(crate) fn usage(log: &str) -> Option<Value> {
     let mut turns: Option<Map<String, Value>> = None;
     let mut result = None;
