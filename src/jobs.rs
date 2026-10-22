@@ -3876,6 +3876,38 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         }
         return Ok(job);
     }
+    // Only a supervisor's claim moves a job on from `starting`, and it spawns
+    // no payload before claiming. A job still starting with no live
+    // supervisor past the start grace was never claimed, so there is no
+    // payload to look for: it fails here, as any job whose work is provably
+    // gone does, instead of waiting as an orphan for a forced recovery.
+    if job.status == "starting"
+        && !supervisor_alive
+        && job.payload.is_none()
+        && Store::now_ms() - job.created_ms > START_GRACE_MS
+    {
+        let observed_incarnation = job.incarnation.clone();
+        let mut settled = false;
+        job = alter(store, &job.id, |j| {
+            if j.status != "starting" || j.incarnation != observed_incarnation {
+                return;
+            }
+            settled = true;
+            j.status = "failed".into();
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some("supervisor never started".into());
+        })?;
+        if terminal(&job.status) {
+            release(store, &job)?;
+        }
+        if settled {
+            store.audit(
+                "job.settled",
+                &json!({"job_id": job.id, "status": job.status, "exit_code": job.exit_code}),
+            )?;
+        }
+        return Ok(job);
+    }
     if !supervisor_alive
         && (job.payload.is_some() || Store::now_ms() - job.created_ms > START_GRACE_MS)
     {
