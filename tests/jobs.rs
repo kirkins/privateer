@@ -2553,6 +2553,50 @@ fn a_finished_job_keeps_its_capacity_while_what_it_left_still_runs() {
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 
+#[test]
+fn a_lost_supervisor_still_finds_what_its_payload_starts_later() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // The payload starts a helper in a session of its own only when told
+    // to, after its supervisor is gone, and exits when told to.
+    let command = [
+        support::python().display().to_string(),
+        "-c".into(),
+        "import os, subprocess, time\n\
+         while not os.path.exists('go'): time.sleep(0.02)\n\
+         child = subprocess.Popen(['sleep', '60'], start_new_session=True)\n\
+         open('escaped.pid', 'w').write(str(child.pid))\n\
+         while not os.path.exists('leave'): time.sleep(0.02)"
+            .into(),
+    ];
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    start(&home, "build", &command);
+    let running = wait(&home, "build", &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    assert!(gone(supervisor));
+    fs::write(fixture.repo.join("go"), "").unwrap();
+    let child = escaped_pid(&fixture);
+    // A pass while the payload still runs finds the helper it started.
+    fixture.serve(&home);
+    fs::write(fixture.repo.join("leave"), "").unwrap();
+    assert!(gone(payload));
+    fixture.serve(&home);
+    let job = ok(&home, "job.status", json!({"id":"build"}));
+    assert_eq!(job["status"], "orphaned", "{job}");
+    assert!(active_pid(child), "the helper was ended with the leader");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+    assert!(gone(child));
+    let settled = fixture.settle(&home, "build", &["failed"]);
+    assert_eq!(
+        settled["reason"],
+        "supervisor disappeared; payload ended without a recorded result"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
 /// Where a job's stdout log is, for the one incarnation this fixture ran.
 fn stdout_log(home: &Path, id: &str) -> PathBuf {
     let job = ok(home, "job.status", json!({"id":id}));
