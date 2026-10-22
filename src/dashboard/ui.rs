@@ -108,6 +108,14 @@ pub struct App {
     pub pick: Option<(String, String)>,
     /// Show the observation details in place of the live feed.
     pub diagnostics: bool,
+    /// The full-screen view of one need, while open.
+    pub focus: Option<super::focus::Focus>,
+    /// A reply or dismissal the focus view asked for, for the worker.
+    pub focus_send: Option<super::focus::Send>,
+    /// Needs answered from here, hidden until the fleet stops listing them.
+    pub answered: std::collections::BTreeSet<String>,
+    /// The selected row of Needs you, by need id.
+    pub need_cursor: Option<String>,
 }
 impl App {
     pub fn select_ship(&mut self, id: Option<String>) {
@@ -119,6 +127,7 @@ impl App {
         }
         self.ship = id;
         self.pick = None;
+        self.focus = None;
         self.inbox_open = false;
         self.needs_focus = false;
         self.selected = 0;
@@ -383,12 +392,38 @@ impl App {
         if self.inbox_open {
             self.mail.len()
         } else if self.needs_focus {
-            self.attention.items().len()
+            self.queue().len()
         } else {
             self.snapshot.ships.len()
         }
     }
+    /// Selects a row of Needs you; a need of this machine also keeps its
+    /// exact binding, as the answer path requires.
+    fn select_need(&mut self, index: usize) {
+        let queue = self.queue();
+        let item = queue.get(index);
+        self.selected = index;
+        self.need_cursor = item.map(|i| i.id.clone());
+        self.need_id = item
+            .and_then(|i| i.local)
+            .and_then(|l| self.attention.items().get(l).map(|n| n.binding()));
+    }
     pub fn move_selection(&mut self, down: bool) {
+        if self.needs_focus && !self.inbox_open {
+            let len = self.queue().len();
+            let current = self
+                .need_cursor
+                .as_ref()
+                .and_then(|id| self.queue().iter().position(|i| &i.id == id));
+            let next = match current {
+                Some(c) if down => (c + 1).min(len.saturating_sub(1)),
+                Some(c) => c.saturating_sub(1),
+                None => 0,
+            };
+            self.select_need(next);
+            self.scroll = 0;
+            return;
+        }
         if self.inbox_open || self.needs_focus {
             self.selected = if down {
                 self.selected
@@ -451,8 +486,19 @@ impl App {
     pub fn update_attention(&mut self, attention: Attention) {
         self.attention = attention;
         if self.needs_focus {
-            // Never silently select the replacement when an actionable row disappears.
-            let index = self.need_id.as_ref().and_then(|binding| {
+            // A need is followed by its id; when it leaves the queue nothing
+            // else is silently selected in its place.
+            let queue = self.queue();
+            let index = self
+                .need_cursor
+                .as_ref()
+                .and_then(|id| queue.iter().position(|i| &i.id == id));
+            self.selected = index.unwrap_or(usize::MAX);
+            if index.is_none() {
+                self.need_cursor = None;
+            }
+            // Never silently bind the replacement when an actionable row disappears.
+            let bound = self.need_id.as_ref().and_then(|binding| {
                 if self
                     .attention
                     .sources
@@ -471,9 +517,14 @@ impl App {
                 let first = matches.next().map(|(i, _)| i);
                 first.filter(|_| matches.next().is_none())
             });
-            self.selected = index.unwrap_or(usize::MAX);
-            if index.is_none() {
+            if bound.is_none() {
                 self.need_id = None;
+                // A need of this machine whose exact binding went is selected
+                // again explicitly, never followed to its replacement.
+                if index.is_some_and(|i| queue[i].local.is_some()) {
+                    self.need_cursor = None;
+                    self.selected = usize::MAX;
+                }
             }
         }
     }
@@ -625,6 +676,10 @@ impl App {
             self.revoke_key(key);
             return false;
         }
+        if self.focus.is_some() {
+            self.focus_key(key);
+            return false;
+        }
         match key {
             KeyCode::Char('i') => self.open_inbox(),
             KeyCode::Char('d') if !self.inbox_open => {
@@ -643,7 +698,7 @@ impl App {
                 self.selected = 0;
                 self.scroll = 0;
                 if self.needs_focus {
-                    self.need_id = self.attention.items().first().map(|n| n.binding());
+                    self.select_need(0);
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(false),
@@ -656,7 +711,20 @@ impl App {
                     self.notice = "Select a history item again.".into();
                 }
             }
-            KeyCode::Enter | KeyCode::Char('r') if self.needs_focus => self.begin_answer(),
+            KeyCode::Enter | KeyCode::Char('r') if self.needs_focus => {
+                match self.need_cursor.clone() {
+                    Some(id) => self.open_focus(&id),
+                    None => self.notice = "Select a need with ↑↓.".into(),
+                }
+            }
+            // n opens the oldest need from anywhere on the deck.
+            KeyCode::Char('n') if !self.inbox_open => match self.queue().first() {
+                Some(item) => {
+                    let id = item.id.clone();
+                    self.open_focus(&id)
+                }
+                None => self.notice = "Nothing is waiting on you.".into(),
+            },
             KeyCode::Enter
                 if !self.inbox_open
                     && (self.selected_remote().is_some() || self.picked_elsewhere().is_some()) =>
@@ -673,6 +741,7 @@ impl App {
             || self.composer.is_some()
             || self.answer.is_some()
             || self.revoke.is_some()
+            || self.focus.is_some()
         {
             return;
         }
@@ -696,7 +765,7 @@ impl App {
                     self.scroll = 0;
                     if !self.inbox_open {
                         self.needs_focus = true;
-                        self.need_id = self.attention.items().get(index).map(|n| n.binding());
+                        self.select_need(index);
                     } else {
                         self.mail_id = self.mail.get(index).map(Mail::binding);
                     }
@@ -1028,6 +1097,15 @@ impl App {
                 .style(Style::default().fg(Color::Yellow)),
                 rows[0],
             );
+        } else if self.focus.is_some() {
+            frame.render_widget(
+                Paragraph::new(self.focus_header()).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rows[0],
+            );
         } else {
             let (header, clock) = self.header_line(crate::store::Store::now_ms());
             frame.render_widget(Paragraph::new(header), rows[0]);
@@ -1046,6 +1124,8 @@ impl App {
                 self.reduced,
                 self.ascii,
             );
+        } else if self.focus.is_some() {
+            self.draw_focus(frame, rows[1]);
         } else if self.inbox_open {
             let parts = Layout::vertical([
                 Constraint::Length((rows[1].height / 3).max(3)),
@@ -1105,13 +1185,15 @@ impl App {
             Paragraph::new(vec![
                 Line::from(if self.voyage.is_some() {
                     "v / Esc: back to bridge · q quit".to_owned()
+                } else if self.focus.is_some() {
+                    self.focus_keys().to_owned()
                 } else if self.inbox_open {
                     "i history · Enter mark read · PgUp/PgDn scroll · Esc bridge · q quit".to_owned()
                 } else if self.revoke.is_some() {
                     "↑↓ pick approval · Enter revoke · Esc cancel".to_owned()
                 } else {
                     format!(
-                        "↑↓ select · Tab Fleet/Needs · Enter focus/answer · d details · {}i history · v voyage · q quit",
+                        "↑↓ select · Tab Fleet/Needs · Enter open · n next need · d details · {}i history · v voyage · q quit",
                         if self.revocable().is_some() {
                             "x revoke approval · "
                         } else {

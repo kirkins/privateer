@@ -120,30 +120,41 @@ impl DeckJob {
     }
 }
 
+/// One runtime need as the fleet view lists it, kept whole so the focus
+/// view can show its decision and answer it.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct DeckNeed {
-    pub id: String,
-    pub kind: String,
-    pub ship: String,
-    pub machine: String,
-    pub question: Option<String>,
-    pub summary: Option<String>,
-    pub asked_ms: Option<i64>,
-    pub created_ms: Option<i64>,
-    pub needs_hands: bool,
-}
+#[serde(transparent)]
+pub struct DeckNeed(pub Value);
 
 impl DeckNeed {
+    pub fn id(&self) -> &str {
+        self.0["id"].as_str().unwrap_or("")
+    }
+    pub fn machine(&self) -> &str {
+        self.0["machine"].as_str().unwrap_or("")
+    }
+    pub fn needs_hands(&self) -> bool {
+        self.0["needs_hands"] == true
+    }
     pub fn since_ms(&self) -> Option<i64> {
-        self.asked_ms.or(self.created_ms)
+        self.0["asked_ms"]
+            .as_i64()
+            .or(self.0["created_ms"].as_i64())
     }
     pub fn text(&self) -> &str {
-        self.question
-            .as_deref()
-            .or(self.summary.as_deref())
+        self.0["question"]
+            .as_str()
+            .or(self.0["summary"].as_str())
             .unwrap_or("")
     }
+}
+
+/// The whole of an ask waiting on the captain, from `captain.waiting`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ask {
+    pub body: String,
+    pub step: Option<String>,
+    pub report: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -217,6 +228,8 @@ pub struct Deck {
     pub cursor: Option<Value>,
     /// The activity read has caught up with the present.
     pub caught_up: bool,
+    /// Asks waiting on the captain, by mail id.
+    pub asks: std::collections::BTreeMap<String, Ask>,
     pub errors: Vec<String>,
 }
 
@@ -252,6 +265,27 @@ impl Deck {
         }
         self.prune(now_ms);
         more
+    }
+
+    /// Replaces the asks with a `captain.waiting` reading.
+    pub fn absorb_waiting(&mut self, waiting: &Value) {
+        self.asks.clear();
+        for entry in waiting["waiting"].as_array().into_iter().flatten() {
+            let mail = &entry["mail"];
+            let Some(id) = mail["id"].as_str() else {
+                continue;
+            };
+            let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+            self.asks.insert(
+                id.to_owned(),
+                Ask {
+                    body: mail["body"].as_str().unwrap_or("").to_owned(),
+                    step: text(&entry["step"])
+                        .or_else(|| text(&mail["payload"]["needs_hands"]["step"])),
+                    report: text(&mail["payload"]["report"]["content"]),
+                },
+            );
+        }
     }
 
     fn prune(&mut self, now_ms: i64) {
@@ -314,6 +348,10 @@ pub fn worker(home: PathBuf) -> Receiver<Deck> {
                     deck.fleet_ms = Some(Store::now_ms());
                 }
                 Err(e) => deck.errors.push(format!("fleet: {e}")),
+            }
+            match call("captain.waiting", json!({})) {
+                Ok(waiting) => deck.absorb_waiting(&waiting),
+                Err(e) => deck.errors.push(format!("asks: {e}")),
             }
             match call("resource.status", json!({})).and_then(|v| Ok(serde_json::from_value(v)?)) {
                 Ok(resources) => deck.resources = Some(resources),

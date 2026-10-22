@@ -482,6 +482,8 @@ pub struct Answer {
     pub body: String,
     pub choice: usize,
     pub deny: bool,
+    /// Words sent with a choice; for a typed decision they go in the answer's text.
+    pub note: String,
 }
 impl Answer {
     pub fn new(need: Need) -> Self {
@@ -491,6 +493,7 @@ impl Answer {
             body: String::new(),
             choice: 0,
             deny: false,
+            note: String::new(),
         }
     }
     pub fn command(&self) -> Result<(&'static str, Value)> {
@@ -518,19 +521,41 @@ impl Answer {
                 "no inline action for recorded blockers"
             );
             let choices = item["choices"].as_array().context("missing choices")?;
-            let body = if choices.is_empty() {
-                self.body.as_str()
+            let note = self.note.trim();
+            let (body, answer) = if choices.is_empty() {
+                (self.body.clone(), None)
             } else {
-                choices
+                let label = choices
                     .get(self.choice)
                     .and_then(Value::as_str)
-                    .context("select a provided choice")?
+                    .context("select a provided choice")?;
+                // A typed decision is answered by its option id, with the note as text.
+                let option = item["decision"]["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|o| o["label"] == label)
+                    .and_then(|o| o["id"].as_str());
+                let answer = option.map(|id| {
+                    let mut answer = json!({"option_id": id});
+                    if !note.is_empty() {
+                        answer["text"] = json!(note);
+                    }
+                    answer
+                });
+                let body = if note.is_empty() {
+                    label.to_owned()
+                } else {
+                    format!("{label}\n\n{note}")
+                };
+                (body, answer)
             };
             ensure!(!body.trim().is_empty(), "answer is empty");
-            Ok((
-                "mail.send",
-                json!({"id":self.id,"from":"captain","to":item["ship"],"kind":"reply","correlation":item["source_id"],"body":body}),
-            ))
+            let mut args = json!({"id":self.id,"from":"captain","to":item["ship"],"kind":"reply","correlation":item["source_id"],"body":body});
+            if let Some(answer) = answer {
+                args["payload"] = json!({"answer": answer});
+            }
+            Ok(("mail.send", args))
         }
     }
 }
@@ -588,12 +613,14 @@ mod tests {
             app.bridge_key(KeyCode::Tab);
         }
         app.bridge_key(KeyCode::Enter);
-        assert!(app.answer.is_some(), "{}", app.notice);
+        assert!(app.focus.is_some(), "{}", app.notice);
         for c in text.chars() {
             app.bridge_key(KeyCode::Char(c));
         }
         app.bridge_key(KeyCode::Enter);
-        app.answer_action.take().unwrap()
+        app.answer_action
+            .take()
+            .unwrap_or_else(|| panic!("no answer: {} {:?}", app.notice, app.focus))
     }
     fn act(app: &App, home: &Path, answer: &Answer) -> Result<Value> {
         execute_as(
@@ -685,7 +712,7 @@ mod tests {
         assert_eq!(app.attention.items().len(), 1);
         app.bridge_key(KeyCode::Tab);
         app.bridge_key(KeyCode::Enter);
-        app.bridge_key(KeyCode::Right);
+        app.bridge_key(KeyCode::Down);
         app.bridge_key(KeyCode::Enter);
         let answer = app.answer_action.take().unwrap();
         let first = act(&app, store.home(), &answer).unwrap();
@@ -750,6 +777,8 @@ mod tests {
             crate::dispatch(&mut store,"mail.send",json!({"id":id,"from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Ship exact artifact?","payload":{"artifact":"sha256:exact","environment":"isolated-production"}})).unwrap();
             app.select_ship(None);
             app.answer = None;
+            app.focus = None;
+            app.needs_focus = false;
             observe(&mut app, store.home());
             app.bridge_key(KeyCode::Tab);
             app.bridge_key(KeyCode::Enter);
@@ -801,7 +830,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         observe(&mut app, store.home());
         assert!(app.attention.actionable(&answer.need));
-        assert_eq!(app.answer.as_ref().unwrap().id, answer.id);
+        // The open focus view keeps the need it was opened on.
+        let held = app.focus.as_ref().and_then(|f| f.need.as_ref()).unwrap();
+        assert_eq!(held.identity, answer.need.identity);
         let mut truncated = app.snapshot.clone();
         truncated.discovery = super::super::model::Discovery::Incomplete;
         assert!(
@@ -856,7 +887,7 @@ mod tests {
         assert!(act(&app, &home, &old_intent).is_err());
         app.bridge_key(KeyCode::Esc);
         app.bridge_key(KeyCode::Enter);
-        assert!(app.answer.is_none() && app.answer_action.is_none());
+        assert!(app.focus.is_none() && app.answer.is_none() && app.answer_action.is_none());
         app.bridge_key(KeyCode::Down); // explicit reselection of the copied generation
         let new_intent = intent(&mut app, "fresh answer");
         assert_ne!(new_intent.need.identity, answer.need.identity);
