@@ -1044,6 +1044,7 @@ pub(crate) fn long_jobs(store: &Store, cutoff_ms: i64) -> Result<Vec<LongJob>> {
          WHERE json_extract(j.record,'$.status')='running'
            AND json_extract(j.record,'$.spawned_ms') <= ?1
            AND COALESCE(json_extract(j.record,'$.action'),'') != 'spawn'
+           AND json_extract(j.record,'$.model_route') IS NULL
            AND NOT EXISTS(SELECT 1 FROM wakes w WHERE w.job_id=j.id)
            AND NOT EXISTS(SELECT 1 FROM errands e WHERE e.id=j.id)
            AND NOT EXISTS(SELECT 1 FROM crew_panes c WHERE c.job_id=j.id)

@@ -139,7 +139,8 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
     let task = job["task_id"].as_str().unwrap_or_default().to_owned();
     let ship = job["agent_actor"].as_str().unwrap_or_default().to_owned();
     // A command job (tests, a build) writes plain output, not agent events.
-    let command = job["action"] != "spawn";
+    // A crew is spawned, and any job with a model route runs an agent.
+    let command = job["action"] != "spawn" && job["model_route"].is_null();
     let what = if command { "job" } else { "crew" };
     let harness = job["model_route"]
         .as_str()
