@@ -8,6 +8,7 @@ pub mod captain;
 pub mod deck;
 pub mod deck_ui;
 pub mod fleet;
+pub mod focus;
 pub use crate::herdr;
 pub mod model;
 pub mod overview;

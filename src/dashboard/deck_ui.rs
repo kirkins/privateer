@@ -398,7 +398,7 @@ impl App {
         if models {
             self.draw_models(frame, models_area);
         }
-        let needs = self.attention.items().len() + self.remote_needs().len();
+        let needs = self.queue().len();
         let needs_h = (needs as u16 + 2).clamp(3, (right.height / 2).max(3));
         let [needs_area, lower] =
             Layout::vertical([Constraint::Length(needs_h), Constraint::Min(0)]).areas(right);
@@ -426,23 +426,6 @@ impl App {
         unseen
     }
 
-    fn remote_needs(&self) -> Vec<&super::deck::DeckNeed> {
-        let Some(fleet) = &self.deck.fleet else {
-            return vec![];
-        };
-        // This machine's needs come from local attention, which can answer
-        // them; the fleet view adds the rest, including any local home the
-        // attention pass could not read.
-        let local: Vec<&str> = self.attention.items().iter().map(|n| n.id()).collect();
-        let mut needs: Vec<_> = fleet
-            .needs
-            .iter()
-            .filter(|n| !local.contains(&n.id.as_str()))
-            .collect();
-        needs.sort_by_key(|n| n.since_ms().unwrap_or(i64::MAX));
-        needs
-    }
-
     fn draw_tiles(&self, frame: &mut Frame, area: Rect, now: i64) {
         let deck = &self.deck;
         let fleet = deck.fleet.as_ref();
@@ -459,7 +442,7 @@ impl App {
             Some(f) => (
                 f.needs.len(),
                 f.needs.iter().filter_map(|n| n.since_ms()).min(),
-                f.needs.iter().filter(|n| n.needs_hands).count(),
+                f.needs.iter().filter(|n| n.needs_hands()).count(),
             ),
             None => (self.attention.items().len(), None, 0),
         };
@@ -481,10 +464,11 @@ impl App {
                     ),
                 ]),
                 Line::styled(
-                    match (count, hands) {
-                        (0, _) => "nothing waiting".into(),
-                        (_, 0) => "all answerable here".into(),
-                        (_, h) => format!("{h} need your hands"),
+                    match (fleet.is_some(), count, hands) {
+                        (false, _, _) => "fleet not read yet".into(),
+                        (_, 0, _) => "nothing waiting".into(),
+                        (_, _, 0) => "n opens the oldest".into(),
+                        (_, _, h) => format!("{h} need your hands · n opens"),
                     },
                     dim(),
                 ),
@@ -1017,62 +1001,34 @@ impl App {
     }
 
     fn draw_needs(&mut self, frame: &mut Frame, area: Rect, list_style: Style, now: i64) {
-        let local = self.attention.items();
-        let remote = self.remote_needs();
+        let queue = self.queue();
         let width = area.width.saturating_sub(2) as usize;
-        let row = |glyph: &str, since: Option<i64>, ship: String, text: &str, style: Style| {
-            let age = since.map_or("  ".into(), |s| short_age(s, now));
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{glyph} {age:>3} "),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(ship, Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {}", clean(text, width.max(8))), style),
-            ]))
-        };
-        let mut items: Vec<ListItem> = local
+        let here = self.deck.fleet.as_ref().map(|f| f.machine.clone());
+        let mut items: Vec<ListItem> = queue
             .iter()
-            .map(|n| {
-                let item = &n.item;
-                row(
-                    need_glyph(
-                        item["kind"].as_str().unwrap_or(""),
-                        item["needs_hands"] == true,
-                        self.ascii,
+            .map(|item| {
+                let age = item.since_ms.map_or("  ".into(), |s| short_age(s, now));
+                let ship = if Some(&item.machine) == here.as_ref() || item.machine.is_empty() {
+                    clean(&item.ship, 30)
+                } else {
+                    format!("{}@{}", clean(&item.ship, 30), clean(&item.machine, 20))
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{} {age:>3} ",
+                            need_glyph(&item.kind, item.hands, self.ascii)
+                        ),
+                        Style::default().fg(Color::Yellow),
                     ),
-                    item["asked_ms"].as_i64().or(item["created_ms"].as_i64()),
-                    format!(
-                        "{}{}",
-                        if n.stale { "STALE " } else { "" },
-                        clean(item["ship"].as_str().unwrap_or("?"), 40)
+                    Span::styled(
+                        format!("{}{ship}", if item.stale { "STALE " } else { "" }),
+                        Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    item["question"]
-                        .as_str()
-                        .or(item["summary"].as_str())
-                        .unwrap_or(""),
-                    Style::default(),
-                )
+                    Span::raw(format!(" {}", clean(&item.question, width.max(8)))),
+                ]))
             })
             .collect();
-        items.extend(remote.iter().map(|n| {
-            row(
-                need_glyph(&n.kind, n.needs_hands, self.ascii),
-                n.since_ms(),
-                if self
-                    .deck
-                    .fleet
-                    .as_ref()
-                    .is_some_and(|f| f.machine == n.machine)
-                {
-                    clean(&n.ship, 30)
-                } else {
-                    format!("{}@{}", clean(&n.ship, 30), clean(&n.machine, 20))
-                },
-                n.text(),
-                Style::default().fg(Color::Gray),
-            )
-        }));
         // Homes whose needs were not read: an empty list is no all-clear.
         let unseen = self.unseen_needs();
         if items.is_empty() {
@@ -1095,19 +1051,21 @@ impl App {
                 dim(),
             )));
         }
-        let total = local.len() + remote.len();
         let block = block(
             if area.width >= 60 {
-                format!("Needs you · {total} · Tab select · Enter answer")
+                format!("Needs you · {} · Tab select · Enter open", queue.len())
             } else {
-                format!("Needs you · {total}")
+                format!("Needs you · {}", queue.len())
             },
             self.ascii,
         );
         self.mouse.list = block.inner(area);
-        let mut state = ListState::default().with_selected(
-            (self.needs_focus && self.selected < local.len()).then_some(self.selected),
-        );
+        let selected = self
+            .need_cursor
+            .as_ref()
+            .filter(|_| self.needs_focus)
+            .and_then(|id| queue.iter().position(|i| &i.id == id));
+        let mut state = ListState::default().with_selected(selected);
         frame.render_stateful_widget(
             List::new(items).block(block).highlight_style(list_style),
             area,
@@ -1116,17 +1074,78 @@ impl App {
         self.mouse.list_offset = state.offset();
     }
 
+    /// The selected need in brief, under the list; Enter opens it in full.
+    fn need_preview(&self, width: u16, now: i64) -> (String, Vec<Line<'static>>) {
+        let queue = self.queue();
+        let Some(item) = self
+            .need_cursor
+            .as_ref()
+            .and_then(|id| queue.iter().find(|i| &i.id == id))
+        else {
+            return (
+                "Needs you".into(),
+                vec![Line::styled("Select a need with ↑↓.", dim())],
+            );
+        };
+        let mut lines = vec![Line::styled(
+            format!(
+                "{} · {}{}",
+                clean(&item.kind, 20),
+                item.since_ms.map_or(String::new(), |s| format!(
+                    "asked {} ago",
+                    short_age(s, now)
+                )),
+                item.task
+                    .as_ref()
+                    .map_or(String::new(), |t| format!(" · task {}", clean(t, 60)))
+            ),
+            dim(),
+        )];
+        lines.push(Line::raw(""));
+        let body = item.body.as_deref().unwrap_or(&item.question);
+        let room = (width as usize).saturating_sub(2).max(20);
+        lines.extend(body.lines().take(12).map(|l| {
+            let text = clean(l, 4096);
+            Line::raw(if text.chars().count() > room * 3 {
+                format!("{}…", text.chars().take(room * 3 - 1).collect::<String>())
+            } else {
+                text
+            })
+        }));
+        for (i, option) in item.options.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}  ", i + 1), dim()),
+                Span::styled(
+                    clean(&option.label, 120),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if option.recommended { " ★" } else { "" },
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Enter opens it to read in full and answer.",
+            Style::default().fg(Color::Cyan),
+        ));
+        (
+            format!("{}@{}", clean(&item.ship, 40), clean(&item.machine, 40)),
+            lines,
+        )
+    }
+
     /// Details while answering, selecting a need or asked for (d); a ship's
     /// card while one is picked; otherwise the live feed.
     fn draw_lower(&mut self, frame: &mut Frame, area: Rect, now: i64) {
         self.mouse.details = area;
-        let details =
-            self.answer.is_some() || self.revoke.is_some() || self.needs_focus || self.diagnostics;
+        let details = self.answer.is_some() || self.revoke.is_some() || self.diagnostics;
         let (title, lines, wrap) = if details {
             (
                 if self.answer.is_some() {
                     "Answer"
-                } else if self.diagnostics && !self.needs_focus {
+                } else if self.diagnostics {
                     "Details · d to close"
                 } else {
                     "Details"
@@ -1135,6 +1154,15 @@ impl App {
                 self.need_details(),
                 true,
             )
+        } else if self.needs_focus {
+            let (title, mut lines) = self.need_preview(area.width, now);
+            if !self.notice.is_empty() {
+                lines.insert(
+                    0,
+                    Line::styled(clean(&self.notice, 512), Style::default().fg(Color::Yellow)),
+                );
+            }
+            (title, lines, true)
         } else if let Some(row) = self
             .tree_index(&self.tree())
             .map(|i| self.tree()[i].clone())

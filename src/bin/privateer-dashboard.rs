@@ -114,9 +114,13 @@ struct Update {
     revoke: bool,
     /// A privileged command the bridge just granted: its home and id.
     privileged: Option<(PathBuf, String)>,
+    /// The need the outcome settles, so the focus view moves on.
+    focused: Option<String>,
 }
 enum Action {
     Answer(Answer),
+    /// A focus view reply or dismissal, run from a local home.
+    Fleet(privateer::dashboard::focus::Send, PathBuf),
     Revoke(Revoke),
     Read(Mail),
     History,
@@ -153,7 +157,17 @@ fn state_worker(
             }
             let mut privileged = None;
             let revoke = matches!(action, Some(Action::Revoke(_)));
+            let focused = match &action {
+                Some(Action::Fleet(send, _)) => Some(send.need.clone()),
+                Some(Action::Answer(answer)) => Some(answer.need.id().to_owned()),
+                _ => None,
+            };
             let outcome = match action {
+                Some(Action::Fleet(send, home)) => Some(
+                    command::binary()
+                        .and_then(|binary| command::json(&binary, &home, send.verb, &send.args))
+                        .map(|_| send.done.clone()),
+                ),
                 Some(Action::Revoke(revoke)) => Some(if failure.is_some() {
                     Err(anyhow::anyhow!("Fleet unavailable; revoke refused"))
                 } else {
@@ -219,6 +233,7 @@ fn state_worker(
                     outcome,
                     revoke,
                     privileged,
+                    focused,
                 })
                 .is_err()
             {
@@ -412,15 +427,14 @@ fn run(opts: Options) -> Result<()> {
         .socket
         .map(|path| herdr_worker(path, registry, opts.home));
     // Any home reads the whole fleet; the deck stays empty without one.
-    let deck = deck_home
-        .or_else(|| {
-            snapshot
-                .ships
-                .iter()
-                .find_map(|ship| ship.live.as_ref().filter(|l| l.error.is_none()))
-                .map(|live| live.home.clone())
-        })
-        .map(privateer::dashboard::deck::worker);
+    let command_home = deck_home.or_else(|| {
+        snapshot
+            .ships
+            .iter()
+            .find_map(|ship| ship.live.as_ref().filter(|l| l.error.is_none()))
+            .map(|live| live.home.clone())
+    });
+    let deck = command_home.clone().map(privateer::dashboard::deck::worker);
     let mut app = App {
         snapshot,
         ascii: opts.ascii,
@@ -461,6 +475,17 @@ fn run(opts: Options) -> Result<()> {
                         Ok(notice) => notice.clone(),
                         Err(e) => e.to_string(),
                     };
+                } else if let (Some(need), Some(outcome)) =
+                    (update.focused.as_ref(), update.outcome.as_ref())
+                {
+                    app.mail_pending = false;
+                    match outcome {
+                        Ok(notice) => {
+                            app.answer = None;
+                            app.focus_done(need, notice.clone());
+                        }
+                        Err(e) => app.notice = format!("Not sent: {e}"),
+                    }
                 } else if let Some(outcome) = update.outcome {
                     app.mail_pending = false;
                     app.notice = match outcome {
@@ -519,7 +544,9 @@ fn run(opts: Options) -> Result<()> {
                     {
                         continue;
                     }
-                    if app.answer.is_none() && key.code == KeyCode::Char('q') {
+                    // In the focus view q may be part of a note; Esc leaves it.
+                    if app.answer.is_none() && app.focus.is_none() && key.code == KeyCode::Char('q')
+                    {
                         break;
                     }
                     if app.bridge_key(key.code) {
@@ -541,6 +568,17 @@ fn run(opts: Options) -> Result<()> {
                             app.notice = "Revoking the approval…".into();
                         } else {
                             app.notice = "Action queue busy; choose again.".into();
+                        }
+                    }
+                    if let Some(send) = app.focus_send.take() {
+                        match &command_home {
+                            Some(home)
+                                if actions.try_send(Action::Fleet(send, home.clone())).is_ok() =>
+                            {
+                                app.mail_pending = true;
+                            }
+                            Some(_) => app.notice = "Action queue busy; try again.".into(),
+                            None => app.notice = "No local ship home to send from.".into(),
                         }
                     }
                     if let Some(answer) = app.answer_action.take() {

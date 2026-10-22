@@ -214,7 +214,21 @@ answer, then the fleet's other needs, read-only, marked `ship@machine`. Homes
 whose needs could not be read are named there as not an all-clear. Selecting a
 ship replaces the Live feed with its card: state, work, running crew, scope,
 home, live approvals and its own recent events. Enter opens the space of a ship
-on this machine only; a ship elsewhere says where to open it. `d` shows the
+on this machine only; a ship elsewhere says where to open it.
+
+Enter on a need (Tab to the list, or `n` for the oldest from anywhere) opens it
+full screen: its whole message, the steps it asks of the captain and any report
+(from `captain.waiting`), then its choices with what each one does, the
+recommended one marked and preselected, and a note line. ↑↓ or 1–9 choose,
+typing writes the note, Enter sends, ←/→ walks the queue, `x` dismisses a stale
+ask with a reason, Esc returns. Hands-on asks offer **Done** with the note as
+what was asked to be reported. This machine's needs are answered through the
+exact-binding path below (a typed decision now carries its `option_id`, and the
+note as its text); needs on linked machines through `captain.reply`, which
+checks the ask is still open and the option is one it offered; dismissals
+through `captain.dismiss`. Approvals are granted only on the machine that holds
+them. A need answered here leaves the queue at once and the view moves to the
+next; blockers are shown last and are read-only. `d` shows the
 observation details (sources, origins and unknowns) in place of the feed.
 
 The feed's finished tasks come from `task.update` audits, which record the
