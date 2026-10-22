@@ -143,6 +143,26 @@ class Runtime:
         self.write({"type": "delivered", "ref": ref})
 
 
+# Commands that change the whole fleet or close the captain's own items. In a
+# group chat they run only for a listed user: any member is heard as the
+# captain otherwise, and one /yolo on would put every first mate on bypass.
+FLEET_COMMANDS = ("yolo", "stow", "afk", "dismiss")
+
+
+def chat_kind(cfg: dict) -> str:
+    """The configured chat's Telegram type (`private`, `group`, `supergroup`,
+    `channel`), asked of the API; when it does not answer, the id's sign says
+    it, since Telegram gives groups and channels negative ids."""
+    result, err = tg.api(cfg, "getChat", {"chat_id": tg.chat_id(cfg)}, retries=2)
+    if isinstance(result, dict) and isinstance(result.get("type"), str):
+        return result["type"]
+    tg.log(f"could not read the chat's type ({err}); judging it by its id")
+    try:
+        return "private" if int(tg.chat_id(cfg)) > 0 else "group"
+    except ValueError:
+        return "group"
+
+
 class Door:
     def __init__(self, hello: dict, cfg: dict, runtime: Runtime):
         self.hello = hello
@@ -151,6 +171,10 @@ class Door:
         self.pending: list[dict] = []
         self.sent = tg.read_state(SENT, [])
         self.retry_at = 0.0
+        # Whether the chat is a group, from its type at start or from any
+        # update that says so; and who sent the update being handled.
+        self.group = False
+        self.sender = None
 
     # --- sending to Telegram ---------------------------------------------
 
@@ -493,6 +517,10 @@ class Door:
         if not self.authorized(chat, user):
             tg.log(f"ignoring a message from chat={chat} user={user}")
             return
+        kind = (msg.get("chat") or {}).get("type")
+        if isinstance(kind, str) and kind != "private":
+            self.group = True
+        self.sender = user
         msg_id = msg.get("message_id")
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
         raw = msg.get("text") or ""
@@ -514,6 +542,10 @@ class Door:
             return False
         allowed = self.cfg.get("allowed_user_ids", [])
         return not allowed or str(user) in {str(u) for u in allowed}
+
+    def listed(self, user) -> bool:
+        """Named in allowed_user_ids, not merely a member of the chat."""
+        return str(user) in {str(u) for u in self.cfg.get("allowed_user_ids", [])}
 
     def on_callback(self, query: dict) -> None:
         chat = ((query.get("message") or {}).get("chat") or {}).get("id")
@@ -578,6 +610,11 @@ class Door:
         head, _, rest = text.partition(" ")
         name = head[1:].split("@")[0].lower()
         rest = rest.strip()
+        if name in FLEET_COMMANDS and self.group and not self.listed(self.sender):
+            tg.log(f"refusing /{name} from user={self.sender}: not in allowed_user_ids of a group chat")
+            self.say(f"🔒 /{name} needs your Telegram user id in allowed_user_ids in a group chat.",
+                     reply_to=msg_id)
+            return
         try:
             if name in ("help", "start"):
                 recipient = self.recipient() or "the liaison"
@@ -1155,6 +1192,12 @@ def main() -> int:
     if problem:
         print(f"Telegram door config: {problem}", file=sys.stderr)
         return 2
+    kind = chat_kind(cfg)
+    if kind != "private" and not cfg.get("allowed_user_ids"):
+        print(f"Telegram door config: chat_id names a {kind}, and allowed_user_ids is not set; "
+              "anyone in it would be heard as the captain, so set allowed_user_ids to your user id",
+              file=sys.stderr)
+        return 2
     import stt
     import tts
     for warning in stt.startup_warnings(cfg) + tts.startup_warnings(cfg):
@@ -1164,6 +1207,7 @@ def main() -> int:
     events: queue.Queue = queue.Queue()
     runtime = Runtime(events)
     door = Door(hello, cfg, runtime)
+    door.group = kind != "private"
     stop = threading.Event()
     threading.Thread(target=poll_telegram, args=(cfg, events, stop),
                      name="telegram-poller", daemon=True).start()

@@ -97,8 +97,13 @@ the adapter's stderr, `state/telegram.log` from the adapter).
 Only the configured `chat_id` is heard, and within it only `allowed_user_ids`
 when set; everything else is logged and dropped. Approving a privileged command
 here is only half of it: the command runs only when you confirm it at the
-machine. Anyone the door hears can mail
-your ships as the captain, so in a group chat set `allowed_user_ids`. The bot
+machine. Anyone the door hears can mail your ships as the captain, so a group
+or supergroup needs `allowed_user_ids`: the door asks Telegram what the chat is
+(`getChat`, else the id's sign) and refuses to start a group chat without the
+list, naming the setting. A private chat with you needs no list. In a group,
+the fleet-wide commands `/yolo`, `/stow`, `/afk` and `/dismiss` run only for a
+user on the list, never for a member an empty list would otherwise hear, even
+if the chat is only found to be a group from a message's `chat.type`. The bot
 token is never put on a command line: it reaches curl in a private temporary
 file and is redacted from logs.
 

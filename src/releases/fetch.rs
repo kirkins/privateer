@@ -252,7 +252,7 @@ fn run(mut command: Command, limit: Duration, stdout: Option<fs::File>) -> Resul
     })
 }
 
-fn checked(command: Command, limit: Duration, what: &str) -> Result<Output> {
+pub(super) fn checked(command: Command, limit: Duration, what: &str) -> Result<Output> {
     let output = run(command, limit, None).map_err(|e| anyhow!("{what} could not run: {e:#}"))?;
     ensure!(
         output.status.success(),
@@ -598,7 +598,7 @@ pub fn verify(root: &Path) -> Result<()> {
 /// HOME, configuration, fleet registry and ledger, no service manager,
 /// nothing Privateer-specific from the caller, and no Python bytecode
 /// written into the release.
-fn sandboxed(program: impl AsRef<std::ffi::OsStr>, sandbox: &Path) -> Command {
+pub(super) fn sandboxed(program: impl AsRef<std::ffi::OsStr>, sandbox: &Path) -> Command {
     let mut command = Command::new(program);
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().starts_with("PRIVATEER_") {
@@ -808,7 +808,7 @@ fn build(options: &Options, commit: &str, data: &Path, work: &Path, out: &Path) 
 
 /// An existing `releases/<commit>`: a real directory (never a link to one)
 /// whose SHA256SUMS checks out. `when` says how it was found.
-fn existing(root: &Path, when: &str) -> Result<()> {
+pub(super) fn existing(root: &Path, when: &str) -> Result<()> {
     let shown = root.display();
     let meta = fs::symlink_metadata(root).with_context(|| format!("{shown} is missing"))?;
     ensure!(
@@ -821,7 +821,7 @@ fn existing(root: &Path, when: &str) -> Result<()> {
 }
 
 /// Removes a staging directory however staging ends.
-struct Staging(PathBuf);
+pub(super) struct Staging(pub(super) PathBuf);
 impl Drop for Staging {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
