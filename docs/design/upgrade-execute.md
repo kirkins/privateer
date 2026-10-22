@@ -1,6 +1,6 @@
 # Design: executing an upgrade (`privateer upgrade <sha>`)
 
-Status: PR 1 (fetch and stage, plus the CI release change) is implemented in `src/releases/fetch.rs`, `scripts/release-layout.sh` and `.github/workflows/ci.yml`; PR 2a (adoption, §4 step 3) in `src/releases/adopt.rs`; PRs 2b-5 are not yet. Read with [versioned releases](../releases.md), which describes the layout and `upgrade status` this builds on. Tracks [issue #76](https://github.com/kirkins/privateer/issues/76).
+Status: PR 1 (fetch and stage, plus the CI release change) is implemented in `src/releases/fetch.rs`, `scripts/release-layout.sh` and `.github/workflows/ci.yml`; PR 2a (adoption, §4 step 3) in `src/releases/adopt.rs`; PR 2b (switch, restart, health, rollback, prune on one machine) in `src/releases/apply.rs` and `src/releases/prune.rs`; PRs 3-5 are not yet. Read with [versioned releases](../releases.md), which describes the layout and `upgrade status` this builds on. Tracks [issue #76](https://github.com/kirkins/privateer/issues/76).
 
 ## As built in PR 1
 
@@ -22,6 +22,20 @@ Status: PR 1 (fetch and stage, plus the CI release change) is implemented in `sr
 - **Launchers** are looked for in `~/.cargo/bin`, `~/.local/bin` and the running executable's directory, for all three binaries. A real file is replaced only when proven Privateer's: the running image, or a native executable that answers as itself in a sandbox (`upgrade status` naming that file as its `running_executable`, the dashboard's banner, the broker's version). Scripts, links elsewhere, unproven files and launchers in a directory (or file) this user cannot write are reported, not changed.
 - **Units** are found by name and description (agents by their exact `--home HOME serve` or `door run NAME` arguments) in the systemd unit and LaunchAgents directories, doors included; a dispatcher's stop policy is applied as `service stop` does. Only a unit running a launcher this adoption moves (same path, or same device and inode) or a release of this installation is repointed; one pinned to another `privateer` is reported and left. launchd gets no call: a changed agent is read at its next bootstrap.
 - **History** gains `kind: "adopt"` (absent for upgrades); `upgrade status` adds `launcher_unversioned`. A rerun that finds the work done but no adoption recorded (its reload or history write failed) reloads and records it.
+
+## As built in PR 2b
+
+`privateer upgrade COMMIT --local [--dry-run]`, `privateer upgrade rollback [--local] [--dry-run]` and `privateer upgrade prune [--keep N] [--dry-run]` are operator only. [Versioned releases](../releases.md#switching-to-a-release) describes them. Where they differ from the sections here:
+
+- **Preconditions, never fixed here.** `releases/COMMIT` must exist and pass `verify()`; `current` must exist; every dispatcher or door unit adopt would repoint must already run `current/bin/privateer` (or a launcher linked to it). A unit pinned to another `privateer` is left out of the round and reported. `launcher_unversioned` is reported, not refused: switching is how such a machine moves on.
+- **Detached round with a state file.** The command spawns `upgrade _round ID` with `setsid` and waits on `<data>/upgrade/ID.json`, written beside itself and renamed over after every step; the newest 20 are kept. `upgrade status` gains `round` (the newest state, `in_progress` while `upgrade.lock` is held). The lock is the authority: the caller checks it to fail fast, and the runner takes it for the whole round.
+- **Which services.** Dispatchers are the fleet registry's ships whose home is here and whose `serve.lock` is held; doors the registry's doors whose lock is held. A detached one is in the round only when `service start` recorded its pid and that process runs a release of this installation. Not running means left stopped.
+- **Restart** is `service::Restartable::restart`: `systemctl --user restart` (refused unless the unit has `KillMode=process`), launchd `bootout` + wait for the lock + `enable` + `bootstrap` (refused unless the agent abandons its process group), or for a detached process SIGTERM after the same pid/marks/lock checks `service stop` makes, a wait for the lock, and a start from `current`. Units missing the safe stop policy are rewritten first and one `daemon-reload` runs before any restart.
+- **Health** is a new dispatcher generation holding `serve.lock` whose `dispatcher_release` metadata (the image `serve` records beside its generation, new here) names `releases/COMMIT`, within 60 s (`PRIVATEER_UPGRADE_HEALTH_SECS` in tests). A release older than this record only has to come back. Any failure switches `current` back and restarts every dispatcher again; doors are restarted only after all dispatchers passed, and a door that does not come back is reported, not rolled back for.
+- **Panes** are reported, not relaunched by the round: the existing catch-up path (`host::upgrade::wanted`) already relaunches a pane behind `current` at its next safe point without waking a sleeping ship, which an explicit relaunch request would. No request is written and no lease moves.
+- **History.** `UpgradeRecord` gains `outcome` (`switched`, `rolled_back`, `failed`) and `rollback_of`; switches record `kind: "upgrade"` or `"rollback"`. Doors appear in `ships` as `door:NAME`. `upgrade rollback` follows only `kind: "upgrade"` records that ended `switched`.
+- **Prune** keeps the newest N by directory modification time (publish time), `current`, the rollback target, the command's own release, and any release named by a live process's executable or arguments (`/proc` on Linux, `ps` elsewhere), rechecked before each removal. A removal renames the release aside inside `releases/` and removes it through `std::fs`.
+- **macOS** restarts through launchd as above; the tests use only fake `launchctl`/`systemctl`, so the claim that `bootout` leaves wakes running rests on the same reasoning `service stop` does (agents abandon their process group; job supervisors call `setsid`), not on a run on a Mac.
 
 ## 1, 3, 5-9 and 12, in summary
 
@@ -130,7 +144,7 @@ All tests run on disposable `HOME`, `XDG_*`, `PRIVATEER_FLEET` and data director
 2. **Apply locally.**
    - `privateer upgrade <sha> --local`: adoption, atomic switch, `service::restart`, door restart, pane relaunch, summary, history, auto-rollback, `upgrade rollback`, `upgrade prune`; operator only, run detached with a state file.
    - Tests: fake units, the real-subprocess wake survival, mail delivered once, panes, rollback and prune.
-   - Value: does the captain's whole round on one machine. This is the largest PR; adoption split off first as PR 2a (implemented: `privateer upgrade adopt`, `tests/upgrade_adopt.rs`), and the rest is PR 2b.
+   - Value: does the captain's whole round on one machine. This is the largest PR; adoption split off first as PR 2a (implemented: `privateer upgrade adopt`, `tests/upgrade_adopt.rs`), and the rest is PR 2b (implemented: `upgrade COMMIT --local`, `rollback`, `prune`, `tests/upgrade_apply.rs`; panes are reported and left to their own catch-up rather than relaunched by the round).
 3. **Source-build fallback.**
    - `--build` and automatic fallback, worktree build with the heavy slot, the shared layout script.
    - Tests: fake cargo, refusals, `current` unchanged on failure.

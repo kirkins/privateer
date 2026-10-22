@@ -644,6 +644,169 @@ fn released(service: &Service) -> Result<bool> {
     Ok(false)
 }
 
+/// A dispatcher or front door as an upgrade restarts it.
+pub(crate) struct Restartable(Service);
+
+/// How a running service is kept: its user unit, its launchd agent, or a
+/// detached process recorded in its pid file.
+pub(crate) enum Managed {
+    Unit(PathBuf),
+    Agent(PathBuf),
+    Detached,
+}
+
+pub(crate) fn restartable_dispatcher(home: &Path, ship: &str) -> Restartable {
+    Restartable(dispatcher(home, ship))
+}
+
+pub(crate) fn restartable_door(name: &str) -> Result<Restartable> {
+    Ok(Restartable(door(name)?))
+}
+
+impl Restartable {
+    pub(crate) fn running(&self) -> Result<bool> {
+        held(&self.0.lock)
+    }
+
+    pub(crate) fn pid_file(&self) -> &Path {
+        &self.0.pid
+    }
+
+    /// Where it is kept, as `halt` finds it: a unit, else an agent, else the
+    /// detached process.
+    pub(crate) fn managed(&self) -> Result<Managed> {
+        let unit = unit_dir()?.join(&self.0.unit);
+        if unit.exists() {
+            return Ok(Managed::Unit(unit));
+        }
+        let plist = agent_path(&self.0)?;
+        if plist.exists() {
+            return Ok(Managed::Agent(plist));
+        }
+        Ok(Managed::Detached)
+    }
+
+    /// Stop and start it again through what keeps it, from `current` when
+    /// this process runs a release. A dispatcher's stop never ends its wakes:
+    /// its unit must already stop the main process alone
+    /// (`KillMode=process`), and its agent abandon its process group (job
+    /// supervisors run in their own sessions either way). A detached one is
+    /// signalled only while it still holds its lock and is this service's
+    /// process; it must let go of its lock before the new one starts. A
+    /// systemd unit or detached process that is not running is started.
+    pub(crate) fn restart(&self) -> Result<String> {
+        let service = &self.0;
+        match self.managed()? {
+            Managed::Unit(unit) => {
+                if service.preserve_children {
+                    let text = fs::read_to_string(&unit)?;
+                    ensure!(
+                        text.lines().any(|l| l.trim() == "KillMode=process"),
+                        "{} has no KillMode=process; not restarting it",
+                        unit.display()
+                    );
+                }
+                let name = &service.unit;
+                let status = Command::new(systemctl())
+                    .args(["--user", "restart", name.as_str()])
+                    .status()
+                    .context("cannot run systemctl")?;
+                ensure!(status.success(), "systemctl --user restart {name} failed");
+                Ok(format!("restarted user service {name}"))
+            }
+            Managed::Agent(plist) => {
+                if service.preserve_children {
+                    let text = fs::read_to_string(&plist)?;
+                    ensure!(
+                        text.contains("<key>AbandonProcessGroup</key><true/>"),
+                        "{} does not abandon its process group; not restarting it",
+                        plist.display()
+                    );
+                }
+                let label = label(service);
+                let target = format!("{}/{label}", gui_domain());
+                // bootout sends the agent SIGTERM; bootstrap reads the agent
+                // again, so a changed one is read now.
+                let status = Command::new(launchctl())
+                    .args(["bootout", &target])
+                    .status()
+                    .context("cannot run launchctl")?;
+                ensure!(
+                    status.success() || !held(&service.lock)?,
+                    "launchctl bootout {label} failed; {} is still running",
+                    service.what
+                );
+                ensure!(
+                    released(service)?,
+                    "{} did not stop within 10 seconds of launchctl bootout",
+                    service.what
+                );
+                rotate(&service.log)?;
+                let plist_text = plist.to_string_lossy();
+                for args in [
+                    vec!["enable", target.as_str()],
+                    vec!["bootstrap", &gui_domain(), &plist_text],
+                ] {
+                    let status = Command::new(launchctl()).args(&args).status()?;
+                    ensure!(status.success(), "launchctl {} failed", args.join(" "));
+                }
+                Ok(format!("restarted launchd agent {label}"))
+            }
+            // One that already exited (a release that failed to start, being
+            // rolled back) is started again.
+            Managed::Detached if !held(&service.lock)? => {
+                let _ = fs::remove_file(&service.pid);
+                detached(service, &crate::executable::installed()?)?;
+                Ok("started in the background".into())
+            }
+            Managed::Detached => {
+                let pid = fs::read_to_string(&service.pid)
+                    .ok()
+                    .and_then(|p| p.trim().parse::<i32>().ok())
+                    .with_context(|| {
+                        format!("{} records no pid; restart it by hand", service.what)
+                    })?;
+                let command = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "command="])
+                    .output()?;
+                let line = String::from_utf8_lossy(&command.stdout);
+                ensure!(
+                    held(&service.lock)? && service.marks.iter().all(|m| line.contains(m.as_str())),
+                    "{} is running but is not the process Privateer started (pid {pid}); restart it by hand",
+                    service.what
+                );
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                ensure!(
+                    released(service)?,
+                    "{} (pid {pid}) did not stop within 10 seconds",
+                    service.what
+                );
+                detached(service, &crate::executable::installed()?)?;
+                Ok(format!("restarted in the background (was pid {pid})"))
+            }
+        }
+    }
+}
+
+/// The unit or agent text for a dispatcher with the safe stop policy, if it
+/// lacks it; its program, arguments and environment are kept.
+pub(crate) fn with_stop_policy(installed: &Installed) -> Result<Option<String>> {
+    let text = &installed.text;
+    if !installed.dispatcher {
+        return Ok(None);
+    }
+    if installed.launchd {
+        let abandons = "<key>AbandonProcessGroup</key><false/>";
+        return Ok(text
+            .contains(abandons)
+            .then(|| text.replace(abandons, "<key>AbandonProcessGroup</key><true/>")));
+    }
+    if text.lines().any(|l| l.trim() == "KillMode=process") {
+        return Ok(None);
+    }
+    dispatcher_stop_policy(text).map(Some)
+}
+
 /// Upgrade only the stop policy of a previously generated dispatcher unit.
 fn dispatcher_stop_policy(unit: &str) -> Result<String> {
     let mut service = false;

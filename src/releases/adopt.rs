@@ -218,8 +218,8 @@ fn clear(new: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Serialises adoptions (and, later, switches) of one installation.
-fn lock(data: &Path) -> Result<fs::File> {
+/// Serialises adoptions, switches and prunes of one installation.
+pub(super) fn lock(data: &Path) -> Result<fs::File> {
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -508,6 +508,8 @@ pub fn adopt(options: &Options, actor: &str) -> Result<Value> {
         let record = UpgradeRecord {
             id: uuid::Uuid::new_v4().to_string(),
             kind: Some("adopt".into()),
+            outcome: None,
+            rollback_of: None,
             from_commit: None,
             to_commit: commit.clone(),
             actor: actor.into(),

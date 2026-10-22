@@ -831,7 +831,7 @@ fn rewrite(home: &Path, manifest: &Value, folder: &Path, path: &str) -> Result<V
         }
     }
     tx.execute(
-        "DELETE FROM metadata WHERE key IN ('pid_namespace','dispatcher_generation')",
+        "DELETE FROM metadata WHERE key IN ('pid_namespace','dispatcher_generation','dispatcher_release')",
         [],
     )?;
     if has_table(&tx, "workspaces")? {

@@ -522,6 +522,48 @@ pub fn panes(store: &Store) -> Result<Value> {
     Ok(json!(out))
 }
 
+/// Where a ship's live hosted pane stands after an upgrade moved `current`,
+/// for its summary; None without one. Nothing is asked of the pane and its
+/// lease is not touched: a pane behind `current` catches up on its own at
+/// its next safe point (asleep at once, awake once idle for its threshold),
+/// so `pending` is an idle pane that will relaunch there and `catching_up` a
+/// busy one that will once its turn ends. `current` is a pane on the
+/// selected release, and `unversioned` one that is never behind (relaunching
+/// it would start the same binary again).
+pub(crate) fn pane_outcome(store: &Store, ship: &str) -> Result<Option<&'static str>> {
+    let Some(pane) = view(store, ship)? else {
+        return Ok(None);
+    };
+    Ok(Some(if pane["drift"] == true {
+        if busy(store, ship)? {
+            "catching_up"
+        } else {
+            "pending"
+        }
+    } else if pane["commit"].is_null() {
+        "unversioned"
+    } else {
+        "current"
+    }))
+}
+
+/// `pane_outcome` for every live hosted pane in this home, by ship.
+pub(crate) fn pane_outcomes(store: &Store) -> Result<Vec<(String, &'static str)>> {
+    let mut statement = store
+        .connection()
+        .prepare("SELECT ship FROM hosted_panes ORDER BY ship")?;
+    let ships = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = vec![];
+    for ship in ships {
+        if let Some(outcome) = pane_outcome(store, &ship)? {
+            out.push((ship, outcome));
+        }
+    }
+    Ok(out)
+}
+
 /// The pending relaunch for this holder, with its force flag, if still fresh.
 fn requested(store: &Store, ship: &str, holder: &str) -> Result<Option<bool>> {
     Ok(store
@@ -1005,6 +1047,74 @@ mod tests {
         new_pane.kill().unwrap();
         new_pane.wait().unwrap();
         old_pane.wait().unwrap();
+    }
+
+    /// After an upgrade moved `current`, an idle pane behind it is pending
+    /// its relaunch at its next safe point and a busy one is catching up;
+    /// neither is asked anything and no lease moves. A pane already on the
+    /// selected release is current.
+    #[test]
+    fn an_upgrade_reports_idle_panes_pending_and_busy_ones_catching_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let store = Store::open(&root.join("home")).unwrap();
+        let data = root.join("data/privateer");
+        let (old, new) = ("a".repeat(40), "b".repeat(40));
+        // Panes are stand-in processes running from a release's bin.
+        let mut children = vec![];
+        for (ship, commit) in [("infra", &old), ("apps", &old), ("docs", &new)] {
+            let bin = data.join("releases").join(commit).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let image = bin.join("privateer");
+            if !image.exists() {
+                std::fs::copy("/bin/sleep", &image).unwrap();
+            }
+            let child = std::process::Command::new(&image)
+                .arg("60")
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while kernel_image(child.id()).is_some_and(|i| !i.ends_with("/bin/privateer"))
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let started = crate::jobs::process_identity(child.id()).unwrap().unwrap();
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms) VALUES(?1,?2,?3,?4,0)",
+                    params![ship, child.id(), started, image.to_string_lossy()],
+                )
+                .unwrap();
+            children.push(child);
+        }
+        std::os::unix::fs::symlink(Path::new("releases").join(&new), data.join("current")).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO work_sessions(ship,holder,idle,checked_ms) VALUES('apps','host:apps',0,?1)",
+                [Store::now_ms()],
+            )
+            .unwrap();
+        let outcomes = pane_outcomes(&store).unwrap();
+        for mut child in children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(
+            outcomes,
+            [
+                ("apps".to_owned(), "catching_up"),
+                ("docs".to_owned(), "current"),
+                ("infra".to_owned(), "pending"),
+            ]
+        );
+        let requests: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM hosted_relaunches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(requests, 0);
     }
 
     /// A catch-up on a ship that never sleeps starts awake: only a ship that

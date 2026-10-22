@@ -1568,12 +1568,22 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         Err(error) => eprintln!("could not refresh AGENTS.md: {error:#}"),
     }
     if !once {
+        let generation = uuid::Uuid::new_v4().to_string();
+        // The image this generation runs, so an upgrade's health check sees
+        // which release came back (`releases::apply`).
+        let image = crate::releases::running_image()?;
+        let release = json!({"generation": generation, "image": image, "pid": std::process::id()});
         let tx = store.write_transaction()?;
         tx.execute("DELETE FROM sessions", [])?;
         tx.execute(
             "INSERT INTO metadata(key, value) VALUES('dispatcher_generation', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [uuid::Uuid::new_v4().to_string()],
+            [&generation],
+        )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES('dispatcher_release', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [release.to_string()],
         )?;
         tx.commit()?;
     }
