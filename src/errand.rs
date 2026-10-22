@@ -354,7 +354,7 @@ pub(crate) fn last_reply(log: &str) -> Option<(String, bool)> {
         if let Some(text) = crate::reply::text(&event) {
             reply = Some((text, crate::reply::ends_turn(&event)));
         } else if let Some((_, ended)) = &mut reply
-            && !crate::crew_relaunch::bookkeeping(&event)
+            && !crate::reply::closes_reply(&event)
         {
             *ended = false;
         }
@@ -707,6 +707,24 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(last_reply(&blocked), Some(("verdict".to_owned(), true)));
+        // Pi closes its turn and run after its stopped reply; a new turn or a
+        // retry start after it is work.
+        let pi = |after: &str| {
+            [
+                r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"verdict"}]}}"#,
+                r#"{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"verdict"}]},"toolResults":[]}"#,
+                r#"{"type":"agent_end","messages":[],"willRetry":false}"#,
+                r#"{"type":"auto_retry_end","success":true}"#,
+                r#"{"type":"agent_settled","aborted":false}"#,
+                after,
+                r#"{"type":"native.turn.failed","harness":"pi","native_exit_code":1}"#,
+            ]
+            .join("\n")
+        };
+        assert_eq!(last_reply(&pi("")), Some(("verdict".to_owned(), true)));
+        for work in [r#"{"type":"turn_start"}"#, r#"{"type":"auto_retry_start"}"#] {
+            assert_eq!(last_reply(&pi(work)), Some(("verdict".to_owned(), false)));
+        }
         // A dropped middle may have held work: a reply before it is not final.
         let cut = format!(
             "{}\n{}\n{{\"type\":\"native.turn.failed\"}}",

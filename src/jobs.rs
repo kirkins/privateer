@@ -2787,7 +2787,7 @@ fn persist_reply(line: &[u8], path: &Path, ended: &mut bool) -> Result<()> {
         return Ok(());
     };
     let Some(reply) = crate::reply::text(&event) else {
-        if !crate::crew_relaunch::bookkeeping(&event) {
+        if !crate::reply::closes_reply(&event) {
             reply_worked(path, ended)?;
         }
         return Ok(());
@@ -3142,6 +3142,27 @@ mod reply_capture_tests {
         feed(r#"{"type":"native.permission_blocked","denials":[],"denied":1}"#);
         assert!(marker.exists());
         assert_eq!(fs::read_to_string(&sidecar).unwrap(), "verdict");
+
+        // Pi's stopped reply, then its close of the turn and run: still the
+        // verdict. A new turn after it is work.
+        let pi = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Pi verdict"}]}}"#;
+        feed(pi);
+        for close in [
+            r#"{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Pi verdict"}]},"toolResults":[]}"#,
+            r#"{"type":"agent_end","messages":[],"willRetry":false}"#,
+            r#"{"type":"auto_retry_end","success":true}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
+            r#"{"type":"native.turn.failed","harness":"pi","native_exit_code":1}"#,
+        ] {
+            feed(close);
+            assert!(marker.exists(), "{close} only closes the reply");
+        }
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), "Pi verdict");
+        feed(r#"{"type":"turn_start"}"#);
+        assert!(!marker.exists(), "a new turn is work");
+        feed(pi);
+        feed(r#"{"type":"auto_retry_start","attempt":1}"#);
+        assert!(!marker.exists(), "a retry is work");
     }
 
     #[test]

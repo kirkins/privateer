@@ -31,6 +31,18 @@ pub(crate) fn ends_turn(event: &Value) -> bool {
     text(event).is_some() && matches!(event["type"].as_str(), Some("message_end" | "result"))
 }
 
+/// Whether an event after a turn-ending reply only closes it, so the reply is
+/// still the run's last word: other than the shared bookkeeping, that is Pi's
+/// close of its turn and run, which repeat messages already given. A new turn
+/// or a retry start (`turn_start`, `auto_retry_start`) is still work.
+pub(crate) fn closes_reply(event: &Value) -> bool {
+    crate::crew_relaunch::bookkeeping(event)
+        || matches!(
+            event["type"].as_str(),
+            Some("turn_end" | "agent_end" | "auto_retry_end" | "agent_settled")
+        )
+}
+
 fn content_text(content: &Value) -> Option<String> {
     let pieces: Vec<&str> = content
         .as_array()?

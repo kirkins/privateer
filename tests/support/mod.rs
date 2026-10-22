@@ -150,10 +150,14 @@ if errand:
     verdict = "Reviewed: %s. Brief seen: %s" % (errand.group(1), "the cache" in prompt)
     if mode == "errand-unconfirmed":
         # Pi wrote its whole stopped reply, but the turn wrapper could not
-        # confirm the completion.
-        print(json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
-            "content": [{"type": "text", "text": verdict}]}}), flush=True)
-        print(json.dumps({"type": "native.turn.failed", "reason": "Native completion was not confirmed."}), flush=True)
+        # confirm the completion. Pi closes its turn and run after the reply.
+        reply = {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": verdict}]}
+        print(json.dumps({"type": "message_end", "message": reply}), flush=True)
+        print(json.dumps({"type": "turn_end", "message": reply, "toolResults": []}), flush=True)
+        print(json.dumps({"type": "agent_end", "messages": [reply], "willRetry": False}), flush=True)
+        print(json.dumps({"type": "agent_settled", "aborted": False}), flush=True)
+        print(json.dumps({"type": "native.turn.failed", "harness": "pi", "native_exit_code": 1,
+            "reason": "Native completion was not confirmed."}), flush=True)
         sys.exit(2)
     if mode == "errand-blocked":
         # Claude finished its result, but a tool was denied along the way.
