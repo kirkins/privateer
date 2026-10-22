@@ -1,7 +1,9 @@
-//! Versioned installation identities and upgrade reporting. This module does
-//! not build, switch, prune, or restart anything; those are operator upgrade
-//! operations. A running image always belongs to its own immutable release.
-use anyhow::{Context, Result, ensure};
+//! Versioned installation identities and upgrade reporting. This module
+//! switches, prunes and restarts nothing; `fetch` prepares a release without
+//! selecting it. A running image always belongs to its own immutable release.
+pub mod fetch;
+
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -269,11 +271,18 @@ pub fn status() -> Result<Value> {
     )
 }
 
-pub fn cli(args: &[String]) -> Result<()> {
-    ensure!(
-        args == ["status"],
-        "usage: privateer upgrade status (upgrade execution is not implemented yet)"
-    );
-    println!("{}", serde_json::to_string_pretty(&status()?)?);
+pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
+    let result = match args.first().map(String::as_str) {
+        Some("status") if args.len() == 1 => status()?,
+        // Preparing a release is the operator's; it switches nothing.
+        Some("fetch") => {
+            caller.require_operator("upgrade fetch")?;
+            fetch::fetch(&fetch::Options::parse(&args[1..])?)?
+        }
+        _ => bail!(
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] (switching to a release is not implemented yet)"
+        ),
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }

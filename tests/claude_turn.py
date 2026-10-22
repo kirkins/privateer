@@ -114,12 +114,15 @@ class ClaudeTurn(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_stream(self, events, *, code=0, raw=None, resume=None, env_extra=None, driver=False, timeout=10):
+    def run_stream(self, events, *, code=0, raw=None, resume=None, model=None, env_extra=None, driver=False,
+                   timeout=10):
         stream = self.root / "stream.jsonl"
         stream.write_bytes(raw if raw is not None else b"".join((json.dumps(e)+"\n").encode() for e in events))
         flags = ["--print", "--verbose", "--output-format", "stream-json"]
         if resume:
             flags += ["--resume", resume]
+        if model:
+            flags += ["--model", model]
         pid_file = self.root / "pid"
         run_env = {
             **os.environ,
@@ -297,6 +300,17 @@ class ClaudeTurn(unittest.TestCase):
         self.assertEqual((summary["type"], summary["session_id"]), ("turn.completed", IDENTITY))
         self.assertEqual(summary["usage"], {"input":2, "output":67, "cacheRead":14166,
                                             "cacheWrite":10049, "totalTokens":24284})
+
+    def test_a_run_on_another_model_than_the_route_records_the_mismatch(self):
+        used = {**RESULT, "modelUsage": {"claude-haiku-5-5": {"inputTokens": 2, "outputTokens": 67}}}
+        run, summary = self.run_stream([INIT, used], model="opus")
+        self.assertEqual((run.returncode, summary["type"]), (0, "turn.completed"), run.stdout)
+        self.assertEqual(summary["models"], ["claude-haiku-5-5"])
+        self.assertEqual(summary["route_mismatch"], {"expected": "opus", "used": ["claude-haiku-5-5"]})
+        # An alias names the model carrying it; a run on its route records none.
+        run, summary = self.run_stream([INIT, used], model="haiku")
+        self.assertEqual(summary["models"], ["claude-haiku-5-5"])
+        self.assertNotIn("route_mismatch", summary)
 
     def test_a_rising_second_result_settles_the_run_with_the_last_result(self):
         waiting = {**RESULT, "result":"Waiting for the test job to finish.", "result_index":0,

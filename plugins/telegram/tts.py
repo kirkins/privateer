@@ -45,8 +45,10 @@ import json
 import os
 import re
 import tempfile
+import sys
 import time
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 import tg
 
 SUPPORTED_PROVIDERS = {"openai", "cloudflare"}

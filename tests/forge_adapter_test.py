@@ -677,6 +677,36 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertIn("<!-- privateer-review rev-uuid-123 -->", reqs[2]["body"]["body"])
         self.assertEqual(reqs[2]["headers"].get("authorization"), f"Bearer {TOKEN}")
 
+    def test_pr_comment_posts_once_per_marker_on_both_forges(self):
+        marker = "<!-- privateer-review 0123abcd -->"
+        body = f"{marker}\n**Privateer review: APPROVE**"
+        for forge_kind, request, prefix, identity in (
+                ("github", self.gh_request, "", GH_IDENTITY),
+                ("forgejo", self.fj_request, "/api/v1", FJ_IDENTITY)):
+            repo, pr = (GH_REPO, 10) if forge_kind == "github" else (FJ_REPO, 5)
+            path = f"{prefix}/repos/{repo}/issues/{pr}/comments"
+            self.server.clear_requests()
+            # Another login's comment with the marker does not count.
+            self.server.routes = {
+                ("GET", f"{prefix}/user"): (200, {"login": identity, "username": identity}),
+                ("GET", path): (200, [{"id": 1, "user": {"login": "someone"}, "body": body}]),
+                ("POST", path): (201, {"id": 77}),
+            }
+            res = forge.handle("pr.comment", request(marker=marker, body=body))
+            self.assertEqual((res["posted"], res["comment_id"]), (True, 77), forge_kind)
+            posted = [r for r in self.server.get_requests() if r["method"] == "POST"]
+            self.assertEqual(posted[0]["path"], path)
+            self.assertEqual(posted[0]["body"], {"body": body})
+            # Its own earlier comment is returned, and nothing is posted.
+            self.server.clear_requests()
+            self.server.routes[("GET", path)] = (
+                200, [{"id": 5, "user": {"login": identity, "username": identity}, "body": body}])
+            res = forge.handle("pr.comment", request(marker=marker, body=body))
+            self.assertEqual((res["posted"], res["comment_id"]), (False, 5), forge_kind)
+            self.assertNotIn("POST", [r["method"] for r in self.server.get_requests()])
+        with self.assertRaises(forge.ForgeError):
+            forge.handle("pr.comment", self.gh_request(marker=marker, body="no marker here"))
+
     def test_github_review_post_idempotent_marker_match(self):
         self.gh_routes_review(existing=[{
             "id": 8801,

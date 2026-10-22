@@ -162,6 +162,10 @@ struct Job {
     /// usage may be short of what the harness used.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     usage_partial: bool,
+    /// The models a harness reported using that are not its route's
+    /// (`{"expected", "used"}`), recorded with the usage when the job settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_mismatch: Option<Value>,
     /// Bundled Codex read-only crew must leave a durable report; otherwise a
     /// sandboxed no-op would be indistinguishable from successful work.
     #[serde(default)]
@@ -426,9 +430,10 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
         // A harness job's usage is read from its log once, as it settles,
         // and commits with the status that settled it.
         if terminal(&job.status) && !terminal(&before) && job.usage.is_none() {
-            let (usage, cut) = harness_usage(store, &job);
+            let (usage, cut, mismatch) = harness_usage(store, &job);
             job.usage = usage;
             job.usage_partial = is_harness(&job) && (cut || job.stdout_dropped_bytes > 0);
+            job.route_mismatch = mismatch;
         }
         conn.execute(
             "UPDATE jobs SET record=?2 WHERE id=?1",
@@ -461,10 +466,11 @@ fn is_harness(job: &Job) -> bool {
 /// `cacheWrite` and `totalTokens`. A hosted crew's log holds its finished
 /// messages, not the streaming updates whose usage this reads, so it reports
 /// nothing here. Also whether the log was cut: a
-/// truncation marker stands where bytes were dropped.
-fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool) {
+/// truncation marker stands where bytes were dropped. And the route mismatch
+/// the harness's turn summary recorded, if it reported one.
+fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool, Option<Value>) {
     if !is_harness(job) {
-        return (None, false);
+        return (None, false, None);
     }
     let log = store
         .home()
@@ -474,10 +480,30 @@ fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool) {
         .join("stdout.log");
     // A bounded log can be cut inside a UTF-8 character; keep the rest.
     let Ok(text) = fs::read(log).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()) else {
-        return (None, false);
+        return (None, false, None);
     };
     let usage = crate::activation::usage(&text).and_then(|raw| normalize_usage(&raw));
-    (usage, log_cut(&text))
+    (usage, log_cut(&text), route_mismatch(&text))
+}
+/// The `route_mismatch` a native turn summary in the log carries: the models
+/// the harness reported using that are not the route's, a fact the outcome
+/// keeps rather than a sum that hides it.
+pub(crate) fn route_mismatch(text: &str) -> Option<Value> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| {
+            matches!(
+                value["type"].as_str(),
+                Some("turn.completed" | "native.turn.failed")
+            )
+        })
+        .filter_map(|value| {
+            value
+                .get("route_mismatch")
+                .filter(|m| m.is_object())
+                .cloned()
+        })
+        .next_back()
 }
 /// Whether a bounded log dropped bytes: its truncation marker is a line.
 pub(crate) fn log_cut(text: &str) -> bool {
@@ -2357,6 +2383,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .map(str::to_owned),
         usage: None,
         usage_partial: false,
+        route_mismatch: None,
         codex_read_only_crew: args
             .get("codex_read_only_crew")
             .and_then(Value::as_bool)
@@ -3192,6 +3219,20 @@ mod reply_capture_tests {
     }
 
     #[test]
+    fn a_turn_summary_route_mismatch_is_read_from_the_log() {
+        let log = "{\"type\":\"assistant\",\"route_mismatch\":{\"expected\":\"x\"}}\n\
+            {\"type\":\"turn.completed\",\"usage\":{\"input\":1},\"route_mismatch\":{\"expected\":\"opus\",\"used\":[\"claude-haiku-5-5\"]}}\n";
+        assert_eq!(
+            route_mismatch(log),
+            Some(json!({"expected": "opus", "used": ["claude-haiku-5-5"]}))
+        );
+        assert_eq!(
+            route_mismatch("{\"type\":\"turn.completed\",\"usage\":{\"input\":1}}\n"),
+            None
+        );
+    }
+
+    #[test]
     fn every_harness_reports_usage_in_one_shape_and_nothing_stays_unknown() {
         let native = json!({"input": 8, "output": 3366, "cacheRead": 308807, "cacheWrite": 4943,
             "totalTokens": 317124});
@@ -3414,10 +3455,11 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         }
     };
     let payload = identity(child.id())?.context("payload exited before identity captured")?;
+    let spawned_ms = Store::now_ms();
     job = alter(store, id, |j| {
         j.payload = Some(payload.clone());
         j.status = "running".into();
-        j.spawned_ms = Some(Store::now_ms());
+        j.spawned_ms = Some(spawned_ms);
     })?;
     update_reservation(store, &job)?;
     drop(workspace_lock);
@@ -3471,7 +3513,9 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     // Each incarnation gets a fresh grant of the charter's budget. Queued and
     // parked time is not in it; the total is bounded by the park and 24 h caps
     // (see `crew::park_at_deadline`), not by summing run time across resumes.
-    let deadline = spawned + Duration::from_secs(job.timeout_secs);
+    // The deadline is wall-clock time from the recorded spawn, as the
+    // queue's is: a monotonic clock stops while the machine sleeps and would
+    // let the deadline slide by the sleep.
     let mut outcome = "succeeded";
     let mut reason = None;
     // Why a crew at its deadline could not park: the job then times out with it.
@@ -3521,6 +3565,8 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             }
         }
         job = load(store, id)?;
+        let overdue = Store::now_ms()
+            >= job.spawned_ms.unwrap_or(spawned_ms) + job.timeout_secs as i64 * 1000;
         if let Some(status) = leader_status {
             let group = group_alive(&payload)?;
             if !group && !escaped_alive(&job.escaped)? {
@@ -3559,7 +3605,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         // its first mate when no job is outstanding.
         let parking = match job.park.clone() {
             Some(park) => Some(park),
-            None if terminated_at.is_none() && Instant::now() >= deadline => {
+            None if terminated_at.is_none() && overdue => {
                 // A park that cannot be opened leaves the job to time out, as
                 // it did before; the failure is audited, not a supervisor error.
                 match crate::crew::park_at_deadline(store, id) {
@@ -3583,7 +3629,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         if terminated_at.is_none()
             && (job.cancel_requested
                 || authority_error.is_some()
-                || (!grace && (parking.is_some() || Instant::now() >= deadline)))
+                || (!grace && (parking.is_some() || overdue)))
         {
             outcome = if job.cancel_requested || authority_error.is_some() {
                 "cancelled"
@@ -3807,6 +3853,24 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         }
         return Ok(job);
     }
+    // The supervisor's search for descendants that leave the payload's group
+    // ends with it, and what it left running can start more. Carry the
+    // search on from what still runs, so the job settles only once nothing
+    // recorded or found remains.
+    if !supervisor_alive {
+        if let Some(p) = &job.payload {
+            let found = escaped_descendants(p, &job.escaped)?;
+            if found != job.escaped {
+                let observed_incarnation = job.incarnation.clone();
+                job = alter(store, &job.id, |j| {
+                    if j.incarnation == observed_incarnation {
+                        j.escaped = found;
+                    }
+                })?;
+                update_reservation(store, &job)?;
+            }
+        }
+    }
     let payload_alive = match &job.payload {
         Some(p) => payload_alive(p, &job.escaped)?,
         None => false,
@@ -3846,6 +3910,38 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
                 }
             }
             j.finished_ms = j.finished_ms.or(Some(Store::now_ms()));
+        })?;
+        if terminal(&job.status) {
+            release(store, &job)?;
+        }
+        if settled {
+            store.audit(
+                "job.settled",
+                &json!({"job_id": job.id, "status": job.status, "exit_code": job.exit_code}),
+            )?;
+        }
+        return Ok(job);
+    }
+    // Only a supervisor's claim moves a job on from `starting`, and it spawns
+    // no payload before claiming. A job still starting with no live
+    // supervisor past the start grace was never claimed, so there is no
+    // payload to look for: it fails here, as any job whose work is provably
+    // gone does, instead of waiting as an orphan for a forced recovery.
+    if job.status == "starting"
+        && !supervisor_alive
+        && job.payload.is_none()
+        && Store::now_ms() - job.created_ms > START_GRACE_MS
+    {
+        let observed_incarnation = job.incarnation.clone();
+        let mut settled = false;
+        job = alter(store, &job.id, |j| {
+            if j.status != "starting" || j.incarnation != observed_incarnation {
+                return;
+            }
+            settled = true;
+            j.status = "failed".into();
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some("supervisor never started".into());
         })?;
         if terminal(&job.status) {
             release(store, &job)?;

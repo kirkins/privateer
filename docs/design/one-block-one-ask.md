@@ -1,6 +1,6 @@
 # Design: one block, one ask
 
-Status: revised after the Opus design review of ff2ce0b (approve with eight changes, all folded in below), and being implemented. Task `privateer-one-block-one-ask` (captain finding 13, notice d8789f3d). It also covers finding 7 (`privateer-permission-decision-detail`, a decision that names the denied tool and input, the narrowest rule, and the job). Read with [crew park and resume](crew-park-resume.md), [cross-machine fleet](cross-machine-fleet.md) and [tool permissions](../tool-permissions.md).
+Status (2026-10-22): implemented in `src/block_ask.rs` (see [tool permissions](../tool-permissions.md)); this document is the design rationale. Revised after the Opus design review of ff2ce0b (approve with eight changes, all folded in below). Task `privateer-one-block-one-ask` (captain finding 13, notice d8789f3d). It also covers finding 7 (`privateer-permission-decision-detail`, a decision that names the denied tool and input, the narrowest rule, and the job). Read with [crew park and resume](crew-park-resume.md), [cross-machine fleet](cross-machine-fleet.md) and [tool permissions](../tool-permissions.md).
 
 ## Problem
 
@@ -112,7 +112,7 @@ A rule is refused (null) if it would fail the policy's own validation or allow e
 - A denial in the first mate's own wake job (`scope: wake`) pauses the ship, as before, because that wake would hit it again.
 - An **errand** denial (`scope: errand`) raises the ask but parks nothing and refuses nothing: nothing retries a finished errand, and a denied review errand must not hold the main task.
 
-**Resolution.** Each answer is applied where the ask lives (its home, and its machine), after the reply commits:
+**Resolution.** Each answer is applied where the ask lives (its home, and its machine), after the reply commits. An answer that cannot take effect there (the fleet policy file would not write, say) does not leave the ask answered with nothing granted: the ask goes back to `open`, the failure is audited as `permissions.answer_failed`, and the ship sends the captain a notice (`payload.answer_failed`, `about` the ask) saying why, so the decision is asked for again once the cause is fixed.
 
 - `allow`:
   - granted **only on a positive operator marker**. `mail.send` stamps `payload.operator: true` on a captain reply when the caller is the operator and the reply is the operator's own (the door, the CLI). The field is refused from anyone else, and from any caller who sets it by hand. `captain.relay` writes through a path that does not stamp it, so a liaison passing the captain's words on cannot grant. Fan-out keeps the original reply's marker.

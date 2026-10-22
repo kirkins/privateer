@@ -5,6 +5,7 @@ import sys
 import uuid
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from protocol import context, option, serve
 from tool_permissions import options_for, claude_disallowed, claude_rules, policy, claude_auto_mode_settings, authorized_for
 

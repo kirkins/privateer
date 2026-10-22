@@ -71,7 +71,7 @@ mod wake_reason;
 pub mod watch;
 pub mod workspace;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use store::{Caller, Store};
 
@@ -692,14 +692,21 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             let mut started = jobs::start_agent(store, job.clone())?;
             if viewed {
-                // Presentation only: a refused space never stops the crew.
-                let viewer = host::view_crew(
-                    store,
-                    started["id"].as_str().unwrap_or_default(),
-                    &task,
-                    owner.as_str().unwrap_or_default(),
-                    std::path::Path::new(started["cwd"].as_str().unwrap_or_default()),
-                );
+                // Presentation only: a refused space never stops the crew,
+                // and neither does a record missing what the space needs.
+                let field = |record: &Value, name: &str| -> Result<String> {
+                    record[name]
+                        .as_str()
+                        .map(str::to_owned)
+                        .with_context(|| format!("started job record has no {name}"))
+                };
+                let viewer = field(&started, "id").and_then(|id| {
+                    let ship = owner
+                        .as_str()
+                        .with_context(|| format!("task {task} has no owner"))?;
+                    let cwd = field(&started, "cwd")?;
+                    host::view_crew(store, &id, &task, ship, std::path::Path::new(&cwd))
+                });
                 started["viewer"] = serde_json::json!(viewer.is_ok());
             }
             started["route"] = route_choice

@@ -242,7 +242,9 @@ pub(super) fn poll(store: &Store, args: &Value) -> Result<Value> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         for id in ids {
-            let mut w = load(store, &id)?.unwrap();
+            let Some(mut w) = load(store, &id)? else {
+                continue;
+            };
             w.lease_until_ms = now + CLAIM_MS;
             save(store, &w)?;
         }
@@ -456,7 +458,11 @@ pub(crate) fn tick(store: &mut Store) -> Result<Vec<Value>> {
     drop(statement);
     let mut launched = vec![];
     for id in ids {
-        let mut work = load(store, &id)?.unwrap();
+        // The SELECT above ran outside this pass's transactions: a row it
+        // listed may have been reconciled or released since.
+        let Some(mut work) = load(store, &id)? else {
+            continue;
+        };
         if let Err(error) = start_headless(store, &mut work) {
             launch_failed(store, &mut work, &error)?;
         }
@@ -476,7 +482,9 @@ pub(crate) fn tick(store: &mut Store) -> Result<Vec<Value>> {
                 .is_some_and(|holder| holder.starts_with(crate::presence::HOSTED));
             let healthy:bool=store.connection().query_row("SELECT EXISTS(SELECT 1 FROM work_sessions WHERE ship=?1 AND holder=?2 AND checked_ms>?3)",params![ship,presence["lease"]["holder"].as_str(),Store::now_ms()-ADAPTER_MS],|r|r.get(0))?;
             for id in ready_ids(store, &ship)? {
-                let mut work = load(store, &id)?.unwrap();
+                let Some(mut work) = load(store, &id)? else {
+                    continue;
+                };
                 if !hosted {
                     work.reason = Some("Waiting for the person-started session to leave; automatic native delivery is hosted only".into());
                 } else if !healthy && Store::now_ms() - work.created_ms > CLAIM_MS {
