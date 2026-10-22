@@ -1654,6 +1654,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
         "to": if to == "here" { "here" } else { machine.as_str() },
         "folder": arrived["folder"], "dispatcher": arrived["dispatcher"],
         "set_aside": arrived["set_aside"], "notes": arrived["notes"],
+        "login_shell": arrived["login_shell"],
         "folder_kept": released["folder_kept"], "directory": directory}))
 }
 

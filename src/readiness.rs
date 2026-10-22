@@ -2034,16 +2034,13 @@ mod tests {
         let shell = m.root.join("shell");
         let pids = m.root.join("pids");
         // A login shell whose rc file never returns, holding a child too.
-        std::fs::write(
+        let shell = crate::service::tests::script(
             &shell,
-            format!(
+            &format!(
                 "#!/bin/sh\nsleep 10 &\necho $$ $! > '{}'\nwait\n",
                 pids.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let shell = shell.to_string_lossy().into_owned();
+        );
         let bound = Duration::from_secs(1);
         let begun = Instant::now();
         let (path, why) = crate::service::login_path_from(Some(&shell), Instant::now() + bound);
