@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from native_launch import native_environment
 from native_turn import MAX_LINE, Turn
 

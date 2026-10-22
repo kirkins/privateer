@@ -23,6 +23,8 @@ pub const DEFAULT_REPO: &str = "kirkins/privateer";
 /// The oldest glibc a CI Linux release runs on (it is built on Ubuntu 24.04).
 pub const GLIBC_FLOOR: (u32, u32) = (2, 39);
 pub const SUMS: &str = "SHA256SUMS";
+/// The workflow whose push runs on main publish releases.
+pub const WORKFLOW: &str = ".github/workflows/ci.yml";
 /// The layout CI runs from scripts/, built in so a source build of any
 /// commit is laid out and checked the same way.
 const LAYOUT: &str = include_str!("../../scripts/release-layout.sh");
@@ -40,6 +42,8 @@ const MAX_SUMS: u64 = 1 << 20;
 pub struct Options {
     pub commit: String,
     pub repo: String,
+    /// `--repo` was given, so a source checkout's origin must name it too.
+    pub repo_given: bool,
     /// Build from source even where CI has an artifact.
     pub build: bool,
     /// The checkout a source build exports the commit from. Without it, a
@@ -58,6 +62,7 @@ impl Options {
         let mut options = Self {
             commit,
             repo: DEFAULT_REPO.into(),
+            repo_given: false,
             build: false,
             source: None,
         };
@@ -69,7 +74,10 @@ impl Options {
                     ensure!(source.is_absolute(), "--source must be an absolute path");
                     options.source = Some(source);
                 }
-                "--repo" => options.repo = args.next().context(USAGE)?.clone(),
+                "--repo" => {
+                    options.repo = args.next().context(USAGE)?.clone();
+                    options.repo_given = true;
+                }
                 _ => bail!("{USAGE}"),
             }
         }
@@ -274,7 +282,8 @@ struct Artifact {
 
 /// What the API has for a commit: an artifact, or why there is none (no
 /// such run, the job did not succeed, the artifact expired). A malformed
-/// answer is an error, never a reason to build instead.
+/// answer, or a release job still running, is an error, never a reason to
+/// build instead.
 enum Lookup {
     Found(Artifact),
     Missing(String),
@@ -292,7 +301,8 @@ fn lookup(repo: &str, commit: &str, platform: &str) -> Result<Lookup> {
         "repos/{repo}/actions/runs?head_sha={commit}&event=push&branch=main&per_page=100"
     ))?;
     let full_name = |run: &Value, key: &str| run[key]["full_name"].as_str() == Some(repo);
-    // A push to main in this repository; never a pull request's or a fork's run.
+    // A push to main in this repository running its CI workflow; never a
+    // pull request's or a fork's run, or another workflow's.
     let mut candidates: Vec<&Value> = runs["workflow_runs"]
         .as_array()
         .context("gh api: no workflow_runs")?
@@ -301,6 +311,7 @@ fn lookup(repo: &str, commit: &str, platform: &str) -> Result<Lookup> {
             run["head_sha"].as_str() == Some(commit)
                 && run["event"].as_str() == Some("push")
                 && run["head_branch"].as_str() == Some("main")
+                && run["path"].as_str() == Some(WORKFLOW)
                 && full_name(run, "repository")
                 && full_name(run, "head_repository")
         })
@@ -308,18 +319,30 @@ fn lookup(repo: &str, commit: &str, platform: &str) -> Result<Lookup> {
     candidates.sort_by_key(|run| std::cmp::Reverse(run["id"].as_u64()));
     let job = job_name(platform);
     let name = format!("privateer-{platform}-{commit}");
-    let mut missing = format!("no push run on main in {repo} for {commit}");
+    let mut missing = format!("no push run on main of {WORKFLOW} in {repo} for {commit}");
+    let mut building = false;
     for run in candidates {
         let run_id = run["id"].as_u64().context("gh api: a run without an id")?;
         let jobs = gh_json(&format!(
             "repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
         ))?;
-        let conclusion = jobs["jobs"]
+        let found = jobs["jobs"]
             .as_array()
             .context("gh api: no jobs")?
             .iter()
-            .find(|j| j["name"].as_str() == Some(&job))
-            .map(|j| j["conclusion"].as_str().unwrap_or("pending"));
+            .find(|j| j["name"].as_str() == Some(&job));
+        // A release job not yet listed (it waits on others) or not yet
+        // completed will have an artifact: never build in its place.
+        let finished = |status: &Value| status.as_str() == Some("completed");
+        let running = match found {
+            Some(found) => !finished(&found["status"]) || found["conclusion"].is_null(),
+            None => !finished(&run["status"]),
+        };
+        if running {
+            building = true;
+            continue;
+        }
+        let conclusion = found.map(|j| j["conclusion"].as_str().unwrap_or("unknown"));
         if conclusion != Some("success") {
             missing = format!(
                 "run {run_id}'s {job} job is {}",
@@ -357,6 +380,10 @@ fn lookup(repo: &str, commit: &str, platform: &str) -> Result<Lookup> {
             digest: digest.to_ascii_lowercase(),
         }));
     }
+    ensure!(
+        !building,
+        "CI is still building {commit} for {platform}; try again when it finishes, or pass --build to build from source"
+    );
     Ok(Lookup::Missing(missing))
 }
 
@@ -521,18 +548,10 @@ pub fn parse_sums(text: &str) -> Result<BTreeMap<String, String>> {
     Ok(sums)
 }
 
-/// Python writes bytecode caches beside the plugins it runs; a release in
-/// use gains them, and they are the only files it may gain.
-fn runtime_cache(name: &str) -> bool {
-    Path::new(name)
-        .components()
-        .any(|c| c.as_os_str() == "__pycache__")
-}
-
-/// Check a release's layout and its SHA256SUMS. A freshly unpacked release
-/// must match its sums exactly; one already published may also hold
-/// bytecode caches.
-pub fn verify(root: &Path, fresh: bool) -> Result<()> {
+/// Check a release's layout and its SHA256SUMS, which must match exactly:
+/// every listed file, and nothing else. The bundled plugins never write
+/// bytecode beside themselves, so a `__pycache__` in a release was put there.
+pub fn verify(root: &Path) -> Result<()> {
     let shown = root.display();
     for name in BINARIES {
         let path = root.join("bin").join(name);
@@ -563,11 +582,8 @@ pub fn verify(root: &Path, fresh: bool) -> Result<()> {
     for name in sums.keys() {
         ensure!(present.contains(name), "{shown}: {name} is missing");
     }
-    for name in present.iter().filter(|n| !sums.contains_key(*n)) {
-        ensure!(
-            !fresh && runtime_cache(name),
-            "{shown}: {name} is not in {SUMS}"
-        );
+    if let Some(name) = present.iter().find(|n| !sums.contains_key(*n)) {
+        bail!("{shown}: {name} is not in {SUMS}");
     }
     for (name, digest) in &sums {
         ensure!(
@@ -579,8 +595,9 @@ pub fn verify(root: &Path, fresh: bool) -> Result<()> {
 }
 
 /// The environment a staged release runs in for its checks: a throwaway
-/// HOME, configuration, fleet registry and ledger, no service manager, and
-/// nothing Privateer-specific from the caller.
+/// HOME, configuration, fleet registry and ledger, no service manager,
+/// nothing Privateer-specific from the caller, and no Python bytecode
+/// written into the release.
 fn sandboxed(program: impl AsRef<std::ffi::OsStr>, sandbox: &Path) -> Command {
     let mut command = Command::new(program);
     for (name, _) in std::env::vars_os() {
@@ -597,6 +614,7 @@ fn sandboxed(program: impl AsRef<std::ffi::OsStr>, sandbox: &Path) -> Command {
         .env("PRIVATEER_FLEET", sandbox.join("fleet.sqlite"))
         .env("PRIVATEER_RESOURCE_HOME", sandbox.join("ledger"))
         .env("PRIVATEER_SERVICE", "none")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_SOCKET_PATH");
     command
@@ -656,11 +674,75 @@ fn git(dir: &Path, args: &[&str], limit: Duration) -> Result<Output> {
     checked(command, limit, &format!("git {}", args.join(" ")))
 }
 
-/// Build `commit` from `checkout` into `out/<commit>`. The commit must be on
-/// the checkout's origin main; it is exported with `git archive`, so the
-/// checkout's working tree and index are never touched, and built with
-/// `cargo` (`PRIVATEER_CARGO` in tests) in a target directory of its own.
-fn build(checkout: &Path, commit: &str, data: &Path, work: &Path, out: &Path) -> Result<()> {
+/// Whether a remote URL names `repo` (OWNER/NAME) as its last two path
+/// segments, in any of Git's URL forms, a `.git` suffix aside.
+pub fn origin_names(url: &str, repo: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let mut segments = url.rsplit(['/', ':']);
+    let (Some(name), Some(owner)) = (segments.next(), segments.next()) else {
+        return false;
+    };
+    format!("{owner}/{name}").eq_ignore_ascii_case(repo)
+}
+
+/// The machine's one source build: every build shares `<data>/build/target`
+/// (incremental reuse), so two at once could lay out each other's binaries.
+/// Held from the checkout's fetch through the layout; a second build is
+/// refused, naming the holder.
+fn build_lock(data: &Path, commit: &str) -> Result<fs::File> {
+    use std::io::{Seek, Write};
+    use std::os::fd::AsRawFd;
+    let dir = data.join("build");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("lock");
+    let mut lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let mut holder = String::new();
+        let _ = lock.read_to_string(&mut holder);
+        let holder = holder.trim();
+        bail!(
+            "another source build holds {} ({}); try again when it finishes",
+            path.display(),
+            if holder.is_empty() {
+                "holder unknown"
+            } else {
+                holder
+            }
+        );
+    }
+    lock.set_len(0)?;
+    lock.rewind()?;
+    write!(lock, "pid {} building {commit}", std::process::id())?;
+    Ok(lock)
+}
+
+/// Build `commit` from `checkout` into `out/<commit>`. The checkout is the
+/// operator's choice: its origin is trusted for main (and, with `--repo`,
+/// must name that repository). The commit must be on that origin's main; it
+/// is exported with `git archive`, so the checkout's working tree and index
+/// are never touched, and built with `cargo` (`PRIVATEER_CARGO` in tests)
+/// under the build lock.
+fn build(options: &Options, commit: &str, data: &Path, work: &Path, out: &Path) -> Result<()> {
+    let checkout = options.source.as_deref().context("--source CHECKOUT")?;
+    if options.repo_given {
+        let url = git(checkout, &["remote", "get-url", "origin"], API_TIMEOUT)
+            .map_err(|e| anyhow!("the source checkout has no origin: {e:#}"))?;
+        let url = String::from_utf8_lossy(&url.stdout).trim().to_owned();
+        ensure!(
+            origin_names(&url, &options.repo),
+            "the source checkout's origin {url} is not {}; build from a checkout of it, or drop --repo",
+            options.repo
+        );
+    }
+    let _lock = build_lock(data, commit)?;
     git(
         checkout,
         &[
@@ -724,6 +806,20 @@ fn build(checkout: &Path, commit: &str, data: &Path, work: &Path, out: &Path) ->
     Ok(())
 }
 
+/// An existing `releases/<commit>`: a real directory (never a link to one)
+/// whose SHA256SUMS checks out. `when` says how it was found.
+fn existing(root: &Path, when: &str) -> Result<()> {
+    let shown = root.display();
+    let meta = fs::symlink_metadata(root).with_context(|| format!("{shown} is missing"))?;
+    ensure!(
+        meta.is_dir(),
+        "{shown} {when} but is not a directory (a link or a file); nothing was overwritten"
+    );
+    verify(root).map_err(|e| {
+        anyhow!("{shown} {when} but is not an intact release ({e:#}); nothing was overwritten")
+    })
+}
+
 /// Removes a staging directory however staging ends.
 struct Staging(PathBuf);
 impl Drop for Staging {
@@ -752,12 +848,7 @@ pub fn fetch(options: &Options) -> Result<Value> {
     };
     // Releases never change: one already here is reused only if it checks out.
     if fs::symlink_metadata(&release.root).is_ok() {
-        verify(&release.root, false).map_err(|e| {
-            anyhow!(
-                "{} exists but is not an intact release ({e:#}); nothing was overwritten",
-                release.root.display()
-            )
-        })?;
+        existing(&release.root, "exists")?;
         return Ok(report("existing", json!({})));
     }
     ensure!(
@@ -792,7 +883,7 @@ pub fn fetch(options: &Options) -> Result<Value> {
     let Some(source) = &options.source else {
         bail!("{commit} needs a source build ({reason}); pass --source CHECKOUT to build it");
     };
-    build(source, commit, &data, &staging.0, &out)?;
+    build(options, commit, &data, &staging.0, &out)?;
     let extra = json!({"platform": platform.ok(), "build_reason": reason, "source": source});
     publish(&release, &out, &staging.0, report("build", extra))
 }
@@ -814,7 +905,7 @@ fn publish(release: &Release, out: &Path, work: &Path, report: Value) -> Result<
         "{} is not a directory",
         staged.display()
     );
-    verify(&staged, true)?;
+    verify(&staged)?;
     smoke(&staged, &release.commit, &work.join("smoke"))?;
     let releases = release.root.parent().context("releases directory")?;
     fs::create_dir_all(releases)?;
@@ -822,12 +913,7 @@ fn publish(release: &Release, out: &Path, work: &Path, report: Value) -> Result<
         if fs::symlink_metadata(&release.root).is_err() {
             bail!("cannot publish the staged release: {error}");
         }
-        verify(&release.root, false).map_err(|e| {
-            anyhow!(
-                "{} appeared while staging and is not an intact release ({e:#})",
-                release.root.display()
-            )
-        })?;
+        existing(&release.root, "appeared while staging")?;
         let mut report = report;
         report["from"] = json!("existing");
         return Ok(report);
@@ -900,8 +986,6 @@ mod tests {
         assert!(parse_sums(&format!("{digest} x\n")).is_err());
         assert!(parse_sums(&format!("{digest}  x\n{digest}  x\n")).is_err());
         assert!(parse_sums("short  x\n").is_err());
-        assert!(runtime_cache("share/privateer/plugins/__pycache__/a.pyc"));
-        assert!(!runtime_cache("share/privateer/plugins/a.py"));
     }
 
     #[test]
@@ -912,12 +996,37 @@ mod tests {
         assert!(!parsed.build && parsed.source.is_none());
         let parsed =
             Options::parse(&args(&[C, "--build", "--source", "/src", "--repo", "a/b"])).unwrap();
-        assert!(parsed.build);
+        assert!(parsed.build && parsed.repo_given);
         assert_eq!(parsed.repo, "a/b");
+        assert!(!Options::parse(&args(&[C])).unwrap().repo_given);
         assert!(Options::parse(&args(&["main"])).is_err());
         assert!(Options::parse(&args(&[C, "--build"])).is_err());
         assert!(Options::parse(&args(&[C, "--source", "rel"])).is_err());
         assert!(Options::parse(&args(&[C, "--repo", "a/../b"])).is_err());
         assert!(Options::parse(&args(&[C, "--repo", "a"])).is_err());
+    }
+
+    #[test]
+    fn an_origin_url_names_its_repository() {
+        for url in [
+            "https://github.com/owner/name.git",
+            "https://github.com/owner/name",
+            "https://github.com/Owner/Name/",
+            "git@github.com:owner/name.git",
+            "ssh://git@github.com/owner/name.git",
+            "/srv/git/owner/name.git",
+        ] {
+            assert!(origin_names(url, "owner/name"), "{url}");
+        }
+        for url in [
+            "https://github.com/someone/name.git",
+            "https://github.com/owner/name-fork",
+            "https://github.com/owner/name/other",
+            "git@github.com:name.git",
+            "/srv/origin",
+            "",
+        ] {
+            assert!(!origin_names(url, "owner/name"), "{url}");
+        }
     }
 }

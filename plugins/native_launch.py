@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from native import PROFILES
 
 IDENTITY_MARKERS = (

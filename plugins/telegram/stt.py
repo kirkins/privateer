@@ -22,8 +22,10 @@ treatment tg.redact gives the bot token.
 import json
 import os
 import subprocess
+import sys
 import tempfile
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 import tg
 
 # One provider table, because every provider speaks the same OpenAI
