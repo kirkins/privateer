@@ -580,6 +580,13 @@ fn ledger_path(store: &Store) -> Result<PathBuf> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
     Ok(fs::canonicalize(path)?.join("resources.sqlite"))
 }
+/// Every home on the host shares the ledger, and each supervisor writes it as
+/// its job starts, changes and ends. A writer waits this long for another, so
+/// a host busy with several crews slows a supervisor instead of ending it.
+const LEDGER_BUSY: Duration = Duration::from_secs(30);
+/// A supervisor keeps custody of a running payload: a home's store busy with
+/// other crews delays it, and only a lock held past this long ends it.
+const SUPERVISOR_BUSY: Duration = Duration::from_secs(30);
 fn ledger(path: &Path) -> Result<Connection> {
     if path.exists() {
         ensure!(
@@ -587,9 +594,27 @@ fn ledger(path: &Path) -> Result<Connection> {
             "resource ledger may not be a symlink"
         );
     }
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    let conn = Connection::open(path)
+        .with_context(|| format!("open resource ledger {}", path.display()))?;
+    conn.busy_timeout(LEDGER_BUSY)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    // In rollback mode every commit locked out every reader in every home
+    // until its fsync finished, and readers held off commits in turn; under
+    // 3-4 crews and heavy jobs that outlasted the busy wait and supervisors
+    // died with "database is locked" (2026-10-21). With WAL a reader never
+    // waits on a writer. A ledger an older release made changes mode once;
+    // if another connection holds it then, this open goes on in rollback mode
+    // and a later open changes it.
+    match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) => {}
+        result => {
+            result.with_context(|| format!("resource ledger {} journal", path.display()))?;
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS reservations (key TEXT PRIMARY KEY, record TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS released (key TEXT PRIMARY KEY, cpus REAL NOT NULL,
@@ -3078,6 +3103,7 @@ mod reply_capture_tests {
 
 fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     let me = identity(std::process::id())?.context("cannot identify supervisor")?;
+    store.connection().busy_timeout(SUPERVISOR_BUSY)?;
     let conn = store.connection();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let claimed = (|| -> Result<Job> {
@@ -3318,7 +3344,12 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
                 // reports ESRCH for its process group); periodic snapshots are
                 // retried, and the exit-time one is proven by waitid.
                 if let Some(anchors) = capture_anchors(&payload, exited)? {
-                    let _ = alter(store, id, |j| j.group_anchors = anchors)?;
+                    // Written only when the group changed: every running job
+                    // rewrote its record twice a second, each a commit other
+                    // crews' supervisors in this home waited behind.
+                    if anchors != job.group_anchors {
+                        let _ = alter(store, id, |j| j.group_anchors = anchors)?;
+                    }
                     last_anchor_snapshot = Instant::now();
                 }
             }
@@ -4592,5 +4623,117 @@ mod schema_race_tests {
         for thread in threads {
             thread.join().unwrap().expect("open must migrate, not fail");
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_lock_tests {
+    use super::*;
+
+    fn journal_mode(path: &Path) -> String {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Every home's supervisors share the ledger. A commit in progress in one
+    /// of them must not hold up another's open or a read-only observer: in
+    /// rollback mode both waited out the busy timeout and supervisors died
+    /// with "database is locked" under 3-4 crews (2026-10-21).
+    #[test]
+    fn a_ledger_commit_in_progress_holds_up_no_open_or_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("resources.sqlite");
+        drop(ledger(&path).unwrap());
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "BEGIN EXCLUSIVE;
+                 INSERT INTO reservations(key,record) VALUES('held','{}');",
+            )
+            .unwrap();
+        let started = Instant::now();
+        let conn = ledger(&path).expect("an open beside a writer");
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM reservations", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&conn), 0, "the uncommitted row is not seen");
+        let reader =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        assert_eq!(count(&reader), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} on the writer",
+            started.elapsed()
+        );
+        writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(count(&conn), 1);
+        assert_eq!(count(&reader), 1);
+    }
+
+    /// Two supervisors writing at once: the second waits for the first however
+    /// long a busy host keeps it, up to the bound, where it used to give up
+    /// after 5 s and take its job down with it.
+    #[test]
+    fn a_ledger_writer_waits_out_another_held_past_the_old_five_seconds() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("resources.sqlite");
+        let first = ledger(&path).unwrap();
+        first
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO reservations(key,record) VALUES('first','{}');",
+            )
+            .unwrap();
+        let second = {
+            let path = path.clone();
+            thread::spawn(move || -> Result<Duration> {
+                let started = Instant::now();
+                let conn = ledger(&path)?;
+                conn.execute(
+                    "INSERT INTO reservations(key,record) VALUES('second','{}')",
+                    [],
+                )?;
+                Ok(started.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_secs(6));
+        first.execute_batch("COMMIT").unwrap();
+        let waited = second.join().unwrap().expect("the second write waits");
+        assert!(waited >= Duration::from_secs(5), "waited only {waited:?}");
+        let keys: i64 = first
+            .query_row("SELECT COUNT(*) FROM reservations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(keys, 2);
+    }
+
+    /// A ledger an older release left in rollback mode is changed on open,
+    /// rows and all, and stays readable read-only once every writer closes.
+    #[test]
+    fn a_rollback_mode_ledger_changes_to_wal_on_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("resources.sqlite");
+        {
+            let conn = ledger(&path).unwrap();
+            conn.execute(
+                "INSERT INTO reservations(key,record) VALUES('kept','{}')",
+                [],
+            )
+            .unwrap();
+            conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))
+                .unwrap();
+        }
+        assert_eq!(journal_mode(&path), "delete");
+        drop(ledger(&path).unwrap());
+        assert_eq!(journal_mode(&path), "wal");
+        let reader =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let kept: String = reader
+            .query_row("SELECT key FROM reservations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, "kept");
     }
 }

@@ -109,16 +109,28 @@ pub fn init(conn: &Connection) -> Result<()> {
            window_ends_ms INTEGER, window_utilization REAL, weekly_ends_ms INTEGER,
            weekly_utilization REAL, capped_until_ms INTEGER, updated_ms INTEGER NOT NULL);",
     )?;
-    // The run count, added after the ledger shipped. Checked and added under
-    // the write lock so concurrent homes cannot both add one.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    for column in ["runs", "runs_window_ends_ms"] {
-        let present: bool = tx.query_row(
+    // The run count, added after the ledger shipped. Every ledger open comes
+    // here, so the columns are read first and the write lock is taken only to
+    // add one; it is checked again under the lock so concurrent homes cannot
+    // both add it.
+    const COLUMNS: [&str; 2] = ["runs", "runs_window_ends_ms"];
+    let present = |conn: &Connection, column: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_usage') WHERE name=?1)",
             [column],
             |r| r.get(0),
-        )?;
-        if !present {
+        )
+    };
+    let mut all = true;
+    for column in COLUMNS {
+        all &= present(conn, column)?;
+    }
+    if all {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for column in COLUMNS {
+        if !present(&tx, column)? {
             tx.execute_batch(&format!(
                 "ALTER TABLE route_usage ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
             ))?;
