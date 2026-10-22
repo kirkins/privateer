@@ -358,9 +358,10 @@ pub(crate) fn login_path_from(shell: Option<&str>, deadline: std::time::Instant)
         .filter(|shell| shell.starts_with('/'))
         .and_then(|shell| {
             let mut command = Command::new(shell);
-            command.args(["-lc", "printf %s \"$PATH\""]);
+            command.args(["-lc", &format!("printf '%s%s' '{PATH_MARK}' \"$PATH\"")]);
             crate::capabilities::run_bounded(command, "the login shell", deadline, true).ok()
-        });
+        })
+        .and_then(|output| marked_path(&output));
     for entry in login.iter().flat_map(std::env::split_paths) {
         if !entries.contains(&entry) {
             entries.push(entry);
@@ -369,6 +370,17 @@ pub(crate) fn login_path_from(shell: Option<&str>, deadline: std::time::Instant)
     std::env::join_paths(entries)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Printed just before the login shell's PATH, so text an rc file prints
+/// first (a banner, a motd, a fortune) is never read as PATH entries.
+const PATH_MARK: &str = "privateer-login-path:";
+
+/// The PATH after the last `PATH_MARK` in a login shell's output, or none
+/// when the mark is missing (the shell never ran the command).
+fn marked_path(output: &str) -> Option<String> {
+    let (_, path) = output.rsplit_once(PATH_MARK)?;
+    Some(path.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 /// Make sure a front door's supervisor is running; report how.
@@ -613,4 +625,46 @@ fn capitalized(text: &str) -> String {
         .next()
         .map(|c| c.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    /// A login shell whose rc file prints a banner before running the
+    /// command, as many server images do.
+    fn shell_printing(dir: &std::path::Path, banner: &str, path: &str) -> String {
+        let shell = dir.join("shell");
+        std::fs::write(
+            &shell,
+            format!("#!/bin/sh\nprintf '%s\\n' '{banner}'\nPATH='{path}' exec /bin/sh \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shell.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_login_shell_banner_never_becomes_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = shell_printing(dir.path(), "Welcome to: the server", "/opt/login/bin");
+        let path = super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        let entries: Vec<_> = std::env::split_paths(&path).collect();
+        assert!(
+            entries.contains(&std::path::PathBuf::from("/opt/login/bin")),
+            "{path}"
+        );
+        assert!(!path.contains("Welcome"), "{path}");
+        assert!(!path.contains("the server"), "{path}");
+    }
+
+    #[test]
+    fn output_without_the_mark_adds_nothing() {
+        assert_eq!(super::marked_path("Welcome\n/usr/bin"), None);
+        assert_eq!(
+            super::marked_path("motd\nprivateer-login-path:/a:/b\n").as_deref(),
+            Some("/a:/b")
+        );
+    }
 }
