@@ -42,7 +42,7 @@ def refuse_transport():
 
 def main():
     pi = str(Path(sys.argv[1]).resolve(strict=True))
-    fixture = Path(__file__).with_name("pi-calm-native.ts").resolve()
+    fixture = (Path(__file__).resolve().parents[1] / "tests" / "pi-calm-native.ts").resolve()
     with tempfile.TemporaryDirectory(prefix="privateer-calm-native-") as scratch:
         agent = Path(scratch) / "agent"
         agent.mkdir()

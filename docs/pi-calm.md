@@ -95,7 +95,7 @@ documentation and Privateer's own dashboard boat geometry, not First Mate code.
 
 - `node tests/pi-calm.mjs`: simulated extension events, queue transitions and
   deterministic clock/geometry assertions; included in `cargo test`.
-- `python3 tests/pi_calm_native.py /path/to/pi`: isolated installed-Pi entry-point,
+- `python3 scripts/pi_calm_native.py /path/to/pi`: isolated installed-Pi entry-point,
   real exported layout methods, a real `AgentSession`'s queue/restore seams and
   real built-in subprocess execution. Also checks actual headless, attended and
   hosted-crew resource inventories for legacy and explicit-empty bounded plans.
