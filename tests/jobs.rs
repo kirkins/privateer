@@ -685,6 +685,92 @@ fn cancelling_an_orphan_whose_supervisor_is_still_exiting_stops_its_payload() {
     ok(&home, "job.cancel", json!({"id":"stand-in"}));
 }
 
+/// Rewrite a running job's record as one still starting: its reservation
+/// held, no payload, and `supervisor` as the identity start() recorded (none,
+/// in the window before it records one). The real supervisor and payload are
+/// stopped first, so nothing acts on the job but the cancel.
+fn forge_starting(home: &Path, id: &str, supervisor: Value) {
+    start(home, id, &["sleep", "30"]);
+    let running = wait(home, id, &["running"]);
+    let real = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(real, libc::SIGKILL) }, 0);
+    assert!(gone(real));
+    assert_eq!(unsafe { libc::kill(-payload, libc::SIGKILL) }, 0);
+    assert!(gone(payload));
+    let store = Store::open(home).unwrap();
+    let raw: String = store
+        .connection()
+        .query_row("SELECT record FROM jobs WHERE id=?1", [id], |r| r.get(0))
+        .unwrap();
+    let mut record: Value = serde_json::from_str(&raw).unwrap();
+    record["status"] = json!("starting");
+    record["supervisor"] = supervisor;
+    record["payload"] = Value::Null;
+    record["spawned_ms"] = Value::Null;
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=?2 WHERE id=?1",
+            params![id, record.to_string()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn cancelling_a_job_still_starting_ends_it_and_frees_its_slot() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // A live process standing in for a supervisor spawned but not yet past
+    // its claim: it is alive, but this one never reaches the claim's check.
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"stand-in","command":["sleep","30"],"heavy":false}),
+    );
+    let stand_in = wait(&home, "stand-in", &["running"])["payload"].clone();
+    // A supervisor that is alive, and none recorded yet (the spawn window,
+    // or one whose identity cannot be confirmed): no payload exists in
+    // either until a supervisor claims the job, so the cancel ends it.
+    for (id, supervisor) in [("claimless", stand_in), ("unrecorded", Value::Null)] {
+        forge_starting(&home, id, supervisor);
+        assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+        let cancelled = run(&home, "job.cancel", json!({"id":id}));
+        assert!(
+            cancelled.status.success(),
+            "{id}: {}",
+            String::from_utf8_lossy(&cancelled.stderr)
+        );
+        let cancelled: Value = serde_json::from_slice(&cancelled.stdout).unwrap();
+        assert_eq!(cancelled["status"], "cancelled", "{id}: {cancelled}");
+        assert_eq!(
+            ok(&home, "job.status", json!({"id":id}))["status"],
+            "cancelled"
+        );
+        assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+        // A second cancel finds it ended and changes nothing.
+        assert_eq!(
+            ok(&home, "job.cancel", json!({"id":id}))["status"],
+            "cancelled"
+        );
+    }
+    // A supervisor that arrives after the cancel finds nothing to claim and
+    // cannot take the slot back.
+    let late = cli(&home)
+        .arg("--home")
+        .arg(&home)
+        .args(["_job-supervise", "unrecorded"])
+        .output()
+        .unwrap();
+    assert!(!late.status.success());
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"unrecorded"}))["status"],
+        "cancelled"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+    ok(&home, "job.cancel", json!({"id":"stand-in"}));
+}
+
 #[test]
 fn completion_cleanup_stops_leftover_helpers_by_default_and_preserves_success() {
     let fixture = Fixture::new();

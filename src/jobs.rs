@@ -4081,12 +4081,27 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
         Caller::Agent { actor } => actor.clone(),
         Caller::Operator => "operator".into(),
     };
+    let mut ended = false;
     let mut job = alter(store, id, |j| {
         if !terminal(&j.status) && !j.cancel_requested {
             j.cancel_requested = true;
             j.cancelled_by = Some(by);
         }
+        // Only a supervisor's claim moves a job on from starting, and it
+        // spawns no payload before claiming. Ending the job here leaves a
+        // supervisor nothing to claim, whether or not one has been spawned
+        // yet or its identity can be checked, so its capacity is ours to free.
+        if j.status == "starting" {
+            j.status = "cancelled".into();
+            j.finished_ms = Some(Store::now_ms());
+            j.reason = Some("cancelled while starting".into());
+            ended = true;
+        }
     })?;
+    if ended {
+        release(store, &job)?;
+        store.audit("job.cancel_requested", &json!({"job_id": id}))?;
+    }
     if terminal(&job.status) {
         return Ok(public_job(&job));
     }
@@ -4159,9 +4174,14 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
             })?;
             release(store, &job)?;
         } else {
-            // A missing identity in the detach/spawn window is not proof that
-            // no process exists. Keep the reservation for manual inspection.
-            bail!(
+            // The supervisor may have seen the request and ended the job
+            // between our write and its liveness check, which on macOS forks
+            // ps. Otherwise it claimed the job and is gone without recording
+            // a payload: one may still run, so keep the reservation for
+            // manual inspection.
+            job = load(store, id)?;
+            ensure!(
+                terminal(&job.status),
                 "supervisor/payload identity unavailable; cancellation recorded, reservation preserved; after checking for the payload, release it with resource.recover and force:true"
             );
         }
