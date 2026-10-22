@@ -1348,10 +1348,41 @@ fn only_a_tier_one_approval_covers_and_the_crew_record_names_the_writer() {
         ),
         format!("after the covering approval:\n- `{second}`: CHANGES_REQUESTED"),
         format!(
-            "- `{second}`, written by `claude-sonnet-5-5` (from the crew record); its commit trailer names `claude-opus-5-5`, which the crew record does not"
+            "- `{second}`, written by `claude-sonnet-5-5` (from the PR's crew record); its commit trailer names `claude-opus-5-5`, which the crew record does not"
         ),
         "Coverage: changes requested".to_owned(),
     ] {
         assert!(comment.contains(&present), "{present} missing:\n{comment}");
     }
+
+    // Changes requested at a head, then a tier-1 approval of that same head
+    // finished after it: the approval supersedes the request and covers.
+    let third = f.commit(
+        "again",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 42 }\n")],
+        "Again",
+    );
+    f.pr(41, &third, "again");
+    let asked = f.errand_review(
+        41,
+        &third,
+        "FINDING must-fix src/lib.rs:1 off by one\nVERDICT: CHANGES_REQUESTED\n",
+    );
+    assert_eq!(asked["verdict"], "changes_requested", "{asked}");
+    let approved = f.errand_review(41, &third, APPROVE);
+    assert_eq!(approved["verdict"], "approve", "{approved}");
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 41}),
+    );
+    assert_eq!(merged["review"]["id"], approved["id"], "{merged}");
+    assert_eq!(merged["changes_requested"], json!([]), "{merged}");
+    assert_eq!(merged["coverage"], "reviewed", "{merged}");
+    let comment = f.comments().last().unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(comment.contains("- Coverage: reviewed"), "{comment}");
+    assert!(!comment.contains("Changes requested at"), "{comment}");
 }

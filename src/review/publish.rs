@@ -420,6 +420,33 @@ pub fn resolved(store: &Store, review: &Value) -> Result<Vec<Resolved>> {
     Ok(found)
 }
 
+/// Push `lines` under `heading` while the body, with `reserve` characters
+/// still to come after it, stays within the comment limit; then say how
+/// many were left out.
+fn push_capped(body: &mut String, heading: &str, lines: &[String], reserve: usize) {
+    // Room for the heading, what comes after and the line saying what was cut.
+    let room =
+        COMMENT_CHARS.saturating_sub(body.chars().count() + heading.chars().count() + reserve + 80);
+    let mut used = 0;
+    let fits = lines
+        .iter()
+        .take_while(|line| {
+            used += line.chars().count();
+            used <= room
+        })
+        .count();
+    body.push_str(heading);
+    for line in &lines[..fits] {
+        body.push_str(line);
+    }
+    if fits < lines.len() {
+        body.push_str(&format!(
+            "- {} more left out for the comment limit; review.list holds them.\n",
+            lines.len() - fits
+        ));
+    }
+}
+
 /// A review's comment, from its record alone. When it would pass the
 /// comment limit the earlier findings it resolved are cut first, saying how
 /// many were left out.
@@ -481,29 +508,12 @@ pub fn review_body(review: &Value, resolved: &[Resolved], redact: &Redact) -> St
                 )
             })
             .collect();
-        let heading = "\nMust-fix findings of earlier reviews, resolved:\n";
-        // Room for the heading, the footer and the line saying what was cut.
-        let room = COMMENT_CHARS.saturating_sub(
-            body.chars().count() + heading.chars().count() + footer.chars().count() + 80,
+        push_capped(
+            &mut body,
+            "\nMust-fix findings of earlier reviews, resolved:\n",
+            &lines,
+            footer.chars().count(),
         );
-        let mut used = 0;
-        let fits = lines
-            .iter()
-            .take_while(|line| {
-                used += line.chars().count();
-                used <= room
-            })
-            .count();
-        body.push_str(heading);
-        for line in &lines[..fits] {
-            body.push_str(line);
-        }
-        if fits < lines.len() {
-            body.push_str(&format!(
-                "- {} more left out for the comment limit; review.list holds them.\n",
-                lines.len() - fits
-            ));
-        }
     }
     body.push_str(&footer);
     capped(body)
@@ -534,7 +544,9 @@ fn coverage_words(coverage: &str) -> &'static str {
     }
 }
 
-/// A merge's comment, from its merge record alone.
+/// A merge's comment, from its merge record alone. The coverage comes
+/// first, so the comment limit can only cut the lists after it, each of
+/// which says how many it left out.
 pub fn merge_body(id: &str, merge: &Value, redact: &Redact) -> String {
     let text = |key: &str| merge[key].as_str().unwrap_or_default();
     let mut body = format!(
@@ -552,54 +564,72 @@ pub fn merge_body(id: &str, merge: &Value, redact: &Redact) -> String {
         )),
         None => body.push_str("- No approval by a tier-1 review route covered this merge.\n"),
     }
+    body.push_str(&format!(
+        "- Coverage: {}.\n",
+        coverage_words(text("coverage"))
+    ));
+    let footer = "\nA review is no gate: the record says what was merged either way.\n\
+         Written by the Privateer runtime from its merge record.\n";
+    let reserve = footer.chars().count();
     let list = |key: &str| merge[key].as_array().cloned().unwrap_or_default();
-    let weaker = list("approvals_not_covering");
-    if !weaker.is_empty() {
-        body.push_str(
-            "\nApprovals recorded that do not cover it (only a tier-1 review route's does):\n",
-        );
-        for review in &weaker {
-            body.push_str(&format!(
+    let weaker: Vec<String> = list("approvals_not_covering")
+        .iter()
+        .map(|review| {
+            format!(
                 "- {}: {}\n",
                 named_review(review, redact),
                 sanitize(review["why"].as_str().unwrap_or_default(), redact)
-            ));
-        }
+            )
+        })
+        .collect();
+    if !weaker.is_empty() {
+        push_capped(
+            &mut body,
+            "\nApprovals recorded that do not cover it (only a tier-1 review route's does):\n",
+            &weaker,
+            reserve,
+        );
     }
-    let changes = list("changes_requested");
+    let changes: Vec<String> = list("changes_requested")
+        .iter()
+        .map(|review| format!("- {}\n", named_review(review, redact)))
+        .collect();
     if !changes.is_empty() {
-        body.push_str("\nChanges requested at the merged head or after the covering approval:\n");
-        for review in &changes {
-            body.push_str(&format!("- {}\n", named_review(review, redact)));
-        }
+        push_capped(
+            &mut body,
+            "\nChanges requested at the merged head or after the covering approval:\n",
+            &changes,
+            reserve,
+        );
     }
-    let unreviewed = list("unreviewed");
-    if !unreviewed.is_empty() {
-        body.push_str("\nNot reviewed:\n");
-        let models = |key: &str, commit: &Value| -> Vec<String> {
-            commit[key]
-                .as_array()
-                .map(|w| {
-                    w.iter()
-                        .filter_map(Value::as_str)
-                        .map(|m| format!("`{}`", sanitize(m, redact)))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        for commit in &unreviewed {
+    let models = |key: &str, commit: &Value| -> Vec<String> {
+        commit[key]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .filter_map(Value::as_str)
+                    .map(|m| format!("`{}`", sanitize(m, redact)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let unreviewed: Vec<String> = list("unreviewed")
+        .iter()
+        .map(|commit| {
             let written = models("written_by", commit);
+            let from = match commit["from"].as_str().unwrap_or_default() {
+                // The crew record is the PR's, not the commit's own.
+                "crew record" => "the PR's crew record",
+                "commit trailer" => "its commit trailer",
+                _ => "the record",
+            };
             let mut line = format!(
                 "- `{}`, written by {}",
                 commit["sha"].as_str().unwrap_or_default(),
                 if written.is_empty() {
                     "an unrecorded model".to_owned()
                 } else {
-                    format!(
-                        "{} (from the {})",
-                        written.join(", "),
-                        commit["from"].as_str().unwrap_or_default()
-                    )
+                    format!("{} (from {from})", written.join(", "))
                 }
             );
             if commit["disagrees"] == true {
@@ -608,15 +638,14 @@ pub fn merge_body(id: &str, merge: &Value, redact: &Redact) -> String {
                     models("trailer", commit).join(", ")
                 ));
             }
-            body.push_str(&line);
-            body.push('\n');
-        }
+            line.push('\n');
+            line
+        })
+        .collect();
+    if !unreviewed.is_empty() {
+        push_capped(&mut body, "\nNot reviewed:\n", &unreviewed, reserve);
     }
-    body.push_str(&format!(
-        "\nCoverage: {}.\nA review is no gate: the record says what was merged either way.\n\
-         Written by the Privateer runtime from its merge record.\n",
-        coverage_words(text("coverage"))
-    ));
+    body.push_str(footer);
     capped(body)
 }
 
@@ -814,5 +843,27 @@ mod tests {
         ));
         assert_eq!(long.chars().count(), COMMENT_CHARS);
         assert!(long.starts_with(&marker("m")));
+    }
+
+    #[test]
+    fn a_long_merge_record_keeps_its_coverage_and_cuts_the_unreviewed_list() {
+        let commit = |n: usize| {
+            json!({"sha": format!("{n:040x}"), "written_by": ["claude-sonnet-5-5"],
+                "from": "crew record", "trailer": [], "disagrees": false})
+        };
+        let merge = json!({"head_sha": "a".repeat(40), "merge_sha": "e".repeat(40),
+            "review": null, "coverage": "unreviewed",
+            "unreviewed": (0..2000).map(commit).collect::<Vec<_>>()});
+        let body = merge_body("merge-1", &merge, &redact());
+        assert!(body.chars().count() <= COMMENT_CHARS, "{}", body.len());
+        let coverage = body.find("- Coverage: unreviewed").expect("coverage line");
+        assert!(coverage < body.find("Not reviewed:").unwrap(), "{body}");
+        assert!(
+            body.contains("more left out for the comment limit"),
+            "{body}"
+        );
+        assert!(body.contains("(from the PR's crew record)"));
+        assert!(body.ends_with("Written by the Privateer runtime from its merge record.\n"));
+        assert!(!body.contains("Cut at the forge's comment limit"));
     }
 }

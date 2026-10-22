@@ -985,19 +985,30 @@ fn trailer_model(value: &str) -> Option<String> {
     (!model.is_empty()).then_some(model)
 }
 
-/// The tier-1 review routes' models in the captain's routes file: the
-/// models whose review, or whose writing, the merge rule accepts.
-fn top_tier_models(policy: Option<&Value>) -> BTreeSet<String> {
-    let require = crate::crew_routes::Require {
-        r#use: Some("review".to_owned()),
-        tier: Some(1),
-    };
+/// The models a commit's `Co-authored-by` trailers name, read from the
+/// `\x1f`-separated values: only those `known` (a model of a route in the
+/// routes file, or of the crew record), so a human co-author is never taken
+/// for a model.
+fn trailer_models(trailers: &str, known: &BTreeSet<String>) -> Vec<String> {
+    trailers
+        .split('\x1f')
+        .filter_map(trailer_model)
+        .filter(|model| known.contains(model))
+        .collect()
+}
+
+/// The models of the routes in the captain's routes file that meet
+/// `require` (every route's without one).
+fn route_models(
+    policy: Option<&Value>,
+    require: Option<&crate::crew_routes::Require>,
+) -> BTreeSet<String> {
     policy
         .and_then(|p| p["routes"].as_object())
         .map(|routes| {
             routes
                 .values()
-                .filter(|route| crate::crew_routes::meets(route, Some(&require)))
+                .filter(|route| crate::crew_routes::meets(route, require))
                 .filter_map(|route| {
                     crate::crew_routes::identity(route)
                         .as_deref()
@@ -1006,6 +1017,16 @@ fn top_tier_models(policy: Option<&Value>) -> BTreeSet<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The tier-1 review routes' models in the captain's routes file: the
+/// models whose review, or whose writing, the merge rule accepts.
+fn top_tier_models(policy: Option<&Value>) -> BTreeSet<String> {
+    let require = crate::crew_routes::Require {
+        r#use: Some("review".to_owned()),
+        tier: Some(1),
+    };
+    route_models(policy, Some(&require))
 }
 
 /// A review as a merge record names it.
@@ -1021,7 +1042,8 @@ fn review_brief(review: &Value) -> Value {
 /// file now covers the head or the commit it approved; any other approval
 /// of a carried commit is recorded as not covering, with why. A
 /// CHANGES_REQUESTED at the merged head, or at a commit after the covering
-/// approval, is recorded and makes the coverage `changes_requested`.
+/// approval, is recorded and makes the coverage `changes_requested`; one
+/// the covering approval of the same commit finished after is superseded.
 ///
 /// The commits past the covering approval (all of the PR's without one) are
 /// recorded with the models that wrote them. The runtime's own crew record
@@ -1029,7 +1051,8 @@ fn review_brief(review: &Value) -> Value {
 /// a `Co-authored-by` trailer, which crews add whatever route they run on:
 /// a trailer is read only when no crew record exists, and a trailer naming
 /// a model the crew record does not is recorded as a disagreement, never
-/// counted as written by a tier-1 model.
+/// counted as written by a tier-1 model. A trailer counts only when it
+/// names a known model (`trailer_models`): a human co-author names none.
 fn coverage(
     store: &Store,
     ship: &str,
@@ -1094,16 +1117,17 @@ fn coverage(
         .filter(|r| r["verdict"] == "changes_requested")
         .filter(|r| {
             let sha = r["head_sha"].as_str().unwrap_or_default();
-            sha == head
-                || covering.is_some_and(|c| {
-                    let at = c["head_sha"].as_str().unwrap_or_default();
-                    carried(sha)
-                        && if sha == at {
-                            r["finished_ms"].as_i64() > c["finished_ms"].as_i64()
-                        } else {
-                            ancestor(at, sha)
-                        }
-                })
+            let Some(c) = covering else {
+                return sha == head;
+            };
+            // The covering approval of the same commit supersedes a request
+            // for changes it finished after, at the merged head too.
+            let at = c["head_sha"].as_str().unwrap_or_default();
+            if sha == at {
+                r["finished_ms"].as_i64() > c["finished_ms"].as_i64()
+            } else {
+                sha == head || (carried(sha) && ancestor(at, sha))
+            }
         })
         .map(review_brief)
         .collect();
@@ -1132,6 +1156,10 @@ fn coverage(
         }
         Err(error) => notes.push(format!("the crew record could not be read: {error:#}")),
     }
+    let known: BTreeSet<String> = route_models(policy.as_ref(), None)
+        .into_iter()
+        .chain(crew.iter().cloned())
+        .collect();
     let unreviewed: Vec<Value> = commits
         .lines()
         .map(|sha| {
@@ -1145,7 +1173,7 @@ fn coverage(
                 ],
             )
             .unwrap_or_default();
-            let named: Vec<String> = trailers.split('\x1f').filter_map(trailer_model).collect();
+            let named = trailer_models(&trailers, &known);
             let (written, from, disagrees) = if !crew.is_empty() {
                 let disagrees = named.iter().any(|m| !crew.contains(m));
                 (
@@ -1339,5 +1367,19 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "review.list" => list(store, &args),
         "pr.merge" => merge(store, &args),
         _ => bail!("unknown review command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_trailer_naming_a_known_model_counts() {
+        let known: BTreeSet<String> = ["claude-opus-5-5".to_owned()].into();
+        let trailers = "Jane Doe <jane@example.invalid>\x1fClaude Opus 5.5 <noreply@anthropic.com>\x1fGPT 6.1 <bot@example.invalid>";
+        assert_eq!(trailer_models(trailers, &known), ["claude-opus-5-5"]);
+        assert!(trailer_models("Jane Doe <jane@example.invalid>", &known).is_empty());
+        assert!(trailer_models("", &known).is_empty());
     }
 }
