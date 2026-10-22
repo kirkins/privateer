@@ -220,8 +220,11 @@ for m in call("mail.inbox", {"address": ship})["messages"]:
     if m["kind"] == "request" and m["state"] == "open":
         call("mail.send", {"from": ship, "to": m["from"], "kind": "reply", "correlation": m["id"], "body": "handled by " + ship})
 through = int(re.search(r"through seq (\d+)", prompt).group(1))
-for focus in re.findall(r"^## (\S+)$", prompt, re.M):
-    call("note.put", {"ship": ship, "focus": focus, "body": "Seen through seq %d" % through})
+# One CLI call per focus: a wake over hundreds of routine threads would spend
+# a minute or more in them on a loaded runner; a test of coverage turns them off.
+if mode != "no-notes":
+    for focus in re.findall(r"^## (\S+)$", prompt, re.M):
+        call("note.put", {"ship": ship, "focus": focus, "body": "Seen through seq %d" % through})
 call("mail.ack", {"address": ship, "through_seq": through})
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1200, "cached_input_tokens": 1000, "output_tokens": 80}}))
 "#;

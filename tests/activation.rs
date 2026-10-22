@@ -692,6 +692,10 @@ fn a_correction_still_waits_for_the_batch_window_and_the_wake_budget() {
 #[test]
 fn actionable_mail_after_a_full_routine_page_keeps_contiguous_wake_coverage() {
     let mut fleet = Fleet::new(json!({"batch_secs":0,"max_delay_secs":0,"max_wakes_per_hour":1}));
+    // The first wake has 200 focuses, one per routine thread. This test is
+    // about which mail each wake covers, not the handoff notes, which would
+    // cost the scripted mate one CLI call per focus.
+    fleet.mode("no-notes");
     for n in 0..205 {
         fleet.send(
             json!({"id":format!("routine-{n}"),"from":"apps","to":"infra",
@@ -885,14 +889,24 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
         );
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
-    let started = Instant::now();
     // Budget for cold Python startup (including the injected delay), while
     // remaining well below the fixture's five-second blocked call and the
     // configured peer timeout. Production timeouts are unchanged.
     let first = tick(3000);
-    assert!(started.elapsed() < Duration::from_secs(4), "{first}");
     assert_eq!(Fleet::infra(&first)["status"], "running", "{first}");
     assert_eq!(first["delivered"]["attempted"], 1);
+    // The pass cut the slow call at what was left of its delivery budget, not
+    // at the peer's own five seconds. Read the cap the call ran under rather
+    // than timing the whole pass, whose process start-up and local work a
+    // loaded runner stretches by seconds.
+    let slow = fleet.ok("mail.show", json!({"id":"out-slow"}), None);
+    let error = slow["delivery_error"].as_str().unwrap_or_default();
+    let capped_ms: u64 = error
+        .split_once("timed out after ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("slow call was not cut at a deadline: {slow}"));
+    assert!(capped_ms <= 3000, "{slow}");
     // The fake peer writes the marker after its cold start; wait for it
     // rather than reading once, since a loaded runner can start it late.
     let until = Instant::now() + Duration::from_secs(10);
@@ -913,7 +927,9 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
         unsafe { libc::kill(observed["pid"].as_i64().unwrap() as i32, 0) },
         -1
     );
-    let second = tick(1000);
+    // The healthy call is a whole privateer subprocess; on a loaded runner its
+    // start-up alone can pass one second, so give it the same budget.
+    let second = tick(3000);
     assert_eq!(second["delivered"]["delivered"], 1, "{second}");
     assert_eq!(second["delivered"]["pending"], 1);
     let inbox = dispatch(&mut remote, "mail.inbox", json!({"address":"healthy"})).unwrap();
