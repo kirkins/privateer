@@ -1,6 +1,6 @@
 # Design: one block, one ask
 
-Status: revised after the Opus design review of ff2ce0b (approve with eight changes, all folded in below), and being implemented. Task `privateer-one-block-one-ask` (captain finding 13, notice d8789f3d). It also covers finding 7 (`privateer-permission-decision-detail`, a decision that names the denied tool and input, the narrowest rule, and the job). Read with [crew park and resume](crew-park-resume.md), [cross-machine fleet](cross-machine-fleet.md) and [tool permissions](../tool-permissions.md).
+Status (2026-10-22): implemented in `src/block_ask.rs` (see [tool permissions](../tool-permissions.md)); this document is the design rationale. Revised after the Opus design review of ff2ce0b (approve with eight changes, all folded in below). Task `privateer-one-block-one-ask` (captain finding 13, notice d8789f3d). It also covers finding 7 (`privateer-permission-decision-detail`, a decision that names the denied tool and input, the narrowest rule, and the job). Read with [crew park and resume](crew-park-resume.md), [cross-machine fleet](cross-machine-fleet.md) and [tool permissions](../tool-permissions.md).
 
 ## Problem
 
