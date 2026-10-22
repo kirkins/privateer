@@ -301,14 +301,9 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
             "Task ownership changed; the new owner must enqueue its assignment",
             now,
         )?;
-    } else if matches!(task["status"].as_str(), Some("done" | "cancelled")) {
-        work.state = if task["status"] == "done" {
-            "done"
-        } else {
-            "stopped"
-        }
-        .into();
-        work.reason = Some(format!("Task is {}", task["status"].as_str().unwrap()));
+    } else if let Some(status @ ("done" | "cancelled")) = task["status"].as_str() {
+        work.state = if status == "done" { "done" } else { "stopped" }.into();
+        work.reason = Some(format!("Task is {status}"));
         finish_wake(store, work, "succeeded", now)?;
     } else if let Err(error) = store.authorize(&work.task_id, "spawn") {
         fault(

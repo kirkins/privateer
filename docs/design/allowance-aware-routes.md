@@ -1,6 +1,6 @@
 # Design: allowance-aware routes
 
-Status: revised after the Opus design review of `a0efe89` (verdict: changes needed). This revision makes the review's must-fixes 1 to 9 and records the first mate's answers to the open questions. Task `privateer-allowance-aware-routes` (captain finding, notice 3ea9cf1b, 2026-10-18). Read with [crew park and resume](crew-park-resume.md) (a resume's route policy) and [architecture](../architecture.md). Names marked **new** do not exist yet; every other name was checked against the tree at `49501c5`.
+Status (2026-10-22): implemented in `src/crew_routes.rs` (`Allowance`, `allowances`) and `src/routes.rs` (`allowance_spent`, `claude_windows`); this document is the design rationale. Revised after the Opus design review of `a0efe89` (verdict: changes needed). This revision makes the review's must-fixes 1 to 9 and records the first mate's answers to the open questions. Task `privateer-allowance-aware-routes` (captain finding, notice 3ea9cf1b, 2026-10-18). Read with [crew park and resume](crew-park-resume.md) (a resume's route policy) and [architecture](../architecture.md). Names marked **new** do not exist yet; every other name was checked against the tree at `49501c5`.
 
 ## Problem
 

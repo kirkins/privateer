@@ -403,13 +403,26 @@ pub(crate) fn run_argv_output(
     let shown = Path::new(&argv[0])
         .file_name()
         .map_or_else(|| argv[0].clone(), |n| n.to_string_lossy().into_owned());
-    run_bounded(command, &shown, deadline, capture)
+    // Until `deadline` or the probe's own timeout, whichever is first.
+    let own = Instant::now() + PROBE_TIMEOUT;
+    match run_bounded(command, &shown, deadline.min(own), capture) {
+        Err(why) if why == TIMED_OUT => Err(if deadline < own {
+            CUT_SHORT
+        } else {
+            "probe timed out"
+        }
+        .to_owned()),
+        other => other,
+    }
 }
 
+/// Why `run_bounded` stopped a command: it was still running at its deadline.
+pub(crate) const TIMED_OUT: &str = "timed out";
+
 /// Run `command` as a probe: in its own process group, without input, until
-/// `deadline` or the probe timeout, whichever is first, when the whole group
-/// is killed. Keeps the first 64 KiB of standard output when `capture` is
-/// set (empty otherwise). `Err` says why it failed, naming it `shown`.
+/// `deadline`, when the whole group is killed and `Err` is `TIMED_OUT`. Keeps
+/// the first 64 KiB of standard output when `capture` is set (empty
+/// otherwise). Any other `Err` says why it failed, naming it `shown`.
 pub(crate) fn run_bounded(
     mut command: Command,
     shown: &str,
@@ -443,15 +456,10 @@ pub(crate) fn run_bounded(
         receive
     });
     let pid = child.id();
-    let own = Instant::now() + PROBE_TIMEOUT;
-    let cut = deadline < own;
-    let deadline = deadline.min(own);
     let outcome = loop {
         match crate::jobs::exited_unreaped(pid) {
             Ok(Some(_)) => break None,
-            Ok(None) if Instant::now() >= deadline => {
-                break Some(if cut { CUT_SHORT } else { "probe timed out" }.to_owned());
-            }
+            Ok(None) if Instant::now() >= deadline => break Some(TIMED_OUT.to_owned()),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => break Some(format!("{error:#}")),
         }
@@ -498,6 +506,18 @@ fn evaluate(
     live: bool,
     budget: Duration,
 ) -> Result<Vec<(String, std::result::Result<&'static str, String>)>> {
+    evaluate_with(conn, names, live, budget, &crate::service::login_path_by)
+}
+
+/// `evaluate` with `login` giving the PATH probes run on, asked by the
+/// budget's deadline, so a slow login shell cannot outlast the budget.
+fn evaluate_with(
+    conn: &Connection,
+    names: &[String],
+    live: bool,
+    budget: Duration,
+    login: &dyn Fn(Instant) -> String,
+) -> Result<Vec<(String, std::result::Result<&'static str, String>)>> {
     let vocabulary = vocabulary(conn)?;
     let declared = declarations(conn)?;
     let now = Store::now_ms();
@@ -539,8 +559,8 @@ fn evaluate(
         verdicts.push((name.clone(), verdict));
     }
     if !to_probe.is_empty() {
-        let path = crate::service::login_path();
         let budget = Instant::now() + budget;
+        let path = login(budget);
         for batch in to_probe.chunks(PARALLEL) {
             let results: Vec<(usize, std::result::Result<(), String>)> =
                 std::thread::scope(|scope| {
@@ -916,6 +936,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(defined_on(&conn).unwrap().as_deref(), Some("studio"));
+    }
+
+    #[test]
+    fn the_login_lookup_is_bounded_by_the_exchange_budget() {
+        let conn = registry();
+        put(
+            &conn,
+            &json!({"name": "quick", "probe": {"argv": ["true"]}}),
+        )
+        .unwrap();
+        let names = vec!["quick".to_owned()];
+        let budget = Duration::from_millis(300);
+        let asked = std::sync::Mutex::new(None);
+        let latest = Instant::now() + budget;
+        evaluate_with(&conn, &names, false, budget, &|deadline| {
+            *asked.lock().unwrap() = Some(deadline);
+            "/usr/bin:/bin".to_owned()
+        })
+        .unwrap();
+        let asked = asked.lock().unwrap().expect("the login PATH was asked");
+        assert!(
+            asked <= latest + Duration::from_millis(100),
+            "the login lookup may run {:?} past the budget",
+            asked - latest
+        );
     }
 
     #[test]

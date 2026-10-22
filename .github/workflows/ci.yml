@@ -40,56 +40,48 @@ jobs:
     timeout-minutes: 5
     steps:
       - run: test "${{ needs.macos.result }}" = success
-  # A macOS arm64 release for machines without a Rust toolchain, in the
-  # versioned release layout: <commit>/bin and <commit>/share/privateer/plugins.
-  macos-release:
-    name: macOS arm64 release
+  # A release for each platform CI builds, for machines without a Rust
+  # toolchain, in the versioned release layout scripts/release-layout.sh
+  # writes: <commit>/bin, <commit>/share/privateer/plugins and
+  # <commit>/SHA256SUMS. `privateer upgrade fetch` finds the job by its name
+  # and the artifact by privateer-<platform>-<commit>, and checks the
+  # artifact's digest and then SHA256SUMS. Linux binaries link against the
+  # runner's glibc, so the images are pinned (not ubuntu-latest, which moves
+  # to each new LTS) and they run on Ubuntu 24.04 (glibc 2.39) and newer.
+  release:
+    name: ${{ matrix.name }}
     if: github.event_name != 'pull_request'
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64 release
+            platform: macos-arm64
+            os: macos-latest
+          - name: Linux x86_64 release
+            platform: linux-x86_64
+            os: ubuntu-24.04
+          - name: Linux aarch64 release
+            platform: linux-aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90.0
       - run: cargo build --release --locked --features dashboard
-      - name: Lay out the release
+      # Lays out releases/<commit>, writes SHA256SUMS and checks that the
+      # image knows itself as this exact release.
+      - run: scripts/release-layout.sh "$GITHUB_SHA" target/release plugins releases
+      - name: Check the glibc floor
+        if: runner.os == 'Linux'
         run: |
-          root="releases/$GITHUB_SHA"
-          mkdir -p "$root/bin" "$root/share/privateer"
-          cp target/release/privateer target/release/privateer-dashboard target/release/privateer-mcp-broker "$root/bin/"
-          cp -R plugins "$root/share/privateer/plugins"
-          # The image must know itself as this exact release.
-          "$root/bin/privateer" upgrade status | grep -q "\"running_commit\": \"$GITHUB_SHA\""
-          tar -czf privateer-macos-arm64.tar.gz -C releases "$GITHUB_SHA"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: privateer-macos-arm64-${{ github.sha }}
-          path: privateer-macos-arm64.tar.gz
-  # The same layout for Linux x86_64 servers. The binaries link against the
-  # runner's glibc, so the image is pinned (not ubuntu-latest, which moves to
-  # each new LTS) and they run on Ubuntu 24.04 (glibc 2.39) and newer.
-  linux-release:
-    name: Linux x86_64 release
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90.0
-      - run: cargo build --release --locked --features dashboard
-      - name: Lay out the release
-        run: |
-          root="releases/$GITHUB_SHA"
-          mkdir -p "$root/bin" "$root/share/privateer"
-          cp target/release/privateer target/release/privateer-dashboard target/release/privateer-mcp-broker "$root/bin/"
-          cp -R plugins "$root/share/privateer/plugins"
-          # The image must know itself as this exact release.
-          "$root/bin/privateer" upgrade status | grep -q "\"running_commit\": \"$GITHUB_SHA\""
           # Fail if any binary needs a glibc newer than the floor above.
-          need=$(objdump -T "$root"/bin/* | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          need=$(objdump -T releases/"$GITHUB_SHA"/bin/* | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
           echo "highest glibc symbol: $need"
           test "$(printf '%s\n' "$need" 2.39 | sort -V | tail -1)" = 2.39
-          tar -czf privateer-linux-x86_64.tar.gz -C releases "$GITHUB_SHA"
+      - run: tar -czf privateer-${{ matrix.platform }}.tar.gz -C releases "$GITHUB_SHA"
       - uses: actions/upload-artifact@v4
         with:
-          name: privateer-linux-x86_64-${{ github.sha }}
-          path: privateer-linux-x86_64.tar.gz
+          name: privateer-${{ matrix.platform }}-${{ github.sha }}
+          path: privateer-${{ matrix.platform }}.tar.gz

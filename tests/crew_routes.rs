@@ -2704,6 +2704,20 @@ fn a_route_whose_harness_is_not_installed_is_passed_over_for_the_next() {
         "first in allowance order on engineering's crew list: opus (no requirement)"
     );
     f.harness("claude", false);
+    // Bearings say so before any launch, as they do for a route backing off.
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains(
+            "Model route opus is unavailable (claude not installed); launches pass it over, \
+             and one that names it is refused.\n"
+        ),
+        "{bearings}"
+    );
+    assert!(
+        !text.contains("Model route steady is unavailable"),
+        "{bearings}"
+    );
     let second = f.json(
         Some("engineering"),
         "agent.start",

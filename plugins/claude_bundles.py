@@ -19,6 +19,7 @@ import hashlib
 import stat
 import subprocess
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from bundles import (SEMVER, at, credential_directory, credential_environment, file_bytes, present, require,
                      require_flags, safe_path, stdio_argv, validate_plan)
 
