@@ -274,6 +274,29 @@ pub(crate) fn harness(store: &Store, ship: &str, harness: u32) -> Result<()> {
     Ok(())
 }
 
+/// The model route, `harness/provider/model`, a hosted pane last launched
+/// the ship folder's session on; None before any pane recorded one.
+pub(crate) fn session_route(store: &Store, ship: &str) -> Result<Option<String>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT session_route FROM hosted_panes WHERE ship=?1",
+            [ship],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Record the model route this pane launched its session on.
+pub(crate) fn record_session_route(store: &Store, ship: &str, route: Option<&str>) -> Result<()> {
+    store.connection().execute(
+        "UPDATE hosted_panes SET session_route=?3 WHERE ship=?1 AND pid=?2",
+        params![ship, std::process::id(), route],
+    )?;
+    Ok(())
+}
+
 /// The recorded pane for a ship, if its process is still the one recorded.
 pub(crate) fn live_pane(store: &Store, ship: &str) -> Result<Option<(u32, String, String)>> {
     let row: Option<(u32, String, String)> = store

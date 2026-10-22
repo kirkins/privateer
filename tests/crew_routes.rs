@@ -401,7 +401,63 @@ fn crew_and_errands_with_no_list_of_their_own_take_the_first_mate_route() {
             refusal.contains("mate: model route codex/-/model-mate is backing off"),
             "{refusal}"
         );
+        // Nothing queues the launch: it is the caller's to retry.
+        assert!(refusal.contains("retry once one clears"), "{refusal}");
+        assert!(!refusal.contains("waits for one to clear"), "{refusal}");
     }
+}
+
+/// Crew that take the first mate's listed route are judged against each
+/// route's crew share through the list order: a first route past the crew
+/// share, though inside the first mate's, passes them to the next listed one
+/// instead of refusing them. An errand, judged as the first mate, keeps it.
+#[test]
+fn crew_on_the_first_mate_list_pass_a_route_past_the_crew_share() {
+    let f = Fleet::new();
+    let mut mate = codex("model-mate", "plan");
+    mate["allowance"] = json!({"window_hours": 5, "weekly_utc": "Mon 00:00"});
+    mate["tier"] = json!(1);
+    f.routes(json!({
+        "routes": {"mate": mate, "spare": codex("model-spare", "plan")},
+        "first_mate": ["mate", "spare"]
+    }));
+    f.tick();
+    let now = privateer::store::Store::now_ms();
+    rusqlite::Connection::open(f.root.join("ledger/resources.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('codex/-/model-mate', 0.85, ?1, ?2)",
+            rusqlite::params![now + 3_600_000, now],
+        )
+        .unwrap();
+    let crew = f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert_eq!(crew["route"]["name"], "spare", "{crew}");
+    assert_eq!(f.model(&crew), "model-spare");
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Review the fix."}),
+    );
+    assert_eq!(errand["route"]["name"], "mate", "{errand}");
+    assert_eq!(f.model(&json!({"id":errand["errand"]})), "model-mate");
+
+    // Past the crew share on both: refused, and told nothing is queued.
+    rusqlite::Connection::open(f.root.join("ledger/resources.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO route_usage(route, weekly_utilization, weekly_ends_ms, updated_ms)
+             VALUES('codex/-/model-spare', 0.85, ?1, ?2)",
+            rusqlite::params![now + 3_600_000, now],
+        )
+        .unwrap();
+    let refusal = f.refused(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert!(
+        refusal.contains("every first_mate route for engineering is unavailable"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("80% for crew"), "{refusal}");
+    assert!(refusal.contains("retry once one clears"), "{refusal}");
 }
 
 #[test]

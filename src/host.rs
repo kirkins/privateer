@@ -276,6 +276,9 @@ pub(crate) enum Conversation {
     /// Transcripts exist, but none has an entrypoint record: an empty file, or
     /// a session that stopped before its first record with one.
     NoEntrypoint,
+    /// An interactive conversation exists, but a pane launched it on another
+    /// model route than this launch takes: it is not resumed on a new model.
+    Rerouted,
 }
 
 impl Conversation {
@@ -290,6 +293,7 @@ impl Conversation {
             Self::HeadlessOnly => "headless only",
             Self::BoundReached => "bound reached",
             Self::NoEntrypoint => "no entrypoint",
+            Self::Rerouted => "rerouted",
         }
     }
 }

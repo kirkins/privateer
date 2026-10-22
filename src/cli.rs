@@ -1272,12 +1272,34 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     if hosted {
         let _ = crate::host::upgrade::record_settings(&store, &ship);
     }
+    // A pane resumes the folder's session only on the model route a pane
+    // launched it on, Claude's --continue and Pi's alike: on another route it
+    // starts fresh rather than run the old conversation on a new model. A
+    // pane recorded before routes were (none recorded) continues as before.
+    let rerouted = |launch: &mut Launch| -> Result<bool> {
+        if !hosted {
+            return Ok(false);
+        }
+        let now = pane_route(launch, passthrough);
+        let Some(before) = crate::host::upgrade::session_route(&store, &ship)?
+            .filter(|before| Some(before) != now.as_ref())
+        else {
+            return Ok(false);
+        };
+        eprintln!(
+            "note: {ship}'s last session ran on model route {before}; starting a fresh session on {}",
+            now.as_deref().unwrap_or("its harness default")
+        );
+        launch.route.retain(|arg| arg != "--continue");
+        Ok(true)
+    };
     // Bounded live starts are fresh: old history can retain facts from
     // resources no longer selected, and --continue cannot name the exact
     // session a plan digest was recorded for. Omitted selection keeps resumes.
     // Rechecked at every launch: a session that slept has a conversation to
     // continue even if its first launch had none.
-    let continuation_for = |launch: &Launch| -> Result<Option<crate::host::Conversation>> {
+    let continuation_for = |launch: &mut Launch| -> Result<Option<crate::host::Conversation>> {
+        let rerouted = rerouted(launch)?;
         let applies = hosted
             && launch.harness == "claude"
             && launch.bundle_plan.is_none()
@@ -1287,9 +1309,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         if !applies {
             return Ok(None);
         }
-        Ok(Some(crate::host::claude_conversation(
-            &folder.canonicalize()?,
-        )))
+        Ok(Some(
+            match crate::host::claude_conversation(&folder.canonicalize()?) {
+                conversation if conversation.continues() && rerouted => {
+                    crate::host::Conversation::Rerouted
+                }
+                conversation => conversation,
+            },
+        ))
     };
     // The launch command, and the captain approvals it carries for the first
     // time, which the pane announces once the harness has spawned.
@@ -1386,7 +1413,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         Ok((command, first))
     };
     // Decide before claiming presence, so an error leaves nothing to release.
-    let mut continuation = continuation_for(&launch)?;
+    let mut continuation = continuation_for(&mut launch)?;
     // The child can invoke a startup hook immediately after spawn.
     if hosted {
         crate::presence::adopt(&store, &ship, &holder, 90)?;
@@ -1432,14 +1459,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             prepare_harness(&next.harness, &plugins, folder, &control)?;
             Ok(next)
         });
-        let launch = match planned {
+        let mut launch = match planned {
             Ok(next) => next,
             Err(error) => {
                 let _ = crate::host::failed(&store, &ship, holder, &format!("{error:#}"));
                 return Err(error);
             }
         };
-        let continuation = continuation_for(&launch)?;
+        let continuation = continuation_for(&mut launch)?;
         let sleep_after = sleep_after_for(&profile);
         Ok((profile, launch, continuation, sleep_after))
     };
@@ -1476,6 +1503,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 // in place; never abandon an already spawned native process over it.
                 let _ = crate::host::started(&store, &ship, &holder);
                 let _ = crate::host::upgrade::harness(&store, &ship, child.id());
+                let _ = crate::host::upgrade::record_session_route(
+                    &store,
+                    &ship,
+                    pane_route(&launch, passthrough).as_deref(),
+                );
                 let _ = crate::host::upgrade::announce_applied(&store, &ship, &first);
             }
             crate::host::sleep::supervise(&store, &ship, &holder, &mut child, sleep_after)?
@@ -1571,7 +1603,7 @@ fn listed_route(
             Ok(Some(choice))
         }
         crate::crew_routes::Listed::Unavailable(why) => bail!(
-            "{why}; wait for one to clear, or give the first mate its own model with ship.put"
+            "{why}; retry once one clears, or give the first mate its own model with ship.put"
         ),
     }
 }
@@ -1583,6 +1615,17 @@ struct Launch {
     binary: String,
     route: Vec<String>,
     bundle_plan: Option<Value>,
+}
+
+/// The model route, `harness/provider/model`, a launch runs on: its route
+/// arguments, or the session's own where they choose the model.
+fn pane_route(launch: &Launch, passthrough: &[String]) -> Option<String> {
+    let argv: Vec<&str> = ["native_launch.py", &launch.harness, &launch.binary]
+        .into_iter()
+        .chain(launch.route.iter().map(String::as_str))
+        .chain(passthrough.iter().map(String::as_str))
+        .collect();
+    crate::routes::route_of_argv(&json!(argv))
 }
 
 /// Whether the session's own arguments choose `flag`, so the profile yields.

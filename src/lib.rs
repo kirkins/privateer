@@ -390,10 +390,18 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     // Options naming their own provider or model are explicit.
                     let named = args["options"].get("provider").is_some()
                         || args["options"].get("model").is_some();
+                    // Crew are judged against each route's crew share from
+                    // the start, so a later route that can take them is
+                    // taken; a wake keeps the first mate's.
+                    let who = if workspace::is_wake(store, &args)? {
+                        routes::Who::FirstMate
+                    } else {
+                        routes::Who::Crew
+                    };
                     let listed = if named {
                         crew_routes::Listed::Unlisted
                     } else {
-                        crew_routes::listed_first_mate(store, ship, &profile)?
+                        crew_routes::listed_for(store, ship, &profile, who)?
                     };
                     match listed {
                         crew_routes::Listed::Unlisted => {}
@@ -420,7 +428,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                             });
                         }
                         crew_routes::Listed::Unavailable(why) => anyhow::bail!(
-                            "{why}; the crew waits for one to clear, or name a route or manifest"
+                            "{why}; nothing is queued: retry once one clears, or name a route or manifest"
                         ),
                     }
                     args["manifest"] = profile["manifest"].clone();

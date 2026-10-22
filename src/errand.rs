@@ -228,7 +228,7 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
                 });
             }
             crate::crew_routes::Listed::Unavailable(why) => bail!(
-                "{why}; the errand waits for one to clear, or give the first mate its own model with ship.put"
+                "{why}; nothing is queued: retry once one clears, or give the first mate its own model with ship.put"
             ),
         }
     }

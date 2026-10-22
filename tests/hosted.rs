@@ -5060,3 +5060,146 @@ fn a_panes_card_names_the_approval_its_session_carried_and_offers_only_recent_ot
     );
     place.stop_native("infra");
 }
+
+/// Herdr for a hosted fixture, serving panes with the fixture's PATH and HOME.
+fn route_herdr(place: &Place) -> Herdr {
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    )
+}
+
+/// One hosted launch of the first mate, run until its harness starts and then
+/// stopped: whether it continued, and the model it was given.
+fn launched_route(place: &Place, what: &str) -> (bool, String) {
+    place.retry_now();
+    let report = place.tick();
+    assert!(report["hosted"]["pane"].is_string(), "{report}");
+    until(what, || place.root.join("pi-env").exists());
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    let args: Vec<&str> = argv.lines().collect();
+    let continued = args.contains(&"--continue");
+    let model = args
+        .windows(2)
+        .find(|w| w[0] == "--model")
+        .map(|w| w[1].to_owned())
+        .unwrap_or_else(|| panic!("no --model: {argv}"));
+    place.stop_native("infra");
+    (continued, model)
+}
+
+/// A hosted Pi pane continues the folder's session only on the route a pane
+/// launched it on. When the first_mate list moves the first mate to another
+/// route the pane starts fresh, in both directions, rather than resume the
+/// old conversation on a new model; on one route it continues as before.
+#[test]
+fn a_hosted_pi_pane_continues_only_on_the_route_it_ran_on() {
+    let place = Place::new();
+    let route = |model: &str| {
+        json!({"manifest": "bundled:pi", "cost": "plan",
+            "options": {"provider": "fixture-provider", "model": model}})
+    };
+    let list = |order: [&str; 2]| {
+        place.json(
+            "routes.set",
+            json!({"routes": {"flash": route("flash-model"), "pro": route("pro-model")},
+                "first_mate": order}),
+        );
+    };
+    let mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    assert_eq!(mate["options"], json!({}), "{mate}");
+    assert_eq!(mate["host"], "herdr", "{mate}");
+    let _herdr = route_herdr(&place);
+
+    // No pane has recorded a route yet: it continues as it always has.
+    list(["flash", "pro"]);
+    assert_eq!(
+        launched_route(&place, "the first pane"),
+        (true, "flash-model".to_owned())
+    );
+    // The list moves the first mate to pro: a fresh session there.
+    list(["pro", "flash"]);
+    assert_eq!(
+        launched_route(&place, "the pane on pro"),
+        (false, "pro-model".to_owned())
+    );
+    assert_eq!(
+        launched_route(&place, "the pane again on pro"),
+        (true, "pro-model".to_owned())
+    );
+    // And back: pro's session never continues on flash.
+    list(["flash", "pro"]);
+    assert_eq!(
+        launched_route(&place, "the pane back on flash"),
+        (false, "flash-model".to_owned())
+    );
+}
+
+/// A hosted Claude pane is bound the same way: its folder's interactive
+/// conversation is continued only on the route a pane launched it on.
+#[test]
+fn a_hosted_claude_pane_continues_only_on_the_route_it_ran_on() {
+    let place = Place::new();
+    // The fake records its argv like the Pi fake, so stop_native applies.
+    fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
+    let route = |model: &str| json!({"manifest": "bundled:claude", "cost": "plan", "options": {"model": model}});
+    let list = |order: [&str; 2]| {
+        place.json(
+            "routes.set",
+            json!({"routes": {"opus": route("claude-opus"), "sonnet": route("claude-sonnet")},
+                "first_mate": order}),
+        );
+    };
+    let mut mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    mate["manifest"] = json!("bundled:claude");
+    mate["options"] = json!({"permission_mode":"auto"});
+    place.json("ship.put", json!({"name":"infra","first_mate":mate}));
+    let trust =
+        json!({"projects": {place.folder.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
+    fs::write(place.root.join(".claude.json"), trust.to_string()).unwrap();
+    // Claude's own naming: every character but a letter or digit is a dash.
+    let folder: String = place
+        .folder
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = place.root.join(".claude/projects").join(folder);
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::write(
+        transcripts.join("session.jsonl"),
+        "{\"entrypoint\":\"cli\"}\n",
+    )
+    .unwrap();
+    let _herdr = route_herdr(&place);
+
+    list(["opus", "sonnet"]);
+    assert_eq!(
+        launched_route(&place, "the first Claude pane"),
+        (true, "claude-opus".to_owned())
+    );
+    list(["sonnet", "opus"]);
+    assert_eq!(
+        launched_route(&place, "the Claude pane on sonnet"),
+        (false, "claude-sonnet".to_owned())
+    );
+    assert_eq!(
+        launched_route(&place, "the Claude pane again on sonnet"),
+        (true, "claude-sonnet".to_owned())
+    );
+    list(["opus", "sonnet"]);
+    assert_eq!(
+        launched_route(&place, "the Claude pane back on opus"),
+        (false, "claude-opus".to_owned())
+    );
+}

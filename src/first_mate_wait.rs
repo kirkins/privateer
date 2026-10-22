@@ -1,8 +1,9 @@
 //! A first mate held off every route on its first_mate list while wake-worthy
 //! mail waits. The dispatcher pass records the fact once that mail has waited
 //! past `max_delay_secs`, and removes it at the next pass that finds a route
-//! clear, the mail gone or the first mate otherwise attended to; runtime.needs
-//! shows it to the captain. Nothing is mailed.
+//! clear, the mail gone or the first mate otherwise attended to, or that no
+//! longer considers the ship (moved away, or without a first mate);
+//! runtime.needs shows it to the captain. Nothing is mailed.
 use crate::store::Store;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -43,6 +44,17 @@ pub(crate) fn clear(store: &Store, ship: &str) -> Result<()> {
     store
         .connection()
         .execute("DELETE FROM first_mate_waits WHERE ship=?1", [ship])?;
+    Ok(())
+}
+
+/// Keep waits only for `ships`, the ones the dispatcher pass considers: a ship
+/// moved to another machine, or left with no first mate, is no longer
+/// checked, so its recorded wait would never clear.
+pub(crate) fn retain(store: &Store, ships: &[&str]) -> Result<()> {
+    store.connection().execute(
+        "DELETE FROM first_mate_waits WHERE ship NOT IN (SELECT value FROM json_each(?1))",
+        [serde_json::to_string(ships)?],
+    )?;
     Ok(())
 }
 

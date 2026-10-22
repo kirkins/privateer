@@ -1139,6 +1139,13 @@ pub(crate) enum Listed {
 /// the routes file. A profile with its own model, set by `ship.put` or
 /// `init`, always wins, and so does a charter-pinned provider adapter.
 pub(crate) fn listed_first_mate(store: &Store, ship: &str, profile: &Value) -> Result<Listed> {
+    listed_for(store, ship, profile, Who::FirstMate)
+}
+
+/// `listed_first_mate` for a launch of kind `who`: crew that take the first
+/// mate's route are judged against each listed route's crew share, through
+/// the same list order, so a route past it is passed over for a later one.
+pub(crate) fn listed_for(store: &Store, ship: &str, profile: &Value, who: Who) -> Result<Listed> {
     if profile["options"]
         .get("model")
         .is_some_and(|m| !m.is_null())
@@ -1171,9 +1178,7 @@ pub(crate) fn listed_first_mate(store: &Store, ship: &str, profile: &Value) -> R
             refusals.push(format!("{name}: {}", unavailable(&missing)));
             continue;
         }
-        if let Some(refusal) =
-            crate::routes::refusal_for(store, &route_id, Who::FirstMate, limits(route))?
-        {
+        if let Some(refusal) = crate::routes::refusal_for(store, &route_id, who, limits(route))? {
             refusals.push(format!("{name}: {refusal}"));
             continue;
         }
