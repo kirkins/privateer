@@ -165,7 +165,10 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
     let (charter_id, depth) = if let Some(parent) = parent {
         let task = store.task(parent)?;
         store.authorize(parent, "spawn")?;
-        let cid = task["charter_id"].as_str().unwrap().to_owned();
+        let cid = task["charter_id"]
+            .as_str()
+            .context("parent task charter missing")?
+            .to_owned();
         if args
             .get("charter_id")
             .and_then(Value::as_str)
@@ -173,7 +176,10 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
         {
             bail!("a child inherits its parent's charter");
         }
-        (cid, task["depth"].as_i64().unwrap() + 1)
+        let depth = task["depth"]
+            .as_i64()
+            .context("parent task depth missing")?;
+        (cid, depth + 1)
     } else {
         (required(&args, "charter_id")?.to_owned(), 0)
     };

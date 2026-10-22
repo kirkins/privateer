@@ -5,7 +5,8 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     let tx = store.write_transaction()?;
     let task = owner(store, id)?;
-    profile(store, task["owner"].as_str().context("task owner missing")?)?;
+    let owner = task["owner"].as_str().context("task owner missing")?;
+    profile(store, owner)?;
     ensure!(
         stopped_ancestor(store, id)?.is_none(),
         "a scheduled ancestor is explicitly stopped"
@@ -22,13 +23,9 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
     );
     let brief = match args.get("brief") {
         Some(value) => value.as_str().context("brief must be text")?.to_owned(),
-        None => crate::context::current_note(
-            store,
-            task["owner"].as_str().unwrap(),
-            &format!("assignment:{id}"),
-        )?
-        .and_then(|n| n["body"].as_str().map(str::to_owned))
-        .context("prepare an assignment or supply brief before enqueueing")?,
+        None => crate::context::current_note(store, owner, &format!("assignment:{id}"))?
+            .and_then(|n| n["body"].as_str().map(str::to_owned))
+            .context("prepare an assignment or supply brief before enqueueing")?,
     };
     ensure!(
         !brief.trim().is_empty() && brief.len() <= BRIEF_BYTES,
@@ -37,7 +34,7 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
     let now = Store::now_ms();
     let work = Scheduled {
         task_id: id.into(),
-        owner: task["owner"].as_str().unwrap().into(),
+        owner: owner.into(),
         revision: old.map_or(1, |w| w.revision.saturating_add(1)),
         brief,
         state: "ready".into(),
