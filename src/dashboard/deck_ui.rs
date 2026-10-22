@@ -941,10 +941,11 @@ impl App {
                 [one] => parts.push(format!("crew · {}", clean(one, 80))),
                 [first, ..] => parts.push(format!("{} crew · {}", crew.len(), clean(first, 80))),
             }
+            // Counts first: on a narrow tree the location note is what clips.
+            parts.extend(local.map(|s| overview::summary(s, &self.snapshot)));
             if let Some(machine) = local.and_then(|s| s.remote.as_deref()) {
                 parts.push(format!("on {} · not shared here", clean(machine, 40)));
             }
-            parts.extend(local.map(|s| overview::summary(s, &self.snapshot)));
             let mut summary = parts.join(" · ");
             if a {
                 summary = summary.replace('·', "-");
