@@ -82,8 +82,10 @@ the card says "denied tool not identified" and offers no Allow.
 The host sees a pane's denial when its screen shows Claude's footer notice
 (`bash denied by auto mode · [reason] · /permissions`). That notice shows for a
 few seconds, and Claude holds it back while the pane holds notices or a diff
-panel is open, so the block can be seen long after the refusal. A card filed
-more than five minutes after the refusal says when it was refused. A refusal
+panel is open, so the block can be seen long after the refusal. That is the
+likely cause of a late card, read from Claude 2.1.300's code; a host that
+stopped reading its panes for a while would look the same. A card filed more
+than five minutes after the refusal says when it was refused. A refusal
 the same session got past is not filed: a later successful call of the same
 tool with an equivalent input (the same file for `Edit`, `MultiEdit` or
 `Write`, the same command for Bash, the same input for any other tool) means
@@ -91,9 +93,15 @@ the session is no longer blocked. An open pane card whose refusals were all
 identified is watched: the transcript is read on from where the incident's
 read ended, and once the session gets past every refusal on it, the card is
 withdrawn with "the session got past this block" and the time of the retry,
-and its task no longer waits on the captain. Another ship's card joined to it
-is detached and stays open. A card that names an unidentified refusal is
-never withdrawn this way.
+and its task no longer waits on the captain. Only a success after a refusal
+gets past it, so a refusal that joins the card later is not passed by an
+earlier success, and a call refused again after its retry blocks again. A
+retry still running is remembered by its tool use and matched whenever its
+result is written. Since an edit is matched by its file, a later edit of the
+same file gets past a refused one, whatever it changed. Another ship's card
+joined to it is detached and stays open. A card that names an unidentified
+refusal, or that another source's denial joined (a wake's or a job's, or the
+first mate's own `permissions.blocked`), is never withdrawn this way.
 
 Telegram supports `/yolo on`, `/yolo off`, and `/yolo status` through the existing
 authorized chat/user checks. This is a direct captain command, without inference

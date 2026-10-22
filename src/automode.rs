@@ -17,8 +17,10 @@
 //! long after its refusal, and the session may be past it by then. A refusal
 //! the session got past, by a later successful call of the same tool with an
 //! equivalent input, raises no ask. An ask whose refusals were all
-//! identified is watched: when the session later gets past every one, it is
-//! withdrawn, and its task no longer waits on the captain.
+//! identified is watched: when the session later gets past every one, by a
+//! success after its own refusal, it is withdrawn, and its task no longer
+//! waits on the captain. Another source's denial joining the ask ends the
+//! watch: the pane's retries say nothing of it.
 //!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
@@ -167,7 +169,10 @@ fn alert_in(
         .parent()
         .map(|f| f.canonicalize().unwrap_or(f.into()));
     if let Some((projects, folder)) = projects.zip(folder.as_deref()) {
-        raised.extend(withdraw_passed(store, projects, folder)?);
+        match withdraw_passed(store, projects, folder) {
+            Ok(withdrawn) => raised.extend(withdrawn),
+            Err(error) => eprintln!("privateer: watched block asks were not read: {error:#}"),
+        }
     }
     for (ship, _, screen) in observed {
         let tx = store.write_transaction()?;
@@ -333,29 +338,60 @@ fn watch(
     if let Some((transcript, watched, _)) = &existing {
         watchable &= path.as_deref() == Some(transcript) && session == Some(watched);
     }
+    // Each key keeps when it was last refused: an incident joining the ask
+    // brings refusals later than the watch's place, and only a success after
+    // its own refusal gets past one. A key refused again is blocking again.
     for denial in denials {
         let key = crate::claude_denials::retry_key(
             denial["tool_name"].as_str().unwrap_or_default(),
             &denial["tool_input"],
         );
-        match key {
-            Some(key) if denial["session"].as_str() == session => {
-                if !keys.iter().any(|k| k["key"] == key) {
-                    keys.push(json!({"key": key, "tool": denial["tool_name"]}));
+        let denied = denial["denied_ms"].as_i64();
+        match (key, denied) {
+            (Some(key), Some(denied)) if denial["session"].as_str() == session => {
+                match keys.iter_mut().find(|k| k["key"] == key) {
+                    Some(known) => {
+                        let latest = known["denied_ms"].as_i64().unwrap_or_default().max(denied);
+                        known["denied_ms"] = json!(latest);
+                        if known["passed_ms"].as_i64().is_some_and(|ms| ms <= latest) {
+                            known.as_object_mut().map(|k| k.remove("passed_ms"));
+                        }
+                    }
+                    None => keys.push(
+                        json!({"key": key, "tool": denial["tool_name"], "denied_ms": denied}),
+                    ),
                 }
             }
             _ => watchable = false,
         }
     }
     if !watchable {
-        store
-            .connection()
-            .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [ask])?;
-        return Ok(());
+        return unwatch(store, ask);
     }
     let (Some(scan), Some(session)) = (scan, session) else {
         return Ok(());
     };
+    // A retry already running when the incident was read is behind where
+    // the watch reads on from: it waits for its result by its id.
+    for (id, key, of) in &scan.running {
+        let Some(known) = keys
+            .iter_mut()
+            .find(|k| k["key"] == key.as_str() && !k["passed_ms"].is_i64())
+        else {
+            continue;
+        };
+        if of.as_deref().is_some_and(|of| of != session) {
+            continue;
+        }
+        let pending = known["pending"].as_array().cloned().unwrap_or_default();
+        if !pending.iter().any(|p| p == id.as_str())
+            && pending.len() < crate::claude_denials::MAX_PENDING
+        {
+            let mut pending = pending;
+            pending.push(json!(id));
+            known["pending"] = json!(pending);
+        }
+    }
     // A new watch reads on from where the incident's read ended; one already
     // reading keeps its place.
     store.connection().execute(
@@ -400,67 +436,144 @@ fn withdraw_passed(
     };
     let mut withdrawn = vec![];
     for (id, ship, transcript, session, offset, keys) in rows {
-        let ask = crate::mail::find(store, &id)?.filter(|ask| ask["state"] == "open");
-        let path = std::path::PathBuf::from(&transcript);
-        // Only a transcript of this home's pane is read.
-        let Some(ask) = ask.filter(|_| path.starts_with(projects)) else {
-            store
-                .connection()
-                .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [&id])?;
-            continue;
-        };
-        let mut keys: Vec<Value> = serde_json::from_str(&keys).unwrap_or_default();
-        let wanted: std::collections::HashSet<String> = keys
-            .iter()
-            .filter(|k| !k["passed_ms"].is_i64())
-            .filter_map(|k| k["key"].as_str().map(str::to_owned))
-            .collect();
-        let offset = u64::try_from(offset).unwrap_or_default();
-        let Some((retried, next)) =
-            crate::claude_denials::retried(&path, folder, &session, offset, &wanted)
-        else {
-            continue;
-        };
-        for (key, ms) in retried {
-            for k in keys
-                .iter_mut()
-                .filter(|k| k["key"] == key && !k["passed_ms"].is_i64())
-            {
-                k["passed_ms"] = json!(ms);
+        // One bad watch must not stop the pass, or the panes' new blocks.
+        match withdraw_one(
+            store,
+            projects,
+            folder,
+            &id,
+            &transcript,
+            &session,
+            offset,
+            &keys,
+        ) {
+            Ok(Some(reason)) => {
+                withdrawn.push(json!({"ship": ship, "withdrawn": id, "reason": reason}));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("privateer: the watch on {ship}'s block ask {id} failed: {error:#}");
             }
         }
-        let passed = !keys.is_empty() && keys.iter().all(|k| k["passed_ms"].is_i64());
-        if !passed {
-            store.connection().execute(
-                "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
-                params![
-                    id,
-                    i64::try_from(next).unwrap_or(i64::MAX),
-                    serde_json::to_string(&keys)?
-                ],
-            )?;
-            continue;
-        }
-        let latest = keys
-            .iter()
-            .filter_map(|k| k["passed_ms"].as_i64())
-            .max()
-            .unwrap_or_default();
-        let mut tools: Vec<&str> = keys.iter().filter_map(|k| k["tool"].as_str()).collect();
-        tools.dedup();
-        let reason = format!(
-            "{}: the same {} call succeeded on retry at {}, so this decision is no longer needed",
-            block_ask::PASSED,
-            tools.join(", "),
-            crate::routes::utc_time(latest)
-        );
-        block_ask::withdraw_passed(store, &ask, &reason)?;
-        store
-            .connection()
-            .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [&id])?;
-        withdrawn.push(json!({"ship": ship, "withdrawn": id, "reason": reason}));
     }
     Ok(withdrawn)
+}
+
+/// Read one watched ask's transcript on, and withdraw the ask when its
+/// session has got past every refusal on it: the reason it was withdrawn
+/// with, or None while it still blocks.
+#[allow(clippy::too_many_arguments)]
+fn withdraw_one(
+    store: &Store,
+    projects: &std::path::Path,
+    folder: &std::path::Path,
+    id: &str,
+    transcript: &str,
+    session: &str,
+    offset: i64,
+    keys: &str,
+) -> Result<Option<String>> {
+    let ask = crate::mail::find(store, id)?.filter(|ask| ask["state"] == "open");
+    let path = std::path::PathBuf::from(transcript);
+    // Only a transcript of this home's pane is read.
+    let Some(ask) = ask.filter(|_| path.starts_with(projects)) else {
+        unwatch(store, id)?;
+        return Ok(None);
+    };
+    let mut keys: Vec<Value> = serde_json::from_str(keys).unwrap_or_default();
+    let wanted: std::collections::HashMap<String, i64> = keys
+        .iter()
+        .filter(|k| !k["passed_ms"].is_i64())
+        .filter_map(|k| {
+            let key = k["key"].as_str()?;
+            Some((key.to_owned(), k["denied_ms"].as_i64().unwrap_or_default()))
+        })
+        .collect();
+    // The calls read earlier whose results were not written yet.
+    let mut pending: Vec<(String, String)> = keys
+        .iter()
+        .flat_map(|k| {
+            let key = k["key"].as_str().unwrap_or_default().to_owned();
+            k["pending"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str())
+                .map(move |id| (id.to_owned(), key.clone()))
+        })
+        .collect();
+    let offset = u64::try_from(offset).unwrap_or_default();
+    let Some((retried, next)) =
+        crate::claude_denials::retried(&path, folder, session, offset, &wanted, &mut pending)
+    else {
+        return Ok(None);
+    };
+    for k in &mut keys {
+        let key = k["key"].as_str().unwrap_or_default().to_owned();
+        if let Some(ms) = retried
+            .iter()
+            .filter(|(retry, _)| *retry == key)
+            .map(|(_, ms)| *ms)
+            .min()
+            .filter(|_| !k["passed_ms"].is_i64())
+        {
+            k["passed_ms"] = json!(ms);
+        }
+        let waiting: Vec<&str> = pending
+            .iter()
+            .filter(|(_, of)| *of == key && !k["passed_ms"].is_i64())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        match k.as_object_mut() {
+            Some(k) if waiting.is_empty() => {
+                k.remove("pending");
+            }
+            Some(k) => {
+                k.insert("pending".into(), json!(waiting));
+            }
+            None => {}
+        }
+    }
+    let passed = !keys.is_empty() && keys.iter().all(|k| k["passed_ms"].is_i64());
+    if !passed {
+        store.connection().execute(
+            "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
+            params![
+                id,
+                i64::try_from(next).unwrap_or(i64::MAX),
+                serde_json::to_string(&keys)?
+            ],
+        )?;
+        return Ok(None);
+    }
+    let latest = keys
+        .iter()
+        .filter_map(|k| k["passed_ms"].as_i64())
+        .max()
+        .unwrap_or_default();
+    let mut tools: Vec<&str> = vec![];
+    for tool in keys.iter().filter_map(|k| k["tool"].as_str()) {
+        if !tools.contains(&tool) {
+            tools.push(tool);
+        }
+    }
+    let reason = format!(
+        "{}: the same {} call succeeded on retry at {}, so this decision is no longer needed",
+        block_ask::PASSED,
+        tools.join(", "),
+        crate::routes::utc_time(latest)
+    );
+    block_ask::withdraw_passed(store, &ask, &reason)?;
+    unwatch(store, id)?;
+    Ok(Some(reason))
+}
+
+/// End the watch on an ask: nothing will withdraw it for its session.
+pub(crate) fn unwatch(store: &Store, ask: &str) -> Result<()> {
+    store
+        .connection()
+        .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [ask])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1071,7 +1184,7 @@ mod tests {
     fn a_raised_ask_is_withdrawn_when_the_session_gets_past_it() {
         let temp = tempfile::tempdir().unwrap();
         let projects = tempfile::tempdir().unwrap();
-        let store = store_with_duty(&temp);
+        let mut store = store_with_duty(&temp);
         launch(&store, 10, "a");
         let path = pane(&store, projects.path(), |n| n <= 3);
         alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
@@ -1103,6 +1216,45 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let duty = "privateer-automode-lockout";
+        // A scheduled task of the ship's waits on the ask, under a charter
+        // that lets it be scheduled.
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id": "duty", "objective": "Keep the duty", "repo": repo, "min_free_bytes": 0}),
+        )
+        .unwrap();
+        store
+            .connection()
+            .execute("UPDATE tasks SET charter_id='duty' WHERE id=?1", [duty])
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO task_schedule(task_id,record) VALUES('privateer-automode-lockout',?1)",
+                [json!({"task_id": "privateer-automode-lockout", "owner": "privateer", "revision": 1,
+                    "brief": "Keep the duty.", "state": "ready", "wait": null, "not_before_ms": 0,
+                    "offer_id": null, "holder": null, "job_id": null, "profile": null,
+                    "charter_hash": null, "attempts": 0, "created_ms": 0, "last_checked_ms": 0,
+                    "lease_until_ms": 0, "reason": null})
+                .to_string()],
+            )
+            .unwrap();
+        let reason = "tool permission: Bash";
+        let parked =
+            crate::scheduling::park_on_ask(&store, duty, open["id"].as_str().unwrap(), reason);
+        assert!(parked.unwrap());
+        // Not offered once it resumes: this home has no profile to offer it with.
+        store
+            .connection()
+            .execute(
+                "UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',?1)",
+                [i64::MAX / 2],
+            )
+            .unwrap();
         // The same command succeeds: the ask is withdrawn and nothing waits.
         append(&store, &path, |folder| {
             retries(folder, |n| (10..=12).contains(&n))
@@ -1136,8 +1288,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // A task waiting on it resumes instead of faulting.
-        let resumed = block_ask::resumed_by_policy(&ended).unwrap();
+        // The task waiting on it resumes, told why, instead of faulting.
+        crate::scheduling::tick(&mut store).unwrap();
+        let record: String = store
+            .connection()
+            .query_row(
+                "SELECT record FROM task_schedule WHERE task_id=?1",
+                [duty],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let work: Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(work["state"], "ready", "{work}");
+        assert!(work["wait"].is_null(), "{work}");
+        let resumed = work["resumed_by"].as_str().unwrap();
+        assert!(resumed.contains(block_ask::PASSED), "{resumed}");
         assert!(resumed.contains("Carry on"), "{resumed}");
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
@@ -1176,12 +1341,365 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = store_with_duty(&temp);
         launch(&store, 10, "a");
-        pane(&store, projects.path(), |n| n == 0 || n == 3);
+        let path = pane(&store, projects.path(), |n| n == 0 || n == 3);
         alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         assert_eq!(ask(&store)["block"]["denials"][0]["unidentified"], true);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
             0
+        );
+        // Not even when the very command it may have been then succeeds.
+        append(&store, &path, |folder| {
+            retries(folder, |n| (10..=12).contains(&n))
+        });
+        let quiet = alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail WHERE kind='decision' AND state='open'"
+            ),
+            1
+        );
+    }
+
+    /// One call of the pane's and its result, written at `at`: a success,
+    /// or with `refused`, the classifier's refusal.
+    fn call(
+        folder: &std::path::Path,
+        id: &str,
+        tool: &str,
+        input: Value,
+        at: &str,
+        refused: bool,
+    ) -> String {
+        let session = "00000000-0000-4000-8000-0000000000f1";
+        let content = if refused {
+            "Permission for this action was denied by the Claude Code auto mode classifier. Reason: [Auto-Mode Bypass]."
+        } else {
+            ""
+        };
+        let use_ = json!({"cwd": folder, "entrypoint": "cli", "type": "assistant", "sessionId": session,
+            "timestamp": at, "message": {"role": "assistant", "content": [{"type": "tool_use",
+            "id": id, "name": tool, "input": input}]}});
+        let result = json!({"cwd": folder, "entrypoint": "cli", "type": "user", "sessionId": session,
+            "timestamp": at, "message": {"role": "user", "content": [{"type": "tool_result",
+            "tool_use_id": id, "content": content, "is_error": refused}]}});
+        format!("{use_}\n{result}\n")
+    }
+
+    fn push(folder: &std::path::Path, id: &str, at: &str) -> String {
+        call(
+            folder,
+            id,
+            "Bash",
+            json!({"command": "git push origin main"}),
+            at,
+            false,
+        )
+    }
+
+    fn edit(folder: &std::path::Path, id: &str, at: &str, refused: bool) -> String {
+        let file = folder.join("scratch/plan.json");
+        call(
+            folder,
+            id,
+            "Edit",
+            json!({"file_path": file, "old_string": "1", "new_string": "2"}),
+            at,
+            refused,
+        )
+    }
+
+    /// The open block asks, by id.
+    fn open_asks(store: &Store) -> Vec<String> {
+        let mut statement = store
+            .connection()
+            .prepare("SELECT id FROM mail WHERE kind='decision' AND state='open' ORDER BY seq")
+            .unwrap();
+        statement
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    /// The pane's ask for its refused `git push`, watched; returns the ask
+    /// and the transcript.
+    fn push_refused(store: &Store, projects: &std::path::Path) -> (String, std::path::PathBuf) {
+        launch(store, 10, "a");
+        let path = pane(store, projects, |n| n == 0 || (7..=9).contains(&n));
+        alert_in(store, &observe(BYPASS_SCREEN), Some(projects)).unwrap();
+        let asks = open_asks(store);
+        assert_eq!(asks.len(), 1);
+        assert_eq!(
+            count(store, "SELECT COUNT(*) FROM hosted_automode_watch"),
+            1
+        );
+        (asks[0].clone(), path)
+    }
+
+    #[test]
+    fn a_retry_still_running_when_the_ask_is_raised_withdraws_it_when_it_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // The refusal, and its retry written with no result yet.
+        let path = pane(&store, projects.path(), |n| n <= 3 || n == 10 || n == 11);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let id = open_asks(&store).remove(0);
+        // It runs a while; other work is written meanwhile.
+        for _ in 0..3 {
+            append(&store, &path, |folder| {
+                filler(folder, "2026-10-20T00:45:46.000Z", 4 * 1024)
+            });
+            let quiet =
+                alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+            assert!(quiet.is_empty(), "{quiet:?}");
+        }
+        append(&store, &path, |folder| retries(folder, |n| n == 12));
+        let withdrawn =
+            alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+    }
+
+    #[test]
+    fn a_refusal_joining_a_watched_ask_is_not_passed_by_an_earlier_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        // The screen clears; the next incident's refusals come after 00:20.
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        let since = crate::routes::iso_timestamp_ms("2026-10-20T00:20:00Z").unwrap();
+        store
+            .connection()
+            .execute("UPDATE hosted_automode SET ms=?1", [since])
+            .unwrap();
+        // More than one read of work, an edit of plan.json that succeeds,
+        // then a later edit of it the classifier refuses.
+        append(&store, &path, |folder| {
+            filler(folder, "2026-10-20T00:25:00.000Z", 9 * 1024 * 1024)
+                + &edit(
+                    folder,
+                    "toolu_edit_early",
+                    "2026-10-20T00:30:00.000Z",
+                    false,
+                )
+                + &edit(
+                    folder,
+                    "toolu_edit_refused",
+                    "2026-10-20T00:35:00.000Z",
+                    true,
+                )
+        });
+        // The edit's refusal joins the push's open ask, while the watch has
+        // not yet read up to the earlier success.
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(open_asks(&store), vec![id.clone()]);
+        let keys: String = store
+            .connection()
+            .query_row(
+                "SELECT keys FROM hosted_automode_watch WHERE ask=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<Value>>(&keys).unwrap().len(),
+            2,
+            "{keys}"
+        );
+        // The push gets through: the refused edit still blocks.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:40:00.000Z")
+        });
+        for _ in 0..3 {
+            let quiet =
+                alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+            assert!(quiet.is_empty(), "{quiet:?}");
+        }
+        assert_eq!(open_asks(&store), vec![id.clone()]);
+        // Refused again after a pass, a key blocks again.
+        let watched =
+            crate::claude_denials::retry_key("Bash", &json!({"command": "git push origin main"}))
+                .unwrap();
+        let keys: Vec<Value> = serde_json::from_str(
+            &store
+                .connection()
+                .query_row::<String, _, _>(
+                    "SELECT keys FROM hosted_automode_watch WHERE ask=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let pushed = keys.iter().find(|k| k["key"] == watched.as_str()).unwrap();
+        assert!(pushed["passed_ms"].is_i64(), "{keys:?}");
+        // The edit gets through too: now the session is past the whole ask.
+        append(&store, &path, |folder| {
+            edit(
+                folder,
+                "toolu_edit_retry",
+                "2026-10-20T00:45:00.000Z",
+                false,
+            )
+        });
+        let withdrawn =
+            alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+        let reason = withdrawn[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("the same Bash, Edit call succeeded on retry at 2026-10-20 00:45 UTC"),
+            "{reason}"
+        );
+        assert!(open_asks(&store).is_empty());
+    }
+
+    #[test]
+    fn a_key_refused_again_after_its_retry_blocks_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        let session = "00000000-0000-4000-8000-0000000000f1";
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let scan = crate::claude_denials::since(projects.path(), &folder, 0).unwrap();
+        // Half the ask passes: an edit refusal is watched with the push.
+        let refused_edit = json!({"tool_name": "Edit", "tool_input": {"file_path": folder.join("scratch/plan.json")},
+            "session": session, "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:10:00Z").unwrap()});
+        watch(&store, "privateer", &id, true, Some(&scan), &[refused_edit]).unwrap();
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+        });
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        // Then the push is refused again and joins: it is not past any more.
+        let refused_push = json!({"tool_name": "Bash", "tool_input": {"command": "git push origin main"},
+            "session": session, "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:31:00Z").unwrap()});
+        watch(&store, "privateer", &id, true, Some(&scan), &[refused_push]).unwrap();
+        append(&store, &path, |folder| {
+            edit(
+                folder,
+                "toolu_edit_retry",
+                "2026-10-20T00:32:00.000Z",
+                false,
+            )
+        });
+        let quiet = alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(open_asks(&store), vec![id.clone()]);
+        // Its own retry after that refusal passes it.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_again", "2026-10-20T00:33:00.000Z")
+        });
+        let withdrawn =
+            alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+    }
+
+    #[test]
+    fn another_sources_block_joining_a_pane_ask_keeps_it_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        // The first mate's own wake is refused something else on its duty task.
+        let task = store.task("privateer-automode-lockout").unwrap();
+        let (records, more) = block_ask::records(
+            &[json!({"tool_name": "Bash", "tool_input": {"command": "cargo publish"}})],
+            None,
+        );
+        let joined = block_ask::raise(
+            &store,
+            "privateer",
+            "privateer-automode-lockout",
+            &task,
+            None,
+            "wake",
+            records,
+            more,
+        )
+        .unwrap();
+        assert_eq!(joined["duplicate"], true);
+        assert_eq!(joined["ask"], id.as_str());
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
+            0
+        );
+        // The pane's push then succeeds: the publish may still be blocked.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+        });
+        let quiet = alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(open_asks(&store), vec![id]);
+    }
+
+    #[test]
+    fn another_ships_ask_attached_to_a_passed_one_is_detached_not_withdrawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // A rule refused the pane's edit of plan.json: a rule ships share.
+        let path = pane(&store, projects.path(), |n| n == 0 || (4..=6).contains(&n));
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let id = open_asks(&store).remove(0);
+        // Another ship of this home is refused the same edit and joins it.
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO tasks(id,charter_id,owner,title,status,parent,depth)
+                 VALUES('sysadmin-duty','privateer','sysadmin','Duty','open',NULL,0);",
+            )
+            .unwrap();
+        let task = store.task("sysadmin-duty").unwrap();
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let (records, more) = block_ask::records(
+            &[
+                json!({"tool_name": "Edit", "tool_input": {"file_path": folder.join("scratch/plan.json")}}),
+            ],
+            Some(&folder),
+        );
+        let theirs = block_ask::raise(
+            &store,
+            "sysadmin",
+            "sysadmin-duty",
+            &task,
+            None,
+            "wake",
+            records,
+            more,
+        )
+        .unwrap();
+        let theirs = theirs["ask"].as_str().unwrap().to_owned();
+        let attached = crate::mail::find(&store, &theirs).unwrap().unwrap();
+        assert_eq!(attached["payload"]["attached_to"], id.as_str());
+        // The pane's edit succeeds: its ask is withdrawn, theirs stands alone.
+        append(&store, &path, |folder| {
+            edit(
+                folder,
+                "toolu_edit_retry",
+                "2026-10-20T00:30:00.000Z",
+                false,
+            )
+        });
+        let withdrawn =
+            alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(open_asks(&store), vec![theirs.clone()]);
+        let detached = crate::mail::find(&store, &theirs).unwrap().unwrap();
+        assert!(detached["payload"]["attached_to"].is_null(), "{detached}");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit WHERE kind='permissions.detached'"
+            ),
+            1
         );
     }
 

@@ -877,6 +877,11 @@ pub(crate) fn raise(
             let reason = format!("tool permission: {}", rules_text(&open["payload"]["block"]));
             crate::scheduling::park_on_ask(store, task_id, ask, &reason)?;
         }
+        // Another source's denial joins it: the pane's session getting past
+        // its own refusals says nothing of that one, so the ask stays open.
+        if scope != "pane" {
+            crate::automode::unwatch(store, ask)?;
+        }
         return Ok(
             json!({"ask": ask, "rules": rules_text(&open["payload"]["block"]),
             "declined": false, "duplicate": true}),
@@ -1165,9 +1170,7 @@ pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
     let reason = request["end_reason"].as_str()?;
     if reason.starts_with(PASSED) {
         let id = request["id"].as_str().unwrap_or_default();
-        return Some(format!(
-            "{id} was withdrawn because {reason}; the captain's decision is no longer needed. Carry on."
-        ));
+        return Some(format!("{id} was withdrawn because {reason}. Carry on."));
     }
     Outcome::from_reason(reason).map(|outcome| ended_text(request, outcome))
 }
