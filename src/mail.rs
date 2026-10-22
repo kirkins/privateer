@@ -1363,15 +1363,27 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     }
 
     let tx = store.write_transaction()?;
+    // Only a gateway link delivers now. Over a collected link the reply waits
+    // for the other machine to collect it, so it cannot be judged here.
+    let direct = match &peer {
+        Some(peer) => crate::peers::direct_machine(store, peer)?,
+        None => false,
+    };
     // A request that declares approves is marked as a block ask is, so the
     // home that holds it can tell the captain's own yes from a relayed one.
+    // A reply over a gateway link to a request this home never held is
+    // marked too: the home that holds it judges it, and keeps the marker
+    // only when this machine holds its desk.
     let approves = |c: &str| {
         by_id(store, c)
             .ok()
             .flatten()
             .is_some_and(|thread| thread["payload"].get("approves").is_some())
     };
-    if operator && correlation.is_some_and(|c| crate::block_ask::is_ask_id(store, c) || approves(c))
+    let elsewhere = |c: &str| direct && by_id(store, c).ok().flatten().is_none();
+    if operator
+        && correlation
+            .is_some_and(|c| crate::block_ask::is_ask_id(store, c) || approves(c) || elsewhere(c))
     {
         payload["operator"] = json!(true);
     }
@@ -1428,12 +1440,6 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             );
         }
     }
-    // Only a gateway link delivers now. Over a collected link the reply waits
-    // for the other machine to collect it, so it cannot be judged here.
-    let direct = match &peer {
-        Some(peer) => crate::peers::direct_machine(store, peer)?,
-        None => false,
-    };
     let mut answering = None;
     if let Some(correlation) = correlation {
         match by_id(store, correlation)? {
@@ -2610,6 +2616,11 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         if let (Some(answer), Some(decision)) = (payload.get("answer"), typed_decision(&request)) {
             check_answer(decision, answer)?;
         }
+        // An Allow or Authorize that lost its marker on the way, or never had
+        // one, is refused here, so the deliverer puts it before the captain;
+        // answering the ask with it would close it and grant nothing.
+        crate::block_ask::check_answer(&request, &payload)
+            .map_err(|refused| anyhow::anyhow!("{correlation} stays open: {refused}"))?;
         answering = Some(request);
     }
     let now = Store::now_ms();

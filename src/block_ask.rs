@@ -1314,10 +1314,12 @@ pub(crate) fn raise(
         params![ship, task_id],
         |r| r.get(0),
     )?;
-    let id = format!(
-        "permissions-{}",
-        hex(format!("{ship}\0{task_id}\0{policy_hash}\0{episode}"))
-    );
+    let episode_id = |episode: i64| {
+        format!(
+            "permissions-{}",
+            hex(format!("{ship}\0{task_id}\0{policy_hash}\0{episode}"))
+        )
+    };
     let fleet_key = hex(format!("{}\0{policy_hash}", names.join("\0")));
     let key = hex(format!(
         "{ship}\0{task_id}\0{}\0{policy_hash}",
@@ -1443,11 +1445,24 @@ pub(crate) fn raise(
         "{question}\n{why}\nDenied: {}.{job_line}\nThe captain can also run {remedy}.",
         previews.join("; ")
     );
-    crate::mail::record_runtime(
-        store,
-        &json!({"id": id, "from": ship, "to": CAPTAIN, "kind": "decision", "task_id": task_id,
-            "body": body, "payload": payload, "urgency": "normal"}),
-    )?;
+    // The episode count only grows while every ended ask is kept: one gone
+    // (pruned, say) makes an id already taken by an ended ask. That ask is
+    // never reopened or parked on; the next free episode is this ask's.
+    let mut id = None;
+    for episode in episode..episode + MAX_EPISODE_TRIES {
+        let candidate = episode_id(episode);
+        if crate::mail::record_runtime(
+            store,
+            &json!({"id": candidate, "from": ship, "to": CAPTAIN, "kind": "decision", "task_id": task_id,
+                "body": body, "payload": payload, "urgency": "normal"}),
+        )? {
+            id = Some(candidate);
+            break;
+        }
+    }
+    let id = id.with_context(|| {
+        format!("no free ask id for {ship}'s task {task_id} after {MAX_EPISODE_TRIES} tries")
+    })?;
     let reason = format!("tool permission: {block_text}");
     if scope == "crew" {
         crate::scheduling::park_on_ask(store, task_id, &id, &reason)?;
@@ -1501,20 +1516,35 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
     }
     let policy = crate::permissions::for_store(store)?;
     let policy_hash = crate::permissions::policy_hash(store)?;
-    let tx = store.write_transaction()?;
-    let ids = {
-        let mut statement = store.connection().prepare(&format!(
-            "SELECT id FROM mail WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'"
-        ))?;
-        statement
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let mut ended = vec![];
-    for id in ids {
-        let Some(ask) = crate::mail::find(store, &id)? else {
-            continue;
+    let own_asks = || -> Result<Vec<Value>> {
+        let ids = {
+            let mut statement = store.connection().prepare(&format!(
+                "SELECT id FROM mail WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'"
+            ))?;
+            statement
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let mut asks = vec![];
+        for id in ids {
+            asks.extend(crate::mail::find(store, &id)?);
+        }
+        Ok(asks)
+    };
+    // An open ask the policy neither covers nor has moved past changes
+    // nothing: a pass with only those takes no write lock either.
+    let due = |ask: &Value| {
+        covered(&policy, &policy_hash, &ask["payload"])
+            || ask["payload"]["policy_hash"].as_str() != Some(&policy_hash)
+    };
+    if !own_asks()?.iter().any(due) {
+        end_orphans(store)?;
+        return Ok(vec![]);
+    }
+    let tx = store.write_transaction()?;
+    let mut ended = vec![];
+    for ask in own_asks()? {
+        let id = ask["id"].as_str().unwrap_or_default().to_owned();
         if covered(&policy, &policy_hash, &ask["payload"]) {
             end_by_policy(store, &policy, &ask)?;
             ended.push((id, ask["from"].as_str().unwrap_or_default().to_owned()));
@@ -1873,6 +1903,9 @@ pub(crate) fn crew_block(store: &Store, task: &str) -> Result<Option<(String, St
     }))
 }
 
+/// Episodes tried past the counted one for a free ask id.
+const MAX_EPISODE_TRIES: i64 = 64;
+
 /// Correlation hops followed to find a message's topic.
 const MAX_HOPS: usize = 8;
 
@@ -2159,7 +2192,30 @@ fn apply(store: &Store, ask: &Value, reply: &Value) -> Result<()> {
             crate::scheduling::hold(store, task, "the captain stopped it at a tool permission")?;
             tx.commit()?;
         }
-        _ => {}
+        // Delivery and sending refuse these first (`check_answer`); one that
+        // still arrives unmarked grants nothing, and says so.
+        Some(option)
+            if reply["payload"]["operator"] != true
+                && (matches!(option, "allow" | "authorize") || approves(&reply["payload"])) =>
+        {
+            anyhow::bail!(
+                "{option} reached {} without the captain's operator marker, so nothing was granted; the captain can answer it again on the card",
+                ask["id"].as_str().unwrap_or_default()
+            )
+        }
+        // Recorded with the reply (`captain_approvals::record`).
+        _ if approves(&reply["payload"]) => {}
+        option => {
+            store.audit(
+                "permissions.answer_unapplied",
+                &json!({"ask": ask["id"], "reply": reply["id"], "option": option,
+                "why": match option {
+                    None => "the answer chose no option; its text is the ship's to read",
+                    Some("stop") => "the ask names no task to hold",
+                    Some(_) => "the ask offers no such option",
+                }}),
+            )?;
+        }
     }
     Ok(())
 }
@@ -2530,6 +2586,149 @@ mod tests {
         );
         // A ship that reports the tool as unknown gets no rule for it either.
         assert_eq!(narrow_rule("unknown", &json!({}), None), None);
+    }
+
+    /// A home holding one ship and one open task, the task returned.
+    fn store_with_task(temp: &tempfile::TempDir) -> (Store, Value) {
+        let store = Store::open(temp.path()).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO charters(id,data) VALUES('privateer','{}');
+                 INSERT INTO tasks(id,charter_id,owner,title,status,parent,depth)
+                 VALUES('privateer-publish','privateer','privateer','Publish','open',NULL,0);
+                 INSERT INTO ships(name,record) VALUES('privateer','{}');",
+            )
+            .unwrap();
+        let task = store.task("privateer-publish").unwrap();
+        (store, task)
+    }
+
+    fn raise_publish(store: &Store, task: &Value) -> Value {
+        let (records, more) = records(
+            &[json!({"tool_name": "Bash", "tool_input": {"command": "cargo publish"}})],
+            None,
+        );
+        raise(
+            store,
+            "privateer",
+            "privateer-publish",
+            task,
+            None,
+            "wake",
+            records,
+            more,
+        )
+        .unwrap()
+    }
+
+    fn open_ask(store: &Store) -> Option<String> {
+        open_for_task(store, "privateer", "privateer-publish")
+            .unwrap()
+            .map(|ask| ask["id"].as_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn a_sweep_with_only_quiet_open_asks_takes_no_write_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, task) = store_with_task(&temp);
+        let ask = raise_publish(&store, &task)["ask"].clone();
+        assert_eq!(open_ask(&store).as_deref(), ask.as_str());
+        let writes = || crate::store::WRITE_TRANSACTIONS.with(|count| count.get());
+        let before = writes();
+        assert!(sweep(&store).unwrap().is_empty());
+        assert_eq!(writes(), before, "a quiet pass took the write lock");
+        // An ask the policy has moved past is still kept up to date.
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=json_set(payload,'$.policy_hash','old') WHERE id=?1",
+                [ask.as_str().unwrap()],
+            )
+            .unwrap();
+        assert!(sweep(&store).unwrap().is_empty());
+        assert_eq!(writes(), before + 1);
+        let kept = crate::mail::find(&store, ask.as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept["payload"]["policy_hash"],
+            crate::permissions::policy_hash(&store).unwrap()
+        );
+        assert_eq!(kept["state"], "open");
+    }
+
+    #[test]
+    fn an_ask_whose_id_an_ended_ask_holds_takes_the_next_free_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, task) = store_with_task(&temp);
+        let answer = |id: &Value| {
+            store
+                .connection()
+                .execute(
+                    "UPDATE mail SET state='answered' WHERE id=?1",
+                    [id.as_str().unwrap()],
+                )
+                .unwrap();
+        };
+        let first = raise_publish(&store, &task)["ask"].clone();
+        answer(&first);
+        let second = raise_publish(&store, &task)["ask"].clone();
+        assert_ne!(second, first);
+        answer(&second);
+        // The first ended ask is gone, so the count of ended asks names the
+        // second's id again.
+        store
+            .connection()
+            .execute("DELETE FROM mail WHERE id=?1", [first.as_str().unwrap()])
+            .unwrap();
+        let third = raise_publish(&store, &task);
+        assert_eq!(third["duplicate"], false, "{third}");
+        assert_ne!(third["ask"], second, "{third}");
+        assert_eq!(open_ask(&store).as_deref(), third["ask"].as_str());
+        let ended = crate::mail::find(&store, second.as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended["state"], "answered");
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_applied_is_refused_or_recorded_never_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, task) = store_with_task(&temp);
+        let id = raise_publish(&store, &task)["ask"].clone();
+        let ask = crate::mail::find(&store, id.as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let reply = |payload: Value| json!({"id": "reply-1", "payload": payload});
+        for option in ["allow", "authorize", "approve", "as_approved_1"] {
+            let error = apply(
+                &store,
+                &ask,
+                &reply(json!({"answer": {"option_id": option}})),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("nothing was granted"), "{option}: {error}");
+        }
+        let unapplied = || -> i64 {
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit WHERE kind='permissions.answer_unapplied'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        apply(
+            &store,
+            &ask,
+            &reply(json!({"answer": {"option_id": "later"}})),
+        )
+        .unwrap();
+        apply(&store, &ask, &reply(json!({}))).unwrap();
+        assert_eq!(unapplied(), 2);
     }
 
     #[test]
