@@ -2958,3 +2958,242 @@ fn routes_set_and_a_first_mate_profile_flag_a_harness_that_is_not_installed() {
     let ship = f.json(None, "ship.show", json!({"name": "engineering"}));
     assert_eq!(ship["first_mate"]["manifest"], manifest, "{ship}");
 }
+
+impl Fleet {
+    /// The routes file exactly as written.
+    fn routes_file(&self) -> Option<Value> {
+        fs::read(self.root.join("fleet.routes.json"))
+            .ok()
+            .map(|raw| serde_json::from_slice(&raw).unwrap())
+    }
+    /// The ship's own store, read directly.
+    fn store_rows(&self, sql: &str) -> Vec<(String, String)> {
+        let store =
+            rusqlite::Connection::open(self.root.join("engineering/.privateer/privateer.sqlite"))
+                .unwrap();
+        let mut statement = store.prepare(sql).unwrap();
+        statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+    fn reverts_audited(&self) -> Vec<(String, String)> {
+        self.store_rows(
+            "SELECT kind, payload FROM audit WHERE kind='routes.reverted' ORDER BY rowid",
+        )
+    }
+    fn revert_notices(&self) -> Vec<(String, String)> {
+        self.store_rows(
+            "SELECT urgency, body FROM mail WHERE recipient='engineering'
+             AND id LIKE 'routes-reverted-%' ORDER BY seq",
+        )
+    }
+}
+
+/// Sleep until the clock has passed `at`, in ms since the epoch.
+fn after(at: i64) {
+    let wait = at + 50 - privateer::store::Store::now_ms();
+    if wait > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(wait as u64));
+    }
+}
+
+fn three_routes() -> Value {
+    json!({"a": codex("model-a", "plan"), "b": codex("model-b", "plan"),
+        "c": codex("model-c", "credits")})
+}
+
+/// A temporary routes change keeps the file it replaced; when its time comes
+/// the dispatcher pass writes that back exactly, audits it once and leaves the
+/// ship a low notice with its restored lists.
+#[test]
+fn a_temporary_routes_change_reverts_to_the_exact_previous_routes_and_tells_the_ship() {
+    let f = Fleet::new();
+    let original = json!({
+        "routes": three_routes(),
+        "crew": ["c", "a", "b"],
+        "errand": ["b"],
+        "ships": {"engineering": {"errand": ["b", "a"]}}
+    });
+    f.routes(original.clone());
+    let until = privateer::store::Store::now_ms() + 2_000;
+    let reply = f.json(
+        None,
+        "routes.set",
+        json!({"routes": three_routes(), "crew": ["a", "b", "c"], "errand": ["b"],
+            "until_ms": until}),
+    );
+    assert_eq!(reply["temporary"]["until_ms"], json!(until), "{reply}");
+    assert!(reply.get("until_ms").is_none(), "{reply}");
+    // Before its time the temporary lists are the ones in force.
+    assert_eq!(
+        f.json(None, "routes.show", json!({}))["crew"],
+        json!(["a", "b", "c"])
+    );
+    after(until);
+    f.tick();
+    assert_eq!(
+        f.routes_file(),
+        Some(original),
+        "the exact routes it replaced"
+    );
+    let audited = f.reverts_audited();
+    assert_eq!(audited.len(), 1, "{audited:?}");
+    let payload: Value = serde_json::from_str(&audited[0].1).unwrap();
+    assert_eq!(payload["until_ms"], json!(until), "{payload}");
+    assert_eq!(payload["ships"], json!(["engineering"]), "{payload}");
+    let notices = f.revert_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].0, "low");
+    assert!(
+        notices[0].1.contains("crew: c, a, b.") && notices[0].1.contains("errand: b, a."),
+        "{notices:?}"
+    );
+    let crew = f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert_eq!(f.model(&crew), "model-c");
+    // A second pass finds nothing left to revert.
+    f.tick();
+    assert_eq!(f.reverts_audited().len(), 1);
+    assert_eq!(f.revert_notices().len(), 1);
+}
+
+/// A routes.set made after a temporary one replaces it: when the older
+/// change's time comes, nothing reverts over the newer one.
+#[test]
+fn a_newer_routes_change_is_not_reverted_when_an_older_temporary_one_ends() {
+    let f = Fleet::new();
+    f.routes(json!({"routes": three_routes(), "crew": ["a"]}));
+    let until = privateer::store::Store::now_ms() + 2_000;
+    f.json(
+        None,
+        "routes.set",
+        json!({"routes": three_routes(), "crew": ["b"], "until_ms": until}),
+    );
+    let newer = json!({"routes": three_routes(), "crew": ["c", "b"]});
+    f.routes(newer.clone());
+    after(until);
+    f.tick();
+    assert_eq!(f.routes_file(), Some(newer.clone()));
+    assert_eq!(
+        f.json(None, "routes.show", json!({}))["crew"],
+        json!(["c", "b"])
+    );
+    assert!(f.reverts_audited().is_empty());
+    assert!(f.revert_notices().is_empty());
+}
+
+/// A temporary change over another stacks: when it ends the one it replaced
+/// is back with its own end, and when that ends the routes before both.
+#[test]
+fn a_temporary_change_over_another_gives_back_the_first_until_its_own_end() {
+    let f = Fleet::new();
+    let original = json!({"routes": three_routes(), "crew": ["a", "b"]});
+    f.routes(original.clone());
+    let now = privateer::store::Store::now_ms();
+    // Far enough apart that a slow pass still runs between the two ends.
+    let (first, second) = (now + 7_000, now + 2_500);
+    f.json(
+        None,
+        "routes.set",
+        json!({"routes": three_routes(), "crew": ["b"], "until_ms": first}),
+    );
+    let reply = f.json(
+        None,
+        "routes.set",
+        json!({"routes": three_routes(), "crew": ["c"], "until_ms": second}),
+    );
+    assert_eq!(reply["temporary"]["stacked_on"]["until_ms"], json!(first));
+    assert_eq!(
+        reply["temporary"]["reverts"]["crew"],
+        json!(["b"]),
+        "{reply}"
+    );
+    after(second);
+    f.tick();
+    let shown = f.json(None, "routes.show", json!({}));
+    assert_eq!(shown["crew"], json!(["b"]), "{shown}");
+    assert_eq!(shown["temporary"]["until_ms"], json!(first), "{shown}");
+    after(first);
+    f.tick();
+    assert_eq!(f.routes_file(), Some(original));
+    assert_eq!(f.reverts_audited().len(), 2);
+    assert_eq!(f.revert_notices().len(), 2);
+}
+
+/// routes show, the CLI as its JSON, marks each list and route a temporary
+/// change set with what comes back and when; bearings mark the list too. An
+/// allowance's reset is a deadline, and the runtime's record is its own.
+#[test]
+fn routes_show_marks_a_temporary_list_with_its_revert_time() {
+    let f = Fleet::new();
+    let mut daily = codex("model-daily", "free");
+    daily["allowance"] = json!({"daily_utc": "07:00"});
+    daily["tier"] = json!(2);
+    let mut routes = three_routes();
+    routes["daily"] = daily;
+    f.routes(json!({"routes": routes, "crew": ["a"], "errand": ["b"]}));
+    let reply = f.json(
+        None,
+        "routes.set",
+        json!({"routes": routes, "crew": ["a"], "errand": ["b"],
+            "ships": {"engineering": {"crew": ["daily", "c"]}}, "until_reset": "daily"}),
+    );
+    let now = privateer::store::Store::now_ms();
+    let day = 86_400_000;
+    let seven = 7 * 3_600_000;
+    let next =
+        now - now.rem_euclid(day) + seven + if now.rem_euclid(day) >= seven { day } else { 0 };
+    let until = reply["temporary"]["until_ms"].as_i64().unwrap();
+    assert!((until - next).abs() < 120_000, "{until} vs {next}");
+    let cli: Value = serde_json::from_str(&f.ok(None, &["routes", "show"])).unwrap();
+    let shown = f.json(None, "routes.show", json!({}));
+    assert_eq!(cli, shown);
+    let temporary = &shown["temporary"];
+    assert_eq!(temporary["until_ms"], json!(until), "{shown}");
+    assert_eq!(temporary["until_reset"], json!("daily"), "{shown}");
+    assert!(
+        temporary["reverts_at"]
+            .as_str()
+            .unwrap()
+            .ends_with(" 07:00 UTC"),
+        "{shown}"
+    );
+    assert_eq!(
+        temporary["reverts"],
+        json!({"ships.engineering.crew": null}),
+        "{shown}"
+    );
+    assert!(temporary.get("previous").is_none(), "{shown}");
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("(ship's own list, temporary until 07:00 UTC)")
+            && text.contains("errand: b (plan; unranked) (fleet list)"),
+        "{text}"
+    );
+    // Refused: a time past, a route with no fixed reset, both at once, and
+    // the runtime's own record.
+    let base = json!({"routes": three_routes(), "crew": ["a"]});
+    for (extra, why) in [
+        (json!({"until_ms": now - 1}), "must be in the future"),
+        (json!({"until_ms": now + 40 * day}), "within 31 days"),
+        (json!({"until_reset": "a"}), "has no fixed reset"),
+        (json!({"until_reset": "nope"}), "unknown route nope"),
+        (
+            json!({"until_ms": now + day, "until_reset": "daily"}),
+            "not both",
+        ),
+        (
+            json!({"temporary": {"id": "x", "set_ms": 1, "until_ms": 2, "previous": null}}),
+            "runtime's record",
+        ),
+    ] {
+        let mut args = base.clone();
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        let error = f.refused(None, "routes.set", args);
+        assert!(error.contains(why), "{why}: {error}");
+    }
+}
