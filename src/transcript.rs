@@ -540,42 +540,63 @@ fn env_name(name: &str) -> bool {
 /// JSON; then every quoted `"name": "value"` pair under a secret-looking
 /// name, every `NAME=value` whose name reads as an environment variable,
 /// the word after a credential flag or label (`--password x`, `token: x`),
-/// every secret-shaped piece between quotes, brackets and separators, and
-/// what `block_ask::mask` hides.
+/// the value assigned to a secret-looking name (`password = x`,
+/// `secret := x`, `token: str = x`), every secret-shaped piece between
+/// quotes, brackets and separators, the values in a YAML block under a
+/// secret-looking key, and what `block_ask::mask` hides. A value that opens
+/// a quote or bracket is hidden through its close, within its line.
 pub(crate) fn mask_text(text: &str) -> String {
-    let text = mask_pieces(&mask_pairs(&mask_json_lines(text)));
+    use crate::block_ask::{
+        Labelled, ends_line, hide_assigned, hide_value, labelled, numbered_line,
+    };
+    let text =
+        crate::block_ask::mask_yaml_blocks(&mask_pieces(&mask_pairs(&mask_json_lines(text))));
+    let words: Vec<&str> = text.split_inclusive(char::is_whitespace).collect();
     let mut out = String::with_capacity(text.len());
     let mut hide_next = false;
-    // The last word was a secret-looking name, as in `password = x`.
-    let mut name_before = false;
-    for word in text.split_inclusive(char::is_whitespace) {
+    // A line ended between the label and the word it hides.
+    let mut after_line = false;
+    // The label's line, and this line, begin with a file read's line number.
+    let mut numbered = false;
+    let mut line_numbered = false;
+    let mut at = 0;
+    while at < words.len() {
+        if at == 0 || ends_line(words[at - 1]) {
+            line_numbered = numbered_line(&words[at..]);
+        }
+        let word = words[at];
         let trimmed = word.trim_end();
-        let tail = &word[trimmed.len()..];
         if trimmed.is_empty() {
+            after_line |= ends_line(word);
             out.push_str(word);
+            at += 1;
             continue;
         }
-        let after_name = std::mem::take(&mut name_before);
-        if hide_next {
-            hide_next = false;
-            out.push_str(MASK);
-            out.push_str(tail);
-            continue;
+        if std::mem::take(&mut hide_next) {
+            match labelled(word, after_line, after_line && numbered) {
+                Labelled::Skip => {
+                    hide_next = true;
+                    out.push_str(word);
+                    at += 1;
+                    continue;
+                }
+                Labelled::Value(from) => {
+                    at = hide_value(&words, at, from, &mut out);
+                    continue;
+                }
+                Labelled::Kept => {}
+            }
         }
-        if after_name && matches!(trimmed, "=" | ":") {
-            hide_next = true;
-            out.push_str(word);
+        if let Some(next) = hide_assigned(&words, at, &mut out) {
+            at = next;
             continue;
         }
         let bare = trimmed.trim_start_matches(['"', '\'', '`', '(', '{', '[', ',', ';']);
         if let Some((name, value)) = bare.split_once('=')
-            && env_name(name)
-            && !value.is_empty()
+            && (env_name(name) && !value.is_empty() || crate::block_ask::sensitive_name(name))
         {
             let cut = trimmed.find('=').map_or(trimmed.len(), |at| at + 1);
-            out.push_str(&trimmed[..cut]);
-            out.push_str(MASK);
-            out.push_str(tail);
+            at = hide_value(&words, at, cut, &mut out);
             continue;
         }
         let label = bare.trim_end_matches(['"', '\'', '`']);
@@ -585,9 +606,11 @@ pub(crate) fn mask_text(text: &str) -> String {
             && crate::block_ask::sensitive_name(name)
         {
             hide_next = true;
+            after_line = ends_line(word);
+            numbered = line_numbered;
         }
-        name_before = !label.contains('=') && crate::block_ask::sensitive_name(name);
         out.push_str(word);
+        at += 1;
     }
     crate::block_ask::mask(&out)
 }
@@ -599,12 +622,7 @@ fn mask_json_lines(text: &str) -> String {
     for line in text.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
         let end = &line[body.len()..];
-        let digits = body.trim_start();
-        let number = digits.trim_start_matches(|c: char| c.is_ascii_digit());
-        let start = match number.strip_prefix(['\t', '→']) {
-            Some(rest) if number.len() < digits.len() => body.len() - rest.len(),
-            _ => 0,
-        };
+        let start = crate::block_ask::line_number_len(body);
         match serde_json::from_str::<Value>(&body[start..]) {
             Ok(value @ (Value::Object(_) | Value::Array(_))) => {
                 out.push_str(&body[..start]);
@@ -879,6 +897,183 @@ mod tests {
         assert!(text.contains("cat ~/.config/tokens.jsonl"), "{text}");
         assert!(text.contains("warning:"), "{text}");
         assert_eq!(events.len(), 6, "{text}");
+    }
+
+    #[test]
+    fn a_typed_assignment_hides_its_value_and_the_word_after_its_label() {
+        // What reads as a type may be the value, so it is hidden as before.
+        assert_eq!(
+            mask_text("    password: str = hunter2\n    user: str = ada\n"),
+            "    password: ••• = •••\n    user: str = ada\n"
+        );
+        assert_eq!(
+            mask_text("const token: string = \"tok.planted\";\nconst port: number = 80;"),
+            "const token: ••• = •••\nconst port: number = 80;"
+        );
+        assert_eq!(
+            mask_text("let api_key: &str = \"planted-key\";"),
+            "let api_key: ••• = •••"
+        );
+        assert_eq!(
+            mask_text("    secret: Option<HashMap<String, String>> = Some(m),"),
+            "    secret: ••• String>> = •••"
+        );
+        // A label without `=` after it still hides the word after it.
+        assert_eq!(mask_text("password: swordfish now"), "password: ••• now");
+    }
+
+    #[test]
+    fn what_main_hid_after_a_label_or_name_stays_hidden() {
+        let cases = [
+            ("token: abc123 ttl = 3600", "abc123"),
+            ("password: hunter2, retries = 3", "hunter2"),
+            ("secret: xyz # default = none", "xyz"),
+            ("auth_token: 9f8e7d, ttl = 300", "9f8e7d"),
+            ("Set-Cookie: sid123; Path = /", "sid123"),
+            ("password\n= hunter2", "hunter2"),
+        ];
+        let mut shown: Vec<String> = cases
+            .iter()
+            .flat_map(|(text, secret)| {
+                [mask_text(text), crate::block_ask::mask(text)]
+                    .into_iter()
+                    .filter(move |shown| shown.contains(secret))
+            })
+            .collect();
+        // A value glued to a block marker is no block scalar, and a line
+        // number is read only in numbered output.
+        for (text, secret) in [
+            ("password: >1234", "1234"),
+            ("password: |1234", "1234"),
+            ("password: |1234\n  below", "1234"),
+            ("password:\n1234\tnext", "1234"),
+            ("password:\n  1234\tnext", "1234"),
+        ] {
+            shown.extend(Some(mask_text(text)).filter(|shown| shown.contains(secret)));
+        }
+        assert!(shown.is_empty(), "{shown:#?}");
+        assert_eq!(
+            mask_text("    12\tpassword:\n    13\thunter2 shown"),
+            "    12\tpassword:\n    13\t••• shown"
+        );
+    }
+
+    #[test]
+    fn closers_after_a_value_mask_in_linear_time() {
+        let text = format!("password={}", ")".repeat(100_000));
+        let started = std::time::Instant::now();
+        let shown = mask_text(&text);
+        let masked = crate::block_ask::mask(&text);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        assert!(shown.starts_with("password=•••)") && shown.ends_with("))"));
+        assert_eq!(shown, masked);
+    }
+
+    #[test]
+    fn a_go_short_declaration_hides_its_value() {
+        let shown = mask_text(
+            "\tsecret := \"planted-go\"\n\tapiKey := os.Getenv(\"X\")\n\tname := \"ada\"\n",
+        );
+        assert_eq!(
+            shown,
+            "\tsecret := •••\n\tapiKey := •••\n\tname := \"ada\"\n"
+        );
+    }
+
+    #[test]
+    fn a_quoted_value_with_spaces_is_hidden_whole() {
+        let phrase = "correct horse battery staple";
+        let texts = [
+            format!("password = \"{phrase}\"\nnext"),
+            format!("password=\"{phrase}\" ./run"),
+            format!("export API_KEY='{phrase}' && go"),
+            format!("mysql --password \"{phrase}\" -h db"),
+            format!("login({{ password: \"{phrase}\" }})"),
+            format!("let token: String = \"{phrase}\".into();"),
+            format!("tokens: [\"{phrase}\", \"b c\"] # list"),
+        ];
+        for text in &texts {
+            let shown = mask_text(text);
+            for word in phrase.split(' ') {
+                assert!(!shown.contains(word), "{word} in {shown}");
+            }
+        }
+        assert_eq!(mask_text(&texts[0]), "password = •••\nnext");
+        assert_eq!(mask_text(&texts[1]), "password=••• ./run");
+        assert_eq!(mask_text(&texts[2]), "export API_KEY=••• && go");
+        assert_eq!(mask_text(&texts[3]), "mysql --password ••• -h db");
+        assert_eq!(mask_text(&texts[4]), "login({ password: ••• })");
+        assert_eq!(mask_text(&texts[6]), "tokens: ••• # list");
+        // A quote never closed hides to the end of its line only.
+        assert_eq!(
+            mask_text("password = \"open quote\nnext line"),
+            "password = •••\nnext line"
+        );
+        // Quoted text under an ordinary name stays.
+        assert_eq!(
+            mask_text("title = \"correct horse\""),
+            "title = \"correct horse\""
+        );
+    }
+
+    #[test]
+    fn a_yaml_block_under_a_secret_key_hides_its_values() {
+        let file = "\
+service: api
+tokens:
+  - tok-alpha-one
+  - tok-beta-two
+api_keys:
+- name: prod
+  value: prodvalue
+password: |
+  line one
+  line two
+credentials:
+  user: alice
+  scopes:
+    - read
+replicas: 3
+labels:
+  - web
+";
+        let masked = "\
+service: api
+tokens:
+  - •••
+  - •••
+api_keys:
+- name: •••
+  value: •••
+password: |
+  •••
+  •••
+credentials:
+  user: •••
+  scopes:
+    - •••
+replicas: 3
+labels:
+  - web
+";
+        assert_eq!(mask_text(file), masked);
+        // The same file as a Read shows it, numbered.
+        let number = |text: &str, sep: &str| {
+            text.lines()
+                .enumerate()
+                .map(|(n, line)| format!("{:>6}{sep}{line}\n", n + 1))
+                .collect::<String>()
+        };
+        for sep in ["→", "\t"] {
+            assert_eq!(mask_text(&number(file, sep)), number(masked, sep));
+        }
+        // A key whose value is on its line, and a key with nothing under it,
+        // hide nothing below.
+        assert_eq!(
+            mask_text("token: abc\n  - shown\nsecret:\nnext: 1\n"),
+            "token: •••\n  - shown\nsecret:\nnext: 1\n"
+        );
     }
 
     #[test]
