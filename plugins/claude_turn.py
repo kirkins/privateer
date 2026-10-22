@@ -170,6 +170,24 @@ class ClaudeTurn(Turn):
         self.denied = False
         self.denials = []
         self.servers = list(servers)
+        # The route's model, as the launch named it; the models Claude then
+        # reports, from its init and each result's modelUsage.
+        self.route_model = flags[flags.index("--model") + 1] if "--model" in flags[:-1] else None
+        self.models = []
+
+    def saw_model(self, name):
+        if isinstance(name, str) and name and name not in self.models:
+            self.models.append(name)
+
+    def route_mismatch(self):
+        """The models used that are not the route's, as a recorded fact for the
+        job: a settings file or alias can send a run elsewhere than argv said.
+        An alias (`opus`) names any model carrying it; `[1m]` is not a model."""
+        if self.route_model is None:
+            return None
+        expected = self.route_model.lower().replace("[1m]", "")
+        strays = [m for m in self.models if expected not in m.lower().replace("[1m]", "")]
+        return {"expected": self.route_model, "used": strays} if strays else None
 
     def check_servers(self, reported, tools):
         """Every selected MCP server connected with tools, and no other: the Pi
@@ -199,6 +217,7 @@ class ClaudeTurn(Turn):
         if kind == "system" and value.get("subtype") == "init":
             super().observe({"type": "session", "id": value.get("session_id")})
             self.check_servers(value.get("mcp_servers"), value.get("tools"))
+            self.saw_model(value.get("model"))
         elif kind == "result":
             if value.get("session_id") != self.session:
                 raise ValueError("changed-session")
@@ -214,6 +233,9 @@ class ClaudeTurn(Turn):
             usage = value.get("usage")
             if isinstance(usage, dict):
                 self.add_usage({new: usage[old] for old, new in USAGE_FIELDS if old in usage})
+            if isinstance(value.get("modelUsage"), dict):
+                for name in value["modelUsage"]:
+                    self.saw_model(name)
             if self.usage:
                 self.usage["totalTokens"] = sum(n for key, n in self.usage.items() if key != "totalTokens")
 
@@ -489,6 +511,10 @@ def run(argv, control):
             summary["reason"] = reason
         if turn.usage:
             summary["usage"] = turn.usage
+        if turn.models:
+            summary["models"] = turn.models
+        if mismatch := turn.route_mismatch():
+            summary["route_mismatch"] = mismatch
         print(json.dumps(summary, separators=(",", ":")), flush=True)
         if turn.denied:
             report_denial(turn.denials)

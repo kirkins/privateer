@@ -267,6 +267,35 @@ class ClaudeBundles(unittest.TestCase):
         self.assertRegex(version, r'^[0-9]+\.[0-9]+\.[0-9]+$')
         print(f'verified installed Claude Code {version} at {binary}', file=sys.stderr)
 
+    def test_working_directory_settings_that_change_the_route_refuse_the_launch(self):
+        before = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, before)
+        cases = [
+            ('claude', ['claude', '--model', 'exact', '--', 'brief'], '.claude/settings.local.json',
+             {'env': {'ANTHROPIC_BASE_URL': 'http://127.0.0.1:1'}}, 'env'),
+            ('claude', ['claude', '--', 'brief'], '.claude/settings.json', {'apiKeyHelper': 'x'}, 'apiKeyHelper'),
+            ('claude', ['claude', '--', 'brief'], '.claude/settings.json', {'model': 'other'}, 'model'),
+            ('claude', ['claude', '--', 'brief'], '.claude/settings.json', [], 'unreadable'),
+            ('pi', ['pi', '--', 'brief'], '.pi/settings.json', {'defaultModel': 'other'}, 'defaultModel'),
+        ]
+        for harness, argv, name, content, key in cases:
+            path = self.repo / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(content))
+            with self.subTest(file=name, key=key), patch.object(native_launch.os, 'execvpe') as execute, \
+                    self.assertRaisesRegex(native_launch.RouteOverride, re.escape(f'({name}: {key})')) as refusal:
+                native_launch.launch(harness, argv)
+            execute.assert_not_called()
+            self.assertNotIn('127.0.0.1', refusal.exception.public_message)
+            path.unlink()
+        # The project settings Privateer writes (its allow rule and hooks) launch.
+        (self.repo / '.claude/settings.json').write_text(json.dumps(
+            {'permissions': {'allow': ['Bash(privateer:*)']}, 'hooks': {'SessionStart': []}}))
+        with patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('claude', ['claude', '--', 'brief'])
+        execute.assert_called_once()
+
     def test_native_adapter_unbounded_unchanged_bounded_resume_and_attended_adapter(self):
         request = {'method': 'command', 'context': {'repo': str(self.repo), 'title': 'brief', 'control': {}},
                    'options': {'model': 'exact'}}

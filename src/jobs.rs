@@ -162,6 +162,10 @@ struct Job {
     /// usage may be short of what the harness used.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     usage_partial: bool,
+    /// The models a harness reported using that are not its route's
+    /// (`{"expected", "used"}`), recorded with the usage when the job settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_mismatch: Option<Value>,
     /// Bundled Codex read-only crew must leave a durable report; otherwise a
     /// sandboxed no-op would be indistinguishable from successful work.
     #[serde(default)]
@@ -426,9 +430,10 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
         // A harness job's usage is read from its log once, as it settles,
         // and commits with the status that settled it.
         if terminal(&job.status) && !terminal(&before) && job.usage.is_none() {
-            let (usage, cut) = harness_usage(store, &job);
+            let (usage, cut, mismatch) = harness_usage(store, &job);
             job.usage = usage;
             job.usage_partial = is_harness(&job) && (cut || job.stdout_dropped_bytes > 0);
+            job.route_mismatch = mismatch;
         }
         conn.execute(
             "UPDATE jobs SET record=?2 WHERE id=?1",
@@ -461,10 +466,11 @@ fn is_harness(job: &Job) -> bool {
 /// `cacheWrite` and `totalTokens`. A hosted crew's log holds its finished
 /// messages, not the streaming updates whose usage this reads, so it reports
 /// nothing here. Also whether the log was cut: a
-/// truncation marker stands where bytes were dropped.
-fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool) {
+/// truncation marker stands where bytes were dropped. And the route mismatch
+/// the harness's turn summary recorded, if it reported one.
+fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool, Option<Value>) {
     if !is_harness(job) {
-        return (None, false);
+        return (None, false, None);
     }
     let log = store
         .home()
@@ -474,10 +480,30 @@ fn harness_usage(store: &Store, job: &Job) -> (Option<Value>, bool) {
         .join("stdout.log");
     // A bounded log can be cut inside a UTF-8 character; keep the rest.
     let Ok(text) = fs::read(log).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()) else {
-        return (None, false);
+        return (None, false, None);
     };
     let usage = crate::activation::usage(&text).and_then(|raw| normalize_usage(&raw));
-    (usage, log_cut(&text))
+    (usage, log_cut(&text), route_mismatch(&text))
+}
+/// The `route_mismatch` a native turn summary in the log carries: the models
+/// the harness reported using that are not the route's, a fact the outcome
+/// keeps rather than a sum that hides it.
+pub(crate) fn route_mismatch(text: &str) -> Option<Value> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| {
+            matches!(
+                value["type"].as_str(),
+                Some("turn.completed" | "native.turn.failed")
+            )
+        })
+        .filter_map(|value| {
+            value
+                .get("route_mismatch")
+                .filter(|m| m.is_object())
+                .cloned()
+        })
+        .next_back()
 }
 /// Whether a bounded log dropped bytes: its truncation marker is a line.
 pub(crate) fn log_cut(text: &str) -> bool {
@@ -2357,6 +2383,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             .map(str::to_owned),
         usage: None,
         usage_partial: false,
+        route_mismatch: None,
         codex_read_only_crew: args
             .get("codex_read_only_crew")
             .and_then(Value::as_bool)
@@ -3189,6 +3216,20 @@ mod reply_capture_tests {
             "Started."
         );
         assert!(!temp.path().join(REPLY_ENDED).exists());
+    }
+
+    #[test]
+    fn a_turn_summary_route_mismatch_is_read_from_the_log() {
+        let log = "{\"type\":\"assistant\",\"route_mismatch\":{\"expected\":\"x\"}}\n\
+            {\"type\":\"turn.completed\",\"usage\":{\"input\":1},\"route_mismatch\":{\"expected\":\"opus\",\"used\":[\"claude-haiku-5-5\"]}}\n";
+        assert_eq!(
+            route_mismatch(log),
+            Some(json!({"expected": "opus", "used": ["claude-haiku-5-5"]}))
+        );
+        assert_eq!(
+            route_mismatch("{\"type\":\"turn.completed\",\"usage\":{\"input\":1}}\n"),
+            None
+        );
     }
 
     #[test]
