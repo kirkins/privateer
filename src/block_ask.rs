@@ -180,6 +180,23 @@ pub(crate) fn narrow_rule(tool: &str, input: &Value, base: Option<&Path>) -> Opt
     valid.then_some(rule)
 }
 
+/// A path with each secret-shaped part hidden alone, so a digit in
+/// `/home/me/app2/src/main.rs` leaves it readable while a token pasted in as
+/// one of its parts is still hidden. A word with `+` or `=` reads as base64,
+/// not a path, and is judged whole.
+fn masked_path(word: &str) -> Option<String> {
+    let rooted = ["/", "./", "../", "~/"].iter().any(|p| word.starts_with(p));
+    if !rooted || word.matches('/').count() < 2 || word.contains(['+', '=']) {
+        return None;
+    }
+    Some(
+        word.split('/')
+            .map(|part| if secret_shaped(part) { MASK } else { part })
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
 /// Whether a run of characters looks like a key or token: long, and mixing
 /// letters with digits.
 pub(crate) fn secret_shaped(word: &str) -> bool {
@@ -233,6 +250,8 @@ pub(crate) fn mask(text: &str) -> String {
             && let Some((_, host)) = rest.split_once('@')
         {
             format!("{scheme}://{MASK}@{host}")
+        } else if let Some(path) = masked_path(trimmed) {
+            path
         } else if secret_shaped(trimmed) {
             MASK.to_owned()
         } else {
@@ -1903,6 +1922,24 @@ mod tests {
             preview("NotebookEdit", &json!({"notebook_path": "/w/a.ipynb"})),
             "/w/a.ipynb"
         );
+        // A path with a digit stays readable, and only a random or
+        // token-shaped part of it is hidden.
+        assert_eq!(
+            preview(
+                "Edit",
+                &json!({"file_path": "/home/me/ships/app2/scratch/plan.json"})
+            ),
+            "/home/me/ships/app2/scratch/plan.json"
+        );
+        assert_eq!(
+            preview(
+                "Read",
+                &json!({"file_path": format!("/var/folders/zz/zyxvpxvq6csfxvn_n0000gn/T/{planted}/a.rs")})
+            ),
+            "/var/folders/zz/•••/T/•••/a.rs"
+        );
+        let base64 = format!("cat /{planted}/x+y==");
+        assert_eq!(preview("Bash", &json!({"command": base64})), "cat •••");
         let long = preview("Bash", &json!({"command": "echo ".repeat(100)}));
         assert_eq!(long.chars().count(), PREVIEW_CHARS);
         assert!(long.ends_with('…'));
