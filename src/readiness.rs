@@ -4,11 +4,12 @@
 //!
 //! What is needed comes from configuration, never from machine paths: git
 //! always; Treehouse (config.json's `treehouse_binary`, or `treehouse`) when
-//! an active charter's repository is a Git work tree; and the executables
-//! each harness manifest `requires`, for every local ship's first mate
-//! (blocking: that ship cannot wake) and every route in the routes file
-//! (warning: that route cannot launch). A custom manifest that declares no
-//! `requires` is reported unchecked, never missing.
+//! an active charter's jobs can land in Git (`workspace::git_backed`: its
+//! repo, a project under its `projects/`, or a held workspace); and the
+//! executables each harness manifest `requires`, for every local ship's
+//! first mate (blocking: that ship cannot wake) and every route in the
+//! routes file (warning: that route cannot launch). A custom manifest that
+//! declares no `requires` is reported unchecked, never missing.
 //!
 //! A check only stats binaries. It spawns the version and protocol probes
 //! when a tool's fingerprint (PATH, resolved path, its size and modification
@@ -174,11 +175,6 @@ fn requires(reference: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Whether `repo` is inside a Git work tree.
-fn in_git_tree(repo: &Path) -> bool {
-    repo.ancestors().any(|dir| dir.join(".git").exists())
-}
-
 /// What this home needs, from its charters, ships and the routes file.
 fn needed(store: &Store) -> Result<Needs> {
     // A hand-edited routes file must not stop the check; launches refuse it.
@@ -201,14 +197,17 @@ fn needed_from(store: &Store, policy: Option<&Value>) -> Result<Needs> {
         .prepare("SELECT id, data FROM charters ORDER BY id")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let git_charters: Vec<String> = charters
-        .into_iter()
-        .filter_map(|(id, data)| {
-            let charter: Value = serde_json::from_str(&data).ok()?;
-            let repo = charter["repo"].as_str()?;
-            (charter["active"] == true && in_git_tree(Path::new(repo))).then_some(id)
-        })
-        .collect();
+    let mut git_charters = Vec::new();
+    for (id, data) in charters {
+        let Ok(charter) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        if let (true, Some(repo)) = (charter["active"] == true, charter["repo"].as_str())
+            && crate::workspace::git_backed(store, Path::new(repo))?
+        {
+            git_charters.push(id);
+        }
+    }
     if !git_charters.is_empty() {
         let binary = crate::workspace::treehouse_name(store)?;
         needs.add(Need {
@@ -659,15 +658,19 @@ pub(crate) fn owner_problems(store: &Store) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// Check `home` live on `path` and summarize what fails, for the output of
-/// init, ship.create and service start. Never refuses: a home that cannot
-/// be opened or checked just gets no summary.
-pub(crate) fn ensure_summary(home: &Path, path: &str) -> Option<String> {
+/// Summarize what fails in `home`, for the output of init, ship.create and
+/// service start: checked live on `path`, the PATH a dispatcher about to
+/// start records, or with no `path` (one is already running, on its own
+/// PATH) what that dispatcher last stored, without probing or saving.
+/// Never refuses: a home that cannot be opened or checked gets no summary.
+pub(crate) fn ensure_summary(home: &Path, path: Option<&str>) -> Option<String> {
     if !home.join("privateer.sqlite").is_file() {
         return None;
     }
     let store = Store::open(home).ok()?;
-    check(&store, path, true).ok()?;
+    if let Some(path) = path {
+        check(&store, path, true).ok()?;
+    }
     let failing = failing(store.connection()).ok()?;
     if failing.is_empty() {
         return None;
@@ -749,11 +752,13 @@ mod tests {
             );
         }
 
-        /// An active charter whose repo is a Git work tree.
+        /// An active charter laid out as ships are: its repo is the ship
+        /// folder, which is no Git work tree, and the Git repository is a
+        /// project under it, `<folder>/projects/<name>/.git`.
         fn git_charter(&self, id: &str) {
-            let repo = self.root.join(format!("repo-{id}"));
-            std::fs::create_dir_all(repo.join(".git")).unwrap();
-            self.charter(id, &repo);
+            let folder = self.root.join(format!("ship-{id}"));
+            std::fs::create_dir_all(folder.join("projects").join(id).join(".git")).unwrap();
+            self.charter(id, &folder);
         }
 
         fn charter(&self, id: &str, repo: &Path) {
@@ -1076,6 +1081,30 @@ mod tests {
     }
 
     #[test]
+    fn a_charter_whose_projects_live_elsewhere_needs_treehouse_once_it_holds_a_workspace() {
+        let m = Machine::new();
+        let folder = m.root.join("ship-notes");
+        std::fs::create_dir_all(folder.join("projects").join(".staging").join(".git")).unwrap();
+        m.charter("notes", &folder);
+        // A clone still being staged is not a project yet.
+        m.check();
+        assert!(m.failing_tools().is_empty());
+        let conn = m.store.connection();
+        conn.execute(
+            "INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('t','notes','p','t','open',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspaces(task_id, record) VALUES('t', ?1)",
+            [json!({"charter_repo": folder}).to_string()],
+        )
+        .unwrap();
+        m.check();
+        assert_eq!(m.failing_tools(), ["treehouse"]);
+    }
+
+    #[test]
     fn runtime_needs_pages_readiness_items_by_source_and_id() {
         let m = Machine::new();
         m.git_charter("storefront");
@@ -1112,6 +1141,76 @@ mod tests {
         m.treehouse("v3.1.2", HELP);
         m.check();
         assert!(owner_problems(&m.store).unwrap().is_empty());
+    }
+
+    /// Holds `home`'s serve lock, as a running dispatcher does.
+    fn hold_serve_lock(home: &Path) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(home.join("serve.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        lock
+    }
+
+    #[test]
+    fn a_running_dispatcher_keeps_its_rows_when_started_from_a_bare_path() {
+        let m = Machine::new();
+        m.git_charter("storefront");
+        m.treehouse("v3.1.2", HELP);
+        m.check();
+        assert!(m.failing_tools().is_empty());
+        let home = m.root.join("home");
+        let _running = hold_serve_lock(&home);
+        // A non-login SSH shell: nothing of the dispatcher's tools on PATH.
+        let empty = m.root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let report =
+            crate::service::ensure_with_path(&home, "storefront", &empty.to_string_lossy())
+                .unwrap();
+        assert_eq!(report, "already running");
+        assert!(m.failing_tools().is_empty(), "{:?}", m.failing_tools());
+    }
+
+    #[test]
+    fn a_running_dispatcher_keeps_its_failures_when_started_from_a_fuller_path() {
+        let m = Machine::new();
+        m.git_charter("storefront");
+        m.check();
+        assert_eq!(m.failing_tools(), ["treehouse"]);
+        let home = m.root.join("home");
+        let _running = hold_serve_lock(&home);
+        // This shell has Treehouse; the running dispatcher's PATH does not.
+        let fuller = m.root.join("fuller");
+        std::fs::create_dir(&fuller).unwrap();
+        std::fs::copy(m.bin.join("git"), fuller.join("git")).unwrap();
+        std::fs::write(
+            fuller.join("treehouse"),
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo v3.1.2;; get) echo '{HELP}';; esac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fuller.join("treehouse"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let report =
+            crate::service::ensure_with_path(&home, "storefront", &fuller.to_string_lossy())
+                .unwrap();
+        assert_eq!(m.failing_tools(), ["treehouse"]);
+        // The report says what the running dispatcher last found.
+        assert!(
+            report.starts_with("already running. Readiness: treehouse (block)"),
+            "{report}"
+        );
     }
 
     #[test]

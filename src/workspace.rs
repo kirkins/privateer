@@ -102,6 +102,37 @@ pub(crate) fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Whether a job working in `dir` runs in a Treehouse workspace: some
+/// folder from it up holds a `.git`, even one Git cannot read.
+pub(crate) fn in_git(dir: &Path) -> bool {
+    dir.ancestors()
+        .any(|p| p.join(".git").symlink_metadata().is_ok())
+}
+
+/// Whether a charter's jobs can land in a Git repository, and so need
+/// Treehouse: its repo is in one, a project under `<repo>/projects/` is
+/// one, or one of its tasks already holds a workspace.
+pub(crate) fn git_backed(store: &Store, repo: &Path) -> Result<bool> {
+    if in_git(repo) {
+        return Ok(true);
+    }
+    let projects = std::fs::read_dir(repo.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten();
+    if projects
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .any(|e| e.path().join(".git").symlink_metadata().is_ok())
+    {
+        return Ok(true);
+    }
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE json_extract(record,'$.charter_repo')=?1)",
+        [repo.to_string_lossy()],
+        |r| r.get(0),
+    )?)
+}
+
 fn load(store: &Store, task: &str) -> Result<Option<Workspace>> {
     store
         .connection()
@@ -586,10 +617,7 @@ pub(crate) fn execution(
     } else {
         selected.to_owned()
     };
-    let has_marker = selected
-        .ancestors()
-        .any(|p| p.join(".git").symlink_metadata().is_ok());
-    if !has_marker && exists.as_ref().is_none_or(|w| w.state == "released") {
+    if !in_git(&selected) && exists.as_ref().is_none_or(|w| w.state == "released") {
         return Ok(Execution {
             root: selected.clone(),
             source_root: selected,

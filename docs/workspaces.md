@@ -39,7 +39,9 @@ dispatcher launches with (the one its user service records):
 - git 2.31 or later, always;
 - Treehouse 3.1.2 or later whose `get --help` lists `--lease` and `--json`
   (`treehouse_binary` in config.json, or `treehouse`), when an active
-  charter's repository is a Git work tree;
+  charter's jobs can land in Git: its repository is in a Git work tree, a
+  project under its `projects/` folder is one, or one of its tasks already
+  holds a workspace;
 - the executables a harness manifest lists in `requires`, such as
   `["python3", "claude"]`, for each local ship's first mate and each route in
   the routes file. A custom manifest without `requires` is reported unchecked.

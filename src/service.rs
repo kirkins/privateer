@@ -321,9 +321,11 @@ pub(crate) fn ensure_with_path(home: &Path, ship: &str, path: &str) -> Result<St
 
 /// Start a dispatcher, after checking the tools it needs on the PATH its
 /// unit records. What fails is appended to the report; nothing is refused.
+/// A dispatcher already running checks on its own PATH, not this command's,
+/// so then the report shows what it last found.
 fn started(service: &Service, home: &Path) -> Result<String> {
-    let path = recorded(service, "PATH").unwrap_or_default();
-    let readiness = crate::readiness::ensure_summary(home, &path);
+    let path = (!held(&service.lock)?).then(|| recorded(service, "PATH").unwrap_or_default());
+    let readiness = crate::readiness::ensure_summary(home, path.as_deref());
     let report = start(service, &home.join("serve.log"))?;
     Ok(match readiness {
         Some(summary) => format!("{report}. {summary}"),

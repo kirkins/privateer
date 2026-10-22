@@ -17,7 +17,7 @@ Task privateer-machine-readiness, from captain notice 80d3c1d5. On the server, s
 ## What to check, and how
 One list, built from configuration, never from machine paths:
 1. git: `git --version` >= 2.31 (workspace.rs `common()` uses `rev-parse --path-format=absolute`). Blocks everything.
-2. Treehouse (`treehouse_binary` or `treehouse`), when any active charter's repo is a Git work tree: `treehouse --version` >= 3.1.2 (qualified version) and `treehouse get --help` naming `--lease` and `--json`. A missing tool or a version below the floor blocks crews on Git charters. Help flags present but version unparseable: warn "unqualified".
+2. Treehouse (`treehouse_binary` or `treehouse`), when any active charter's jobs can land in Git (its repo is in a Git work tree, a project under `<repo>/projects/` is one, or one of its tasks holds a workspace; `workspace::git_backed`): `treehouse --version` >= 3.1.2 (qualified version) and `treehouse get --help` naming `--lease` and `--json`. A missing tool or a version below the floor blocks crews on Git charters. Help flags present but version unparseable: warn "unqualified".
 3. Harness binaries: from a new optional manifest field `"requires": ["python3", "claude"]`, binary names only, which we add to the 16 bundled manifests. Read for each manifest named by a first-mate profile or a route in the routes file. A custom manifest without `requires` reports "unchecked", never missing.
 4. herdr when any local ship's first mate has `host: herdr`; ssh when the registry has linked machines. Both are presence plus `--version`; both warn only.
 
