@@ -37,6 +37,13 @@ fn retry_fixture_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::i
     }
 }
 
+/// Node on this test's PATH, which hosted crew panes do not search.
+fn node() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join("node"))
+        .find(|node| node.is_file())
+}
+
 // A wait polls for an event, so its deadline only bounds a failure. Loaded CI
 // runners can be far slower than a workstation: PRIVATEER_TEST_WAIT_SECS
 // raises every deadline.
@@ -98,7 +105,7 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\nput() {{ f='{root}/'$1; shift; printf \"$@\" > \"$f.$$\" && mv -f \"$f.$$\" \"$f\"; }}\ncase \"$PRIVATEER_JOB\" in errand-*) put $PRIVATEER_JOB-pid '%s' \"$$\"; while [ ! -e '{root}/'$PRIVATEER_JOB'-release' ] && [ -d '{root}' ]; do sleep 0.05; done; printf '%s\\n' '{{\"type\":\"session\",\"id\":\"22222222-2222-4222-8222-222222222222\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{{\"type\":\"text\",\"text\":\"Reviewed fixture\"}}]}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'; exit 0;; esac\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
+                "#!/bin/sh\nput() {{ f='{root}/'$1; shift; printf \"$@\" > \"$f.$$\" && mv -f \"$f.$$\" \"$f\"; }}\ncase \"$PRIVATEER_JOB\" in errand-*) put $PRIVATEER_JOB-pid '%s' \"$$\"; while [ ! -e '{root}/'$PRIVATEER_JOB'-release' ] && [ -d '{root}' ]; do sleep 0.05; done; printf '%s\\n' '{{\"type\":\"session\",\"id\":\"22222222-2222-4222-8222-222222222222\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{{\"type\":\"text\",\"text\":\"Reviewed fixture\"}}]}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'; exit 0;; esac\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; {crew}; fi\n\
                  put pi-argv '%s\\n' \"$@\"\n\
                  put pi-pid '%s\\n' \"$$\"\n\
                  put pi-context '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\"\n\
@@ -111,7 +118,18 @@ impl Place {
                  if [ -e '{root}/native-fail' ]; then exit 17; fi\n\
                  while [ ! -e '{root}/release' ]; do [ -d '{root}' ] || exit 1; sleep 0.05; done\n\
                  printf '%s\\n' '{{\"type\":\"session\",\"id\":\"'\"$sid\"'\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
-                root = root.display()
+                root = root.display(),
+                // A hosted crew plays a short run through the real crew
+                // extension, when Node is here to load it.
+                crew = match node() {
+                    Some(node) => format!(
+                        "exec '{}' '{}/tests/hosted-crew-pane.mjs' '{}' \"$@\"",
+                        node.display(),
+                        env!("CARGO_MANIFEST_DIR"),
+                        root.display()
+                    ),
+                    None => "exit 0".into(),
+                }
             ),
         )
         .unwrap();
@@ -3240,6 +3258,105 @@ fn a_hosted_ships_crew_runs_live_in_its_own_space_under_the_same_custody() {
     assert_eq!(outcome["payload"]["status"], "succeeded");
 }
 
+/// A crew job's stdout log, by its current incarnation.
+fn crew_log(place: &Place, job: &str, name: &str) -> PathBuf {
+    let status = place.json("job.status", json!({"id": job}));
+    place
+        .folder
+        .join(".privateer/jobs")
+        .join(job)
+        .join(status["incarnation"].as_str().unwrap())
+        .join(name)
+}
+
+#[test]
+fn a_hosted_crews_masked_events_are_its_log_while_it_runs_and_after() {
+    assert!(
+        node().is_some(),
+        "Node is required to run the hosted crew extension"
+    );
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "task.create",
+        json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
+    );
+    // The crew's Pi holds its run open after its first tool.
+    fs::write(place.root.join("crew-hold"), "").unwrap();
+    let started = place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
+    assert_eq!(started["hosted"], true, "{started}");
+    let planted = ["ghp", "0123456789abcdefABCDEF0123456789abcd"].join("_");
+    let log = crew_log(&place, "crew-1", "stdout.log");
+    let read = || fs::read_to_string(&log).unwrap_or_default();
+    // What its harness did so far is in its log while it runs, even though
+    // its harness writes only to its pane. Its Pi waits after this turn.
+    until("the running crew's log", || {
+        let text = read();
+        text.contains("\"turn_end\"") && text.ends_with('\n')
+    });
+    assert_eq!(
+        place.json("job.status", json!({"id":"crew-1"}))["status"],
+        "running"
+    );
+    let running = read();
+    for line in running.lines() {
+        serde_json::from_str::<Value>(line).unwrap_or_else(|_| panic!("{line}"));
+    }
+    assert!(running.contains("Fixture crew is working"), "{running}");
+    assert!(running.contains("built"), "{running}");
+    assert!(
+        running.contains("0d5a1f0e-7b1c-4b8e-9c55-1f2e3d4c5b6a"),
+        "{running}"
+    );
+
+    fs::write(place.root.join("crew-release"), "").unwrap();
+    until("the crew to finish", || {
+        place.json("job.status", json!({"id":"crew-1"}))["status"] == "succeeded"
+    });
+    let done = read();
+    assert!(done.starts_with(&running), "{done}");
+    assert!(done.contains("Fixture crew finished the work"), "{done}");
+    // Terminal escapes and secret-shaped text never reach the log.
+    assert!(
+        !done.contains('\u{1b}') && !done.contains("u001b"),
+        "{done}"
+    );
+    assert!(!done.contains(&planted), "{done}");
+    assert!(
+        fs::read(crew_log(&place, "crew-1", "reply"))
+            .is_ok_and(|reply| String::from_utf8_lossy(&reply).contains("finished the work")),
+        "its last reply is saved as a headless crew's is"
+    );
+    assert!(!crew_log(&place, "crew-1", "events").exists());
+
+    // Its outcome mail ends with its log.
+    let inbox = place.json("mail.inbox", json!({"address":"infra","all":true}));
+    let outcome = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["from"] == "crew" && m["payload"]["job_id"] == "crew-1")
+        .cloned()
+        .unwrap();
+    assert_eq!(outcome["payload"]["status"], "succeeded");
+    let body = outcome["body"].as_str().unwrap();
+    assert!(body.contains("--- end of stdout ---"), "{body}");
+    assert!(body.contains("Fixture crew finished the work"), "{body}");
+    assert!(!body.contains(&planted), "{body}");
+}
+
 #[test]
 fn a_hosted_ships_crew_on_another_harness_runs_headless_with_a_viewer_space() {
     let place = Place::new();
@@ -3295,6 +3412,14 @@ fn a_hosted_ships_crew_on_another_harness_runs_headless_with_a_viewer_space() {
     until("the crew to finish", || {
         place.json("job.status", json!({"id":"crew-2"}))["status"] == "succeeded"
     });
+    // A headless crew's log is its output, as it printed it.
+    assert_eq!(
+        fs::read_to_string(crew_log(&place, "crew-2", "stdout.log")).unwrap(),
+        "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n\
+         {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"cache fixed\"}}\n\
+         {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n"
+    );
+    assert!(!crew_log(&place, "crew-2", "events").exists());
     // The view reports the crew to Herdr as working, then done.
     until("the viewer to report the crew done", || {
         herdr

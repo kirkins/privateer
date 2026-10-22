@@ -15,6 +15,7 @@ pub mod context;
 pub mod core;
 pub mod credentials;
 pub mod crew;
+mod crew_events;
 mod crew_launch;
 pub mod crew_relaunch;
 pub mod crew_routes;
