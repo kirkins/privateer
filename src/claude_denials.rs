@@ -114,11 +114,19 @@ pub(crate) fn latest(path: &Path, folder: &Path) -> Option<Scan> {
     read_back(path, folder, 0, |found, _| !found.is_empty())
 }
 
-/// Whether a refusal was made before `ms`: one a lookup since `ms` misses.
+/// Whether a refusal written at `at` may have been made at or after `ms`, by
+/// the clock slack: one a lookup since `ms` reads.
+fn after(at: i64, ms: i64) -> bool {
+    at + SLACK_MS >= ms
+}
+
+/// Whether a refusal may have been made before `ms`, by the same slack. One
+/// within the slack of `ms` is both before and `after` it, so none falls
+/// between a lookup since `ms` and this.
 pub(crate) fn before(denial: &Value, ms: i64) -> bool {
     denial["denied_ms"]
         .as_i64()
-        .is_some_and(|at| at + SLACK_MS < ms)
+        .is_some_and(|at| at - SLACK_MS < ms)
 }
 
 /// One transcript's refusals since `since_ms`, read back from its end until
@@ -155,7 +163,7 @@ fn read_back(
             .iter()
             .filter_map(|r| r["timestamp"].as_str())
             .find_map(crate::routes::iso_timestamp_ms)
-            .is_some_and(|first| first + SLACK_MS < since_ms);
+            .is_some_and(|first| !after(first, since_ms));
         let named = found.iter().all(|d| d["unidentified"] != true);
         if done || (enough(&found, reached) && named) {
             return Some(Scan {
@@ -367,7 +375,7 @@ fn denials(records: &[Value], folder: &Path, since_ms: i64) -> Vec<Value> {
         let Some((reason, classifier)) = refusal(record, block, &text) else {
             continue;
         };
-        if at.is_none_or(|at| at + SLACK_MS < since_ms) {
+        if at.is_none_or(|at| !after(at, since_ms)) {
             continue;
         }
         let mut denial = match named {

@@ -38,7 +38,9 @@
 //! A relaunch is a new incident, and a relaunched or woken pane can redraw
 //! the footer of a refusal from before its launch. With nothing refused since
 //! the launch, the footer's refusal is the newest one before it in the same
-//! transcript. One an ask already held raises nothing new (see `held_by`).
+//! transcript. A refusal either lookup reads that an ask already held raises
+//! nothing new (see `held_by`); a refusal within the clock slack of the
+//! launch is read by both.
 //!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
@@ -278,9 +280,9 @@ fn alert_in(
                 // no refusal since the last incident, and the newest one in
                 // the same transcript from before the launch, the footer's is
                 // that one. The refusal's own time is judged against the
-                // launch: a clear seen since moves the incident's, not it.
-                let before = found.is_empty();
-                if before {
+                // launch, with the lookup's slack: a clear seen since moves
+                // the incident's, not it.
+                if found.is_empty() {
                     found = scan
                         .as_ref()
                         .zip(folder.as_deref())
@@ -292,27 +294,35 @@ fn alert_in(
                         .into_iter()
                         .collect();
                 }
-                let (passed, blocking): (Vec<Value>, Vec<Value>) =
+                let (passed, found): (Vec<Value>, Vec<Value>) =
                     found.into_iter().partition(|d| d["passed_ms"].is_i64());
-                let asked = match blocking.first() {
-                    Some(denial) if before => held_by(store, ship, denial)?,
-                    _ => None,
-                };
-                if let Some((id, open)) = asked {
-                    // That refusal was put to the captain already. Its ask
-                    // holds it while open; once ended, the footer is seen and
-                    // the watch reads on from here with no ask.
+                // A refusal an ask already held, whichever lookup read it, is
+                // put to the captain once: only the others are raised.
+                let mut asked = vec![];
+                let mut blocking = vec![];
+                for denial in found {
+                    match held_by(store, ship, &denial)? {
+                        Some((id, open)) => asked.push((denial, id, open)),
+                        None => blocking.push(denial),
+                    }
+                }
+                asked.sort_by_key(|(_, _, open)| !open);
+                if let Some((_, id, open)) = asked.first().filter(|_| blocking.is_empty()) {
+                    // Every refusal was put to the captain already. An open
+                    // ask holds its own while open; once ended, the footer is
+                    // seen and the watch reads on from here with no ask.
                     store.audit(
                         "permissions.ask_skipped",
                         &json!({"ship": ship, "task_id": duty_task, "reason": ASKED_ALREADY,
-                            "ask": id, "tool_use_ids": [blocking[0]["tool_use_id"]]}),
+                            "ask": id, "tool_use_ids": asked.iter().map(|(d, _, _)| &d["tool_use_id"]).collect::<Vec<_>>()}),
                     )?;
-                    let (ask, held) = if open {
-                        (Some(id.as_str()), &blocking[..])
-                    } else {
-                        (None, &[][..])
-                    };
-                    watch(store, ship, &incident, ask, false, scan.as_ref(), held)?;
+                    let held: Vec<Value> = asked
+                        .iter()
+                        .filter(|(_, by, _)| *open && by == id)
+                        .map(|(d, _, _)| d.clone())
+                        .collect();
+                    let ask = open.then_some(id.as_str());
+                    watch(store, ship, &incident, ask, false, scan.as_ref(), &held)?;
                     outcome["asked"] = json!(id);
                 } else if blocking.is_empty() && !passed.is_empty() {
                     // The session is already past every refusal: nobody waits.
@@ -370,9 +380,9 @@ fn duty_task(store: &Store, ship: &str) -> Result<Option<String>> {
 
 /// Why an incident raised no ask: the session got past every refusal.
 const PAST_ALREADY: &str = "the session got past every refusal it showed before the block was seen";
-/// Why a relaunched pane's block raised no ask: an ask already held the
-/// refusal its footer shows.
-const ASKED_ALREADY: &str = "an ask before the pane's launch already held the refusal it shows";
+/// Why a block raised no ask: an ask already held every refusal it shows,
+/// as when a relaunched pane redraws an answered one.
+const ASKED_ALREADY: &str = "an ask already held every refusal the pane shows";
 
 /// The pane's ask that held a refusal, by its tool use, open ones first, and
 /// whether it is still open. None when no ask of the ship's ever held it.
@@ -2987,6 +2997,76 @@ mod tests {
         assert_eq!(raised.len(), 1, "{raised:?}");
         assert_eq!(raised[0]["asked"], id.as_str(), "{raised:?}");
         assert_eq!(asks(&store), 1);
+    }
+
+    /// When the fixture's Bash refusal was written.
+    fn refused_ms() -> i64 {
+        crate::routes::iso_timestamp_ms("2026-10-20T00:06:16.000Z").unwrap()
+    }
+
+    /// The pane's card for the fixture's refusal, filed a moment after it was
+    /// written and answered at once; the pane is woken a second after the
+    /// refusal, within the lookup's clock slack. Returns the card.
+    fn answered_then_woken_within_the_slack(store: &Store, projects: &std::path::Path) -> String {
+        launch(store, 10, "a");
+        pane(store, projects, |n| n <= 3);
+        alert_in(store, &observe(BYPASS_SCREEN), Some(projects)).unwrap();
+        let (id, _) = open_card(store);
+        let connection = store.connection();
+        connection
+            .execute("UPDATE mail SET state='answered' WHERE id=?1", [&id])
+            .unwrap();
+        connection
+            .execute("UPDATE hosted_automode SET ms=?1", [refused_ms() + 300])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO hosted_panes(ship,pid,started,executable,recorded_ms)
+                 VALUES('privateer',11,'b','privateer',?1)",
+                [refused_ms() + 1_000],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn a_relaunch_within_the_slack_redrawing_an_answered_refusal_raises_no_new_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let id = answered_then_woken_within_the_slack(&store, projects.path());
+        // The lookup since the launch reads the refusal by its slack: the
+        // ask that held it still holds it.
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0]["asked"], id.as_str(), "{raised:?}");
+        assert!(raised[0]["ask"].is_null(), "{raised:?}");
+        assert_eq!(asks(&store), 1);
+    }
+
+    #[test]
+    fn a_relaunch_within_the_slack_and_a_loading_screen_raises_no_new_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let id = answered_then_woken_within_the_slack(&store, projects.path());
+        // The loading screen moves the lookup past the refusal, which the
+        // fallback still reads as from before the launch.
+        alert_in(
+            &store,
+            &observe("Resuming conversation…"),
+            Some(projects.path()),
+        )
+        .unwrap();
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0]["asked"], id.as_str(), "{raised:?}");
+        assert_eq!(asks(&store), 1);
+        let card = ask(&store);
+        assert_ne!(
+            card["block"]["denials"][0]["preview"],
+            block_ask::UNIDENTIFIED
+        );
     }
 
     #[test]
