@@ -246,10 +246,15 @@ impl Coordination {
         );
         Ok(())
     }
+    /// Dispatchers and fleet reads (the bridge's own deck among them) briefly
+    /// hold the hosting home and the registry, so a lock or a lapsed query
+    /// deadline is waited out for a bounded time; any other refusal is final.
     fn owner(&self, owner: &Owner) -> Result<()> {
-        self.validate()?;
-        owner.validate().context("bridge hosting home")?;
-        self.member(owner).context("fleet registry")
+        retry_contended(std::time::Duration::from_secs(2), || {
+            self.validate()?;
+            owner.validate().context("bridge hosting home")?;
+            self.member(owner).context("fleet registry")
+        })
     }
     fn member(&self, owner: &Owner) -> Result<()> {
         let conn = rusqlite::Connection::open_with_flags(
@@ -548,13 +553,21 @@ pub fn adopt() -> Result<Option<Lease>> {
     let Ok(token) = std::env::var(TOKEN) else {
         return Ok(None);
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    retry_contended(std::time::Duration::from_secs(10), || adopt_once(&token)).map(Some)
+}
+
+/// Runs `attempt` again while it fails only on contention, until `limit`.
+fn retry_contended<T>(
+    limit: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = std::time::Instant::now() + limit;
     loop {
-        match adopt_once(&token) {
+        match attempt() {
             Err(error) if contended(&error) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            result => return result.map(Some),
+            result => return result,
         }
     }
 }
@@ -610,4 +623,45 @@ fn adopt_once(token: &str) -> Result<Lease> {
 /// succeed before any dashboard work; this function grants no ownership.
 pub fn requested() -> bool {
     std::env::var_os(TOKEN).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real SQLite lock held by another connection, then released.
+    #[test]
+    fn a_registry_writer_is_waited_out_but_a_refusal_is_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.sqlite");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE ships(name TEXT); BEGIN EXCLUSIVE; INSERT INTO ships VALUES('a');",
+            )
+            .unwrap();
+        let read = || -> Result<i64> {
+            let conn = rusqlite::Connection::open(&path)?;
+            conn.busy_timeout(std::time::Duration::ZERO)?;
+            Ok(conn.query_row("SELECT COUNT(*) FROM ships", [], |r| r.get(0))?)
+        };
+        assert!(contended(&read().unwrap_err()));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            writer.execute_batch("COMMIT").unwrap();
+        });
+        assert_eq!(
+            retry_contended(std::time::Duration::from_secs(5), read).unwrap(),
+            1
+        );
+        release.join().unwrap();
+
+        let mut calls = 0;
+        let refused: Result<()> = retry_contended(std::time::Duration::from_secs(5), || {
+            calls += 1;
+            anyhow::bail!("bridge hosting home changed")
+        });
+        assert!(refused.is_err());
+        assert_eq!(calls, 1);
+    }
 }
