@@ -389,6 +389,31 @@ fn adopt_refuses_what_it_cannot_prove_and_leaves_it_alone() {
     assert_eq!(w.snapshot(), before);
     assert_eq!(w.calls(), "");
 
+    // An installed privateer that is another build than the release's may be
+    // newer: adopt cannot tell, so it needs the operator's --allow-downgrade.
+    let mut other = fs::read(BIN).unwrap();
+    other.extend_from_slice(b"another build");
+    fs::write(w.local(), &other).unwrap();
+    refused(
+        &w.adopt(&w.cargo(), &["--dry-run", "--commit", C]),
+        &format!(
+            "{} is not the build in releases/{C}, and adopt cannot tell whether {C} is older",
+            w.local().display()
+        ),
+    );
+    let dry = json_of(&w.adopt(
+        &w.cargo(),
+        &["--dry-run", "--allow-downgrade", "--commit", C],
+    ));
+    assert_eq!(
+        dry["installed"],
+        json!([{"path": w.cargo(), "same_build": true}, {"path": w.local(), "same_build": false}]),
+        "{dry:#}"
+    );
+    assert_eq!(w.calls(), "");
+    fs::copy(BIN, w.local()).unwrap();
+    assert_eq!(w.snapshot(), before);
+
     // A launcher linked elsewhere, a native program that does not answer as
     // the dashboard, and a script wrapper are reported and left alone.
     let elsewhere = w.root.join("elsewhere/privateer");
@@ -429,7 +454,6 @@ fn adopt_refuses_what_it_cannot_prove_and_leaves_it_alone() {
             done("launcher"),
             done("unit"),
             done("unit"),
-            done("unit"),
             ("reload".into(), "failed".into())
         ],
         "{report:#}"
@@ -444,7 +468,7 @@ fn adopt_refuses_what_it_cannot_prove_and_leaves_it_alone() {
         report["error"]
             .as_str()
             .unwrap()
-            .contains("run `systemctl --user daemon-reload`"),
+            .contains("rerun `privateer upgrade adopt`"),
         "{report:#}"
     );
     assert_eq!(w.calls(), "systemctl --user daemon-reload\n");
@@ -465,6 +489,8 @@ fn adopt_refuses_what_it_cannot_prove_and_leaves_it_alone() {
             "did not answer as Privateer's privateer-dashboard",
         ),
         (wrapper.clone(), "not a native executable"),
+        // The agent runs that linked-elsewhere launcher, which is not moved.
+        (w.agent(), "neither a launcher this adoption moves"),
     ] {
         let action = find(&file);
         assert_eq!(action["state"], "left", "{action}");
@@ -491,4 +517,195 @@ fn adopt_refuses_what_it_cannot_prove_and_leaves_it_alone() {
         json!([foreign]),
         "{status:#}"
     );
+
+    // Once systemctl works, a rerun finds everything in place but nothing
+    // recorded: it reloads and records the adoption, and then is a no-op.
+    executable(
+        &w.root.join("fake/systemctl"),
+        &format!(
+            "#!/bin/sh\necho \"systemctl $*\" >> '{}'\n",
+            w.calls_log().display()
+        ),
+    );
+    let rerun = json_of(&w.adopt(&w.cargo(), &[]));
+    assert_eq!(rerun["noop"], false, "{rerun:#}");
+    let changed: Vec<_> = actions(&rerun)
+        .into_iter()
+        .filter(|(_, _, state)| !["left", "already"].contains(&state.as_str()))
+        .collect();
+    assert_eq!(
+        changed,
+        [("reload".into(), String::new(), "done".into())],
+        "{rerun:#}"
+    );
+    assert_eq!(w.calls(), "systemctl --user daemon-reload\n".repeat(2));
+    let history = &w.status()["history"];
+    assert_eq!(history.as_array().unwrap().len(), 1, "{history:#}");
+    assert_eq!(history[0]["kind"], "adopt");
+    let again = json_of(&w.adopt(&w.cargo(), &[]));
+    assert_eq!(again["noop"], true, "{again:#}");
+    assert_eq!(w.calls(), "systemctl --user daemon-reload\n".repeat(2));
+}
+
+/// Restores a directory's permissions however the test ends, so the
+/// fixture can be removed.
+struct Writable(PathBuf);
+impl Drop for Writable {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn adopt_repoints_only_units_running_what_it_adopts_past_an_unwritable_launcher() {
+    let w = World::new();
+    // Adopt runs from a privateer in a directory this user cannot write,
+    // like /usr/local/bin: it is proven but left, and the run goes on.
+    let system = w.root.join("system/bin/privateer");
+    fs::create_dir_all(system.parent().unwrap()).unwrap();
+    fs::copy(BIN, &system).unwrap();
+    let dev = w.root.join("dev/target/release/privateer");
+    fs::create_dir_all(dev.parent().unwrap()).unwrap();
+    fs::copy(BIN, &dev).unwrap();
+    // Another name for the cargo launcher's file is the same launcher.
+    let alias = w.root.join("alias/privateer");
+    fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    fs::hard_link(w.cargo(), &alias).unwrap();
+    let pinned = |name: &str, program: &Path| {
+        let unit = w.units().join(format!("privateer-{name}-0000eeee.service"));
+        fs::write(
+            &unit,
+            format!(
+                "[Unit]\nDescription=Privateer dispatcher for ship {name}\n\n[Service]\nExecStart=\"{}\" --home \"/ships/{name}\" serve\nKillMode=process\n",
+                program.display()
+            ),
+        )
+        .unwrap();
+        unit
+    };
+    let left = [
+        pinned("dev", &dev),
+        pinned("system", &system),
+        pinned(
+            "other",
+            &w.root.join("other/privateer/current/bin/privateer"),
+        ),
+    ];
+    let moved = [
+        pinned("alias", &alias),
+        pinned(
+            "release",
+            &w.data().join("releases").join(C).join("bin/privateer"),
+        ),
+    ];
+    // An unquoted program after blanks is found and replaced in place; one
+    // with a systemd prefix is not what `start` writes, and is left.
+    let door = |name: &str, exec: &str| {
+        let unit = w
+            .units()
+            .join(format!("privateer-door-{name}-0000ffff.service"));
+        fs::write(
+            &unit,
+            format!("[Unit]\nDescription=Privateer front door {name}\n\n[Service]\n{exec} door run {name}\nKillMode=control-group\n"),
+        )
+        .unwrap();
+        unit
+    };
+    let blanks = door("blanks", &format!("ExecStart=  {}", w.cargo().display()));
+    let prefixed = door("prefixed", &format!("ExecStart=-{}", w.cargo().display()));
+    // A door named `serve` is a door: its agent keeps its process group.
+    let serve = w
+        .agent()
+        .with_file_name("privateer-door-serve-0000ffff.plist");
+    fs::write(
+        &serve,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>privateer-door-serve-0000ffff</string>\n<key>ProgramArguments</key><array><string>{}</string><string>door</string><string>run</string><string>serve</string></array>\n<key>AbandonProcessGroup</key><false/>\n</dict></plist>\n",
+            w.cargo().display()
+        ),
+    )
+    .unwrap();
+    let kept: Vec<_> = left.iter().map(|u| fs::read(u).unwrap()).collect();
+    let prefixed_text = fs::read(&prefixed).unwrap();
+    fs::set_permissions(system.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = Writable(system.parent().unwrap().to_path_buf());
+
+    let report = json_of(&w.adopt(&system, &["--commit", C]));
+    let find = |p: &Path| {
+        report["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["path"] == json!(p))
+            .unwrap_or_else(|| panic!("{} is not reported: {report:#}", p.display()))
+            .clone()
+    };
+    let launcher = find(&system);
+    assert_eq!(launcher["state"], "left", "{launcher}");
+    assert_eq!(launcher["proof"], "the running image");
+    assert!(
+        launcher["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not writable"),
+        "{launcher}"
+    );
+    assert!(fs::symlink_metadata(&system).unwrap().is_file());
+    for launcher in [w.cargo(), w.local()] {
+        assert_eq!(fs::read_link(&launcher).unwrap(), w.entry());
+    }
+    for (unit, text) in left.iter().zip(&kept) {
+        let action = find(unit);
+        assert_eq!(action["state"], "left", "{action}");
+        assert!(
+            action["reason"]
+                .as_str()
+                .unwrap()
+                .contains("neither a launcher this adoption moves"),
+            "{action}"
+        );
+        assert_eq!(&fs::read(unit).unwrap(), text);
+    }
+    for unit in moved {
+        assert_eq!(find(&unit)["state"], "done", "{report:#}");
+        assert!(
+            fs::read_to_string(&unit)
+                .unwrap()
+                .contains(&format!("ExecStart=\"{}\" ", w.entry().display()))
+        );
+    }
+    assert_eq!(find(&w.dispatcher_unit())["state"], "done");
+    assert_eq!(find(&blanks)["state"], "done");
+    let text = fs::read_to_string(&blanks).unwrap();
+    assert!(
+        text.contains(&format!(
+            "\nExecStart=  \"{}\" door run blanks\n",
+            w.entry().display()
+        )),
+        "{text}"
+    );
+    let action = find(&prefixed);
+    assert_eq!(action["state"], "left", "{action}");
+    assert!(
+        action["reason"]
+            .as_str()
+            .unwrap()
+            .contains("neither quoted nor an absolute path"),
+        "{action}"
+    );
+    assert_eq!(fs::read(&prefixed).unwrap(), prefixed_text);
+    let action = find(&serve);
+    assert_eq!(
+        (&action["service"], &action["state"]),
+        (&json!("door"), &json!("done")),
+        "{action}"
+    );
+    let text = fs::read_to_string(&serve).unwrap();
+    assert!(
+        text.contains(&format!("<array><string>{}</string>", w.entry().display()))
+            && text.contains("<key>AbandonProcessGroup</key><false/>"),
+        "{text}"
+    );
+    assert_eq!(w.calls(), "systemctl --user daemon-reload\n");
+    assert!(report.get("error").is_none(), "{report:#}");
 }

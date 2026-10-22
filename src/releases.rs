@@ -236,6 +236,31 @@ pub fn current_for(executable: &Path) -> Result<Option<Release>> {
     selected(&installation(running.as_ref())?)
 }
 
+/// The newest `limit` upgrade outcomes (all of them for -1), read only: a
+/// missing registry or table is an empty history.
+fn read_history(registry: &Path, limit: i64) -> Result<Vec<UpgradeRecord>> {
+    let mut history = Vec::new();
+    if registry.exists() {
+        let conn = Connection::open_with_flags(registry, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        let present: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='upgrades'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if present.is_some() {
+            let mut statement =
+                conn.prepare("SELECT record FROM upgrades ORDER BY seq DESC LIMIT ?1")?;
+            for raw in statement.query_map([limit], |r| r.get::<_, String>(0))? {
+                history.push(serde_json::from_str(&raw?)?);
+            }
+        }
+    }
+    Ok(history)
+}
+
 /// Read-only status works outside a ship and never creates a fleet registry.
 /// `current_commit` is the selected release; `running_commit` may be older.
 pub fn status() -> Result<Value> {
@@ -249,25 +274,7 @@ pub fn status() -> Result<Value> {
         registry.is_absolute(),
         "the fleet registry path must be absolute"
     );
-    let mut history = Vec::<UpgradeRecord>::new();
-    if registry.exists() {
-        let conn = Connection::open_with_flags(registry, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(std::time::Duration::from_secs(10))?;
-        let present: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='upgrades'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if present.is_some() {
-            let mut statement =
-                conn.prepare("SELECT record FROM upgrades ORDER BY seq DESC LIMIT 100")?;
-            for raw in statement.query_map([], |r| r.get::<_, String>(0))? {
-                history.push(serde_json::from_str(&raw?)?);
-            }
-        }
-    }
+    let history = read_history(&registry, 100)?;
     // Once `current` is set, a native executable at a launcher path (a later
     // `cargo install`) runs outside the releases until adopted again.
     let mut unversioned = Vec::new();
@@ -304,7 +311,7 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
             adopt::adopt(&adopt::Options::parse(&args[1..])?, "operator")?
         }
         _ => bail!(
-            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] (switching to a release is not implemented yet)"
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-downgrade] (switching to a release is not implemented yet)"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

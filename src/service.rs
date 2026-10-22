@@ -706,24 +706,7 @@ pub(crate) fn installed_services() -> Result<Vec<Installed>> {
                 continue;
             }
             let text = fs::read_to_string(&path)?;
-            let dispatcher = if launchd {
-                if text.contains("<string>serve</string>") {
-                    Some(true)
-                } else {
-                    text.contains("<string>door</string><string>run</string>")
-                        .then_some(false)
-                }
-            } else if text
-                .lines()
-                .any(|l| l.starts_with("Description=Privateer dispatcher for ship "))
-            {
-                Some(true)
-            } else {
-                text.lines()
-                    .any(|l| l.starts_with("Description=Privateer front door "))
-                    .then_some(false)
-            };
-            if let Some(dispatcher) = dispatcher {
+            if let Some(dispatcher) = dispatcher_or_door(&text, launchd) {
                 found.push(Installed {
                     path,
                     launchd,
@@ -734,6 +717,49 @@ pub(crate) fn installed_services() -> Result<Vec<Installed>> {
         }
     }
     Ok(found)
+}
+
+/// Whether a unit or agent `start` wrote runs a dispatcher (true) or a door
+/// (false). A unit says so in its description; an agent by its exact
+/// arguments, `--home HOME serve` or `door run NAME`, so a door named
+/// `serve` is still a door.
+fn dispatcher_or_door(text: &str, launchd: bool) -> Option<bool> {
+    if launchd {
+        let arguments = agent_arguments(text)?;
+        return match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [_, "door", "run", _] => Some(false),
+            [_, "--home", _, "serve"] => Some(true),
+            _ => None,
+        };
+    }
+    let described = |prefix: &str| text.lines().any(|l| l.trim_start().starts_with(prefix));
+    if described("Description=Privateer dispatcher for ship ") {
+        Some(true)
+    } else {
+        described("Description=Privateer front door ").then_some(false)
+    }
+}
+
+/// An agent's ProgramArguments, as `property_list` writes them.
+fn agent_arguments(text: &str) -> Option<Vec<String>> {
+    let mark = "<key>ProgramArguments</key><array>";
+    let rest = &text[text.find(mark)? + mark.len()..];
+    let mut array = &rest[..rest.find("</array>")?];
+    let mut arguments = Vec::new();
+    while !array.is_empty() {
+        let value = array.strip_prefix("<string>")?;
+        let end = value.find("</string>")?;
+        arguments.push(unxml(&value[..end]));
+        array = &value[end + "</string>".len()..];
+    }
+    Some(arguments)
+}
+
+fn unxml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// The program an installed unit or agent runs.
@@ -754,46 +780,57 @@ fn program_span(installed: &Installed) -> Result<(std::ops::Range<usize>, String
             + text[start..]
                 .find("</string>")
                 .context("the agent's program is unterminated")?;
-        let program = text[start..end]
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&");
+        let program = unxml(&text[start..end]);
         return Ok((start..end, program));
     }
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
-        if let Some(value) = line.strip_prefix("ExecStart=") {
-            let start = offset + "ExecStart=".len();
-            let (len, program) = match value.strip_prefix('"') {
-                Some(rest) => {
-                    // `quote` escapes backslashes and double quotes.
-                    let mut program = String::new();
-                    let mut chars = rest.char_indices();
-                    let mut end = None;
-                    while let Some((i, c)) = chars.next() {
-                        match c {
-                            '\\' => program.extend(chars.next().map(|(_, c)| c)),
-                            '"' => {
-                                end = Some(i + 2);
-                                break;
-                            }
-                            c => program.push(c),
+        // `ExecStart = VALUE`, with any blanks systemd allows around it.
+        let blanks = |s: &str| s.trim_start_matches([' ', '\t']).to_owned();
+        let Some(value) = blanks(line)
+            .strip_prefix("ExecStart")
+            .map(blanks)
+            .and_then(|rest| rest.strip_prefix('=').map(blanks))
+        else {
+            offset += line.len();
+            continue;
+        };
+        let start = offset + line.len() - value.len();
+        let (len, program) = match value.strip_prefix('"') {
+            Some(rest) => {
+                // `quote` escapes backslashes and double quotes.
+                let mut program = String::new();
+                let mut chars = rest.char_indices();
+                let mut end = None;
+                while let Some((i, c)) = chars.next() {
+                    match c {
+                        '\\' => program.extend(chars.next().map(|(_, c)| c)),
+                        '"' => {
+                            end = Some(i + 2);
+                            break;
                         }
+                        c => program.push(c),
                     }
-                    (
-                        end.context("the unit's ExecStart is unterminated")?,
-                        program,
-                    )
                 }
-                None => {
-                    let word = value.split_whitespace().next().unwrap_or_default();
-                    (word.len(), word.to_owned())
-                }
-            };
-            ensure!(!program.is_empty(), "the unit's ExecStart is empty");
-            return Ok((start..start + len, program));
-        }
-        offset += line.len();
+                (
+                    end.context("the unit's ExecStart is unterminated")?,
+                    program,
+                )
+            }
+            None => {
+                let word = value.split_whitespace().next().unwrap_or_default();
+                (word.len(), word.to_owned())
+            }
+        };
+        // A prefix (`-`, `@`, `+`, `!`), a single quote, an escape or a
+        // relative program is not what `start` writes: left as it is.
+        ensure!(
+            (value.starts_with('"') || value.starts_with('/'))
+                && Path::new(&program).is_absolute()
+                && (value.starts_with('"') || !program.contains(['\\', '\'', '"', '%'])),
+            "the unit's ExecStart program {program:?} is neither quoted nor an absolute path; change it by hand"
+        );
+        return Ok((start..start + len, program));
     }
     bail!("the unit has no ExecStart")
 }
@@ -1023,6 +1060,66 @@ pub(crate) mod tests {
         };
         let fixed = super::repointed(&installed, new).unwrap().unwrap();
         assert!(fixed.contains("\nKillMode=process\n") && !fixed.contains("control-group"));
+    }
+
+    #[test]
+    fn adoption_finds_an_unquoted_program_after_blanks_and_refuses_the_rest() {
+        let new = std::path::Path::new("/data/privateer/current/bin/privateer");
+        let unit = |exec: &str| super::Installed {
+            path: "/u".into(),
+            launchd: false,
+            dispatcher: false,
+            text: format!("[Service]\n{exec}\nKillMode=control-group\n"),
+        };
+        for exec in [
+            "ExecStart=  /old/bin/privateer door run tg",
+            "ExecStart = \t/old/bin/privateer door run tg",
+            " ExecStart=\"/old/bin/privateer\" door run tg",
+        ] {
+            let installed = unit(exec);
+            assert_eq!(
+                super::program(&installed).unwrap(),
+                std::path::Path::new("/old/bin/privateer"),
+                "{exec}"
+            );
+            let text = super::repointed(&installed, new).unwrap().unwrap();
+            assert!(
+                text.contains(&format!(
+                    "{} door run tg\n",
+                    super::quote(&new.to_string_lossy())
+                )) && !text.contains("/old/"),
+                "{exec}: {text}"
+            );
+        }
+        for exec in [
+            "ExecStart=-/old/bin/privateer door run tg",
+            "ExecStart=privateer door run tg",
+            "ExecStart='/old/bin/privateer' door run tg",
+            "ExecStart=/old/bin/priv\\x20ateer door run tg",
+            "ExecStart=",
+        ] {
+            let error = super::program(&unit(exec)).unwrap_err().to_string();
+            assert!(error.contains("change it by hand"), "{exec}: {error}");
+            assert!(super::repointed(&unit(exec), new).is_err(), "{exec}");
+        }
+    }
+
+    #[test]
+    fn an_agent_is_a_dispatcher_or_a_door_by_its_exact_arguments() {
+        let old = std::path::Path::new("/old/bin/privateer");
+        let dispatcher = super::property_list(&super::dispatcher("/ships/a".as_ref(), "a"), old);
+        assert_eq!(super::dispatcher_or_door(&dispatcher, true), Some(true));
+        // A door named `serve` is a door: its process group stops with it.
+        let door = |name: &str| {
+            dispatcher.replace(
+                "<string>--home</string><string>/ships/a</string><string>serve</string>",
+                &format!("<string>door</string><string>run</string><string>{name}</string>"),
+            )
+        };
+        assert_eq!(super::dispatcher_or_door(&door("serve"), true), Some(false));
+        assert_eq!(super::dispatcher_or_door(&door("tg"), true), Some(false));
+        let other = dispatcher.replace("<string>serve</string>", "<string>rpc</string>");
+        assert_eq!(super::dispatcher_or_door(&other, true), None);
     }
 
     #[test]
