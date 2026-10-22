@@ -204,7 +204,7 @@ The same edit applies on the Mac and the server, where `sol` already exists: onl
 
    `forges.set` reads this back through `plugins/forge.py protection.read` and warns about anything missing.
 
-**Forgejo, per repository** (git.lobbykit.net/hermes/*):
+**Forgejo, per repository** (forge.example.com/hermes/*):
 1. **[hands]** Create `reviewer`, `merger` and `ships` users, all as non-admin write collaborators (not site admins). Ships' API tokens move to `ships`. Store `forge-reviewer-forgejo` and `forge-merger-forgejo` with `credential.set` (paste at no-echo prompt).
 2. **[hands]** Set protection on the default branch:
    - `enable_push: false`, `apply_to_admins: true`;
