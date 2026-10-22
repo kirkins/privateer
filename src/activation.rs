@@ -87,6 +87,9 @@ pub fn init(store: &Store) -> Result<()> {
            harness_started TEXT, recorded_ms INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS hosted_automode(ship TEXT PRIMARY KEY, incident TEXT NOT NULL,
            ms INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS hosted_automode_watch(ask TEXT PRIMARY KEY, ship TEXT NOT NULL,
+           transcript TEXT NOT NULL, session TEXT NOT NULL, offset INTEGER NOT NULL,
+           keys TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS hosted_untrusted(ship TEXT PRIMARY KEY, folder TEXT NOT NULL,
            ms INTEGER NOT NULL, mail_id TEXT);
          CREATE TABLE IF NOT EXISTS hosted_relaunches(ship TEXT PRIMARY KEY, holder TEXT NOT NULL,

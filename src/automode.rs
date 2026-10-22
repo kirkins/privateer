@@ -11,6 +11,15 @@
 //! pane's own Claude transcript (see `claude_denials`). When that cannot be
 //! read, the ask says the denied tool was not identified and offers no Allow.
 //!
+//! The screen shows a denial as Claude's footer notice, for a few seconds,
+//! when Claude shows it: Claude holds a notice while its pane holds notices
+//! or a diff panel is open, and shows it later. So an incident can be seen
+//! long after its refusal, and the session may be past it by then. A refusal
+//! the session got past, by a later successful call of the same tool with an
+//! equivalent input, raises no ask. An ask whose refusals were all
+//! identified is watched: when the session later gets past every one, it is
+//! withdrawn, and its task no longer waits on the captain.
+//!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
 use crate::block_ask;
@@ -153,6 +162,13 @@ fn alert_in(
     projects: Option<&std::path::Path>,
 ) -> Result<Vec<Value>> {
     let mut raised = vec![];
+    let folder = store
+        .home()
+        .parent()
+        .map(|f| f.canonicalize().unwrap_or(f.into()));
+    if let Some((projects, folder)) = projects.zip(folder.as_deref()) {
+        raised.extend(withdraw_passed(store, projects, folder)?);
+    }
     for (ship, _, screen) in observed {
         let tx = store.write_transaction()?;
         let Some(finding) = read(screen) else {
@@ -231,27 +247,220 @@ fn alert_in(
                 }),
             )?;
         }
+        let mut outcome = json!({"ship": ship, "incident": incident, "lockout": finding.lockout});
         if finding.lockout || count > 0 {
             if let Ok(task) = store.task(&duty_task) {
-                let folder = store
-                    .home()
-                    .parent()
-                    .map(|f| f.canonicalize().unwrap_or(f.into()));
-                let denials = projects
+                let scan = projects
                     .zip(folder.as_deref())
                     .and_then(|(projects, folder)| {
                         crate::claude_denials::since(projects, folder, last_ms.max(launched_ms))
-                    })
-                    .filter(|denials| !denials.is_empty())
-                    .unwrap_or_else(|| vec![block_ask::unidentified()]);
-                let (records, more) = block_ask::records(&denials, folder.as_deref());
-                block_ask::raise(store, ship, &duty_task, &task, None, "pane", records, more)?;
+                    });
+                let found = scan.as_ref().map(|s| s.denials.clone()).unwrap_or_default();
+                let (passed, blocking): (Vec<Value>, Vec<Value>) =
+                    found.into_iter().partition(|d| d["passed_ms"].is_i64());
+                if blocking.is_empty() && !passed.is_empty() {
+                    // The session is already past every refusal: nobody waits.
+                    outcome["passed"] = json!(passed.len());
+                    store.audit(
+                        "permissions.ask_skipped",
+                        &json!({"ship": ship, "task_id": duty_task, "reason": PAST_ALREADY,
+                            "tool_use_ids": passed.iter().map(|d| &d["tool_use_id"]).collect::<Vec<_>>()}),
+                    )?;
+                } else {
+                    let denials = if blocking.is_empty() {
+                        vec![block_ask::unidentified()]
+                    } else {
+                        blocking
+                    };
+                    let (records, more) = block_ask::records(&denials, folder.as_deref());
+                    let ask = block_ask::raise(
+                        store, ship, &duty_task, &task, None, "pane", records, more,
+                    )?;
+                    if let Some(id) = ask["ask"].as_str() {
+                        watch(
+                            store,
+                            ship,
+                            id,
+                            ask["duplicate"] == true,
+                            scan.as_ref(),
+                            &denials,
+                        )?;
+                    }
+                    outcome["ask"] = ask["ask"].clone();
+                }
             }
         }
         tx.commit()?;
-        raised.push(json!({"ship": ship, "incident": incident, "lockout": finding.lockout}));
+        raised.push(outcome);
     }
     Ok(raised)
+}
+
+/// Why an incident raised no ask: the session got past every refusal.
+const PAST_ALREADY: &str = "the session got past every refusal it showed before the block was seen";
+
+/// Watch an ask whose refusals were all read from one transcript session,
+/// so it can be withdrawn when that session gets past them. A refusal that
+/// was not identified, or another transcript, ends the watch: nothing can
+/// then show that the session got past the whole ask.
+fn watch(
+    store: &Store,
+    ship: &str,
+    ask: &str,
+    duplicate: bool,
+    scan: Option<&crate::claude_denials::Scan>,
+    denials: &[Value],
+) -> Result<()> {
+    let existing: Option<(String, String, String)> = store
+        .connection()
+        .query_row(
+            "SELECT transcript, session, keys FROM hosted_automode_watch WHERE ask=?1",
+            [ask],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    // A duplicate the watch did not start with was raised another way.
+    if duplicate && existing.is_none() {
+        return Ok(());
+    }
+    let mut keys: Vec<Value> = existing
+        .as_ref()
+        .and_then(|(_, _, keys)| serde_json::from_str(keys).ok())
+        .unwrap_or_default();
+    let session = denials.first().and_then(|d| d["session"].as_str());
+    let path = scan.map(|s| s.transcript.to_string_lossy().into_owned());
+    let mut watchable = scan.is_some() && session.is_some();
+    if let Some((transcript, watched, _)) = &existing {
+        watchable &= path.as_deref() == Some(transcript) && session == Some(watched);
+    }
+    for denial in denials {
+        let key = crate::claude_denials::retry_key(
+            denial["tool_name"].as_str().unwrap_or_default(),
+            &denial["tool_input"],
+        );
+        match key {
+            Some(key) if denial["session"].as_str() == session => {
+                if !keys.iter().any(|k| k["key"] == key) {
+                    keys.push(json!({"key": key, "tool": denial["tool_name"]}));
+                }
+            }
+            _ => watchable = false,
+        }
+    }
+    if !watchable {
+        store
+            .connection()
+            .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [ask])?;
+        return Ok(());
+    }
+    let (Some(scan), Some(session)) = (scan, session) else {
+        return Ok(());
+    };
+    // A new watch reads on from where the incident's read ended; one already
+    // reading keeps its place.
+    store.connection().execute(
+        "INSERT INTO hosted_automode_watch(ask,ship,transcript,session,offset,keys)
+         VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(ask) DO UPDATE SET keys=excluded.keys",
+        params![
+            ask,
+            ship,
+            scan.transcript.to_string_lossy(),
+            session,
+            i64::try_from(scan.end).unwrap_or(i64::MAX),
+            serde_json::to_string(&keys)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read each watched ask's transcript on from where it was last read, and
+/// withdraw an ask once its session has got past every refusal on it.
+fn withdraw_passed(
+    store: &Store,
+    projects: &std::path::Path,
+    folder: &std::path::Path,
+) -> Result<Vec<Value>> {
+    let rows: Vec<(String, String, String, String, i64, String)> = {
+        let mut statement = store.connection().prepare(
+            "SELECT ask, ship, transcript, session, offset, keys FROM hosted_automode_watch",
+        )?;
+        statement
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut withdrawn = vec![];
+    for (id, ship, transcript, session, offset, keys) in rows {
+        let ask = crate::mail::find(store, &id)?.filter(|ask| ask["state"] == "open");
+        let path = std::path::PathBuf::from(&transcript);
+        // Only a transcript of this home's pane is read.
+        let Some(ask) = ask.filter(|_| path.starts_with(projects)) else {
+            store
+                .connection()
+                .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [&id])?;
+            continue;
+        };
+        let mut keys: Vec<Value> = serde_json::from_str(&keys).unwrap_or_default();
+        let wanted: std::collections::HashSet<String> = keys
+            .iter()
+            .filter(|k| !k["passed_ms"].is_i64())
+            .filter_map(|k| k["key"].as_str().map(str::to_owned))
+            .collect();
+        let offset = u64::try_from(offset).unwrap_or_default();
+        let Some((retried, next)) =
+            crate::claude_denials::retried(&path, folder, &session, offset, &wanted)
+        else {
+            continue;
+        };
+        for (key, ms) in retried {
+            for k in keys
+                .iter_mut()
+                .filter(|k| k["key"] == key && !k["passed_ms"].is_i64())
+            {
+                k["passed_ms"] = json!(ms);
+            }
+        }
+        let passed = !keys.is_empty() && keys.iter().all(|k| k["passed_ms"].is_i64());
+        if !passed {
+            store.connection().execute(
+                "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
+                params![
+                    id,
+                    i64::try_from(next).unwrap_or(i64::MAX),
+                    serde_json::to_string(&keys)?
+                ],
+            )?;
+            continue;
+        }
+        let latest = keys
+            .iter()
+            .filter_map(|k| k["passed_ms"].as_i64())
+            .max()
+            .unwrap_or_default();
+        let mut tools: Vec<&str> = keys.iter().filter_map(|k| k["tool"].as_str()).collect();
+        tools.dedup();
+        let reason = format!(
+            "{}: the same {} call succeeded on retry at {}, so this decision is no longer needed",
+            block_ask::PASSED,
+            tools.join(", "),
+            crate::routes::utc_time(latest)
+        );
+        block_ask::withdraw_passed(store, &ask, &reason)?;
+        store
+            .connection()
+            .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [&id])?;
+        withdrawn.push(json!({"ship": ship, "withdrawn": id, "reason": reason}));
+    }
+    Ok(withdrawn)
 }
 
 #[cfg(test)]

@@ -27,6 +27,11 @@ const MASK: &str = "•••";
 pub(crate) const UNIDENTIFIED: &str = "denied tool not identified";
 /// What a card shows of a refusal's reason, after masking.
 const REASON_CHARS: usize = 160;
+/// How long after its refusal an ask says when the denial was refused.
+const LATE_MS: i64 = 5 * 60_000;
+/// The reason a block ask is withdrawn with when its own session got past
+/// it: a later call of the same tool with the same input succeeded.
+pub(crate) const PASSED: &str = "the session got past this block";
 /// Senders of open requests to a blocked ship who are told about its ask.
 const MAX_REQUESTERS: usize = 5;
 /// The reason a covering policy change ends an ask with.
@@ -412,8 +417,10 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
     for denial in denials {
         if denial["unidentified"] == true {
             if seen.insert("unidentified".to_owned()) {
-                records.push(json!({"tool": "", "rule": null, "preview": UNIDENTIFIED,
-                    "source": "denial", "unidentified": true}));
+                let mut record = json!({"tool": "", "rule": null, "preview": UNIDENTIFIED,
+                    "source": "denial", "unidentified": true});
+                transcript_ref(&mut record, denial);
+                records.push(record);
             }
             continue;
         }
@@ -448,6 +455,7 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
         if let Some(authorize) = authorize {
             record["authorize"] = json!(authorize);
         }
+        transcript_ref(&mut record, denial);
         // What a captain approval's command prefix is matched against, and
         // whether the card shows the whole command, byte for byte: not
         // clipped, cut at a heredoc, flattened or masked.
@@ -466,6 +474,17 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
     let more = records.len().saturating_sub(MAX_DENIALS);
     records.truncate(MAX_DENIALS);
     (records, more)
+}
+
+/// Where a denial read from a pane's transcript is recorded: its tool use's
+/// id and when it was refused. Neither holds any of its input.
+fn transcript_ref(record: &mut Value, denial: &Value) {
+    if let Some(id) = denial["tool_use_id"].as_str().filter(|id| !id.is_empty()) {
+        record["tool_use_id"] = json!(id);
+    }
+    if let Some(ms) = denial["denied_ms"].as_i64() {
+        record["denied_ms"] = json!(ms);
+    }
 }
 
 /// The standing authorization an ask offers: its records' suggestions, one
@@ -926,6 +945,7 @@ pub(crate) fn raise(
         "what_happens": "The task resumes; its first mate is told the tool stays denied."}));
     options.push(json!({"id": "stop", "label": "Stop the task",
         "what_happens": "The task is held; its owner is told."}));
+    let now = Store::now_ms();
     let previews: Vec<String> = records
         .iter()
         .map(|d| {
@@ -934,8 +954,18 @@ pub(crate) fn raise(
                 Some(tool) => format!("{tool}: {preview}"),
                 None => preview.to_owned(),
             };
-            match d["reason"].as_str() {
+            let shown = match d["reason"].as_str() {
                 Some(reason) => format!("{shown} (refused: {reason})"),
+                None => shown,
+            };
+            // A pane's denial is seen when its screen shows it, which can be
+            // well after the refusal: say when it was refused.
+            match d["denied_ms"].as_i64().filter(|ms| now - ms >= LATE_MS) {
+                Some(ms) => format!(
+                    "{shown} (refused at {}, {} before this ask)",
+                    crate::routes::utc_time(ms),
+                    crate::activation::idle_duration(now - ms)
+                ),
                 None => shown,
             }
         })
@@ -1127,11 +1157,62 @@ fn ended_text(ask: &Value, outcome: Outcome) -> String {
 }
 
 /// Why a task parked on a block ask resumes, when a policy change ended the
-/// ask; None for any other ending.
+/// ask or its own session got past it; None for any other ending.
 pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
-    let outcome = Outcome::from_reason(request["end_reason"].as_str()?)?;
-    (request["state"] == "withdrawn" && request["payload"]["type"] == "tool_permission")
-        .then(|| ended_text(request, outcome))
+    if request["state"] != "withdrawn" || request["payload"]["type"] != "tool_permission" {
+        return None;
+    }
+    let reason = request["end_reason"].as_str()?;
+    if reason.starts_with(PASSED) {
+        let id = request["id"].as_str().unwrap_or_default();
+        return Some(format!(
+            "{id} was withdrawn because {reason}; the captain's decision is no longer needed. Carry on."
+        ));
+    }
+    Outcome::from_reason(reason).map(|outcome| ended_text(request, outcome))
+}
+
+/// Withdraw an open block ask its own session got past, with `reason`
+/// (starting with `PASSED`). Another ship's ask attached to it is
+/// detached first, so the captain sees it as its own card: that ship may
+/// still be blocked.
+pub(crate) fn withdraw_passed(store: &Store, ask: &Value, reason: &str) -> Result<bool> {
+    let id = ask["id"].as_str().context("ask id")?;
+    let ship = ask["from"].as_str().unwrap_or_default();
+    let mut homes = vec![store.home().to_path_buf()];
+    homes.extend(other_homes(store.home()).into_iter().map(|(_, h)| h));
+    for home in homes {
+        let Ok(other) = Store::open(&home) else {
+            continue;
+        };
+        let tx = other.write_transaction()?;
+        let detached = other.connection().execute(
+            &format!(
+                "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
+                 WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'
+                 AND json_extract(payload,'$.attached_to')=?1 AND sender<>?2"
+            ),
+            params![id, ship],
+        )?;
+        if detached > 0 {
+            other.audit(
+                "permissions.detached",
+                &json!({"from": id, "reason": reason, "asks": detached}),
+            )?;
+        }
+        tx.commit()?;
+    }
+    let tx = store.write_transaction()?;
+    let open = crate::mail::find(store, id)?.is_some_and(|ask| ask["state"] == "open");
+    if open {
+        crate::mail::end_request(store, ask, "withdrawn", reason)?;
+        store.audit(
+            "permissions.passed",
+            &json!({"ask": id, "ship": ship, "task_id": ask["task_id"], "reason": reason}),
+        )?;
+    }
+    tx.commit()?;
+    Ok(open)
 }
 
 /// Before a primary that a policy change ended takes its attachments with
