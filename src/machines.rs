@@ -1967,6 +1967,24 @@ fn forget_wait(conn: &Connection, machine: &Machine, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Open a home for a pass over every home here. One that cannot be opened
+/// (moved, deleted, its database broken) is skipped and tried again on the
+/// next pass, so it never stops the others' mail; the pass logs it once and
+/// lists it in `skipped`.
+fn open_member(home: &std::path::Path, skipped: &mut Vec<String>) -> Option<Store> {
+    match Store::open(home) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            let shown = home.display().to_string();
+            if !skipped.contains(&shown) {
+                eprintln!("privateer: this pass skips the home {shown}: {error:#}");
+                skipped.push(shown);
+            }
+            None
+        }
+    }
+}
+
 /// Hand this machine's captain mail written since the desk moved (along with
 /// any still-open requests and decisions) to the machine holding it, and
 /// record what it took or refused, so nothing is sent twice and a refusal
@@ -1982,13 +2000,16 @@ fn push_captain(
         .as_deref()
         .context("link has no local name")?;
     let peer = peer_name(&machine.name);
+    let mut skipped = vec![];
     let mut messages = vec![];
     let mut bytes = 0;
     for member in crate::fleet::members(conn)? {
         if !member.home.is_dir() || messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
             continue;
         }
-        let store = Store::open(&member.home)?;
+        let Some(store) = open_member(&member.home, &mut skipped) else {
+            continue;
+        };
         let (limit, room) = (COLLECT_LIMIT - messages.len(), COLLECT_BYTES - bytes);
         for envelope in crate::mail::awaiting_captain(&store, &peer, since_ms, true, limit, room)? {
             bytes += envelope.to_string().len();
@@ -1997,13 +2018,26 @@ fn push_captain(
     }
     let mut pushed = 0;
     if !messages.is_empty() {
-        pushed = push_messages(conn, machine, &peer, known_as, &messages, timeout)?;
+        pushed = push_messages(
+            conn,
+            machine,
+            &peer,
+            known_as,
+            &messages,
+            timeout,
+            &mut skipped,
+        )?;
     }
-    let closed = push_closures(conn, machine, &peer, known_as, timeout)?;
-    Ok(json!({"machine": machine.name, "captain_pushed": pushed, "captain_closed": closed}))
+    let closed = push_closures(conn, machine, &peer, known_as, timeout, &mut skipped)?;
+    Ok(
+        json!({"machine": machine.name, "captain_pushed": pushed, "captain_closed": closed,
+        "skipped_homes": skipped}),
+    )
 }
 
 /// Send captain messages to the desk and record what it took or refused.
+/// A home skipped here does not record it, so its mail is offered again on a
+/// later pass, as after any pass that failed before recording.
 fn push_messages(
     conn: &Connection,
     machine: &Machine,
@@ -2011,6 +2045,7 @@ fn push_messages(
     known_as: &str,
     messages: &[Value],
     timeout: Duration,
+    skipped: &mut Vec<String>,
 ) -> Result<usize> {
     let result = call(
         machine,
@@ -2043,8 +2078,11 @@ fn push_messages(
         taken.push((id.to_owned(), Some(error.to_owned())));
     }
     for member in crate::fleet::members(conn)? {
-        if member.home.is_dir() {
-            crate::mail::collected_captain(&Store::open(&member.home)?, peer, &taken)?;
+        if !member.home.is_dir() {
+            continue;
+        }
+        if let Some(store) = open_member(&member.home, skipped) {
+            crate::mail::collected_captain(&store, peer, &taken)?;
         }
     }
     Ok(taken.len())
@@ -2059,6 +2097,7 @@ fn push_closures(
     peer: &str,
     known_as: &str,
     timeout: Duration,
+    skipped: &mut Vec<String>,
 ) -> Result<usize> {
     // Read the refresh epoch fresh: an exchange earlier in this pass may have moved it.
     let epoch = self::machine(conn, &machine.name)?
@@ -2080,7 +2119,9 @@ fn push_closures(
         if !member.home.is_dir() || closures.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
             continue;
         }
-        let store = Store::open(&member.home)?;
+        let Some(store) = open_member(&member.home, skipped) else {
+            continue;
+        };
         let room = COLLECT_LIMIT - closures.len();
         for closure in crate::mail::closed_captain(&store, peer, room)? {
             // A closure now carries the answer it records. Stop before the
@@ -2114,8 +2155,11 @@ fn push_closures(
             params![machine.name, epoch],
         )?;
         for member in crate::fleet::members(conn)? {
-            if member.home.is_dir() {
-                Store::open(&member.home)?.audit(
+            if !member.home.is_dir() {
+                continue;
+            }
+            if let Some(store) = open_member(&member.home, skipped) {
+                store.audit(
                     "machine.closures_unsupported",
                     &json!({"machine": machine.name, "count": closures.len()}),
                 )?;
@@ -2140,8 +2184,10 @@ fn push_closures(
         .collect();
     let offered: Vec<String> = closed.iter().chain(&refused_ids).cloned().collect();
     for member in crate::fleet::members(conn)? {
-        if member.home.is_dir() {
-            let store = Store::open(&member.home)?;
+        if !member.home.is_dir() {
+            continue;
+        }
+        if let Some(store) = open_member(&member.home, skipped) {
             crate::mail::collected_closed(&store, peer, &offered)?;
             for refusal in &refused {
                 store.audit(
@@ -2233,7 +2279,8 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
                     Ok(
                         json!({"machine": machine.name, "delivered": collected["delivered"],
                         "refused": collected["refused"], "captain_pushed": pushed["captain_pushed"],
-                        "captain_closed": pushed["captain_closed"]}),
+                        "captain_closed": pushed["captain_closed"],
+                        "skipped_homes": pushed["skipped_homes"]}),
                     )
                 }
                 _ => Ok(collected),
@@ -2414,11 +2461,14 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 && desk(&conn)?.is_none_or(|(desk, _)| desk == machine.name);
             let mut messages = vec![];
             let mut bytes = 0;
+            let mut skipped = vec![];
             for member in crate::fleet::members(&conn)? {
                 if !member.home.is_dir() {
                     continue;
                 }
-                let store = Store::open(&member.home)?;
+                let Some(store) = open_member(&member.home, &mut skipped) else {
+                    continue;
+                };
                 // The collecting machine's call is the link heard; after a
                 // silence, the waits that ride it resync.
                 if let Err(error) = crate::waits::heard(&store, &peer) {
@@ -2477,10 +2527,13 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 .map(|(id, _)| (id.clone(), None))
                 .chain(refused.iter().map(|(id, e)| (id.clone(), Some(e.clone()))))
                 .collect();
-            let mut recorded = 0;
+            // A home skipped here offers its mail again on the next collection.
+            let (mut recorded, mut skipped) = (0, vec![]);
             for member in crate::fleet::members(&conn)? {
-                if member.home.is_dir() {
-                    let store = Store::open(&member.home)?;
+                if !member.home.is_dir() {
+                    continue;
+                }
+                if let Some(store) = open_member(&member.home, &mut skipped) {
                     recorded += crate::mail::collected(&store, &peer, &delivered, &refused)?;
                     recorded += crate::mail::collected_captain(&store, &peer, &captain)?;
                 }
