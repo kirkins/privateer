@@ -972,7 +972,14 @@ mod tests {
         )
         .unwrap();
         let names = vec!["slow".to_owned()];
-        let verdicts = evaluate(&conn, &names, false, Duration::from_millis(200)).unwrap();
+        // The login lookup answers at once, so the whole budget goes to the
+        // probe: a real login shell on a loaded machine can use it all up
+        // first, and the probe is then not run rather than cut short. A 1 s
+        // budget cuts the 2 s probe; the refresh below gives it its full time.
+        let verdicts = evaluate_with(&conn, &names, false, Duration::from_secs(1), &|_| {
+            "/usr/bin:/bin".to_owned()
+        })
+        .unwrap();
         assert_eq!(verdicts[0].1, Err(CUT_SHORT.to_owned()));
         let cached: i64 = conn
             .query_row("SELECT COUNT(*) FROM machine_offers", [], |r| r.get(0))
