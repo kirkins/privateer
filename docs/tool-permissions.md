@@ -223,10 +223,13 @@ approval:
 - On a request, a plain free-text yes: plain words only with a yes word
   among them ("yes", "ok", "go ahead"), or the action's own words retyped in
   full and in order, with only plain words before or after them ("ok, Deploy
-  build 55 to staging and prod, thanks").
+  build 55 to staging and prod, thanks"). "you" is plain only right after
+  "thank" ("yes thank you"), and "it" only right after a yes word ("do it",
+  "ship it", "go for it"), so "you good" and "it ok" ask rather than approve.
 
 A hedge ("yes but", "wait", "only staging"), a question mark, an emoji,
-symbol or combining mark, or any shorter form of the action approves nothing:
+symbol or combining mark (a tilde, which strikes words through; the Telegram
+door marks a strike from its formatting menu with one), or any shorter form of the action approves nothing:
 "deploy to staging" for "Deploy to staging and prod" narrows it, and "merge
 PR 12" for "Merge PR 12 ship to prod" leaves out a step, so a reply that is
 not a bare yes must retype every word of the action. The reply's

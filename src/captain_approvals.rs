@@ -127,11 +127,11 @@ const REFUSAL_STEMS: &[&str] = &[
 ];
 /// Words a plain yes may hold besides the words of the action it answers.
 /// None turns a yes into a question or a no: "you good", "that ok" and
-/// "this fine" ask, and "y" reads as "why", so those are left out.
+/// "this fine" ask, and "y" reads as "why", so those are left out. "you",
+/// "it" and "for" are plain only where `plain_run` allows them.
 const PLAIN_WORDS: &[&str] = &[
-    "yes", "yep", "yeah", "ok", "okay", "k", "sure", "go", "ahead", "do", "it", "please",
-    "approve", "approved", "proceed", "lgtm", "ship", "thanks", "thank", "the", "fine", "good",
-    "now",
+    "yes", "yep", "yeah", "ok", "okay", "k", "sure", "go", "ahead", "do", "please", "approve",
+    "approved", "proceed", "lgtm", "ship", "thanks", "thank", "the", "fine", "good", "now",
 ];
 /// The words of which a free-text reply needs one, unless it retypes the
 /// whole action.
@@ -139,6 +139,8 @@ const YES_WORDS: &[&str] = &[
     "yes", "yep", "yeah", "ok", "okay", "k", "sure", "go", "approve", "approved", "proceed",
     "lgtm", "ship", "do", "fine", "good",
 ];
+/// Words that, straight after "it", make a dropped-"is" question of it.
+const ASKS_AFTER_IT: &[&str] = &["ok", "okay", "k", "sure", "fine", "good"];
 const NOT_PLAIN: &str = "reply was not a plain yes; ask again with a decision";
 const PICTURED: &str =
     "reply carries a symbol or emoji, so nothing was approved; ask again with a decision";
@@ -493,9 +495,27 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `word` is a plain word.
-fn plain(word: &str) -> bool {
-    PLAIN_WORDS.contains(&word)
+/// Whether every word of `run` is plain. "you" is plain only right after
+/// "thank" ("yes thank you", never "you good" or "do you"), and "it" only
+/// right after a yes word ("do it", "ship it"; never "it ok", which asks)
+/// or in "go for it", the only place "for" is plain. Each word is judged
+/// by its neighbours inside `run` alone, so the words of an action never
+/// make the plain words beside it plain.
+fn plain_run(run: &[String]) -> bool {
+    let at = |i: usize| run.get(i).map(String::as_str);
+    (0..run.len()).all(|i| {
+        let before = i.checked_sub(1).and_then(at);
+        match run[i].as_str() {
+            "you" => before == Some("thank"),
+            "for" => before == Some("go") && at(i + 1) == Some("it"),
+            // "sure it ok" drops an "is" and asks, as "it ok" does.
+            "it" => {
+                before.is_some_and(|w| w == "for" || YES_WORDS.contains(&w))
+                    && !at(i + 1).is_some_and(|w| ASKS_AFTER_IT.contains(&w))
+            }
+            word => PLAIN_WORDS.contains(&word),
+        }
+    })
 }
 
 /// Whether `said` holds `own` in full and in order, its plain words
@@ -507,9 +527,7 @@ fn retyped(said: &[String], own: &[String]) -> bool {
     };
     (0..=last).any(|lead| {
         let tail = lead + own.len();
-        said[lead..tail] == own[..]
-            && said[..lead].iter().all(|w| plain(w))
-            && said[tail..].iter().all(|w| plain(w))
+        said[lead..tail] == own[..] && plain_run(&said[..lead]) && plain_run(&said[tail..])
     })
 }
 
@@ -521,7 +539,7 @@ fn retyped(said: &[String], own: &[String]) -> bool {
 /// prod" or "Tag v1.2 to production" of "Tag v1.2 ship to production".
 fn plain_yes(text: &str, action: &str) -> bool {
     let said = words(text);
-    if said.iter().all(|w| plain(w)) {
+    if plain_run(&said) {
         return said.iter().any(|w| YES_WORDS.contains(&w.as_str()));
     }
     retyped(&said, &words(action))
@@ -535,7 +553,7 @@ fn plain_yes(text: &str, action: &str) -> bool {
 /// it.
 fn plain_beside(text: &str, label: &str) -> bool {
     let said = words(text);
-    said.iter().all(|w| plain(w)) || retyped(&said, &words(label))
+    plain_run(&said) || retyped(&said, &words(label))
 }
 
 /// Question marks in any script, each a refusal like "?".
@@ -2007,6 +2025,94 @@ mod tests {
         for yes in ["ok do it", "yes please", "go ahead", "ship it now"] {
             assert!(plain_yes(yes, deploy), "{yes}");
         }
+    }
+
+    #[test]
+    fn you_is_plain_only_after_thank() {
+        let deploy = "Deploy build 55 to staging and prod";
+        for yes in [
+            "yes thank you",
+            "ok, thank you",
+            "Yes. Thank you!",
+            "thank you, yes",
+            "Deploy build 55 to staging and prod, thank you",
+            "thank you: deploy build 55 to staging and prod",
+        ] {
+            assert!(plain_yes(yes, deploy), "{yes}");
+        }
+        let wrong: Vec<_> = [
+            "you good",
+            "do you",
+            "thank you",
+            "you yes",
+            "yes you",
+            "thank you you yes",
+            "Deploy build 55 to staging and prod you",
+        ]
+        .into_iter()
+        .filter(|asked| plain_yes(asked, deploy))
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        // An action that holds "thank you" is retyped whole, its "you"
+        // included; the plain words beside it never shorten it.
+        let thank = "Send the thank you note";
+        assert!(plain_yes("ok, send the thank you note", thank));
+        assert!(!plain_yes("send the thank", thank));
+        assert!(!plain_yes("send the note", thank));
+        assert!(!plain_yes("ok send the thank you", thank));
+        // The same check holds beside a tapped option.
+        assert!(plain_beside("thank you", "Ship it"));
+        assert!(plain_beside("yes, ship it, thank you", "Ship it"));
+        assert!(!plain_beside("you sure", "Ship it"));
+    }
+
+    #[test]
+    fn it_is_plain_only_after_a_yes_word() {
+        // "it ok" drops an "is" and asks, as "that ok" does.
+        let deploy = "Deploy build 55 to staging and prod";
+        let wrong: Vec<_> = [
+            "it ok",
+            "it good",
+            "it fine",
+            "it's ok",
+            "is it ok",
+            "thanks it",
+            "please it",
+            "the it",
+            "it",
+            "for it",
+            "go for",
+            "ok for it",
+            "yes for now",
+            "Deploy build 55 to staging and prod it",
+            "sure it ok",
+            "sure it fine",
+            "ok it good",
+            "yes it ok",
+            "good it ok",
+            "k it fine",
+            "do it ok",
+        ]
+        .into_iter()
+        .filter(|asked| plain_yes(asked, deploy))
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        for yes in [
+            "do it",
+            "ship it",
+            "yes it",
+            "approve it",
+            "ok do it",
+            "go for it",
+            "yes, go for it",
+            "please do it now",
+            "ok, deploy build 55 to staging and prod, ship it",
+        ] {
+            assert!(plain_yes(yes, deploy), "{yes}");
+        }
+        assert!(!plain_beside("it ok", "Ship it"));
+        assert!(!plain_beside("sure it ok", "Ship it"));
+        assert!(plain_beside("go for it", "Ship it"));
     }
 
     #[test]
