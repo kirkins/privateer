@@ -2416,7 +2416,18 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
 pub(crate) const ACCEPTED: crate::Accepted = &[
     (
         "routes.set",
-        &["routes", "crew", "errand", "first_mate", "review", "ships"],
+        &[
+            "routes",
+            "crew",
+            "errand",
+            "first_mate",
+            "review",
+            "ships",
+            "until_ms",
+            "until_reset",
+            // Refused by `set` itself, with a reason that names the fix.
+            "temporary",
+        ],
     ),
     ("routes.show", &[]),
 ];
